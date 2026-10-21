@@ -296,7 +296,7 @@ field that stores them.
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
 | `params` of `diag.request` | dict literal whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`). The keys, and the values of the service's constants, are known at ingestion (`STAR_NON_CONSTANT_ARGUMENT`); a field's value may be known only at run time (below) |
 | `params` of `diag.routine` | dict literal whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
-| `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`). Under the target contract of 3.2 (ADR-336) it must name a session of the target whose handle the call is made on, and its value is the RequestTransferExit response in the 3.4 shape without `fields` |
+| `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); for now an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) only for a plan's session, the `@flashPlan` annotation's; a `diag.flash_transfer` outside a plan is refused as not lowered yet. Under the target contract of 3.2 (ADR-336) it must name a session of the target whose handle the call is made on, and its value is the RequestTransferExit response in the 3.4 shape without `fields` |
 
 A `diag.wait` whose duration is known at ingestion lowers to `Wait`, with the range checked then. One whose
 duration is an `int` computed at run time lowers to the code that pushes it, then `WaitFromStack` (ADR-233),
@@ -329,7 +329,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.read_dtc` | `SendReceive` | the complete request (bytes), built at ingestion from the profile's template with the `mask` constant, of the declared service the template selects (ADR-309 item 4, ADR-314 item 2); the call's value is the response, read under the profile's names (3.4) |
 | `diag.routine` | `RoutineControl` | the rest of the request after the sub-function and the routine identifier (bytes), built at ingestion from `params`, with a field's value known only at run time written into it then (below); the instruction holds `routine_id` and `sub`, which select the variant's generated routine service through the profile (ADR-309 item 4, ADR-314). The call's value is the response, read under the response's declared names (3.4) |
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to the profile's three steps (ADR-309 item 4, ADR-314): the seed request (on UDS the SecurityAccess service with the odd sub-function `level`), `SecurityAccess`, which turns the seed into the key through the host, and the send-key request (on UDS sub-function `level + 1`) carrying that key. The profile decodes neither response through a declared service, so both requests are `ServiceRequest`s of the template's SID with the payload it gives, and the variant needs no declared service for them; the seed is the seed response after the profile's leading bytes (on UDS the response SID and the level). A negative seed response ends the call before the key step, like a failed `diag.request`, and is its value; otherwise the value is the send-key response, positive or negative |
-| `diag.flash_transfer` | `FlashTransfer` | none lowered today: the converter refuses the call (`STAR_NOT_LOWERABLE`). The contract ADR-336 decides is below: the call expands to RequestDownload, a loop of `FlashBlock` and `FlashTransfer`, and RequestTransferExit, whose run-time operands are the block index for `FlashBlock` and the block bytes it leaves for `FlashTransfer` |
+| `diag.flash_transfer` | `FlashTransfer` | none lowered today: the converter refuses the call (`STAR_NOT_LOWERABLE`, or `STAR_NOT_IN_PROFILE` in a variant whose application layer is not UDS). The contract ADR-336 decides is below: the call expands to RequestDownload, a loop of `FlashBlock` and `FlashTransfer`, and RequestTransferExit, whose run-time operands are the block index for `FlashBlock` and the block bytes it leaves for `FlashTransfer` |
 | `diag.wait` | `Wait`, or `WaitFromStack` | none for a constant duration; for a duration known only at run time, the duration in milliseconds (`int`), pushed before `WaitFromStack` |
 | `diag.hmi` | `HmiRequest` | none: the instruction sends a constant, so the transpiler encodes the form and its constant `params` into one constant-pool entry; parameters known only at run time need a variant that takes them from the stack |
 | `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry |
@@ -613,7 +613,10 @@ authentication time (8.10.1) each time the function is called.
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
-  times as the procedure needs, enters the section once per call.
+  times as the procedure needs, enters the section once per call. A flash plan's expansion
+  (4.9) is the exception: what the plan reaches is inlined in it, so a call there nests in no
+  section; a section function reached from the top level or `main` without passing through a
+  plan, or from no plan at all, still nests the sections it calls.
 - **Values.** A section function takes what it needs as arguments and returns what the caller
   needs, like any function: one run-time value, since the VM has no run-time lists, dicts or
   tuples (2.5). Work that needs several results of a section is done inside the section, or the
@@ -720,7 +723,9 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
 
 ### 4.9 Flash plans and preconditions
 
-**Target contract (ADR-336).** This section is what ADR-336 decides. The converter implements `# @preconditions` and the copy of `identity.csv` into every program (below); it lowers none of the flash plan, and refuses `diag.flash_transfer` (3.2).
+**Target contract (ADR-336).** This section is what ADR-336 decides. The converter implements `# @preconditions` and the copy of `identity.csv` into every program (below). It also checks the flash plan's annotations and shape rules: the syntax of `@flashPlan`, `@erase` and `@recoveryRequired` and their placement, the shape rules, and the mandatory preconditions, per file; the session, the `@erase` against the session's steps, the identity rows of a restartable plan and the UDS layer, per variant. It lowers no plan: once those checks pass, a file that uses `diag.flash_transfer`, inside a plan or not, still ends in `STAR_NOT_LOWERABLE` at the call (3.2), except in a variant whose application layer is not UDS, where the call is `STAR_NOT_IN_PROFILE`. The expansion, the boundaries, the `CheckState` default of 4.6 and the conversion limits below are not applied yet.
+
+Where each check runs. The per-file checks run on the syntax alone, whatever the variants declare, and are reported once. They are: the annotation placement (`STAR_BAD_ANNOTATION`) and ranges (`STAR_ARGUMENT_OUT_OF_RANGE`, which also refuses the reserved maximum session id); every rule of the shape list (`STAR_PLAN_SHAPE`); and the mandatory preconditions. The per-variant checks need the variant's tables and run in the lowering, before any instruction is emitted: `STAR_UNKNOWN_FLASH_SESSION`, the `erase-memory` cross-check of `@erase` and the identity rows (`STAR_PLAN_SHAPE`), and `STAR_NOT_IN_PROFILE`. A `diag.flash_transfer` whose session is an integer literal (with a `+` or `-` sign, of any size), or a top-level constant bound to such a literal or to an earlier constant that is, and not hidden by a parameter or local of the plan, is compared with the annotation's session by the per-file check; any other expression is not compared, and is left to the lowering of the call.
 
 A flash recovery plan (design 8.2.5) is a whole top-level function that the lowering expands in
 place at its one call site in `main`. ECU facts (identity and precondition sources, the plan's
@@ -762,7 +767,7 @@ def main():
   function is never called; `main` carries the annotation (nothing calls it, so it has no call
   site to expand at); the plan function carries no `@section uninterruptible` or
   `@section recoveryRequired` (4.5); the plan's `diag.flash_transfer` call names another session than its
-  annotation, or the plan has no `diag.flash_transfer` call or more than one.
+  annotation, or the plan has no `diag.flash_transfer` call or more than one; a `diag.flash_transfer` in a function the plan calls, directly or not, section functions included, is refused at that call, since the expansion would make a second download.
 - **Coverage.** Everything that runs during the call is in the plan. Functions it calls, directly
   or not, section functions included, are expanded in place, not copied and called: a plan
   contains no `Call` or `Ret` (ADR-245 item 4). A `Ret` becomes a jump to the join, locals get
@@ -772,12 +777,12 @@ def main():
   expansion emits. The erase point is the `diag.routine` statement annotated `# @erase`, a single
   call and a top-level statement of the plan before the transfer; with no `erase-memory` step in
   the session `@erase` is refused and the erase point is the RequestDownload, and with one it is
-  required. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
+  required. Each of those two statements is the one call, or a name assigned from it, with no other `diag` call inside it and no call to a function of the program, which the expansion would inline into it; built-ins and methods of values are allowed (`STAR_PLAN_SHAPE`), so each boundary is one operation. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
   so no jump skips them; loops and `if`s between them are fine.
 - **Recovery-required point.** By default the plan requires on-site intervention from the erase
   point (no automatic restart after it). `recovery=never` declares that no step does.
-  `# @recoveryRequired` before a statement of the plan moves the point to that statement's first
-  instruction; it is exclusive with `recovery=never`. A plan function whose section is
+  `# @recoveryRequired` before a top-level statement of the plan, like `@erase` and the transfer (a nested statement is `STAR_BAD_ANNOTATION`), moves the point to that statement's first
+  instruction, so the point lies on the plan's straight-line path and no loop jumps back across it; it is exclusive with `recovery=never`. A plan function whose section is
   `recoveryRequired` requires on-site intervention from its entry, the only point that agrees with
   a section covering the whole plan (`Program::validate` refuses a contradiction); `# @recoveryRequired`
   and `recovery=never` are refused in it (`STAR_PLAN_SHAPE`).
@@ -851,11 +856,12 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 }
 ```
 
-The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECONDITION` is reported by the converter, the other two belong to the flash plan contract:
+The error codes of the restart declaration (ADR-336, 4.9); the converter reports each of them, `STAR_UNKNOWN_FLASH_SESSION` and `STAR_PLAN_SHAPE` from its checks of the flash plan (4.9), `STAR_PLAN_INVALID` from the validation of a lowered program, which no plan reaches yet:
 
 | Code | Meaning |
 |---|---|
-| `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called) |
+| `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called, section, `diag.flash_transfer`, `@erase`, `@recoveryRequired`), the variant's `erase-memory` step disagrees with `@erase`, a restartable plan lacks identity rows, or the procedure's `# @preconditions` lacks `voltage`, `externalSupply` or `ignition` |
+| `STAR_UNKNOWN_FLASH_SESSION` | the `session` of `# @flashPlan` is not a flash session of the variant (reported at the annotation) |
 | `STAR_PLAN_INVALID` | the lowered program is refused by `Program::validate` with an error that names a pc; located at the source of that pc (an error without a pc is `STAR_NOT_LOWERABLE`) |
 | `STAR_UNKNOWN_IDENTITY` | a key of `diag.ecu_info()` (`vin`, `part_number`, `software_version`) has no row in the variant's `identity.csv` (reported at the key; ADR-339) |
 | `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions`, or the kind a `diag.precondition` call names, has no row in the variant's `preconditions.csv` (for the call, also a row with no default-session source, which the tables never produce) |
@@ -891,7 +897,8 @@ The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECOND
   An integer, negative ones included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any
   other fault `STAR_BAD_ANNOTATION`
 - Section nesting (4.5) is found on the call graph the recursion check builds, in one pass: the
-  functions reachable from any section function are marked, and a call from a marked function
+  functions reachable from any section function that runs outside every plan's expansion are
+  marked (without entering a plan), and a call from a marked function
   to a section function is reported, unless it closes a cycle, which is reported as recursion
   only. Calls through function parameters (2.6) are followed along the specialized call paths
 - Sections (4.5) are lowered as copies keyed by the function and the section function whose call

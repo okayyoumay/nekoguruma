@@ -21,8 +21,9 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::profile::Profile;
-use diag_ir::{IdentitySources, PreconditionKind, Preconditions};
+use diag_ir::{IdentitySources, PLAIN_PROCEDURE_STAGE, PreconditionKind, Preconditions};
 use starlark_syntax::codemap::Span;
+use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
     ArgumentP, AssignTargetP, AstArgument, AstAssignTarget, AstExpr, AstLiteral, AstNoPayload,
     AstParameter, AstStmt, BinOp, ClauseP, DefP, ExprP, ForClauseP, ParameterP, StmtP,
@@ -142,6 +143,14 @@ pub enum StarCode {
     /// A name in `# @preconditions` that has no row in the variant's `preconditions.csv` (4.9).
     #[serde(rename = "STAR_UNKNOWN_PRECONDITION")]
     UnknownPrecondition,
+    /// A `# @flashPlan` whose function breaks a shape rule of 4.9 (call count and call site,
+    /// `return`, section, `diag.flash_transfer`, `@erase`, `@recoveryRequired`), or whose
+    /// variant lacks what the plan needs (an erase row, the identity rows, ADR-336 items 2, 4, 6).
+    #[serde(rename = "STAR_PLAN_SHAPE")]
+    PlanShape,
+    /// A `# @flashPlan` session that is not a flash session of the variant (4.9, ADR-336 item 2).
+    #[serde(rename = "STAR_UNKNOWN_FLASH_SESSION")]
+    UnknownFlashSession,
     /// A `diag.ecu_info()` key whose value the variant's `identity.csv` has no row for (3.2).
     #[serde(rename = "STAR_UNKNOWN_IDENTITY")]
     UnknownIdentity,
@@ -204,6 +213,8 @@ impl StarCode {
             Self::BuiltinNotAllowed => "STAR_BUILTIN_NOT_ALLOWED",
             Self::BadAnnotation => "STAR_BAD_ANNOTATION",
             Self::UnknownPrecondition => "STAR_UNKNOWN_PRECONDITION",
+            Self::PlanShape => "STAR_PLAN_SHAPE",
+            Self::UnknownFlashSession => "STAR_UNKNOWN_FLASH_SESSION",
             Self::UnknownIdentity => "STAR_UNKNOWN_IDENTITY",
             Self::ArgumentOutOfRange => "STAR_ARGUMENT_OUT_OF_RANGE",
             Self::SourceTooLarge => "STAR_SOURCE_TOO_LARGE",
@@ -294,7 +305,46 @@ pub enum Annotation {
         /// The preconditions the procedure requires, in the order written.
         kinds: Vec<PreconditionKind>,
     },
+    /// `@flashPlan session=<int> [maxResumes=<int>] [recovery=never]`, which makes the whole
+    /// top-level `def` that follows it a flash plan (4.9, ADR-336 item 2).
+    FlashPlan {
+        line: u32,
+        /// The line of the `def`.
+        def: u32,
+        /// The comment, where a variant's problem with the plan is reported.
+        span: Span,
+        session: u32,
+        max_resumes: u32,
+        /// `recovery=never`.
+        recovery_never: bool,
+    },
+    /// `@erase`, before the `diag.routine` statement that erases the session's memory, a
+    /// top-level statement of a plan function (4.9).
+    Erase {
+        line: u32,
+        /// The line of the plan's `def`.
+        def: u32,
+        span: Span,
+        /// The byte offset where the statement begins.
+        statement_at: u32,
+    },
+    /// `@recoveryRequired`, before the top-level statement of a plan function where the plan
+    /// requires on-site intervention from (4.9).
+    RecoveryRequired {
+        line: u32,
+        /// The line of the plan's `def`.
+        def: u32,
+        span: Span,
+        /// The byte offset where the statement begins.
+        statement_at: u32,
+    },
 }
+
+/// The most `maxResumes` a flash plan may allow (`FlashRecovery.max_resumes`, 4.9).
+const MAX_PLAN_RESUMES: u32 = 65_535;
+
+/// What `@flashPlan` gives when it has no `maxResumes` (4.9).
+const DEFAULT_PLAN_RESUMES: u32 = 3;
 
 /// A procedure that passed the checks: its AST and annotations, for the lowering. The AST nests
 /// no deeper than the bounds of 2.8 allow, which a recursive walk over it can rely on only on a
@@ -1921,6 +1971,43 @@ impl Checker<'_> {
         let mut idempotent: HashSet<u32> = HashSet::new();
         // Whether `main` has its `@preconditions`.
         let mut preconditioned = false;
+        // The plan functions, by the line of their `def`, and the statements that have an
+        // `@erase` or a `@recoveryRequired`, by where they begin (4.9).
+        let mut planned: HashSet<u32> = HashSet::new();
+        let mut attempted: HashSet<u32> = HashSet::new();
+        let mut erased: HashSet<u32> = HashSet::new();
+        let mut recovered: HashSet<u32> = HashSet::new();
+        // The top-level statements of each top-level `def`'s body, by where they begin, in
+        // source order, so a lookup is a binary search.
+        let body_starts: HashMap<u32, Vec<u32>> = top
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                StmtP::Def(def) => Some((
+                    line_of(stmt.span),
+                    Self::statements(&def.body)
+                        .iter()
+                        .map(|inner| inner.span.begin().get())
+                        .collect(),
+                )),
+                _ => None,
+            })
+            .collect();
+        // The top-level `def` a comment on `line` directly precedes, if the comment stands alone
+        // at the start of its line and only comments and blank lines come between (4.5).
+        let def_after = |line: u32| -> Option<(u32, String)> {
+            let standalone = source_lines
+                .get(line as usize - 1)
+                .is_some_and(|text| text.starts_with('#'));
+            next_code
+                .get(line as usize + 1)
+                .filter(|_| standalone)
+                .and_then(|next| {
+                    top_defs
+                        .binary_search_by_key(next, |(def_line, _)| *def_line)
+                        .ok()
+                })
+                .map(|at| top_defs[at].clone())
+        };
         'comments: for &span in module.comments() {
             let file_span = module.file_span(span);
             // One comment marker: after `##` the text starts with `#`, an ordinary comment.
@@ -2162,6 +2249,177 @@ impl Checker<'_> {
                     preconditioned = true;
                     annotations.push(Annotation::Preconditions { line, span, kinds });
                 }
+                "flashPlan" => {
+                    // Even a malformed one makes its `def` a plan for `@erase` and
+                    // `@recoveryRequired`, which then have nothing more to report.
+                    let target = def_after(line);
+                    if let Some((def, _)) = &target {
+                        attempted.insert(*def);
+                    }
+                    let (mut session, mut max_resumes, mut never) = (None, None, false);
+                    for arg in &args {
+                        if let Some(value) = arg.strip_prefix("session=") {
+                            if session.is_some() {
+                                bad(self, "`session=` is given twice (4.9)".to_owned());
+                                continue 'comments;
+                            }
+                            let Some(id) = parse_range(self, span, value, 0, i128::from(u32::MAX))
+                            else {
+                                continue 'comments;
+                            };
+                            if id == PLAIN_PROCEDURE_STAGE {
+                                self.error(
+                                    StarCode::ArgumentOutOfRange,
+                                    span,
+                                    format!(
+                                        "session {id} is the reserved id of a plain procedure \
+                                         (4.9)"
+                                    ),
+                                );
+                                continue 'comments;
+                            }
+                            session = Some(id);
+                        } else if let Some(value) = arg.strip_prefix("maxResumes=") {
+                            if max_resumes.is_some() {
+                                bad(self, "`maxResumes=` is given twice (4.9)".to_owned());
+                                continue 'comments;
+                            }
+                            let Some(count) =
+                                parse_range(self, span, value, 1, i128::from(MAX_PLAN_RESUMES))
+                            else {
+                                continue 'comments;
+                            };
+                            max_resumes = Some(count);
+                        } else if *arg == "recovery=never" {
+                            if never {
+                                bad(self, "`recovery=never` is given twice (4.9)".to_owned());
+                                continue 'comments;
+                            }
+                            never = true;
+                        } else {
+                            bad(
+                                self,
+                                format!(
+                                    "unknown `@flashPlan` attribute `{arg}`; it takes `session=`, \
+                                     `maxResumes=` and `recovery=never` (4.9)"
+                                ),
+                            );
+                            continue 'comments;
+                        }
+                    }
+                    let Some(session) = session else {
+                        bad(self, "`@flashPlan` needs `session=<int>` (4.9)".to_owned());
+                        continue;
+                    };
+                    let Some((def, name)) = target else {
+                        bad(
+                            self,
+                            "`@flashPlan` must directly precede a top-level `def`, which it \
+                             makes a flash plan (4.9)"
+                                .to_owned(),
+                        );
+                        continue;
+                    };
+                    if name == "main" {
+                        self.error(
+                            StarCode::PlanShape,
+                            span,
+                            "`main` cannot be a flash plan: nothing calls it, so it has no call \
+                             site to expand at (4.9)",
+                        );
+                        continue;
+                    }
+                    if !planned.insert(def) {
+                        bad(
+                            self,
+                            format!("`{name}` already has a `@flashPlan`; a `def` takes one (4.9)"),
+                        );
+                        continue;
+                    }
+                    annotations.push(Annotation::FlashPlan {
+                        line,
+                        def,
+                        span,
+                        session,
+                        max_resumes: max_resumes.unwrap_or(DEFAULT_PLAN_RESUMES),
+                        recovery_never: never,
+                    });
+                }
+                "erase" | "recoveryRequired" => {
+                    if !args.is_empty() {
+                        bad(self, format!("`@{keyword}` takes no argument (4.9)"));
+                        continue;
+                    }
+                    // A comment after code would take that statement's line and so annotate a
+                    // later one.
+                    if !source_lines
+                        .get(line as usize - 1)
+                        .is_some_and(|text| text.trim_start().starts_with('#'))
+                    {
+                        bad(
+                            self,
+                            format!(
+                                "`@{keyword}` stands on a line of its own, directly before the \
+                                 statement it annotates (4.9)"
+                            ),
+                        );
+                        continue;
+                    }
+                    let target = enclosing(line, column)
+                        .and_then(|def| next_statement(def, line).map(|stmt| (def.0, stmt.2)));
+                    let Some((def, statement_at)) = target else {
+                        bad(
+                            self,
+                            format!(
+                                "`@{keyword}` must precede a statement in the same function (4.9)"
+                            ),
+                        );
+                        continue;
+                    };
+                    let seen = if keyword == "erase" {
+                        &mut erased
+                    } else {
+                        &mut recovered
+                    };
+                    if !seen.insert(statement_at) {
+                        bad(
+                            self,
+                            format!(
+                                "this statement already has an `@{keyword}`; a statement takes \
+                                 one (4.9)"
+                            ),
+                        );
+                        continue;
+                    }
+                    if !body_starts
+                        .get(&def)
+                        .is_some_and(|starts| starts.binary_search(&statement_at).is_ok())
+                    {
+                        bad(
+                            self,
+                            format!(
+                                "`@{keyword}` must precede a top-level statement of a flash plan \
+                                 function, not a nested one (4.9)"
+                            ),
+                        );
+                        continue;
+                    }
+                    annotations.push(if keyword == "erase" {
+                        Annotation::Erase {
+                            line,
+                            def,
+                            span,
+                            statement_at,
+                        }
+                    } else {
+                        Annotation::RecoveryRequired {
+                            line,
+                            def,
+                            span,
+                            statement_at,
+                        }
+                    });
+                }
                 "endsection" => bad(
                     self,
                     "`@endsection` does not exist: a section is a whole top-level `def`, marked \
@@ -2174,33 +2432,490 @@ impl Checker<'_> {
                 ),
             }
         }
-        self.section_nesting(sectioned.values());
+        let plan_ids: HashSet<usize> = top_defs
+            .iter()
+            .filter(|(line, _)| planned.contains(line))
+            .map(|(_, name)| self.def_ids[name])
+            .collect();
+        self.section_nesting(sectioned.values(), &plan_ids);
+        // `@erase` and `@recoveryRequired` belong to a plan function, which is known only now.
+        let mut misplaced = Vec::new();
+        annotations.retain(|annotation| match annotation {
+            Annotation::Erase { def, span, .. }
+            | Annotation::RecoveryRequired { def, span, .. }
+                if !planned.contains(def) && !attempted.contains(def) =>
+            {
+                misplaced.push(*span);
+                false
+            }
+            _ => true,
+        });
+        for span in misplaced {
+            self.error(
+                StarCode::BadAnnotation,
+                span,
+                "`@erase` and `@recoveryRequired` belong to a function with a `@flashPlan` (4.9)",
+            );
+        }
+        self.flash_plans(&annotations);
         annotations
+    }
+
+    /// The shape rules of flash plans (4.9, ADR-336 items 2, 4 and 6), which the syntax alone
+    /// decides. What needs the variant's tables is checked in the lowering.
+    fn flash_plans(&mut self, annotations: &[Annotation]) {
+        let plans: Vec<&Annotation> = annotations
+            .iter()
+            .filter(|a| matches!(a, Annotation::FlashPlan { .. }))
+            .collect();
+        if plans.is_empty() {
+            return;
+        }
+        let module = self.module;
+        let codemap = module.file_span(module.statement().span).file;
+        let line_of = |span: Span| to_u32(codemap.find_line(span.begin()) + 1);
+        let top = Self::statements(module.statement());
+        // The top-level `def`s, by the line of their `def`.
+        let defs: HashMap<u32, &DefP<AstNoPayload>> = top
+            .iter()
+            .filter_map(|stmt| match &stmt.node {
+                StmtP::Def(def) => Some((line_of(stmt.span), def)),
+                _ => None,
+            })
+            .collect();
+        let main = defs.values().find(|def| def.name.node.ident == "main");
+        // The kind of each section function, by the line of its `def`.
+        let section_kinds: HashMap<u32, SectionKind> = annotations
+            .iter()
+            .filter_map(|a| match a {
+                Annotation::Section { def, kind, .. } => Some((*def, *kind)),
+                _ => None,
+            })
+            .collect();
+        let section_ids: HashSet<usize> = section_kinds
+            .keys()
+            .filter_map(|line| defs.get(line))
+            .map(|def| self.def_ids[&def.name.node.ident])
+            .collect();
+        // The calls of `main`'s body that are statements of it, outside every `for`.
+        let mut call_sites = HashSet::new();
+        if let Some(main) = main {
+            plan_call_sites(&main.body, &mut call_sites);
+        }
+        // The top-level constants that are integer literals, which name a session.
+        let mut constants: HashMap<&str, i128> = HashMap::new();
+        // In source order, so a constant bound to an earlier one resolves, and no cycle exists.
+        for stmt in &top {
+            if let StmtP::Assign(assign) = &stmt.node
+                && let AssignTargetP::Identifier(name) = &assign.lhs.node
+                && let Some(value) = literal_int(&assign.rhs, &constants, &HashSet::new())
+            {
+                constants.insert(&name.node.ident, value);
+            }
+        }
+        // The calls of each function, in source order, and the `diag.flash_transfer` calls in
+        // each top-level function's body, each taken once so a walk costs its edges.
+        let mut callees: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
+        for call in &self.calls {
+            callees[call.caller].push(call.callee);
+        }
+        let mut reached_transfers: Vec<Option<(&str, Vec<Span>)>> = vec![None; self.next_function];
+        for def in defs.values() {
+            let mut inner = Vec::new();
+            collect_statements(&def.body, &mut inner);
+            let mut calls = Vec::new();
+            for stmt in &inner {
+                for expr in stmt_exprs(stmt) {
+                    find_diag_calls(expr, "flash_transfer", &mut calls);
+                }
+            }
+            let id = self.def_ids[def.name.node.ident.as_str()];
+            reached_transfers[id] = Some((
+                def.name.node.ident.as_str(),
+                calls.iter().map(|call| call.span).collect(),
+            ));
+        }
+        let mut reported: HashSet<u32> = HashSet::new();
+        // The calls to each function, and the `@erase` and `@recoveryRequired` of each plan by
+        // its `def` line, in source order, so each plan costs its own share.
+        let mut incoming: Vec<Vec<&Call>> = vec![Vec::new(); self.next_function];
+        for call in &self.calls {
+            incoming[call.callee].push(call);
+        }
+        let mut markers: HashMap<u32, Vec<&Annotation>> = HashMap::new();
+        for annotation in annotations {
+            if let Annotation::Erase { def, .. } | Annotation::RecoveryRequired { def, .. } =
+                annotation
+            {
+                markers.entry(*def).or_default().push(annotation);
+            }
+        }
+        let mut walked: HashSet<usize> = HashSet::new();
+        let mut found: Vec<(Span, String)> = Vec::new();
+        for plan in plans {
+            let Annotation::FlashPlan {
+                def: def_line,
+                span: plan_span,
+                session,
+                recovery_never,
+                ..
+            } = plan
+            else {
+                continue;
+            };
+            let Some(def) = defs.get(def_line).copied() else {
+                continue;
+            };
+            let name = def.name.node.ident.as_str();
+            let id = self.def_ids[name];
+            let at = def.name.span;
+            let section = section_kinds.get(def_line).copied();
+            if !matches!(
+                section,
+                Some(SectionKind::Uninterruptible | SectionKind::RecoveryRequired)
+            ) {
+                found.push((
+                    at,
+                    format!(
+                        "the flash plan `{name}` must also be `@section uninterruptible` or \
+                         `@section recoveryRequired` (4.5, 4.9)"
+                    ),
+                ));
+            }
+            let mut statements = Vec::new();
+            collect_statements(&def.body, &mut statements);
+            for stmt in &statements {
+                if matches!(stmt.node, StmtP::Return(_)) {
+                    found.push((
+                        stmt.span,
+                        format!(
+                            "the flash plan `{name}` has a `return`: it ends by falling off its \
+                             body or by `diag.fail` (4.9)"
+                        ),
+                    ));
+                }
+            }
+            // Where the plan is called.
+            let calls = &incoming[id];
+            if calls.is_empty() {
+                found.push((
+                    at,
+                    format!("the flash plan `{name}` is never called; `main` calls it once (4.9)"),
+                ));
+            }
+            for (index, call) in calls.iter().enumerate() {
+                let hint = if index > 0 {
+                    format!("the flash plan `{name}` is called more than once (4.9)")
+                } else if section_ids.contains(&call.caller) {
+                    format!("the flash plan `{name}` is called from a section function (4.9)")
+                } else if Some(call.caller) != self.def_ids.get("main").copied() {
+                    format!(
+                        "the flash plan `{name}` is called from another function, not from \
+                         `main` (4.9)"
+                    )
+                } else if !call_sites.contains(&call.span.begin().get()) {
+                    format!(
+                        "the call to the flash plan `{name}` must be a statement of `main`'s \
+                         body, in an `if` at most, not in a `for` or an expression (4.9)"
+                    )
+                } else {
+                    continue;
+                };
+                found.push((call.span, hint));
+            }
+            // The plan's one transfer is its own: the functions it calls are expanded in place,
+            // so a transfer in one of them would make a second download.
+            // One visited set for all plans: a function walked from an earlier plan has had its
+            // callees scanned already, and its transfers reported once.
+            let mut stack = Vec::new();
+            if walked.insert(id) {
+                stack.push(id);
+            }
+            while let Some(function) = stack.pop() {
+                for &callee_id in &callees[function] {
+                    if !walked.insert(callee_id) {
+                        continue;
+                    }
+                    stack.push(callee_id);
+                    let Some((callee_name, reached)) = &reached_transfers[callee_id] else {
+                        continue;
+                    };
+                    for &transfer in reached {
+                        if reported.insert(transfer.begin().get()) {
+                            found.push((
+                                transfer,
+                                format!(
+                                    "`diag.flash_transfer` is in `{callee_name}`, which the \
+                                     flash plan `{name}` calls; the plan's one transfer is a \
+                                     statement of the plan itself (4.9)"
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
+            // The transfer: one call, a top-level statement, of the annotation's session.
+            let body = Self::statements(&def.body);
+            let mut locals = HashSet::new();
+            collect_locals(&def.body, &mut locals, &mut HashSet::new());
+            for param in &def.params {
+                if let ParameterP::Normal(ident, ..)
+                | ParameterP::Args(ident, ..)
+                | ParameterP::KwArgs(ident, ..) = &param.node
+                {
+                    locals.insert(ident.node.ident.clone());
+                }
+            }
+            // The top-level statements by where they begin and by the span of the expression
+            // they are made of.
+            let by_start: HashMap<u32, &AstStmt> = body
+                .iter()
+                .map(|stmt| (stmt.span.begin().get(), *stmt))
+                .collect();
+            let by_expr: HashMap<(u32, u32), &AstStmt> = body
+                .iter()
+                .filter_map(|stmt| {
+                    direct_expr(stmt).map(|e| ((e.span.begin().get(), e.span.end().get()), *stmt))
+                })
+                .collect();
+            let mut transfers = Vec::new();
+            for stmt in &statements {
+                for expr in stmt_exprs(stmt) {
+                    find_diag_calls(expr, "flash_transfer", &mut transfers);
+                }
+            }
+            if transfers.is_empty() {
+                found.push((
+                    at,
+                    format!("the flash plan `{name}` has no `diag.flash_transfer` call (4.9)"),
+                ));
+            }
+            // Where the top-level statement holding the transfer begins.
+            let mut transfer_at = None;
+            for (index, transfer) in transfers.iter().enumerate() {
+                if index > 0 {
+                    found.push((
+                        transfer.span,
+                        format!(
+                            "the flash plan `{name}` has more than one `diag.flash_transfer` \
+                             call (4.9)"
+                        ),
+                    ));
+                }
+                match by_expr.get(&(transfer.span.begin().get(), transfer.span.end().get())) {
+                    Some(stmt) => {
+                        transfer_at = transfer_at.or(Some(stmt.span.begin().get()));
+                        // The statement holds this one operation: no other `diag` call in
+                        // the arguments.
+                        if diag_call_count(transfer) > 1
+                            || calls_program_function(
+                                transfer,
+                                &locals,
+                                &[&self.defs, &self.globals],
+                            )
+                        {
+                            found.push((
+                                transfer.span,
+                                "`diag.flash_transfer` must be the only `diag` call of its \
+                                 statement, with no call to a function of the program (4.9)"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    None => found.push((
+                        transfer.span,
+                        "`diag.flash_transfer` must be a top-level statement of the flash plan, \
+                         alone or assigned to a name (4.9)"
+                            .to_owned(),
+                    )),
+                }
+                if let ExprP::Call(_, call_args) = &transfer.node
+                    && let Some(arg) = call_args.args.first()
+                    && let ArgumentP::Positional(value) = &arg.node
+                    && let Some(named) = literal_int(value, &constants, &locals)
+                    && named != i128::from(*session)
+                {
+                    found.push((
+                        value.span,
+                        format!(
+                            "`diag.flash_transfer` names session {named}, but `@flashPlan` \
+                             names session {session} (4.9)"
+                        ),
+                    ));
+                }
+            }
+            // `@erase`: one `diag.routine` statement before the transfer.
+            let mut erases = 0;
+            let mut recoveries = 0;
+            for annotation in markers.get(def_line).into_iter().flatten().copied() {
+                match annotation {
+                    Annotation::Erase {
+                        def,
+                        span,
+                        statement_at,
+                        ..
+                    } if def == def_line => {
+                        erases += 1;
+                        if erases > 1 {
+                            found.push((
+                                *span,
+                                format!("the flash plan `{name}` has more than one `@erase` (4.9)"),
+                            ));
+                        }
+                        // One `diag.routine` call, and no other `diag` call inside it.
+                        let routine = by_start
+                            .get(statement_at)
+                            .and_then(|stmt| direct_expr(stmt))
+                            .is_some_and(|e| {
+                                is_diag_call(e, "routine").is_some()
+                                    && diag_call_count(e) == 1
+                                    && !calls_program_function(
+                                        e,
+                                        &locals,
+                                        &[&self.defs, &self.globals],
+                                    )
+                            });
+                        if !routine {
+                            found.push((
+                                *span,
+                                "`@erase` must precede a single `diag.routine` call, alone or \
+                                 assigned to a name, with no other `diag` call in it and no \
+                                 call to a function of the program (4.9)"
+                                    .to_owned(),
+                            ));
+                        } else if transfer_at.is_some_and(|transfer| *statement_at >= transfer) {
+                            found.push((
+                                *span,
+                                "`@erase` must precede the `diag.flash_transfer` statement (4.9)"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    Annotation::RecoveryRequired { def, span, .. } if def == def_line => {
+                        recoveries += 1;
+                        if recoveries > 1 {
+                            found.push((
+                                *span,
+                                format!(
+                                    "the flash plan `{name}` has more than one \
+                                     `@recoveryRequired` (4.9)"
+                                ),
+                            ));
+                        }
+                        if *recovery_never {
+                            found.push((
+                                *span,
+                                "`@recoveryRequired` and `recovery=never` exclude each other \
+                                 (4.9)"
+                                    .to_owned(),
+                            ));
+                        }
+                        if section == Some(SectionKind::RecoveryRequired) {
+                            found.push((
+                                *span,
+                                "a plan whose section is `recoveryRequired` requires on-site \
+                                 intervention from its entry and takes no `@recoveryRequired` \
+                                 (4.9)"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            if *recovery_never && section == Some(SectionKind::RecoveryRequired) {
+                found.push((
+                    *plan_span,
+                    "a plan whose section is `recoveryRequired` requires on-site intervention \
+                     from its entry and takes no `recovery=never` (4.9)"
+                        .to_owned(),
+                ));
+            }
+        }
+        // A procedure with a plan checks the supply voltage, the external supply and the
+        // ignition before it reprograms (design 8.9.1).
+        let named = annotations.iter().find_map(|a| match a {
+            Annotation::Preconditions { span, kinds, .. } => Some((*span, kinds)),
+            _ => None,
+        });
+        let required = [
+            (PreconditionKind::Voltage, "voltage"),
+            (PreconditionKind::ExternalSupply, "externalSupply"),
+            (PreconditionKind::Ignition, "ignition"),
+        ];
+        let missing: Vec<&str> = required
+            .iter()
+            .filter(|(kind, _)| !named.is_some_and(|(_, kinds)| kinds.contains(kind)))
+            .map(|(_, name)| *name)
+            .collect();
+        if !missing.is_empty() {
+            let at = named
+                .map(|(span, _)| span)
+                .or_else(|| main.map(|main| main.name.span));
+            if let Some(at) = at {
+                found.push((
+                    at,
+                    format!(
+                        "a procedure with a flash plan names `voltage`, `externalSupply` and \
+                         `ignition` in `# @preconditions` before `def main()`; missing: {} (4.9)",
+                        missing.join(", ")
+                    ),
+                ));
+            }
+        }
+        for (span, hint) in found {
+            self.error(StarCode::PlanShape, span, hint);
+        }
     }
 
     /// Sections do not nest: no function that runs inside a section, the section function itself
     /// or anything it calls, directly or not, may call another section function (4.5,
     /// ADR-301). A call that closes a cycle is reported as recursion only.
-    fn section_nesting<'n>(&mut self, sections: impl Iterator<Item = &'n String>) {
+    fn section_nesting<'n>(
+        &mut self,
+        sections: impl Iterator<Item = &'n String>,
+        plans: &HashSet<usize>,
+    ) {
         let ids: HashSet<usize> = sections.map(|name| self.def_ids[name]).collect();
         let mut successors: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
         for call in &self.calls {
             successors[call.caller].push(call.callee);
         }
-        // Every function reachable from a section function, by one pass over the graph.
-        let mut inside = vec![false; self.next_function];
-        let mut stack: Vec<usize> = ids.iter().copied().collect();
-        for &id in &stack {
-            inside[id] = true;
-        }
-        while let Some(function) = stack.pop() {
-            for &next in &successors[function] {
-                if !inside[next] {
-                    inside[next] = true;
-                    stack.push(next);
+        // The functions reachable from `roots` without entering a plan, or from the plans.
+        let reach = |roots: Vec<usize>, enter_plans: bool| {
+            let mut reached = vec![false; self.next_function];
+            let mut stack = Vec::new();
+            for root in roots {
+                if !reached[root] {
+                    reached[root] = true;
+                    stack.push(root);
                 }
             }
-        }
+            while let Some(function) = stack.pop() {
+                for &next in &successors[function] {
+                    if !reached[next] && (enter_plans || !plans.contains(&next)) {
+                        reached[next] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+            reached
+        };
+        // A plan's expansion inlines every function it reaches, section functions included, so
+        // a section there nests in no other (ADR-336 item 3). A section function nests others
+        // only where it runs outside every plan: reached from the top level or `main` without
+        // passing through a plan, or never reached from a plan at all.
+        let mut roots = vec![0];
+        roots.extend(self.def_ids.get("main").copied());
+        let outside = reach(roots, false);
+        let in_plans = reach(plans.iter().copied().collect(), true);
+        let seeds: Vec<usize> = ids
+            .iter()
+            .copied()
+            .filter(|id| !plans.contains(id) && (outside[*id] || !in_plans[*id]))
+            .collect();
+        // Every function reachable from such a section function, by one pass over the graph.
+        let inside = reach(seeds, false);
         let nested: Vec<(Span, String)> = self
             .calls
             .iter()
@@ -2227,6 +2942,17 @@ impl Checker<'_> {
 /// An annotation's integer, from `min` to 2^32 - 1. A value that is not a decimal integer, signed
 /// or not, is a bad annotation; one outside the range is out of range.
 fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: i128) -> Option<u32> {
+    parse_range(checker, span, value, min, i128::from(u32::MAX))
+}
+
+/// An annotation's integer, from `min` to `max` (at most 2^32 - 1), as [`parse_limit`] reads it.
+fn parse_range(
+    checker: &mut Checker<'_>,
+    span: Span,
+    value: &str,
+    min: i128,
+    max: i128,
+) -> Option<u32> {
     let digits = value.strip_prefix(['-', '+']).unwrap_or(value);
     if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
         checker.error(
@@ -2238,15 +2964,143 @@ fn parse_limit(checker: &mut Checker<'_>, span: Span, value: &str, min: i128) ->
     }
     // Too many digits for an i128 is out of range as well.
     match value.parse::<i128>() {
-        Ok(n) if n >= min && n <= i128::from(u32::MAX) => u32::try_from(n).ok(),
+        Ok(n) if n >= min && n <= max => u32::try_from(n).ok(),
         _ => {
             checker.error(
                 StarCode::ArgumentOutOfRange,
                 span,
-                format!("`{value}` is outside {min} to 4294967295"),
+                format!("`{value}` is outside {min} to {max}"),
             );
             None
         }
+    }
+}
+
+/// The calls of `body`, the body of `main`, that are statements of it or of an `if` in it (4.9),
+/// by the byte offset where the callee's name begins. A `for` is not entered.
+fn plan_call_sites(body: &AstStmt, out: &mut HashSet<u32>) {
+    for stmt in Checker::statements(body) {
+        match &stmt.node {
+            StmtP::Expression(expr) => {
+                if let ExprP::Call(function, _) = &expr.node
+                    && matches!(function.node, ExprP::Identifier(_))
+                {
+                    out.insert(function.span.begin().get());
+                }
+            }
+            StmtP::If(_, then) => plan_call_sites(then, out),
+            StmtP::IfElse(_, branches) => {
+                plan_call_sites(&branches.0, out);
+                plan_call_sites(&branches.1, out);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// The expressions a statement evaluates itself, not those of the statements nested in it.
+fn stmt_exprs(stmt: &AstStmt) -> Vec<&AstExpr> {
+    match &stmt.node {
+        StmtP::Expression(expr) => vec![expr],
+        StmtP::Return(value) => value.iter().collect(),
+        StmtP::Assign(assign) => vec![&assign.rhs],
+        StmtP::AssignModify(_, _, value) => vec![value],
+        StmtP::If(condition, _) | StmtP::IfElse(condition, _) => vec![condition],
+        StmtP::For(for_) => vec![&for_.over],
+        _ => Vec::new(),
+    }
+}
+
+/// The expression a statement is made of: `expr` or `name = expr`.
+fn direct_expr(stmt: &AstStmt) -> Option<&AstExpr> {
+    match &stmt.node {
+        StmtP::Expression(expr) => Some(expr),
+        StmtP::Assign(assign) if matches!(assign.lhs.node, AssignTargetP::Identifier(_)) => {
+            Some(&assign.rhs)
+        }
+        _ => None,
+    }
+}
+
+/// The arguments of `expr` when it is a call to `diag.<method>`.
+fn is_diag_call<'a>(expr: &'a AstExpr, method: &str) -> Option<&'a [AstArgument]> {
+    let ExprP::Call(function, args) = &expr.node else {
+        return None;
+    };
+    let ExprP::Dot(object, name) = &function.node else {
+        return None;
+    };
+    (is_name(object, "diag") && name.node == method).then_some(args.args.as_slice())
+}
+
+/// How many calls to a function of `diag` `expr` holds, itself included.
+fn diag_call_count(expr: &AstExpr) -> usize {
+    let own = match &expr.node {
+        ExprP::Call(function, _) => {
+            usize::from(matches!(&function.node, ExprP::Dot(object, _) if is_name(object, "diag")))
+        }
+        _ => 0,
+    };
+    let mut count = own;
+    expr.visit_expr(|inner| count += diag_call_count(inner));
+    count
+}
+
+/// Whether `expr` calls, itself included, anything but `diag`, a built-in (2.4) or a method of
+/// a value: a function of the program, which the plan's expansion inlines, so its own `diag`
+/// calls would join the statement. A name in `hidden` (a local) or in `top` (the top-level
+/// `def`s and constants) is no built-in, even when it has a built-in's name.
+fn calls_program_function(
+    expr: &AstExpr,
+    hidden: &HashSet<String>,
+    top: &[&HashSet<String>],
+) -> bool {
+    if let ExprP::Call(function, _) = &expr.node {
+        let builtin = match &function.node {
+            ExprP::Identifier(name) => {
+                let name = &name.node.ident;
+                !hidden.contains(name)
+                    && !top.iter().any(|names| names.contains(name))
+                    && BUILTINS.contains(&name.as_str())
+            }
+            ExprP::Dot(..) => true,
+            _ => false,
+        };
+        if !builtin {
+            return true;
+        }
+    }
+    let mut found = false;
+    expr.visit_expr(|inner| found |= calls_program_function(inner, hidden, top));
+    found
+}
+
+/// Every call to `diag.<method>` in `expr`, itself included.
+fn find_diag_calls<'a>(expr: &'a AstExpr, method: &str, out: &mut Vec<&'a AstExpr>) {
+    if is_diag_call(expr, method).is_some() {
+        out.push(expr);
+    }
+    expr.visit_expr(|inner| find_diag_calls(inner, method, out));
+}
+
+/// The value of an integer literal, with a sign, or of a name in `constants`; `None` for any
+/// other expression. A literal beyond `i128` stands for `i128::MAX`, which no session id equals.
+fn literal_int(
+    expr: &AstExpr,
+    constants: &HashMap<&str, i128>,
+    hidden: &HashSet<String>,
+) -> Option<i128> {
+    match &expr.node {
+        ExprP::Literal(AstLiteral::Int(int)) => match &int.node {
+            TokenInt::I32(n) => Some(i128::from(*n)),
+            TokenInt::BigInt(big) => Some(i128::try_from(big).unwrap_or(i128::MAX)),
+        },
+        ExprP::Minus(inner) => literal_int(inner, constants, hidden).map(|n| -n),
+        ExprP::Plus(inner) => literal_int(inner, constants, hidden),
+        ExprP::Identifier(name) if !hidden.contains(&name.node.ident) => {
+            constants.get(name.node.ident.as_str()).copied()
+        }
+        _ => None,
     }
 }
 

@@ -13802,6 +13802,15 @@ def main():
         flash_job_of(&[(4, length, 4), (0, 2, 4)], &[(segment, 0)])
     }
 
+    /// The checks of `check_job` up to and including the artifact's: a release agent's ceiling
+    /// (ADR-247) refuses every flash job after them, so the artifact tests leave the policy out
+    /// and run in both builds.
+    fn check_flash(job: &Job) -> Result<(), JobError> {
+        check_runnable(&job.program)?;
+        check_declared(job)?;
+        check_artifact(job)
+    }
+
     /// The artifact of ten bytes the flash jobs name.
     fn ten_bytes() -> Artifact {
         Artifact::from_bytes((0..10u8).collect::<Vec<_>>())
@@ -13812,18 +13821,18 @@ def main():
         let artifact = ten_bytes();
         let named = *artifact.sha256();
         let ok = flash_job(0, 6).with_artifact(named, artifact.clone());
-        check_job(&ok, policy::build_ceiling()).expect("segment 4..10 of 10 bytes is inside");
+        check_flash(&ok).expect("segment 4..10 of 10 bytes is inside");
         assert_eq!(ok.artifact().map(Artifact::len), Some(10));
         // No artifact.
+        let refused = check_flash(&flash_job(0, 6));
+        assert!(matches!(refused, Err(JobError::NoArtifact)), "{refused:?}");
+        // `check_job` makes the artifact check before the policy, in both builds.
         let refused = check_job(&flash_job(0, 6), policy::build_ceiling());
         assert!(matches!(refused, Err(JobError::NoArtifact)), "{refused:?}");
         // Another hash than the file's; the message names both.
         let mut other = named;
         other[0] ^= 1;
-        let refused = check_job(
-            &flash_job(0, 6).with_artifact(other, artifact.clone()),
-            policy::build_ceiling(),
-        );
+        let refused = check_flash(&flash_job(0, 6).with_artifact(other, artifact.clone()));
         match refused {
             Err(JobError::ArtifactMismatch { named, actual }) => {
                 assert_eq!(named, to_hex(&other));
@@ -13840,7 +13849,7 @@ def main():
         // Ends exactly at the end: accepted. One byte past it: refused, at the instruction (pc 3 in the fixture).
         for (length, accepted) in [(6, true), (7, false)] {
             let job = flash_job(0, length).with_artifact(named, artifact.clone());
-            let checked = check_job(&job, policy::build_ceiling());
+            let checked = check_flash(&job);
             if accepted {
                 checked.expect("inside");
             } else {
@@ -13862,12 +13871,9 @@ def main():
         // A segment whose end overflows is a declaration error, refused before the artifact.
         let job = flash_job(0, u64::MAX).with_artifact(named, artifact);
         assert!(
-            matches!(
-                check_job(&job, policy::build_ceiling()),
-                Err(JobError::Undeclared { .. })
-            ),
+            matches!(check_flash(&job), Err(JobError::Undeclared { .. })),
             "{:?}",
-            check_job(&job, policy::build_ceiling())
+            check_flash(&job)
         );
     }
 
@@ -13876,15 +13882,9 @@ def main():
     fn an_artifact_without_a_flash_block_is_still_hash_checked() {
         let artifact = ten_bytes();
         let plain = || Job::from(program(Vec::new()));
-        check_job(
-            &plain().with_artifact(*artifact.sha256(), artifact.clone()),
-            policy::build_ceiling(),
-        )
-        .expect("no instruction reads it");
-        let refused = check_job(
-            &plain().with_artifact([0; SHA256_LEN], artifact),
-            policy::build_ceiling(),
-        );
+        check_flash(&plain().with_artifact(*artifact.sha256(), artifact.clone()))
+            .expect("no instruction reads it");
+        let refused = check_flash(&plain().with_artifact([0; SHA256_LEN], artifact));
         assert!(
             matches!(refused, Err(JobError::ArtifactMismatch { .. })),
             "{refused:?}"
@@ -13932,7 +13932,7 @@ def main():
         // Segment 1 (offset 8, length 3) is past the end; the program reads only segment 0.
         let job =
             flash_job_of(&[(0, 4, 4), (8, 3, 4)], &[(0, 0)]).with_artifact(named, artifact.clone());
-        let refused = check_job(&job, policy::build_ceiling());
+        let refused = check_flash(&job);
         assert!(
             matches!(
                 refused,
@@ -13949,12 +13949,12 @@ def main():
         // The same when the plan reads no block: the plan names the session.
         let job = flash_job_of(&[(0, 4, 4), (8, 3, 4)], &[]).with_artifact(named, artifact.clone());
         assert!(matches!(
-            check_job(&job, policy::build_ceiling()),
+            check_flash(&job),
             Err(JobError::SegmentOutsideArtifact { segment: 1, .. })
         ));
         // Both inside: accepted.
         let job = flash_job_of(&[(0, 4, 4), (8, 2, 4)], &[(0, 0)]).with_artifact(named, artifact);
-        check_job(&job, policy::build_ceiling()).expect("inside");
+        check_flash(&job).expect("inside");
     }
 
     /// An empty artifact holds a zero-length segment at offset 0 and nothing else.
@@ -13963,10 +13963,10 @@ def main():
         let empty = Artifact::from_bytes(Vec::new());
         let named = *empty.sha256();
         let job = flash_job_of(&[(0, 0, 4)], &[]).with_artifact(named, empty.clone());
-        check_job(&job, policy::build_ceiling()).expect("a zero-length segment at 0 is inside");
+        check_flash(&job).expect("a zero-length segment at 0 is inside");
         let job = flash_job_of(&[(0, 1, 4)], &[(0, 0)]).with_artifact(named, empty.clone());
         assert!(matches!(
-            check_job(&job, policy::build_ceiling()),
+            check_flash(&job),
             Err(JobError::SegmentOutsideArtifact {
                 end: 1,
                 artifact_len: 0,
@@ -13978,11 +13978,7 @@ def main():
         for (offset, accepted) in [(10, true), (11, false)] {
             let job =
                 flash_job_of(&[(offset, 0, 4)], &[]).with_artifact(*ten.sha256(), ten.clone());
-            assert_eq!(
-                check_job(&job, policy::build_ceiling()).is_ok(),
-                accepted,
-                "offset {offset}"
-            );
+            assert_eq!(check_flash(&job).is_ok(), accepted, "offset {offset}");
         }
     }
 
@@ -13998,7 +13994,7 @@ def main():
         let reads = [(0, 0), (0, 1), (0, 2), (1, 0)];
         let job =
             flash_job_of(&segments, &reads).with_artifact(*artifact.sha256(), artifact.clone());
-        check_job(&job, policy::build_ceiling()).expect("the job is valid");
+        check_flash(&job).expect("the job is valid");
         let mut host = FakeHost {
             document: job.document().cloned(),
             artifact: Some(artifact),

@@ -1611,6 +1611,64 @@ fn run_time_params_are_laid_out_as_the_constant_encoding_lays_them_out() {
 }
 
 #[test]
+fn a_little_endian_run_time_param_is_laid_out_as_its_constant_is() {
+    // Every row gains an empty `byte_order`, and two 16-bit fields of the routine's request
+    // after its identifier take `little`; `b` stays big-endian.
+    let fields: String = example()
+        .into_iter()
+        .find(|(n, _)| n == "fields.csv")
+        .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+        .expect("fields.csv")
+        .lines()
+        .enumerate()
+        .map(|(at, line)| {
+            if at == 0 {
+                format!("{line},byte_order\n")
+            } else {
+                format!("{line},\n")
+            }
+        })
+        .chain([
+            "routine:checkProgrammingDependencies:start:request,a,0,,uint,16,,,,,,,,,,little\n"
+                .to_owned(),
+            "routine:checkProgrammingDependencies:start:request,b,2,,uint,16,,,,,,,,,,\n"
+                .to_owned(),
+            "routine:checkProgrammingDependencies:start:request,c,4,,uint,32,,,,,,,,,,little\n"
+                .to_owned(),
+        ])
+        .collect();
+    let files = with(example(), "fields.csv", &fields);
+    let call = |a: &str, b: &str, c: &str| {
+        format!("diag.routine(0xFF01, 1, {{\"c\": {c}, \"a\": {a}, \"b\": {b}}})")
+    };
+    for (a, b, c) in [
+        ("0x1234", "0x1234", "0x01020304"),
+        ("0xFF00", "0x00FF", "0xFFFFFFFF"),
+    ] {
+        let constant = requests_sent_until_failure(
+            files.clone(),
+            &format!("def main():\n    {}\n", call(a, b, c)),
+        );
+        let run_time = requests_sent_until_failure(
+            files.clone(),
+            &format!(
+                "def f(a, b, c):\n    {}\n\ndef main():\n    f({a}, {b}, {c})\n",
+                call("a", "b", "c")
+            ),
+        );
+        assert_eq!(constant.1, None);
+        assert_eq!(run_time, constant, "{a} {b} {c}");
+    }
+    // The little-endian field's low byte goes first.
+    let (sent, _) = requests_sent_until_failure(
+        files,
+        "def f(a):\n    diag.routine(0xFF01, 1, {\"a\": a, \"b\": 0, \"c\": 0})\n\n\
+         def main():\n    f(0x1234)\n",
+    );
+    assert_eq!(sent[0].1[3..5], [0x34, 0x12]);
+}
+
+#[test]
 fn a_run_time_param_must_be_an_int_for_a_uint_field() {
     use crate::star::StarCode::{NotLowerable, UnsupportedSyntax};
     let codes =

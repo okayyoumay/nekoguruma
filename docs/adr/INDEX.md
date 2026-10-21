@@ -297,12 +297,12 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-305](ADR-305-lowering-starlark-loops.md) | Lowering Starlark Loops | Accepted | `diag-frontend` Starlark lowering, subset spec 4.2 |
 | [ADR-306](ADR-306-comparing-a-variant-pattern-with-a-decoded-field.md) | Comparing a Variant Pattern with a Decoded Field | Accepted (how entries combine and which variant wins decided by ADR-315) | `diag-ir` decoder, `diag-frontend` CSV variant patterns, design 8.9.1 |
 | [ADR-307](ADR-307-packaging-starlark-procedures-into-documents.md) | Packaging Starlark Procedures into Documents | Accepted (item 2's single lowering amended by ADR-311; item 1's one document per variant and procedure and item 5's digest amended by ADR-325) | `diag-frontend` conversion, CSV format sections 1 and 6, design 8.2.6 |
-| [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
+| [ADR-308](ADR-308-encoding-a-request-operand.md) | Encoding a Request Operand | Accepted (the Consequences' run-time parameter decided by ADR-341) | `diag-ir` request encoder, CSV format 5.3, design 8.2.2 |
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted (items 2 and 5 given their form by ADR-314; item 3's one program per variant lowered per combination of target variants, each call against its target's declarations, by ADR-325 item 6) | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
 | [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
 | [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted (item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325) | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
 | [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted (Decision item 4 amended: comparison done, Codex kept) | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
-| [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted (item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6) | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
+| [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted (item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6; item 4 amended by ADR-341) | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
 | [ADR-314](ADR-314-application-layer-profiles-as-typed-frontend-data.md) | Application-Layer Profiles as Typed Frontend Data | Accepted | `diag-frontend` profiles, Starlark subset 3.2 and 3.4, CSV format 5.3; ADR-309 items 2 and 5 |
 | [ADR-315](ADR-315-variant-patterns-grouped-into-patterns.md) | Variant Pattern Entries Grouped into Patterns | Accepted (item 3's first matching variant: reported in full by identification jobs, guarded for jobs that change an ECU, and replaced by the operator's pick for a read-only job, by ADR-327) | `diag-ir` schema and decoder (`IR_SCHEMA_VERSION` 10), `diag-frontend` CSV variant patterns, CSV format 4.2, design 8.9.1; ADR-306 |
 | [ADR-316](ADR-316-the-vm-decodes-response-fields-through-the-declaration-part.md) | The VM Decodes Response Fields Through the Declaration Part | Accepted (the runner's stepping without declarations superseded by ADR-318; decoding extended to the current target's declaration part by ADR-325 item 3) | `diag-ir` VM (`Op::DecodeField`, `Vm::step_with_declarations`, `IR_SCHEMA_VERSION` 11), `agent` policy and journal, design 8.2.4; ADR-233, ADR-297 |
@@ -330,6 +330,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-338](ADR-338-diag-precondition-reads-a-declared-source.md) | `diag.precondition` Reads the Row's Default-Session Source | Accepted | `diag-ir` (`Op::ReadInput`, `DiagHost::runtime_input`, `IR_SCHEMA_VERSION` 17, dry run), `diag-frontend` Starlark lowering, `agent` policy and host, Starlark subset 3.1, 3.2, 4.6 and 5, design 8.2.4, 8.9; ADR-233, ADR-245, ADR-254, ADR-316, ADR-321, ADR-328, ADR-336 |
 | [ADR-339](ADR-339-diag-ecu-info-reads-the-declared-identity.md) | `diag.ecu_info` Reads the Declared Identity Through a Literal Key | Accepted | `diag-frontend` Starlark lowering (`STAR_UNKNOWN_IDENTITY`), Starlark subset 3.2, 3.4, 4.6 and 5, `csv-tables.md` 4.13; ADR-254, ADR-336, ADR-338 |
 | [ADR-340](ADR-340-hmi-forms-are-encoded-hmi-forms-answered-as-status-and-text.md) | HMI Forms and Record Templates Are Encoded `HmiForm`s, Answered as a Status Byte and Text | Accepted | `diag-ir` (`hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 19, `Program::validate`, dry run), `diag-frontend` lowering of `diag.hmi` and `diag.record`, `agent` host and runner (the agent-server protocol left to an ADR of its own), Starlark subset 2.5, 3.1, 3.2, 3.4 and 4.6, design 5.6, 5.7, 8.2.4, 8.6; ADR-229, ADR-233, ADR-254, ADR-304, ADR-317, ADR-328, ADR-330, ADR-335 |
+| [ADR-341](ADR-341-request-params-known-only-at-run-time.md) | Request Params Known Only at Run Time Are Written into the Ingestion-Time Encoding | Accepted | `diag-frontend` Starlark lowering of `diag.request` and `diag.routine`, Starlark subset 3.1 and 3.2; ADR-308, ADR-313 item 4 |
 
 ## Status Legend
 
@@ -745,11 +746,11 @@ the predecessor repository these ADRs came from.
 - ADR-305
 - ADR-306 (how entries combine and which variant wins decided by ADR-315)
 - ADR-307 (item 2's single lowering amended by ADR-311; item 1's one document per variant and procedure and item 5's digest amended by ADR-325)
-- ADR-308
+- ADR-308 (the Consequences' run-time parameter decided by ADR-341)
 - ADR-309 (items 2 and 5 given their form by ADR-314; item 3's one program per variant lowered per combination of target variants, each call against its target's declarations, by ADR-325 item 6)
 - ADR-310
 - ADR-311 (item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325)
-- ADR-313 (item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6)
+- ADR-313 (item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6; item 4 amended by ADR-341)
 - ADR-314
 - ADR-315 (item 3's first matching variant: reported in full by identification jobs, guarded for jobs that change an ECU, and replaced by the operator's pick for a read-only job, by ADR-327)
 - ADR-316 (the runner's stepping without declarations superseded by ADR-318; decoding extended to the current target's declaration part by ADR-325 item 3)
@@ -771,6 +772,7 @@ the predecessor repository these ADRs came from.
 - ADR-338
 - ADR-339
 - ADR-340
+- ADR-341
 
 ### Acquired Data & Monitoring
 - ADR-236

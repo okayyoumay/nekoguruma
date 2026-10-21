@@ -4399,7 +4399,7 @@ impl<'a> Lowerer<'a> {
     /// is computed in source order and kept in a temporary, each must fit its field or the
     /// procedure ends with `Fail` code `PARAM_OUT_OF_RANGE`, and its bits are then written into
     /// the operand encoded with 0 in its place. Only a fixed-length `uint` field takes such a
-    /// value. Where each of the value's bits goes is found by encoding it alone, so the layout
+    /// value (ADR-341). Where each of the value's bits goes is found by encoding it alone, so the layout
     /// is `encode_request`'s, byte order and bit position included. Errors about the params
     /// point at `params_span`, and the operand's code at the call's `span`. `None` once an error
     /// is reported.
@@ -4479,6 +4479,10 @@ impl<'a> Lowerer<'a> {
         for (at, (param, &width)) in run.iter().zip(&fields).enumerate() {
             // A value is never negative, so bit 63 of a 64-bit field stays 0.
             for bit in 0..width.min(63) {
+                // Each probe encodes the request and scans it (ADR-341 item 3).
+                if !self.charge(base.len().saturating_mul(2), param.span) {
+                    return None;
+                }
                 values.insert(&keys[at], ParamValue::Int(1 << bit));
                 let probe = encode(self, &values)?;
                 let changed: Vec<(usize, u32)> = (0..base.len())

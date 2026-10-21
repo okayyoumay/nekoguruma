@@ -35,6 +35,13 @@ binary(grpc_mock) & (
 """
 threads-required = "num-test-threads"
 
+# `j2534-0404-service`'s `agent_flash_transfer` runs two flash jobs, each with an agent, a worker
+# and `sim-vci`, in about 16 s alone. Beside the restart end-to-end tests, which start the same
+# processes, it ran past its 120 s hang guard, so it runs alone too.
+[[profile.ci-windows.overrides]]
+filter = 'binary(agent_flash_transfer)'
+threads-required = "num-test-threads"
+
 # The Windows signer tests of `ngr-library-resolver` create and remove a self-signed certificate
 # in the user's certificate store, which fails with access denied when two processes do so at once.
 [[profile.ci-windows.overrides]]

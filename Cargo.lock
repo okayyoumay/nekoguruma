@@ -1337,6 +1337,7 @@ dependencies = [
  "url",
  "vci-service-interface",
  "vci-service-launcher",
+ "windows-sys",
  "worker-host",
 ]
 

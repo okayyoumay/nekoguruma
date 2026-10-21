@@ -94,9 +94,9 @@ each call's value and how a decline, a timeout and a cancel surface; which check
      a bad `Fail` code (ADR-280); `check_primitive` repeats the decode, which is cheap under the 16
      KiB bound, so a damaged program fails before the host is called.
 3. **The answer is one status byte followed by UTF-8 text, and in Starlark a value read through
-   the literal keys `ok` and `value`.** The host returns `[status] ++ text`: status 1 means the
-   operator answered, 0 that the operator declined the form or record, in which case `text` is
-   empty; the whole answer is at most 16 KiB (`MAX_HMI_ANSWER_LEN`). That shape is the host's
+   the literal keys `ok`, `timed_out` and `value`.** The host returns `[status] ++ text`: status 1
+   means the operator answered, 0 that the operator declined the form or record, and 2 that the
+   HMI timeout of design 5.6 expired first (item 6); with 0 and 2 `text` is empty; the whole answer is at most 16 KiB (`MAX_HMI_ANSWER_LEN`). That shape is the host's
    contract, and the VM pushes the answer as it pushes every other primitive's, without checking
    it after the call: ADR-233 item 3 (every VM error comes before the host call, so no answer is
    discarded) holds unchanged. The reads below are total over any bytes: an empty answer, or one
@@ -108,6 +108,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    (ADR-317):
    - `ans["ok"]` is a `bool`: `PushI64(0); PushI64(1); Slice; PushBytes(k); CmpEq` with `k` the
      pooled constant `[0x01]` (the sequence `response_ok` uses);
+   - `ans["timed_out"]` is a `bool`: the same sequence with the constant `[0x02]`;
    - `ans["value"]` is a `str`: `PushI64(1); PushI64(i64::MAX); Slice`; empty when `ok` is false.
    Another key is `STAR_UNSUPPORTED_SYNTAX`, a non-literal key `STAR_DYNAMIC_KEY_NOT_ALLOWED`, and
    any other use of the answer (its truth value, an operator, a built-in, passing it on)
@@ -116,9 +117,9 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    entered text for a text input; the number as decimal text, normalized by the server, for a
    number input; the chosen option's `value` string for a choice; and for a record template the
    server's overall judgment of the record's pass criteria, `ok` or `ng`, or empty when the
-   template has none. A decline gives `ok == False` and an empty `value` for every kind. A timeout
-   and a job cancel are never an answer: the instruction stays waiting and the runner ends the job
-   (item 6).
+   template has none. A decline gives `ok == False` and an empty `value` for every kind, and a
+   timeout the same with `timed_out == True`. A job cancel is never an answer: the instruction
+   stays waiting until the runner takes the cancel (item 6).
 4. **The lowering checks (subset 3.1, 3.2).** `diag.hmi(form_id, params)` and
    `diag.record(template_id)` take exactly those arguments (`STAR_UNSUPPORTED_SYNTAX` otherwise).
    The id is a constant `str` (`STAR_NON_CONSTANT_ARGUMENT` when known only at run time,
@@ -156,12 +157,19 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    the `POST .../hmi/{requestId}` body are `{ ok: boolean, value: string }`.
 6. **The runner polls an HMI wait as it polls a timer.** `Waiting(WaitingOn::Hmi)` reports
    `JobState::AwaitingHmi`, sleeps `wait_poll` and steps again, keeping the keep-alive and the
-   cancel check; `JobError::Unanswerable` remains for `SeedKey` only. The HMI timeout of design 5.6
-   raises the job's cancel flag, so the existing cancel path ends the job at an interruptible point
-   (ADR-330); where the timeout's value comes from (the job instruction or the agent's settings)
-   is a separate decision.
+   cancel check; `JobError::Unanswerable` remains for `SeedKey` only. When the HMI timeout of
+   design 5.6 expires, the runner raises the job's cancel flag and the host closes the inquiry with
+   the timed-out answer (status 2) on its next poll, telling the server the inquiry is withdrawn.
+   Outside every uninterruptible and recovery-required section the waiting instruction is an
+   interruptible point, so the runner takes the cancel before that poll and the job ends there.
+   Inside such a section ADR-330 holds the cancel, so the instruction completes with the timed-out
+   answer, the procedure runs on to the section's end (it may test `timed_out` and `diag.fail`),
+   and the held cancel is taken at the next interruptible point, as design 5.6 asks. Without that
+   answer a wait in such a section could never end. Where the timeout's value comes from (the job
+   instruction or the agent's settings) is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer
-   bytes, and gain `Script::form_answer(ok, text)` and `record_answer(ok, text)` that build them;
+   bytes, and gain `Script::form_answer(ok, text)`, `record_answer(ok, text)` and
+   `hmi_timed_out()` that build them;
    the report decodes `DryRunEvent::Hmi::form` and `RecordInput::template` as `HmiForm`s. Raw
    bytes of another shape are pushed as they are and read as item 3 says, so a test can script a
    host that breaks the contract.
@@ -196,7 +204,14 @@ each call's value and how a decline, a timeout and a cancel surface; which check
   schema version bump, no format change).
 - **Treating a server refusal as `ok == False`.** Hides a deployment fault behind an operator
   decline.
-- **Treating the HMI timeout as an answer.** Design 5.6 makes it a stop at an interruptible point.
+- **Leaving the instruction waiting on an HMI timeout and relying on the cancel alone.** Inside
+  an uninterruptible or recovery-required section ADR-330 holds the cancel until the instruction
+  completes, so the wait would never end and the job would never reach the interruptible point
+  design 5.6 stops at.
+- **Refusing `diag.hmi` and `diag.record` inside such sections.** A flash plan may need the
+  operator (to switch the ignition, for one), and the section is where that happens.
+- **Reporting a timeout as a plain decline.** A procedure could not tell an operator's refusal
+  from an absent operator.
 - **Keying the server-side inquiry by (job, inquiry number) across restarts.** A replay from the
   start (ADR-335) reaching the same step count would receive a previous run's answer without the
   operator; a request id per host instance costs at most one repeated question after a restart.
@@ -226,7 +241,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 - Implementation split. **PR A** (`diag-ir`, `diag-frontend`, docs): the `hmi` module and its
   bounds, `HmiRequestFromStack`, the VM and `Program::validate` checks, the dry-run helpers, the
   lowering of both calls and of the two keys with tests against a scripted host (a constant form,
-  a form with constant and run-time parameters in mixed order, a record, a decline, a resume at
+  a form with constant and run-time parameters in mixed order, a record, a decline, a timed-out answer, a resume at
   the waiting instruction rebuilding identical bytes), subset 2.5, 3.1, 3.2, 3.4, design 8.2.4,
   this ADR and the index. **PR B** (`agent`, `shared-proto`, `api/`): the host's inquiry map and
   `HostError::HmiRefused`, the runner's `AwaitingHmi` polling, the event and command shapes, the

@@ -16,8 +16,10 @@
 //!    `Wait` instruction right after that block, which leaves the child alive at a known
 //!    instruction until the kill arrives.
 //! 3. [`AgentChild::kill`] ends the agent and its worker at once: SIGKILL to the child's
-//!    process group on unix, `taskkill /F /T` on the child's process tree on Windows. Nothing is
-//!    closed or flushed, as when the host loses everything at once.
+//!    process group on unix, `TerminateJobObject` on the job object the child was put in on
+//!    Windows. Nothing is closed or flushed, as when the host loses everything at once. Both
+//!    take effect within the call, so the kill lands inside the program's `Wait` even on a loaded
+//!    runner, where starting a `taskkill` process took longer than the wait.
 //! 4. [`Env::probe`] reads the simulated ECU's session, flash state and power-cycle count from a
 //!    separate process (the library keeps the ECU of the first use for the life of its process,
 //!    so a probe in the test process would not see later changes), and [`Env::restart`] resumes
@@ -42,9 +44,10 @@
 //! command at that block instead of killing it (an ECU power loss, a VCI disconnect), and stops
 //! the worker once the run has ended.
 //!
-//! On Windows, `taskkill /F` ends a process with `TerminateProcess`, which stops it at once as
-//! SIGKILL does: [`Env::crash_worker`] ends the worker that way, and [`AgentChild::kill`] the
-//! agent's process tree (`/T`), which holds its worker.
+//! On Windows, `TerminateProcess` stops a process at once as SIGKILL does:
+//! [`Env::crash_worker`] ends the worker with it, and [`AgentChild::kill`] ends the agent and
+//! its worker together with `TerminateJobObject`, which does the same for every process in the
+//! job object [`Env::spawn_agent`] put the agent in.
 
 #[cfg(unix)]
 use std::os::unix::process::{CommandExt, ExitStatusExt};
@@ -279,7 +282,8 @@ impl Env {
     }
 
     /// Starts the agent as a child process running the job's first run, on unix in a process
-    /// group of its own. It runs until the job ends, which a test normally prevents by killing it.
+    /// group of its own, on Windows in a job object of its own. It runs until the job ends, which
+    /// a test normally prevents by killing it.
     pub fn spawn_agent(&self) -> AgentChild {
         let mut command = self.child("agent");
         #[cfg(unix)]
@@ -288,7 +292,15 @@ impl Env {
             .stdout(Stdio::null())
             .spawn()
             .expect("the agent process should start");
-        AgentChild { child: Some(child) }
+        // The agent starts its worker only after it has opened its journal and taken its guards,
+        // long after this, and the worker joins the agent's job when it is created.
+        #[cfg(windows)]
+        let job = Job::holding(&child);
+        AgentChild {
+            child: Some(child),
+            #[cfg(windows)]
+            job,
+        }
     }
 
     /// Waits until the journal records block `block` (counted from 1, as the host's running
@@ -643,19 +655,25 @@ fn kill_worker(pid: u32) {
     );
 }
 
-/// Ends the worker process `pid` at once, as a crash would: `taskkill /F` terminates it
-/// (`TerminateProcess`), so nothing in it is closed or flushed.
+/// Ends the worker process `pid` at once, as a crash would: `TerminateProcess`, so nothing in
+/// it is closed or flushed.
 #[cfg(windows)]
 fn kill_worker(pid: u32) {
-    let status = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .status()
-        .expect("taskkill should run");
+    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::System::Threading::{OpenProcess, PROCESS_TERMINATE, TerminateProcess};
+    // SAFETY: OpenProcess takes an access mask, a flag and a process ID and touches no memory.
+    let process = unsafe { OpenProcess(PROCESS_TERMINATE, 0, pid) };
     assert!(
-        status.success(),
-        "taskkill of worker {pid} failed: {status}"
+        !process.is_null(),
+        "opening worker {pid} failed: {}",
+        std::io::Error::last_os_error()
     );
+    // SAFETY: `process` is the handle opened above, closed only after this call.
+    let terminated = unsafe { TerminateProcess(process, 1) };
+    let error = std::io::Error::last_os_error();
+    // SAFETY: `process` is open and not used after this.
+    unsafe { CloseHandle(process) };
+    assert_ne!(terminated, 0, "terminating worker {pid} failed: {error}");
 }
 
 /// Ends the agent process `pid` and its worker at once. The agent leads its own process group
@@ -671,18 +689,53 @@ fn kill_agent_and_worker(pid: u32) -> std::io::Result<()> {
     }
 }
 
-/// Ends the agent process `pid` and its worker at once: `taskkill /F /T` terminates the agent's
-/// process tree (`TerminateProcess` on each), which holds the worker it launched.
+/// The job object an agent of a scenario runs in, with every process it starts, so the agent
+/// and its worker end together in one call.
 #[cfg(windows)]
-fn kill_agent_and_worker(pid: u32) -> std::io::Result<()> {
-    let status = Command::new("taskkill")
-        .args(["/F", "/T", "/PID", &pid.to_string()])
-        .stdout(Stdio::null())
-        .status()?;
-    if status.success() {
-        Ok(())
-    } else {
-        Err(std::io::Error::other(format!("taskkill failed: {status}")))
+struct Job(windows_sys::Win32::Foundation::HANDLE);
+
+#[cfg(windows)]
+impl Job {
+    /// A new job object holding `child`.
+    fn holding(child: &Child) -> Self {
+        use std::os::windows::io::AsRawHandle;
+        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        // SAFETY: no security attributes and no name; the call touches no memory of ours.
+        let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
+        assert!(
+            !handle.is_null(),
+            "creating the agent's job object failed: {}",
+            std::io::Error::last_os_error()
+        );
+        let job = Job(handle);
+        // SAFETY: both handles are open: the job's above, the child's while `child` lives.
+        let assigned = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) };
+        assert_ne!(
+            assigned,
+            0,
+            "putting the agent in its job object failed: {}",
+            std::io::Error::last_os_error()
+        );
+        job
+    }
+
+    /// Terminates every process in the job with exit code 1, as `taskkill /F` would.
+    fn terminate(&self) -> std::io::Result<()> {
+        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        // SAFETY: the job's handle is open until the drop.
+        if unsafe { TerminateJobObject(self.0, 1) } != 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+#[cfg(windows)]
+impl Drop for Job {
+    fn drop(&mut self) {
+        // SAFETY: the handle is open and not used after this.
+        unsafe { windows_sys::Win32::Foundation::CloseHandle(self.0) };
     }
 }
 
@@ -690,6 +743,25 @@ fn kill_agent_and_worker(pid: u32) -> std::io::Result<()> {
 pub struct AgentChild {
     /// `None` once [`AgentChild::kill`] has reaped the agent, so the drop does not kill again.
     child: Option<Child>,
+    /// The job object holding the agent and its worker.
+    #[cfg(windows)]
+    job: Job,
+}
+
+impl AgentChild {
+    /// Ends the agent and its worker at once.
+    fn end(&self, child: &Child) -> std::io::Result<()> {
+        #[cfg(unix)]
+        {
+            let _ = self;
+            kill_agent_and_worker(child.id())
+        }
+        #[cfg(windows)]
+        {
+            let _ = child;
+            self.job.terminate()
+        }
+    }
 }
 
 impl AgentChild {
@@ -697,14 +769,14 @@ impl AgentChild {
     /// test checks that it was killed ([`died_of_kill`]), so a job that finished by itself before
     /// the kill fails the test instead of passing it unnoticed.
     pub fn kill(mut self) -> ExitStatus {
-        let child = self.child.as_mut().expect("the agent is reaped only here");
+        let mut child = self.child.take().expect("the agent is reaped only here");
         let pid = child.id();
-        if let Err(error) = kill_agent_and_worker(pid) {
+        if let Err(error) = self.end(&child) {
             panic!("kill of agent {pid} and its worker failed: {error}");
         }
         let status = child.wait().expect("the killed agent should be reaped");
-        // Reaped: its PID and process group may be reused, so the drop must not signal them.
-        self.child = None;
+        // Reaped, and taken: its PID and process group may be reused, so the drop must not
+        // signal them.
         status
     }
 }
@@ -713,15 +785,15 @@ impl Drop for AgentChild {
     fn drop(&mut self) {
         // A test that failed before the kill must leave neither the agent nor its worker
         // running; the agent may have ended by then, so a failure here is not reported.
-        if let Some(child) = self.child.as_mut() {
-            let _ = kill_agent_and_worker(child.id());
+        if let Some(mut child) = self.child.take() {
+            let _ = self.end(&child);
             let _ = child.wait();
         }
     }
 }
 
 /// Whether `status` is the end of a process [`AgentChild::kill`] killed: by SIGKILL on unix, by
-/// `TerminateProcess` with exit code 1 (what `taskkill /F` gives) on Windows. A job that ended by
+/// `TerminateJobObject` with exit code 1 on Windows. A job that ended by
 /// itself exits 0, and a panicking test 101.
 pub fn died_of_kill(status: ExitStatus) -> bool {
     #[cfg(unix)]

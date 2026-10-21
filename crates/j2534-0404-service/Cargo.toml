@@ -48,3 +48,13 @@ worker-host = { workspace = true }
 # Built for tests/sim_vci_end_to_end.rs and tests/sim_vci_control.rs, which load the cdylib;
 # not linked.
 sim-vci = { path = "../sim-vci" }
+
+# tests/agent_restart_end_to_end.rs ends the agent and its worker through a job object, and a
+# worker alone with TerminateProcess, without starting taskkill.
+[target.'cfg(windows)'.dev-dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_JobObjects",
+    "Win32_System_Threading",
+] }

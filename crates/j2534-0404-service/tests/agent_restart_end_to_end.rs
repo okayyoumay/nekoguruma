@@ -4,7 +4,7 @@
 //! unplugged mid-transfer, or an agent killed after RequestTransferExit (design 5.3, 5.6, 8.2.5;
 //! ADR-229, ADR-276): the agent runs a flash job against a real `j2534-0404-service` worker and
 //! `sim-vci` as a child process, is killed with its worker (SIGKILL to its process group on unix,
-//! `taskkill /F /T` on Windows) after a block of the transfer was
+//! `TerminateJobObject` on Windows) after a block of the transfer was
 //! journaled, or after RequestTransferExit was sent, and the job is resumed at library level
 //! (`resume_program_journaled`) with the same journal directory. In the worker-crash, power-loss
 //! and VCI-disconnect scenarios the agent runs in the test process and survives; the agent's

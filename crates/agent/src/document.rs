@@ -119,6 +119,7 @@ pub(crate) mod tests {
         encode_ecu_document(&document)
     }
 
+    #[cfg(debug_assertions)]
     /// A document whose flash session 1 declares one segment per `(artifact_offset, length,
     /// block_size)` of `segments`, with `procedure` as its procedure.
     pub(crate) fn flash_document(procedure: &Program, segments: &[(u64, u64, u32)]) -> Vec<u8> {

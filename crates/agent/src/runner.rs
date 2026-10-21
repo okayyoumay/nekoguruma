@@ -13738,6 +13738,7 @@ def main():
         assert!(!guards.link_unconfirmed());
     }
 
+    #[cfg(debug_assertions)]
     /// A plan of flash session 1 that downloads, with no erase, the blocks `reads` names, each
     /// `(segment, index)` as a `FlashBlock` and a `FlashTransfer`, then RequestTransferExit.
     fn flash_block_program(reads: &[(u32, i64)]) -> Program {
@@ -13789,6 +13790,7 @@ def main():
         program
     }
 
+    #[cfg(debug_assertions)]
     /// A job whose document declares flash session 1 with `segments` (artifact offset, length,
     /// block size) and whose plan reads the blocks `reads` names.
     fn flash_job_of(segments: &[(u64, u64, u32)], reads: &[(u32, i64)]) -> Job {
@@ -13796,6 +13798,7 @@ def main():
         Job::from_document(JobDocument::new(bytes).unwrap()).unwrap()
     }
 
+    #[cfg(debug_assertions)]
     /// A job that reads block 0 of `segment`. The document declares segment 0 at artifact offset
     /// 4, `length` bytes long, in blocks of 4, and segment 1 at offset 0, 2 bytes long.
     fn flash_job(segment: u32, length: u64) -> Job {
@@ -13807,6 +13810,9 @@ def main():
         Artifact::from_bytes((0..10u8).collect::<Vec<_>>())
     }
 
+    // A release agent refuses every flash job by its read-only ceiling (ADR-247) before the
+    // artifact is looked at, so the checks of a flash job's artifact run in debug builds only.
+    #[cfg(debug_assertions)]
     #[test]
     fn a_flash_block_needs_an_artifact_that_is_the_one_named() {
         let artifact = ten_bytes();
@@ -13833,6 +13839,7 @@ def main():
         }
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     fn a_segment_outside_the_artifact_is_refused() {
         let artifact = ten_bytes();
@@ -13923,6 +13930,7 @@ def main():
         .unwrap();
     }
 
+    #[cfg(debug_assertions)]
     /// Every segment of a session the program names is checked, also one no block read uses, and
     /// one the plan names without any block read.
     #[test]
@@ -13957,6 +13965,7 @@ def main():
         check_job(&job, policy::build_ceiling()).expect("inside");
     }
 
+    #[cfg(debug_assertions)]
     /// An empty artifact holds a zero-length segment at offset 0 and nothing else.
     #[test]
     fn an_empty_artifact_and_zero_length_segments() {
@@ -13986,6 +13995,7 @@ def main():
         }
     }
 
+    #[cfg(debug_assertions)]
     /// The bytes a plan's `FlashTransfer`s get are the artifact's slices of the declared
     /// segments: blocks of a segment that starts past offset 0, the last one short, and a second
     /// segment. A host that ignored an offset would send other bytes.

@@ -2579,6 +2579,44 @@ impl Checker<'_> {
                 };
                 found.push((call.span, hint));
             }
+            // The plan's one transfer is its own: the functions it calls are expanded in place,
+            // so a transfer in one of them would make a second download.
+            let mut seen = HashSet::from([id]);
+            let mut stack = vec![id];
+            while let Some(function) = stack.pop() {
+                for call in self.calls.iter().filter(|c| c.caller == function) {
+                    if !seen.insert(call.callee) {
+                        continue;
+                    }
+                    stack.push(call.callee);
+                    let Some(callee) = defs.values().find(|d| {
+                        self.def_ids.get(d.name.node.ident.as_str()) == Some(&call.callee)
+                    }) else {
+                        continue;
+                    };
+                    let mut inner = Vec::new();
+                    collect_statements(&callee.body, &mut inner);
+                    let mut reached = Vec::new();
+                    for stmt in &inner {
+                        for expr in stmt_exprs(stmt) {
+                            find_diag_calls(expr, "flash_transfer", &mut reached);
+                        }
+                    }
+                    for transfer in reached {
+                        if found.iter().all(|(span, _)| *span != transfer.span) {
+                            found.push((
+                                transfer.span,
+                                format!(
+                                    "`diag.flash_transfer` is in `{}`, which the flash plan \
+                                     `{name}` calls; the plan's one transfer is a statement of \
+                                     the plan itself (4.9)",
+                                    callee.name.node.ident
+                                ),
+                            ));
+                        }
+                    }
+                }
+            }
             // The transfer: one call, a top-level statement, of the annotation's session.
             let body = Self::statements(&def.body);
             let mut locals = HashSet::new();

@@ -1814,7 +1814,7 @@ def second():
 def main():
     first()
 ";
-    assert_eq!(codes(two), [(Bad, 7), (Shape, 7)]);
+    assert_eq!(codes(two), [(Bad, 7), (Shape, 7), (Shape, 14)]);
     // `main` cannot be a plan, and a plan returns nothing.
     assert_eq!(
         codes("# @flashPlan session=1\ndef main():\n    pass\n"),
@@ -2025,4 +2025,29 @@ fn the_session_comparison_reads_signs_big_literals_and_chains() {
     // A later constant, or anything computed, is not compared.
     assert_eq!(with("B = A\nA = 2\n", "B"), []);
     assert_eq!(with("", "1 + 1"), []);
+}
+
+#[test]
+fn a_transfer_in_a_function_the_plan_calls_is_refused() {
+    use StarCode::PlanShape as Shape;
+    let direct = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    helper()",
+    ) + "\ndef helper():\n    diag.flash_transfer(1)\n";
+    assert_eq!(codes(&direct), [(Shape, 14)]);
+    let transitive = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    helper()",
+    ) + "\ndef helper():\n    inner()\n\ndef inner():\n    diag.flash_transfer(1)\n";
+    assert_eq!(codes(&transitive), [(Shape, 17)]);
+    // A section function the plan calls, too.
+    let section = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    helper()",
+    ) + "\n# @section interruptible\ndef helper():\n    diag.flash_transfer(1)\n";
+    assert!(
+        codes(&section).contains(&(Shape, 15)),
+        "{:?}",
+        codes(&section)
+    );
 }

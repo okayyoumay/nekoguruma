@@ -764,7 +764,7 @@ def main():
   function is never called; `main` carries the annotation (nothing calls it, so it has no call
   site to expand at); the plan function carries no `@section uninterruptible` or
   `@section recoveryRequired` (4.5); the plan's `diag.flash_transfer` call names another session than its
-  annotation, or the plan has no `diag.flash_transfer` call or more than one.
+  annotation, or the plan has no `diag.flash_transfer` call or more than one; a `diag.flash_transfer` in a function the plan calls, directly or not, section functions included, is refused at that call, since the expansion would make a second download.
 - **Coverage.** Everything that runs during the call is in the plan. Functions it calls, directly
   or not, section functions included, are expanded in place, not copied and called: a plan
   contains no `Call` or `Ret` (ADR-245 item 4). A `Ret` becomes a jump to the join, locals get

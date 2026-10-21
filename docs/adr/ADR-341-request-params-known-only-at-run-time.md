@@ -3,8 +3,8 @@
 **Date:** 2026-10-21
 **Status:** Accepted
 **Affects:** `diag-frontend` (`src/star/lower.rs`: `request_params`, `request_operand`),
-`crates/diag-frontend/docs/starlark-subset.md` 3.1 and 3.2; ADR-308 (Consequences), ADR-313
-item 4
+`crates/diag-frontend/docs/starlark-subset.md` 3.1 and 3.2, the IR golden files, design 8.2.2
+and 8.4; ADR-308 (Consequences), ADR-313 item 4
 
 ## Context
 

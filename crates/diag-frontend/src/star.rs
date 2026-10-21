@@ -2507,6 +2507,30 @@ impl Checker<'_> {
                 constants.insert(&name.node.ident, value);
             }
         }
+        // The calls of each function, in source order, and the `diag.flash_transfer` calls in
+        // each top-level function's body, each taken once so a walk costs its edges.
+        let mut callees: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
+        for call in &self.calls {
+            callees[call.caller].push(call.callee);
+        }
+        let mut reached_transfers: Vec<Option<(&str, Vec<Span>)>> = vec![None; self.next_function];
+        for def in defs.values() {
+            let mut inner = Vec::new();
+            collect_statements(&def.body, &mut inner);
+            let mut calls = Vec::new();
+            for stmt in &inner {
+                for expr in stmt_exprs(stmt) {
+                    find_diag_calls(expr, "flash_transfer", &mut calls);
+                }
+            }
+            let id = self.def_ids[def.name.node.ident.as_str()];
+            reached_transfers[id] = Some((
+                def.name.node.ident.as_str(),
+                calls.iter().map(|call| call.span).collect(),
+            ));
+        }
+        let mut reported: HashSet<u32> = HashSet::new();
+        let mut walked: HashSet<usize> = HashSet::new();
         let mut found: Vec<(Span, String)> = Vec::new();
         for plan in plans {
             let Annotation::FlashPlan {
@@ -2581,36 +2605,29 @@ impl Checker<'_> {
             }
             // The plan's one transfer is its own: the functions it calls are expanded in place,
             // so a transfer in one of them would make a second download.
-            let mut seen = HashSet::from([id]);
-            let mut stack = vec![id];
+            // One visited set for all plans: a function walked from an earlier plan has had its
+            // callees scanned already, and its transfers reported once.
+            let mut stack = Vec::new();
+            if walked.insert(id) {
+                stack.push(id);
+            }
             while let Some(function) = stack.pop() {
-                for call in self.calls.iter().filter(|c| c.caller == function) {
-                    if !seen.insert(call.callee) {
+                for &callee_id in &callees[function] {
+                    if !walked.insert(callee_id) {
                         continue;
                     }
-                    stack.push(call.callee);
-                    let Some(callee) = defs.values().find(|d| {
-                        self.def_ids.get(d.name.node.ident.as_str()) == Some(&call.callee)
-                    }) else {
+                    stack.push(callee_id);
+                    let Some((callee_name, reached)) = &reached_transfers[callee_id] else {
                         continue;
                     };
-                    let mut inner = Vec::new();
-                    collect_statements(&callee.body, &mut inner);
-                    let mut reached = Vec::new();
-                    for stmt in &inner {
-                        for expr in stmt_exprs(stmt) {
-                            find_diag_calls(expr, "flash_transfer", &mut reached);
-                        }
-                    }
-                    for transfer in reached {
-                        if found.iter().all(|(span, _)| *span != transfer.span) {
+                    for &transfer in reached {
+                        if reported.insert(transfer.begin().get()) {
                             found.push((
-                                transfer.span,
+                                transfer,
                                 format!(
-                                    "`diag.flash_transfer` is in `{}`, which the flash plan \
-                                     `{name}` calls; the plan's one transfer is a statement of \
-                                     the plan itself (4.9)",
-                                    callee.name.node.ident
+                                    "`diag.flash_transfer` is in `{callee_name}`, which the \
+                                     flash plan `{name}` calls; the plan's one transfer is a \
+                                     statement of the plan itself (4.9)"
                                 ),
                             ));
                         }

@@ -220,17 +220,19 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    its request until it has an acceptance or a timeout. While the server cannot be reached the
    host also times the wait on the agent's monotonic clock from its first send, so an unreachable
    server still ends it. Either way the runner commits `Record::HmiTimedOut` to the journal
-   before it raises the cancel and before the host returns the timed-out answer, and
-   `Record::HmiAnswered` when the host returns the operator's answer, before that step's
-   checkpoint. A run that resumes with a `HmiTimedOut` record and no `HmiAnswered` after it starts
-   with the cancel raised and the timeout as its reason, whether it resumes from a checkpoint or
-   starts again from the first instruction; inquiries come one at a time, so the records need no
-   key. A handover (ADR-229) needs no message from the failed device: the server marks the job
+   before it raises the cancel and before the host returns the timed-out answer. The record is a
+   fact about the job that nothing clears, a later answered form included: a run that resumes with
+   a `HmiTimedOut` record anywhere in the journal starts with the cancel raised and the timeout as
+   its reason, whether it resumes from a checkpoint or starts again from the first instruction,
+   so the record needs no key. A handover (ADR-229) needs no message from the failed device: the server marks the job
    timed out when its own wait expired, or when the failed device's withdrawal reported a timeout
    (`timed_out` set), and puts the mark in the instruction it signs for the receiving device,
-   whose run then starts with the cancel raised. A timeout only the failed device's local clock
-   saw, and could not report, leaves the server's wait to decide, as it does for every
-   inquiry the server accepted; an inquiry it never accepted was never shown, and the receiving
+   whose run then starts with the cancel raised. The timeout of design 5.6 is the server's wait;
+   the agent's own clock stands in for it only while the agent cannot hear the server, and binds
+   the device that fired it, through its journal, but not the job after a handover. A timeout only
+   the failed device's local clock saw, and could not report, therefore leaves the server's wait
+   to decide, as it does for every inquiry the server accepted: an operator who answers within
+   that wait on the receiving device answered within the job's timeout; an inquiry it never accepted was never shown, and the receiving
    device asks it with a fresh wait. A procedure that ends by `diag.fail` or an error while the cancel is held ends
    that way, as ADR-330 item 2 says. Where the timeout's value comes from (the job
    instruction or the agent's settings) is a separate decision.

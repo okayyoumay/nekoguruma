@@ -2502,7 +2502,7 @@ impl Checker<'_> {
         for stmt in &top {
             if let StmtP::Assign(assign) = &stmt.node
                 && let AssignTargetP::Identifier(name) = &assign.lhs.node
-                && let Some(value) = literal_int(&assign.rhs, &constants)
+                && let Some(value) = literal_int(&assign.rhs, &constants, &HashSet::new())
             {
                 constants.insert(&name.node.ident, value);
             }
@@ -2530,6 +2530,20 @@ impl Checker<'_> {
             ));
         }
         let mut reported: HashSet<u32> = HashSet::new();
+        // The calls to each function, and the `@erase` and `@recoveryRequired` of each plan by
+        // its `def` line, in source order, so each plan costs its own share.
+        let mut incoming: Vec<Vec<&Call>> = vec![Vec::new(); self.next_function];
+        for call in &self.calls {
+            incoming[call.callee].push(call);
+        }
+        let mut markers: HashMap<u32, Vec<&Annotation>> = HashMap::new();
+        for annotation in annotations {
+            if let Annotation::Erase { def, .. } | Annotation::RecoveryRequired { def, .. } =
+                annotation
+            {
+                markers.entry(*def).or_default().push(annotation);
+            }
+        }
         let mut walked: HashSet<usize> = HashSet::new();
         let mut found: Vec<(Span, String)> = Vec::new();
         for plan in plans {
@@ -2576,7 +2590,7 @@ impl Checker<'_> {
                 }
             }
             // Where the plan is called.
-            let calls: Vec<&Call> = self.calls.iter().filter(|c| c.callee == id).collect();
+            let calls = &incoming[id];
             if calls.is_empty() {
                 found.push((
                     at,
@@ -2646,10 +2660,17 @@ impl Checker<'_> {
                     locals.insert(ident.node.ident.clone());
                 }
             }
-            let local_constants: HashMap<&str, i128> = constants
+            // The top-level statements by where they begin and by the span of the expression
+            // they are made of.
+            let by_start: HashMap<u32, &AstStmt> = body
                 .iter()
-                .filter(|(name, _)| !locals.contains(**name))
-                .map(|(name, value)| (*name, *value))
+                .map(|stmt| (stmt.span.begin().get(), *stmt))
+                .collect();
+            let by_expr: HashMap<(u32, u32), &AstStmt> = body
+                .iter()
+                .filter_map(|stmt| {
+                    direct_expr(stmt).map(|e| ((e.span.begin().get(), e.span.end().get()), *stmt))
+                })
                 .collect();
             let mut transfers = Vec::new();
             for stmt in &statements {
@@ -2675,11 +2696,20 @@ impl Checker<'_> {
                         ),
                     ));
                 }
-                match body
-                    .iter()
-                    .find(|stmt| direct_expr(stmt).is_some_and(|e| e.span == transfer.span))
-                {
-                    Some(stmt) => transfer_at = transfer_at.or(Some(stmt.span.begin().get())),
+                match by_expr.get(&(transfer.span.begin().get(), transfer.span.end().get())) {
+                    Some(stmt) => {
+                        transfer_at = transfer_at.or(Some(stmt.span.begin().get()));
+                        // The statement holds this one operation: no other `diag` call in
+                        // the arguments.
+                        if diag_call_count(transfer) > 1 {
+                            found.push((
+                                transfer.span,
+                                "`diag.flash_transfer` must be the only `diag` call of its \
+                                 statement (4.9)"
+                                    .to_owned(),
+                            ));
+                        }
+                    }
                     None => found.push((
                         transfer.span,
                         "`diag.flash_transfer` must be a top-level statement of the flash plan, \
@@ -2690,7 +2720,7 @@ impl Checker<'_> {
                 if let ExprP::Call(_, call_args) = &transfer.node
                     && let Some(arg) = call_args.args.first()
                     && let ArgumentP::Positional(value) = &arg.node
-                    && let Some(named) = literal_int(value, &local_constants)
+                    && let Some(named) = literal_int(value, &constants, &locals)
                     && named != i128::from(*session)
                 {
                     found.push((
@@ -2705,7 +2735,7 @@ impl Checker<'_> {
             // `@erase`: one `diag.routine` statement before the transfer.
             let mut erases = 0;
             let mut recoveries = 0;
-            for annotation in annotations {
+            for annotation in markers.get(def_line).into_iter().flatten().copied() {
                 match annotation {
                     Annotation::Erase {
                         def,
@@ -2720,16 +2750,18 @@ impl Checker<'_> {
                                 format!("the flash plan `{name}` has more than one `@erase` (4.9)"),
                             ));
                         }
-                        let routine = body
-                            .iter()
-                            .find(|stmt| stmt.span.begin().get() == *statement_at)
+                        // One `diag.routine` call, and no other `diag` call inside it.
+                        let routine = by_start
+                            .get(statement_at)
                             .and_then(|stmt| direct_expr(stmt))
-                            .is_some_and(|e| is_diag_call(e, "routine").is_some());
+                            .is_some_and(|e| {
+                                is_diag_call(e, "routine").is_some() && diag_call_count(e) == 1
+                            });
                         if !routine {
                             found.push((
                                 *span,
                                 "`@erase` must precede a single `diag.routine` call, alone or \
-                                 assigned to a name (4.9)"
+                                 assigned to a name, with no other `diag` call in it (4.9)"
                                     .to_owned(),
                             ));
                         } else if transfer_at.is_some_and(|transfer| *statement_at >= transfer) {
@@ -2957,6 +2989,19 @@ fn is_diag_call<'a>(expr: &'a AstExpr, method: &str) -> Option<&'a [AstArgument]
     (is_name(object, "diag") && name.node == method).then_some(args.args.as_slice())
 }
 
+/// How many calls to a function of `diag` `expr` holds, itself included.
+fn diag_call_count(expr: &AstExpr) -> usize {
+    let own = match &expr.node {
+        ExprP::Call(function, _) => {
+            usize::from(matches!(&function.node, ExprP::Dot(object, _) if is_name(object, "diag")))
+        }
+        _ => 0,
+    };
+    let mut count = own;
+    expr.visit_expr(|inner| count += diag_call_count(inner));
+    count
+}
+
 /// Every call to `diag.<method>` in `expr`, itself included.
 fn find_diag_calls<'a>(expr: &'a AstExpr, method: &str, out: &mut Vec<&'a AstExpr>) {
     if is_diag_call(expr, method).is_some() {
@@ -2967,15 +3012,21 @@ fn find_diag_calls<'a>(expr: &'a AstExpr, method: &str, out: &mut Vec<&'a AstExp
 
 /// The value of an integer literal, with a sign, or of a name in `constants`; `None` for any
 /// other expression. A literal beyond `i128` stands for `i128::MAX`, which no session id equals.
-fn literal_int(expr: &AstExpr, constants: &HashMap<&str, i128>) -> Option<i128> {
+fn literal_int(
+    expr: &AstExpr,
+    constants: &HashMap<&str, i128>,
+    hidden: &HashSet<String>,
+) -> Option<i128> {
     match &expr.node {
         ExprP::Literal(AstLiteral::Int(int)) => match &int.node {
             TokenInt::I32(n) => Some(i128::from(*n)),
             TokenInt::BigInt(big) => Some(i128::try_from(big).unwrap_or(i128::MAX)),
         },
-        ExprP::Minus(inner) => literal_int(inner, constants).map(|n| -n),
-        ExprP::Plus(inner) => literal_int(inner, constants),
-        ExprP::Identifier(name) => constants.get(name.node.ident.as_str()).copied(),
+        ExprP::Minus(inner) => literal_int(inner, constants, hidden).map(|n| -n),
+        ExprP::Plus(inner) => literal_int(inner, constants, hidden),
+        ExprP::Identifier(name) if !hidden.contains(&name.node.ident) => {
+            constants.get(name.node.ident.as_str()).copied()
+        }
         _ => None,
     }
 }

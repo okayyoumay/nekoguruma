@@ -2051,3 +2051,31 @@ fn a_transfer_in_a_function_the_plan_calls_is_refused() {
         codes(&section)
     );
 }
+
+#[test]
+fn the_erase_and_transfer_statements_hold_one_diag_call() {
+    use StarCode::PlanShape as Shape;
+    // An outer `diag.routine` with another `diag` call among its arguments is two operations.
+    assert_eq!(
+        plan_codes(
+            "diag.routine(0xFF00, 1, {})",
+            "diag.routine(0xFF00, 1, {\"x\": diag.routine(0xFF01, 1, {})})"
+        ),
+        [(Shape, 4)]
+    );
+    assert_eq!(
+        plan_codes(
+            "diag.routine(0xFF00, 1, {})",
+            "diag.routine(0xFF00, diag.wait(1), {})"
+        ),
+        [(Shape, 4)]
+    );
+    // The transfer's argument holds no other `diag` call either.
+    let errors = codes(&PLAN.replace(
+        "flash_transfer(1)",
+        "flash_transfer(len(diag.log(1, \"\")))",
+    ));
+    assert_eq!(errors, [(Shape, 6)]);
+    // The plain forms still pass.
+    passes(PLAN);
+}

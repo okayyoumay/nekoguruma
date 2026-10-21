@@ -17,7 +17,8 @@
 //!    instruction until the kill arrives.
 //! 3. [`AgentChild::kill`] ends the agent and its worker at once: SIGKILL to the child's
 //!    process group on unix, `TerminateJobObject` on the job object the child was put in on
-//!    Windows. Nothing is closed or flushed, as when the host loses everything at once. Both
+//!    Windows (it starts suspended and resumes once it is in the job, so its worker is created
+//!    in the job too). Nothing is closed or flushed, as when the host loses everything at once. Both
 //!    take effect within the call, so the kill lands inside the program's `Wait` even on a loaded
 //!    runner, where starting a `taskkill` process took longer than the wait.
 //! 4. [`Env::probe`] reads the simulated ECU's session, flash state and power-cycle count from a
@@ -288,14 +289,21 @@ impl Env {
         let mut command = self.child("agent");
         #[cfg(unix)]
         command.process_group(0);
+        // Suspended until it is in its job, so that the worker it starts is created in the job
+        // too, however late the assignment runs on a loaded runner.
+        #[cfg(windows)]
+        std::os::windows::process::CommandExt::creation_flags(
+            &mut command,
+            windows_sys::Win32::System::Threading::CREATE_SUSPENDED,
+        );
         let child = command
             .stdout(Stdio::null())
             .spawn()
             .expect("the agent process should start");
-        // The agent starts its worker only after it has opened its journal and taken its guards,
-        // long after this, and the worker joins the agent's job when it is created.
         #[cfg(windows)]
         let job = Job::holding(&child);
+        #[cfg(windows)]
+        resume(&child);
         AgentChild {
             child: Some(child),
             #[cfg(windows)]
@@ -729,6 +737,59 @@ impl Job {
             Err(std::io::Error::last_os_error())
         }
     }
+}
+
+/// Resumes the only thread of `child`, which was created suspended.
+#[cfg(windows)]
+fn resume(child: &Child) {
+    use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
+    use windows_sys::Win32::System::Diagnostics::ToolHelp::{
+        CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
+    };
+    use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
+    // SAFETY: the call touches no memory of ours.
+    let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
+    assert_ne!(
+        snapshot,
+        INVALID_HANDLE_VALUE,
+        "listing the threads failed: {}",
+        std::io::Error::last_os_error()
+    );
+    let mut entry = THREADENTRY32 {
+        dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
+        ..Default::default()
+    };
+    let mut thread_id = None;
+    // SAFETY: the snapshot is open and `entry` is a THREADENTRY32 with its size set.
+    let mut more = unsafe { Thread32First(snapshot, &mut entry) } != 0;
+    while more {
+        if entry.th32OwnerProcessID == child.id() {
+            thread_id = Some(entry.th32ThreadID);
+            break;
+        }
+        // SAFETY: as above.
+        more = unsafe { Thread32Next(snapshot, &mut entry) } != 0;
+    }
+    // SAFETY: the snapshot is open and not used after this.
+    unsafe { CloseHandle(snapshot) };
+    let thread_id = thread_id.expect("the suspended agent should have a thread");
+    // SAFETY: the call touches no memory of ours.
+    let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
+    assert!(
+        !thread.is_null(),
+        "opening the agent's thread failed: {}",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY: the thread's handle is open; it is closed right after.
+    let resumed = unsafe { ResumeThread(thread) };
+    // SAFETY: the handle is open and not used after this.
+    unsafe { CloseHandle(thread) };
+    assert_ne!(
+        resumed,
+        u32::MAX,
+        "resuming the agent failed: {}",
+        std::io::Error::last_os_error()
+    );
 }
 
 #[cfg(windows)]

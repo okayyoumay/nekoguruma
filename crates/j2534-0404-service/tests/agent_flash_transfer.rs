@@ -256,13 +256,11 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .enable_all()
         .build()
         .expect("runtime");
-    // A wedged service must fail the test, not hang the CI job. The jobs take about 16 s on the
-    // Windows runner, and took over 120 s there beside the restart end-to-end tests, so the
-    // bound only catches a hang.
+    // A wedged service must fail the test, not hang the CI job.
     runtime
         .block_on(async {
             tokio::time::timeout(
-                Duration::from_secs(300),
+                Duration::from_secs(120),
                 run_the_jobs(journal_dir.clone(), long_block_journal_dir.clone()),
             )
             .await

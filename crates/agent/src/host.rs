@@ -87,6 +87,12 @@ pub enum HostError {
     /// A `ServiceRequest` for TransferData: the block counter belongs to `FlashTransfer`.
     #[error("TransferData (0x36) must be sent with FlashTransfer, not ServiceRequest (ADR-250)")]
     UseFlashTransfer,
+    /// An `Op::FlashBlock` ran on a host whose job has no artifact.
+    #[error("the job has no flash artifact (ADR-336)")]
+    NoArtifact,
+    /// The range an `Op::FlashBlock` asked for is not inside the job's artifact.
+    #[error("{len} artifact bytes from offset {offset} are outside the flash artifact (ADR-336)")]
+    ArtifactRange { offset: u64, len: u32 },
     #[error("{0} is not supported by this agent yet")]
     Unsupported(&'static str),
     /// A `SendReceive` with no request bytes (ADR-321).
@@ -388,6 +394,8 @@ pub struct WorkerHost<C: WorkerApi> {
     transfer: TransferCounter,
     /// The job's document, which the VM decodes response fields with (ADR-316).
     document: Option<crate::document::JobDocument>,
+    /// The job's flash artifact, which `Op::FlashBlock` reads its blocks from (ADR-336).
+    artifact: Option<crate::artifact::Artifact>,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -401,12 +409,18 @@ impl<C: WorkerApi> WorkerHost<C> {
             vbatt_id: crate::inputs::VbattId::Unknown,
             transfer: TransferCounter::default(),
             document: None,
+            artifact: None,
         }
     }
 
     /// Gives the host the job's document (`crate::document`).
     pub fn set_document(&mut self, document: Option<crate::document::JobDocument>) {
         self.document = document;
+    }
+
+    /// Gives the host the job's flash artifact, which `artifact_bytes` serves (ADR-336 item 12).
+    pub fn set_artifact(&mut self, artifact: Option<crate::artifact::Artifact>) {
+        self.artifact = artifact;
     }
 
     /// The number of TransferData blocks the ECU confirmed since the last RequestDownload sent
@@ -784,9 +798,14 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         Err(HostError::Unsupported("MonitorCapture"))
     }
 
-    // The agent holds no artifact yet (ADR-336 item 12).
-    fn artifact_bytes(&mut self, _offset: u64, _len: u32) -> Result<Vec<u8>, HostError> {
-        Err(HostError::Unsupported("FlashBlock"))
+    // The job's artifact, held in memory since it was hashed (ADR-336 item 12). `check_job` has
+    // refused a segment outside it, so a range outside it is defended against, not expected.
+    fn artifact_bytes(&mut self, offset: u64, len: u32) -> Result<Vec<u8>, HostError> {
+        let artifact = self.artifact.as_ref().ok_or(HostError::NoArtifact)?;
+        artifact
+            .slice(offset, len)
+            .map(<[u8]>::to_vec)
+            .ok_or(HostError::ArtifactRange { offset, len })
     }
 
     // Reads through the host's runtime inputs, the source the restart's precondition checks use

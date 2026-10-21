@@ -16,6 +16,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
+use crate::artifact::{Artifact, SHA256_LEN, to_hex};
 use crate::client::WorkerApi;
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
@@ -65,7 +66,8 @@ impl Default for JobLimits {
     }
 }
 
-/// What a job runs: a program, and the document its program decodes responses with, if any.
+/// What a job runs: a program, the document its program decodes responses with, if any, and the
+/// flash artifact its `Op::FlashBlock` reads from, if any.
 /// A program and a document come together only from the document itself, whose procedure is
 /// the program (design 8.2.6), so a job never decodes one variant's responses with another's
 /// declarations. The caller of a restart passes the same job again: the journal records neither
@@ -74,6 +76,9 @@ impl Default for JobLimits {
 pub struct Job {
     program: Program,
     document: Option<JobDocument>,
+    /// The hash the job names for its artifact (ADR-336 item 1) and the artifact the agent read.
+    /// [`check_job`] compares them.
+    artifact: Option<([u8; SHA256_LEN], Artifact)>,
 }
 
 impl Job {
@@ -82,7 +87,19 @@ impl Job {
         Ok(Self {
             program: document.program()?,
             document: Some(document),
+            artifact: None,
         })
+    }
+
+    /// Gives the job its flash artifact and the SHA-256 the job names for it (design 8.2.5,
+    /// ADR-336 item 1). [`check_job`] refuses the job when `artifact` hashes to something else.
+    pub fn with_artifact(mut self, named_sha256: [u8; SHA256_LEN], artifact: Artifact) -> Self {
+        self.artifact = Some((named_sha256, artifact));
+        self
+    }
+
+    pub fn artifact(&self) -> Option<&Artifact> {
+        self.artifact.as_ref().map(|(_, artifact)| artifact)
     }
 
     pub fn program(&self) -> &Program {
@@ -117,6 +134,7 @@ impl From<Program> for Job {
         Self {
             program,
             document: None,
+            artifact: None,
         }
     }
 }
@@ -198,6 +216,25 @@ pub enum JobError {
     /// ADR-321; `Op::FlashBlock`, ADR-336) but the job has no document to give it.
     #[error("the program needs the declarations, but the job has no document")]
     NoDeclarations,
+    /// The program has an `Op::FlashBlock` and the job names no flash artifact (ADR-336).
+    #[error("the program reads flash blocks, but the job has no artifact")]
+    NoArtifact,
+    /// The artifact's SHA-256 is not the one the job names (ADR-336 item 1).
+    #[error("the artifact's SHA-256 is {actual}, not the {named} the job names")]
+    ArtifactMismatch { named: String, actual: String },
+    /// The segment instruction `pc` reads (`session`, `segment`) ends at `end`, past the
+    /// artifact's `artifact_len` bytes, or its end overflows.
+    #[error(
+        "instruction {pc} reads flash segment {segment} of session {session}, which ends at \
+         {end:?}, past the artifact's {artifact_len} bytes"
+    )]
+    SegmentOutsideArtifact {
+        pc: u32,
+        session: u32,
+        segment: u32,
+        end: Option<u64>,
+        artifact_len: u64,
+    },
     /// Instruction `pc` decodes a field the job's document does not declare as a top-level
     /// field of the service's positive response, or one with a nested layout.
     #[error("instruction {pc} decodes a field the job's document does not declare: {source}")]
@@ -341,6 +378,7 @@ fn check_runnable(program: &Program) -> Result<(), JobError> {
 pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
     check_runnable(&job.program)?;
     check_declared(job)?;
+    check_artifact(job)?;
     let variant = job.document.as_ref().map(JobDocument::variant);
     if let (Some(variant), Some(pc)) = (
         &variant,
@@ -374,6 +412,46 @@ fn check_declared(job: &Job) -> Result<(), JobError> {
         }
         None => Ok(()),
     }
+}
+
+/// The artifact part of [`check_job`] (ADR-336 item 1, design 8.2.5): an artifact the job gives
+/// hashes to the hash it names, a program with `Op::FlashBlock` has one, and every segment such an
+/// instruction reads lies inside it. Runs after the declarations, which it relies on to find the
+/// segments.
+fn check_artifact(job: &Job) -> Result<(), JobError> {
+    if let Some((named, artifact)) = &job.artifact
+        && named != artifact.sha256()
+    {
+        return Err(JobError::ArtifactMismatch {
+            named: to_hex(named),
+            actual: to_hex(artifact.sha256()),
+        });
+    }
+    let (Some(document), artifact) = (&job.document, job.artifact()) else {
+        // Without a document, `check_declared` has refused any `FlashBlock`.
+        return Ok(());
+    };
+    let variant = document.variant();
+    for (pc, op) in job.program.code.iter().enumerate() {
+        let Op::FlashBlock { session, segment } = op else {
+            continue;
+        };
+        let artifact = artifact.ok_or(JobError::NoArtifact)?;
+        let pc = u32::try_from(pc).unwrap_or(u32::MAX);
+        let (offset, length) = diag_ir::flash_segment_extent(&variant, *session, *segment)
+            .map_err(|source| JobError::Undeclared { pc, source })?;
+        let end = offset.checked_add(length);
+        if end.is_none_or(|end| end > artifact.len()) {
+            return Err(JobError::SegmentOutsideArtifact {
+                pc,
+                session: *session,
+                segment: *segment,
+                end,
+                artifact_len: artifact.len(),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// The policy part of [`check_program`] and [`check_job`].
@@ -667,7 +745,12 @@ async fn run_program_within<C: WorkerApi>(
             "the link given is not the one the document declares".to_owned(),
         )));
     }
-    let Job { program, document } = job;
+    let Job {
+        program,
+        document,
+        artifact,
+    } = job;
+    let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
@@ -675,7 +758,8 @@ async fn run_program_within<C: WorkerApi>(
     tokio::task::spawn_blocking(move || {
         std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_job(
-                handle, client, &config, &program, document, limits, &cancelled, journal, guards,
+                handle, client, &config, &program, document, artifact, limits, &cancelled, journal,
+                guards,
             )
         }))
         .unwrap_or(Err(JobError::Panicked))
@@ -702,6 +786,7 @@ fn run_job<C: WorkerApi>(
     config: &LinkConfig,
     program: &Program,
     document: Option<JobDocument>,
+    artifact: Option<Artifact>,
     limits: JobLimits,
     cancelled: &AtomicBool,
     journal: Option<JournalMode>,
@@ -786,6 +871,7 @@ fn run_job<C: WorkerApi>(
     );
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     host.set_document(document);
+    host.set_artifact(artifact);
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -4120,6 +4206,7 @@ def main():
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &flash_program(),
                         None,
+                        None,
                         JobLimits::default(),
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
@@ -4250,6 +4337,7 @@ def main():
                         unreachable_client(),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program,
+                        None,
                         None,
                         JobLimits::default(),
                         &cancelled,
@@ -4714,6 +4802,7 @@ def main():
                         unreachable_client(),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program(two_requests()),
+                        None,
                         None,
                         JobLimits::default(),
                         &AtomicBool::new(false),
@@ -9295,6 +9384,7 @@ def main():
         let job = |service, document| Job {
             program: send(service),
             document: Some(document),
+            artifact: None,
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -9380,6 +9470,7 @@ def main():
             Job {
                 program,
                 document: Some(document()),
+                artifact: None,
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -9426,6 +9517,7 @@ def main():
         let job = Job {
             program: program.clone(),
             document: Some(vin_job_document()),
+            artifact: None,
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
         // A field the document does not declare is refused before anything is sent, also
@@ -9438,6 +9530,7 @@ def main():
         let job = Job {
             program: undeclared,
             document: Some(vin_job_document()),
+            artifact: None,
         };
         assert!(
             matches!(
@@ -9493,6 +9586,7 @@ def main():
         let job = Job {
             program,
             document: Some(vin_job_document()),
+            artifact: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -12865,6 +12959,7 @@ def main():
                 &config,
                 &program,
                 None,
+                None,
                 JobLimits::default(),
                 &AtomicBool::new(true),
                 None,
@@ -13597,5 +13692,145 @@ def main():
         .await;
         result.expect("runs once the worker is gone");
         assert!(!guards.link_unconfirmed());
+    }
+
+    /// A job that reads block 0 of `segment` of flash session 1 inside the plan of
+    /// [`flash_program`]. The document declares segment 0 at artifact offset 4, `length` bytes
+    /// long, in blocks of 4, and segment 1 at offset 0, 2 bytes long.
+    fn flash_job(segment: u32, length: u64) -> Job {
+        let mut program = flash_program();
+        let transfer = program
+            .code
+            .iter()
+            .position(|op| matches!(op, Op::FlashTransfer { .. }))
+            .expect("the fixture transfers");
+        program.code[transfer - 1] = Op::FlashBlock {
+            session: 1,
+            segment,
+        };
+        program.validate().expect("the block sits in the plan");
+        let bytes = crate::document::tests::flash_document(&program, &[(4, length, 4), (0, 2, 4)]);
+        Job::from_document(JobDocument::new(bytes).unwrap()).unwrap()
+    }
+
+    /// The artifact of ten bytes the flash jobs name.
+    fn ten_bytes() -> Artifact {
+        Artifact::from_bytes((0..10u8).collect::<Vec<_>>())
+    }
+
+    #[test]
+    fn a_flash_block_needs_an_artifact_that_is_the_one_named() {
+        let artifact = ten_bytes();
+        let named = *artifact.sha256();
+        let ok = flash_job(0, 6).with_artifact(named, artifact.clone());
+        check_job(&ok, policy::build_ceiling()).expect("segment 4..10 of 10 bytes is inside");
+        assert_eq!(ok.artifact().map(Artifact::len), Some(10));
+        // No artifact.
+        let refused = check_job(&flash_job(0, 6), policy::build_ceiling());
+        assert!(matches!(refused, Err(JobError::NoArtifact)), "{refused:?}");
+        // Another hash than the file's; the message names both.
+        let mut other = named;
+        other[0] ^= 1;
+        let refused = check_job(
+            &flash_job(0, 6).with_artifact(other, artifact.clone()),
+            policy::build_ceiling(),
+        );
+        match refused {
+            Err(JobError::ArtifactMismatch { named, actual }) => {
+                assert_eq!(named, to_hex(&other));
+                assert_eq!(actual, to_hex(artifact.sha256()));
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_segment_outside_the_artifact_is_refused() {
+        let artifact = ten_bytes();
+        let named = *artifact.sha256();
+        // Ends exactly at the end: accepted. One byte past it: refused, at the instruction (pc 9 in the fixture).
+        for (length, accepted) in [(6, true), (7, false)] {
+            let job = flash_job(0, length).with_artifact(named, artifact.clone());
+            let checked = check_job(&job, policy::build_ceiling());
+            if accepted {
+                checked.expect("inside");
+            } else {
+                assert!(
+                    matches!(
+                        checked,
+                        Err(JobError::SegmentOutsideArtifact {
+                            pc: 9,
+                            session: 1,
+                            segment: 0,
+                            end: Some(11),
+                            artifact_len: 10
+                        })
+                    ),
+                    "{checked:?}"
+                );
+            }
+        }
+        // A segment whose end overflows is a declaration error, refused before the artifact.
+        let job = flash_job(0, u64::MAX).with_artifact(named, artifact);
+        assert!(
+            matches!(
+                check_job(&job, policy::build_ceiling()),
+                Err(JobError::Undeclared { .. })
+            ),
+            "{:?}",
+            check_job(&job, policy::build_ceiling())
+        );
+    }
+
+    /// An artifact given to a job that reads none is still hash-checked.
+    #[test]
+    fn an_artifact_without_a_flash_block_is_still_hash_checked() {
+        let artifact = ten_bytes();
+        let plain = || Job::from(program(Vec::new()));
+        check_job(
+            &plain().with_artifact(*artifact.sha256(), artifact.clone()),
+            policy::build_ceiling(),
+        )
+        .expect("no instruction reads it");
+        let refused = check_job(
+            &plain().with_artifact([0; SHA256_LEN], artifact),
+            policy::build_ceiling(),
+        );
+        assert!(
+            matches!(refused, Err(JobError::ArtifactMismatch { .. })),
+            "{refused:?}"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_host_serves_the_artifact_slice() {
+        use diag_ir::DiagHost;
+        let (mut client, _calls) = fake_worker(false).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings::for_link(&config);
+        tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            assert!(matches!(
+                host.artifact_bytes(0, 1),
+                Err(HostError::NoArtifact)
+            ));
+            host.set_artifact(Some(ten_bytes()));
+            assert_eq!(host.artifact_bytes(4, 4).unwrap(), vec![4, 5, 6, 7]);
+            assert_eq!(host.artifact_bytes(10, 0).unwrap(), Vec::<u8>::new());
+            assert!(matches!(
+                host.artifact_bytes(8, 3),
+                Err(HostError::ArtifactRange { offset: 8, len: 3 })
+            ));
+            assert!(matches!(
+                host.artifact_bytes(u64::MAX, 1),
+                Err(HostError::ArtifactRange { .. })
+            ));
+        })
+        .await
+        .unwrap();
     }
 }

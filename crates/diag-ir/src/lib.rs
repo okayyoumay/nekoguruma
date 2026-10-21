@@ -1263,6 +1263,19 @@ pub fn check_declarations(
     Ok(())
 }
 
+/// The artifact range of segment `segment` (an index into `segments`) of flash session
+/// `session` (`FlashSession.id`): its `artifact_offset` and `length`, so the segment covers
+/// `offset..offset + length` of the artifact. Checked as [`check_declarations`] checks an
+/// [`Op::FlashBlock`]'s segment, so a caller that has checked a program need not handle the
+/// errors again (ADR-336).
+pub fn flash_segment_extent(
+    variant: &EcuVariant<'_>,
+    session: u32,
+    segment: u32,
+) -> Result<(u64, u64), VmError> {
+    declared_segment(variant, session, segment).map(|(offset, _, length)| (offset, length))
+}
+
 /// The offset, block size and length of segment `segment` (an index into `segments`) of flash
 /// session `session` (`FlashSession.id`), with the segment's block size checked to be non-zero,
 /// its end not to overflow and its longest block to fit [`MAX_BYTES_LEN`].

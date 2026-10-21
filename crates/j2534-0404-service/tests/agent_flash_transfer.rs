@@ -4,13 +4,20 @@
 //! `j2534-0404-service` binary against the `sim-vci` cdylib, and `agent::run_program` runs a
 //! diag-ir procedure on a CAN link to the simulated ECU behind it.
 //!
-//! The `FlashTransfer` instruction against the simulated ECU (ADR-250): a download of more
-//! blocks than the wire block counter holds before it wraps, the last one as long as the ECU's
+//! The `FlashBlock` and `FlashTransfer` instructions against the simulated ECU (ADR-250,
+//! ADR-336): the job's document declares a flash session whose segments are ranges of an
+//! artifact file, the job names the file by its SHA-256, and the agent reads each block from the
+//! file's bytes with `FlashBlock` and sends it with `FlashTransfer`. A download of more blocks
+//! than the wire block counter holds before it wraps, the last one as long as the ECU's
 //! maxNumberOfBlockLength allows, followed by RequestTransferExit, which the ECU accepts only
-//! when every block arrived in order. A second job's block one byte longer than that is refused
-//! by the host before it is sent (ADR-336 item 12). (A `FlashTransfer` with no RequestDownload
-//! before it cannot pass the program validator, so the host's refusal is a unit test in
-//! `crates/agent/src/host.rs`.)
+//! when every block arrived in order. A second job's block one byte longer than that (a segment
+//! with a larger block size) is refused by the host before it is sent (ADR-336 item 12). (A
+//! `FlashTransfer` with no RequestDownload before it cannot pass the program validator, so the
+//! host's refusal is a unit test in `crates/agent/src/host.rs`.)
+//!
+//! A job whose artifact does not hash to the name it gives, or whose segment lies outside the
+//! file, is refused before a worker is asked anything; those checks are unit tests in
+//! `crates/agent/src/runner.rs`.
 //!
 //! The jobs run with the write-job journal (ADR-252): the ECU's part number and software
 //! version are read at the plan's entry, and the first job's journal reads back with every
@@ -27,7 +34,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent::guards::{GuardSetup, JobGuards};
 use agent::inputs::{Encoding, ServiceField, ServiceSources};
 use agent::journal::{JobKey, Journal};
-use agent::{HostError, JobError, JobLimits, JournalSetup, LinkConfig, run_program_journaled};
+use agent::{
+    Artifact, HostError, Job, JobDocument, JobError, JobLimits, JournalSetup, LinkConfig,
+    run_program_journaled,
+};
+use diag_ir::declaration::{
+    EcuDocumentT, EcuVariantT, FlashSegmentT, FlashSessionT, ProtocolT, encode_ecu_document,
+};
 use diag_ir::{
     FlashRecovery, IR_SCHEMA_VERSION, IdentitySources, Op, Program, RecoveryBoundaries,
     RecoveryRequired, RecoveryTiming, Source, Value,
@@ -83,21 +96,37 @@ impl Drop for TempFile {
     }
 }
 
-/// Programming session, erase, RequestDownload of the blocks' bytes at 0, one `FlashTransfer`
-/// per block, then RequestTransferExit. The instruction's operand is the block number the
+/// The flash session of the job's document, which the plan names.
+const FLASH_SESSION: u32 = 1;
+
+/// A segment of the artifact: `length` bytes from `artifact_offset`, read in blocks of
+/// `block_size`.
+#[derive(Clone, Copy)]
+struct Segment {
+    artifact_offset: u64,
+    length: u64,
+    block_size: u32,
+}
+
+impl Segment {
+    fn blocks(&self) -> u64 {
+        self.length.div_ceil(u64::from(self.block_size))
+    }
+}
+
+/// Programming session, erase, RequestDownload of the segments' total size at 0, then for every
+/// block of every segment a `FlashBlock` (the block's index in its segment) and a
+/// `FlashTransfer`, and RequestTransferExit. The `FlashTransfer` operand is the block number the
 /// compiler would write; the host ignores it.
-fn download_program(blocks: Vec<Vec<u8>>) -> Program {
-    let size = blocks.iter().map(Vec::len).sum::<usize>() as u32;
-    let count = blocks.len() as u32;
-    let mut constants = vec![
+fn download_program(segments: &[Segment]) -> Program {
+    let size = segments.iter().map(|s| s.length).sum::<u64>() as u32;
+    let constants = vec![
         vec![0x02],
         Vec::new(),
         // dataFormatIdentifier, address and size lengths (4 and 4), address 0, size.
         [&[0x00, 0x44, 0, 0, 0, 0][..], &size.to_be_bytes()].concat(),
         Vec::new(),
     ];
-    let first_block = constants.len() as u32;
-    constants.extend(blocks);
     let mut code = vec![
         Op::PushBytes(0),
         Op::ServiceRequest { service: 0x10 },
@@ -109,9 +138,15 @@ fn download_program(blocks: Vec<Vec<u8>>) -> Program {
         Op::PushBytes(2),
         Op::ServiceRequest { service: 0x34 },
     ];
-    for i in 0..count {
-        code.push(Op::PushBytes(first_block + i));
-        code.push(Op::FlashTransfer { block: 7 });
+    for (segment, declared) in segments.iter().enumerate() {
+        for index in 0..declared.blocks() {
+            code.push(Op::PushI64(index as i64));
+            code.push(Op::FlashBlock {
+                session: FLASH_SESSION,
+                segment: segment as u32,
+            });
+            code.push(Op::FlashTransfer { block: 7 });
+        }
     }
     code.push(Op::PushBytes(3));
     let exit_pc = code.len() as u32;
@@ -119,7 +154,7 @@ fn download_program(blocks: Vec<Vec<u8>>) -> Program {
     // The validator wants download instructions inside a flash session's plan. The plan never
     // allows a restart (a recovery point at the erase), so it declares nothing else.
     let flash = vec![FlashRecovery {
-        flash_session: 1,
+        flash_session: FLASH_SESSION,
         stage: 1,
         max_resumes: 1,
         recovery_required: RecoveryRequired::FromPc(3),
@@ -177,11 +212,82 @@ fn identity_sources() -> ServiceSources {
     .expect("identity table")
 }
 
-/// One-byte blocks past the counter's wrap, then one as long as the ECU allows.
-fn accepted_blocks() -> Vec<Vec<u8>> {
-    let mut blocks: Vec<Vec<u8>> = (0..BLOCKS).map(|i| vec![i as u8]).collect();
-    blocks.push(vec![0xA5; LONGEST_BLOCK]);
-    blocks
+/// One-byte blocks past the counter's wrap (segment 0), then one block as long as the ECU
+/// allows (segment 1), right after them in the artifact.
+fn accepted_segments() -> Vec<Segment> {
+    vec![
+        Segment {
+            artifact_offset: 0,
+            length: u64::from(BLOCKS),
+            block_size: 1,
+        },
+        Segment {
+            artifact_offset: u64::from(BLOCKS),
+            length: LONGEST_BLOCK as u64,
+            block_size: LONGEST_BLOCK as u32,
+        },
+    ]
+}
+
+/// One byte more than the ECU allows in one block: a single block of a segment whose block
+/// size is that long.
+fn long_block_segments() -> Vec<Segment> {
+    vec![Segment {
+        artifact_offset: 0,
+        length: LONGEST_BLOCK as u64 + 1,
+        block_size: LONGEST_BLOCK as u32 + 1,
+    }]
+}
+
+/// The artifact's bytes: a pattern that differs from block to block, so a block read from the
+/// wrong place would differ.
+fn artifact_bytes(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// The job: a document whose variant declares the flash session with `segments` and whose
+/// procedure is [`download_program`], and the artifact file at `artifact_path` that it names by
+/// the file's SHA-256.
+fn download_job(segments: &[Segment], artifact_path: &std::path::Path) -> Job {
+    let mut session = FlashSessionT::default();
+    session.id = FLASH_SESSION;
+    session.segments = Some(
+        segments
+            .iter()
+            .map(|s| {
+                let mut segment = FlashSegmentT::default();
+                segment.artifact_offset = s.artifact_offset;
+                segment.length = s.length;
+                segment.block_size = s.block_size;
+                segment
+            })
+            .collect(),
+    );
+    // UDS on ISO 15765 as `LinkConfig::iso15765(0x7E0, 0x7E8)` opens it: a document's job runs
+    // on the link its variant declares (ADR-324).
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("sim".into());
+    variant.protocols = Some(vec![protocol]);
+    variant.flash_sessions = Some(vec![session]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure =
+        Some(postcard::to_allocvec(&download_program(segments)).expect("program should serialize"));
+    let document = JobDocument::new(encode_ecu_document(&document)).expect("the document loads");
+    let artifact = Artifact::read(artifact_path).expect("the artifact file reads");
+    Job::from_document(document)
+        .expect("the document carries its procedure")
+        .with_artifact(*artifact.sha256(), artifact)
 }
 
 fn job_key() -> JobKey {
@@ -226,6 +332,22 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         std::env::temp_dir().join(format!("agent-flash-{nanos}-long-block-journal"));
     std::fs::create_dir_all(&long_block_journal_dir).expect("journal directory");
     let _long_block_journal = TempDir(long_block_journal_dir.clone());
+    // The artifact files: the first job's segments end at the end of the file, the second
+    // job's single block is the whole file.
+    let artifact_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-artifacts"));
+    std::fs::create_dir_all(&artifact_dir).expect("artifact directory");
+    let _artifacts = TempDir(artifact_dir.clone());
+    let accepted_len = (u64::from(BLOCKS) + LONGEST_BLOCK as u64) as usize;
+    std::fs::write(
+        artifact_dir.join("accepted.bin"),
+        artifact_bytes(accepted_len),
+    )
+    .expect("artifact file should be writable");
+    std::fs::write(
+        artifact_dir.join("long-block.bin"),
+        artifact_bytes(LONGEST_BLOCK + 1),
+    )
+    .expect("artifact file should be writable");
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
@@ -261,7 +383,11 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .block_on(async {
             tokio::time::timeout(
                 Duration::from_secs(120),
-                run_the_jobs(journal_dir.clone(), long_block_journal_dir.clone()),
+                run_the_jobs(
+                    journal_dir.clone(),
+                    long_block_journal_dir.clone(),
+                    artifact_dir.clone(),
+                ),
             )
             .await
         })
@@ -321,7 +447,11 @@ fn job_guards(writes: bool) -> JobGuards {
     .expect("guards should be free")
 }
 
-async fn run_the_jobs(journal_dir: PathBuf, long_block_journal_dir: PathBuf) {
+async fn run_the_jobs(
+    journal_dir: PathBuf,
+    long_block_journal_dir: PathBuf,
+    artifact_dir: PathBuf,
+) {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
@@ -338,14 +468,14 @@ async fn run_the_jobs(journal_dir: PathBuf, long_block_journal_dir: PathBuf) {
     .expect("worker should launch");
 
     let worker_ref = &worker;
-    let run = move |blocks, dir, key| async move {
+    let run = move |job, dir, key| async move {
         let (state, _guards) = run_program_journaled(
             worker_ref
                 .connect(&ConnectOptions::default())
                 .await
                 .expect("client should connect"),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
-            download_program(blocks),
+            job,
             JobLimits::default(),
             JournalSetup {
                 dir,
@@ -360,9 +490,13 @@ async fn run_the_jobs(journal_dir: PathBuf, long_block_journal_dir: PathBuf) {
         state
     };
 
-    let state = run(accepted_blocks(), journal_dir, job_key())
-        .await
-        .expect("the download job should finish");
+    let state = run(
+        download_job(&accepted_segments(), &artifact_dir.join("accepted.bin")),
+        journal_dir,
+        job_key(),
+    )
+    .await
+    .expect("the download job should finish");
     // RequestTransferExit is positive only when every block, in counter order across the wrap
     // from 0xFF to 0x00, arrived, the one at the ECU's limit included.
     assert_eq!(
@@ -375,7 +509,7 @@ async fn run_the_jobs(journal_dir: PathBuf, long_block_journal_dir: PathBuf) {
     // One byte over the limit. The ECU would refuse the block itself (NRC 0x13), which the
     // host would report as `TransferRefused`; `BlockTooLong` means it was never sent.
     let refused = run(
-        vec![vec![0xA5; LONGEST_BLOCK + 1]],
+        download_job(&long_block_segments(), &artifact_dir.join("long-block.bin")),
         long_block_journal_dir,
         long_block_job_key(),
     )

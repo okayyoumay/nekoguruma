@@ -3329,3 +3329,246 @@ def main():
         [(StarCode::NotLowerable, 2)]
     );
 }
+
+// ---------------------------------------------------------------- Flash plans (4.9, ADR-336)
+
+/// A plan for session 1 whose steps have no erase: its transfer is the last statement.
+const PLAN_NO_ERASE: &str = "\
+# @section uninterruptible expected=1000
+# @flashPlan session=1
+def write():
+    diag.wait(1)
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+";
+
+/// The same with an erase, whose `diag.routine` the empty variants of these tests cannot select.
+const PLAN_ERASE: &str = "\
+# @section uninterruptible expected=1000
+# @flashPlan session=1
+def write():
+    # @erase
+    diag.routine(0xFF00, 1, {})
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+";
+
+/// A request index with the three mandatory preconditions and `identity` sources.
+fn flash_index(identity: &[&str]) -> RequestIndex {
+    let source = diag_ir::Source::RuntimeInput(diag_ir::RuntimeInput::SupplyVoltageMillivolts);
+    let row = || diag_ir::Precondition {
+        satisfied: diag_ir::Satisfied { lower: 1, upper: 1 },
+        default_session: Some(source),
+        programming_session: None,
+    };
+    let read = Some(diag_ir::Source::EcuService {
+        service_id: 4,
+        field_id: 9,
+    });
+    let has = |name: &str| identity.contains(&name).then_some(read).flatten();
+    RequestIndex {
+        identity: diag_ir::IdentitySources {
+            vin: has("vin"),
+            hardware_part_number: has("hardware_part_number"),
+            software_version: has("software_version"),
+        },
+        preconditions: diag_ir::Preconditions {
+            voltage_mv: Some(row()),
+            external_supply: Some(row()),
+            ignition: Some(row()),
+            ..Default::default()
+        },
+        ..RequestIndex::default()
+    }
+}
+
+/// A document whose variant declares flash session 1 with `steps`, or no session for `None`.
+fn flash_document(steps: Option<&[diag_ir::declaration::FlashStep]>) -> Vec<u8> {
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("test".to_owned());
+    document.source_digest = Some(String::new());
+    let mut variant = EcuVariantT::default();
+    variant.flash_sessions = steps.map(|steps| {
+        let mut session = diag_ir::declaration::FlashSessionT::default();
+        session.id = 1;
+        session.steps = Some(steps.to_vec());
+        vec![session]
+    });
+    document.variant = Some(Box::new(variant));
+    encode_ecu_document(&document)
+}
+
+/// What lowering `source` for a variant whose flash session 1 has `steps` reports (no session
+/// at all when `steps` is `None`), with its error codes and lines.
+fn flash_codes(
+    source: &str,
+    steps: Option<&[diag_ir::declaration::FlashStep]>,
+    requests: &RequestIndex,
+) -> Vec<(StarCode, u32)> {
+    flash_errors(source, steps, requests)
+        .iter()
+        .map(|e| (e.code, e.line))
+        .collect()
+}
+
+fn flash_errors(
+    source: &str,
+    steps: Option<&[diag_ir::declaration::FlashStep]>,
+    requests: &RequestIndex,
+) -> Vec<StarError> {
+    let bytes = flash_document(steps);
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    lower("t.star", &checked, variant, requests)
+        .err()
+        .unwrap_or_default()
+}
+
+const NO_ERASE: &[diag_ir::declaration::FlashStep] = &[
+    diag_ir::declaration::FlashStep::EnterProgrammingSession,
+    diag_ir::declaration::FlashStep::TransferData,
+];
+const WITH_ERASE: &[diag_ir::declaration::FlashStep] = &[
+    diag_ir::declaration::FlashStep::EnterProgrammingSession,
+    diag_ir::declaration::FlashStep::EraseMemory,
+    diag_ir::declaration::FlashStep::TransferData,
+];
+
+#[test]
+fn a_valid_flash_plan_is_refused_as_not_lowered_yet() {
+    let requests = flash_index(&[]);
+    // Past every check of the plan, the transfer is the one thing left that is refused.
+    assert_eq!(
+        flash_codes(PLAN_NO_ERASE, Some(NO_ERASE), &requests),
+        [(StarCode::NotLowerable, 5)]
+    );
+    // The erase's `diag.routine` finds no service in this empty variant, which is its own
+    // refusal; the plan's checks report nothing.
+    assert_eq!(
+        flash_codes(PLAN_ERASE, Some(WITH_ERASE), &requests),
+        [(StarCode::UnknownService, 5), (StarCode::NotLowerable, 6)]
+    );
+    // So is a transfer outside any plan.
+    assert_eq!(
+        flash_codes(
+            "def main():\n    diag.flash_transfer(1)\n",
+            Some(NO_ERASE),
+            &requests
+        ),
+        [(StarCode::NotLowerable, 2)]
+    );
+}
+
+#[test]
+fn a_flash_plan_names_a_session_of_the_variant() {
+    let requests = flash_index(&[]);
+    assert_eq!(
+        flash_codes(PLAN_NO_ERASE, None, &requests),
+        [(StarCode::UnknownFlashSession, 2)]
+    );
+    let other = PLAN_NO_ERASE
+        .replace("session=1", "session=2")
+        .replace("flash_transfer(1)", "flash_transfer(2)");
+    assert_eq!(
+        flash_codes(&other, Some(NO_ERASE), &requests),
+        [(StarCode::UnknownFlashSession, 2)]
+    );
+}
+
+#[test]
+fn erase_is_required_exactly_when_the_session_erases() {
+    let requests = flash_index(&[]);
+    // A session with an erase step needs the `@erase`; one without it refuses the `@erase`.
+    assert_eq!(
+        flash_codes(PLAN_NO_ERASE, Some(WITH_ERASE), &requests),
+        [(StarCode::PlanShape, 2)]
+    );
+    assert_eq!(
+        flash_codes(PLAN_ERASE, Some(NO_ERASE), &requests),
+        [(StarCode::PlanShape, 4)]
+    );
+}
+
+#[test]
+fn a_restartable_flash_plan_needs_the_identity_rows() {
+    let never = PLAN_NO_ERASE.replace("session=1", "session=1 recovery=never");
+    let marked = PLAN_NO_ERASE.replace("    res =", "    # @recoveryRequired\n    res =");
+    let all = ["vin", "hardware_part_number", "software_version"];
+    for source in [&never, &marked] {
+        // One error, naming the rows that are missing.
+        let errors = flash_errors(source, Some(NO_ERASE), &flash_index(&["vin"]));
+        assert_eq!(
+            errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+            [(StarCode::PlanShape, 2)]
+        );
+        assert!(
+            errors[0]
+                .hint
+                .contains("missing: hardware_part_number, software_version"),
+            "{}",
+            errors[0].hint
+        );
+        // With every row it goes on to the transfer's refusal.
+        assert_eq!(
+            flash_codes(source, Some(NO_ERASE), &flash_index(&all)),
+            [(StarCode::NotLowerable, 5 + u32::from(source == &marked))]
+        );
+    }
+    // The default point, at the erase, and a section that requires on-site intervention from
+    // its entry allow no restart: the identity rows are not needed.
+    let requests = flash_index(&[]);
+    assert_eq!(
+        flash_codes(PLAN_NO_ERASE, Some(NO_ERASE), &requests),
+        [(StarCode::NotLowerable, 5)]
+    );
+    assert_eq!(
+        flash_codes(
+            &PLAN_NO_ERASE.replace("uninterruptible", "recoveryRequired"),
+            Some(NO_ERASE),
+            &requests
+        ),
+        [(StarCode::NotLowerable, 5)]
+    );
+}
+
+#[test]
+fn a_flash_plan_is_for_uds_only() {
+    static OTHER: Profile = Profile {
+        layer: "TEST",
+        calls: &[],
+        negative: crate::profile::NEGATIVE_7F,
+        pending: &[0x78],
+    };
+    let bytes = flash_document(Some(NO_ERASE));
+    let variant = load_ecu_document(&bytes)
+        .expect("loads")
+        .variant()
+        .expect("a variant");
+    let over = |source: &str| -> Vec<(StarCode, u32)> {
+        let requests = RequestIndex {
+            profile: &OTHER,
+            ..flash_index(&[])
+        };
+        let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        match lower("t.star", &checked, variant, &requests) {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.iter().map(|e| (e.code, e.line)).collect(),
+        }
+    };
+    // The annotation is refused, and so is the call, wherever it is.
+    assert_eq!(over(PLAN_NO_ERASE), [(StarCode::NotInProfile, 2)]);
+    assert_eq!(
+        over("def main():\n    diag.flash_transfer(1)\n"),
+        [(StarCode::NotInProfile, 2)]
+    );
+}

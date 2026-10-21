@@ -720,7 +720,9 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
 
 ### 4.9 Flash plans and preconditions
 
-**Target contract (ADR-336).** This section is what ADR-336 decides. The converter implements `# @preconditions` and the copy of `identity.csv` into every program (below); it lowers none of the flash plan, and refuses `diag.flash_transfer` (3.2).
+**Target contract (ADR-336).** This section is what ADR-336 decides. The converter implements `# @preconditions` and the copy of `identity.csv` into every program (below). It also checks the flash plan's annotations and shape rules: the syntax of `@flashPlan`, `@erase` and `@recoveryRequired` and their placement, the shape rules, and the mandatory preconditions, per file; the session, the `@erase` against the session's steps, the identity rows of a restartable plan and the UDS layer, per variant. It lowers no plan: once those checks pass, a file that uses `diag.flash_transfer`, inside a plan or not, still ends in `STAR_NOT_LOWERABLE` at the call (3.2). The expansion, the boundaries, the `CheckState` default of 4.6 and the conversion limits below are not applied yet.
+
+Where each check runs. The per-file checks run on the syntax alone, whatever the variants declare, and are reported once. They are: the annotation placement (`STAR_BAD_ANNOTATION`) and ranges (`STAR_ARGUMENT_OUT_OF_RANGE`, which also refuses the reserved maximum session id); every rule of the shape list (`STAR_PLAN_SHAPE`); and the mandatory preconditions. The per-variant checks need the variant's tables and run in the lowering, before any instruction is emitted: `STAR_UNKNOWN_FLASH_SESSION`, the `erase-memory` cross-check of `@erase` and the identity rows (`STAR_PLAN_SHAPE`), and `STAR_NOT_IN_PROFILE`. A `diag.flash_transfer` whose session is a name or a signed integer literal is compared with the annotation's session by the per-file check; any other expression is left to the lowering of the call.
 
 A flash recovery plan (design 8.2.5) is a whole top-level function that the lowering expands in
 place at its one call site in `main`. ECU facts (identity and precondition sources, the plan's
@@ -851,11 +853,12 @@ names them at the end of its hint (`(in variant V1)`, `(in variants V1, V2)`).
 }
 ```
 
-The error codes of the restart declaration (ADR-336, 4.9); `STAR_UNKNOWN_PRECONDITION` is reported by the converter, the other two belong to the flash plan contract:
+The error codes of the restart declaration (ADR-336, 4.9); the converter reports each of them, `STAR_UNKNOWN_FLASH_SESSION` and `STAR_PLAN_SHAPE` from its checks of the flash plan (4.9), `STAR_PLAN_INVALID` from the validation of a lowered program, which no plan reaches yet:
 
 | Code | Meaning |
 |---|---|
-| `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called) |
+| `STAR_PLAN_SHAPE` | a `@flashPlan` function breaks a shape rule (call count, call site, `return`, section callee, never called, section, `diag.flash_transfer`, `@erase`, `@recoveryRequired`), the variant's `erase-memory` step disagrees with `@erase`, a restartable plan lacks identity rows, or the procedure's `# @preconditions` lacks `voltage`, `externalSupply` or `ignition` |
+| `STAR_UNKNOWN_FLASH_SESSION` | the `session` of `# @flashPlan` is not a flash session of the variant (reported at the annotation) |
 | `STAR_PLAN_INVALID` | the lowered program is refused by `Program::validate` with an error that names a pc; located at the source of that pc (an error without a pc is `STAR_NOT_LOWERABLE`) |
 | `STAR_UNKNOWN_IDENTITY` | a key of `diag.ecu_info()` (`vin`, `part_number`, `software_version`) has no row in the variant's `identity.csv` (reported at the key; ADR-339) |
 | `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions`, or the kind a `diag.precondition` call names, has no row in the variant's `preconditions.csv` (for the call, also a row with no default-session source, which the tables never produce) |

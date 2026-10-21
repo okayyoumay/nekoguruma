@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use diag_ir::declaration::{DataKind, EcuVariant, LengthKind, Request};
+use diag_ir::declaration::{DataKind, EcuVariant, FlashStep, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{
     IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, PreconditionKind, Preconditions, Program,
@@ -34,7 +34,7 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::uniplate::Visit;
 
-use crate::profile::{Intent, Part, ResultMap, Source, StepKind};
+use crate::profile::{Intent, Part, ResultMap, Source, StepKind, UDS};
 
 use super::{
     Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
@@ -184,6 +184,7 @@ fn lower_here<'a>(
     lowerer.globals_built = lowerer.built;
     lowerer.functions();
     lowerer.preconditions();
+    lowerer.flash_plans();
     if lowerer.errors.is_empty() {
         lowerer.infer();
         lowerer.reject_if_exhausted();
@@ -817,6 +818,122 @@ impl<'a> Lowerer<'a> {
                     absent.join(", ")
                 ),
             );
+        }
+    }
+
+    /// What a flash plan needs of the variant (4.9, ADR-336 items 2, 4 and 9): a UDS application
+    /// layer, a flash session of the plan's id, an `@erase` exactly when that session's steps
+    /// erase memory, and, for a plan that allows a restart, all three `identity.csv` rows.
+    fn flash_plans(&mut self) {
+        let checked = self.checked;
+        let identity = &self.requests.identity;
+        let absent: Vec<&str> = [
+            ("vin", identity.vin.is_none()),
+            (
+                "hardware_part_number",
+                identity.hardware_part_number.is_none(),
+            ),
+            ("software_version", identity.software_version.is_none()),
+        ]
+        .into_iter()
+        .filter(|(_, absent)| *absent)
+        .map(|(name, _)| name)
+        .collect();
+        let uds = self.requests.profile.layer == UDS;
+        let mut errors = Vec::new();
+        for annotation in &checked.annotations {
+            let Annotation::FlashPlan {
+                def,
+                span,
+                session,
+                recovery_never,
+                ..
+            } = annotation
+            else {
+                continue;
+            };
+            if !uds {
+                errors.push((
+                    StarCode::NotInProfile,
+                    *span,
+                    format!(
+                        "the {} profile of this variant's protocols has no flash plan: only UDS \
+                         has one (4.9)",
+                        self.requests.profile.layer
+                    ),
+                ));
+                continue;
+            }
+            let Some(flash) = self
+                .variant
+                .flash_sessions()
+                .into_iter()
+                .flatten()
+                .find(|flash| flash.id() == *session)
+            else {
+                errors.push((
+                    StarCode::UnknownFlashSession,
+                    *span,
+                    format!("the variant declares no flash session {session} (4.9)"),
+                ));
+                continue;
+            };
+            let erases = flash
+                .steps()
+                .into_iter()
+                .flatten()
+                .any(|step| step == FlashStep::EraseMemory);
+            let erase = checked.annotations.iter().find_map(|a| match a {
+                Annotation::Erase { def: at, span, .. } if at == def => Some(*span),
+                _ => None,
+            });
+            match (erases, erase) {
+                (true, None) => errors.push((
+                    StarCode::PlanShape,
+                    *span,
+                    format!(
+                        "flash session {session} has an erase-memory step, so the plan needs \
+                         an `@erase` before its `diag.routine` that erases (4.9)"
+                    ),
+                )),
+                (false, Some(erase)) => errors.push((
+                    StarCode::PlanShape,
+                    erase,
+                    format!(
+                        "flash session {session} has no erase-memory step, so the plan has no \
+                         `@erase` (4.9)"
+                    ),
+                )),
+                _ => {}
+            }
+            let on_site_from_entry = checked.annotations.iter().any(|a| {
+                matches!(
+                    a,
+                    Annotation::Section {
+                        def: at,
+                        kind: SectionKind::RecoveryRequired,
+                        ..
+                    } if at == def
+                )
+            });
+            let moved = checked
+                .annotations
+                .iter()
+                .any(|a| matches!(a, Annotation::RecoveryRequired { def: at, .. } if at == def));
+            if !on_site_from_entry && (*recovery_never || moved) && !absent.is_empty() {
+                errors.push((
+                    StarCode::PlanShape,
+                    *span,
+                    format!(
+                        "a plan that allows a restart needs the vin, hardware_part_number and \
+                         software_version rows of the variant's identity.csv; missing: {} (4.9)",
+                        absent.join(", ")
+                    ),
+                ));
+            }
+        }
+        for (code, span, hint) in errors {
+            self.error(code, span, hint);
         }
     }
 
@@ -3906,6 +4023,19 @@ impl<'a> Lowerer<'a> {
             }
             "precondition" => self.diag_precondition(id, args, span),
             "ecu_info" => self.diag_ecu_info(id, args, key, span),
+            // UDS only (ADR-336 item 9); on UDS the transfer is not lowered yet.
+            "flash_transfer" if self.requests.profile.layer != UDS => {
+                self.error(
+                    StarCode::NotInProfile,
+                    span,
+                    format!(
+                        "the {} profile of this variant's protocols has no `diag.flash_transfer`: \
+                         only UDS has one (3.2, 4.9)",
+                        self.requests.profile.layer
+                    ),
+                );
+                Val::Run(Tys::default(), Vec::new())
+            }
             _ => {
                 self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
                 Val::Run(Tys::default(), Vec::new())

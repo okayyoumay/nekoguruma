@@ -1581,3 +1581,382 @@ fn long_runs_of_one_character_lex_without_overflow() {
     let continuations = format!("def main():\n    x = 1{}\n", " \\\n".repeat(300_000));
     assert!(check("test.star", &continuations).is_ok());
 }
+
+// ---------------------------------------------------------------- Flash plans (4.9, ADR-336)
+
+/// A valid plan: its section, annotation, `@erase`, transfer and the mandatory preconditions.
+const PLAN: &str = "\
+# @section uninterruptible expected=1000
+# @flashPlan session=1
+def write():
+    # @erase
+    diag.routine(0xFF00, 1, {})
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+";
+
+/// The codes of `PLAN` with its `from` replaced by `to`.
+fn plan_codes(from: &str, to: &str) -> Vec<(StarCode, u32)> {
+    assert!(PLAN.contains(from), "{from}");
+    codes(&PLAN.replace(from, to))
+}
+
+#[test]
+fn a_valid_flash_plan_passes_with_its_annotations() {
+    let checked = passes(PLAN);
+    let span = |checked: &Checked, wanted: u32| {
+        checked.annotations.iter().find_map(|a| match a {
+            Annotation::FlashPlan { line, span, .. }
+            | Annotation::Erase { line, span, .. }
+            | Annotation::RecoveryRequired { line, span, .. }
+                if *line == wanted =>
+            {
+                Some(*span)
+            }
+            _ => None,
+        })
+    };
+    assert_eq!(
+        checked.annotations[1],
+        Annotation::FlashPlan {
+            line: 2,
+            def: 3,
+            span: span(&checked, 2).unwrap(),
+            session: 1,
+            max_resumes: 3,
+            recovery_never: false
+        }
+    );
+    assert_eq!(
+        checked.annotations[2],
+        Annotation::Erase {
+            line: 4,
+            def: 3,
+            span: span(&checked, 4).unwrap(),
+            statement_at: PLAN.find("diag.routine").unwrap() as u32
+        }
+    );
+    // Every attribute, in any order, and `@recoveryRequired` on a statement of the plan.
+    let source = PLAN
+        .replace("session=1", "recovery=never maxResumes=65535 session=7")
+        .replace("flash_transfer(1)", "flash_transfer(7)");
+    let checked = passes(&source);
+    assert!(matches!(
+        checked.annotations[1],
+        Annotation::FlashPlan {
+            session: 7,
+            max_resumes: 65_535,
+            recovery_never: true,
+            ..
+        }
+    ));
+    let source = PLAN.replace("    res =", "    # @recoveryRequired\n\n    res =");
+    let checked = passes(&source);
+    assert!(checked.annotations.iter().any(|a| matches!(
+        a,
+        Annotation::RecoveryRequired {
+            line: 6,
+            def: 3,
+            ..
+        }
+    )));
+    // A session of a constant, and a call in an `if`, are fine.
+    let source = PLAN
+        .replace("# @preconditions", "SESSION = 1\n\n# @preconditions")
+        .replace("flash_transfer(1)", "flash_transfer(SESSION)")
+        .replace("    write()", "    if True:\n        write()");
+    passes(&source);
+    // `diag.flash_transfer` outside a plan is the lowering's to refuse, not the checker's.
+    passes("def main():\n    diag.flash_transfer(1)\n");
+}
+
+#[test]
+fn flash_plan_annotations_are_checked() {
+    use StarCode::{ArgumentOutOfRange as Range, BadAnnotation as Bad};
+    let flash = |text: &str| plan_codes("# @flashPlan session=1", text);
+    assert_eq!(flash("# @flashPlan"), [(Bad, 2)]);
+    assert_eq!(flash("# @flashPlan maxResumes=2"), [(Bad, 2)]);
+    assert_eq!(flash("# @flashPlan session=x"), [(Bad, 2)]);
+    assert_eq!(flash("# @flashPlan session=1 session=2"), [(Bad, 2)]);
+    assert_eq!(flash("# @flashPlan session=1 recovery=always"), [(Bad, 2)]);
+    assert_eq!(
+        flash("# @flashPlan session=1 recovery=never recovery=never"),
+        [(Bad, 2)]
+    );
+    assert_eq!(flash("# @flashPlan session=1 maxResumes=0"), [(Range, 2)]);
+    assert_eq!(
+        flash("# @flashPlan session=1 maxResumes=65536"),
+        [(Range, 2)]
+    );
+    assert_eq!(flash("# @flashPlan session=1 maxResumes=-1"), [(Range, 2)]);
+    assert_eq!(flash("# @flashPlan session=-1"), [(Range, 2)]);
+    // The maximum id is the reserved id of a plain procedure.
+    assert_eq!(flash("# @flashPlan session=4294967295"), [(Range, 2)]);
+    assert!(matches!(
+        passes(&PLAN.replace("session=1", "session=1 maxResumes=65535")).annotations[1],
+        Annotation::FlashPlan {
+            max_resumes: 65_535,
+            ..
+        }
+    ));
+    // A `def` takes one.
+    assert_eq!(
+        flash("# @flashPlan session=1\n# @flashPlan session=1"),
+        [(Bad, 3)]
+    );
+    // Placement: directly before a top-level `def`, alone at the start of its line.
+    let nested = "\
+def main():
+    # @flashPlan session=1
+    diag.wait(1)
+";
+    assert_eq!(codes(nested), [(Bad, 2)]);
+    assert_eq!(
+        codes("def f():\n    pass\n\n# @flashPlan session=1\nx = 1\ndef main():\n    f()\n"),
+        [(Bad, 4)]
+    );
+    assert_eq!(
+        plan_codes("def write():", "def write():  # @flashPlan session=1"),
+        [(Bad, 3)]
+    );
+    // `@erase` and `@recoveryRequired` take no argument, stand before a statement, belong to
+    // a plan function and to a top-level statement of it, and are given once.
+    assert_eq!(plan_codes("# @erase", "# @erase now"), [(Bad, 4)]);
+    assert_eq!(plan_codes("# @erase", "# @erase\n    # @erase"), [(Bad, 5)]);
+    assert_eq!(plan_codes("# @erase", "# @recoveryRequired x"), [(Bad, 4)]);
+    assert_eq!(
+        plan_codes("    write()", "    # @erase\n    write()"),
+        [(Bad, 10)]
+    );
+    assert_eq!(
+        plan_codes("    write()", "    # @recoveryRequired\n    write()"),
+        [(Bad, 10)]
+    );
+    assert_eq!(
+        plan_codes(
+            "    # @erase\n    diag.routine(0xFF00, 1, {})",
+            "    if True:\n        # @erase\n        diag.routine(0xFF00, 1, {})"
+        ),
+        [(Bad, 5)]
+    );
+    assert_eq!(
+        plan_codes(
+            "    res =",
+            "    # @recoveryRequired\n    # @recoveryRequired\n    res ="
+        ),
+        [(Bad, 7)]
+    );
+    assert_eq!(
+        plan_codes(
+            "    res = diag.flash_transfer(1)",
+            "    diag.flash_transfer(1)  # @erase"
+        ),
+        [(Bad, 6)]
+    );
+}
+
+#[test]
+fn a_flash_plan_breaks_a_shape_rule() {
+    use StarCode::{BadAnnotation as Bad, PlanShape as Shape};
+    let call = "    write()";
+    // Called never, twice, in a `for`, as a value, by another function or by a section.
+    assert_eq!(plan_codes(call, "    pass"), [(Shape, 3)]);
+    assert_eq!(plan_codes(call, "    write()\n    write()"), [(Shape, 11)]);
+    assert_eq!(
+        plan_codes(call, "    for i in range(2):\n        write()"),
+        [(Shape, 11)]
+    );
+    assert_eq!(
+        plan_codes(
+            call,
+            "    for i in range(2):\n        if i:\n            write()"
+        ),
+        [(Shape, 12)]
+    );
+    assert_eq!(plan_codes(call, "    x = write()"), [(Shape, 10)]);
+    let helper = |annotation: &str| {
+        let pre = "# @preconditions voltage externalSupply ignition\ndef main():\n    write()";
+        plan_codes(
+            pre,
+            &format!(
+                "{annotation}def helper():\n    write()\n\n# @preconditions voltage externalSupply \
+                 ignition\ndef main():\n    helper()"
+            ),
+        )
+    };
+    assert_eq!(helper(""), [(Shape, 9)]);
+    // A section function that calls the plan breaks the nesting rule of 4.5 as well.
+    assert_eq!(
+        helper("# @section interruptible\n"),
+        [(Bad, 10), (Shape, 10)]
+    );
+    // A plan that calls a plan is a section function that calls the plan, which is a section.
+    let two = "\
+# @section uninterruptible
+# @flashPlan session=1
+def first():
+    # @erase
+    diag.routine(0xFF00, 1, {})
+    diag.flash_transfer(1)
+    second()
+
+# @section uninterruptible
+# @flashPlan session=2
+def second():
+    # @erase
+    diag.routine(0xFF00, 1, {})
+    diag.flash_transfer(2)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    first()
+";
+    assert_eq!(codes(two), [(Bad, 7), (Shape, 7)]);
+    // `main` cannot be a plan, and a plan returns nothing.
+    assert_eq!(
+        codes("# @flashPlan session=1\ndef main():\n    pass\n"),
+        [(Shape, 1)]
+    );
+    assert_eq!(
+        plan_codes("    res =", "    if True:\n        return\n    res ="),
+        [(Shape, 7)]
+    );
+}
+
+#[test]
+fn a_flash_plan_needs_its_section_and_one_transfer() {
+    use StarCode::PlanShape as Shape;
+    let transfer = "    res = diag.flash_transfer(1)";
+    assert_eq!(
+        plan_codes("# @section uninterruptible expected=1000\n", ""),
+        [(Shape, 2)]
+    );
+    assert_eq!(
+        plan_codes("uninterruptible expected=1000", "interruptible"),
+        [(Shape, 3)]
+    );
+    passes(&PLAN.replace("uninterruptible", "recoveryRequired"));
+    assert_eq!(plan_codes(transfer, "    pass"), [(Shape, 3)]);
+    assert_eq!(
+        plan_codes(transfer, &format!("{transfer}\n    diag.flash_transfer(1)")),
+        [(Shape, 7)]
+    );
+    // The session must be the annotation's, through a constant too.
+    assert_eq!(
+        plan_codes(transfer, "    res = diag.flash_transfer(2)"),
+        [(Shape, 6)]
+    );
+    assert_eq!(
+        codes(
+            &PLAN
+                .replace("# @preconditions", "OTHER = 4\n\n# @preconditions")
+                .replace("flash_transfer(1)", "flash_transfer(OTHER)")
+        ),
+        [(Shape, 6)]
+    );
+    // The transfer is a top-level statement: not in an `if`, not inside a larger expression.
+    assert_eq!(
+        plan_codes(transfer, "    if True:\n        diag.flash_transfer(1)"),
+        [(Shape, 7)]
+    );
+    assert_eq!(
+        plan_codes(transfer, "    res = diag.flash_transfer(1)[\"raw\"]"),
+        [(Shape, 6)]
+    );
+}
+
+#[test]
+fn erase_and_recovery_required_in_a_flash_plan() {
+    use StarCode::PlanShape as Shape;
+    let erase = "    # @erase\n    diag.routine(0xFF00, 1, {})\n";
+    let transfer = "    res = diag.flash_transfer(1)\n";
+    // `@erase` precedes one `diag.routine` call, before the transfer.
+    assert_eq!(
+        plan_codes(erase, "    # @erase\n    diag.wait(1)\n"),
+        [(Shape, 4)]
+    );
+    assert_eq!(
+        plan_codes(erase, "    # @erase\n    diag.request(0x11, {})\n"),
+        [(Shape, 4)]
+    );
+    assert_eq!(
+        plan_codes(&format!("{erase}{transfer}"), &format!("{transfer}{erase}")),
+        [(Shape, 5)]
+    );
+    // Not the erase of two statements.
+    assert_eq!(
+        plan_codes(
+            erase,
+            "    # @erase\n    diag.routine(0xFF00, 1, {})\n    # @erase\n    diag.routine(0xFF01, 1, {})\n"
+        ),
+        [(Shape, 6)]
+    );
+    // `@erase` assigned to a name is a single call too.
+    passes(&PLAN.replace("    diag.routine", "    r = diag.routine"));
+    // `@recoveryRequired` and `recovery=never` exclude each other, and a plan whose section is
+    // `recoveryRequired` takes neither.
+    let marked = "    # @recoveryRequired\n    res = diag.flash_transfer(1)";
+    passes(&PLAN.replace("    res = diag.flash_transfer(1)", marked));
+    passes(&PLAN.replace("session=1", "session=1 recovery=never"));
+    assert_eq!(
+        codes(
+            &PLAN
+                .replace("    res = diag.flash_transfer(1)", marked)
+                .replace("session=1", "session=1 recovery=never")
+        ),
+        [(Shape, 6)]
+    );
+    let required = PLAN.replace("uninterruptible", "recoveryRequired");
+    assert_eq!(
+        codes(&required.replace("session=1", "session=1 recovery=never")),
+        [(Shape, 2)]
+    );
+    assert_eq!(
+        codes(&required.replace("    res = diag.flash_transfer(1)", marked)),
+        [(Shape, 6)]
+    );
+}
+
+#[test]
+fn a_procedure_with_a_flash_plan_names_its_mandatory_preconditions() {
+    use StarCode::PlanShape as Shape;
+    // Missing altogether: reported at `main`.
+    assert_eq!(
+        plan_codes("# @preconditions voltage externalSupply ignition\n", ""),
+        [(Shape, 8)]
+    );
+    // Missing a kind: reported at the annotation, which names it.
+    let source = PLAN.replace("voltage externalSupply ignition", "voltage ignition engine");
+    let errors = check("test.star", &source).unwrap_err();
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(Shape, 8)]
+    );
+    assert!(
+        errors[0].hint.contains("missing: externalSupply"),
+        "{}",
+        errors[0].hint
+    );
+    // A procedure without a plan needs none of them.
+    passes("def main():\n    pass\n");
+}
+
+#[test]
+fn flash_plan_codes_are_named_as_specified() {
+    assert_eq!(StarCode::PlanShape.as_str(), "STAR_PLAN_SHAPE");
+    assert_eq!(
+        StarCode::UnknownFlashSession.as_str(),
+        "STAR_UNKNOWN_FLASH_SESSION"
+    );
+    assert_eq!(
+        serde_json::to_string(&StarCode::PlanShape).unwrap(),
+        "\"STAR_PLAN_SHAPE\""
+    );
+    assert_eq!(
+        serde_json::to_string(&StarCode::UnknownFlashSession).unwrap(),
+        "\"STAR_UNKNOWN_FLASH_SESSION\""
+    );
+}

@@ -1,7 +1,7 @@
 # ADR-330: A Cancel Waits for an Interruptible Point
 
 **Date:** 2026-10-18
-**Status:** Accepted (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337)
+**Status:** Accepted (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337; item 2 amended by ADR-340: a procedure that ends while an HMI timeout's cancel is held ends as cancelled, not completed)
 **Affects:** `agent` job runner (`run_vm`, `cancel_held_at`, `holds_cancel` in
 `crates/agent/src/runner.rs`), `crates/agent/docs/ngr-agent.md`; design 5.6, 8.10.1; ADR-235
 item 7, ADR-252 item 3, ADR-301, ADR-329

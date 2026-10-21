@@ -319,7 +319,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-327](ADR-327-vehicle-identification-on-the-agent.md) | Vehicle Identification Runs on the Agent | Accepted | `agent` identification job and variant guard, `server` identification plans and guard lists, variant attributes and definitive negative responses in `diag-frontend` / `diag-ir`; design 8.2.4, 8.2.5, 8.8.2, 8.9.1; ADR-229 item 2, ADR-235 items 3 and 8, ADR-244's record set, ADR-315 item 3, ADR-318 items 1 and 4 and its Consequences, ADR-324 items 1 and 2, ADR-325 item 7, ADR-326 items 2, 3 and 5 and its Consequences |
 | [ADR-328](ADR-328-dry-run-with-vehicle-access-mocked.md) | Dry Run with Vehicle Access Mocked | Accepted (`FlashBlock` served as zero bytes of the requested length by ADR-336) | `diag-ir` `dry_run` (`Script`, `DryRunReport`), `diag-frontend` dry-run tests; design 12.1, `starlark-subset.md` 6; ADR-233, ADR-280, ADR-297, ADR-321 |
 | [ADR-329](ADR-329-a-lowered-section-is-check-state-until-idempotency-is-lowered.md) | A Lowered Section Is CheckState Until Idempotency Is Lowered | Accepted (item 3 realized by ADR-332) | `diag-frontend` lowering of section functions; `starlark-subset.md` 4.5, design 8.4; ADR-245, ADR-271, ADR-301 |
-| [ADR-330](ADR-330-a-cancel-waits-for-an-interruptible-point.md) | A Cancel Waits for an Interruptible Point | Accepted (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337) | `agent` job runner (`run_vm`, `cancel_held_at`, `holds_cancel`), `crates/agent/docs/ngr-agent.md`; design 5.6, 8.10.1; ADR-235 item 7, ADR-252 item 3, ADR-301, ADR-329 |
+| [ADR-330](ADR-330-a-cancel-waits-for-an-interruptible-point.md) | A Cancel Waits for an Interruptible Point | Accepted (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337; item 2 amended by ADR-340: a procedure that ends while an HMI timeout's cancel is held ends as cancelled, not completed) | `agent` job runner (`run_vm`, `cancel_held_at`, `holds_cancel`), `crates/agent/docs/ngr-agent.md`; design 5.6, 8.10.1; ADR-235 item 7, ADR-252 item 3, ADR-301, ADR-329 |
 | [ADR-331](ADR-331-debug-builds-treat-iso22900-mock-as-the-simulator.md) | Debug Builds Treat `iso22900-mock` as the Simulator | Accepted | `agent` policy (`identify`), `crates/agent/docs/ngr-agent.md`, `iso22900-service` definition end-to-end test, design 8.2.4; ADR-247, ADR-299 |
 | [ADR-332](ADR-332-a-diag-calls-idempotency-is-a-one-instruction-section.md) | A `diag` Call's Idempotency Is a One-Instruction Section | Accepted (item 6 amended by ADR-336: a section function inside a plan is entered by fallthrough, and the 4.6 revisit is done there) | `diag-frontend` lowering of `@idempotency` and section ranges, `starlark-subset.md` 4.5, 4.6, design 8.2.5; ADR-233, ADR-301, ADR-329, ADR-330 |
 | [ADR-333](ADR-333-hardware-check-guard-is-one-pure-decision-and-teardown-is-owned-by-the-run-guard.md) | The Hardware-Check Guard Is One Pure Decision over the Profile, and Teardown Is Owned by the Run Guard | Accepted | `ngr-hw-checks` guard, teardown, `report::RunGuard`, design 13.5; ADR-275 items 4 and 6 |
@@ -329,6 +329,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-337](ADR-337-a-run-start-is-an-interruptible-point.md) | A Run's Start Is an Interruptible Point | Accepted | `agent` job runner (`run_on_from`, `run_vm`), `crates/agent/docs/ngr-agent.md`, Starlark subset 4.5; design 5.6, 8.10.1; ADR-330, ADR-332, ADR-336 |
 | [ADR-338](ADR-338-diag-precondition-reads-a-declared-source.md) | `diag.precondition` Reads the Row's Default-Session Source | Accepted | `diag-ir` (`Op::ReadInput`, `DiagHost::runtime_input`, `IR_SCHEMA_VERSION` 17, dry run), `diag-frontend` Starlark lowering, `agent` policy and host, Starlark subset 3.1, 3.2, 4.6 and 5, design 8.2.4, 8.9; ADR-233, ADR-245, ADR-254, ADR-316, ADR-321, ADR-328, ADR-336 |
 | [ADR-339](ADR-339-diag-ecu-info-reads-the-declared-identity.md) | `diag.ecu_info` Reads the Declared Identity Through a Literal Key | Accepted | `diag-frontend` Starlark lowering (`STAR_UNKNOWN_IDENTITY`), Starlark subset 3.2, 3.4, 4.6 and 5, `csv-tables.md` 4.13; ADR-254, ADR-336, ADR-338 |
+| [ADR-340](ADR-340-hmi-forms-are-encoded-hmi-forms-answered-as-status-and-text.md) | HMI Forms and Record Templates Are Encoded `HmiForm`s, Answered as a Status Byte and Text | Accepted | `diag-ir` (`hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 18, `Program::validate`, dry run), `diag-frontend` lowering of `diag.hmi` and `diag.record`, `agent` host and runner (the agent-server protocol left to an ADR of its own), Starlark subset 2.5, 3.1, 3.2, 3.4 and 4.6, design 5.6, 5.7, 8.2.4, 8.6; ADR-229, ADR-233, ADR-254, ADR-304, ADR-317, ADR-328, ADR-330, ADR-335 |
 
 ## Status Legend
 
@@ -719,7 +720,7 @@ the predecessor repository these ADRs came from.
 - ADR-291 (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal)
 - ADR-293 (a job with several target combinations keeps a journal when any of them would, by ADR-325 item 7; items 1 to 3 amended by ADR-335: every journaled job keeps a journal, and a missing one is a plain start only for an all-`Safe` program)
 - ADR-294
-- ADR-330 (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337)
+- ADR-330 (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337; item 2 amended by ADR-340: a procedure that ends while an HMI timeout's cancel is held ends as cancelled, not completed)
 - ADR-331
 - ADR-335 (the Consequences' remedy realized by ADR-336: session control and TesterPresent default to `Safe`)
 - ADR-336
@@ -769,6 +770,7 @@ the predecessor repository these ADRs came from.
 - ADR-336
 - ADR-338
 - ADR-339
+- ADR-340
 
 ### Acquired Data & Monitoring
 - ADR-236

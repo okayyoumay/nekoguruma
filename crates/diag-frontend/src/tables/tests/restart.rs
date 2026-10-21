@@ -61,7 +61,7 @@ fn the_example_declares_its_identity_preconditions_and_recovery_facts() {
             Some(2000),
             Some(3000),
             Some(3),
-            None
+            Some(0x22)
         )
     );
     let segment = &tables.flash_segments[0];

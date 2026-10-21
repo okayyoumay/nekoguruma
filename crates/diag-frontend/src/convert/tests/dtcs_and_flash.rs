@@ -153,7 +153,7 @@ fn segment_formats_reach_the_loaded_document() {
 
 #[test]
 fn dtcs_and_flash_sessions_follow_their_variants_and_layouts() {
-    // Ids 36 to 38 follow the example's 35 fields.
+    // Ids 40 to 42 follow the example's 39 fields.
     let files = with_fields(&[
         "layout:snap,odometer,0,,uint,16,,,,,,,,,,,",
         "layout:snap,temperature,2,,int,8,,,,,,,,,,,",
@@ -185,10 +185,10 @@ fn dtcs_and_flash_sessions_follow_their_variants_and_layouts() {
     );
     let documents = documents(&convert(files));
     let snapshot = [
-        (36, "odometer", 0, 16, DataKind::Uint),
-        (37, "temperature", 16, 8, DataKind::Int),
+        (40, "odometer", 0, 16, DataKind::Uint),
+        (41, "temperature", 16, 8, DataKind::Int),
     ];
-    let extended = [(38, "occurrences", 0, 8, DataKind::Uint)];
+    let extended = [(42, "occurrences", 0, 8, DataKind::Uint)];
     assert_eq!(
         dtcs(&documents[0]),
         [(0x91_0116, "B1101-16", 20), (0x12_3456, "P1234-56", 21)]

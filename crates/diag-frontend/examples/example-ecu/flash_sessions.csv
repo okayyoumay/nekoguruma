@@ -1,2 +1,2 @@
-id,name,steps,session_timeout_ms,teardown_margin_ms,ecu_startup_ms,confirmation_window_ms,version_read_retries
-1,application,enter-programming-session;security-access;erase-memory;request-download;transfer-data;transfer-exit;check-memory;ecu-reset,5000,1000,2000,3000,3
+id,name,steps,session_timeout_ms,teardown_margin_ms,ecu_startup_ms,confirmation_window_ms,version_read_retries,no_application_nrc
+1,application,enter-programming-session;security-access;erase-memory;request-download;transfer-data;transfer-exit;check-memory;ecu-reset,5000,1000,2000,3000,3,0x22

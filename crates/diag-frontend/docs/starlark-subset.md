@@ -751,6 +751,14 @@ def main():
     write_application()
 ```
 
+The example write procedure, `examples/sequence.example.star`, is a plan of this shape for session 1
+of `examples/example-ecu/`, called once from `main` with `# @preconditions voltage externalSupply
+ignition`: it enters the programming session, unlocks, erases (`# @erase`), transfers, checks with
+`checkProgrammingDependencies` and resets the ECU, calls no function, and keeps the default
+recovery point at the erase, so it needs no identity rows. The golden procedure
+(`tests/golden/procedure.star`) holds such a plan too, so the golden files record its expansion
+and `Program.flash`.
+
 - **`# @flashPlan session=<int> [maxResumes=<int>] [recovery=never]`.** It stands directly before a
   top-level `def` other than `main`, under the placement rules of `@section` (4.5), and may share
   the `def` with one. `session` must name a `FlashSession` of the target the call

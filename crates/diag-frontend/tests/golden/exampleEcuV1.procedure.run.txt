@@ -10,10 +10,20 @@ log 1 two DTCs
 routine FF01 01
 log 1 programming dependencies correct
 request 27 01
-security-access 01 
+security-access 01 12 34
 request 27 02 C0 DE
 log 1 unlocked
 request 22 F1 90
 request 2E F1 90 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31
+request 10 02
+request 27 01
+security-access 01 12 34
+request 27 02 C0 DE
+routine FF00 01
+request 34 00 44 00 00 00 00 00 01 00 00
+flash-transfer 256 blocks 65536 bytes sum 8189175
+request 37 
+routine FF01 01
+request 11 01
 log 1 done
 finished

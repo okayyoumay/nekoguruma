@@ -858,15 +858,24 @@ does not have:
   procedure reads through their conversions.
 - `services.csv`: three session controls told apart by their `sub` constant, and
   ReadDTCInformation by status mask, whose response repeats the `dtcRecord` layout to the end of
-  the message.
+  the message; then the services the example write procedure sends (`examples/sequence.example.star`):
+  ECUReset (request and response `reset`), SecurityAccess, RequestDownload (whose response gives the
+  length format and the maximum block length) and RequestTransferExit. SecurityAccess, RequestDownload and
+  RequestTransferExit have no request fields, so any request with their SID belongs to them: a
+  dry run answers the seed and key requests of `diag.security_access` and the download and exit
+  of `diag.flash_transfer` through them.
 - `routines.csv`: eraseMemory, behind security access, and checkProgrammingDependencies, with its
   result as a text table; both start only, in the programming session.
 - `dtcs.csv`: two DTCs sharing the `dtcStatus` layout, whose eight one-bit fields are the bits
   of the DTC status byte (ISO 14229-1 (2026) Annex D), under names of the example's own.
-- `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment, with the
-  recovery timings and the RequestDownload format bytes.
+- `flash_sessions.csv` and `flash_segments.csv`: one flash session with one segment, with all
+  the recovery facts (the timings, the version read retries and the no-application NRC) and the
+  RequestDownload format bytes. The session lists every step, `erase-memory` included, so the
+  example write procedure marks its erase with `# @erase`.
 - `identity.csv`: the VIN, the one field of its DID. The spare part number and software version
-  DIDs are terminated text, which an identity row refuses (4.13), so they have no row.
+  DIDs are terminated text, which an identity row refuses (4.13), so they have no row. The
+  example write procedure keeps the default recovery point at the erase, which allows no restart
+  after it and so needs no identity rows (`starlark-subset.md` 4.9).
 - `preconditions.csv`: the five preconditions, all read from the agent's inputs.
 
 A row of `fields.csv` from it, the VIN in its data record:

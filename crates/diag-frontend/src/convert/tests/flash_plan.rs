@@ -81,16 +81,6 @@ fn with_segment(
     )
 }
 
-/// The example with an ECU reset service whose one request field is `reset`.
-fn with_ecu_reset(files: Vec<(String, Vec<u8>)>) -> Vec<(String, Vec<u8>)> {
-    let files = appended(files, "services.csv", &["ecuReset,0x11"]);
-    appended(
-        files,
-        "fields.csv",
-        &["request:ecuReset,reset,0,,uint,8,,,,,,,,,"],
-    )
-}
-
 /// What lowering `source` for every variant of `files` gives: a program for each, or the errors.
 fn lowered(
     files: Vec<(String, Vec<u8>)>,
@@ -173,7 +163,7 @@ fn a_plan_with_the_default_recovery_point_requires_intervention_from_the_erase()
     );
     assert_eq!(plan.timing, TIMING);
     assert_eq!(plan.version_read_retries, 3);
-    assert_eq!(plan.no_application, None);
+    assert_eq!(plan.no_application, Some(NoApplication::Nrc(0x22)));
     // The identity sources are the variant's table, the preconditions the named ones.
     assert!(program.identity.vin.is_some());
     assert!(program.preconditions.voltage_mv.is_some());
@@ -281,7 +271,7 @@ def main():
     write()
     diag.request(0x11, {\"reset\": 4})
 ";
-    let (program, plan) = one_plan(with_ecu_reset(example()), source);
+    let (program, plan) = one_plan(example(), source);
     let idempotency_of = |pc: u32| {
         let covering: Vec<_> = program
             .sections
@@ -334,8 +324,8 @@ def main():
     // An unannotated reset is `CheckState` in the plan and validates; the unsafe one is refused,
     // as `Program::validate` finds an unsafe section in the replay.
     let unannotated = source.replace("    # @idempotency unsafe\n", "");
-    one_plan(with_ecu_reset(identity_table()), &unannotated);
-    let errors = lowered(with_ecu_reset(identity_table()), source).expect_err("refused");
+    one_plan(identity_table(), &unannotated);
+    let errors = lowered(identity_table(), source).expect_err("refused");
     // The refusal names a section, not a pc: it stays not lowerable, at the file's first
     // statement.
     assert_eq!(
@@ -381,7 +371,7 @@ def write_application():
 def main():
     write_application()
 ";
-    let (program, plan) = one_plan(with_ecu_reset(identity_table()), source);
+    let (program, plan) = one_plan(identity_table(), source);
     assert_eq!(plan.recovery_required, RecoveryRequired::Never);
     assert!(program.preconditions.engine.is_some());
     assert!(program.preconditions.vehicle_speed.is_some());
@@ -535,14 +525,9 @@ fn a_lowered_plan_serves_the_blocks_from_the_artifact_in_order() {
 #[test]
 fn a_dry_run_serves_zero_blocks_to_a_lowered_plan() {
     use diag_ir::dry_run::{DryRunEnd, DryRunEvent, Script, dry_run};
-    // The dry run answers a request through a declared service, so the download and the exit
-    // are declared here, which the example does not do.
+    // The dry run answers a request through a declared service: the example declares the
+    // download and the exit.
     let files = with_segment(example(), "0x08000000", "0x25", "0x10", "0x44");
-    let files = appended(
-        files,
-        "services.csv",
-        &["requestDownload,0x34", "requestTransferExit,0x37"],
-    );
     let source = "\
 # @section uninterruptible expected=180000
 # @flashPlan session=1
@@ -662,5 +647,93 @@ fn a_session_row_that_leaves_a_recovery_fact_empty_is_plan_shape_at_the_annotati
             [(StarCode::PlanShape, 2)],
             "{row}"
         );
+    }
+}
+
+/// The example write procedure (`examples/sequence.example.star`) lowers for every variant of
+/// the example ECU to a valid program with the plan its session's columns give, and a dry run
+/// carries it through the plan with the example's own declared services.
+#[test]
+fn the_example_write_procedure_lowers_and_dry_runs_for_every_variant() {
+    use diag_ir::RuntimeInput;
+    use diag_ir::dry_run::{DryRunEnd, DryRunEvent, Script, dry_run};
+    let source = include_str!("../../../examples/sequence.example.star");
+    let converted = convert(with(example(), "main.star", source));
+    assert_eq!(converted.documents.len(), 2);
+    for converted in &converted.documents {
+        let document = load_ecu_document(&converted.bytes).expect("the document loads");
+        let program: Program =
+            postcard::from_bytes(document.procedure().expect("a program").bytes())
+                .expect("a program");
+        program.validate().expect("valid");
+        // One plan, the example's session 1, expanded in place: no call inside it (the
+        // read-back after it calls a function).
+        assert_eq!(program.flash.len(), 1, "{}", converted.name);
+        let plan = &program.flash[0];
+        let inside =
+            plan.boundaries.entry_pc as usize..plan.boundaries.post_transfer_end_pc as usize;
+        assert!(
+            !program.code[inside]
+                .iter()
+                .any(|op| matches!(op, Op::Call(_)))
+        );
+        assert!(program.code.iter().any(|op| matches!(op, Op::Call(_))));
+        assert_eq!(
+            (plan.flash_session, plan.stage, plan.max_resumes),
+            (1, 1, 3)
+        );
+        assert_eq!(plan.timing, TIMING);
+        assert_eq!(plan.version_read_retries, 3);
+        assert_eq!(plan.no_application, Some(NoApplication::Nrc(0x22)));
+        let erase = find(&program, 0, routine(0xFF00));
+        assert_eq!(plan.boundaries.erase_pc, erase);
+        assert_eq!(plan.recovery_required, RecoveryRequired::FromPc(erase));
+        assert!(!plan.allows_restart());
+        // The plan's section is uninterruptible, one piece per primitive, all inside the plan.
+        let pieces: Vec<_> = program
+            .sections
+            .iter()
+            .filter(|s| s.end_pc <= plan.boundaries.post_transfer_end_pc)
+            .collect();
+        assert_eq!(pieces[0].start_pc, plan.boundaries.entry_pc);
+        for section in pieces {
+            assert!(matches!(section.interruptible, Interruptible::No));
+            assert_eq!(section.expected_millis, 120_000);
+        }
+        assert!(program.preconditions.voltage_mv.is_some());
+        assert!(program.preconditions.external_supply.is_some());
+        assert!(program.preconditions.ignition.is_some());
+        assert!(program.preconditions.engine.is_none());
+        assert!(program.preconditions.vehicle_speed.is_none());
+
+        let script = Script::new()
+            .input(RuntimeInput::SupplyVoltageMillivolts, 13_000)
+            .response("programmingSession", [0x50, 0x02, 0x00, 0x32, 0x01, 0xF4])
+            .key([0x12, 0x34, 0x56, 0x78])
+            .response("securityAccess", [0x67, 0x01, 0x00, 0x00, 0x00, 0x00])
+            .response("securityAccess", [0x67, 0x02])
+            .response("eraseMemory.start", [0x71, 0x01, 0xFF, 0x00])
+            .response("requestDownload", [0x74, 0x20, 0x01, 0x00])
+            .response("requestTransferExit", [0x77])
+            .response(
+                "checkProgrammingDependencies.start",
+                [0x71, 0x01, 0xFF, 0x01, 0x00],
+            )
+            .response("ecuReset", [0x51, 0x01])
+            .response("softwareVersion.read", [0x62, 0xF1, 0x89, b'1', b'.', b'0']);
+        let report = dry_run(
+            &program,
+            &document.variant().expect("a variant"),
+            &script,
+            1_000_000,
+        );
+        assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+        // The example's segment is 0x10000 bytes in blocks of 0x100.
+        let blocks = report
+            .events
+            .iter()
+            .filter(|event| matches!(event, DryRunEvent::FlashTransfer { .. }))
+            .count();
+        assert_eq!(blocks, 256);
     }
 }

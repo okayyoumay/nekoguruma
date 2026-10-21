@@ -16,7 +16,7 @@ use vci_service_interface::{
 };
 
 use crate::host::{HostError, unary};
-use crate::policy::Permission;
+use crate::policy::{ApplicationLayer, Permission};
 
 /// What a job's link needs: from the protocol a job's document declares
 /// ([`LinkConfig::declared`], ADR-324), or built by the caller for a program without one.
@@ -132,6 +132,12 @@ impl LinkConfig {
             .validate()
             .map_err(|error| refuse(error.to_string()))?;
         Ok(config)
+    }
+
+    /// The application layer the link carries: UDS on the one protocol [`LinkConfig::validate`]
+    /// accepts, and none on any other, so that a read-only job could send nothing on it.
+    pub fn application_layer(&self) -> Option<ApplicationLayer> {
+        (self.protocol_short_name == PROTOCOL_UDS_ON_CAN).then_some(ApplicationLayer::Uds)
     }
 
     /// Refuses values the worker would read differently from the host: the worker replaces a
@@ -261,6 +267,9 @@ pub struct Link {
     /// Not public: only [`open`] may decide it, so a library caller cannot grant a link to a
     /// real VCI the simulator permission.
     pub(crate) permission: Permission,
+    /// The application layer whose read-only list the policy applies to the link's requests
+    /// (ADR-342), from [`LinkConfig::application_layer`].
+    pub(crate) application_layer: Option<ApplicationLayer>,
 }
 
 impl Link {
@@ -375,6 +384,7 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
             cll_handle,
             events,
             permission,
+            application_layer: config.application_layer(),
         }),
         Err(error) => {
             let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
@@ -677,6 +687,7 @@ pub async fn close<C: WorkerApi>(
         cll_handle,
         events,
         permission: _,
+        application_layer: _,
     } = link;
     drop(events);
     teardown(client, module_handle, cll_handle, deadline).await

@@ -1,4 +1,4 @@
-//! Which requests the minimal runner may send (ADR-235 item 8, ADR-247).
+//! Which requests the minimal runner may send (ADR-235 item 8, ADR-247, ADR-342).
 //!
 //! Until job authorization, approval and the execution preconditions exist (design 5.5, 5.6,
 //! 6, 8.9), a job may only read: a request that changes the ECU's state, session or memory is
@@ -20,7 +20,8 @@ use crate::host::HostError;
 /// What a job may send, decided per link.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Permission {
-    /// Only [`READ_ONLY_SERVICES`] (ADR-235 item 8).
+    /// Only the read-only services of the link's application layer
+    /// ([`ApplicationLayer::read_only_services`], ADR-235 item 8, ADR-342).
     ReadOnly,
     /// Any request the host implements, on a simulated VCI of a debug build (ADR-247, ADR-331).
     /// The `FlashTransfer` instruction is covered too (ADR-250). The `SecurityAccess`
@@ -29,10 +30,54 @@ pub enum Permission {
     Simulator,
 }
 
-/// ReadDTCInformation and ReadDataByIdentifier: they change nothing on the ECU. TesterPresent
-/// is left out: it keeps the ECU's current session alive, which a job may only do once it owns
-/// that session.
-pub const READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
+/// An application layer the agent has a read-only list for (ADR-309 item 4, ADR-342). Adding one
+/// is an agent change, since the match in [`ApplicationLayer::read_only_services`] must name its
+/// list; the program never says which of its services are read-only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ApplicationLayer {
+    Uds,
+}
+
+impl ApplicationLayer {
+    /// The layer a protocol declaration names (`Protocol::application_layer`, ADR-321 item 4),
+    /// or `None` when the agent has no list for it.
+    pub fn named(name: &str) -> Option<Self> {
+        match name {
+            "UDS" => Some(Self::Uds),
+            _ => None,
+        }
+    }
+
+    /// The service identifiers a read-only job may send on this layer.
+    pub fn read_only_services(self) -> &'static [u8] {
+        match self {
+            Self::Uds => UDS_READ_ONLY_SERVICES,
+        }
+    }
+
+    /// The layer a job's requests are judged by before its link opens: the one every protocol
+    /// of its variant names (ADR-309 item 3). `None`, so that a read-only job may send nothing,
+    /// when the variant declares no protocol, protocols naming different layers, or a layer
+    /// without a list here. A job without a document runs on a link its caller built, which is
+    /// UDS on CAN (`LinkConfig::validate`).
+    pub fn of_job(variant: Option<&EcuVariant<'_>>) -> Option<Self> {
+        let Some(variant) = variant else {
+            return Some(Self::Uds);
+        };
+        let mut layers = variant
+            .protocols()
+            .into_iter()
+            .flatten()
+            .map(|protocol| protocol.application_layer().and_then(Self::named));
+        let first = layers.next()??;
+        layers.all(|layer| layer == Some(first)).then_some(first)
+    }
+}
+
+/// UDS's read-only services: ReadDTCInformation and ReadDataByIdentifier, which change nothing
+/// on the ECU. TesterPresent is left out: it keeps the ECU's current session alive, which a job
+/// may only do once it owns that session.
+pub const UDS_READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
 
 /// The most a job may get in this build, before the VCI behind the worker is known: the
 /// simulator permission in a debug build, read-only in a release build (ADR-247). The
@@ -95,12 +140,21 @@ pub fn identify(version: &vci_service_interface::VersionData) -> Permission {
     }
 }
 
-/// Whether a request with this service ID may be sent. A value that is not a UDS service ID
-/// fails as [`HostError::BadService`].
-pub fn check_service(service: u16, permission: Permission) -> Result<(), HostError> {
+/// Whether a request with this service ID may be sent on a link carrying `layer`. A value that
+/// is not a one-byte service ID fails as [`HostError::BadService`]. A read-only job may send
+/// nothing on a layer without a list (`None`).
+pub fn check_service(
+    service: u16,
+    layer: Option<ApplicationLayer>,
+    permission: Permission,
+) -> Result<(), HostError> {
     let sid = u8::try_from(service).map_err(|_| HostError::BadService(service))?;
     match permission {
-        Permission::ReadOnly if READ_ONLY_SERVICES.contains(&sid) => Ok(()),
+        Permission::ReadOnly
+            if layer.is_some_and(|layer| layer.read_only_services().contains(&sid)) =>
+        {
+            Ok(())
+        }
         Permission::ReadOnly => Err(HostError::NotAllowed(service)),
         #[cfg(debug_assertions)]
         Permission::Simulator => Ok(()),
@@ -108,30 +162,37 @@ pub fn check_service(service: u16, permission: Permission) -> Result<(), HostErr
 }
 
 /// Whether an encoded request may be sent; its first byte is the service ID.
-pub fn check_request(request: &[u8], permission: Permission) -> Result<(), HostError> {
+pub fn check_request(
+    request: &[u8],
+    layer: Option<ApplicationLayer>,
+    permission: Permission,
+) -> Result<(), HostError> {
     match request.first() {
-        Some(&sid) => check_service(sid.into(), permission),
+        Some(&sid) => check_service(sid.into(), layer, permission),
         None => Err(HostError::NotAllowed(0)),
     }
 }
 
 /// The first instruction of `program` the runner would refuse: its pc and why. `variant` is the
-/// job's document's, which gives a `SendReceive`'s SID (ADR-322 item 1); without one, every
+/// job's document's, which gives a `SendReceive`'s SID (ADR-322 item 1) and the application
+/// layer the SIDs are judged by ([`ApplicationLayer::of_job`]); without one, every
 /// `SendReceive` is refused.
 pub fn check_program(
     program: &Program,
     variant: Option<&EcuVariant<'_>>,
     permission: Permission,
 ) -> Result<(), (u32, HostError)> {
+    let layer = ApplicationLayer::of_job(variant);
     for (pc, op) in program.code.iter().enumerate() {
         // Exhaustive, so a new instruction that sends something cannot slip past.
         let refused = match op {
             // TransferData goes through `FlashTransfer` and the host's block count (ADR-250),
             // whatever the permission; refused here so it fails before anything is erased.
             Op::ServiceRequest { service: 0x36 } => Some(HostError::UseFlashTransfer),
-            Op::ServiceRequest { service } => check_service(*service, permission).err(),
-            // Always ReadDTCInformation.
-            Op::ReadDtc { .. } => None,
+            Op::ServiceRequest { service } => check_service(*service, layer, permission).err(),
+            // The frontend lowers `diag.read_dtc` to a send-receive (ADR-309 item 4); the agent
+            // builds no request for this one (ADR-342), whatever the permission.
+            Op::ReadDtc { .. } => Some(HostError::Unsupported("ReadDtc")),
             // The host sends only a request that starts with the declared service's SID
             // (ADR-322 item 1), so that SID is checked as a `ServiceRequest`'s would be. A
             // download belongs at a recovery plan's boundary, which only a `ServiceRequest`
@@ -140,7 +201,7 @@ pub fn check_program(
                 match variant.and_then(|v| crate::send_receive::declared_sid(v, *service)) {
                     None => Some(HostError::UndeclaredService(*service)),
                     Some(sid) => crate::send_receive::check_flash_rules(sid, false)
-                        .and_then(|()| check_service(sid.into(), permission))
+                        .and_then(|()| check_service(sid.into(), layer, permission))
                         .err(),
                 }
             }
@@ -233,21 +294,22 @@ mod tests {
     use super::*;
     use crate::send_receive::tests::{
         DOWNLOAD, NO_REQUEST, READ_DTC, RESET, SESSION, TRANSFER_DATA, TRANSFER_EXIT, WRITE_DID,
-        document,
+        document, document_with_protocols,
     };
 
     const READ_ONLY: Permission = Permission::ReadOnly;
+    const UDS: Option<ApplicationLayer> = Some(ApplicationLayer::Uds);
 
     #[test]
     fn only_read_only_services_pass() {
         for sid in [0x19, 0x22] {
-            check_service(sid, READ_ONLY).unwrap();
+            check_service(sid, UDS, READ_ONLY).unwrap();
         }
         for sid in [
             0x10, 0x11, 0x14, 0x27, 0x28, 0x2E, 0x2F, 0x31, 0x34, 0x36, 0x37, 0x3E, 0x85,
         ] {
             assert!(
-                matches!(check_service(sid, READ_ONLY), Err(HostError::NotAllowed(s)) if s == sid),
+                matches!(check_service(sid, UDS, READ_ONLY), Err(HostError::NotAllowed(s)) if s == sid),
                 "{sid:#x}"
             );
         }
@@ -256,27 +318,125 @@ mod tests {
     #[test]
     fn values_that_are_not_service_ids_are_bad_services() {
         assert!(matches!(
-            check_service(0x122, READ_ONLY),
+            check_service(0x122, UDS, READ_ONLY),
             Err(HostError::BadService(0x122))
         ));
     }
 
     #[test]
     fn encoded_requests_are_checked_by_their_first_byte() {
-        check_request(&[0x22, 0xF1, 0x90], READ_ONLY).unwrap();
-        check_request(&[0x19, 0x02, 0x08], READ_ONLY).unwrap();
+        check_request(&[0x22, 0xF1, 0x90], UDS, READ_ONLY).unwrap();
+        check_request(&[0x19, 0x02, 0x08], UDS, READ_ONLY).unwrap();
         assert!(matches!(
-            check_request(&[0x31, 0x01, 0xFF, 0x00], READ_ONLY),
+            check_request(&[0x31, 0x01, 0xFF, 0x00], UDS, READ_ONLY),
             Err(HostError::NotAllowed(0x31))
         ));
         assert!(matches!(
-            check_request(&[0x2E, 0x22], READ_ONLY),
+            check_request(&[0x2E, 0x22], UDS, READ_ONLY),
             Err(HostError::NotAllowed(0x2E))
         ));
         assert!(matches!(
-            check_request(&[], READ_ONLY),
+            check_request(&[], UDS, READ_ONLY),
             Err(HostError::NotAllowed(0))
         ));
+    }
+
+    /// The read-only list is the link's application layer's (ADR-342): a layer without one
+    /// lets a read-only job send nothing, not even a read.
+    #[test]
+    fn the_read_only_list_is_the_application_layer_s() {
+        assert_eq!(ApplicationLayer::Uds.read_only_services(), [0x19, 0x22]);
+        for sid in [0x19, 0x22, 0x10, 0x2E] {
+            assert!(
+                matches!(check_service(sid, None, READ_ONLY), Err(HostError::NotAllowed(s)) if s == sid),
+                "{sid:#x}"
+            );
+        }
+        assert!(matches!(
+            check_request(&[0x22, 0xF1, 0x90], None, READ_ONLY),
+            Err(HostError::NotAllowed(0x22))
+        ));
+        assert_eq!(ApplicationLayer::named("UDS"), UDS);
+        for name in ["KWP2000", "uds", "UDS ", ""] {
+            assert_eq!(ApplicationLayer::named(name), None, "{name:?}");
+        }
+    }
+
+    fn protocol(layer: Option<&str>) -> diag_ir::declaration::ProtocolT {
+        let mut protocol = crate::document::tests::uds_on_can();
+        protocol.application_layer = layer.map(Into::into);
+        protocol
+    }
+
+    /// Before the link opens, a job's requests are judged by the layer every protocol of its
+    /// variant names; anything else leaves no list, so a read-only job may send nothing.
+    #[test]
+    fn a_job_s_layer_is_the_one_its_variant_s_protocols_name() {
+        assert_eq!(ApplicationLayer::of_job(None), UDS);
+        let layer = |layers: &[Option<&str>]| {
+            let document = document_with_protocols(
+                layers.iter().map(|layer| protocol(*layer)).collect(),
+                None,
+            );
+            ApplicationLayer::of_job(Some(&document.variant()))
+        };
+        assert_eq!(layer(&[Some("UDS")]), UDS);
+        assert_eq!(layer(&[Some("UDS"), Some("UDS")]), UDS);
+        for layers in [
+            &[][..],
+            &[Some("KWP2000")],
+            &[None],
+            &[Some("UDS"), Some("KWP2000")],
+            &[Some("UDS"), None],
+        ] {
+            assert_eq!(layer(layers), None, "{layers:?}");
+        }
+        // A read on a variant whose layer has no list is refused, as a send-receive and as a
+        // request; on UDS the same program passes.
+        let reads = program(vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+            Op::PushBytes(0),
+            Op::SendReceive { service: READ_DTC },
+        ]);
+        let document = document_with_protocols(vec![protocol(Some("UDS"))], None);
+        check_program(&reads, Some(&document.variant()), READ_ONLY).unwrap();
+        let document = document_with_protocols(vec![protocol(Some("KWP2000"))], None);
+        let refused = check_program(&reads, Some(&document.variant()), READ_ONLY);
+        assert!(
+            matches!(refused, Err((1, HostError::NotAllowed(0x22)))),
+            "{refused:?}"
+        );
+        let refused = check_program(
+            &send_receive(READ_DTC),
+            Some(&document.variant()),
+            READ_ONLY,
+        );
+        assert!(
+            matches!(refused, Err((1, HostError::NotAllowed(0x19)))),
+            "{refused:?}"
+        );
+        // A release build's ceiling is read-only, so the same holds for it.
+        #[cfg(not(debug_assertions))]
+        assert!(matches!(
+            check_program(&reads, Some(&document.variant()), build_ceiling()),
+            Err((1, HostError::NotAllowed(0x22)))
+        ));
+    }
+
+    /// The agent builds no request for `ReadDtc` (ADR-342): the frontend lowers `diag.read_dtc`
+    /// to a send-receive, so the instruction is refused before anything opens, whatever the
+    /// permission.
+    #[test]
+    fn read_dtc_is_refused_whatever_the_permission() {
+        let read_dtc = program(vec![Op::PushI64(1), Op::ReadDtc { mask: 0x08 }]);
+        for permission in [READ_ONLY, build_ceiling()] {
+            let refused = check_program(&read_dtc, None, permission);
+            assert!(
+                matches!(refused, Err((1, HostError::Unsupported("ReadDtc")))),
+                "{refused:?}"
+            );
+        }
     }
 
     fn program(code: Vec<Op>) -> Program {
@@ -298,7 +458,7 @@ mod tests {
             &program(vec![
                 Op::PushBytes(0),
                 Op::ServiceRequest { service: 0x22 },
-                Op::ReadDtc { mask: 0x08 },
+                Op::ServiceRequest { service: 0x19 },
                 Op::Jump(0),
             ]),
             None,
@@ -405,7 +565,7 @@ mod tests {
             &program(vec![
                 Op::PushBytes(0),
                 Op::ServiceRequest { service: 0x22 },
-                Op::ReadDtc { mask: 0x08 },
+                Op::ServiceRequest { service: 0x19 },
             ]),
             None
         ));
@@ -442,21 +602,22 @@ mod tests {
                 0x10, 0x11, 0x14, 0x19, 0x22, 0x27, 0x28, 0x2E, 0x2F, 0x31, 0x34, 0x36, 0x37, 0x3E,
                 0x85, 0xFF,
             ] {
-                check_service(sid, SIMULATOR).unwrap_or_else(|e| panic!("{sid:#x}: {e}"));
+                // Whatever the layer: the simulator permission has no list.
+                check_service(sid, None, SIMULATOR).unwrap_or_else(|e| panic!("{sid:#x}: {e}"));
             }
             for sid in [0x2E, 0x31, 0x34] {
-                check_request(&[sid, 0x01], SIMULATOR).unwrap();
+                check_request(&[sid, 0x01], None, SIMULATOR).unwrap();
             }
         }
 
         #[test]
         fn values_that_are_not_service_ids_are_still_bad_services() {
             assert!(matches!(
-                check_service(0x122, SIMULATOR),
+                check_service(0x122, None, SIMULATOR),
                 Err(HostError::BadService(0x122))
             ));
             assert!(matches!(
-                check_request(&[], SIMULATOR),
+                check_request(&[], None, SIMULATOR),
                 Err(HostError::NotAllowed(0))
             ));
         }

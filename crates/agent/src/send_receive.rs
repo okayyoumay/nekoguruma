@@ -281,6 +281,22 @@ pub(crate) mod tests {
         shapes: Vec<Option<NegativeShapeT>>,
         procedure: Option<&diag_ir::Program>,
     ) -> JobDocument {
+        let protocols = shapes
+            .into_iter()
+            .map(|shape| {
+                let mut protocol = crate::document::tests::uds_on_can();
+                protocol.negative_shape = shape.map(Box::new);
+                protocol
+            })
+            .collect();
+        document_with_protocols(protocols, procedure)
+    }
+
+    /// [`document_with`] with the variant's protocols as given.
+    pub(crate) fn document_with_protocols(
+        protocols: Vec<diag_ir::declaration::ProtocolT>,
+        procedure: Option<&diag_ir::Program>,
+    ) -> JobDocument {
         let service = |id, sid: u8, prefix: Vec<u8>| {
             let mut service = ServiceT::default();
             service.id = id;
@@ -300,16 +316,7 @@ pub(crate) mod tests {
         let mut variant = EcuVariantT::default();
         variant.id = 1;
         variant.short_name = Some("v".into());
-        variant.protocols = Some(
-            shapes
-                .into_iter()
-                .map(|shape| {
-                    let mut protocol = crate::document::tests::uds_on_can();
-                    protocol.negative_shape = shape.map(Box::new);
-                    protocol
-                })
-                .collect(),
-        );
+        variant.protocols = Some(protocols);
         variant.services = Some(vec![
             service(READ_DTC, 0x19, vec![0x02]),
             service(WRITE_DID, 0x2E, vec![0xF1, 0x90]),

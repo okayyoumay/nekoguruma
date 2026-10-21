@@ -157,11 +157,11 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    restart creates, opens a new `request_id` for the same inquiry number: the server supersedes
    the job's open inquiry, and a late answer to a superseded id is audit data only. Because a
    restart may repeat the primitive (it is `Safe`, ADR-335) after the server stored a record but
-   before the agent's checkpoint after it, the server keeps one record per job and inquiry number:
-   a record entered under a later request id for the same job and inquiry number supersedes the
+   before the agent's checkpoint after it, the server keeps one record per job, inquiry number and
+   template id: a record entered under a later request id for the same three supersedes the
    earlier one, which stays as audit data only, so the job's records hold no duplicate. A replay
-   from the start that reaches the same inquiry number again (ADR-335) is the same step of the
-   same job, so superseding is right there too; only the answer is never reused. A server
+   from the start (ADR-335) that reaches the same inquiry number with the same template is the
+   same step of the same job, so superseding is right there too; only the answer is never reused. A server
    refusal (an id the server does not have, params the form cannot take) is a command of its own,
    `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
    returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the

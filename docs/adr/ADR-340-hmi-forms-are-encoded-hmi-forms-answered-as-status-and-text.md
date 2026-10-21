@@ -158,9 +158,12 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    refusal (an id the server does not have, params the form cannot take) is a command of its own,
    `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
    returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the
-   instruction opens a new inquiry. When the host closes an inquiry with the timed-out answer
-   (item 6) it sends `EventBody::HmiWithdrawn { job_id, generation, request_id }`, so the server
-   takes the form off the screen. The stream and Web API schemas change accordingly: `hmiRequest`
+   instruction opens a new inquiry. Whenever an inquiry ends without the operator's answer, the
+   host sends `EventBody::HmiWithdrawn { job_id, generation, request_id }`, so the server takes
+   the form off the screen: when it closes the inquiry with the timed-out answer (item 6), and when
+   the run ends while the inquiry is still open (a cancel taken at the waiting instruction, the
+   HMI timeout's included, or any other end of the run), before the job's final state is
+   reported. The stream and Web API schemas change accordingly: `hmiRequest`
    carries the generation, `kind`, `id` and `params`; `hmiResponse` and the `POST
    .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the refusal and the withdrawal
    are messages of their own.
@@ -171,7 +174,8 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    the timed-out answer (status 2) on its next poll, telling the server the inquiry is withdrawn
    (item 5).
    Outside every uninterruptible and recovery-required section the waiting instruction is an
-   interruptible point, so the runner takes the cancel before that poll and the job ends there.
+   interruptible point, so the runner takes the cancel before that poll and the job ends there;
+   the inquiry is still open, so the host withdraws it as the run ends (item 5).
    Inside such a section ADR-330 holds the cancel, so the instruction completes with the timed-out
    answer, the procedure runs on to the section's end (it may test `timed_out` and `diag.fail`),
    and the held cancel is taken at the next interruptible point, as design 5.6 asks. Without that
@@ -258,9 +262,10 @@ each call's value and how a decline, a timeout and a cancel surface; which check
   bounds, `HmiRequestFromStack`, the VM and `Program::validate` checks, the dry-run helpers, the
   lowering of both calls and of the three keys with tests against a scripted host (a constant form,
   a form with constant and run-time parameters in mixed order, a record, a decline, a timed-out answer, a resume at
-  the waiting instruction rebuilding identical bytes), subset 2.5, 3.1, 3.2, 3.4, design 8.2.4,
-  this ADR and the index. **PR B** (`agent`, `shared-proto`, `api/`): the host's inquiry map and
+  the waiting instruction rebuilding identical bytes), subset 2.5, 3.1, 3.2 and 3.4, and ADR-233's
+  and ADR-254's status annotations; design 8.6 records the contract with this ADR. **PR B** (`agent`, `shared-proto`, `api/`): the host's inquiry map and
   `HostError::HmiRefused`, the runner's `AwaitingHmi` polling, the event and command shapes, the
-  schema files, with tests against a fake server channel; the server's rendering, validation and
+  schema files, and design 8.2.4's agent paragraph, which says HMI requests and record input are
+  not supported yet, with tests against a fake server channel; the server's rendering, validation and
   record storage stay with the server's milestone. PR B and the follow-ups above are backlog
   items.

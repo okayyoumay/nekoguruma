@@ -949,6 +949,9 @@ OTX HMI elements (confirmation, value input) are relayed via the server, because
 
 - Since this waits on human interaction, round-trip time is not an issue. S3 keep-alive continues while waiting
 - If the connection drops while waiting for HMI, a timeout transitions to a safe abort point
+- The procedure sends a form or a record template as a typed form (the form or template id and its parameters, constant or taken from the procedure's run-time values) and receives one of three outcomes: answered, with the entered text, the chosen option or the record's overall judgment; declined; or timed out. A Starlark procedure reads them through literal keys (`ok`, `timed_out`, `value`). The server validates the operator's input against the form or template and stores a record itself; only the outcome reaches the agent (ADR-340)
+- Each inquiry has a request id per agent run, so a restart asks the operator again instead of reusing an earlier answer. Every HMI message carries the job's ownership generation (ADR-229). The server can refuse an inquiry (an unknown form, parameters the form cannot take), which the job treats as a resumable error and not as an answer, and the agent withdraws an inquiry that ends without an answer
+- The HMI timeout completes a waiting form inside a section that must not be interrupted, so the procedure runs on to the next interruptible point and then stops; a run whose HMI timeout fired never ends as completed (ADR-340, ADR-330)
 
 ### 8.7 External Interfaces (SOVD / ExVe)
 

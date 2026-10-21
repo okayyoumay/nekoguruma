@@ -329,6 +329,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-337](ADR-337-a-run-start-is-an-interruptible-point.md) | A Run's Start Is an Interruptible Point | Accepted | `agent` job runner (`run_on_from`, `run_vm`), `crates/agent/docs/ngr-agent.md`, Starlark subset 4.5; design 5.6, 8.10.1; ADR-330, ADR-332, ADR-336 |
 | [ADR-338](ADR-338-diag-precondition-reads-a-declared-source.md) | `diag.precondition` Reads the Row's Default-Session Source | Accepted | `diag-ir` (`Op::ReadInput`, `DiagHost::runtime_input`, `IR_SCHEMA_VERSION` 17, dry run), `diag-frontend` Starlark lowering, `agent` policy and host, Starlark subset 3.1, 3.2, 4.6 and 5, design 8.2.4, 8.9; ADR-233, ADR-245, ADR-254, ADR-316, ADR-321, ADR-328, ADR-336 |
 | [ADR-339](ADR-339-diag-ecu-info-reads-the-declared-identity.md) | `diag.ecu_info` Reads the Declared Identity Through a Literal Key | Accepted | `diag-frontend` Starlark lowering (`STAR_UNKNOWN_IDENTITY`), Starlark subset 3.2, 3.4, 4.6 and 5, `csv-tables.md` 4.13; ADR-254, ADR-336, ADR-338 |
+| [ADR-340](ADR-340-hmi-forms-are-encoded-hmi-forms-answered-as-status-and-text.md) | HMI Forms and Record Templates Are Encoded `HmiForm`s, Answered as a Status Byte and Text | Accepted | `diag-ir` (`hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 18, `Program::validate`, dry run), `diag-frontend` lowering of `diag.hmi` and `diag.record`, `agent` host and runner, `shared-proto`, `api/asyncapi.yaml`, `api/openapi.yaml`, Starlark subset 2.5, 3.1, 3.2 and 3.4, design 8.2.4, 8.6; ADR-233, ADR-254, ADR-304, ADR-317, ADR-328, ADR-330, ADR-335 |
 
 ## Status Legend
 
@@ -769,6 +770,7 @@ the predecessor repository these ADRs came from.
 - ADR-336
 - ADR-338
 - ADR-339
+- ADR-340
 
 ### Acquired Data & Monitoring
 - ADR-236

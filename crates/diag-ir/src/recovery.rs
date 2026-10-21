@@ -252,6 +252,10 @@ pub enum ProgramError {
     )]
     BadFailureCode { pc: u32 },
     #[error(
+        "instruction {pc}: the constant of an HMI request or record input is not a form template it takes (ADR-340)"
+    )]
+    BadHmiForm { pc: u32 },
+    #[error(
         "flash session {flash_session}: boundaries must satisfy entry <= erase < transfer exit < post-transfer end <= code length"
     )]
     BoundaryOutOfOrder { flash_session: u32 },
@@ -367,6 +371,7 @@ impl ProgramError {
     pub fn pc(&self) -> Option<u32> {
         match self {
             Self::BadFailureCode { pc }
+            | Self::BadHmiForm { pc }
             | Self::WrongBoundaryInstruction { pc, .. }
             | Self::RecoveryRequiredOutOfRange { pc, .. }
             | Self::JumpOutOfRecovery { pc, .. }
@@ -450,7 +455,8 @@ impl Program {
     /// instructions at them, where download instructions sit, the control flow into, inside
     /// and out of each plan, and the identity and precondition sources. It does not check the
     /// schema version or the program's size ([`crate::Vm::check_state`]) or each instruction's
-    /// operands, which fail when the VM reaches them.
+    /// operands, which fail when the VM reaches them. It also checks the constants it can
+    /// check without running: a `Fail`'s code (ADR-280) and an HMI form's template (ADR-340).
     ///
     /// The restart rules (identity sources, session mapping, timeout, resume limit) apply only
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
@@ -471,6 +477,18 @@ impl Program {
                     .is_some_and(|text| (1..=MAX_FAILURE_CODE_LEN).contains(&text.len()))
             {
                 return Err(ProgramError::BadFailureCode { pc: pc as u32 });
+            }
+            // A form template decodes and has the shape its instruction takes (ADR-340 item 2).
+            if let Op::HmiRequest { form: index }
+            | Op::RecordInput { template: index }
+            | Op::HmiRequestFromStack { form: index } = op
+                && !self
+                    .constants
+                    .get(*index as usize)
+                    .and_then(|bytes| crate::hmi::decode_template(bytes).ok())
+                    .is_some_and(|template| crate::hmi_template_fits(op, &template))
+            {
+                return Err(ProgramError::BadHmiForm { pc: pc as u32 });
             }
         }
         // The overlap checks below would read a reversed section as empty.

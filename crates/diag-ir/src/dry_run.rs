@@ -14,6 +14,7 @@ use crate::declaration::{
     Shape, Termination,
 };
 use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_positive_response};
+use crate::hmi::{self, HmiForm};
 use crate::{
     DiagHost, Failure, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm, VmError,
     WaitingOn,
@@ -74,6 +75,31 @@ impl Script {
         self
     }
 
+    /// Adds the answer to an HMI form as the host builds it (ADR-340 item 3): `text` the operator
+    /// entered when `ok`, a decline otherwise.
+    pub fn form_answer(self, ok: bool, text: &str) -> Self {
+        self.form(if ok {
+            hmi::answered(text)
+        } else {
+            hmi::declined()
+        })
+    }
+
+    /// Adds the answer to a record template as the host builds it: the server's judgment of the
+    /// record (`ok`, `ng` or empty) when `ok`, a decline otherwise.
+    pub fn record_answer(self, ok: bool, text: &str) -> Self {
+        self.record(if ok {
+            hmi::answered(text)
+        } else {
+            hmi::declined()
+        })
+    }
+
+    /// Adds an HMI timeout as the answer to an HMI form.
+    pub fn hmi_timed_out(self) -> Self {
+        self.form(hmi::timed_out())
+    }
+
     /// Sets the value `Op::ReadInput` of `input` reads (ADR-338), in the unit the precondition
     /// checks use: millivolts, 0 or 1 for a flag, km/h. A later call for the same input replaces
     /// the value. An input that is not set is one the run cannot establish
@@ -114,12 +140,14 @@ pub enum DryRunEvent {
     Wait {
         millis: u32,
     },
+    /// The form the VM sent, decoded (ADR-340 item 7), and the scripted answer as it was
+    /// pushed.
     Hmi {
-        form: Vec<u8>,
+        form: HmiForm,
         answer: Vec<u8>,
     },
     RecordInput {
-        template: Vec<u8>,
+        template: HmiForm,
         answer: Vec<u8>,
     },
     MonitorCapture {
@@ -189,6 +217,9 @@ pub enum DryRunError {
     /// The script has no answer of this kind.
     #[error("the script has no {what}")]
     NotScripted { what: &'static str },
+    /// The host was sent bytes that are not an encoded [`HmiForm`], which the VM never sends.
+    #[error("the HMI form sent is not an encoded form")]
+    BadHmiForm,
     /// The report would grow past [`MAX_REPORT_BYTES`].
     #[error("the report would hold more than {MAX_REPORT_BYTES} bytes")]
     ReportTooLarge,
@@ -581,6 +612,24 @@ fn decoded_cost(fields: &[DecodedField]) -> usize {
     })
 }
 
+/// The heap a decoded form takes in the report: its id, and per parameter the pair, its name
+/// and any text, so a form of many small parameters is charged what it holds rather than its
+/// compact encoding.
+fn form_cost(form: &HmiForm) -> usize {
+    form.params
+        .iter()
+        .fold(form.id.len(), |total: usize, (key, value)| {
+            let text = match value {
+                hmi::HmiValue::Text(text) => text.len(),
+                hmi::HmiValue::Int(_) | hmi::HmiValue::Bool(_) => 0,
+            };
+            total
+                .saturating_add(size_of::<(String, hmi::HmiValue)>())
+                .saturating_add(key.len())
+                .saturating_add(text)
+        })
+}
+
 impl DiagHost for ScriptedHost<'_, '_> {
     type Error = DryRunError;
 
@@ -673,9 +722,12 @@ impl DiagHost for ScriptedHost<'_, '_> {
             self.next(Answers::Form, &script.forms)
                 .ok_or(DryRunError::NotScripted { what: "HMI answer" })?
         };
-        self.charge(form.len() + answer.len())?;
+        // Decoding is bounded by the form's 16 KiB (ADR-340 item 1); what the report keeps is
+        // the decoded form.
+        let form = hmi::decode_form(form).map_err(|_| DryRunError::BadHmiForm)?;
+        self.charge(form_cost(&form).saturating_add(answer.len()))?;
         self.events.push(DryRunEvent::Hmi {
-            form: form.to_vec(),
+            form,
             answer: answer.clone(),
         });
         Ok(Some(answer))
@@ -693,9 +745,10 @@ impl DiagHost for ScriptedHost<'_, '_> {
                     what: "record answer",
                 })?
         };
-        self.charge(template.len() + answer.len())?;
+        let template = hmi::decode_form(template).map_err(|_| DryRunError::BadHmiForm)?;
+        self.charge(form_cost(&template).saturating_add(answer.len()))?;
         self.events.push(DryRunEvent::RecordInput {
-            template: template.to_vec(),
+            template,
             answer: answer.clone(),
         });
         Ok(Some(answer))

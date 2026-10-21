@@ -353,7 +353,14 @@ fn a_request_no_service_declares_ends_the_run() {
 #[test]
 fn an_unscripted_operator_answer_ends_the_run() {
     let document = document("read.star", "exampleEcuV1");
-    let program = bare_program(vec![Op::HmiRequest { form: 0 }], vec![b"form".to_vec()]);
+    let template = diag_ir::hmi::HmiTemplate {
+        id: "form".to_owned(),
+        params: Vec::new(),
+    };
+    let program = bare_program(
+        vec![Op::HmiRequest { form: 0 }],
+        vec![diag_ir::hmi::encode_template(&template).expect("encodes")],
+    );
     let report = run(&document, Some(&program), &Script::new());
     assert_eq!(
         report.end,
@@ -363,14 +370,17 @@ fn an_unscripted_operator_answer_ends_the_run() {
     let report = run(
         &document,
         Some(&program),
-        &Script::new().form(b"ok".to_vec()),
+        &Script::new().form_answer(true, "ok"),
     );
     assert_eq!(report.end, DryRunEnd::Finished, "{report:#?}");
     assert_eq!(
         report.events,
         [DryRunEvent::Hmi {
-            form: b"form".to_vec(),
-            answer: b"ok".to_vec()
+            form: diag_ir::hmi::HmiForm {
+                id: "form".to_owned(),
+                params: Vec::new(),
+            },
+            answer: b"\x01ok".to_vec()
         }]
     );
 }

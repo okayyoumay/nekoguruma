@@ -12,6 +12,7 @@ pub mod declaration;
 pub mod decode;
 pub mod dry_run;
 pub mod encode;
+pub mod hmi;
 mod recovery;
 
 pub use recovery::*;
@@ -47,7 +48,10 @@ use crate::declaration::{EcuVariant, Shape};
 /// 17: `Op` gained `ReadInput` (ADR-338).
 /// 18: `FlashSegment` gained `data_format` and `address_and_length_format` (ADR-336 item 1); a
 /// document of version 17 would read every segment with the default formats.
-pub const IR_SCHEMA_VERSION: u32 = 18;
+/// 19: `Op` gained `HmiRequestFromStack`, and `VmError` gained `BadHmiForm` and
+/// `HmiFormTooLong`; the constant of `HmiRequest` and `RecordInput` is an encoded
+/// [`hmi::HmiTemplate`] (ADR-340).
+pub const IR_SCHEMA_VERSION: u32 = 19;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
@@ -129,10 +133,13 @@ pub enum Op {
     Wait {
         millis: u32,
     },
+    /// `form` is an encoded [`hmi::HmiTemplate`] with no run-time slot; the host is sent its
+    /// [`hmi::HmiForm`] (ADR-340 item 2) and the answer is pushed.
     HmiRequest {
         form: u32,
     },
-    /// `template` is a 4.3.1 record template.
+    /// `template` names a 4.3.1 record template: an encoded [`hmi::HmiTemplate`] with no
+    /// parameters, sent as its [`hmi::HmiForm`] like `HmiRequest`'s.
     RecordInput {
         template: u32,
     },
@@ -266,6 +273,20 @@ pub enum Op {
     ReadInput {
         input: RuntimeInput,
     },
+
+    // Diagnostic primitives. Appended after `ReadInput` (ADR-233, ADR-340).
+    /// Like `HmiRequest`, but the template at `form` may hold run-time slots
+    /// ([`hmi::HmiParam::Runtime`]), filled from the stack, the first slot being the deepest: an
+    /// `I64` is an `Int`, a `Bool` a `Bool` and `Bytes` of UTF-8 a `Text`. Before the host is
+    /// called the template must decode (`VmError::BadHmiForm`), each operand have one of those
+    /// types (`VmError::TypeMismatch`; invalid UTF-8 is `VmError::InvalidUtf8` with `form`), and
+    /// the filled form encode to at most [`hmi::MAX_HMI_FORM_LEN`] bytes
+    /// (`VmError::HmiFormTooLong`). While the host has no answer the state is unchanged,
+    /// operands included, so each poll and each resume sends the same bytes under the same
+    /// inquiry; the answer then replaces the operands.
+    HmiRequestFromStack {
+        form: u32,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -345,6 +366,7 @@ impl Op {
             | Op::WaitFromStack
             | Op::LogFromStack { .. }
             | Op::HmiRequest { .. }
+            | Op::HmiRequestFromStack { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }
             | Op::Log { .. } => true,
@@ -526,7 +548,8 @@ impl Vm {
     /// The job runner uses it to journal an intent marker before a primitive is sent (ADR-229).
     ///
     /// It runs [`Vm::check_state`] and, for a diagnostic primitive, the checks [`Vm::step`] makes
-    /// before it calls the host (operand, constant, UTF-8, room for an answer that is pushed). So for a primitive, `Ok(Some(op))` means the next `step` reaches
+    /// before it calls the host (operand, constant, UTF-8, an HMI form's template and encoded
+    /// length, room for an answer that is pushed). So for a primitive, `Ok(Some(op))` means the next `step` reaches
     /// the host (ADR-233): the runner never journals an intent for a request that is not sent.
     /// Other instructions can still fail in `step` (arithmetic, types, limits); no intent
     /// precedes them.
@@ -901,20 +924,17 @@ impl Vm {
                 }
                 self.state.stack.pop();
             }
-            Op::HmiRequest { .. } => {
-                match host
-                    .hmi_request(inquiry, input.bytes())
-                    .map_err(StepError::Host)?
-                {
-                    Some(answer) => self.push_checked(Value::Bytes(answer)),
+            Op::HmiRequest { .. } | Op::HmiRequestFromStack { .. } => {
+                // Built again from what `check_primitive` checked, so it cannot fail here.
+                let (form, operands) = self.hmi_form(op, program)?;
+                match host.hmi_request(inquiry, &form).map_err(StepError::Host)? {
+                    Some(answer) => self.replace(operands, Value::Bytes(answer)),
                     None => return Ok(Executed::Waiting(WaitingOn::Hmi)),
                 }
             }
             Op::RecordInput { .. } => {
-                match host
-                    .record_input(inquiry, input.bytes())
-                    .map_err(StepError::Host)?
-                {
+                let (form, _) = self.hmi_form(op, program)?;
+                match host.record_input(inquiry, &form).map_err(StepError::Host)? {
                     Some(answer) => self.push_checked(Value::Bytes(answer)),
                     None => return Ok(Executed::Waiting(WaitingOn::Hmi)),
                 }
@@ -969,11 +989,12 @@ impl Vm {
                 self.check_room(0, 1)?;
                 HostInput::Nothing
             }
-            // Send a constant and push the answer.
-            Op::HmiRequest { form: index } | Op::RecordInput { template: index } => {
-                let bytes = constant(program, *index)?;
-                self.check_room(0, 1)?;
-                HostInput::Bytes(bytes)
+            // Send the form the template builds, and replace its operands, if any, with the
+            // answer. The form is built again in `execute`: it is not borrowed from the state.
+            Op::HmiRequest { .. } | Op::RecordInput { .. } | Op::HmiRequestFromStack { .. } => {
+                let (_, operands) = self.hmi_form(op, program)?;
+                self.check_room(operands, 1)?;
+                HostInput::Nothing
             }
             Op::Log { message, .. } => HostInput::Text(
                 std::str::from_utf8(constant(program, *message)?)
@@ -1031,6 +1052,54 @@ impl Vm {
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
         })
+    }
+
+    /// The form an `HmiRequest`, `RecordInput` or `HmiRequestFromStack` sends, and how many
+    /// operands it takes from the stack (ADR-340 item 2).
+    fn hmi_form(&self, op: &Op, program: &Program) -> Result<(Vec<u8>, usize), VmError> {
+        let index = match op {
+            Op::HmiRequest { form } | Op::HmiRequestFromStack { form } => *form,
+            Op::RecordInput { template } => *template,
+            _ => unreachable!("only the HMI instructions build a form"),
+        };
+        let template = hmi::decode_template(constant(program, index)?)
+            .ok()
+            .filter(|template| hmi_template_fits(op, template))
+            .ok_or(VmError::BadHmiForm(index))?;
+        let operands = template.runtime_slots();
+        // A form holds at most `MAX_HMI_FORM_LEN` bytes, so text operands longer than that
+        // together are refused before any is copied; the error then gives their length.
+        let text: usize = self
+            .top(operands)?
+            .iter()
+            .map(|value| match value {
+                Value::Bytes(bytes) => bytes.len(),
+                _ => 0,
+            })
+            .sum();
+        if text > hmi::MAX_HMI_FORM_LEN {
+            return Err(VmError::HmiFormTooLong(text as u64));
+        }
+        let values = self
+            .top(operands)?
+            .iter()
+            .map(|value| match value {
+                Value::I64(n) => Ok(hmi::HmiValue::Int(*n)),
+                Value::Bool(b) => Ok(hmi::HmiValue::Bool(*b)),
+                Value::Bytes(bytes) => std::str::from_utf8(bytes)
+                    .map(|text| hmi::HmiValue::Text(text.to_owned()))
+                    .map_err(|_| VmError::InvalidUtf8(index)),
+                Value::F64(_) => Err(VmError::TypeMismatch),
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let form = template
+            .fill(values)
+            .expect("one value for each run-time slot");
+        let bytes = hmi::encode_form(&form).map_err(|e| match e {
+            hmi::HmiError::TooLong(len) => VmError::HmiFormTooLong(len as u64),
+            _ => VmError::BadHmiForm(index),
+        })?;
+        Ok((bytes, operands))
     }
 
     /// Pushes a host answer whose room [`Vm::check_primitive`] already checked; cannot fail, so
@@ -1109,6 +1178,16 @@ impl<'a> HostInput<'a> {
             HostInput::Text(text) => text,
             _ => unreachable!("check_primitive returns text for this instruction"),
         }
+    }
+}
+
+/// Whether `template` has the shape `op` takes: no run-time slot for `HmiRequest` and no
+/// parameter at all for `RecordInput` (ADR-340 item 2).
+pub(crate) fn hmi_template_fits(op: &Op, template: &hmi::HmiTemplate) -> bool {
+    match op {
+        Op::HmiRequest { .. } => template.runtime_slots() == 0,
+        Op::RecordInput { .. } => template.params.is_empty(),
+        _ => true,
     }
 }
 
@@ -1476,7 +1555,8 @@ pub enum VmError {
     ShiftOutOfRange(i64),
     #[error("invalid constant index: {0}")]
     BadConstant(u32),
-    #[error("constant {0} is not valid UTF-8")]
+    /// Also the error of an HMI form's text operand that is not UTF-8, with the form's constant.
+    #[error("constant {0}, or a text operand of the HMI form it holds, is not valid UTF-8")]
     InvalidUtf8(u32),
     #[error("variable slot {0} is not set")]
     UndefinedVariable(u16),
@@ -1514,6 +1594,11 @@ pub enum VmError {
     },
     #[error("the host gave {got} artifact bytes for a block of {expected}")]
     ArtifactLength { expected: u32, got: u64 },
+    #[error("constant {0} is not an HMI form template the instruction takes")]
+    BadHmiForm(u32),
+    /// The encoded length, or the length of the text operands alone when they already pass it.
+    #[error("the HMI form encodes to {0} bytes or more, more than {max}", max = hmi::MAX_HMI_FORM_LEN)]
+    HmiFormTooLong(u64),
 }
 
 #[cfg(test)]

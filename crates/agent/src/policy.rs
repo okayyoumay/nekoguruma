@@ -163,6 +163,7 @@ pub fn check_program(
             | Op::WaitFromStack
             | Op::LogFromStack { .. }
             | Op::HmiRequest { .. }
+            | Op::HmiRequestFromStack { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }
             | Op::Log { .. } => None,

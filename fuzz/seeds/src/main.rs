@@ -8,6 +8,7 @@ use std::path::{Path, PathBuf};
 
 use diag_frontend::convert::{lower_procedures, to_ir};
 use diag_frontend::tables::{read_directory, resolve};
+use diag_ir::hmi::{HmiParam, HmiTemplate, HmiValue, encode_template};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Vm};
 
 fn main() {
@@ -57,6 +58,24 @@ fn main() {
                 Op::Pop,
             ],
             vec![vec![0x19, 0x02, 0x08]],
+        ),
+        (
+            // A form with a constant and a run-time parameter (ADR-340).
+            "hmi-form",
+            vec![Op::PushI64(3), Op::HmiRequestFromStack { form: 0 }, Op::Pop],
+            vec![
+                encode_template(&HmiTemplate {
+                    id: "confirm".to_owned(),
+                    params: vec![
+                        (
+                            "ecu".to_owned(),
+                            HmiParam::Const(HmiValue::Text("engine".to_owned())),
+                        ),
+                        ("count".to_owned(), HmiParam::Runtime),
+                    ],
+                })
+                .expect("the seed template encodes"),
+            ],
         ),
         (
             "loop",

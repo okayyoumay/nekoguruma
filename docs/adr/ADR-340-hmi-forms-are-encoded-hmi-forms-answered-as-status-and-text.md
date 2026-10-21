@@ -55,11 +55,13 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 
 1. **One encoding for both calls: a postcard-encoded `diag_ir::hmi::HmiForm`.**
    ```rust
-   pub struct HmiForm { pub id: String, pub params: Vec<(String, HmiValue)> }
+   pub struct HmiForm { pub id: String, pub site: u32, pub params: Vec<(String, HmiValue)> }
    pub enum HmiValue { Int(i64), Bool(bool), Text(String) }
    ```
    `id` is the form id or the record template id (the `id` of
-   `schemas/record-template.schema.json`), 1 to 128 bytes of UTF-8 (`MAX_HMI_ID_LEN`). `params` holds
+   `schemas/record-template.schema.json`), 1 to 128 bytes of UTF-8 (`MAX_HMI_ID_LEN`). `site` is the
+   call site: the lowering numbers the procedure's `diag.hmi` and `diag.record` calls in source
+   order from 0, so a program holds each site once (item 5 says what it is for). `params` holds
    at most 32 pairs (`MAX_HMI_PARAMS`), in the source order of the Starlark dict literal; a key is an
    ASCII identifier (`[A-Za-z_][A-Za-z0-9_]*`) of 1 to 64 bytes, unique within the form. The whole
    encoding is at most 16 KiB (`MAX_HMI_FORM_LEN`). A record template's `params` is empty in this
@@ -143,11 +145,17 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    the VM's inquiry number, `kind` `Form` or
    `Record`, `generation` the job's ownership generation (ADR-229: every job-scoped message
    carries it, and the server applies one only under the current owner and generation), and
-   `form` typed (`id` and `params`, which serialize as JSON on the wire), and returns `Ok(None)`;
+   `form` typed (`id`, `site` and `params`, which serialize as JSON on the wire, an `Int` as a
+   decimal string so that no value outside the range a browser holds exactly is rounded before
+   the operator sees it), and returns `Ok(None)`;
    later polls return `Ok(None)` until the answer command `HmiAnswer { job_id, generation,
    request_id, ok, value }` arrives, then encode item 3's bytes and return `Some`, closing the
    inquiry. The agent takes an answer or refusal command only when its job, generation and request
-   id name the open inquiry, and drops any other as stale. The agent
+   id name the open inquiry, and drops any other as stale. The host holds the inquiry's HMI
+   deadline (item 6) and moves the inquiry from open to timed out under the same lock that takes
+   commands, so exactly one of the two wins: an answer taken before the deadline is returned even
+   if the poll comes later, and one that arrives after it is dropped as late (the server keeps it
+   as audit data) and the next poll returns the timed-out answer. The agent
    checks only the shape (`value` is text of at most 16 KiB minus one, empty when `ok` is false)
    when the command arrives, before any poll can return it; a command of another shape is refused
    to the server and the inquiry stays open, so the host never hands the VM a malformed answer;
@@ -157,11 +165,15 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    restart creates, opens a new `request_id` for the same inquiry number: the server supersedes
    the job's open inquiry, and a late answer to a superseded id is audit data only. Because a
    restart may repeat the primitive (it is `Safe`, ADR-335) after the server stored a record but
-   before the agent's checkpoint after it, the server keeps one record per job, inquiry number and
-   template id: a record entered under a later request id for the same three supersedes the
-   earlier one, which stays as audit data only, so the job's records hold no duplicate. A replay
-   from the start (ADR-335) that reaches the same inquiry number with the same template is the
-   same step of the same job, so superseding is right there too; only the answer is never reused. A server
+   before the agent's checkpoint after it, the server keeps one record per job, call site and
+   inquiry number: a record entered under a later request id for the same three supersedes the
+   earlier one, which stays as audit data only, so the job's records hold no duplicate. The call
+   site is `site`, a number the lowering gives each `diag.hmi` and `diag.record` call of the
+   procedure, distinct within the program, since the inquiry number counts steps and not
+   instructions: a replay from the start (ADR-335) whose earlier reads take another branch can
+   reach the same step count at another call, and the site keeps that record apart. A replay
+   that reaches the same call at the same step count repeats that call, so superseding is right
+   there; only the answer is never reused. A server
    refusal (an id the server does not have, params the form cannot take) is a command of its own,
    `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
    returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the

@@ -301,9 +301,7 @@ impl Env {
             .spawn()
             .expect("the agent process should start");
         #[cfg(windows)]
-        let job = Job::holding(&child);
-        #[cfg(windows)]
-        resume(&child);
+        let (child, job) = start_in_job(child);
         AgentChild {
             child: Some(child),
             #[cfg(windows)]
@@ -705,43 +703,83 @@ struct Job(windows_sys::Win32::Foundation::HANDLE);
 #[cfg(windows)]
 impl Job {
     /// A new job object holding `child`.
-    fn holding(child: &Child) -> Self {
+    fn holding(child: &Child) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
         use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
         // SAFETY: no security attributes and no name; the call touches no memory of ours.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
-        assert!(
-            !handle.is_null(),
-            "creating the agent's job object failed: {}",
-            std::io::Error::last_os_error()
-        );
+        if handle.is_null() {
+            return Err(std::io::Error::last_os_error());
+        }
         let job = Job(handle);
         // SAFETY: both handles are open: the job's above, the child's while `child` lives.
-        let assigned = unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) };
-        assert_ne!(
-            assigned,
-            0,
-            "putting the agent in its job object failed: {}",
-            std::io::Error::last_os_error()
-        );
-        job
+        if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(job)
     }
 
-    /// Terminates every process in the job with exit code 1, as `taskkill /F` would.
+    /// Terminates every process in the job with exit code 1, as `taskkill /F` would, and waits
+    /// until none is left: a process whose termination waits on pending I/O can outlive the call,
+    /// and the next step of a scenario must not find the old worker still using the VCI.
     fn terminate(&self) -> std::io::Result<()> {
-        use windows_sys::Win32::System::JobObjects::TerminateJobObject;
+        use windows_sys::Win32::System::JobObjects::{
+            JOBOBJECT_BASIC_ACCOUNTING_INFORMATION, JobObjectBasicAccountingInformation,
+            QueryInformationJobObject, TerminateJobObject,
+        };
         // SAFETY: the job's handle is open until the drop.
-        if unsafe { TerminateJobObject(self.0, 1) } != 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
+        if unsafe { TerminateJobObject(self.0, 1) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let mut info = JOBOBJECT_BASIC_ACCOUNTING_INFORMATION::default();
+            // SAFETY: the handle is open, and `info` is the structure the class names, of the
+            // size passed.
+            let queried = unsafe {
+                QueryInformationJobObject(
+                    self.0,
+                    JobObjectBasicAccountingInformation,
+                    (&raw mut info).cast(),
+                    std::mem::size_of_val(&info) as u32,
+                    std::ptr::null_mut(),
+                )
+            };
+            if queried == 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            if info.ActiveProcesses == 0 {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::other(format!(
+                    "{} processes of the job still run 30 s after its termination",
+                    info.ActiveProcesses
+                )));
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+}
+
+/// Puts `child`, created suspended, in a job object of its own and resumes it. On a failure the
+/// child is killed before the panic, since dropping a [`Child`] leaves it running (here, suspended
+/// for good).
+#[cfg(windows)]
+fn start_in_job(mut child: Child) -> (Child, Job) {
+    match Job::holding(&child).and_then(|job| resume(&child).map(|()| job)) {
+        Ok(job) => (child, job),
+        Err(error) => {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("starting the agent in its job object failed: {error}");
         }
     }
 }
 
 /// Resumes the only thread of `child`, which was created suspended.
 #[cfg(windows)]
-fn resume(child: &Child) {
+fn resume(child: &Child) -> std::io::Result<()> {
     use windows_sys::Win32::Foundation::{CloseHandle, INVALID_HANDLE_VALUE};
     use windows_sys::Win32::System::Diagnostics::ToolHelp::{
         CreateToolhelp32Snapshot, TH32CS_SNAPTHREAD, THREADENTRY32, Thread32First, Thread32Next,
@@ -749,12 +787,9 @@ fn resume(child: &Child) {
     use windows_sys::Win32::System::Threading::{OpenThread, ResumeThread, THREAD_SUSPEND_RESUME};
     // SAFETY: the call touches no memory of ours.
     let snapshot = unsafe { CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0) };
-    assert_ne!(
-        snapshot,
-        INVALID_HANDLE_VALUE,
-        "listing the threads failed: {}",
-        std::io::Error::last_os_error()
-    );
+    if snapshot == INVALID_HANDLE_VALUE {
+        return Err(std::io::Error::last_os_error());
+    }
     let mut entry = THREADENTRY32 {
         dwSize: std::mem::size_of::<THREADENTRY32>() as u32,
         ..Default::default()
@@ -772,24 +807,22 @@ fn resume(child: &Child) {
     }
     // SAFETY: the snapshot is open and not used after this.
     unsafe { CloseHandle(snapshot) };
-    let thread_id = thread_id.expect("the suspended agent should have a thread");
+    let thread_id =
+        thread_id.ok_or_else(|| std::io::Error::other("the suspended agent has no thread"))?;
     // SAFETY: the call touches no memory of ours.
     let thread = unsafe { OpenThread(THREAD_SUSPEND_RESUME, 0, thread_id) };
-    assert!(
-        !thread.is_null(),
-        "opening the agent's thread failed: {}",
-        std::io::Error::last_os_error()
-    );
+    if thread.is_null() {
+        return Err(std::io::Error::last_os_error());
+    }
     // SAFETY: the thread's handle is open; it is closed right after.
     let resumed = unsafe { ResumeThread(thread) };
+    let error = std::io::Error::last_os_error();
     // SAFETY: the handle is open and not used after this.
     unsafe { CloseHandle(thread) };
-    assert_ne!(
-        resumed,
-        u32::MAX,
-        "resuming the agent failed: {}",
-        std::io::Error::last_os_error()
-    );
+    if resumed == u32::MAX {
+        return Err(error);
+    }
+    Ok(())
 }
 
 #[cfg(windows)]

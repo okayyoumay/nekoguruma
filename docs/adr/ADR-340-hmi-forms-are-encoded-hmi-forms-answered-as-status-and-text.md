@@ -6,8 +6,8 @@
 `Program::validate`, `VmError`, `dry_run::Script`), `diag-frontend` (the lowering of `diag.hmi`
 and `diag.record` and of the answer's keys), `agent` (`host.rs`, `runner.rs`, `policy.rs`),
 `shared-proto` (`EventBody::HmiRequest` and the answer command), `api/asyncapi.yaml`,
-`api/openapi.yaml`, Starlark subset 2.5, 3.1, 3.2, 3.4 and 4.6, design 8.2.4 and 8.6; ADR-233
-(items 4 and 7), ADR-254, ADR-304, ADR-317, ADR-328, ADR-330, ADR-335
+`api/openapi.yaml`, Starlark subset 2.5, 3.1, 3.2, 3.4 and 4.6, design 8.2.4 and 8.6; ADR-229,
+ADR-233 (items 4 and 7), ADR-254, ADR-304, ADR-317, ADR-328, ADR-330, ADR-335
 
 ## Context
 
@@ -139,10 +139,14 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 5. **The agent's host and the server.** The host keeps, per instance and in memory, a map from
    inquiry number to the request's state, as `wait_elapsed` keeps its timers: the first poll of an
    inquiry generates a `request_id` (UUIDv7, design 4.4), decodes the `HmiForm`, sends
-   `EventBody::HmiRequest { job_id, request_id, kind, form }` with `kind` `Form` or `Record` and
+   `EventBody::HmiRequest { job_id, generation, request_id, kind, form }` with `kind` `Form` or
+   `Record`, `generation` the job's ownership generation (ADR-229: every job-scoped message
+   carries it, and the server applies one only under the current owner and generation), and
    `form` typed (`id` and `params`, which serialize as JSON on the wire), and returns `Ok(None)`;
-   later polls return `Ok(None)` until the answer command `HmiAnswer { job_id, request_id, ok,
-   value }` arrives, then encode item 3's bytes and return `Some`, closing the inquiry. The agent
+   later polls return `Ok(None)` until the answer command `HmiAnswer { job_id, generation,
+   request_id, ok, value }` arrives, then encode item 3's bytes and return `Some`, closing the
+   inquiry. The agent takes an answer or refusal command only when its job, generation and request
+   id name the open inquiry, and drops any other as stale. The agent
    checks only the shape (`value` is text of at most 16 KiB minus one, empty when `ok` is false)
    when the command arrives, before any poll can return it; a command of another shape is refused
    to the server and the inquiry stays open, so the host never hands the VM a malformed answer;
@@ -151,21 +155,32 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    itself (design 4.3.1); only the judgment reaches the agent. A new host instance, which every
    restart creates, opens a new `request_id` for the same inquiry number: the server supersedes
    the job's open inquiry, and a late answer to a superseded id is audit data only. A server
-   refusal (an id the server does not have, params the form cannot take) is
-   `HostError::HmiRefused`, a resumable host error and not an answer. The stream and Web API
-   schemas change accordingly: `hmiRequest` carries `kind`, `id` and `params`; `hmiResponse` and
-   the `POST .../hmi/{requestId}` body are `{ ok: boolean, value: string }`.
+   refusal (an id the server does not have, params the form cannot take) is a command of its own,
+   `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
+   returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the
+   instruction opens a new inquiry. When the host closes an inquiry with the timed-out answer
+   (item 6) it sends `EventBody::HmiWithdrawn { job_id, generation, request_id }`, so the server
+   takes the form off the screen. The stream and Web API schemas change accordingly: `hmiRequest`
+   carries the generation, `kind`, `id` and `params`; `hmiResponse` and the `POST
+   .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the refusal and the withdrawal
+   are messages of their own.
 6. **The runner polls an HMI wait as it polls a timer.** `Waiting(WaitingOn::Hmi)` reports
    `JobState::AwaitingHmi`, sleeps `wait_poll` and steps again, keeping the keep-alive and the
    cancel check; `JobError::Unanswerable` remains for `SeedKey` only. When the HMI timeout of
    design 5.6 expires, the runner raises the job's cancel flag and the host closes the inquiry with
-   the timed-out answer (status 2) on its next poll, telling the server the inquiry is withdrawn.
+   the timed-out answer (status 2) on its next poll, telling the server the inquiry is withdrawn
+   (item 5).
    Outside every uninterruptible and recovery-required section the waiting instruction is an
    interruptible point, so the runner takes the cancel before that poll and the job ends there.
    Inside such a section ADR-330 holds the cancel, so the instruction completes with the timed-out
    answer, the procedure runs on to the section's end (it may test `timed_out` and `diag.fail`),
    and the held cancel is taken at the next interruptible point, as design 5.6 asks. Without that
-   answer a wait in such a section could never end. Where the timeout's value comes from (the job
+   answer a wait in such a section could never end. A run whose HMI timeout fired never ends as
+   Completed: when the procedure reaches its end while that cancel is still held, which ADR-330
+   item 2 would let finish, the job ends as cancelled by the HMI timeout instead, as it would have
+   at an interruptible point. Every instruction ran, and the job's outcome still says the operator
+   never answered. A procedure that ends by `diag.fail` or an error while the cancel is held ends
+   that way, as ADR-330 item 2 says. Where the timeout's value comes from (the job
    instruction or the agent's settings) is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer
    bytes, and gain `Script::form_answer(ok, text)`, `record_answer(ok, text)` and
@@ -223,7 +238,8 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 - `IR_SCHEMA_VERSION` becomes 18: a runtime of 17 cannot decode `HmiRequestFromStack`, and the
   version a server matches against `capabilities` (9.5) changes, as for every appended
   instruction (ADR-233). `VmError` gains `BadHmiForm` and `HmiFormTooLong` (both raised before the host call),
-  `ProgramError` gains `BadHmiForm`. ADR-233's status annotation records the appended
+  `ProgramError` gains `BadHmiForm`. ADR-330 item 2 is amended for a cancel an HMI timeout
+  raised (item 6). ADR-233's status annotation records the appended
   instruction, and its item 7 is read with this ADR: the constant is an encoded `HmiTemplate`.
   The IR golden files change in their version, and in their code if `procedure.star` gains a
   `diag.hmi` and a `diag.record` with scripted answers.

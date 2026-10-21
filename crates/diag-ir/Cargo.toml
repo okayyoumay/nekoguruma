@@ -10,5 +10,15 @@ postcard.workspace = true
 flatbuffers.workspace = true
 thiserror.workspace = true
 
+[build-dependencies]
+# Check and unpack the pinned flatc release binary for `download-flatc` (schema/README.md).
+sha2 = { workspace = true, optional = true }
+zip = { version = "9.0.5", default-features = false, features = ["deflate-flate2-zlib-rs"], optional = true }
+
+[features]
+# Regenerate `src/generated/ir_generated.rs` from `schema/ir.fbs` in the build script.
+flatc = []
+download-flatc = ["flatc", "dep:sha2", "dep:zip"]
+
 [dev-dependencies]
 serde_json.workspace = true

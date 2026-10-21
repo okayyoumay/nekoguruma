@@ -15,9 +15,10 @@ paths:
   the result with the proto change. Update `docs/rpc-api-guide.md` in the same
   PR.
 - **IR FlatBuffers bindings** (`crates/diag-ir`): `schema/ir.fbs` is the
-  source of truth; `src/generated/ir_generated.rs` is regenerated with `flatc`
-  (command and version in `schema/README.md`) in the same commit as every
-  schema change, never edited by hand. A schema change also bumps
+  source of truth; `src/generated/ir_generated.rs` is regenerated with
+  `cargo build -p diag-ir --features download-flatc`, which fetches the pinned
+  `flatc` release binary itself (details and version in `schema/README.md`), in the same
+  commit as every schema change, never edited by hand. A schema change also bumps
   `IR_SCHEMA_VERSION`.
 - **FFI bindings** (`crates/iso22900-sys`, `crates/j2534-0404-sys`): the C
   headers in `src/bindings/*.h` are the source of truth;

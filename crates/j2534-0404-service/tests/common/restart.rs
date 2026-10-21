@@ -702,16 +702,37 @@ struct Job(windows_sys::Win32::Foundation::HANDLE);
 
 #[cfg(windows)]
 impl Job {
-    /// A new job object holding `child`.
+    /// A new job object holding `child`. Closing the job's handle, which only the test holds,
+    /// terminates whatever it still holds, so a test that fails on any path, a failed kill
+    /// included, leaves neither the agent nor its worker running.
     fn holding(child: &Child) -> std::io::Result<Self> {
         use std::os::windows::io::AsRawHandle;
-        use windows_sys::Win32::System::JobObjects::{AssignProcessToJobObject, CreateJobObjectW};
+        use windows_sys::Win32::System::JobObjects::{
+            AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
+            SetInformationJobObject,
+        };
         // SAFETY: no security attributes and no name; the call touches no memory of ours.
         let handle = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
         if handle.is_null() {
             return Err(std::io::Error::last_os_error());
         }
         let job = Job(handle);
+        let mut limits = JOBOBJECT_EXTENDED_LIMIT_INFORMATION::default();
+        limits.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+        // SAFETY: the handle is open, and `limits` is the structure the class names, of the size
+        // passed.
+        let limited = unsafe {
+            SetInformationJobObject(
+                job.0,
+                JobObjectExtendedLimitInformation,
+                (&raw const limits).cast(),
+                std::mem::size_of_val(&limits) as u32,
+            )
+        };
+        if limited == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
         // SAFETY: both handles are open: the job's above, the child's while `child` lives.
         if unsafe { AssignProcessToJobObject(job.0, child.as_raw_handle()) } == 0 {
             return Err(std::io::Error::last_os_error());

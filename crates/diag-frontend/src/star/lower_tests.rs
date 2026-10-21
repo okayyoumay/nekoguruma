@@ -3842,7 +3842,9 @@ fn a_value_that_does_not_fit_the_format_widths_is_not_lowerable() {
         // A length of two bytes in a one-byte field.
         (segment(0x100, 0x10, 0x14, 0x10), "length"),
         // A zero-width length cannot hold the length.
-        (segment(0x25, 0x10, 0x04, 0x10), "zero width"),
+        (segment(0x25, 0x10, 0x04, 0x10), "zero length width"),
+        // Nor can a zero-width address field, even for the address 0.
+        (segment(0x25, 0x10, 0x40, 0), "zero address width"),
     ] {
         let errors = lower_plan(PLAN_NO_ERASE, vec![segment]).expect_err(name);
         assert_eq!(
@@ -3865,6 +3867,8 @@ fn a_block_size_above_what_a_transfer_takes_is_not_lowerable() {
     let most = diag_ir::MAX_BYTES_LEN as u32 - 2;
     // The largest block size lowers (one block of that size); one more does not.
     lower_plan(PLAN_NO_ERASE, vec![segment(u64::from(most), most, 0x44, 0)]).expect("lowers");
+    // Only the longest block that exists counts: a block size above the length is one block.
+    lower_plan(PLAN_NO_ERASE, vec![segment(0x25, u32::MAX, 0x44, 0)]).expect("lowers");
     let errors = lower_plan(
         PLAN_NO_ERASE,
         vec![segment(u64::from(most) + 1, most + 1, 0x44, 0)],
@@ -4121,4 +4125,75 @@ def main():
         "{codes:?}"
     );
     assert!(codes.iter().all(|&(_, line)| line != 8), "{codes:?}");
+}
+
+#[test]
+fn a_recovery_marker_on_a_statement_that_emits_nothing_is_refused() {
+    // A docstring and a `pass` emit no instruction, so the point would fall back to the erase.
+    let docstring = PLAN_NO_ERASE.replace(
+        "def write():\n",
+        "def write():\n    # @recoveryRequired\n    \"The plan.\"\n",
+    );
+    let trailing = PLAN_NO_ERASE.replace(
+        "    res = diag.flash_transfer(1)\n",
+        "    res = diag.flash_transfer(1)\n    # @recoveryRequired\n    pass\n",
+    );
+    let requests = flash_index(&["vin", "hardware_part_number", "software_version"]);
+    for (source, line) in [(docstring, 5), (trailing, 7)] {
+        let found = flash_errors(&source, Some(NO_ERASE), &requests);
+        assert_eq!(
+            found.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+            [(StarCode::BadAnnotation, line)],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn a_local_of_main_live_across_a_plan_keeps_its_value() {
+    // `main` holds `x` across the plan, which has a local of the same name: the plan's frame is
+    // shifted past `main`'s, so the plan's `x` is another slot.
+    let source = "\
+# @section uninterruptible expected=1000
+# @flashPlan session=1
+def write():
+    x = diag.precondition(\"ignition\")
+    diag.log(1, \"plan x=\" + (\"one\" if x == 1 else \"other\"))
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    x = diag.precondition(\"voltage\")
+    write()
+    if x == 5:
+        diag.log(1, \"main kept x\")
+    else:
+        diag.log(1, \"main lost x\")
+";
+    let program = lower_plan(source, vec![plan_segment()]).expect("lowers");
+    program.validate().expect("valid");
+    let bytes = flash_document(Some(NO_ERASE));
+    let variant = load_ecu_document(&bytes)
+        .expect("loads")
+        .variant()
+        .expect("a variant");
+    let mut host = ScriptedHost {
+        responses: [vec![0x74, 0x20, 0x01, 0x00], vec![0x77]].into(),
+        artifact: vec![0; 64],
+        inputs: vec![
+            (RuntimeInput::SupplyVoltageMillivolts, 5),
+            (RuntimeInput::IgnitionOn, 1),
+        ],
+        ..ScriptedHost::default()
+    };
+    let mut vm = Vm::new(&program);
+    for _ in 0..1000 {
+        match vm.step_with_declarations(&program, Some(&variant), &mut host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    let logged: Vec<_> = host.calls.iter().filter(|c| c.starts_with("log")).collect();
+    assert_eq!(logged, ["log 1 plan x=one", "log 1 main kept x"]);
 }

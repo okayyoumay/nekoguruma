@@ -470,14 +470,14 @@ five; a session no plan names may leave them empty, and a plan whose session lea
 | `block_size` | integer, 1 to 2^32 - 1 | yes | |
 | `checksum` | bytes | no | Default empty |
 | `data_format` | integer, 0x00 to 0xFF | no | ADR-336: the dataFormatIdentifier of the RequestDownload built from the segment, default 0x00 |
-| `address_and_length_format` | integer, 0x00 to 0xFF | no | ADR-336: the addressAndLengthFormatIdentifier, default 0x44; its nibbles give the widths of the address and length (ISO 14229-1 (2026) 14.2.2.3), and a value that does not fit is a conversion error |
+| `address_and_length_format` | integer, 0x00 to 0xFF | no | ADR-336: the addressAndLengthFormatIdentifier, default 0x44; its nibbles give the widths of the address and length (ISO 14229-1 (2026) 14.2.2.3), neither nibble may be 0 (the request would carry no address or size; `BadValue`), and a value that does not fit is a conversion error |
 
 The RequestDownload that a plan's `diag.flash_transfer` expands to is built from the two format
 bytes, which the converter copies into the `FlashSegment` fields `data_format` and
 `address_and_length_format` (ADR-336 item 1; `ir.fbs` gives them the same defaults).
 
 Under ADR-336, `block_size` is the payload of one TransferData request. `block_size + 2` must not
-exceed the ECU's maxNumberOfBlockLength (14.2.3.2), and the lowering refuses a `block_size` above
+exceed the ECU's maxNumberOfBlockLength (14.2.3.2), and the lowering refuses a segment whose longest block, `min(block_size, length)`, is above
 `MAX_BYTES_LEN - 2`. The converter does not read `checksum` (ADR-336 item 14).
 
 Every flash session needs at least one segment, and the address ranges of one session's segments

@@ -136,11 +136,19 @@ fn recovery_columns_and_segment_formats_are_range_checked() {
                 "application,a,0,1,0,1,0x100,",
                 "application,b,1,1,1,1,,256",
                 "application,c,2,1,2,1,0xFF,0xFF",
+                // A nibble of 0 leaves the request without an address or a size.
+                "application,d,3,1,3,1,0,0x40",
+                "application,e,4,1,4,1,0,0x04",
+                "application,f,5,1,5,1,0,0x00",
+                "application,g,6,1,6,1,0,0x11",
             ]
         ),
         vec![
             cell(BadValue, 2, "data_format"),
-            cell(BadValue, 3, "address_and_length_format")
+            cell(BadValue, 3, "address_and_length_format"),
+            cell(BadValue, 5, "address_and_length_format"),
+            cell(BadValue, 6, "address_and_length_format"),
+            cell(BadValue, 7, "address_and_length_format"),
         ]
     );
 }

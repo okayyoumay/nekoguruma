@@ -583,3 +583,84 @@ def main():
         .collect();
     assert_eq!(blocks, [16, 16, 5]);
 }
+
+const ERASE_STEPS: &str = "enter-programming-session;security-access;erase-memory;\
+                           request-download;transfer-data;transfer-exit";
+
+#[test]
+fn a_plan_that_names_the_second_of_two_sessions_takes_its_facts_and_segment() {
+    let files = with(
+        example(),
+        "flash_sessions.csv",
+        &format!(
+            "id,name,steps,session_timeout_ms,teardown_margin_ms,ecu_startup_ms,\
+             confirmation_window_ms,version_read_retries,no_application_nrc\n\
+             1,application,{ERASE_STEPS},5000,1000,2000,3000,3,\n\
+             2,calibration,{ERASE_STEPS},7000,100,200,300,1,0x22\n"
+        ),
+    );
+    let files = appended(
+        files,
+        "flash_segments.csv",
+        &["calibration,cal,0x20000000,0x40,8,0x20,0x00,0x24"],
+    );
+    let source = PLAN
+        .replace("session=1", "session=2")
+        .replace("flash_transfer(1)", "flash_transfer(2)");
+    let (program, plan) = one_plan(files.clone(), &source);
+    assert_eq!((plan.flash_session, plan.stage), (2, 2));
+    assert_eq!(
+        plan.timing,
+        RecoveryTiming {
+            session_timeout_millis: 7000,
+            teardown_margin_millis: 100,
+            ecu_startup_millis: 200,
+            confirmation_window_millis: 300,
+        }
+    );
+    assert_eq!(plan.version_read_retries, 1);
+    assert_eq!(plan.no_application, Some(NoApplication::Nrc(0x22)));
+    // The download is built from the second session's segment (format 0x24: a four-byte
+    // address, a two-byte length), and its blocks are read from that session's segment 0.
+    let download = find(&program, 0, service(0x34)) as usize;
+    let Op::PushBytes(operand) = program.code[download - 1] else {
+        panic!("the operand is pushed before the request");
+    };
+    assert_eq!(
+        program.constants[operand as usize],
+        [0x00, 0x24, 0x20, 0, 0, 0, 0, 0x40]
+    );
+    assert!(program.code.contains(&Op::FlashBlock {
+        session: 2,
+        segment: 0
+    }));
+    // And a plan for session 1 in the same variant still takes the first one's.
+    let (_, first) = one_plan(files, PLAN);
+    assert_eq!(first.timing, TIMING);
+}
+
+#[test]
+fn a_session_row_that_leaves_a_recovery_fact_empty_is_plan_shape_at_the_annotation() {
+    // The annotation is on line 2 of `PLAN`.
+    for row in [
+        // No timeout, no retry count, and no startup time.
+        format!("1,application,{ERASE_STEPS},,1000,2000,3000,3,"),
+        format!("1,application,{ERASE_STEPS},5000,1000,2000,3000,,"),
+        format!("1,application,{ERASE_STEPS},5000,1000,,3000,3,"),
+    ] {
+        let files = with(
+            example(),
+            "flash_sessions.csv",
+            &format!(
+                "id,name,steps,session_timeout_ms,teardown_margin_ms,ecu_startup_ms,\
+                 confirmation_window_ms,version_read_retries,no_application_nrc\n{row}\n"
+            ),
+        );
+        let errors = lowered(files, PLAN).expect_err("refused");
+        assert_eq!(
+            errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+            [(StarCode::PlanShape, 2)],
+            "{row}"
+        );
+    }
+}

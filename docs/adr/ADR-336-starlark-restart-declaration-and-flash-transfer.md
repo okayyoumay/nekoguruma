@@ -1,7 +1,7 @@
 # ADR-336: The Starlark Restart Declaration and `diag.flash_transfer`
 
 **Date:** 2026-10-20
-**Status:** Accepted
+**Status:** Accepted (Consequences' step figure corrected: a block costs 12 steps, about 83,000 blocks at the default limit)
 **Affects:** `diag-frontend` (Starlark lowering, CSV conversion), `crates/diag-frontend/docs/starlark-subset.md`
 3.1, 3.2, 4.5, 4.6, 4.9 and 5, `crates/diag-frontend/docs/csv-tables.md` 1, 4.12 and the new
 tables, `diag-ir` (`Op::FlashBlock`, `DiagHost::artifact_bytes`, `FlashSegment`, `IR_SCHEMA_VERSION`),

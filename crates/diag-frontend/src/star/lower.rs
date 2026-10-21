@@ -3992,6 +3992,9 @@ impl<'a> Lowerer<'a> {
                 && is_string_expression(stmt)
                 && !self.idempotency.contains_key(&stmt.span.begin().get())
             {
+                if recovery_at == Some(stmt.span.begin().get()) {
+                    self.no_instruction_to_mark(stmt.span);
+                }
                 continue;
             }
             let mut code = Vec::new();
@@ -4006,7 +4009,11 @@ impl<'a> Lowerer<'a> {
                 }
             }
             if recovery_at == Some(at) {
-                code.insert(0, (Ins::Boundary(Boundary::RecoveryRequired), stmt.span));
+                if code.iter().any(|(ins, _)| !ins.is_pseudo()) {
+                    code.insert(0, (Ins::Boundary(Boundary::RecoveryRequired), stmt.span));
+                } else {
+                    self.no_instruction_to_mark(stmt.span);
+                }
             }
             body.extend(code);
         }
@@ -4146,19 +4153,22 @@ impl<'a> Lowerer<'a> {
                 span,
                 format!(
                     "the segment's start address {start:#x} or length {length:#x} does not fit \
-                     the {address_width} and {length_width} bytes its address_and_length_format \
-                     {format:#04x} gives (ISO 14229-1 (2026) 14.2.2.3, csv-tables 4.12)"
+                     the {address_width} and {length_width} bytes (each 1 or more) its \
+                     address_and_length_format {format:#04x} gives (ISO 14229-1 (2026) 14.2.2.3, csv-tables 4.12)"
                 ),
             );
             return failed();
         };
         // The TransferData request is the counter, then the block (ADR-336 item 11).
-        if block_size == 0 || block_size > (MAX_BYTES_LEN - 2) as u64 {
+        // Only the longest block that exists counts: a block size above the length is one block.
+        if block_size == 0 || block_size.min(length) > (MAX_BYTES_LEN - 2) as u64 {
             self.not_lowerable(
                 span,
                 format!(
-                    "the segment's block_size {block_size} is not 1 to {}, the most one \
-                     TransferData payload holds (csv-tables 4.12, ADR-336 item 11)",
+                    "the segment's longest block, {} bytes (block_size {block_size}), is not 1 to \
+                     {}, the most one TransferData payload holds (csv-tables 4.12, ADR-336 \
+                     item 11)",
+                    block_size.min(length),
                     MAX_BYTES_LEN - 2
                 ),
             );
@@ -4228,6 +4238,19 @@ impl<'a> Lowerer<'a> {
             },
             code,
         )
+    }
+
+    /// `# @recoveryRequired` marks the first instruction of its statement (4.9), so a statement
+    /// that emits none (a docstring, `pass`, a constant expression, a branch that folds away)
+    /// cannot carry it: the point would silently fall back to the erase, which is weaker than
+    /// what the author declared.
+    fn no_instruction_to_mark(&mut self, span: Span) {
+        self.error(
+            StarCode::BadAnnotation,
+            span,
+            "`@recoveryRequired` marks the first instruction of its statement, and this statement \
+             emits none; put it on a statement that does something (4.9)",
+        );
     }
 
     /// Lowers `diag.{name}(...)` and gives each diagnostic primitive it emits the call's
@@ -6500,11 +6523,13 @@ fn default_idempotency(call: &str, op: &Op, in_plan: bool) -> Idempotency {
     }
 }
 
-/// `value` as `width` big-endian bytes, or `None` when it does not fit: a width of 0 holds only 0,
-/// and one above 8 bytes pads with zeros.
+/// `value` as `width` big-endian bytes, or `None` when it does not fit: a width of 0 is refused
+/// (a RequestDownload carries an address and a size), and one above 8 bytes pads with zeros.
 fn be_in_width(value: u64, width: usize) -> Option<Vec<u8>> {
     let bytes = value.to_be_bytes();
-    if width >= bytes.len() {
+    if width == 0 {
+        None
+    } else if width >= bytes.len() {
         let mut padded = vec![0; width - bytes.len()];
         padded.extend(bytes);
         Some(padded)

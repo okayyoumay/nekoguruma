@@ -979,6 +979,18 @@ pub(crate) fn flash_segments(sheet: &Sheet, errors: &mut Errors) -> Vec<FlashSeg
         let data_format = row.or(e, "data_format", 0x00, as_u8(0, 0xFF));
         let address_and_length_format =
             row.or(e, "address_and_length_format", 0x44, as_u8(0, 0xFF));
+        // A RequestDownload needs a memory address and a memory size, so neither nibble of the
+        // format may be 0 (ISO 14229-1 (2026) 14.2.2.3).
+        if let Some(format) = address_and_length_format
+            && (format & 0x0F == 0 || format >> 4 == 0)
+        {
+            row.error(
+                e,
+                ErrorCode::BadValue,
+                "address_and_length_format",
+                "a nibble of the format is 0: the request would carry no memory address or size",
+            );
+        }
         if let Some(length) = length {
             for (column, start) in [
                 ("start_address", start_address),

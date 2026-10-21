@@ -68,10 +68,10 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-No entries at present.
-
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".
+
+- `tester_present_send_type::mode_0_own_send_does_not_stamp_last_bus_activity_for_mode_1_sibling` (`crates/j2534-0404-service/tests/grpc_mock/tester_present_send_type.rs`, ADR-149): on unmodified commit `2080403d4fb79de975cfa3d6d0500c2853d42552`, the Linux full run `cargo nextest run --workspace --locked --profile ci` failed the assertion that cll_b's arm-time frame is second: the last byte was `0x11` instead of `0x3e`. The diagnostic run `cargo nextest run -p j2534-0404-service --test grpc_mock --locked --profile ci -E 'test(tester_present_send_type::mode_0_own_send_does_not_stamp_last_bus_activity_for_mode_1_sibling)' --test-threads 1` passed once; this does not erase the full-run failure or establish a confirmed root cause. The test sleeps 75 ms inside cll_a's 150 ms window, so scheduling delay is a candidate to investigate. Done when: the frame-order and idle-clock assertions are deterministic under parallel load, with a verified cause and no skipped test, retries that hide failures, or loosened assertions.
 
 ### Prioritized Backlog
 

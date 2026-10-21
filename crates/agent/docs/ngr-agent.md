@@ -105,6 +105,14 @@ clause 14.4). Only a positive 0x34 begins a transfer. RequestUpload (0x35), Requ
 (0x37), RequestFileTransfer (0x38), DiagnosticSessionControl (0x10) and ECUReset (0x11) end it
 whatever the response, and so does any failed block: a negative TransferData response, a wrong
 echo or no response (a new RequestDownload is needed; a same-counter retry could leave a gap).
+The positive RequestDownload response also sets the transfer's limit: its
+maxNumberOfBlockLength (clause 14.2.3, the length its lengthFormatIdentifier's high nibble
+names), which counts the whole TransferData request, SID and counter included. A block whose
+`2 + data.len()` exceeds it fails as `HostError::BlockTooLong` before it is sent, and the
+tracked transfer stays as it was (ADR-336 item 12). A positive response with no readable limit
+(a length of 0, a reserved low nibble that is not 0, or not exactly the length it names) still
+begins the transfer, which the ECU has accepted, but its first block fails as
+`HostError::NoBlockLength` before it is sent; a limit wider than 64 bits is never reached.
 A `FlashTransfer` with no tracked transfer is an error and sends nothing, and a
 `ServiceRequest` for 0x36 is refused, both before the link opens (`check_program`) and by
 the host. `Program::validate` refuses a plan with 0x10, 0x11, 0x35 or 0x38 between its

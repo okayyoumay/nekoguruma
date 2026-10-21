@@ -71,6 +71,19 @@ pub enum HostError {
         counter: u8,
         response: Vec<u8>,
     },
+    /// The TransferData request for this block, SID and counter included, would be longer than
+    /// the maxNumberOfBlockLength the ECU gave in its positive RequestDownload response
+    /// (ADR-336 item 12). Nothing was sent, and the tracked transfer is unchanged.
+    #[error(
+        "TransferData block {block} would be {length} bytes, longer than the ECU's maxNumberOfBlockLength of {max} (ADR-336)"
+    )]
+    BlockTooLong { block: u64, length: u64, max: u64 },
+    /// The positive RequestDownload response that began the transfer carries no readable
+    /// maxNumberOfBlockLength (clause 14.2.3), so no block is sent (ADR-336 item 12).
+    #[error(
+        "the ECU's RequestDownload response {response:02X?} has no readable maxNumberOfBlockLength, so TransferData block {block} is not sent (ADR-336)"
+    )]
+    NoBlockLength { block: u64, response: Vec<u8> },
     /// A `ServiceRequest` for TransferData: the block counter belongs to `FlashTransfer`.
     #[error("TransferData (0x36) must be sent with FlashTransfer, not ServiceRequest (ADR-250)")]
     UseFlashTransfer,
@@ -216,6 +229,10 @@ pub(crate) struct TransferCounter {
     /// Blocks the ECU confirmed since the last RequestDownload; `None` when no transfer is
     /// tracked.
     accepted: Option<u64>,
+    /// The maxNumberOfBlockLength of the positive RequestDownload response that began the
+    /// transfer, or that response when it carries none readable ([`max_block_length`]). It
+    /// counts only while `accepted` is `Some`: every RequestDownload sets both.
+    max_block_length: Option<Result<u64, Vec<u8>>>,
 }
 
 impl TransferCounter {
@@ -223,7 +240,8 @@ impl TransferCounter {
     /// response, or `Err` when there was none or sending failed.
     ///
     /// - RequestDownload (0x34) answered positively begins a transfer at count 0, so a second
-    ///   one mid-transfer starts over. Any other outcome leaves no transfer.
+    ///   one mid-transfer starts over, and the response's maxNumberOfBlockLength becomes the
+    ///   transfer's limit. Any other outcome leaves no transfer.
     /// - RequestUpload (0x35), RequestTransferExit (0x37), RequestFileTransfer (0x38),
     ///   DiagnosticSessionControl (0x10) and ECUReset (0x11) end the tracked transfer whatever
     ///   the response: FlashTransfer would discard upload data, and the other four end or
@@ -232,9 +250,12 @@ impl TransferCounter {
     fn after_request(&mut self, request: &[u8], outcome: Result<&[u8], ()>) {
         match request.first() {
             Some(0x34) => {
-                self.accepted = match outcome {
-                    Ok([0x74, ..]) => Some(0),
-                    _ => None,
+                (self.accepted, self.max_block_length) = match outcome {
+                    Ok(response @ [0x74, ..]) => (
+                        Some(0),
+                        Some(max_block_length(response).ok_or_else(|| response.to_vec())),
+                    ),
+                    _ => (None, None),
                 };
             }
             Some(0x35 | 0x37 | 0x38 | 0x10 | 0x11) => self.accepted = None,
@@ -246,6 +267,25 @@ impl TransferCounter {
     fn next(&self) -> Result<(u64, u8), HostError> {
         let index = self.accepted.ok_or(HostError::NoTransferActive)? + 1;
         Ok((index, wire_counter(index)))
+    }
+
+    /// Refuses block `index` when its TransferData request, `2 + data_len` bytes, exceeds the
+    /// transfer's maxNumberOfBlockLength, or when the RequestDownload response carried none
+    /// readable (ADR-336 item 12). The tracked transfer is left as it is, since nothing is sent.
+    fn check_length(&self, index: u64, data_len: usize) -> Result<(), HostError> {
+        let length = (data_len as u64).saturating_add(2);
+        match &self.max_block_length {
+            Some(Ok(max)) if length > *max => Err(HostError::BlockTooLong {
+                block: index,
+                length,
+                max: *max,
+            }),
+            Some(Err(response)) => Err(HostError::NoBlockLength {
+                block: index,
+                response: response.clone(),
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Takes the outcome of sending block `index` with counter `counter`.
@@ -280,6 +320,27 @@ impl TransferCounter {
             }
         }
     }
+}
+
+/// The maxNumberOfBlockLength of a positive RequestDownload response (ISO 14229-1:2026 clause
+/// 14.2.3): the high nibble of the lengthFormatIdentifier after the SID gives its length in
+/// bytes, and the value counts the whole TransferData request, SID and counter included.
+///
+/// `None` when the response is not that shape: no lengthFormatIdentifier, a length of 0, a
+/// reserved low nibble that is not 0, or a response that is not exactly the identifier and
+/// the length it names. Then no block is sent ([`HostError::NoBlockLength`]). A value wider
+/// than 64 bits counts as `u64::MAX`, which no block reaches.
+fn max_block_length(response: &[u8]) -> Option<u64> {
+    let format = *response.get(1)?;
+    let width = usize::from(format >> 4);
+    if width == 0 || format & 0x0F != 0 || response.len() != 2 + width {
+        return None;
+    }
+    let value = &response[2..];
+    Some(value.iter().fold(0u64, |max, &byte| {
+        max.checked_mul(256)
+            .map_or(u64::MAX, |max| max | u64::from(byte))
+    }))
 }
 
 /// The wire block sequence counter of the `index`-th block (1-based) of a transfer: 1, 2, ...,
@@ -702,6 +763,7 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     // rises and wraps, so the counter comes from the host's own running count (ADR-250).
     fn flash_transfer(&mut self, _block: u32, data: &[u8]) -> Result<(), HostError> {
         let (index, counter) = self.transfer.next()?;
+        self.transfer.check_length(index, data.len())?;
         let outcome = self.send_recv(transfer_data_bytes(counter, data));
         self.transfer.after_block(index, counter, outcome)
     }
@@ -986,6 +1048,78 @@ mod tests {
             assert_eq!(counter.accepted, None);
             assert!(matches!(counter.next(), Err(HostError::NoTransferActive)));
         }
+    }
+
+    #[test]
+    fn the_download_response_sets_the_block_length_limit() {
+        assert_eq!(max_block_length(&[0x74, 0x20, 0x01, 0x02]), Some(0x0102));
+        assert_eq!(max_block_length(&[0x74, 0x10, 0x82]), Some(0x82));
+        assert_eq!(
+            max_block_length(&[0x74, 0x80, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFE]),
+            Some(u64::MAX - 1)
+        );
+        // Wider than 64 bits: no block reaches it, also with leading zeros kept exact.
+        assert_eq!(
+            max_block_length(&[0x74, 0x90, 0x01, 0, 0, 0, 0, 0, 0, 0, 0]),
+            Some(u64::MAX)
+        );
+        assert_eq!(
+            max_block_length(&[0x74, 0x90, 0, 0, 0, 0, 0, 0, 0, 0x01, 0x02]),
+            Some(0x0102)
+        );
+        // No readable limit: no length byte, a length of 0, a reserved nibble that is not 0,
+        // too few bytes, or more than the length names.
+        for response in [
+            &[0x74][..],
+            &[0x74, 0x00],
+            &[0x74, 0x00, 0x01],
+            &[0x74, 0x2F, 0x01, 0x02],
+            &[0x74, 0x20, 0x01],
+            &[0x74, 0x40],
+            &[0x74, 0x20, 0x01, 0x02, 0xAA],
+        ] {
+            assert_eq!(max_block_length(response), None, "{response:02X?}");
+        }
+    }
+
+    #[test]
+    fn a_block_longer_than_the_ecus_limit_is_refused_and_the_transfer_kept() {
+        // A limit of 0x0102 bytes leaves 0x0100 data bytes after the SID and the counter.
+        let mut counter = begun();
+        assert_eq!(counter.max_block_length, Some(Ok(0x0102)));
+        counter.check_length(1, 0x0100).unwrap();
+        assert!(matches!(
+            counter.check_length(1, 0x0101),
+            Err(HostError::BlockTooLong {
+                block: 1,
+                length: 0x0103,
+                max: 0x0102
+            })
+        ));
+        assert_eq!(counter.accepted, Some(0));
+        confirm(&mut counter, 1);
+        // A limit below the SID and counter refuses every block, even an empty one.
+        counter.after_request(&[0x34, 0x00, 0x44], Ok(&[0x74, 0x10, 0x01]));
+        assert!(matches!(
+            counter.check_length(1, 0),
+            Err(HostError::BlockTooLong {
+                length: 2,
+                max: 1,
+                ..
+            })
+        ));
+        // A response with no readable limit begins the transfer, but no block is sent.
+        counter.after_request(&[0x34, 0x00, 0x44], Ok(&[0x74, 0x00]));
+        assert_eq!(counter.accepted, Some(0));
+        assert!(matches!(
+            counter.check_length(1, 1),
+            Err(HostError::NoBlockLength { block: 1, response }) if response == [0x74, 0x00]
+        ));
+        // A new download replaces the limit; a refused one clears it with the transfer.
+        counter.after_request(&[0x34, 0x00, 0x44], Ok(&[0x74, 0x10, 0x10]));
+        assert_eq!(counter.max_block_length, Some(Ok(0x10)));
+        counter.after_request(&[0x34, 0x00, 0x44], Ok(&[0x7F, 0x34, 0x22]));
+        assert_eq!(counter.max_block_length, None);
     }
 
     #[test]

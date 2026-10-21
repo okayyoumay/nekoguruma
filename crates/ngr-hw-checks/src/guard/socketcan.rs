@@ -356,6 +356,10 @@ mod raw {
                 // Rounded up, so a wait of under a millisecond still waits; after an interrupted
                 // poll, only the time left.
                 let left = deadline.saturating_duration_since(std::time::Instant::now());
+                // A bus that keeps sending frames this skips must not keep the wait going.
+                if left.is_zero() {
+                    return Ok(None);
+                }
                 let millis = i32::try_from(left.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX);
                 // SAFETY: one `pollfd`, alive across the call.
                 let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };

@@ -2096,6 +2096,17 @@ fn the_erase_and_transfer_statements_hold_one_diag_call() {
         "diag.routine(0xFF00, 1, {})",
         "diag.routine(0xFF00, min(1, 2), {})",
     ));
+    // A top-level `def` with a built-in's name is a function of the program.
+    let shadow = PLAN.replace(
+        "diag.routine(0xFF00, 1, {})",
+        "diag.routine(0xFF00, min(1, 2), {})",
+    ) + "\ndef min(a, b):\n    return diag.wait(1)\n";
+    assert!(codes(&shadow).contains(&(Shape, 4)), "{:?}", codes(&shadow));
+    let bound = PLAN.replace(
+        "diag.routine(0xFF00, 1, {})",
+        "diag.routine(0xFF00, min(1, 2), {})",
+    ) + "\nmin = lambda a, b: diag.wait(1)\n";
+    assert!(codes(&bound).contains(&(Shape, 4)), "{:?}", codes(&bound));
     // The plain forms still pass.
     passes(PLAN);
 }

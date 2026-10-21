@@ -2707,7 +2707,11 @@ impl Checker<'_> {
                         // The statement holds this one operation: no other `diag` call in
                         // the arguments.
                         if diag_call_count(transfer) > 1
-                            || calls_program_function(transfer, &locals)
+                            || calls_program_function(
+                                transfer,
+                                &locals,
+                                &[&self.defs, &self.globals],
+                            )
                         {
                             found.push((
                                 transfer.span,
@@ -2764,7 +2768,11 @@ impl Checker<'_> {
                             .is_some_and(|e| {
                                 is_diag_call(e, "routine").is_some()
                                     && diag_call_count(e) == 1
-                                    && !calls_program_function(e, &locals)
+                                    && !calls_program_function(
+                                        e,
+                                        &locals,
+                                        &[&self.defs, &self.globals],
+                                    )
                             });
                         if !routine {
                             found.push((
@@ -3039,12 +3047,20 @@ fn diag_call_count(expr: &AstExpr) -> usize {
 
 /// Whether `expr` calls, itself included, anything but `diag`, a built-in (2.4) or a method of
 /// a value: a function of the program, which the plan's expansion inlines, so its own `diag`
-/// calls would join the statement. A name in `hidden` is no built-in.
-fn calls_program_function(expr: &AstExpr, hidden: &HashSet<String>) -> bool {
+/// calls would join the statement. A name in `hidden` (a local) or in `top` (the top-level
+/// `def`s and constants) is no built-in, even when it has a built-in's name.
+fn calls_program_function(
+    expr: &AstExpr,
+    hidden: &HashSet<String>,
+    top: &[&HashSet<String>],
+) -> bool {
     if let ExprP::Call(function, _) = &expr.node {
         let builtin = match &function.node {
             ExprP::Identifier(name) => {
-                !hidden.contains(&name.node.ident) && BUILTINS.contains(&name.node.ident.as_str())
+                let name = &name.node.ident;
+                !hidden.contains(name)
+                    && !top.iter().any(|names| names.contains(name))
+                    && BUILTINS.contains(&name.as_str())
             }
             ExprP::Dot(..) => true,
             _ => false,
@@ -3054,7 +3070,7 @@ fn calls_program_function(expr: &AstExpr, hidden: &HashSet<String>) -> bool {
         }
     }
     let mut found = false;
-    expr.visit_expr(|inner| found |= calls_program_function(inner, hidden));
+    expr.visit_expr(|inner| found |= calls_program_function(inner, hidden, top));
     found
 }
 

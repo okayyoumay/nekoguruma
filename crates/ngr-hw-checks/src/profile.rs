@@ -440,7 +440,7 @@ pub(crate) const PHYSICAL_COMPARAMS: &[&str] = &[
 
 /// The bus framing a T0 loopback end uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Framing {
+pub(crate) enum Framing {
     /// Raw CAN (`CAN`, `ISO_11898_RAW` and the worker's other CAN names, their additional
     /// channels): bus payloads as they are.
     RawCan,
@@ -454,7 +454,7 @@ enum Framing {
 /// CAN or an ISO 15765 channel (`map_protocol_name`, matched ignoring ASCII case, and an
 /// additional channel's `_CHn` suffix); `None` for a protocol the loopback does not run on, or a
 /// name the worker would not recognise.
-fn framing(protocol: &str) -> Option<Framing> {
+pub(crate) fn framing(protocol: &str) -> Option<Framing> {
     // Not `channel_key`: the worker matches the name as given, so surrounding spaces are no alias.
     let key = protocol.to_ascii_lowercase();
     let base = match key.rfind("_ch") {

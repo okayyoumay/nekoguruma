@@ -16,6 +16,10 @@ vci-service-config = { workspace = true }
 vci-service-interface = { workspace = true }
 worker-host = { workspace = true }
 
+# The SocketCAN end of a T0 loopback (`guard::socketcan`) uses the Linux raw CAN socket.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 diag-ir = { workspace = true }
 tempfile = "3"

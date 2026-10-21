@@ -21,6 +21,9 @@
 //! - [`GuardedClient`]: the same handle as the agent runner's worker client (ADR-334), which holds
 //!   the module, decides every call the job makes and completes the job's link set-up from the
 //!   profile.
+//!
+//! - [`GuardedSocketCan`]: the SocketCAN end of a T0 loopback, which is not on a worker and so
+//!   not decided here: it can send only the end's own T0 frames (ADR-343).
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -45,10 +48,12 @@ mod handle;
 mod ioctl;
 mod link;
 mod runner;
+pub mod socketcan;
 mod uds;
 
 pub use handle::{Decision, GuardedHandle, HandleError, HandleOptions, Trace};
 pub use runner::GuardedClient;
+pub use socketcan::GuardedSocketCan;
 
 /// A worker request, one variant per RPC of `service VciService` in `service.proto`. [`decide`]
 /// matches it without a catch-all arm, so an RPC added to the service does not compile until it

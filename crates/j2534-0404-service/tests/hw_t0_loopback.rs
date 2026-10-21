@@ -1,6 +1,7 @@
 //! `hw_t0_two_endpoint_loopback` (design 13.5, ADR-275): on the T0 profile `NGR_HW_PROFILE` names, a
-//! loopback of two VCI modules, each end sends single RawMode frames that the other must receive
-//! exactly, in both directions, through `j2534-0404-service` and the vendor's library. The result
+//! loopback of two VCI modules or of a VCI module and a SocketCAN interface (Linux only,
+//! ADR-343), each end sends single frames that the other must receive exactly, in both
+//! directions, the VCI's through `j2534-0404-service` and the vendor's library. The result
 //! records the library, ABI and `unsigned long` width the worker ran with.
 //!
 //! The test is ignored: it needs the attached hardware, a hardware profile and the vendor's
@@ -16,7 +17,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use ngr_hw_checks::checks::t0_loopback::{DeviceFacts, Ends, FRAME_TIMEOUT, run};
-use ngr_hw_checks::guard::{GuardedHandle, HandleOptions};
+use ngr_hw_checks::guard::{GuardedHandle, GuardedSocketCan, HandleOptions};
 use ngr_hw_checks::open::open_device;
 use ngr_hw_checks::profile::{Api, Profile, Setup, Vci};
 use ngr_hw_checks::report::{Masker, Outcome};
@@ -61,12 +62,19 @@ fn declared_long_size(_: &Vci) -> Option<u8> {
     None
 }
 
-/// The two VCI ends of a T0 profile, or why the check does not run on it.
-fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
+/// The VCI ends of a T0 profile, and the endpoint of its SocketCAN end if it has one.
+struct ProfileEnds {
+    vcis: Vec<Vci>,
+    socketcan: Option<usize>,
+}
+
+/// The ends of a T0 profile, or why the check does not run on it.
+fn vci_ends(profile: &Profile) -> Result<ProfileEnds, String> {
     let Setup::Loopback(ends) = &profile.setup else {
         return Err("the profile is not a T0 loopback".to_owned());
     };
     let mut found = Vec::new();
+    let mut socketcan = None;
     for (at, end) in ends.iter().enumerate() {
         // `GetResourceIds` answers base protocol names only, so the guarded handle creates no
         // link on an additional channel, whichever module it is on.
@@ -95,13 +103,14 @@ fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
                     "endpoint {at} is a D-PDU API end; the check drives J2534 ends"
                 ));
             }
-            None => {
-                return Err(format!(
-                    "endpoint {at} is a SocketCAN end ({}); the check drives VCI ends only",
-                    end.socketcan.as_deref().unwrap_or("?")
-                ));
-            }
+            None => socketcan = Some(at),
         }
+    }
+    if socketcan.is_some() {
+        return Ok(ProfileEnds {
+            vcis: found,
+            socketcan,
+        });
     }
     let [first, second]: [Vci; 2] = found.try_into().expect("a loopback has two ends");
     if first.identifies_same_module(&second) {
@@ -111,7 +120,10 @@ fn vci_ends(profile: &Profile) -> Result<[Vci; 2], String> {
                 .to_owned(),
         );
     }
-    Ok([first, second])
+    Ok(ProfileEnds {
+        vcis: vec![first, second],
+        socketcan: None,
+    })
 }
 
 #[tokio::test(flavor = "multi_thread")]
@@ -145,9 +157,27 @@ async fn hw_t0_two_endpoint_loopback() {
     let layout = workers(temp.path());
     let options = LaunchOptions::default();
 
+    // The SocketCAN end opens first: off Linux it is refused before any device opens.
+    let mut can = match ends.socketcan {
+        Some(at) => match GuardedSocketCan::open(&profile, at) {
+            Ok(can) => Some(can),
+            Err(error) => {
+                let why = Masker::for_profile(&profile).text(&format!(
+                    "the profile's SocketCAN end did not open: {error}"
+                ));
+                let outcome = match error {
+                    ngr_hw_checks::guard::socketcan::SocketCanError::Refused(_) => Outcome::Refused,
+                    _ => Outcome::Failed,
+                };
+                guard.finish(outcome, &why);
+                panic!("{why}");
+            }
+        },
+        None => None,
+    };
     let mut facts = Vec::new();
     let mut handles = Vec::new();
-    for vci in &ends {
+    for vci in &ends.vcis {
         let device = match open_device(vci, &layout, OperatingMode::User, &options).await {
             Ok(device) => device,
             Err(error) => {
@@ -195,17 +225,30 @@ async fn hw_t0_two_endpoint_loopback() {
         handles.push(handle);
     }
     let masker = Masker::for_profile(&profile);
-    let [first, second]: [GuardedHandle; 2] = handles.try_into().ok().expect("two handles");
-    let (mut first, mut second) = (first, second);
-    let result = run(
-        &profile,
-        Ends::TwoModules(&mut first, &mut second),
-        &facts,
-        &masker,
-        FRAME_TIMEOUT,
-    )
-    .await;
-    drop((first, second));
+    let result = match (&mut can, handles.as_mut_slice()) {
+        (Some(can), [handle]) => {
+            run(
+                &profile,
+                Ends::VciAndSocketCan(handle, can),
+                &facts,
+                &masker,
+                FRAME_TIMEOUT,
+            )
+            .await
+        }
+        (None, [first, second]) => {
+            run(
+                &profile,
+                Ends::TwoModules(first, second),
+                &facts,
+                &masker,
+                FRAME_TIMEOUT,
+            )
+            .await
+        }
+        _ => unreachable!("a SocketCAN end and one VCI, or two VCIs"),
+    };
+    drop((handles, can));
     match result {
         Ok(message) => guard.finish(Outcome::Passed, &message),
         Err(error) => {

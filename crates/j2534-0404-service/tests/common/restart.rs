@@ -899,9 +899,13 @@ impl AgentChild {
 impl Drop for AgentChild {
     fn drop(&mut self) {
         // A test that failed before the kill must leave neither the agent nor its worker
-        // running; the agent may have ended by then, so a failure here is not reported.
+        // running; the agent may have ended by then, so a failure here is not reported. After a
+        // failed kill the agent alone is killed before the wait, which could otherwise block for
+        // good; on Windows closing the job, after this returns, ends a worker left running.
         if let Some(mut child) = self.child.take() {
-            let _ = self.end(&child);
+            if self.end(&child).is_err() {
+                let _ = child.kill();
+            }
             let _ = child.wait();
         }
     }

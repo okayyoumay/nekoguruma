@@ -177,7 +177,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
    returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the
    instruction opens a new inquiry. Whenever an inquiry ends without the operator's answer, the
-   host sends `EventBody::HmiWithdrawn { job_id, generation, request_id }`, so the server takes
+   host sends `EventBody::HmiWithdrawn { job_id, generation, request_id, timed_out }`, so the server takes
    the form off the screen: when it closes the inquiry with the timed-out answer (item 6), and when
    the run ends while the inquiry is still open (a cancel taken at the waiting instruction, the
    HMI timeout's included, or any other end of the run), before the job's final state is
@@ -206,7 +206,13 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    hold that answer without the record, and a restart that finds the record starts its run with
    the cancel already raised and the timeout as its reason. The same rules then apply to the
    resumed run, whether it resumes from a checkpoint or starts again from the first instruction,
-   so a repeated form answered after the restart cannot let the job end as Completed. A procedure that ends by `diag.fail` or an error while the cancel is held ends
+   so a repeated form answered after the restart cannot let the job end as Completed. A
+   handover to another device (ADR-229) keeps it too: the record is part of the checkpoint
+   summary the agent uploads, and the server, which also learns of it from the withdrawal
+   (`timed_out` set, item 5) before or without that summary, marks the job as timed out and
+   puts the mark in the instruction it signs for the receiving device, whose run then starts with
+   the cancel raised in the same way, whether it resumes from the summary's checkpoint or makes
+   a plain start (ADR-335). A procedure that ends by `diag.fail` or an error while the cancel is held ends
    that way, as ADR-330 item 2 says. Where the timeout's value comes from (the job
    instruction or the agent's settings) is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer

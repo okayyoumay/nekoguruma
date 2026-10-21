@@ -343,6 +343,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cmake"
+version = "0.1.58"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c0f78a02292a74a88ac736019ab962ece0bc380e3f977bf72e376c5d78ff0678"
+dependencies = [
+ "cc",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -551,6 +560,7 @@ name = "diag-ir"
 version = "0.1.0"
 dependencies = [
  "flatbuffers",
+ "flatc-fork",
  "postcard",
  "serde",
  "serde_json",
@@ -712,6 +722,15 @@ checksum = "35f6839d7b3b98adde531effaf34f0c2badc6f4735d26fe74709d8e513a96ef3"
 dependencies = [
  "bitflags 2.13.2",
  "rustc_version",
+]
+
+[[package]]
+name = "flatc-fork"
+version = "0.6.0+25.12.19-2026-02-06-03fffb2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f995c44278ee64981366ec17e6847f0756184a92ad0d3a1b6f7170f91e1eb129"
+dependencies = [
+ "cmake",
 ]
 
 [[package]]

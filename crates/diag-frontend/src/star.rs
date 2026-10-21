@@ -1977,7 +1977,8 @@ impl Checker<'_> {
         let mut attempted: HashSet<u32> = HashSet::new();
         let mut erased: HashSet<u32> = HashSet::new();
         let mut recovered: HashSet<u32> = HashSet::new();
-        // The top-level statements of each top-level `def`'s body, by where they begin.
+        // The top-level statements of each top-level `def`'s body, by where they begin, in
+        // source order, so a lookup is a binary search.
         let body_starts: HashMap<u32, Vec<u32>> = top
             .iter()
             .filter_map(|stmt| match &stmt.node {
@@ -2392,7 +2393,7 @@ impl Checker<'_> {
                     }
                     if !body_starts
                         .get(&def)
-                        .is_some_and(|starts| starts.contains(&statement_at))
+                        .is_some_and(|starts| starts.binary_search(&statement_at).is_ok())
                     {
                         bad(
                             self,

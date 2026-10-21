@@ -1946,8 +1946,22 @@ mod tests {
     #[test]
     fn a_wait_the_agent_cannot_answer_ends_the_job() {
         let mut host = FakeHost::default();
+        // The form's constant is an encoded template (ADR-340).
+        let mut hmi = program(vec![Op::HmiRequest { form: 1 }]);
+        hmi.constants.push(
+            diag_ir::hmi::encode_template(&diag_ir::hmi::HmiTemplate {
+                id: "confirm".to_owned(),
+                params: Vec::new(),
+            })
+            .expect("encodes"),
+        );
         assert!(matches!(
-            run(vec![Op::HmiRequest { form: 0 }], 10, &mut host),
+            run_plain(
+                &hmi,
+                &mut host,
+                JobLimits::default(),
+                &AtomicBool::new(false)
+            ),
             Err(JobError::Unanswerable(WaitingOn::Hmi))
         ));
     }

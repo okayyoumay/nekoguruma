@@ -11,8 +11,11 @@
 //! run time has one type, inferred at ingestion (ADR-304); an operation the IR cannot express
 //! for its operands is `STAR_NOT_LOWERABLE`.
 //!
-//! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`;
-//! `flash_transfer`). The built-ins and string methods on values known only at run time that
+//! A flash plan that calls no function is expanded in place at its one call in `main`, with its
+//! `diag.flash_transfer`, and gets its `FlashRecovery` (4.9, ADR-336).
+//!
+//! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`);
+//! the functions a flash plan calls. The built-ins and string methods on values known only at run time that
 //! have no lowering (`abs`, `str`, `find`, ...) name the instruction they wait for. Each is
 //! rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag` function without
 //! an instruction), so nothing is lowered silently wrong.
@@ -23,8 +26,9 @@ use std::rc::Rc;
 use diag_ir::declaration::{DataKind, EcuVariant, FlashStep, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{
-    IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, PreconditionKind, Preconditions, Program,
-    ProgramError, Section, SourceSpan,
+    FlashRecovery, IR_SCHEMA_VERSION, Idempotency, Interruptible, MAX_BYTES_LEN, NoApplication, Op,
+    PreconditionKind, Preconditions, Program, ProgramError, RecoveryBoundaries, RecoveryRequired,
+    RecoveryTiming, Section, SourceSpan,
 };
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
@@ -37,8 +41,9 @@ use starlark_syntax::syntax::uniplate::Visit;
 use crate::profile::{Intent, Part, ResultMap, Source, StepKind, UDS};
 
 use super::{
-    Annotation, BUILTINS, Checked, Pending, RequestConstant, RequestIndex, STRING_METHODS,
-    SectionKind, StarCode, StarError, collect_locals, is_string_expression, resolve, to_u32,
+    Annotation, BUILTINS, Checked, FlashFacts, Pending, RequestConstant, RequestIndex,
+    STRING_METHODS, SectionKind, StarCode, StarError, collect_locals, is_string_expression,
+    resolve, to_u32,
 };
 
 /// The largest constant a fold or literal may build ([`Const::size`]), so a constant expression
@@ -299,6 +304,9 @@ enum Service {
     Dtcs(u32),
     /// A `diag.security_access` result, which has no `fields` (ADR-314 item 4).
     Key,
+    /// A `diag.flash_transfer` result, the RequestTransferExit response, which has no `fields`
+    /// (ADR-336 item 10).
+    Exit,
     /// Requests to more than one service: a variable assigned from both anywhere in its
     /// function (types are per variable, subset 4.8), or a parameter whose callers pass both.
     Several,
@@ -311,6 +319,7 @@ impl Service {
             (Service::One(a), Service::One(b)) if a == b => Service::One(a),
             (Service::Dtcs(a), Service::Dtcs(b)) if a == b => Service::Dtcs(a),
             (Service::Key, Service::Key) => Service::Key,
+            (Service::Exit, Service::Exit) => Service::Exit,
             _ => Service::Several,
         }
     }
@@ -506,6 +515,35 @@ enum Ins {
     JumpIfFalse(Label),
     Call(usize),
     Mark(Label),
+    /// The first instruction after it begins the expansion of the flash plan in function `.0`
+    /// (ADR-336 items 2 and 4); no instruction of its own.
+    PlanBegin(usize),
+    /// The pc after the last instruction of the plan's expansion; no instruction of its own.
+    PlanEnd,
+    /// The instruction after it is the boundary of the plan being expanded; no instruction of its
+    /// own.
+    Boundary(Boundary),
+}
+
+/// Which boundary of a flash plan the next instruction is (ADR-336 item 4).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Boundary {
+    /// The erase point: the erase `RoutineControl`, or the RequestDownload without an erase step.
+    Erase,
+    /// The first instruction of the statement marked `# @recoveryRequired`.
+    RecoveryRequired,
+    /// The RequestTransferExit.
+    TransferExit,
+}
+
+impl Ins {
+    /// Whether the entry stands for no instruction of the program: a label or a plan marker.
+    fn is_pseudo(&self) -> bool {
+        matches!(
+            self,
+            Ins::Mark(_) | Ins::PlanBegin(_) | Ins::PlanEnd | Ins::Boundary(_)
+        )
+    }
 }
 
 /// Lowered code: instructions with the source position each comes from.
@@ -540,6 +578,24 @@ struct Func<'a> {
     code: Code,
     /// The attributes of a section function (4.5): its interruptibility and expected duration.
     section: Option<(Interruptible, u32)>,
+    /// The 1-based line of the `def`, which the annotations name a function by.
+    line: u32,
+}
+
+/// What the lowering knows of a flash plan once the variant's checks passed (4.9, ADR-336).
+struct PlanInfo {
+    /// The flash session the plan drives, and its stage (the stage is the session id).
+    session: u32,
+    max_resumes: u16,
+    recovery_never: bool,
+    /// Whether the session has an erase-memory step, so that `@erase` marks the erase point.
+    erases: bool,
+    /// Where the statement of `@erase` and that of `@recoveryRequired` begin (byte offsets).
+    erase_at: Option<u32>,
+    recovery_at: Option<u32>,
+    timing: RecoveryTiming,
+    version_read_retries: u8,
+    no_application: Option<NoApplication>,
 }
 
 /// One copy of a function in the program (ADR-301): the function, and the section function
@@ -630,6 +686,12 @@ struct Lowerer<'a> {
     attempted: usize,
     /// The preconditions `# @preconditions` names, from the variant's table (4.9).
     preconditions: Preconditions,
+    /// The flash plans, by the function that holds each (4.9).
+    plans: HashMap<usize, PlanInfo>,
+    /// The plan whose body is being expanded in place, if any: no function it calls is lowered
+    /// yet, its `diag.request`s default to `CheckState` (4.6) and it holds the one
+    /// `diag.flash_transfer` (4.9).
+    active_plan: Option<usize>,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -709,6 +771,8 @@ impl<'a> Lowerer<'a> {
             annotated: Vec::new(),
             attempted: 0,
             preconditions: Preconditions::default(),
+            plans: HashMap::new(),
+            active_plan: None,
         }
     }
 
@@ -821,9 +885,11 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// What a flash plan needs of the variant (4.9, ADR-336 items 2, 4 and 9): a UDS application
-    /// layer, a flash session of the plan's id, an `@erase` exactly when that session's steps
-    /// erase memory, and, for a plan that allows a restart, all three `identity.csv` rows.
+    /// What a flash plan needs of the variant (4.9, ADR-336 items 1, 2, 4 and 9): a UDS
+    /// application layer, a flash session of the plan's id with the recovery facts of its
+    /// `flash_sessions.csv` row, an `@erase` exactly when that session's steps erase memory, and,
+    /// for a plan that allows a restart, all three `identity.csv` rows. It also records what the
+    /// expansion of each plan that passes needs ([`PlanInfo`]).
     fn flash_plans(&mut self) {
         let checked = self.checked;
         let identity = &self.requests.identity;
@@ -883,11 +949,19 @@ impl<'a> Lowerer<'a> {
         }
         let mut transfers: Option<HashMap<u32, u32>> = None;
         let mut errors = Vec::new();
+        let mut plans = Vec::new();
+        let func_at: HashMap<u32, usize> = self
+            .funcs
+            .iter()
+            .enumerate()
+            .map(|(at, func)| (func.line, at))
+            .collect();
         for annotation in &checked.annotations {
             let Annotation::FlashPlan {
                 def,
                 span,
                 session,
+                max_resumes,
                 recovery_never,
                 ..
             } = annotation
@@ -934,6 +1008,42 @@ impl<'a> Lowerer<'a> {
                 )),
                 _ => {}
             }
+            // What the plan's expansion takes from the session's row (`csv-tables.md` 4.12).
+            match self.requests.flash.iter().find(|f| f.session == *session) {
+                Some(&FlashFacts {
+                    timing: Some(timing),
+                    version_read_retries: Some(version_read_retries),
+                    no_application_nrc,
+                    ..
+                }) => {
+                    if let Some(&func) = func_at.get(def) {
+                        plans.push((
+                            func,
+                            PlanInfo {
+                                session: *session,
+                                max_resumes: u16::try_from(*max_resumes)
+                                    .expect("the checker bounds maxResumes by 65535"),
+                                recovery_never: *recovery_never,
+                                erases,
+                                erase_at: first_erase.get(def).map(|(_, at)| *at),
+                                recovery_at: last_marker.get(def).copied(),
+                                timing,
+                                version_read_retries,
+                                no_application: no_application_nrc.map(NoApplication::Nrc),
+                            },
+                        ));
+                    }
+                }
+                _ => errors.push((
+                    StarCode::PlanShape,
+                    *span,
+                    format!(
+                        "flash session {session}'s row in flash_sessions.csv lacks a recovery \
+                         fact a plan needs: session_timeout_ms, teardown_margin_ms, \
+                         ecu_startup_ms, confirmation_window_ms and version_read_retries (4.9)"
+                    ),
+                )),
+            }
             // The erase point: the `@erase` statement, or without an erase step the transfer's
             // statement, whose expansion begins with the RequestDownload. A marker moves the
             // point to a restartable place only strictly after it (`allows_restart`).
@@ -962,6 +1072,7 @@ impl<'a> Lowerer<'a> {
         for (code, span, hint) in errors {
             self.error(code, span, hint);
         }
+        self.plans.extend(plans);
     }
 
     /// For each top-level `def`, by its line, where the top-level statement that holds its
@@ -1074,6 +1185,7 @@ impl<'a> Lowerer<'a> {
                 label,
                 code: Vec::new(),
                 section: sections.get(&line).copied(),
+                line,
             });
         }
     }
@@ -2979,6 +3091,17 @@ impl<'a> Lowerer<'a> {
                 );
                 return Val::Run(Tys::default(), Vec::new());
             }
+            Service::Exit => {
+                self.error(
+                    StarCode::NotInProfile,
+                    span,
+                    format!(
+                        "a `diag.flash_transfer` result has no fields, so `{key}` is not one; \
+                         its `raw` is the RequestTransferExit response (3.4, ADR-336)"
+                    ),
+                );
+                return Val::Run(Tys::default(), Vec::new());
+            }
             Service::Several => {
                 self.not_lowerable(
                     span,
@@ -3775,6 +3898,21 @@ impl<'a> Lowerer<'a> {
         args: &[&AstExpr],
         span: Span,
     ) -> Val {
+        if self.plans.contains_key(&callee) {
+            return self.expand_plan(id, callee, args, span);
+        }
+        if self.active_plan.is_some() {
+            // The functions a plan calls are to be expanded in it, which is not lowered yet.
+            self.not_lowerable(
+                span,
+                format!(
+                    "`{}` is called from a flash plan, whose called functions are not expanded in \
+                     place yet (4.9, ADR-336 item 3)",
+                    self.funcs[callee].name
+                ),
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        }
         self.called.push(callee);
         let mut code = Vec::new();
         if args.len() != self.funcs[callee].params.len() {
@@ -3806,6 +3944,292 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// The call of the flash plan `plan` in `main` (4.9, ADR-336 items 2 and 4): its body is
+    /// lowered in place instead of called, between [`Ins::PlanBegin`] and [`Ins::PlanEnd`], with
+    /// markers at the statements of `@erase` and `@recoveryRequired`. The plan has no frame of its
+    /// own: its locals and temporaries take fresh slots in `main`'s frame, after the ones `main`
+    /// has used so far. The statement the call stands in does not annotate what the plan holds,
+    /// and a loop around it does not reach into it.
+    fn expand_plan(
+        &mut self,
+        id: Option<usize>,
+        plan: usize,
+        args: &[&AstExpr],
+        span: Span,
+    ) -> Val {
+        let none = || Val::Void(Vec::new());
+        let main = self.by_name.get("main").copied();
+        if id.is_none() || id != main {
+            self.not_lowerable(
+                span,
+                "a flash plan is called from `main` only, where it is expanded (4.9)",
+            );
+            return none();
+        }
+        let main = id.expect("checked above");
+        if !args.is_empty() || !self.funcs[plan].params.is_empty() {
+            self.not_lowerable(
+                span,
+                "a flash plan that takes parameters is not lowered yet: its call passes none (4.9)",
+            );
+            return none();
+        }
+        let (erase_at, recovery_at) = {
+            let info = &self.plans[&plan];
+            (info.erase_at, info.recovery_at)
+        };
+        let def = self.funcs[plan].def;
+        self.funcs[plan].temps = self.funcs[plan].slots.len() as u16;
+        let annotated = std::mem::take(&mut self.annotated);
+        let loops = std::mem::take(&mut self.loops);
+        self.active_plan = Some(plan);
+        let mut body: Code = vec![(Ins::PlanBegin(plan), span)];
+        for (index, stmt) in super::Checker::statements(&def.body)
+            .into_iter()
+            .enumerate()
+        {
+            if index == 0
+                && is_string_expression(stmt)
+                && !self.idempotency.contains_key(&stmt.span.begin().get())
+            {
+                continue;
+            }
+            let mut code = Vec::new();
+            self.stmt(plan, stmt, &mut code);
+            let at = stmt.span.begin().get();
+            if erase_at == Some(at) {
+                // The statement is the one `diag.routine`, whose `RoutineControl` is the erase.
+                if let Some(erase) = code.iter().position(|(ins, _)| {
+                    matches!(ins, Ins::Primitive(Op::RoutineControl { .. }, _))
+                }) {
+                    code.insert(erase, (Ins::Boundary(Boundary::Erase), stmt.span));
+                }
+            }
+            if recovery_at == Some(at) {
+                code.insert(0, (Ins::Boundary(Boundary::RecoveryRequired), stmt.span));
+            }
+            body.extend(code);
+        }
+        self.active_plan = None;
+        self.annotated = annotated;
+        self.loops = loops;
+        body.push((Ins::PlanEnd, span));
+        // Move the plan's frame into `main`'s.
+        let size = self.funcs[plan].temps;
+        let base = self.funcs[main].temps;
+        let Some(end) = base.checked_add(size) else {
+            self.not_lowerable(
+                span,
+                "a flash plan's locals and temporaries do not fit what is left of `main`'s \
+                 65,535 locals (4.9)",
+            );
+            return none();
+        };
+        let frame = &mut self.funcs[main];
+        frame.temps = end;
+        while frame.slot_tys.len() < usize::from(end) {
+            frame.slot_tys.push(Tys::of(Ty::Int));
+        }
+        for (ins, _) in &mut body {
+            if let Ins::Op(Op::LoadLocal(slot) | Op::StoreLocal(slot)) = ins {
+                *slot += base;
+            }
+        }
+        Val::Void(body)
+    }
+
+    /// `diag.flash_transfer(session)` inside a flash plan's expansion (subset 3.2, 4.9, ADR-336
+    /// items 10, 11 and 13): the RequestDownload built from the session's one segment, a loop
+    /// over its blocks that reads each with `FlashBlock` and sends it with `FlashTransfer`, and
+    /// the RequestTransferExit, whose response is the call's value, without `fields`. The
+    /// RequestDownload's response is dropped. The segment's format byte gives the widths of the
+    /// address and the length in the request (ISO 14229-1 (2026) 14.2.2.3); a value that does not
+    /// fit, a block size above what one `Bytes` value takes less the two bytes the
+    /// TransferData request adds, and more blocks than the write-job journal numbers are
+    /// `STAR_NOT_LOWERABLE`, as is a session with no segment or with several.
+    fn diag_flash_transfer(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
+        let failed = || {
+            Val::Run(
+                Tys {
+                    bits: Ty::Response.bit(),
+                    service: Service::Exit,
+                },
+                Vec::new(),
+            )
+        };
+        let (Some(plan), Some(id)) = (self.active_plan, id) else {
+            self.error(
+                StarCode::PlanShape,
+                span,
+                "`diag.flash_transfer` belongs in a flash plan function, a top-level function \
+                 annotated `# @flashPlan` (4.9)",
+            );
+            return failed();
+        };
+        if id != plan {
+            self.error(
+                StarCode::PlanShape,
+                span,
+                "`diag.flash_transfer` is a statement of the flash plan itself, not of a function \
+                 it calls (4.9)",
+            );
+            return failed();
+        }
+        let [session_arg] = args else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                "`diag.flash_transfer` takes a session id (3.1)",
+            );
+            return failed();
+        };
+        let (session, erases) = {
+            let info = &self.plans[&plan];
+            (info.session, info.erases)
+        };
+        let named = self.constant_int(
+            Some(id),
+            session_arg,
+            "flash_transfer",
+            "session_id",
+            0..=i64::from(u32::MAX),
+        );
+        let Some(named) = named else {
+            return failed();
+        };
+        if named != i64::from(session) {
+            self.error(
+                StarCode::PlanShape,
+                session_arg.span,
+                format!(
+                    "`diag.flash_transfer` names session {named}, but `@flashPlan` names \
+                     session {session} (4.9)"
+                ),
+            );
+            return failed();
+        }
+        // The session exists in the variant: `flash_plans` checked it.
+        let declared = self
+            .variant
+            .flash_sessions()
+            .and_then(|sessions| sessions.iter().find(|s| s.id() == session));
+        let segments = declared.and_then(|d| d.segments());
+        let count = segments.map_or(0, |segments| segments.len());
+        if count != 1 {
+            self.not_lowerable(
+                span,
+                if count == 0 {
+                    format!("flash session {session} declares no segment to transfer (4.12)")
+                } else {
+                    format!(
+                        "flash session {session} declares {count} segments, and a plan transfers \
+                         one: a plan holds one RequestDownload and one RequestTransferExit, which \
+                         `Program::validate` enforces (ADR-336 item 13)"
+                    )
+                },
+            );
+            return failed();
+        }
+        let segment = segments.expect("one segment").get(0);
+        let (start, length, block_size) = (
+            segment.start_address(),
+            segment.length(),
+            u64::from(segment.block_size()),
+        );
+        let (data_format, format) = (segment.data_format(), segment.address_and_length_format());
+        let (address_width, length_width) = (usize::from(format & 0x0F), usize::from(format >> 4));
+        let (Some(address), Some(size)) = (
+            be_in_width(start, address_width),
+            be_in_width(length, length_width),
+        ) else {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the segment's start address {start:#x} or length {length:#x} does not fit \
+                     the {address_width} and {length_width} bytes its address_and_length_format \
+                     {format:#04x} gives (ISO 14229-1 (2026) 14.2.2.3, csv-tables 4.12)"
+                ),
+            );
+            return failed();
+        };
+        // The TransferData request is the counter, then the block (ADR-336 item 11).
+        if block_size == 0 || block_size > (MAX_BYTES_LEN - 2) as u64 {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the segment's block_size {block_size} is not 1 to {}, the most one \
+                     TransferData payload holds (csv-tables 4.12, ADR-336 item 11)",
+                    MAX_BYTES_LEN - 2
+                ),
+            );
+            return failed();
+        }
+        let blocks = length.div_ceil(block_size);
+        if blocks > u64::from(u32::MAX) {
+            self.not_lowerable(
+                span,
+                format!(
+                    "the segment needs {blocks} blocks, more than the 2^32 - 1 the write-job \
+                     journal numbers; use a larger block_size (ADR-336 item 11)"
+                ),
+            );
+            return failed();
+        }
+        let operand: Vec<u8> = [data_format, format]
+            .into_iter()
+            .chain(address)
+            .chain(size)
+            .collect();
+        let operand = self.pool(&operand);
+        let exit = self.pool(&[]);
+        let i = self.temp(id, span);
+        let (head, end) = (self.label(), self.label());
+        let mut code: Code = Vec::new();
+        code.push((Ins::Op(Op::PushBytes(operand)), span));
+        if !erases {
+            // Without an erase step the RequestDownload is the erase point (ADR-336 item 4).
+            code.push((Ins::Boundary(Boundary::Erase), span));
+        }
+        code.extend(
+            [
+                Ins::Op(Op::ServiceRequest { service: 0x34 }),
+                // Its response is dropped (ADR-336 item 10).
+                Ins::Op(Op::Pop),
+                Ins::Op(Op::PushI64(0)),
+                Ins::Op(Op::StoreLocal(i)),
+                Ins::Mark(head),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::PushI64(blocks as i64)),
+                Ins::Op(Op::CmpLt),
+                Ins::JumpIfFalse(end),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::FlashBlock {
+                    session,
+                    segment: 0,
+                }),
+                // The host numbers the blocks itself, so the operand is the same for each.
+                Ins::Op(Op::FlashTransfer { block: 0 }),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::PushI64(1)),
+                Ins::Op(Op::Add),
+                Ins::Op(Op::StoreLocal(i)),
+                Ins::Jump(head),
+                Ins::Mark(end),
+                Ins::Op(Op::PushBytes(exit)),
+                Ins::Boundary(Boundary::TransferExit),
+                Ins::Op(Op::ServiceRequest { service: 0x37 }),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        Val::Run(
+            Tys {
+                bits: Ty::Response.bit(),
+                service: Service::Exit,
+            },
+            code,
+        )
+    }
+
     /// Lowers `diag.{name}(...)` and gives each diagnostic primitive it emits the call's
     /// idempotency (ADR-332): the innermost `@idempotency` around the call, or else the default
     /// of 4.6 for the Starlark call, whatever instructions it lowers to. A primitive an argument
@@ -3826,13 +4250,14 @@ impl<'a> Lowerer<'a> {
     ) -> Val {
         let value = self.call_diag_untagged(id, name, args, key, span);
         let annotation = self.annotated.last().map(|(value, _)| *value);
+        let in_plan = self.active_plan.is_some();
         let tag = |code: Code, lowered: &mut bool| -> Code {
             code.into_iter()
                 .map(|(ins, span)| match ins {
                     Ins::Op(op) if op.is_diagnostic_primitive() => {
                         *lowered = true;
                         let idempotency =
-                            annotation.unwrap_or_else(|| default_idempotency(name, &op));
+                            annotation.unwrap_or_else(|| default_idempotency(name, &op, in_plan));
                         (Ins::Primitive(op, idempotency), span)
                     }
                     other => (other, span),
@@ -4078,7 +4503,7 @@ impl<'a> Lowerer<'a> {
             }
             "precondition" => self.diag_precondition(id, args, span),
             "ecu_info" => self.diag_ecu_info(id, args, key, span),
-            // UDS only (ADR-336 item 9); on UDS the transfer is not lowered yet.
+            // UDS only (ADR-336 item 9).
             "flash_transfer" if self.requests.profile.layer != UDS => {
                 self.error(
                     StarCode::NotInProfile,
@@ -4091,6 +4516,7 @@ impl<'a> Lowerer<'a> {
                 );
                 Val::Run(Tys::default(), Vec::new())
             }
+            "flash_transfer" => self.diag_flash_transfer(id, args, span),
             _ => {
                 self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
                 Val::Run(Tys::default(), Vec::new())
@@ -5706,15 +6132,46 @@ impl<'a> Lowerer<'a> {
         let mut code: Vec<(Ins, Span, usize)> = Vec::new();
         // The sections, in layout order and so by start pc (ADR-332).
         let mut sections: Vec<Section> = Vec::new();
+        // Where each flash plan's expansion begins and ends, and its boundaries (ADR-336 item 4).
+        let mut plan_ranges: Vec<PlanRange> = Vec::new();
         let mut pc = 0u32;
         for (at, copy) in self.copies.iter().enumerate() {
             let start = pc;
             let mut primitives: Vec<(u32, Idempotency)> = Vec::new();
+            let mut open: Option<PlanRange> = None;
+            let first_plan = plan_ranges.len();
             for (ins, span) in &self.funcs[copy.func].code {
-                if !matches!(ins, Ins::Mark(_)) {
-                    if let Ins::Primitive(_, idempotency) = ins {
-                        primitives.push((pc, *idempotency));
+                match ins {
+                    Ins::PlanBegin(plan) => {
+                        open = Some(PlanRange {
+                            plan: *plan,
+                            entry: pc,
+                            end: pc,
+                            erase: None,
+                            recovery: None,
+                            exit: None,
+                        });
                     }
+                    Ins::PlanEnd => {
+                        if let Some(mut range) = open.take() {
+                            range.end = pc;
+                            plan_ranges.push(range);
+                        }
+                    }
+                    Ins::Boundary(boundary) => {
+                        if let Some(range) = &mut open {
+                            let slot = match boundary {
+                                Boundary::Erase => &mut range.erase,
+                                Boundary::RecoveryRequired => &mut range.recovery,
+                                Boundary::TransferExit => &mut range.exit,
+                            };
+                            slot.get_or_insert(pc);
+                        }
+                    }
+                    Ins::Primitive(_, idempotency) => primitives.push((pc, *idempotency)),
+                    _ => {}
+                }
+                if !ins.is_pseudo() {
                     pc += 1;
                 }
                 code.push((ins.clone(), *span, at));
@@ -5725,26 +6182,66 @@ impl<'a> Lowerer<'a> {
                 Some(section) => self.funcs[section].section.expect("a section function"),
                 None => (Interruptible::Yes, 0),
             };
-            let section = |start_pc, end_pc, idempotency| Section {
-                start_pc,
-                end_pc,
-                interruptible,
-                idempotency,
-                expected_millis,
-            };
-            // The copy's range is cut around its primitives: the pieces between cover none and
-            // say nothing about idempotency.
-            let mut cursor = start;
-            for (primitive, idempotency) in primitives {
-                if copy.section.is_some() && cursor < primitive {
-                    sections.push(section(cursor, primitive, Idempotency::CheckState));
+            let section =
+                |start_pc, end_pc, (interruptible, expected_millis), idempotency| Section {
+                    start_pc,
+                    end_pc,
+                    interruptible,
+                    idempotency,
+                    expected_millis,
+                };
+            // The ranges whose pieces are cut around the primitives: the copy's own when it runs in
+            // a section, and each plan's expansion, which the plan function's section covers
+            // whole, inlined code included (ADR-336 items 3 and 4). The pieces between the
+            // primitives cover none and say nothing about idempotency.
+            let mut covered: Vec<(u32, u32, (Interruptible, u32))> = Vec::new();
+            if copy.section.is_some() {
+                covered.push((start, pc, (interruptible, expected_millis)));
+            }
+            for range in &plan_ranges[first_plan..] {
+                // A plan function without a section is refused by the checker.
+                let attributes = self.funcs[range.plan]
+                    .section
+                    .unwrap_or((Interruptible::No, 0));
+                covered.push((range.entry, range.end, attributes));
+            }
+            let mut pieces: Vec<Section> = Vec::new();
+            for &(from, to, attributes) in &covered {
+                let mut cursor = from;
+                for &(primitive, idempotency) in &primitives {
+                    if primitive < from || primitive >= to {
+                        continue;
+                    }
+                    if cursor < primitive {
+                        pieces.push(section(
+                            cursor,
+                            primitive,
+                            attributes,
+                            Idempotency::CheckState,
+                        ));
+                    }
+                    pieces.push(section(primitive, primitive + 1, attributes, idempotency));
+                    cursor = primitive + 1;
                 }
-                sections.push(section(primitive, primitive + 1, idempotency));
-                cursor = primitive + 1;
+                if cursor < to {
+                    pieces.push(section(cursor, to, attributes, Idempotency::CheckState));
+                }
             }
-            if copy.section.is_some() && cursor < pc {
-                sections.push(section(cursor, pc, Idempotency::CheckState));
+            for &(primitive, idempotency) in &primitives {
+                if !covered
+                    .iter()
+                    .any(|&(from, to, _)| (from..to).contains(&primitive))
+                {
+                    pieces.push(section(
+                        primitive,
+                        primitive + 1,
+                        (interruptible, expected_millis),
+                        idempotency,
+                    ));
+                }
             }
+            pieces.sort_by_key(|piece| piece.start_pc);
+            sections.extend(pieces);
         }
         // Positions of labels, counting only real instructions.
         let mut positions: HashMap<(usize, Label), u32> = HashMap::new();
@@ -5754,6 +6251,7 @@ impl<'a> Lowerer<'a> {
                 Ins::Mark(label) => {
                     positions.insert((*at, *label), pc);
                 }
+                other if other.is_pseudo() => {}
                 _ => pc += 1,
             }
         }
@@ -5761,7 +6259,7 @@ impl<'a> Lowerer<'a> {
         let mut spans = Vec::with_capacity(pc as usize);
         for (ins, span, at) in code {
             let op = match ins {
-                Ins::Mark(_) => continue,
+                Ins::Mark(_) | Ins::PlanBegin(_) | Ins::PlanEnd | Ins::Boundary(_) => continue,
                 Ins::Op(op) | Ins::Primitive(op, _) => op,
                 Ins::Jump(label) => Op::Jump(positions[&(at, label)]),
                 Ins::JumpIfFalse(label) => Op::JumpIfFalse(positions[&(at, label)]),
@@ -5775,6 +6273,10 @@ impl<'a> Lowerer<'a> {
             spans.push(span);
         }
         let source_map = self.source_map(&spans);
+        let flash = plan_ranges
+            .iter()
+            .map(|range| self.flash_recovery(range))
+            .collect();
         let program = Program {
             schema_version: IR_SCHEMA_VERSION,
             code: ops,
@@ -5783,9 +6285,44 @@ impl<'a> Lowerer<'a> {
             source_map,
             identity: self.requests.identity.clone(),
             preconditions: self.preconditions.clone(),
-            flash: Default::default(),
+            flash,
         };
         (program, spans)
+    }
+
+    /// The recovery plan of the flash plan laid out as `range` (ADR-336 items 1, 4 and 7): the
+    /// session's recovery facts, the boundaries the layout found, and where on-site intervention
+    /// begins. A boundary the layout did not find is placed at the entry, which `validate`
+    /// refuses with the pc of the instruction there.
+    fn flash_recovery(&self, range: &PlanRange) -> FlashRecovery {
+        let info = &self.plans[&range.plan];
+        let erase = range.erase.unwrap_or(range.entry);
+        let from_entry = matches!(
+            self.funcs[range.plan].section,
+            Some((Interruptible::RecoveryRequired, _))
+        );
+        let recovery_required = if from_entry {
+            RecoveryRequired::FromPc(range.entry)
+        } else if info.recovery_never {
+            RecoveryRequired::Never
+        } else {
+            RecoveryRequired::FromPc(range.recovery.unwrap_or(erase))
+        };
+        FlashRecovery {
+            flash_session: info.session,
+            stage: info.session,
+            max_resumes: info.max_resumes,
+            recovery_required,
+            boundaries: RecoveryBoundaries {
+                entry_pc: range.entry,
+                erase_pc: erase,
+                transfer_exit_pc: range.exit.unwrap_or(range.entry),
+                post_transfer_end_pc: range.end,
+            },
+            timing: info.timing,
+            version_read_retries: info.version_read_retries,
+            no_application: info.no_application,
+        }
     }
 
     /// One entry for each run of instructions from the same source position; an entry covers
@@ -5828,6 +6365,18 @@ impl<'a> Lowerer<'a> {
         }
         map
     }
+}
+
+/// Where one flash plan's expansion lies in the laid-out code, and its boundaries (pcs).
+struct PlanRange {
+    /// The function that holds the plan.
+    plan: usize,
+    entry: u32,
+    /// Exclusive: the pc after the last instruction.
+    end: u32,
+    erase: Option<u32>,
+    recovery: Option<u32>,
+    exit: Option<u32>,
 }
 
 /// A condition's value.
@@ -5927,9 +6476,11 @@ fn binary_hint(op: BinOp, a: Ty, b: Ty) -> String {
 /// `security_access` is `CheckState`. A `request` follows its service identifier, which the
 /// request instruction holds: a read of data or of DTC information (0x22, 0x19), a
 /// DiagnosticSessionControl (0x10) and a TesterPresent (0x3E) are `Safe` (a repeat re-enters the
-/// session and is harmless in any state, ADR-336 item 8), any other service `Unsafe`. Every call of the table is listed, and a name not in it is `Unsafe`,
-/// so a call that starts to lower cannot become `Safe` by default.
-fn default_idempotency(call: &str, op: &Op) -> Idempotency {
+/// session and is harmless in any state, ADR-336 item 8), any other service `Unsafe`, except
+/// inside a flash plan's expansion (`in_plan`), where the plan's redo rules govern a repeat and
+/// it is `CheckState` (ADR-336 item 8). Every call of the table is listed, and a name not in it
+/// is `Unsafe`, so a call that starts to lower cannot become `Safe` by default.
+fn default_idempotency(call: &str, op: &Op, in_plan: bool) -> Idempotency {
     match (call, op) {
         (
             "request",
@@ -5937,6 +6488,7 @@ fn default_idempotency(call: &str, op: &Op) -> Idempotency {
                 service: 0x22 | 0x19 | 0x10 | 0x3E,
             },
         ) => Idempotency::Safe,
+        ("request", _) if in_plan => Idempotency::CheckState,
         ("request", _) => Idempotency::Unsafe,
         (
             "read_dtc" | "ecu_info" | "precondition" | "wait" | "capture" | "log" | "hmi"
@@ -5945,6 +6497,21 @@ fn default_idempotency(call: &str, op: &Op) -> Idempotency {
         ) => Idempotency::Safe,
         ("security_access" | "routine" | "flash_transfer", _) => Idempotency::CheckState,
         _ => Idempotency::Unsafe,
+    }
+}
+
+/// `value` as `width` big-endian bytes, or `None` when it does not fit: a width of 0 holds only 0,
+/// and one above 8 bytes pads with zeros.
+fn be_in_width(value: u64, width: usize) -> Option<Vec<u8>> {
+    let bytes = value.to_be_bytes();
+    if width >= bytes.len() {
+        let mut padded = vec![0; width - bytes.len()];
+        padded.extend(bytes);
+        Some(padded)
+    } else if value >> (8 * width) == 0 {
+        Some(bytes[bytes.len() - width..].to_vec())
+    } else {
+        None
     }
 }
 

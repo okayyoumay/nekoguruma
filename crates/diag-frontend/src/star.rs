@@ -21,7 +21,9 @@ use std::rc::Rc;
 use serde::Serialize;
 
 use crate::profile::Profile;
-use diag_ir::{IdentitySources, PLAIN_PROCEDURE_STAGE, PreconditionKind, Preconditions};
+use diag_ir::{
+    IdentitySources, PLAIN_PROCEDURE_STAGE, PreconditionKind, Preconditions, RecoveryTiming,
+};
 use starlark_syntax::codemap::Span;
 use starlark_syntax::lexer::TokenInt;
 use starlark_syntax::syntax::ast::{
@@ -54,6 +56,24 @@ pub struct RequestIndex {
     /// The variant's `preconditions.csv`; a program carries the ones its `# @preconditions` names
     /// (`csv-tables.md` 4.14, subset 4.9).
     pub preconditions: Preconditions,
+    /// The recovery facts of the variant's `flash_sessions.csv` rows, one per flash session, which
+    /// a plan that names the session copies into its `FlashRecovery` (`csv-tables.md` 4.12,
+    /// ADR-336 item 1).
+    pub flash: Vec<FlashFacts>,
+}
+
+/// The recovery facts of one flash session's row in `flash_sessions.csv` (`csv-tables.md` 4.12).
+/// A session no plan names may leave them out, so each is optional here; a plan that names the
+/// session needs the timing and the retry count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FlashFacts {
+    /// `FlashSession.id`.
+    pub session: u32,
+    /// The four timings, present only when the row gives all of them.
+    pub timing: Option<RecoveryTiming>,
+    pub version_read_retries: Option<u8>,
+    /// The NRC that means no valid application is present.
+    pub no_application_nrc: Option<u8>,
 }
 
 /// No services and no restart facts, over UDS.
@@ -64,6 +84,7 @@ impl Default for RequestIndex {
             profile: &crate::profile::UDS_PROFILE,
             identity: IdentitySources::default(),
             preconditions: Preconditions::default(),
+            flash: Vec::new(),
         }
     }
 }

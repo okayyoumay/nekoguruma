@@ -584,7 +584,7 @@ def main():
 #[test]
 fn a_call_that_is_not_in_the_defaults_table_is_not_safe_by_default() {
     let op = Op::Ret;
-    let default = |call| format!("{:?}", default_idempotency(call, &op));
+    let default = |call| format!("{:?}", default_idempotency(call, &op, false));
     for call in [
         "read_dtc",
         "ecu_info",
@@ -602,11 +602,26 @@ fn a_call_that_is_not_in_the_defaults_table_is_not_safe_by_default() {
     }
     assert_eq!(default("request"), "Unsafe");
     assert_eq!(default("anything_new"), "Unsafe");
-    let read = Op::ServiceRequest { service: 0x22 };
-    assert_eq!(
-        format!("{:?}", default_idempotency("request", &read)),
-        "Safe"
-    );
+    let of = |service, in_plan| {
+        format!(
+            "{:?}",
+            default_idempotency("request", &Op::ServiceRequest { service }, in_plan)
+        )
+    };
+    // A read, a session control and a tester present are safe everywhere (ADR-336 item 8).
+    for service in [0x22, 0x19, 0x10, 0x3E] {
+        assert_eq!(
+            (of(service, false), of(service, true)),
+            ("Safe".into(), "Safe".into())
+        );
+    }
+    // Any other service is unsafe, except in a flash plan's expansion.
+    for service in [0x11, 0x2E, 0x31] {
+        assert_eq!(
+            (of(service, false), of(service, true)),
+            ("Unsafe".into(), "CheckState".into())
+        );
+    }
 }
 
 #[test]
@@ -2017,6 +2032,8 @@ struct ScriptedHost {
     keys_pending: u32,
     /// The values `Op::ReadInput` reads; an input not listed is not established.
     inputs: Vec<(RuntimeInput, i64)>,
+    /// The flash artifact `Op::FlashBlock` reads from.
+    artifact: Vec<u8>,
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -2053,8 +2070,9 @@ impl DiagHost for ScriptedHost {
         self.calls.push(format!("key {level:02X} {}", hex(seed)));
         Ok(Some(self.keys.pop_front().expect("a scripted key")))
     }
-    fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NoHostError> {
-        unreachable!("not lowered yet")
+    fn flash_transfer(&mut self, block: u32, data: &[u8]) -> Result<(), NoHostError> {
+        self.calls.push(format!("transfer {block} {}", hex(data)));
+        Ok(())
     }
     fn wait(&mut self, _: u64, millis: u32) -> Result<bool, NoHostError> {
         if self.waits_pending > 0 {
@@ -2074,8 +2092,10 @@ impl DiagHost for ScriptedHost {
         self.calls.push(format!("capture {back_millis}"));
         Ok(())
     }
-    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NoHostError> {
-        unreachable!("no artifact is scripted")
+    fn artifact_bytes(&mut self, offset: u64, len: u32) -> Result<Vec<u8>, NoHostError> {
+        self.calls.push(format!("artifact {offset} {len}"));
+        let from = usize::try_from(offset).expect("a small offset");
+        Ok(self.artifact[from..from + len as usize].to_vec())
     }
     fn runtime_input(&mut self, input: RuntimeInput) -> Result<i64, NoHostError> {
         self.calls.push(format!("input {input:?}"));
@@ -3361,11 +3381,10 @@ def main():
 
 /// A request index with the three mandatory preconditions and `identity` sources.
 fn flash_index(identity: &[&str]) -> RequestIndex {
-    let source = diag_ir::Source::RuntimeInput(diag_ir::RuntimeInput::SupplyVoltageMillivolts);
-    let row = || diag_ir::Precondition {
+    let row = |input| diag_ir::Precondition {
         satisfied: diag_ir::Satisfied { lower: 1, upper: 1 },
-        default_session: Some(source),
-        programming_session: None,
+        default_session: Some(diag_ir::Source::RuntimeInput(input)),
+        programming_session: Some(diag_ir::Source::RuntimeInput(input)),
     };
     let read = Some(diag_ir::Source::EcuService {
         service_id: 4,
@@ -3379,17 +3398,50 @@ fn flash_index(identity: &[&str]) -> RequestIndex {
             software_version: has("software_version"),
         },
         preconditions: diag_ir::Preconditions {
-            voltage_mv: Some(row()),
-            external_supply: Some(row()),
-            ignition: Some(row()),
+            voltage_mv: Some(row(diag_ir::RuntimeInput::SupplyVoltageMillivolts)),
+            external_supply: Some(row(diag_ir::RuntimeInput::ExternalSupplyConnected)),
+            ignition: Some(row(diag_ir::RuntimeInput::IgnitionOn)),
             ..Default::default()
         },
+        flash: vec![FlashFacts {
+            session: 1,
+            timing: Some(TIMING),
+            version_read_retries: Some(2),
+            no_application_nrc: Some(0x22),
+        }],
         ..RequestIndex::default()
     }
 }
 
-/// A document whose variant declares flash session 1 with `steps`, or no session for `None`.
+/// The timings `flash_index` gives flash session 1.
+const TIMING: diag_ir::RecoveryTiming = diag_ir::RecoveryTiming {
+    session_timeout_millis: 5000,
+    teardown_margin_millis: 1000,
+    ecu_startup_millis: 2000,
+    confirmation_window_millis: 3000,
+};
+
+/// A segment of 0x25 bytes of the artifact in blocks of 0x10, which the format 0x44 describes.
+fn plan_segment() -> diag_ir::declaration::FlashSegmentT {
+    let mut segment = diag_ir::declaration::FlashSegmentT::default();
+    segment.start_address = 0x1000;
+    segment.length = 0x25;
+    segment.artifact_offset = 4;
+    segment.block_size = 0x10;
+    segment
+}
+
+/// A document whose variant declares flash session 1 with `steps` and one segment, or no
+/// session for `None`.
 fn flash_document(steps: Option<&[diag_ir::declaration::FlashStep]>) -> Vec<u8> {
+    flash_document_with(steps, vec![plan_segment()])
+}
+
+/// [`flash_document`] with the given `segments`.
+fn flash_document_with(
+    steps: Option<&[diag_ir::declaration::FlashStep]>,
+    segments: Vec<diag_ir::declaration::FlashSegmentT>,
+) -> Vec<u8> {
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
     document.source_format = Some("test".to_owned());
@@ -3399,10 +3451,26 @@ fn flash_document(steps: Option<&[diag_ir::declaration::FlashStep]>) -> Vec<u8> 
         let mut session = diag_ir::declaration::FlashSessionT::default();
         session.id = 1;
         session.steps = Some(steps.to_vec());
+        session.segments = Some(segments);
         vec![session]
     });
     document.variant = Some(Box::new(variant));
     encode_ecu_document(&document)
+}
+
+/// Lowers `source` against a variant whose flash session 1 has `NO_ERASE` steps and `segments`,
+/// and the index of `flash_index(&[])`.
+fn lower_plan(
+    source: &str,
+    segments: Vec<diag_ir::declaration::FlashSegmentT>,
+) -> Result<Program, Vec<StarError>> {
+    let bytes = flash_document_with(Some(NO_ERASE), segments);
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    lower("t.star", &checked, variant, &flash_index(&[])).map(|lowered| lowered.program)
 }
 
 /// What lowering `source` for a variant whose flash session 1 has `steps` reports (no session
@@ -3445,27 +3513,440 @@ const WITH_ERASE: &[diag_ir::declaration::FlashStep] = &[
 ];
 
 #[test]
-fn a_valid_flash_plan_is_refused_as_not_lowered_yet() {
+fn a_flash_plan_lowers_with_its_recovery_plan_and_a_transfer_outside_one_is_refused() {
     let requests = flash_index(&[]);
-    // Past every check of the plan, the transfer is the one thing left that is refused.
-    assert_eq!(
-        flash_codes(PLAN_NO_ERASE, Some(NO_ERASE), &requests),
-        [(StarCode::NotLowerable, 5)]
-    );
-    // The erase's `diag.routine` finds no service in this empty variant, which is its own
-    // refusal; the plan's checks report nothing.
+    // The plan of a session without an erase step lowers and validates; the erase's
+    // `diag.routine` finds no service in this empty variant, which is its own refusal.
+    assert_eq!(flash_codes(PLAN_NO_ERASE, Some(NO_ERASE), &requests), []);
     assert_eq!(
         flash_codes(PLAN_ERASE, Some(WITH_ERASE), &requests),
-        [(StarCode::UnknownService, 5), (StarCode::NotLowerable, 6)]
+        [(StarCode::UnknownService, 5)]
     );
-    // So is a transfer outside any plan.
+    // A transfer outside a plan function is a plan shape error, in `main` or in another function
+    // (4.9).
+    for source in [
+        "def main():\n    diag.flash_transfer(1)\n",
+        "def helper():\n    diag.flash_transfer(1)\n\ndef main():\n    helper()\n",
+    ] {
+        assert_eq!(
+            flash_codes(source, Some(NO_ERASE), &requests),
+            [(StarCode::PlanShape, 2)],
+            "{source}"
+        );
+    }
+}
+
+/// The index of the first instruction that satisfies `is` at or after `from`.
+fn position(program: &Program, from: usize, is: impl Fn(&Op) -> bool) -> u32 {
+    (from..program.code.len())
+        .find(|&pc| is(&program.code[pc]))
+        .expect("the instruction") as u32
+}
+
+#[test]
+fn a_plan_is_laid_out_at_its_call_with_boundaries_derived_from_the_code() {
+    let program = lower_plan(PLAN_NO_ERASE, vec![plan_segment()]).expect("lowers");
+    program.validate().expect("valid");
+    // `main` is at pc 0 and holds the plan in place: no call, and one closing return.
+    assert!(!program.code.iter().any(|op| matches!(op, Op::Call(_))));
+    assert_eq!(program.code.last(), Some(&Op::Ret));
     assert_eq!(
-        flash_codes(
-            "def main():\n    diag.flash_transfer(1)\n",
-            Some(NO_ERASE),
-            &requests
-        ),
-        [(StarCode::NotLowerable, 2)]
+        program.code.iter().filter(|op| **op == Op::Ret).count(),
+        1,
+        "{:?}",
+        program.code
+    );
+    let [plan] = &program.flash[..] else {
+        panic!("one plan: {:?}", program.flash);
+    };
+    let download = position(&program, 0, |op| {
+        matches!(op, Op::ServiceRequest { service: 0x34 })
+    });
+    let exit = position(&program, 0, |op| {
+        matches!(op, Op::ServiceRequest { service: 0x37 })
+    });
+    // The entry is the plan's first instruction (its `diag.wait`), the erase point the
+    // RequestDownload of a session with no erase step, and the end the closing return.
+    assert_eq!(program.code[0], Op::Wait { millis: 1 });
+    assert_eq!(
+        plan.boundaries,
+        diag_ir::RecoveryBoundaries {
+            entry_pc: 0,
+            erase_pc: download,
+            transfer_exit_pc: exit,
+            post_transfer_end_pc: program.code.len() as u32 - 1,
+        }
+    );
+    // The default recovery point is the erase point; the rest comes from the session's row.
+    assert_eq!(
+        (plan.flash_session, plan.stage, plan.max_resumes),
+        (1, 1, 3)
+    );
+    assert_eq!(
+        plan.recovery_required,
+        diag_ir::RecoveryRequired::FromPc(download)
+    );
+    assert_eq!(plan.timing, TIMING);
+    assert_eq!(plan.version_read_retries, 2);
+    assert_eq!(plan.no_application, Some(diag_ir::NoApplication::Nrc(0x22)));
+    // The plan function's section covers the whole expansion, pieces cut around each primitive.
+    let covering: Vec<_> = program
+        .sections
+        .iter()
+        .filter(|s| {
+            s.start_pc >= plan.boundaries.entry_pc
+                && s.end_pc <= plan.boundaries.post_transfer_end_pc
+        })
+        .collect();
+    assert!(
+        covering
+            .iter()
+            .all(|s| matches!(s.interruptible, diag_ir::Interruptible::No)
+                && s.expected_millis == 1000),
+        "{covering:?}"
+    );
+    let mut next = plan.boundaries.entry_pc;
+    for s in &covering {
+        assert_eq!(s.start_pc, next, "no gap");
+        next = s.end_pc;
+    }
+    assert_eq!(next, plan.boundaries.post_transfer_end_pc);
+}
+
+#[test]
+fn the_markers_and_the_section_move_the_recovery_point() {
+    let requests = flash_index(&["vin", "hardware_part_number", "software_version"]);
+    let lowered = |source: &str| {
+        let bytes = flash_document(Some(NO_ERASE));
+        let variant = load_ecu_document(&bytes)
+            .expect("loads")
+            .variant()
+            .expect("a variant");
+        let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+        let program = lower("t.star", &checked, variant, &requests)
+            .unwrap_or_else(|errors| panic!("{errors:#?}"))
+            .program;
+        program.validate().expect("valid");
+        program
+    };
+    // `recovery=never`.
+    let never = lowered(&PLAN_NO_ERASE.replace("session=1", "session=1 recovery=never"));
+    assert_eq!(
+        never.flash[0].recovery_required,
+        diag_ir::RecoveryRequired::Never
+    );
+    assert!(never.flash[0].allows_restart());
+    // A marker after the transfer: the first instruction of its statement.
+    let marked = lowered(&PLAN_NO_ERASE.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    # @recoveryRequired\n    diag.wait(2)",
+    ));
+    let plan = &marked.flash[0];
+    let wait = position(&marked, 1, |op| matches!(op, Op::Wait { millis: 2 }));
+    assert_eq!(
+        plan.recovery_required,
+        diag_ir::RecoveryRequired::FromPc(wait)
+    );
+    assert!(wait > plan.boundaries.transfer_exit_pc);
+    assert!(plan.allows_restart());
+    // A section that requires on-site intervention requires it from the entry.
+    let section = lowered(&PLAN_NO_ERASE.replace("uninterruptible", "recoveryRequired"));
+    let plan = &section.flash[0];
+    assert_eq!(
+        plan.recovery_required,
+        diag_ir::RecoveryRequired::FromPc(plan.boundaries.entry_pc)
+    );
+    assert!(!plan.allows_restart());
+}
+
+#[test]
+fn a_plan_after_other_statements_of_main_begins_after_them() {
+    let source = PLAN_NO_ERASE.replace(
+        "    write()\n",
+        "    diag.wait(7)\n    write()\n    diag.wait(8)\n",
+    );
+    let program = lower_plan(&source, vec![plan_segment()]).expect("lowers");
+    program.validate().expect("valid");
+    let plan = &program.flash[0];
+    assert_eq!(program.code[0], Op::Wait { millis: 7 });
+    assert_eq!(plan.boundaries.entry_pc, 1);
+    assert_eq!(program.code[1], Op::Wait { millis: 1 });
+    // The statement after the plan is past its end.
+    let after = position(&program, 0, |op| matches!(op, Op::Wait { millis: 8 }));
+    assert_eq!(plan.boundaries.post_transfer_end_pc, after);
+    // The primitives outside the plan are `Yes`, the plan's `No`.
+    let section_of = |pc: u32| {
+        program
+            .sections
+            .iter()
+            .find(|s| (s.start_pc..s.end_pc).contains(&pc))
+            .expect("a section")
+    };
+    assert!(matches!(
+        section_of(0).interruptible,
+        diag_ir::Interruptible::Yes
+    ));
+    assert!(matches!(
+        section_of(1).interruptible,
+        diag_ir::Interruptible::No
+    ));
+    assert!(matches!(
+        section_of(after).interruptible,
+        diag_ir::Interruptible::Yes
+    ));
+}
+
+#[test]
+fn a_plan_in_an_if_is_entered_at_its_first_instruction_only() {
+    let source = PLAN_NO_ERASE.replace(
+        "    write()\n",
+        "    if diag.precondition(\"voltage\") > 0:\n        write()\n",
+    );
+    // The empty index reads the precondition from an input, which `lower` accepts.
+    let program = lower_plan(&source, vec![plan_segment()]).expect("lowers");
+    program.validate().expect("valid");
+    let plan = &program.flash[0];
+    // The jump that skips the plan lands at its end, which is not inside it.
+    let skip = program
+        .code
+        .iter()
+        .find_map(|op| match op {
+            Op::JumpIfFalse(target) => Some(*target),
+            _ => None,
+        })
+        .expect("the if's jump");
+    assert_eq!(skip, plan.boundaries.post_transfer_end_pc);
+}
+
+#[test]
+fn a_plan_that_calls_a_function_is_refused_as_not_lowered_yet() {
+    let source = "\
+def helper():
+    diag.wait(3)
+
+# @section uninterruptible expected=1000
+# @flashPlan session=1
+def write():
+    helper()
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+";
+    let errors = lower_plan(source, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, 7)]
+    );
+    assert!(errors[0].hint.contains("not expanded in place yet"));
+}
+
+#[test]
+fn a_flash_plan_with_parameters_is_not_lowered_yet() {
+    let source = PLAN_NO_ERASE
+        .replace("def write():", "def write(x):")
+        .replace("    write()\n", "    write(1)\n");
+    let errors = lower_plan(&source, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, 9)]
+    );
+}
+
+#[test]
+fn the_session_of_the_transfer_is_evaluated_and_compared_with_the_annotation() {
+    // A constant expression the checker does not evaluate is evaluated by the expansion: the
+    // same session lowers, another one is a plan shape error at the argument.
+    let with_session = |expression: &str| {
+        format!(
+            "SESSION = 1\n{}",
+            PLAN_NO_ERASE.replace(
+                "flash_transfer(1)",
+                &format!("flash_transfer({expression})")
+            )
+        )
+    };
+    let same = with_session("SESSION * 1 + len([1, 2]) - 2");
+    lower_plan(&same, vec![plan_segment()])
+        .expect("lowers")
+        .validate()
+        .expect("valid");
+    let other = with_session("SESSION * 2");
+    let errors = lower_plan(&other, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::PlanShape, 6)]
+    );
+    assert!(
+        errors[0].hint.contains("names session 2"),
+        "{}",
+        errors[0].hint
+    );
+    // A session known only at run time is no constant.
+    let run_time = PLAN_NO_ERASE.replace(
+        "    res = diag.flash_transfer(1)",
+        "    n = diag.precondition(\"voltage\")\n    res = diag.flash_transfer(n)",
+    );
+    let errors = lower_plan(&run_time, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(errors[0].code, StarCode::NonConstantArgument);
+}
+
+fn segment(
+    length: u64,
+    block_size: u32,
+    format: u8,
+    start: u64,
+) -> diag_ir::declaration::FlashSegmentT {
+    let mut segment = plan_segment();
+    segment.length = length;
+    segment.block_size = block_size;
+    segment.address_and_length_format = format;
+    segment.start_address = start;
+    segment
+}
+
+#[test]
+fn the_download_request_is_built_from_the_segment_and_its_format() {
+    let operand_of = |segment| {
+        let program = lower_plan(PLAN_NO_ERASE, vec![segment]).expect("lowers");
+        let download = position(&program, 0, |op| {
+            matches!(op, Op::ServiceRequest { service: 0x34 })
+        });
+        let Op::PushBytes(index) = program.code[download as usize - 1] else {
+            panic!("the operand is pushed before the request");
+        };
+        program.constants[index as usize].clone()
+    };
+    // The default format 0x44: four bytes of address, four of length, after the data format.
+    assert_eq!(
+        operand_of(plan_segment()),
+        [0x00, 0x44, 0, 0, 0x10, 0, 0, 0, 0, 0x25]
+    );
+    // Another data format and widths: two bytes of address, three of length.
+    let mut other = segment(0x25, 0x10, 0x32, 0xBEEF);
+    other.data_format = 0x11;
+    assert_eq!(operand_of(other), [0x11, 0x32, 0xBE, 0xEF, 0, 0, 0x25]);
+    // The widest fields.
+    assert_eq!(
+        operand_of(segment(1, 1, 0x88, u64::MAX)),
+        [&[0x00, 0x88][..], &[0xFF; 8], &[0, 0, 0, 0, 0, 0, 0, 1]].concat()
+    );
+}
+
+#[test]
+fn a_value_that_does_not_fit_the_format_widths_is_not_lowerable() {
+    for (segment, name) in [
+        // An address of three bytes in a two-byte field.
+        (segment(0x25, 0x10, 0x42, 0x1_0000), "address"),
+        // A length of two bytes in a one-byte field.
+        (segment(0x100, 0x10, 0x14, 0x10), "length"),
+        // A zero-width length cannot hold the length.
+        (segment(0x25, 0x10, 0x04, 0x10), "zero width"),
+    ] {
+        let errors = lower_plan(PLAN_NO_ERASE, vec![segment]).expect_err(name);
+        assert_eq!(
+            errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+            [(StarCode::NotLowerable, 5)],
+            "{name}"
+        );
+        assert!(
+            errors[0].hint.contains("does not fit"),
+            "{name}: {}",
+            errors[0].hint
+        );
+    }
+    // The largest value of each width fits.
+    lower_plan(PLAN_NO_ERASE, vec![segment(0xFF, 0x10, 0x11, 0xFF)]).expect("fits");
+}
+
+#[test]
+fn a_block_size_above_what_a_transfer_takes_is_not_lowerable() {
+    let most = diag_ir::MAX_BYTES_LEN as u32 - 2;
+    // The largest block size lowers (one block of that size); one more does not.
+    lower_plan(PLAN_NO_ERASE, vec![segment(u64::from(most), most, 0x44, 0)]).expect("lowers");
+    let errors = lower_plan(
+        PLAN_NO_ERASE,
+        vec![segment(u64::from(most) + 1, most + 1, 0x44, 0)],
+    )
+    .expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, 5)]
+    );
+    assert!(errors[0].hint.contains("block_size"), "{}", errors[0].hint);
+}
+
+#[test]
+fn more_blocks_than_the_journal_numbers_are_not_lowerable() {
+    // 2^32 - 1 blocks of one byte lower; 2^32 do not (the length fits six bytes).
+    let blocks = u64::from(u32::MAX);
+    let program = lower_plan(PLAN_NO_ERASE, vec![segment(blocks, 1, 0x64, 0)]).expect("lowers");
+    assert!(program.code.contains(&Op::PushI64(blocks as i64)));
+    let errors =
+        lower_plan(PLAN_NO_ERASE, vec![segment(blocks + 1, 1, 0x64, 0)]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, 5)]
+    );
+    assert!(errors[0].hint.contains("blocks"), "{}", errors[0].hint);
+}
+
+#[test]
+fn a_session_with_several_segments_or_none_is_not_lowerable() {
+    for segments in [Vec::new(), vec![plan_segment(), plan_segment()]] {
+        let count = segments.len();
+        let errors = lower_plan(PLAN_NO_ERASE, segments).expect_err("refused");
+        assert_eq!(
+            errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+            [(StarCode::NotLowerable, 5)],
+            "{count} segments"
+        );
+    }
+}
+
+#[test]
+fn a_lowered_plan_transfers_the_artifact_block_by_block() {
+    let program = lower_plan(PLAN_NO_ERASE, vec![plan_segment()]).expect("lowers");
+    let bytes = flash_document(Some(NO_ERASE));
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    // The segment is 0x25 bytes from offset 4 in blocks of 0x10: 16, 16 and 5 bytes.
+    let artifact: Vec<u8> = (0..64u8).map(|byte| byte.wrapping_mul(3)).collect();
+    let mut host = ScriptedHost {
+        // The RequestDownload's answer, which is dropped, and the RequestTransferExit's, which
+        // the plan's `res` holds.
+        responses: [vec![0x74, 0x20, 0x01, 0x00], vec![0x77]].into(),
+        artifact: artifact.clone(),
+        ..ScriptedHost::default()
+    };
+    let mut vm = Vm::new(&program);
+    for _ in 0..1000 {
+        match vm.step_with_declarations(&program, Some(&variant), &mut host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    assert!(host.responses.is_empty(), "both requests were sent");
+    let block = |from: usize, to: usize| hex(&artifact[from..to]);
+    assert_eq!(
+        host.calls,
+        [
+            "wait 1".to_owned(),
+            // The format bytes, then the address and the length in four bytes each.
+            "request 34 00440000100000000025".to_owned(),
+            "artifact 4 16".to_owned(),
+            format!("transfer 0 {}", block(4, 20)),
+            "artifact 20 16".to_owned(),
+            format!("transfer 0 {}", block(20, 36)),
+            "artifact 36 5".to_owned(),
+            format!("transfer 0 {}", block(36, 41)),
+            // The transfer exit is the service id alone.
+            "request 37 ".to_owned(),
+        ]
     );
 }
 
@@ -3523,11 +4004,8 @@ fn a_restartable_flash_plan_needs_the_identity_rows() {
             "{}",
             errors[0].hint
         );
-        // With every row it goes on to the transfer's refusal.
-        assert_eq!(
-            flash_codes(source, Some(NO_ERASE), &flash_index(&all)),
-            [(StarCode::NotLowerable, 5)]
-        );
+        // With every row it lowers.
+        assert_eq!(flash_codes(source, Some(NO_ERASE), &flash_index(&all)), []);
     }
     // A marker that is not after the erase point leaves the default: no restart.
     let wait_marked = |source: &str, before: &str| {
@@ -3565,17 +4043,14 @@ fn a_restartable_flash_plan_needs_the_identity_rows() {
     // The default point, at the erase, and a section that requires on-site intervention from
     // its entry allow no restart: the identity rows are not needed.
     let requests = flash_index(&[]);
-    assert_eq!(
-        flash_codes(PLAN_NO_ERASE, Some(NO_ERASE), &requests),
-        [(StarCode::NotLowerable, 5)]
-    );
+    assert_eq!(flash_codes(PLAN_NO_ERASE, Some(NO_ERASE), &requests), []);
     assert_eq!(
         flash_codes(
             &PLAN_NO_ERASE.replace("uninterruptible", "recoveryRequired"),
             Some(NO_ERASE),
             &requests
         ),
-        [(StarCode::NotLowerable, 5)]
+        []
     );
 }
 
@@ -3636,16 +4111,14 @@ def main():
     // The index has rows for the three mandatory preconditions only.
     let source = &source.replace(" engine vehicleSpeed", "");
     let codes = flash_codes(source, Some(WITH_ERASE), &flash_index(&all));
-    // Nothing of the plan's own checks; the empty variant's services and the transfer remain.
+    // Nothing of the plan's own checks and nothing at the transfer; the empty variant's services
+    // remain.
     assert!(
         codes.iter().all(|(code, _)| matches!(
             code,
-            StarCode::UnknownService
-                | StarCode::NotLowerable
-                | StarCode::UnknownPrecondition
-                | StarCode::UnsupportedSyntax
+            StarCode::UnknownService | StarCode::NotLowerable | StarCode::UnsupportedSyntax
         )),
         "{codes:?}"
     );
-    assert!(codes.contains(&(StarCode::NotLowerable, 8)), "{codes:?}");
+    assert!(codes.iter().all(|&(_, line)| line != 8), "{codes:?}");
 }

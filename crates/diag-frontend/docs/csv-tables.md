@@ -446,7 +446,8 @@ The columns below carry the recovery facts of ADR-336. They are read and range-c
 kept on the session's row; they become the `RecoveryTiming`, `version_read_retries` and
 `no_application` of each plan that names the session, in every program of the variant (the plan's
 boundaries come from the Starlark procedure, `starlark-subset.md` 4.9). A plan needs the first
-five; a session no plan names may leave them empty.
+five; a session no plan names may leave them empty, and a plan whose session leaves one empty is
+`STAR_PLAN_SHAPE`.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|

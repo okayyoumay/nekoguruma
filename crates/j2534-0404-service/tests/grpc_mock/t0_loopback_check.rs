@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use ngr_hw_checks::checks::t0_loopback::{CheckError, DeviceFacts, Ends, run as run_check};
-use ngr_hw_checks::guard::{GuardedHandle, HandleError, HandleOptions};
+use ngr_hw_checks::guard::{GuardedHandle, GuardedSocketCan, HandleError, HandleOptions};
 use ngr_hw_checks::profile::{self, Profile, Setup};
 use ngr_hw_checks::report::{Masker, RunGuard};
 use serial_test::serial;
@@ -249,7 +249,8 @@ fn socketcan_end() -> Profile {
     .expect("a T0 profile with a SocketCAN end")
 }
 
-/// The check drives VCI ends only: a SocketCAN end is refused, with nothing sent.
+/// A profile with a SocketCAN end needs that end: given two VCI ends' worth of handle only, the
+/// check is refused, with nothing sent.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn a_socketcan_end_is_refused_by_the_loopback_check() {
@@ -299,6 +300,136 @@ async fn a_socketcan_end_is_refused_by_the_loopback_check() {
     assert!(run.run_teardown().is_empty());
     drop(run);
     server.shutdown().await;
+}
+
+/// A CAN bus on the far side of the mock's channel: what the VCI end writes arrives here, and
+/// what this end sends is injected into the channel's receive queue, as a SocketCAN interface
+/// wired to the VCI would see it.
+struct MockChannelBus {
+    backdoor: MockBackdoor,
+    read: usize,
+}
+
+impl ngr_hw_checks::guard::socketcan::CanBus for MockChannelBus {
+    fn send(&mut self, frame: &ngr_hw_checks::guard::socketcan::CanFrame) -> std::io::Result<()> {
+        self.backdoor
+            .inject_rx(MOCK_CHANNEL_ID, &frame.bytes(), j2534_0404::ISO15765);
+        Ok(())
+    }
+
+    fn recv(
+        &mut self,
+        timeout: Duration,
+    ) -> std::io::Result<Option<ngr_hw_checks::guard::socketcan::CanFrame>> {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if self.read < self.backdoor.written_count(MOCK_CHANNEL_ID) {
+                let bytes = self.backdoor.written_data(MOCK_CHANNEL_ID, self.read);
+                self.read += 1;
+                let (id, data) = bytes.split_at(4);
+                return Ok(Some(ngr_hw_checks::guard::socketcan::CanFrame {
+                    id: u32::from_be_bytes(id.try_into().unwrap()),
+                    extended: false,
+                    data: data.to_vec(),
+                }));
+            }
+            if std::time::Instant::now() >= deadline {
+                return Ok(None);
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+}
+
+/// A VCI end and a SocketCAN end (ADR-343): every frame of 1 to 7 bytes arrives exactly in both
+/// directions, the VCI end's through the mock's channel and the SocketCAN end's through its
+/// guard, and the message names the interface.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_loopback_check_passes_between_a_vci_end_and_a_socketcan_end() {
+    let server = TestServer::start().await;
+    let profile = socketcan_end();
+    let Setup::Loopback(ends) = &profile.setup else {
+        panic!("a loopback");
+    };
+    let vci = ends[1].vci.clone().expect("the VCI end");
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = RunGuard::start_in(
+        &profile,
+        "hw_t0_two_endpoint_loopback",
+        dir.path().join("reports"),
+    );
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci,
+        server.worker_client().await,
+        ModuleHandle {
+            module_handle: MOCK_MODULE_HANDLE,
+        },
+        HandleOptions {
+            request_timeout: Duration::from_secs(5),
+            response_timeout: Some(Duration::from_secs(5)),
+        },
+        &run,
+    )
+    .await
+    .expect("the VCI end opens");
+    let library = j2534_0404_mock::mock_library_path().expect("the mock");
+    let bus = MockChannelBus {
+        read: server.backdoor.written_count(MOCK_CHANNEL_ID),
+        backdoor: MockBackdoor::open(&library),
+    };
+    let mut can = GuardedSocketCan::with_bus(&profile, 0, Box::new(bus))
+        .expect("endpoint 0 is the SocketCAN end");
+    let message = run_check(
+        &profile,
+        Ends::VciAndSocketCan(&mut handle, &mut can),
+        &[facts()],
+        &Masker::unmasked(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the check passes");
+    assert!(
+        message.contains("7 frame lengths in both directions"),
+        "{message}"
+    );
+    assert!(message.contains("SocketCAN interface can0"), "{message}");
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
+/// The SocketCAN end must be given for a profile that has one, and only then.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_socketcan_end_is_given_exactly_when_the_profile_has_one() {
+    let mut opened = open_two_modules().await;
+    let socketcan = socketcan_end();
+    let bus = MockChannelBus {
+        read: 0,
+        backdoor: MockBackdoor::open(&j2534_0404_mock::mock_library_path().expect("the mock")),
+    };
+    let mut can = GuardedSocketCan::with_bus(&socketcan, 0, Box::new(bus)).unwrap();
+    let error = run_check(
+        &opened.profile,
+        Ends::VciAndSocketCan(&mut opened.first, &mut can),
+        &[facts()],
+        &Masker::unmasked(),
+        Duration::from_millis(200),
+    )
+    .await
+    .expect_err("the profile names two VCI ends");
+    assert!(matches!(error, CheckError::Refused(_)), "{error}");
+    drop((opened.first, opened.second));
+    opened.run.pass();
+    assert!(opened.run.run_teardown().is_empty());
+    drop(opened.run);
+    let [a, b] = opened.servers;
+    a.shutdown().await;
+    b.shutdown().await;
 }
 
 /// Under extended addressing the frame is the identifier, the address byte and the payload, which

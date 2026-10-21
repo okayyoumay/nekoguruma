@@ -51,9 +51,10 @@ pub const PROFILE_CHECK: CheckDecl = CheckDecl {
     operations: &[],
 };
 
-/// `hw_t0_two_endpoint_loopback`: on a T0 loopback of two VCI ends, each end sends single RawMode
-/// frames that the other must receive exactly, in both directions (`checks::t0_loopback`). It
-/// needs a T0 profile and no operation beyond the class's.
+/// `hw_t0_two_endpoint_loopback`: on a T0 loopback of two VCI ends, or of a VCI end and a
+/// SocketCAN end on Linux, each end sends single frames that the other must receive exactly, in
+/// both directions (`checks::t0_loopback`). It needs a T0 profile and no operation beyond the
+/// class's.
 pub const T0_LOOPBACK_CHECK: CheckDecl = CheckDecl {
     name: "hw_t0_two_endpoint_loopback",
     classes: &[Class::T0],

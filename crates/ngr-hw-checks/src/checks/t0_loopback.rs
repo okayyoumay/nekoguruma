@@ -1,10 +1,11 @@
-//! `hw_t0_two_endpoint_loopback` (design 13.5, ADR-275): on a T0 loopback of two VCI ends, each end
-//! sends single RawMode frames that the other end must receive exactly, in both directions, and
-//! the check records which library, ABI and `unsigned long` width the worker ran with.
+//! `hw_t0_two_endpoint_loopback` (design 13.5, ADR-275): on a T0 loopback of two ends, each end
+//! sends single frames that the other end must receive exactly, in both directions, and the
+//! check records which library, ABI and `unsigned long` width the worker ran with.
 //!
-//! The ends are two channels of one module (one handle, two links) or two modules (two handles,
-//! one link each); the check takes either as [`Ends`]. Every request goes through the guard, so
-//! the frames are the T0 ones the guard allows: the sending end's own header, and the payload.
+//! The ends are two channels of one module (one handle, two links), two modules (two handles,
+//! one link each), or a VCI module and a SocketCAN interface (ADR-343); the check takes any of
+//! them as [`Ends`]. Every frame goes through a guard, the VCI's or the SocketCAN end's, so the
+//! frames are the T0 ones the guard allows: the sending end's own header, and the payload.
 //!
 //! A frame is a single ISO 15765-2 (2024) frame (clause 9.2: a payload of 1 to 7 bytes, one less
 //! under extended or mixed addressing, which takes a byte of the frame for the address). The
@@ -17,7 +18,8 @@ use std::time::Duration;
 use vci_service_interface::ComLogicalLinkHandle;
 use worker_host::abi::{Abi, detect_file};
 
-use crate::guard::{GuardedHandle, HandleError};
+use crate::guard::socketcan::SocketCanError;
+use crate::guard::{GuardedHandle, GuardedSocketCan, HandleError};
 use crate::open::OpenedDevice;
 use crate::profile::{Addressing, Class, Profile, Setup};
 use crate::report::{Masker, Outcome};
@@ -31,6 +33,14 @@ pub enum Ends<'a> {
     OneModule(&'a mut GuardedHandle),
     /// Two modules: the handle of the first endpoint's VCI, then the second's.
     TwoModules(&'a mut GuardedHandle, &'a mut GuardedHandle),
+    /// A VCI module and a SocketCAN interface, whichever endpoint each is in the profile.
+    VciAndSocketCan(&'a mut GuardedHandle, &'a mut GuardedSocketCan),
+}
+
+/// One end of the loopback, as the check drives it.
+enum End<'h> {
+    Vci(&'h mut GuardedHandle, ComLogicalLinkHandle),
+    SocketCan(&'h mut GuardedSocketCan),
 }
 
 /// What a device was opened with, for the check's result and its ABI check.
@@ -77,13 +87,17 @@ pub enum CheckError {
     /// The receiving end's monitor ended, so no frame can arrive.
     #[error("{0}")]
     Monitor(String),
+    #[error(transparent)]
+    SocketCan(#[from] SocketCanError),
 }
 
 impl CheckError {
     /// The outcome the report records.
     pub fn outcome(&self) -> Outcome {
         match self {
-            CheckError::Refused(_) => Outcome::Refused,
+            CheckError::Refused(_) | CheckError::SocketCan(SocketCanError::Refused(_)) => {
+                Outcome::Refused
+            }
             _ => Outcome::Failed,
         }
     }
@@ -148,11 +162,13 @@ fn max_payload(profile: &Profile) -> usize {
     if addressed { 6 } else { 7 }
 }
 
-/// Which handle and link serve end `end`.
+/// What serves end `end`: a handle and its link, or the SocketCAN end. `socketcan` is the
+/// profile's SocketCAN endpoint, if it has one.
 fn end_of<'h>(
     ends: &'h mut Ends<'_>,
     end: usize,
-) -> Result<(&'h mut GuardedHandle, ComLogicalLinkHandle), CheckError> {
+    socketcan: Option<usize>,
+) -> Result<End<'h>, CheckError> {
     let (handle, index): (&mut GuardedHandle, usize) = match ends {
         Ends::OneModule(handle) => (&mut **handle, end),
         Ends::TwoModules(first, second) => {
@@ -162,11 +178,96 @@ fn end_of<'h>(
                 (&mut **second, 0)
             }
         }
+        Ends::VciAndSocketCan(_, can) if socketcan == Some(end) => {
+            return Ok(End::SocketCan(can));
+        }
+        Ends::VciAndSocketCan(handle, _) => (&mut **handle, 0),
     };
     let cll = *handle.links().get(index).ok_or_else(|| {
         CheckError::Refused(format!("the handle of endpoint {end} has no link {index}"))
     })?;
-    Ok((handle, cll))
+    Ok(End::Vci(handle, cll))
+}
+
+impl End<'_> {
+    /// Starts listening; a SocketCAN end always does.
+    async fn listen(&mut self) -> Result<(), CheckError> {
+        match self {
+            End::Vci(handle, cll) => {
+                handle.raw_listen(*cll).await?;
+                Ok(())
+            }
+            End::SocketCan(_) => Ok(()),
+        }
+    }
+
+    /// Discards what arrived so far; `false` when the bus did not go quiet.
+    async fn drain(&mut self) -> Result<bool, CheckError> {
+        match self {
+            End::Vci(handle, cll) => match handle.raw_drain(*cll).await {
+                Ok(()) => Ok(true),
+                Err(HandleError::NotQuiet) => Ok(false),
+                Err(error) => Err(error.into()),
+            },
+            End::SocketCan(can) => match tokio::task::block_in_place(|| can.drain()) {
+                Ok(()) => Ok(true),
+                Err(SocketCanError::NotQuiet) => Ok(false),
+                Err(error) => Err(error.into()),
+            },
+        }
+    }
+
+    /// The frame the end sends for `payload`.
+    fn frame(&self, payload: &[u8]) -> Result<Vec<u8>, CheckError> {
+        match self {
+            End::Vci(handle, cll) => Ok(handle.raw_frame(*cll, payload)?),
+            End::SocketCan(can) => Ok(can.frame(payload)?),
+        }
+    }
+
+    /// Sends one frame with `payload`; a failure to transmit is `Err(Ok(why))`.
+    async fn send(&mut self, payload: &[u8]) -> Result<(), Result<String, CheckError>> {
+        match self {
+            End::Vci(handle, cll) => match handle.raw_send(*cll, payload).await {
+                Ok(_) => Ok(()),
+                Err(HandleError::SendFailed(why)) => Err(Ok(why)),
+                Err(other) => Err(Err(other.into())),
+            },
+            End::SocketCan(can) => match tokio::task::block_in_place(|| can.send(payload)) {
+                Ok(()) => Ok(()),
+                Err(SocketCanError::Io { source, .. }) => Err(Ok(source.to_string())),
+                Err(other) => Err(Err(other.into())),
+            },
+        }
+    }
+
+    /// Waits for `frame`; what went wrong is a [`Missed`] or an error.
+    async fn receive(&mut self, frame: &[u8], timeout: Duration) -> Result<(), Missed> {
+        match self {
+            End::Vci(handle, cll) => match handle.raw_receive(*cll, frame, timeout).await {
+                Ok(_) => Ok(()),
+                Err(HandleError::MonitorEnded) => Err(Missed::MonitorEnded),
+                Err(HandleError::RawBufferFull { cap }) => Err(Missed::Flooded(cap)),
+                Err(HandleError::NoResponse) => Err(Missed::NoFrame),
+                Err(error) => Err(Missed::Error(error.into())),
+            },
+            End::SocketCan(can) => {
+                match tokio::task::block_in_place(|| can.receive(frame, timeout)) {
+                    Ok(()) => Ok(()),
+                    Err(SocketCanError::NoFrame) => Err(Missed::NoFrame),
+                    Err(error) => Err(Missed::Error(error.into())),
+                }
+            }
+        }
+    }
+}
+
+/// Why an awaited frame did not arrive.
+enum Missed {
+    MonitorEnded,
+    Flooded(usize),
+    NoFrame,
+    Error(CheckError),
 }
 
 /// Runs the check: both ends listen, then each sends frames of 1 to 7 bytes that the other must
@@ -188,14 +289,24 @@ pub async fn run(
     if profile.class != Class::T0 {
         return Err(CheckError::Refused("the check runs on T0 only".to_owned()));
     }
-    if let Some(at) = profile_ends.iter().position(|end| end.vci.is_none()) {
-        return Err(CheckError::Refused(format!(
-            "endpoint {at} is a SocketCAN end ({}); the check drives VCI ends only",
-            profile_ends[at].socketcan.as_deref().unwrap_or("?")
-        )));
+    let socketcan = profile_ends.iter().position(|end| end.vci.is_none());
+    match (&ends, socketcan) {
+        (Ends::VciAndSocketCan(..), Some(_))
+        | (Ends::OneModule(_) | Ends::TwoModules(..), None) => {}
+        (Ends::VciAndSocketCan(..), None) => {
+            return Err(CheckError::Refused(
+                "a SocketCAN end was given, but the profile names two VCI ends".to_owned(),
+            ));
+        }
+        (_, Some(at)) => {
+            return Err(CheckError::Refused(format!(
+                "endpoint {at} is a SocketCAN end ({}), but no SocketCAN end was given",
+                profile_ends[at].socketcan.as_deref().unwrap_or("?")
+            )));
+        }
     }
     let expected_devices = match ends {
-        Ends::OneModule(_) => 1,
+        Ends::OneModule(_) | Ends::VciAndSocketCan(..) => 1,
         Ends::TwoModules(..) => 2,
     };
     if devices.len() != expected_devices {
@@ -209,7 +320,9 @@ pub async fn run(
     }
     // Each handle's link serves the endpoint it stands for, in the profile's order.
     for end in 0..2 {
-        let (handle, cll) = end_of(&mut ends, end)?;
+        let End::Vci(handle, cll) = end_of(&mut ends, end, socketcan)? else {
+            continue;
+        };
         let bound = handle.bound_links();
         let at = bound.get(&cll.cll_handle).map(|link| link.endpoint);
         if at != Some(end) {
@@ -221,8 +334,7 @@ pub async fn run(
 
     // Both ends listen before anything is sent.
     for end in 0..2 {
-        let (handle, cll) = end_of(&mut ends, end)?;
-        handle.raw_listen(cll).await?;
+        end_of(&mut ends, end, socketcan)?.listen().await?;
     }
     let lengths = 1..=max_payload(profile);
     for len in lengths.clone() {
@@ -231,48 +343,44 @@ pub async fn run(
             let bytes = payload(from, len);
             // What the receiver holds already cannot answer this send: a copy of the frame
             // received before it was sent (bus traffic, an earlier run) proves nothing.
-            let (receiver, to_cll) = end_of(&mut ends, to)?;
-            match receiver.raw_drain(to_cll).await {
+            if !end_of(&mut ends, to, socketcan)?.drain().await? {
+                return Err(CheckError::Frame(format!(
+                    "end {to} kept receiving frames before the {len}-byte send; the bus is not a \
+                     quiet loopback"
+                )));
+            }
+            let mut sender = end_of(&mut ends, from, socketcan)?;
+            let frame = sender.frame(&bytes)?;
+            match sender.send(&bytes).await {
                 Ok(()) => {}
-                Err(HandleError::NotQuiet) => {
-                    return Err(CheckError::Frame(format!(
-                        "end {to} kept receiving frames before the {len}-byte send; the bus is \
-                         not a quiet loopback"
+                Err(Ok(why)) => {
+                    return Err(CheckError::Send(format!(
+                        "end {from} could not send the {len}-byte frame {frame:02X?}: {why}"
                     )));
                 }
-                Err(error) => return Err(error.into()),
+                Err(Err(error)) => return Err(error),
             }
-            let (sender, from_cll) = end_of(&mut ends, from)?;
-            let frame = sender.raw_frame(from_cll, &bytes)?;
-            sender
-                .raw_send(from_cll, &bytes)
-                .await
-                .map_err(|error| match error {
-                    HandleError::SendFailed(why) => CheckError::Send(format!(
-                        "end {from} could not send the {len}-byte frame {frame:02X?}: {why}"
-                    )),
-                    other => other.into(),
-                })?;
-            let (receiver, to_cll) = end_of(&mut ends, to)?;
-            let got = receiver.raw_receive(to_cll, &frame, frame_timeout).await;
+            let got = end_of(&mut ends, to, socketcan)?
+                .receive(&frame, frame_timeout)
+                .await;
             match got {
-                Ok(_) => {}
-                Err(HandleError::MonitorEnded) => {
+                Ok(()) => {}
+                Err(Missed::MonitorEnded) => {
                     return Err(CheckError::Monitor(format!(
                         "end {to}'s monitor ended before the {len}-byte frame {frame:02X?} arrived"
                     )));
                 }
-                Err(HandleError::RawBufferFull { cap }) => {
+                Err(Missed::Flooded(cap)) => {
                     return Err(CheckError::Frame(format!(
                         "end {to} received more than {cap} unrelated frames; the bus is not a quiet loopback"
                     )));
                 }
-                Err(HandleError::NoResponse) => {
+                Err(Missed::NoFrame) => {
                     return Err(CheckError::Frame(format!(
                         "end {to} did not receive the {len}-byte frame {frame:02X?} end {from} sent within {frame_timeout:?}"
                     )));
                 }
-                Err(error) => return Err(error.into()),
+                Err(Missed::Error(error)) => return Err(error),
             }
         }
     }
@@ -289,8 +397,12 @@ pub async fn run(
         })
         .collect();
     let counted = lengths.count();
+    let socketcan_text = match &ends {
+        Ends::VciAndSocketCan(_, can) => format!("; SocketCAN interface {}", can.interface()),
+        _ => String::new(),
+    };
     Ok(masker.text(&format!(
-        "{counted} frame lengths in both directions matched exactly; {}",
+        "{counted} frame lengths in both directions matched exactly; {}{socketcan_text}",
         device_text.join("; ")
     )))
 }

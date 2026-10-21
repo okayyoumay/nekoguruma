@@ -332,6 +332,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-340](ADR-340-hmi-forms-are-encoded-hmi-forms-answered-as-status-and-text.md) | HMI Forms and Record Templates Are Encoded `HmiForm`s, Answered as a Status Byte and Text | Accepted | `diag-ir` (`hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 19, `Program::validate`, dry run), `diag-frontend` lowering of `diag.hmi` and `diag.record`, `agent` host and runner (the agent-server protocol left to an ADR of its own), Starlark subset 2.5, 3.1, 3.2, 3.4 and 4.6, design 5.6, 5.7, 8.2.4, 8.6; ADR-229, ADR-233, ADR-254, ADR-304, ADR-317, ADR-328, ADR-330, ADR-335 |
 | [ADR-341](ADR-341-request-params-known-only-at-run-time.md) | Request Params Known Only at Run Time Are Written into the Ingestion-Time Encoding | Accepted | `diag-frontend` Starlark lowering of `diag.request` and `diag.routine`, Starlark subset 3.1 and 3.2, design 8.2.2 and 8.4; ADR-308, ADR-313 item 4 |
 | [ADR-342](ADR-342-the-agent-s-read-only-list-per-application-layer-and-no-read-dtc.md) | The Agent's Read-Only List per Application Layer, and No `ReadDtc` | Accepted | `agent` policy, host and link; ADR-309 item 4, ADR-321 item 6, ADR-235 items 2 and 8 |
+| [ADR-343](ADR-343-the-guarded-socketcan-end-of-a-t0-loopback.md) | The Guarded SocketCAN End of a T0 Loopback | Accepted | `ngr-hw-checks` guard and T0 check, `j2534-0404-service` hardware and mock tests, design 13.5; ADR-275, ADR-333 |
 
 ## Status Legend
 
@@ -677,6 +678,7 @@ the predecessor repository these ADRs came from.
 - ADR-312 (Decision item 4 amended: comparison done, Codex kept)
 - ADR-333 (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342)
 - ADR-334
+- ADR-343
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

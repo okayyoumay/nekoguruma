@@ -415,8 +415,18 @@ carrying its own address byte.
   (`raw_drain`, until 50 ms pass with no frame; a link that never goes quiet fails the check), so a
   copy of the frame received before it was sent cannot answer it. A frame that does not arrive
   within 3 s fails the check and names the frame. The result message records the library path,
-  the ABI and the `unsigned long` width of each device, masked as the report masks. Both ends must be J2534 VCI ends: a
-  SocketCAN end or a D-PDU API end is refused with nothing sent.
+  the ABI and the `unsigned long` width of each device, masked as the report masks. A VCI end must be a J2534 one: a
+  D-PDU API end is refused with nothing sent.
+- **SocketCAN end (ADR-343).** One end may be a `socketcan` interface instead, on Linux only; any
+  other OS refuses the check before a device opens. The interface must be up at the profile's
+  baud rate already, since the harness changes no interface settings. The end is a
+  `guard::GuardedSocketCan` on a raw CAN socket, which offers only the T0 frame of its own end: the
+  end's `request_id` (as a 29-bit identifier when `id_bits` is 29), its address byte when the
+  addressing has one, then the payload, padded to 8 bytes with the end's `padding` byte when the
+  profile pads, as the VCI's frame-padding flag does on the bus. It takes no whole frame and no
+  other identifier. It receives every frame other nodes send, skips error and remote frames, and
+  matches the other end's frame byte for byte, padded as that end pads. The result message names
+  the interface.
 - **ABI check (design 7.1.2).** For each device the ABI read from the library file's header must
   be the worker's, and the width the launch passed to the worker must be the registration
   definition's `LongSize`, else the ABI's default (the test looks the definition up the way the

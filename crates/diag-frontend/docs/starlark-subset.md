@@ -613,7 +613,10 @@ authentication time (8.10.1) each time the function is called.
 - **No nesting.** A call to a section function from anything that runs inside a section,
   directly or through other functions or function arguments, is rejected at that call
   (`STAR_BAD_ANNOTATION`). A call to a section function from outside every section, as many
-  times as the procedure needs, enters the section once per call.
+  times as the procedure needs, enters the section once per call. A flash plan's expansion
+  (4.9) is the exception: what the plan reaches is inlined in it, so a call there nests in no
+  section; a section function reached from the top level or `main` without passing through a
+  plan, or from no plan at all, still nests the sections it calls.
 - **Values.** A section function takes what it needs as arguments and returns what the caller
   needs, like any function: one run-time value, since the VM has no run-time lists, dicts or
   tuples (2.5). Work that needs several results of a section is done inside the section, or the
@@ -774,7 +777,7 @@ def main():
   expansion emits. The erase point is the `diag.routine` statement annotated `# @erase`, a single
   call and a top-level statement of the plan before the transfer; with no `erase-memory` step in
   the session `@erase` is refused and the erase point is the RequestDownload, and with one it is
-  required. Each of those two statements is the one call, or a name assigned from it, with no other `diag` call inside it, and no call to a function that makes one, itself or through a function it calls (`STAR_PLAN_SHAPE`), so each boundary is one operation. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
+  required. Each of those two statements is the one call, or a name assigned from it, with no other `diag` call inside it and no call to a function of the program, which the expansion would inline into it; built-ins and methods of values are allowed (`STAR_PLAN_SHAPE`), so each boundary is one operation. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
   so no jump skips them; loops and `if`s between them are fine.
 - **Recovery-required point.** By default the plan requires on-site intervention from the erase
   point (no automatic restart after it). `recovery=never` declares that no step does.
@@ -894,7 +897,8 @@ The error codes of the restart declaration (ADR-336, 4.9); the converter reports
   An integer, negative ones included, outside its range is `STAR_ARGUMENT_OUT_OF_RANGE`, any
   other fault `STAR_BAD_ANNOTATION`
 - Section nesting (4.5) is found on the call graph the recursion check builds, in one pass: the
-  functions reachable from any section function are marked, and a call from a marked function
+  functions reachable from any section function that runs outside every plan's expansion are
+  marked (without entering a plan), and a call from a marked function
   to a section function is reported, unless it closes a cycle, which is reported as recursion
   only. Calls through function parameters (2.6) are followed along the specialized call paths
 - Sections (4.5) are lowered as copies keyed by the function and the section function whose call

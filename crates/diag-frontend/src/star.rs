@@ -2431,7 +2431,12 @@ impl Checker<'_> {
                 ),
             }
         }
-        self.section_nesting(sectioned.values());
+        let plan_ids: HashSet<usize> = top_defs
+            .iter()
+            .filter(|(line, _)| planned.contains(line))
+            .map(|(_, name)| self.def_ids[name])
+            .collect();
+        self.section_nesting(sectioned.values(), &plan_ids);
         // `@erase` and `@recoveryRequired` belong to a plan function, which is known only now.
         let mut misplaced = Vec::new();
         annotations.retain(|annotation| match annotation {
@@ -2528,34 +2533,6 @@ impl Checker<'_> {
                 def.name.node.ident.as_str(),
                 calls.iter().map(|call| call.span).collect(),
             ));
-        }
-        // The functions that make a `diag` call, themselves or through a function they call:
-        // each function's own calls, then back along the call graph to its callers.
-        let mut makes_diag = vec![false; self.next_function];
-        let mut pending = Vec::new();
-        for def in defs.values() {
-            let mut inner = Vec::new();
-            collect_statements(&def.body, &mut inner);
-            let id = self.def_ids[def.name.node.ident.as_str()];
-            if inner
-                .iter()
-                .any(|stmt| stmt_exprs(stmt).into_iter().any(|e| diag_call_count(e) > 0))
-            {
-                makes_diag[id] = true;
-                pending.push(id);
-            }
-        }
-        let mut callers: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
-        for call in &self.calls {
-            callers[call.callee].push(call.caller);
-        }
-        while let Some(function) = pending.pop() {
-            for &caller in &callers[function] {
-                if !makes_diag[caller] {
-                    makes_diag[caller] = true;
-                    pending.push(caller);
-                }
-            }
         }
         let mut reported: HashSet<u32> = HashSet::new();
         // The calls to each function, and the `@erase` and `@recoveryRequired` of each plan by
@@ -2730,12 +2707,12 @@ impl Checker<'_> {
                         // The statement holds this one operation: no other `diag` call in
                         // the arguments.
                         if diag_call_count(transfer) > 1
-                            || calls_diag_function(transfer, &self.def_ids, &makes_diag, &locals)
+                            || calls_program_function(transfer, &locals)
                         {
                             found.push((
                                 transfer.span,
                                 "`diag.flash_transfer` must be the only `diag` call of its \
-                                 statement, with no call to a function that makes one (4.9)"
+                                 statement, with no call to a function of the program (4.9)"
                                     .to_owned(),
                             ));
                         }
@@ -2787,14 +2764,14 @@ impl Checker<'_> {
                             .is_some_and(|e| {
                                 is_diag_call(e, "routine").is_some()
                                     && diag_call_count(e) == 1
-                                    && !calls_diag_function(e, &self.def_ids, &makes_diag, &locals)
+                                    && !calls_program_function(e, &locals)
                             });
                         if !routine {
                             found.push((
                                 *span,
                                 "`@erase` must precede a single `diag.routine` call, alone or \
                                  assigned to a name, with no other `diag` call in it and no \
-                                 call to a function that makes one (4.9)"
+                                 call to a function of the program (4.9)"
                                     .to_owned(),
                             ));
                         } else if transfer_at.is_some_and(|transfer| *statement_at >= transfer) {
@@ -2885,26 +2862,51 @@ impl Checker<'_> {
     /// Sections do not nest: no function that runs inside a section, the section function itself
     /// or anything it calls, directly or not, may call another section function (4.5,
     /// ADR-301). A call that closes a cycle is reported as recursion only.
-    fn section_nesting<'n>(&mut self, sections: impl Iterator<Item = &'n String>) {
+    fn section_nesting<'n>(
+        &mut self,
+        sections: impl Iterator<Item = &'n String>,
+        plans: &HashSet<usize>,
+    ) {
         let ids: HashSet<usize> = sections.map(|name| self.def_ids[name]).collect();
         let mut successors: Vec<Vec<usize>> = vec![Vec::new(); self.next_function];
         for call in &self.calls {
             successors[call.caller].push(call.callee);
         }
-        // Every function reachable from a section function, by one pass over the graph.
-        let mut inside = vec![false; self.next_function];
-        let mut stack: Vec<usize> = ids.iter().copied().collect();
-        for &id in &stack {
-            inside[id] = true;
-        }
-        while let Some(function) = stack.pop() {
-            for &next in &successors[function] {
-                if !inside[next] {
-                    inside[next] = true;
-                    stack.push(next);
+        // The functions reachable from `roots` without entering a plan, or from the plans.
+        let reach = |roots: Vec<usize>, enter_plans: bool| {
+            let mut reached = vec![false; self.next_function];
+            let mut stack = Vec::new();
+            for root in roots {
+                if !reached[root] {
+                    reached[root] = true;
+                    stack.push(root);
                 }
             }
-        }
+            while let Some(function) = stack.pop() {
+                for &next in &successors[function] {
+                    if !reached[next] && (enter_plans || !plans.contains(&next)) {
+                        reached[next] = true;
+                        stack.push(next);
+                    }
+                }
+            }
+            reached
+        };
+        // A plan's expansion inlines every function it reaches, section functions included, so
+        // a section there nests in no other (ADR-336 item 3). A section function nests others
+        // only where it runs outside every plan: reached from the top level or `main` without
+        // passing through a plan, or never reached from a plan at all.
+        let mut roots = vec![0];
+        roots.extend(self.def_ids.get("main").copied());
+        let outside = reach(roots, false);
+        let in_plans = reach(plans.iter().copied().collect(), true);
+        let seeds: Vec<usize> = ids
+            .iter()
+            .copied()
+            .filter(|id| !plans.contains(id) && (outside[*id] || !in_plans[*id]))
+            .collect();
+        // Every function reachable from such a section function, by one pass over the graph.
+        let inside = reach(seeds, false);
         let nested: Vec<(Span, String)> = self
             .calls
             .iter()
@@ -3035,25 +3037,24 @@ fn diag_call_count(expr: &AstExpr) -> usize {
     count
 }
 
-/// Whether `expr` calls, itself included, a top-level function that makes a `diag` call
-/// (`makes_diag`, by the numbers of `def_ids`). A name in `hidden` is not the top-level function.
-fn calls_diag_function(
-    expr: &AstExpr,
-    def_ids: &HashMap<String, usize>,
-    makes_diag: &[bool],
-    hidden: &HashSet<String>,
-) -> bool {
-    if let ExprP::Call(function, _) = &expr.node
-        && let ExprP::Identifier(name) = &function.node
-        && !hidden.contains(&name.node.ident)
-        && def_ids
-            .get(name.node.ident.as_str())
-            .is_some_and(|&id| makes_diag[id])
-    {
-        return true;
+/// Whether `expr` calls, itself included, anything but `diag`, a built-in (2.4) or a method of
+/// a value: a function of the program, which the plan's expansion inlines, so its own `diag`
+/// calls would join the statement. A name in `hidden` is no built-in.
+fn calls_program_function(expr: &AstExpr, hidden: &HashSet<String>) -> bool {
+    if let ExprP::Call(function, _) = &expr.node {
+        let builtin = match &function.node {
+            ExprP::Identifier(name) => {
+                !hidden.contains(&name.node.ident) && BUILTINS.contains(&name.node.ident.as_str())
+            }
+            ExprP::Dot(..) => true,
+            _ => false,
+        };
+        if !builtin {
+            return true;
+        }
     }
     let mut found = false;
-    expr.visit_expr(|inner| found |= calls_diag_function(inner, def_ids, makes_diag, hidden));
+    expr.visit_expr(|inner| found |= calls_program_function(inner, hidden));
     found
 }
 

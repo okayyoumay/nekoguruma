@@ -1793,7 +1793,8 @@ fn a_flash_plan_breaks_a_shape_rule() {
         helper("# @section interruptible\n"),
         [(Bad, 10), (Shape, 10)]
     );
-    // A plan that calls a plan is a section function that calls the plan, which is a section.
+    // A plan that calls a plan: the call is a shape error, and no nesting one, since the caller's
+    // expansion inlines what it calls.
     let two = "\
 # @section uninterruptible
 # @flashPlan session=1
@@ -1814,7 +1815,7 @@ def second():
 def main():
     first()
 ";
-    assert_eq!(codes(two), [(Bad, 7), (Shape, 7), (Shape, 14)]);
+    assert_eq!(codes(two), [(Shape, 7), (Shape, 14)]);
     // `main` cannot be a plan, and a plan returns nothing.
     assert_eq!(
         codes("# @flashPlan session=1\ndef main():\n    pass\n"),
@@ -2076,8 +2077,9 @@ fn the_erase_and_transfer_statements_hold_one_diag_call() {
         "flash_transfer(len(diag.log(1, \"\")))",
     ));
     assert_eq!(errors, [(Shape, 6)]);
-    // Nor a call to a function that makes one, directly or through another function.
-    let helper = "\ndef args():\n    return inner()\n\ndef inner():\n    return diag.wait(1)\n";
+    // Nor a call to a function of the program, which the expansion would inline into the
+    // statement; built-ins and methods are fine.
+    let helper = "\ndef args():\n    return 1\n";
     let erase = PLAN.replace(
         "diag.routine(0xFF00, 1, {})",
         "diag.routine(0xFF00, args(), {})",
@@ -2085,14 +2087,44 @@ fn the_erase_and_transfer_statements_hold_one_diag_call() {
     assert_eq!(codes(&erase), [(Shape, 4)]);
     let transfer = PLAN.replace("flash_transfer(1)", "flash_transfer(args())") + helper;
     assert_eq!(codes(&transfer), [(Shape, 6)]);
-    // A function that makes no `diag` call may be called there.
-    let pure = "\ndef one():\n    return 1\n";
-    passes(
-        &(PLAN.replace(
-            "diag.routine(0xFF00, 1, {})",
-            "diag.routine(0xFF00, one(), {})",
-        ) + pure),
+    let lambda = PLAN.replace(
+        "diag.routine(0xFF00, 1, {})",
+        "diag.routine(0xFF00, (lambda: 1)(), {})",
     );
+    assert!(codes(&lambda).contains(&(Shape, 4)), "{:?}", codes(&lambda));
+    passes(&PLAN.replace(
+        "diag.routine(0xFF00, 1, {})",
+        "diag.routine(0xFF00, min(1, 2), {})",
+    ));
     // The plain forms still pass.
     passes(PLAN);
+}
+
+/// A section function a plan reaches is inlined in the plan's expansion (ADR-336 item 3), so it
+/// nests in no other section; outside the plan the nesting rule still holds.
+#[test]
+fn a_section_function_inlined_in_a_plan_does_not_nest() {
+    let helper = "\n# @section interruptible\ndef helper():\n    diag.wait(1)\n";
+    let inlined = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    helper()",
+    ) + helper;
+    passes(&inlined);
+    // Through a plain function the plan calls, too.
+    let through = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    relay()",
+    ) + helper
+        + "\ndef relay():\n    helper()\n";
+    passes(&through);
+    // A section that calls `helper` outside every plan still nests.
+    let outside = inlined.clone()
+        + "\n# @section interruptible\ndef other():\n    helper()\n"
+        + "\ndef extra():\n    other()\n";
+    let outside = outside.replace("    write()\n", "    write()\n    extra()\n");
+    assert!(
+        codes(&outside).contains(&(StarCode::BadAnnotation, 20)),
+        "{:?}",
+        codes(&outside)
+    );
 }

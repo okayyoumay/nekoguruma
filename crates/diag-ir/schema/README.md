@@ -48,12 +48,14 @@ program is loaded (8.9, 8.10.1; ADR-245). A plan refers to its `FlashSession` by
 ## Generation
 
 ```
-cargo build -p diag-ir --features vendored-flatc
+cargo build -p diag-ir --features download-flatc
 ```
 
-The `vendored-flatc` feature builds the pinned `flatc` from source (the `flatc-fork` crate, which
-vendors the flatbuffers sources; it needs cmake and a C++ compiler) and runs it from the build
-script. The `flatc` feature runs the `flatc` on `PATH`, or the one the `FLATC` environment
+The `download-flatc` feature fetches the pinned `flatc` release binary from the flatbuffers
+GitHub release with `curl` (so it needs network access and honours the environment's proxy and
+trust settings), checks the archive's SHA-256 against the one the build script pins, unpacks it
+into the build directory and runs it from the build script. The release ships binaries for
+x86_64 Linux, x86_64 Windows and macOS only; on other hosts use the `flatc` feature. The `flatc` feature runs the `flatc` on `PATH`, or the one the `FLATC` environment
 variable names, instead. Either way the build script checks the compiler's version and then runs
 `flatc --rust --gen-object-api -o src/generated schema/ir.fbs` in `crates/diag-ir`. Without
 either feature the build runs no `flatc`.
@@ -62,7 +64,7 @@ The output, `src/generated/ir_generated.rs`, is committed to the repository (so 
 `ir.fbs` and regenerate in the same commit. The `flatc` version must equal the
 `flatbuffers` crate's version in the workspace `Cargo.toml` (25.12.19), since the generated code
 calls that runtime: the build script refuses another version, and when the runtime is updated,
-`flatc-fork`'s pin in `crates/diag-ir/Cargo.toml` and the script's version move with it. `rustfmt` skips the file (`#[rustfmt::skip]` on its module in
+the script's version and its release-asset hashes move with it. `rustfmt` skips the file (`#[rustfmt::skip]` on its module in
 `src/declaration.rs`).
 
 `declaration::load_ecu_document` is the only way a buffer is read: it checks the `DIR1` file

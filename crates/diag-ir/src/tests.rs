@@ -27,6 +27,8 @@ struct MockHost {
     artifact_answer: Option<Vec<u8>>,
     /// The values of the runtime inputs; an input not listed cannot be established.
     inputs: Vec<(RuntimeInput, i64)>,
+    /// The bytes of every HMI form and record template sent.
+    forms: Vec<Vec<u8>>,
 }
 
 impl MockHost {
@@ -95,6 +97,7 @@ impl DiagHost for MockHost {
     }
     fn hmi_request(&mut self, inquiry: u64, form: &[u8]) -> Result<Option<Vec<u8>>, MockError> {
         self.calls.push(format!("hmi {form:02x?}"));
+        self.forms.push(form.to_vec());
         self.inquiries.push(inquiry);
         self.fail()?;
         Ok(self.hmi.pop_front().flatten())
@@ -105,6 +108,7 @@ impl DiagHost for MockHost {
         template: &[u8],
     ) -> Result<Option<Vec<u8>>, MockError> {
         self.calls.push(format!("record {template:02x?}"));
+        self.forms.push(template.to_vec());
         self.inquiries.push(inquiry);
         if !self.records.is_empty() {
             self.fail()?;
@@ -154,6 +158,24 @@ fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         preconditions: Default::default(),
         flash: Vec::new(),
     }
+}
+
+/// An encoded HMI form template with no parameters (ADR-340).
+fn form(id: &str) -> Vec<u8> {
+    crate::hmi::encode_template(&crate::hmi::HmiTemplate {
+        id: id.to_owned(),
+        params: Vec::new(),
+    })
+    .expect("encodes")
+}
+
+/// An encoded HMI form template with one run-time slot, `n`.
+fn runtime_form(id: &str) -> Vec<u8> {
+    crate::hmi::encode_template(&crate::hmi::HmiTemplate {
+        id: id.to_owned(),
+        params: vec![("n".to_owned(), crate::hmi::HmiParam::Runtime)],
+    })
+    .expect("encodes")
 }
 
 /// Steps until the program finishes, failing on anything else.
@@ -774,7 +796,7 @@ fn diagnostic_primitives_reach_the_host() {
         vec![
             vec![0xF1, 0x90],
             vec![0xAA],
-            vec![7],
+            form("rec"),
             b"done".to_vec(),
             vec![0x19, 0x02, 0x08],
         ],
@@ -800,7 +822,8 @@ fn diagnostic_primitives_reach_the_host() {
             "routine 0xff00 1 [aa]",
             "flash 3 [aa]",
             "wait 50",
-            "record [07]",
+            // The template's form: the id's length and bytes, then no parameters.
+            "record [03, 72, 65, 63, 00]",
             "capture 500",
         ]
     );
@@ -869,7 +892,7 @@ fn hmi_and_seed_key_wait_without_changing_the_state() {
             Op::PushBytes(1),
             Op::SecurityAccess { level: 1 },
         ],
-        vec![b"form".to_vec(), vec![0x12, 0x34]],
+        vec![form("form"), vec![0x12, 0x34]],
     );
     let mut vm = Vm::new(&program);
     let mut host = MockHost {
@@ -1096,7 +1119,7 @@ fn state_round_trips_through_postcard_at_every_boundary() {
 
 /// Every host-calling primitive, set up so that the next step calls the host.
 fn primitive_programs() -> Vec<(Op, Program)> {
-    let constants = vec![vec![0x22], b"text".to_vec()];
+    let constants = vec![vec![0x22], form("text"), runtime_form("text")];
     let with_bytes = |op: Op| {
         (
             op.clone(),
@@ -1117,6 +1140,8 @@ fn primitive_programs() -> Vec<(Op, Program)> {
             prog(vec![i(10), Op::WaitFromStack], constants.clone()),
         ),
         alone(Op::HmiRequest { form: 1 }),
+        // The `I64` pushed first fills the template's one run-time slot.
+        alone(Op::HmiRequestFromStack { form: 2 }),
         alone(Op::RecordInput { template: 1 }),
         alone(Op::MonitorCapture { back_millis: 10 }),
     ]
@@ -1175,7 +1200,7 @@ fn full_stack_is_detected_before_the_host_is_asked() {
     ] {
         let mut code = vec![i(0); MAX_STACK];
         code.push(op.clone());
-        let program = prog(code, vec![vec![1]]);
+        let program = prog(code, vec![form("f")]);
         let mut vm = Vm::new(&program);
         let mut host = MockHost::default();
         for _ in 0..MAX_STACK {
@@ -1263,6 +1288,7 @@ fn primitive_classification_covers_every_instruction() {
         Op::ReadInput {
             input: RuntimeInput::SupplyVoltageMillivolts,
         },
+        Op::HmiRequestFromStack { form: 0 },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -1590,7 +1616,7 @@ fn waits_carry_a_stable_inquiry() {
         Op::Jump(2),
         Op::Wait { millis: 100 }, // 13
     ];
-    let program = prog(code, vec![b"form".to_vec()]);
+    let program = prog(code, vec![form("form")]);
     let mut vm = Vm::new(&program);
     let mut host = MockHost {
         hmi: VecDeque::from([None, Some(vec![1]), None, None, Some(vec![2])]),
@@ -1702,7 +1728,7 @@ fn record_input_waits_for_the_operator() {
         Op::JumpIfFalse(13),
         Op::Jump(2),
     ];
-    let program = prog(code, vec![b"tpl".to_vec()]);
+    let program = prog(code, vec![form("tpl")]);
     let mut vm = Vm::new(&program);
     let mut host = MockHost {
         records: VecDeque::from([None, Some(b"a".to_vec()), None, Some(b"b".to_vec())]),
@@ -1802,7 +1828,7 @@ fn current_op_and_step_agree_on_primitives() {
         ),
         (
             with(full(), Op::HmiRequest { form: 0 }),
-            vec![vec![]],
+            vec![form("f")],
             VmError::StackOverflow,
         ),
         (
@@ -1812,7 +1838,7 @@ fn current_op_and_step_agree_on_primitives() {
         ),
         (
             with(full(), Op::RecordInput { template: 0 }),
-            vec![vec![]],
+            vec![form("f")],
             VmError::StackOverflow,
         ),
         (
@@ -1930,8 +1956,10 @@ fn primitives_run_at_the_stack_limit() {
         (Op::LogFromStack { level: 0 }, MAX_STACK),
         (Op::MonitorCapture { back_millis: 1 }, MAX_STACK),
         (Op::ReadDtc { mask: 1 }, MAX_STACK - 1),
-        (Op::HmiRequest { form: 0 }, MAX_STACK - 1),
-        (Op::RecordInput { template: 0 }, MAX_STACK - 1),
+        (Op::HmiRequest { form: 1 }, MAX_STACK - 1),
+        (Op::RecordInput { template: 1 }, MAX_STACK - 1),
+        // Its operand is replaced by the answer.
+        (Op::HmiRequestFromStack { form: 2 }, MAX_STACK),
     ];
     // The list covers every diagnostic primitive once.
     let kinds: std::collections::HashSet<_> = cases
@@ -1955,7 +1983,10 @@ fn primitives_run_at_the_stack_limit() {
                 _ => Value::Bytes(vec![0x41]),
             };
         }
-        let program = prog(vec![op.clone()], vec![b"ok".to_vec()]);
+        let program = prog(
+            vec![op.clone()],
+            vec![b"ok".to_vec(), form("f"), runtime_form("f")],
+        );
         let mut vm = Vm::resume(VmState {
             stack,
             ..Vm::new(&program).state
@@ -4370,4 +4401,293 @@ mod read_input {
         assert_eq!(vm.state.stack.len(), MAX_STACK);
         assert_eq!(vm.state.pc, 0);
     }
+}
+
+// ---------------------------------------------------------------- HMI forms (ADR-340)
+
+fn hmi_template(id: &str, params: Vec<(&str, crate::hmi::HmiParam)>) -> Vec<u8> {
+    crate::hmi::encode_template(&crate::hmi::HmiTemplate {
+        id: id.to_owned(),
+        params: params
+            .into_iter()
+            .map(|(key, param)| (key.to_owned(), param))
+            .collect(),
+    })
+    .expect("encodes")
+}
+
+fn hmi_form(id: &str, params: Vec<(&str, crate::hmi::HmiValue)>) -> crate::hmi::HmiForm {
+    crate::hmi::HmiForm {
+        id: id.to_owned(),
+        params: params
+            .into_iter()
+            .map(|(key, value)| (key.to_owned(), value))
+            .collect(),
+    }
+}
+
+#[test]
+fn an_hmi_request_sends_its_templates_form_and_pushes_the_answer() {
+    use crate::hmi::{HmiParam::Const, HmiValue::*};
+    let program = prog(
+        vec![Op::HmiRequest { form: 0 }],
+        vec![hmi_template(
+            "confirm",
+            vec![("count", Const(Int(2))), ("ok", Const(Bool(false)))],
+        )],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        hmi: VecDeque::from([Some(crate::hmi::answered("yes"))]),
+        ..MockHost::default()
+    };
+    run(&mut vm, &program, &mut host);
+    assert_eq!(
+        crate::hmi::decode_form(&host.forms[0]).unwrap(),
+        hmi_form("confirm", vec![("count", Int(2)), ("ok", Bool(false))])
+    );
+    assert_eq!(vm.state.stack, [Value::Bytes(b"\x01yes".to_vec())]);
+}
+
+#[test]
+fn hmi_request_from_stack_fills_the_slots_deepest_first_in_template_order() {
+    use crate::hmi::{HmiParam::*, HmiValue::*};
+    let template = hmi_template(
+        "enter",
+        vec![
+            ("a", Runtime),
+            ("k", Const(Int(7))),
+            ("b", Runtime),
+            ("c", Runtime),
+        ],
+    );
+    let program = prog(
+        vec![
+            i(9),
+            i(5),
+            Op::PushBytes(1),
+            i(1),
+            i(1),
+            Op::CmpEq,
+            Op::HmiRequestFromStack { form: 0 },
+        ],
+        vec![template, b"ecu".to_vec()],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        hmi: VecDeque::from([Some(crate::hmi::declined())]),
+        ..MockHost::default()
+    };
+    run(&mut vm, &program, &mut host);
+    assert_eq!(
+        crate::hmi::decode_form(&host.forms[0]).unwrap(),
+        hmi_form(
+            "enter",
+            vec![
+                ("a", Int(5)),
+                ("k", Int(7)),
+                ("b", Text("ecu".to_owned())),
+                ("c", Bool(true)),
+            ]
+        )
+    );
+    // The answer replaces the three operands; the value below them stays.
+    assert_eq!(
+        vm.state.stack,
+        [Value::I64(9), Value::Bytes(vec![crate::hmi::DECLINED])]
+    );
+    // A template without slots takes nothing from the stack.
+    let program = prog(
+        vec![i(9), Op::HmiRequestFromStack { form: 0 }],
+        vec![hmi_template("plain", vec![])],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        hmi: VecDeque::from([Some(crate::hmi::timed_out())]),
+        ..MockHost::default()
+    };
+    run(&mut vm, &program, &mut host);
+    assert_eq!(
+        vm.state.stack,
+        [Value::I64(9), Value::Bytes(vec![crate::hmi::TIMED_OUT])]
+    );
+}
+
+#[test]
+fn a_record_input_sends_its_template_id() {
+    let program = prog(
+        vec![Op::RecordInput { template: 0 }],
+        vec![hmi_template("torque_check", vec![])],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        records: VecDeque::from([Some(crate::hmi::answered("ok"))]),
+        ..MockHost::default()
+    };
+    run(&mut vm, &program, &mut host);
+    assert_eq!(
+        crate::hmi::decode_form(&host.forms[0]).unwrap(),
+        hmi_form("torque_check", vec![])
+    );
+    assert_eq!(vm.state.stack, [Value::Bytes(b"\x01ok".to_vec())]);
+}
+
+/// Every refusal of a form comes before the host is called, from `current_op` as from `step`,
+/// and leaves the state as it was (ADR-233 item 3).
+#[test]
+fn hmi_form_errors_come_before_the_host() {
+    use crate::hmi::{HmiParam::*, HmiValue::*};
+    let one_slot = || hmi_template("f", vec![("v", Runtime)]);
+    let cases: Vec<(Vec<Op>, Vec<Vec<u8>>, VmError)> = vec![
+        (
+            vec![Op::HmiRequest { form: 0 }],
+            vec![b"form".to_vec()],
+            VmError::BadHmiForm(0),
+        ),
+        (
+            vec![i(1), Op::HmiRequest { form: 0 }],
+            vec![one_slot()],
+            VmError::BadHmiForm(0),
+        ),
+        (
+            vec![Op::RecordInput { template: 0 }],
+            vec![hmi_template("r", vec![("v", Const(Int(1)))])],
+            VmError::BadHmiForm(0),
+        ),
+        (
+            vec![Op::HmiRequestFromStack { form: 0 }],
+            vec![vec![]],
+            VmError::BadHmiForm(0),
+        ),
+        (
+            vec![Op::HmiRequestFromStack { form: 3 }],
+            vec![],
+            VmError::BadConstant(3),
+        ),
+        (
+            vec![i(1), Op::HmiRequestFromStack { form: 0 }],
+            vec![hmi_template("f", vec![("v", Runtime), ("w", Runtime)])],
+            VmError::StackUnderflow,
+        ),
+        (
+            vec![Op::PushF64(1.5), Op::HmiRequestFromStack { form: 0 }],
+            vec![one_slot()],
+            VmError::TypeMismatch,
+        ),
+        (
+            vec![Op::PushBytes(1), Op::HmiRequestFromStack { form: 0 }],
+            vec![one_slot(), vec![b'a', 0xFF]],
+            VmError::InvalidUtf8(0),
+        ),
+        (
+            vec![Op::PushBytes(1), Op::HmiRequestFromStack { form: 0 }],
+            vec![one_slot(), vec![b'x'; crate::hmi::MAX_HMI_FORM_LEN]],
+            // The text and nine bytes around it: the id, the parameter count, the key, the
+            // value's variant and the text's three-byte length.
+            VmError::HmiFormTooLong(crate::hmi::MAX_HMI_FORM_LEN as u64 + 9),
+        ),
+    ];
+    for (code, constants, expected) in cases {
+        let setup_steps = code.len() - 1;
+        let program = prog(code, constants);
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        for _ in 0..setup_steps {
+            vm.step(&program, &mut host).unwrap();
+        }
+        host.forbidden = true;
+        let before = postcard::to_allocvec(&vm.state).unwrap();
+        assert_eq!(vm.current_op(&program), Err(expected.clone()));
+        assert!(
+            matches!(vm.step(&program, &mut host), Err(StepError::Vm(ref e)) if *e == expected),
+            "{expected:?}"
+        );
+        assert_eq!(
+            postcard::to_allocvec(&vm.state).unwrap(),
+            before,
+            "{expected:?}"
+        );
+    }
+}
+
+#[test]
+fn validate_refuses_a_template_its_instruction_does_not_take() {
+    use crate::hmi::{HmiParam::*, HmiValue::*};
+    let one_slot = hmi_template("f", vec![("v", Runtime)]);
+    let with_param = hmi_template("r", vec![("v", Const(Int(1)))]);
+    for (op, constant) in [
+        (Op::HmiRequest { form: 0 }, b"form".to_vec()),
+        (Op::HmiRequest { form: 0 }, one_slot.clone()),
+        (Op::RecordInput { template: 0 }, with_param.clone()),
+        (Op::RecordInput { template: 0 }, one_slot.clone()),
+        (Op::HmiRequestFromStack { form: 0 }, vec![0xFF]),
+        (Op::HmiRequestFromStack { form: 1 }, one_slot.clone()),
+    ] {
+        let program = prog(vec![i(1), op.clone()], vec![constant]);
+        assert_eq!(
+            program.validate(),
+            Err(ProgramError::BadHmiForm { pc: 1 }),
+            "{op:?}"
+        );
+    }
+    for (op, constant) in [
+        (Op::HmiRequest { form: 0 }, with_param.clone()),
+        (Op::RecordInput { template: 0 }, hmi_template("r", vec![])),
+        (Op::HmiRequestFromStack { form: 0 }, one_slot),
+        (Op::HmiRequestFromStack { form: 0 }, with_param),
+    ] {
+        let program = prog(vec![i(1), op.clone()], vec![constant]);
+        assert_eq!(program.validate(), Ok(()), "{op:?}");
+    }
+}
+
+/// While the operator has not answered, every poll, and every poll after a resume from the
+/// journal at the waiting instruction, sends the same bytes under the same inquiry.
+#[test]
+fn a_resumed_hmi_wait_sends_the_same_form_under_the_same_inquiry() {
+    use crate::hmi::HmiParam::*;
+    let program = prog(
+        vec![i(42), Op::PushBytes(1), Op::HmiRequestFromStack { form: 0 }],
+        vec![
+            hmi_template("f", vec![("n", Runtime), ("label", Runtime)]),
+            b"motor".to_vec(),
+        ],
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        hmi: VecDeque::from([None, None]),
+        ..MockHost::default()
+    };
+    vm.step(&program, &mut host).unwrap();
+    vm.step(&program, &mut host).unwrap();
+    for _ in 0..2 {
+        assert_eq!(
+            vm.step(&program, &mut host).unwrap(),
+            StepOutcome::Waiting(WaitingOn::Hmi)
+        );
+    }
+    let journaled = postcard::to_allocvec(&vm.state).unwrap();
+    let mut resumed = Vm::resume(postcard::from_bytes(&journaled).unwrap());
+    let mut after = MockHost {
+        hmi: VecDeque::from([None, Some(crate::hmi::answered("done"))]),
+        ..MockHost::default()
+    };
+    assert_eq!(
+        resumed.step(&program, &mut after).unwrap(),
+        StepOutcome::Waiting(WaitingOn::Hmi)
+    );
+    assert_eq!(postcard::to_allocvec(&resumed.state).unwrap(), journaled);
+    assert_eq!(
+        resumed.step(&program, &mut after).unwrap(),
+        StepOutcome::Finished
+    );
+    let forms: Vec<_> = host.forms.iter().chain(&after.forms).collect();
+    assert_eq!(forms.len(), 4);
+    assert!(forms.iter().all(|form| *form == forms[0]));
+    let inquiries: Vec<_> = host.inquiries.iter().chain(&after.inquiries).collect();
+    assert!(
+        inquiries.iter().all(|q| *q == inquiries[0]),
+        "{inquiries:?}"
+    );
+    assert_eq!(resumed.state.stack, [Value::Bytes(b"\x01done".to_vec())]);
 }

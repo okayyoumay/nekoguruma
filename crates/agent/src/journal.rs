@@ -3109,6 +3109,8 @@ mod tests {
                 expected: 0,
                 got: 0,
             },
+            VmError::BadHmiForm(0),
+            VmError::HmiFormTooLong(0),
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -3143,7 +3145,9 @@ mod tests {
                 | VmError::UnknownFlashSegment { .. }
                 | VmError::ZeroBlockSize { .. }
                 | VmError::BlockOutOfRange { .. }
-                | VmError::ArtifactLength { .. } => {}
+                | VmError::ArtifactLength { .. }
+                | VmError::BadHmiForm(_)
+                | VmError::HmiFormTooLong(_) => {}
             }
         }
         let encoded = |reason: RunStop| {

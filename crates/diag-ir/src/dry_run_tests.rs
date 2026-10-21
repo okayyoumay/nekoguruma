@@ -362,7 +362,14 @@ fn keys_and_records_come_from_the_script() {
         Op::RecordInput { template: 1 },
         Op::Pop,
     ];
-    let constants = vec![vec![0xAA], b"template".to_vec()];
+    let template = crate::hmi::HmiTemplate {
+        id: "template".to_owned(),
+        params: Vec::new(),
+    };
+    let constants = vec![
+        vec![0xAA],
+        crate::hmi::encode_template(&template).expect("encodes"),
+    ];
     let report = run(
         &buf,
         &program(code.clone(), constants.clone()),
@@ -372,7 +379,7 @@ fn keys_and_records_come_from_the_script() {
         report.end,
         DryRunEnd::Host(DryRunError::NotScripted { what: "key" })
     );
-    let script = Script::new().key(vec![0x55]).record(b"filled".to_vec());
+    let script = Script::new().key(vec![0x55]).record_answer(true, "ok");
     let report = run(&buf, &program(code, constants), &script);
     assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
     assert_eq!(
@@ -384,8 +391,11 @@ fn keys_and_records_come_from_the_script() {
                 key: vec![0x55]
             },
             DryRunEvent::RecordInput {
-                template: b"template".to_vec(),
-                answer: b"filled".to_vec()
+                template: crate::hmi::HmiForm {
+                    id: "template".to_owned(),
+                    params: Vec::new(),
+                },
+                answer: b"\x01ok".to_vec()
             }
         ]
     );

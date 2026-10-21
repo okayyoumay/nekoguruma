@@ -55,13 +55,11 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 
 1. **One encoding for both calls: a postcard-encoded `diag_ir::hmi::HmiForm`.**
    ```rust
-   pub struct HmiForm { pub id: String, pub site: u32, pub params: Vec<(String, HmiValue)> }
+   pub struct HmiForm { pub id: String, pub params: Vec<(String, HmiValue)> }
    pub enum HmiValue { Int(i64), Bool(bool), Text(String) }
    ```
    `id` is the form id or the record template id (the `id` of
-   `schemas/record-template.schema.json`), 1 to 128 bytes of UTF-8 (`MAX_HMI_ID_LEN`). `site` is the
-   call site: the lowering numbers the procedure's `diag.hmi` and `diag.record` calls in source
-   order from 0, so a program holds each site once (item 5 says what it is for). `params` holds
+   `schemas/record-template.schema.json`), 1 to 128 bytes of UTF-8 (`MAX_HMI_ID_LEN`). `params` holds
    at most 32 pairs (`MAX_HMI_PARAMS`), in the source order of the Starlark dict literal; a key is an
    ASCII identifier (`[A-Za-z_][A-Za-z0-9_]*`) of 1 to 64 bytes, unique within the form. The whole
    encoding is at most 16 KiB (`MAX_HMI_FORM_LEN`). A record template's `params` is empty in this
@@ -145,7 +143,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    the VM's inquiry number, `kind` `Form` or
    `Record`, `generation` the job's ownership generation (ADR-229: every job-scoped message
    carries it, and the server applies one only under the current owner and generation), and
-   `form` typed (`id`, `site` and `params`, which serialize as JSON on the wire, an `Int` as a
+   `form` typed (`id` and `params`, which serialize as JSON on the wire, an `Int` as a
    decimal string so that no value outside the range a browser holds exactly is rounded before
    the operator sees it), and returns `Ok(None)`;
    later polls return `Ok(None)` until the answer command `HmiAnswer { job_id, generation,
@@ -165,15 +163,16 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    restart creates, opens a new `request_id` for the same inquiry number: the server supersedes
    the job's open inquiry, and a late answer to a superseded id is audit data only. Because a
    restart may repeat the primitive (it is `Safe`, ADR-335) after the server stored a record but
-   before the agent's checkpoint after it, the server keeps one record per job, call site and
-   inquiry number: a record entered under a later request id for the same three supersedes the
-   earlier one, which stays as audit data only, so the job's records hold no duplicate. The call
-   site is `site`, a number the lowering gives each `diag.hmi` and `diag.record` call of the
-   procedure, distinct within the program, since the inquiry number counts steps and not
-   instructions: a replay from the start (ADR-335) whose earlier reads take another branch can
-   reach the same step count at another call, and the site keeps that record apart. A replay
-   that reaches the same call at the same step count repeats that call, so superseding is right
-   there; only the answer is never reused. A server
+   before the agent's checkpoint after it, a record must never count twice. Within one run the
+   inquiry number is unique, since `steps` only grows. Across runs the agent tells the server where
+   each run starts: before a run's first instruction (a first run or any restart) it sends
+   `EventBody::HmiRunStart { job_id, generation, from_inquiry }` with the inquiry number of the
+   state it starts from, 0 for a run from the start (ADR-335). Everything the abandoned run did at
+   or after that number is what the new run repeats, so the server supersedes the job's records
+   whose inquiry number is at or above `from_inquiry`, which stay as audit data only, and keeps
+   those below it, which the resumed state already holds. The job's active records are therefore
+   exactly those of the steps the final run did not repeat plus those it made, with no duplicate
+   whatever branch a repeated read takes. The answer itself is never reused. A server
    refusal (an id the server does not have, params the form cannot take) is a command of its own,
    `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
    returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the
@@ -184,7 +183,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    HMI timeout's included, or any other end of the run), before the job's final state is
    reported. The stream and Web API schemas change accordingly: `hmiRequest`
    carries the generation, `kind`, `id` and `params`; `hmiResponse` and the `POST
-   .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the refusal and the withdrawal
+   .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the refusal, the withdrawal and the run start
    are messages of their own.
 6. **The runner polls an HMI wait as it polls a timer.** `Waiting(WaitingOn::Hmi)` reports
    `JobState::AwaitingHmi`, sleeps `wait_poll` and steps again, keeping the keep-alive and the

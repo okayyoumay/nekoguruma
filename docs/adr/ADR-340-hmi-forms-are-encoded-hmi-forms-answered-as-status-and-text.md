@@ -185,6 +185,14 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    carries the generation, `kind`, `id` and `params`; `hmiResponse` and the `POST
    .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the refusal, the withdrawal and the run start
    are messages of their own.
+   Only the server can answer, since design 5.7.1 lets the browser's local connection to an
+   offline agent start pre-fetched jobs and read their progress, nothing else. A job whose program
+   holds an `HmiRequest`, `HmiRequestFromStack` or `RecordInput` instruction therefore cannot be
+   started offline, like one that needs a seed-key computation or OEM authentication: the agent
+   refuses the offline start, and the web UI gives the operator form as the reason in advance
+   (design 5.7). A job that loses the server while it runs keeps waiting, as design 8.2.5's table
+   says, until the server returns or the HMI timeout ends the wait (item 6). A local path that
+   lets the on-site operator answer offline is a follow-up of its own.
 6. **The runner polls an HMI wait as it polls a timer.** `Waiting(WaitingOn::Hmi)` reports
    `JobState::AwaitingHmi`, sleeps `wait_poll` and steps again, keeping the keep-alive and the
    cancel check; `JobError::Unanswerable` remains for `SeedKey` only. When the HMI timeout of

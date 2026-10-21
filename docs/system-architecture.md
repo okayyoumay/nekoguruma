@@ -403,7 +403,7 @@ Sites can have poor reception: workshop basements, inside metal structures, road
 
 **Handling results**: Results of offline execution are kept in the journal and synced via the Outbox once connectivity is restored.
 
-The web UI shows in advance whether the target vehicle and operation can be started offline, and if not, the reason (seed-key required, OEM authentication required).
+The web UI shows in advance whether the target vehicle and operation can be started offline, and if not, the reason (seed-key required, OEM authentication required, operator form or record input required: only the server relays HMI requests, 8.6, ADR-340).
 
 #### 5.7.1 UI Path While Offline
 

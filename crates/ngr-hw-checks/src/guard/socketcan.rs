@@ -197,8 +197,11 @@ impl GuardedSocketCan {
             if now >= give_up {
                 return Err(SocketCanError::NotQuiet);
             }
-            match self.bus.recv(quiet_until - now) {
-                Ok(None) => return Ok(()),
+            // The quiet window must end within the limit, as a VCI end's last window does.
+            let wait_until = quiet_until.min(give_up);
+            match self.bus.recv(wait_until - now) {
+                Ok(None) if wait_until == quiet_until => return Ok(()),
+                Ok(None) => return Err(SocketCanError::NotQuiet),
                 // A frame starts the quiet window again.
                 Ok(Some(_)) => quiet_from = Instant::now(),
                 Err(source) => return Err(self.io(source)),

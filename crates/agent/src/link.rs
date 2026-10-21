@@ -869,6 +869,23 @@ mod tests {
         );
     }
 
+    /// The read-only list the host applies is the link's layer's (ADR-342): UDS on the one
+    /// protocol `validate` accepts, none on any other.
+    #[test]
+    fn a_link_carries_uds_only_on_uds_on_can() {
+        assert_eq!(
+            LinkConfig::iso15765(0x7E0, 0x7E8).application_layer(),
+            Some(ApplicationLayer::Uds)
+        );
+        for name in ["ISO_11898_RAW", "ISO15765", ""] {
+            let config = LinkConfig {
+                protocol_short_name: name.to_owned(),
+                ..LinkConfig::iso15765(0x7E0, 0x7E8)
+            };
+            assert_eq!(config.application_layer(), None, "{name:?}");
+        }
+    }
+
     #[test]
     fn a_link_the_agent_cannot_open_is_refused() {
         let with = |change: fn(&mut ProtocolT)| {

@@ -50,8 +50,9 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    service the document does not declare with a request and a positive response, or whose
    variant's negative-response shape the workers do not support (ADR-322), a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
-   (ADR-245), or one with a request this build may never send (a release build sends only
-   read-only requests; ADR-235 item 8, ADR-247), fails here,
+   (ADR-245), one with a request this build may never send (a release build sends only
+   the read-only requests of the variant's application layer; ADR-235 item 8, ADR-247,
+   ADR-342), or one with a `ReadDtc`, which no build serves (ADR-342), fails here,
    before any worker starts. A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
 2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):

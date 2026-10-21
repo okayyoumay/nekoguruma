@@ -67,3 +67,4 @@ Three questions were left open by ADR-309 item 4:
   - the read-only ceiling widened inside access programs (ADR-325 item 10);
   - TesterPresent for an identification job (ADR-327).
 - `policy::check_service` and `check_request` take the layer next to the permission.
+- A program that only reads, on a variant whose layer has no list, counts as writing (`policy::writes`), since a read-only job may send none of its requests. Its job asks for the reprogramming slot, and a debug build without one refuses it as `NoReprogrammingSlot` before the link would be refused. Either way nothing is sent.

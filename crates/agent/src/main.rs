@@ -8,6 +8,7 @@ use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
+use agent::artifact::{Artifact, SHA256_LEN, parse_sha256};
 use agent::guards::{GuardSetup, JobGuards};
 use agent::launch::{Api, launch_worker};
 use agent::policy::build_ceiling;
@@ -31,6 +32,11 @@ options:
                        reports the findings and loads it
   --document <file>    a variant's document (.dir): runs its procedure, which decodes
                        response fields through the variant's declarations (required)
+  --artifact <file>    the flash artifact the procedure reads its blocks from, read once
+                       before any worker starts; needs --artifact-sha256
+  --artifact-sha256 <hex>
+                       the SHA-256 the job names for the artifact, 64 hexadecimal digits;
+                       the job is refused when the file hashes to something else
   --workers <dir>      worker binaries, laid out as <dir>/<ABI name>/<binary>
                        (default: the 'workers' directory next to ngr-agent)
   --locks <dir>        the device's lock directory for the VCI lock and the reprogramming
@@ -50,6 +56,9 @@ struct RunArgs {
     /// The variant's document, whose procedure is the program (design 8.2.6). The job takes
     /// the link its variant declares (ADR-324).
     document: PathBuf,
+    /// The flash artifact file and the SHA-256 the job names for it: both or neither
+    /// (design 8.2.5, ADR-336 item 1).
+    artifact: Option<(PathBuf, [u8; SHA256_LEN])>,
     workers: Option<PathBuf>,
     locks: Option<PathBuf>,
 }
@@ -97,6 +106,8 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     let mut vci = None;
     let mut mode = None;
     let mut document = None;
+    let mut artifact = None;
+    let mut artifact_sha256 = None;
     let mut workers = None;
     let mut locks = None;
     while let Some(flag) = args.next() {
@@ -132,6 +143,21 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                 return Err("give --document once".to_owned());
             }
             "--document" => document = Some(PathBuf::from(value)),
+            "--artifact" if artifact.is_some() => {
+                return Err("give --artifact once".to_owned());
+            }
+            "--artifact" => artifact = Some(PathBuf::from(value)),
+            "--artifact-sha256" if artifact_sha256.is_some() => {
+                return Err("give --artifact-sha256 once".to_owned());
+            }
+            "--artifact-sha256" => {
+                artifact_sha256 = Some(
+                    parse_sha256(value.to_str().ok_or_else(|| {
+                        format!("--artifact-sha256 {value:?} is not valid UTF-8")
+                    })?)
+                    .map_err(|error| format!("--artifact-sha256: {error}"))?,
+                )
+            }
             "--workers" => workers = Some(PathBuf::from(value)),
             // A relative path would name a different lock set from each working directory.
             "--locks" if !Path::new(&value).is_absolute() => {
@@ -141,12 +167,18 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
             _ => return Err(format!("unknown option {flag:?}")),
         }
     }
+    let artifact = match (artifact, artifact_sha256) {
+        (Some(path), Some(sha256)) => Some((path, sha256)),
+        (None, None) => None,
+        _ => return Err("--artifact and --artifact-sha256 must be given together".to_owned()),
+    };
     Ok(RunArgs {
         api,
         vci: vci.ok_or("--vci is required")?,
         // The mode is fixed per device at installation (design 6.2); there is no default.
         mode: mode.ok_or("--mode is required")?,
         document: document.ok_or("--document is required")?,
+        artifact,
         workers,
         locks,
     })
@@ -180,9 +212,20 @@ fn read_job(path: &Path) -> Result<Job, String> {
         .map_err(|error| format!("{}: {error}", path.display()))
 }
 
+/// Reads the artifact file once and gives it to the job under the hash the command line names;
+/// [`check_job`] compares the two.
+fn with_artifact(job: Job, artifact: Option<(PathBuf, [u8; SHA256_LEN])>) -> Result<Job, String> {
+    let Some((path, sha256)) = artifact else {
+        return Ok(job);
+    };
+    let artifact = Artifact::read(&path)
+        .map_err(|error| format!("cannot read {}: {error}", path.display()))?;
+    Ok(job.with_artifact(sha256, artifact))
+}
+
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
-    let job = read_job(&args.document)?;
+    let job = with_artifact(read_job(&args.document)?, args.artifact)?;
     // A program the job would refuse does not need a worker, nor does a link the document
     // declares that cannot be used.
     check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
@@ -279,6 +322,9 @@ fn holds_non_finite_float(state: &VmState) -> bool {
 mod tests {
     use super::*;
 
+    /// A SHA-256 in lowercase hexadecimal.
+    const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+
     fn parse(args: &[&str]) -> Result<RunArgs, String> {
         parse_args(args.iter().map(OsString::from))
     }
@@ -300,6 +346,7 @@ mod tests {
                 vci: "sim-vci".to_owned(),
                 mode: OperatingMode::User,
                 document: PathBuf::from("v.dir"),
+                artifact: None,
                 workers: None,
                 locks: None,
             })
@@ -323,8 +370,16 @@ mod tests {
             "device",
             "--api",
             "dpdu",
+            "--artifact",
+            "a.bin",
+            "--artifact-sha256",
+            &"AB".repeat(32),
         ])
         .expect("valid arguments");
+        assert_eq!(
+            args.artifact,
+            Some((PathBuf::from("a.bin"), [0xAB; SHA256_LEN]))
+        );
         assert_eq!(args.api, Api::Dpdu);
         assert_eq!(args.vci, "x");
         assert_eq!(args.mode, OperatingMode::Device);
@@ -373,6 +428,34 @@ mod tests {
             &["--api", ""],
             &["--api", "J2534"],
             &["--api", "d-pdu"],
+            // Both artifact options or neither, each once, the hash exactly 64 hex digits.
+            &["--artifact", "a.bin"],
+            &["--artifact-sha256", HASH],
+            &[
+                "--artifact",
+                "a",
+                "--artifact",
+                "b",
+                "--artifact-sha256",
+                HASH,
+            ],
+            &[
+                "--artifact",
+                "a",
+                "--artifact-sha256",
+                HASH,
+                "--artifact-sha256",
+                HASH,
+            ],
+            &["--artifact", "a", "--artifact-sha256", &HASH[1..]],
+            &["--artifact", "a", "--artifact-sha256", &format!("{HASH}0")],
+            &[
+                "--artifact",
+                "a",
+                "--artifact-sha256",
+                &format!("g{}", &HASH[1..]),
+            ],
+            &["--artifact", "a", "--artifact-sha256", ""],
         ] {
             let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
             assert!(parse(&args).is_err(), "{args:?}");

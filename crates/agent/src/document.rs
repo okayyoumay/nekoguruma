@@ -119,6 +119,38 @@ pub(crate) mod tests {
         encode_ecu_document(&document)
     }
 
+    /// A document whose flash session 1 declares one segment per `(artifact_offset, length,
+    /// block_size)` of `segments`, with `procedure` as its procedure.
+    pub(crate) fn flash_document(procedure: &Program, segments: &[(u64, u64, u32)]) -> Vec<u8> {
+        use diag_ir::declaration::{FlashSegmentT, FlashSessionT};
+        let mut session = FlashSessionT::default();
+        session.id = 1;
+        session.segments = Some(
+            segments
+                .iter()
+                .map(|&(artifact_offset, length, block_size)| {
+                    let mut segment = FlashSegmentT::default();
+                    segment.artifact_offset = artifact_offset;
+                    segment.length = length;
+                    segment.block_size = block_size;
+                    segment
+                })
+                .collect(),
+        );
+        let mut variant = EcuVariantT::default();
+        variant.id = 1;
+        variant.short_name = Some("v".into());
+        variant.protocols = Some(vec![uds_on_can()]);
+        variant.flash_sessions = Some(vec![session]);
+        let mut document = EcuDocumentT::default();
+        document.schema_version = IR_SCHEMA_VERSION;
+        document.source_format = Some("csv-starlark".into());
+        document.source_digest = Some("00".into());
+        document.variant = Some(Box::new(variant));
+        document.procedure = Some(postcard::to_allocvec(procedure).unwrap());
+        encode_ecu_document(&document)
+    }
+
     /// The protocol of the test documents: UDS over ISO 15765 as `LinkConfig::iso15765(0x7E0,
     /// 0x7E8)` opens it, so a document job runs on the link the runner tests give (ADR-324).
     pub(crate) fn uds_on_can() -> diag_ir::declaration::ProtocolT {

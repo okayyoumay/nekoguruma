@@ -4586,6 +4586,19 @@ fn hmi_form_errors_come_before_the_host() {
             // value's variant and the text's three-byte length.
             VmError::HmiFormTooLong(crate::hmi::MAX_HMI_FORM_LEN as u64 + 9),
         ),
+        // Text operands past the bound together are refused before they are copied.
+        (
+            vec![
+                Op::PushBytes(1),
+                Op::Dup,
+                Op::HmiRequestFromStack { form: 0 },
+            ],
+            vec![
+                hmi_template("f", vec![("v", Runtime), ("w", Runtime)]),
+                vec![b'x'; 1 << 20],
+            ],
+            VmError::HmiFormTooLong(2 << 20),
+        ),
     ];
     for (code, constants, expected) in cases {
         let setup_steps = code.len() - 1;

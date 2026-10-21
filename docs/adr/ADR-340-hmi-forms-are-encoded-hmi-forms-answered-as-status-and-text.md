@@ -63,7 +63,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    at most 32 pairs (`MAX_HMI_PARAMS`), in the source order of the Starlark dict literal; a key is an
    ASCII identifier (`[A-Za-z_][A-Za-z0-9_]*`) of 1 to 64 bytes, unique within the form. The whole
    encoding is at most 16 KiB (`MAX_HMI_FORM_LEN`). A record template's `params` is empty in this
-   version. `hmi::encode` and `hmi::decode` are the one codec; `decode` enforces every bound.
+   version. `hmi::encode_form` and `hmi::decode_form` (with `encode_template` and `decode_template` for item 2's `HmiTemplate`) are the one codec; decoding enforces every bound.
    Postcard is already the IR's codec (`Op`, `VmState`), its output is canonical once the pair order
    is fixed (it is: source order), a typed struct validates the shape by construction, and the VM
    needs the same encoder for item 2. JSON appears once, where the agent hands the form to the

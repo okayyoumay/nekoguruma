@@ -548,7 +548,8 @@ impl Vm {
     /// The job runner uses it to journal an intent marker before a primitive is sent (ADR-229).
     ///
     /// It runs [`Vm::check_state`] and, for a diagnostic primitive, the checks [`Vm::step`] makes
-    /// before it calls the host (operand, constant, UTF-8, room for an answer that is pushed). So for a primitive, `Ok(Some(op))` means the next `step` reaches
+    /// before it calls the host (operand, constant, UTF-8, an HMI form's template and encoded
+    /// length, room for an answer that is pushed). So for a primitive, `Ok(Some(op))` means the next `step` reaches
     /// the host (ADR-233): the runner never journals an intent for a request that is not sent.
     /// Other instructions can still fail in `step` (arithmetic, types, limits); no intent
     /// precedes them.
@@ -1066,6 +1067,19 @@ impl Vm {
             .filter(|template| hmi_template_fits(op, template))
             .ok_or(VmError::BadHmiForm(index))?;
         let operands = template.runtime_slots();
+        // A form holds at most `MAX_HMI_FORM_LEN` bytes, so text operands longer than that
+        // together are refused before any is copied; the error then gives their length.
+        let text: usize = self
+            .top(operands)?
+            .iter()
+            .map(|value| match value {
+                Value::Bytes(bytes) => bytes.len(),
+                _ => 0,
+            })
+            .sum();
+        if text > hmi::MAX_HMI_FORM_LEN {
+            return Err(VmError::HmiFormTooLong(text as u64));
+        }
         let values = self
             .top(operands)?
             .iter()
@@ -1541,7 +1555,8 @@ pub enum VmError {
     ShiftOutOfRange(i64),
     #[error("invalid constant index: {0}")]
     BadConstant(u32),
-    #[error("constant {0} is not valid UTF-8")]
+    /// Also the error of an HMI form's text operand that is not UTF-8, with the form's constant.
+    #[error("constant {0}, or a text operand of the HMI form it holds, is not valid UTF-8")]
     InvalidUtf8(u32),
     #[error("variable slot {0} is not set")]
     UndefinedVariable(u16),
@@ -1581,7 +1596,8 @@ pub enum VmError {
     ArtifactLength { expected: u32, got: u64 },
     #[error("constant {0} is not an HMI form template the instruction takes")]
     BadHmiForm(u32),
-    #[error("the HMI form encodes to {0} bytes, more than {max}", max = hmi::MAX_HMI_FORM_LEN)]
+    /// The encoded length, or the length of the text operands alone when they already pass it.
+    #[error("the HMI form encodes to {0} bytes or more, more than {max}", max = hmi::MAX_HMI_FORM_LEN)]
     HmiFormTooLong(u64),
 }
 

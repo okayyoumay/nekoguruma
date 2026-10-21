@@ -455,7 +455,8 @@ impl Program {
     /// instructions at them, where download instructions sit, the control flow into, inside
     /// and out of each plan, and the identity and precondition sources. It does not check the
     /// schema version or the program's size ([`crate::Vm::check_state`]) or each instruction's
-    /// operands, which fail when the VM reaches them.
+    /// operands, which fail when the VM reaches them. It also checks the constants it can
+    /// check without running: a `Fail`'s code (ADR-280) and an HMI form's template (ADR-340).
     ///
     /// The restart rules (identity sources, session mapping, timeout, resume limit) apply only
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose

@@ -5,17 +5,20 @@
 //! diag-ir procedure on a CAN link to the simulated ECU behind it.
 //!
 //! The `FlashTransfer` instruction against the simulated ECU (ADR-250): a download of more
-//! blocks than the wire block counter holds before it wraps, followed by RequestTransferExit,
-//! which the ECU accepts only when every block arrived in order. (A `FlashTransfer` with no
-//! RequestDownload before it cannot pass the program validator, so the host's refusal is a unit
-//! test in `crates/agent/src/host.rs`.)
+//! blocks than the wire block counter holds before it wraps, the last one as long as the ECU's
+//! maxNumberOfBlockLength allows, followed by RequestTransferExit, which the ECU accepts only
+//! when every block arrived in order. A second job's block one byte longer than that is refused
+//! by the host before it is sent (ADR-336 item 12). (A `FlashTransfer` with no RequestDownload
+//! before it cannot pass the program validator, so the host's refusal is a unit test in
+//! `crates/agent/src/host.rs`.)
 //!
-//! The job runs with the write-job journal (ADR-252): the ECU's part number and software
-//! version are read at the plan's entry, and the journal reads back with every block, the
-//! RequestTransferExit marker and the post-transfer completion.
+//! The jobs run with the write-job journal (ADR-252): the ECU's part number and software
+//! version are read at the plan's entry, and the first job's journal reads back with every
+//! block, the RequestTransferExit marker and the post-transfer completion.
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
-//! spawned service cannot race with another test.
+//! spawned service cannot race with another test; both jobs run in it, one after the other, on
+//! one worker.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -24,7 +27,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent::guards::{GuardSetup, JobGuards};
 use agent::inputs::{Encoding, ServiceField, ServiceSources};
 use agent::journal::{JobKey, Journal};
-use agent::{JobLimits, JournalSetup, LinkConfig, run_program_journaled};
+use agent::{HostError, JobError, JobLimits, JournalSetup, LinkConfig, run_program_journaled};
 use diag_ir::{
     FlashRecovery, IR_SCHEMA_VERSION, IdentitySources, Op, Program, RecoveryBoundaries,
     RecoveryRequired, RecoveryTiming, Source, Value,
@@ -38,6 +41,10 @@ const RID_ERASE_MEMORY: u16 = 0xFF00;
 /// More one-byte blocks than the counter holds before it wraps (255), and past its second wrap
 /// point of 0x00 (block 256) so the counter is 0x00 and 0x01 again.
 const BLOCKS: u32 = 300;
+/// The data bytes of a TransferData request as long as the simulated ECU's
+/// maxNumberOfBlockLength (`sim_ecu::MAX_BLOCK_LENGTH`, 0x0102), which counts the SID and the
+/// counter too.
+const LONGEST_BLOCK: usize = 0x0100;
 /// The simulated ECU's part number and software version (`sim_ecu::DID_SPARE_PART_NUMBER`,
 /// `sim_ecu::DID_SOFTWARE_VERSION`), as the ECU config below sets them.
 const PART_NUMBER: &[u8] = b"NGR-SIM-ECU";
@@ -76,19 +83,21 @@ impl Drop for TempFile {
     }
 }
 
-/// Programming session, erase, RequestDownload of `BLOCKS` bytes at 0, one `FlashTransfer` per
-/// byte, then RequestTransferExit. The instruction's operand is the block number the compiler
-/// would write; the host ignores it.
-fn download_program() -> Program {
+/// Programming session, erase, RequestDownload of the blocks' bytes at 0, one `FlashTransfer`
+/// per block, then RequestTransferExit. The instruction's operand is the block number the
+/// compiler would write; the host ignores it.
+fn download_program(blocks: Vec<Vec<u8>>) -> Program {
+    let size = blocks.iter().map(Vec::len).sum::<usize>() as u32;
+    let count = blocks.len() as u32;
     let mut constants = vec![
         vec![0x02],
         Vec::new(),
         // dataFormatIdentifier, address and size lengths (4 and 4), address 0, size.
-        [&[0x00, 0x44, 0, 0, 0, 0][..], &BLOCKS.to_be_bytes()].concat(),
+        [&[0x00, 0x44, 0, 0, 0, 0][..], &size.to_be_bytes()].concat(),
         Vec::new(),
     ];
     let first_block = constants.len() as u32;
-    constants.extend((0..BLOCKS).map(|i| vec![i as u8]));
+    constants.extend(blocks);
     let mut code = vec![
         Op::PushBytes(0),
         Op::ServiceRequest { service: 0x10 },
@@ -100,7 +109,7 @@ fn download_program() -> Program {
         Op::PushBytes(2),
         Op::ServiceRequest { service: 0x34 },
     ];
-    for i in 0..BLOCKS {
+    for i in 0..count {
         code.push(Op::PushBytes(first_block + i));
         code.push(Op::FlashTransfer { block: 7 });
     }
@@ -168,9 +177,25 @@ fn identity_sources() -> ServiceSources {
     .expect("identity table")
 }
 
+/// One-byte blocks past the counter's wrap, then one as long as the ECU allows.
+fn accepted_blocks() -> Vec<Vec<u8>> {
+    let mut blocks: Vec<Vec<u8>> = (0..BLOCKS).map(|i| vec![i as u8]).collect();
+    blocks.push(vec![0xA5; LONGEST_BLOCK]);
+    blocks
+}
+
 fn job_key() -> JobKey {
+    job_key_named("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e70")
+}
+
+/// The second job's key, for a journal of its own.
+fn long_block_job_key() -> JobKey {
+    job_key_named("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e71")
+}
+
+fn job_key_named(id: &str) -> JobKey {
     JobKey {
-        job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e70".to_owned()),
+        job_id: shared_proto::JobId(id.to_owned()),
         generation: 1,
     }
 }
@@ -197,6 +222,10 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     let journal_dir = std::env::temp_dir().join(format!("agent-flash-{nanos}-journal"));
     std::fs::create_dir_all(&journal_dir).expect("journal directory");
     let _journal = TempDir(journal_dir.clone());
+    let long_block_journal_dir =
+        std::env::temp_dir().join(format!("agent-flash-{nanos}-long-block-journal"));
+    std::fs::create_dir_all(&long_block_journal_dir).expect("journal directory");
+    let _long_block_journal = TempDir(long_block_journal_dir.clone());
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
@@ -230,7 +259,11 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     // A wedged service must fail the test, not hang the CI job.
     runtime
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), run_the_job(journal_dir.clone())).await
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                run_the_jobs(journal_dir.clone(), long_block_journal_dir.clone()),
+            )
+            .await
         })
         .expect("the flow should finish in time");
 
@@ -243,7 +276,7 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
     );
     let transfer = facts.transfer.as_ref().expect("a transfer-start marker");
     assert_eq!(transfer.started_at.pc, 3);
-    assert_eq!(transfer.last_block, Some(BLOCKS));
+    assert_eq!(transfer.last_block, Some(BLOCKS + 1));
     let exit = transfer
         .exit
         .as_ref()
@@ -277,7 +310,7 @@ fn job_guards(writes: bool) -> JobGuards {
     .expect("guards should be free")
 }
 
-async fn run_the_job(journal_dir: PathBuf) {
+async fn run_the_jobs(journal_dir: PathBuf, long_block_journal_dir: PathBuf) {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
@@ -293,32 +326,62 @@ async fn run_the_job(journal_dir: PathBuf) {
     .await
     .expect("worker should launch");
 
-    let (state, _guards) = run_program_journaled(
-        worker
-            .connect(&ConnectOptions::default())
-            .await
-            .expect("client should connect"),
-        &LinkConfig::iso15765(0x7E0, 0x7E8),
-        download_program(),
-        JobLimits::default(),
-        JournalSetup {
-            dir: journal_dir,
-            key: job_key(),
-            sources: identity_sources(),
-            vin: None,
-            intended_software_version: None,
-        },
-        job_guards(true),
-    )
-    .await;
-    let state = state.expect("the download job should finish");
+    let worker_ref = &worker;
+    let run = move |blocks, dir, key| async move {
+        let (state, _guards) = run_program_journaled(
+            worker_ref
+                .connect(&ConnectOptions::default())
+                .await
+                .expect("client should connect"),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            download_program(blocks),
+            JobLimits::default(),
+            JournalSetup {
+                dir,
+                key,
+                sources: identity_sources(),
+                vin: None,
+                intended_software_version: None,
+            },
+            job_guards(true),
+        )
+        .await;
+        state
+    };
+
+    let state = run(accepted_blocks(), journal_dir, job_key())
+        .await
+        .expect("the download job should finish");
     // RequestTransferExit is positive only when every block, in counter order across the wrap
-    // from 0xFF to 0x00, arrived.
+    // from 0xFF to 0x00, arrived, the one at the ECU's limit included.
     assert_eq!(
         state.stack.last(),
         Some(&Value::Bytes(vec![0x77])),
         "{:?}",
         state.stack.last()
+    );
+
+    // One byte over the limit. The ECU would refuse the block itself (NRC 0x13), which the
+    // host would report as `TransferRefused`; `BlockTooLong` means it was never sent.
+    let refused = run(
+        vec![vec![0xA5; LONGEST_BLOCK + 1]],
+        long_block_journal_dir,
+        long_block_job_key(),
+    )
+    .await;
+    assert!(
+        matches!(
+            refused,
+            Err(JobError::Host {
+                source: HostError::BlockTooLong {
+                    block: 1,
+                    length: 0x0103,
+                    max: 0x0102,
+                },
+                ..
+            })
+        ),
+        "{refused:?}"
     );
 
     worker

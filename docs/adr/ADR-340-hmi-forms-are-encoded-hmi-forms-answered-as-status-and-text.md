@@ -96,8 +96,13 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 3. **The answer is one status byte followed by UTF-8 text, and in Starlark a value read through
    the literal keys `ok` and `value`.** The host returns `[status] ++ text`: status 1 means the
    operator answered, 0 that the operator declined the form or record, in which case `text` is
-   empty; the whole answer is at most 16 KiB (`MAX_HMI_ANSWER_LEN`). The VM checks that shape
-   before it pushes (`VmError::BadHmiAnswer`); a malformed answer is the host's bug, and terminal.
+   empty; the whole answer is at most 16 KiB (`MAX_HMI_ANSWER_LEN`). That shape is the host's
+   contract, and the VM pushes the answer as it pushes every other primitive's, without checking
+   it after the call: ADR-233 item 3 (every VM error comes before the host call, so no answer is
+   discarded) holds unchanged. The reads below are total over any bytes: an empty answer, or one
+   whose first byte is not 1, reads as `ok == False`, and `value` is whatever follows the first
+   byte. Text that is not UTF-8 fails only where a later instruction needs UTF-8, in that
+   instruction's own pre-host check, after the answer is stored.
    The value of `diag.hmi(...)` and of `diag.record(...)` has a type of its own in the lowering
    (`Ty::HmiAnswer`), the answer bytes, read only by a string literal key as a response is
    (ADR-317):
@@ -137,7 +142,9 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    `form` typed (`id` and `params`, which serialize as JSON on the wire), and returns `Ok(None)`;
    later polls return `Ok(None)` until the answer command `HmiAnswer { job_id, request_id, ok,
    value }` arrives, then encode item 3's bytes and return `Some`, closing the inquiry. The agent
-   checks only the shape (`value` is text of at most 16 KiB minus one, empty when `ok` is false);
+   checks only the shape (`value` is text of at most 16 KiB minus one, empty when `ok` is false)
+   when the command arrives, before any poll can return it; a command of another shape is refused
+   to the server and the inquiry stays open, so the host never hands the VM a malformed answer;
    the server, which has the form or template, validates the operator's input against it
    (choices, criteria, required items) before it answers, and for a record stores the record
    itself (design 4.3.1); only the judgment reaches the agent. A new host instance, which every
@@ -155,8 +162,9 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer
    bytes, and gain `Script::form_answer(ok, text)` and `record_answer(ok, text)` that build them;
-   the report decodes `DryRunEvent::Hmi::form` and `RecordInput::template` as `HmiForm`s. A
-   scripted answer of another shape is item 3's `VmError`.
+   the report decodes `DryRunEvent::Hmi::form` and `RecordInput::template` as `HmiForm`s. Raw
+   bytes of another shape are pushed as they are and read as item 3 says, so a test can script a
+   host that breaks the contract.
 
 ## Alternatives rejected
 
@@ -199,7 +207,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
   (ADR-336). The two backlog items on `diag.hmi` / `diag.record` and on the stack variant close.
 - `IR_SCHEMA_VERSION` becomes 18: a runtime of 17 cannot decode `HmiRequestFromStack`, and the
   version a server matches against `capabilities` (9.5) changes, as for every appended
-  instruction (ADR-233). `VmError` gains `BadHmiForm`, `HmiFormTooLong` and `BadHmiAnswer`,
+  instruction (ADR-233). `VmError` gains `BadHmiForm` and `HmiFormTooLong` (both raised before the host call),
   `ProgramError` gains `BadHmiForm`. ADR-233's status annotation records the appended
   instruction, and its item 7 is read with this ADR: the constant is an encoded `HmiTemplate`.
   The IR golden files change in their version, and in their code if `procedure.star` gains a

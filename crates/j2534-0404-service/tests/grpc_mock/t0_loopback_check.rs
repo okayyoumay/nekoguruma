@@ -435,6 +435,65 @@ async fn a_socketcan_end_is_given_exactly_when_the_profile_has_one() {
     b.shutdown().await;
 }
 
+/// A SocketCAN end opened for another interface than the profile's is refused, with nothing sent:
+/// its frames would not be the ones the profile's end sends.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn a_socketcan_end_of_another_interface_is_refused() {
+    let server = TestServer::start().await;
+    let profile = socketcan_end();
+    let Setup::Loopback(ends) = &profile.setup else {
+        panic!("a loopback");
+    };
+    let vci = ends[1].vci.clone().expect("the VCI end");
+    let mut other = profile.clone();
+    let Setup::Loopback(other_ends) = &mut other.setup else {
+        panic!("a loopback");
+    };
+    other_ends[0].socketcan = Some("can1".to_owned());
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = RunGuard::start_in(
+        &profile,
+        "hw_t0_two_endpoint_loopback",
+        dir.path().join("reports"),
+    );
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci,
+        server.worker_client().await,
+        ModuleHandle {
+            module_handle: MOCK_MODULE_HANDLE,
+        },
+        HandleOptions::default(),
+        &run,
+    )
+    .await
+    .expect("the VCI end opens");
+    let bus = MockChannelBus {
+        read: 0,
+        backdoor: MockBackdoor::open(&j2534_0404_mock::mock_library_path().expect("the mock")),
+    };
+    let mut can = GuardedSocketCan::with_bus(&other, 0, Box::new(bus)).unwrap();
+    let written = server.backdoor.write_msgs_count();
+    let error = run_check(
+        &profile,
+        Ends::VciAndSocketCan(&mut handle, &mut can),
+        &[facts()],
+        &Masker::unmasked(),
+        Duration::from_millis(200),
+    )
+    .await
+    .expect_err("the SocketCAN end is not the profile's");
+    assert!(matches!(error, CheckError::Refused(_)), "{error}");
+    assert!(error.to_string().contains("endpoint 0's"), "{error}");
+    assert_eq!(server.backdoor.write_msgs_count(), written);
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
 /// Under extended addressing the frame is the identifier, the address byte and the payload, which
 /// is at most 6 bytes: every length from 1 to 6 arrives exactly, both ways.
 #[tokio::test(flavor = "multi_thread")]

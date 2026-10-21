@@ -20,7 +20,7 @@
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
-use diag_ir::declaration::{EcuVariant, LengthKind, Request};
+use diag_ir::declaration::{DataKind, EcuVariant, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
 use diag_ir::{
     IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, PreconditionKind, Preconditions, Program,
@@ -87,6 +87,17 @@ const MAX_COPIED_INSTRUCTIONS: usize = 1 << 22;
 const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
 /// The `Fail` code of a `write_uint` whose value does not fit its width (2.4).
 const UINT_OUT_OF_RANGE: &str = "UINT_OUT_OF_RANGE";
+/// The `Fail` code of a request param known only at run time whose value does not fit its
+/// field (3.2).
+const PARAM_OUT_OF_RANGE: &str = "PARAM_OUT_OF_RANGE";
+
+/// A `params` value of `diag.request` or `diag.routine` known only at run time: its key, the
+/// value, and where it is written.
+struct RunParam {
+    key: Rc<str>,
+    value: Val,
+    span: Span,
+}
 
 /// Where the profile's DTC records are and how each one is laid out (`Lowerer::dtc_layout`).
 #[derive(Debug, Clone, Copy)]
@@ -4289,10 +4300,10 @@ impl<'a> Lowerer<'a> {
                 }
                 !transfer
             });
-        let params = match self.request_params(id, "request", sid, None, params_arg) {
-            None => None,
-            Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
-            Some(Val::Const(other)) => {
+        let (params, run) = match self.request_params(id, "request", sid, None, params_arg) {
+            None => (None, Vec::new()),
+            Some((Val::Const(Const::Dict(entries, _)), run)) => (Some(entries), run),
+            Some((Val::Const(other), _)) => {
                 self.error(
                     StarCode::UnsupportedSyntax,
                     params_arg.span,
@@ -4301,7 +4312,7 @@ impl<'a> Lowerer<'a> {
                         other.type_name()
                     ),
                 );
-                None
+                (None, Vec::new())
             }
             Some(_) => {
                 self.error(
@@ -4310,7 +4321,7 @@ impl<'a> Lowerer<'a> {
                     "`params` of `diag.request` must be a dict known at ingestion: they select \
                      the service (3.1)",
                 );
-                None
+                (None, Vec::new())
             }
         };
         let (Some(sid), Some(params)) = (sid, params) else {
@@ -4361,31 +4372,217 @@ impl<'a> Lowerer<'a> {
             };
             values.insert(&**key, value);
         }
-        match encode_request(&request, &values) {
-            Ok(operand) => {
-                let operand = self.pool(&operand);
-                Val::Run(
-                    Tys::from_service(Ty::Response, service),
-                    vec![
-                        (Ins::Op(Op::PushBytes(operand)), span),
-                        (
-                            Ins::Op(Op::ServiceRequest {
-                                service: u16::from(sid),
-                            }),
-                            span,
-                        ),
-                    ],
-                )
-            }
-            Err(e) => {
-                self.error(
-                    StarCode::ArgumentOutOfRange,
-                    params_arg.span,
-                    format!("the request of `diag.request` cannot be encoded: {e} (3.1)"),
+        let Some(mut code) = self.request_operand(
+            id,
+            "request",
+            &request,
+            values,
+            run,
+            &[],
+            params_arg.span,
+            span,
+        ) else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        code.push((
+            Ins::Op(Op::ServiceRequest {
+                service: u16::from(sid),
+            }),
+            span,
+        ));
+        Val::Run(Tys::from_service(Ty::Response, service), code)
+    }
+
+    /// The code that pushes the operand of `diag.{function}`'s `request`: the bytes after the
+    /// SID that [`encode_request`] writes from `values`, without the leading `skip` bytes, which
+    /// the instruction sends itself. A param in `run` is known only at run time (3.2): its value
+    /// is computed in source order and kept in a temporary, each must fit its field or the
+    /// procedure ends with `Fail` code `PARAM_OUT_OF_RANGE`, and its bits are then written into
+    /// the operand encoded with 0 in its place. Only a fixed-length `uint` field takes such a
+    /// value. Where each of the value's bits goes is found by encoding it alone, so the layout
+    /// is `encode_request`'s, byte order and bit position included. Errors about the params
+    /// point at `params_span`, and the operand's code at the call's `span`. `None` once an error
+    /// is reported.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "what both callers pass: the selected request, its values and the call's parts"
+    )]
+    fn request_operand(
+        &mut self,
+        id: Option<usize>,
+        function: &str,
+        request: &Request<'a>,
+        values: HashMap<&str, ParamValue<'_>>,
+        run: Vec<RunParam>,
+        skip: &[u8],
+        params_span: Span,
+        span: Span,
+    ) -> Option<Code> {
+        let keys: Vec<Rc<str>> = run.iter().map(|param| param.key.clone()).collect();
+        let mut values = values;
+        let mut fields = Vec::new();
+        for param in &run {
+            let field = request
+                .params()
+                .into_iter()
+                .flatten()
+                .find(|field| field.short_name() == Some(&*param.key));
+            let width = field
+                .filter(|field| {
+                    field.kind() == DataKind::Uint && field.length_kind() == LengthKind::Fixed
+                })
+                .map(|field| field.bit_length())
+                .filter(|width| (1..=64).contains(width));
+            let Some(width) = width else {
+                self.not_lowerable(
+                    param.span,
+                    format!(
+                        "the `{}` param of `diag.{function}` is known only at run time, which only \
+                         a fixed-length uint field takes for now (3.2)",
+                        param.key
+                    ),
                 );
-                Val::Run(Tys::of(Ty::Response), Vec::new())
-            }
+                return None;
+            };
+            fields.push(width);
         }
+        let encode = |this: &mut Self, values: &HashMap<&str, ParamValue<'_>>| match encode_request(
+            request, values,
+        ) {
+            Ok(operand) if operand.starts_with(skip) => Some(operand[skip.len()..].to_vec()),
+            Ok(_) => unreachable!("the selected request's prefix starts with them"),
+            Err(e) => {
+                this.error(
+                    StarCode::ArgumentOutOfRange,
+                    params_span,
+                    format!("the request of `diag.{function}` cannot be encoded: {e} (3.1)"),
+                );
+                None
+            }
+        };
+        let base = encode(self, &values)?;
+        if run.is_empty() {
+            let operand = self.pool(&base);
+            return Some(vec![(Ins::Op(Op::PushBytes(operand)), span)]);
+        }
+        let Some(id) = id else {
+            self.not_lowerable(
+                span,
+                format!("`diag.{function}` needs a function to hold its run-time params"),
+            );
+            return None;
+        };
+        // Per operand byte, the runs of value bits written into it: (param, first value bit,
+        // number of bits, first bit in the byte).
+        let mut writes: std::collections::BTreeMap<usize, Vec<(usize, u32, u32, u32)>> =
+            Default::default();
+        for (at, (param, &width)) in run.iter().zip(&fields).enumerate() {
+            // A value is never negative, so bit 63 of a 64-bit field stays 0.
+            for bit in 0..width.min(63) {
+                values.insert(&keys[at], ParamValue::Int(1 << bit));
+                let probe = encode(self, &values)?;
+                let changed: Vec<(usize, u32)> = (0..base.len())
+                    .flat_map(|byte| (0..8).map(move |b| (byte, b)))
+                    .filter(|&(byte, b)| (base[byte] ^ probe[byte]) >> b & 1 == 1)
+                    .collect();
+                let [(byte, b)] = changed[..] else {
+                    self.not_lowerable(
+                        param.span,
+                        format!(
+                            "the `{}` field of `diag.{function}`'s request is not laid out one \
+                             bit per value bit (3.2)",
+                            param.key
+                        ),
+                    );
+                    return None;
+                };
+                let runs = writes.entry(byte).or_default();
+                match runs.last_mut() {
+                    Some((p, first, len, pos))
+                        if *p == at && *first + *len == bit && *pos + *len == b =>
+                    {
+                        *len += 1
+                    }
+                    _ => runs.push((at, bit, 1, b)),
+                }
+            }
+            values.insert(&keys[at], ParamValue::Int(0));
+        }
+        let mut code: Code = Vec::new();
+        let mut slots = Vec::new();
+        for param in run {
+            let span = param.span;
+            let (ty, value) = self.single(
+                param.value,
+                span,
+                &format!("the `{}` param of `diag.{function}`", param.key),
+            )?;
+            if ty != Ty::Int {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    span,
+                    format!(
+                        "the `{}` param of `diag.{function}` is for a uint field, so it is an int, \
+                         not a {} (3.2)",
+                        param.key,
+                        ty.name()
+                    ),
+                );
+                return None;
+            }
+            let slot = self.temp(id, span);
+            code.extend(value);
+            code.push((Ins::Op(Op::StoreLocal(slot)), span));
+            slots.push((slot, param.key, span));
+        }
+        let failure = self.pool(PARAM_OUT_OF_RANGE.as_bytes());
+        for (&(slot, ref key, span), &width) in slots.iter().zip(&fields) {
+            // `Shr` is logical, so a negative value leaves its high bits set as well.
+            let ok = self.label();
+            let detail = self.pool(
+                format!(
+                    "the `{key}` param of `diag.{function}` on line {} was given a value that does \
+                     not fit its {width}-bit field",
+                    self.line_of(span)
+                )
+                .as_bytes(),
+            );
+            code.extend(
+                [
+                    Ins::Op(Op::LoadLocal(slot)),
+                    Ins::Op(Op::PushI64(i64::from(width.min(63)))),
+                    Ins::Op(Op::Shr),
+                    Ins::Op(Op::PushI64(0)),
+                    Ins::Op(Op::CmpEq),
+                    Ins::Op(Op::Not),
+                    Ins::JumpIfFalse(ok),
+                    Ins::Op(Op::PushBytes(detail)),
+                    Ins::Op(Op::Fail { code: failure }),
+                    Ins::Mark(ok),
+                ]
+                .map(|ins| (ins, span)),
+            );
+        }
+        let operand = self.pool(&base);
+        let mut ops = vec![Op::PushBytes(operand)];
+        for (byte, runs) in writes {
+            ops.extend([Op::PushI64(byte as i64), Op::PushI64(i64::from(base[byte]))]);
+            for (at, first, len, pos) in runs {
+                ops.push(Op::LoadLocal(slots[at].0));
+                if first > 0 {
+                    ops.extend([Op::PushI64(i64::from(first)), Op::Shr]);
+                }
+                ops.extend([Op::PushI64((1 << len) - 1), Op::BitAnd]);
+                if pos > 0 {
+                    ops.extend([Op::PushI64(i64::from(pos)), Op::Shl]);
+                }
+                ops.push(Op::BitOr);
+            }
+            // Leaves the operand with the byte written.
+            ops.push(Op::IndexSet);
+        }
+        code.extend(ops.into_iter().map(|op| (Ins::Op(op), span)));
+        Some(code)
     }
 
     /// The `params` of `diag.{function}(sid, ...)` as a value, `function` being `request` or
@@ -4394,8 +4591,9 @@ impl<'a> Lowerer<'a> {
     /// count. A dict literal is built here, so that a value known only at run time is reported
     /// for what it is: under a key some such service with the SID holds as a constant it is
     /// needed to select the service (csv-tables 5.3); under another key it is a field's value,
-    /// which only a run-time encoding could send. `None` once the dict literal's errors are
-    /// reported.
+    /// which [`Self::request_operand`] encodes at run time: the dict then holds 0 under that key,
+    /// and the value is returned beside it, in source order. `None` once the dict literal's
+    /// errors are reported.
     fn request_params(
         &mut self,
         id: Option<usize>,
@@ -4403,12 +4601,13 @@ impl<'a> Lowerer<'a> {
         sid: Option<i64>,
         selected: Option<&[u8]>,
         arg: &AstExpr,
-    ) -> Option<Val> {
+    ) -> Option<(Val, Vec<RunParam>)> {
         let routine = function == "routine";
         let ExprP::Dict(pairs) = &arg.node else {
-            return Some(self.expr(id, arg));
+            return Some((self.expr(id, arg), Vec::new()));
         };
         let mut entries = Vec::new();
+        let mut run = Vec::new();
         let mut keys = HashSet::new();
         let mut complete = true;
         for (key, value) in pairs {
@@ -4430,8 +4629,7 @@ impl<'a> Lowerer<'a> {
             }
             match self.expr(id, value) {
                 Val::Const(value) => entries.push((key, value)),
-                _ => {
-                    complete = false;
+                known_at_run_time => {
                     let constant = self.requests.services.iter().any(|service| {
                         Some(i64::from(service.sid)) == sid
                             && service.routine == routine
@@ -4442,6 +4640,7 @@ impl<'a> Lowerer<'a> {
                             && service.constants.iter().any(|(name, _)| **name == *key)
                     });
                     if constant {
+                        complete = false;
                         self.error(
                             StarCode::NonConstantArgument,
                             value.span,
@@ -4451,13 +4650,14 @@ impl<'a> Lowerer<'a> {
                             ),
                         );
                     } else {
-                        self.not_lowerable(
-                            value.span,
-                            format!(
-                                "the `{key}` param of `diag.{function}` is known only at run \
-                                 time; a request is encoded at ingestion for now (3.2)"
-                            ),
-                        );
+                        // A field's value: 0 stands in for it while the service is selected
+                        // and the rest of the request encoded.
+                        entries.push((key.clone(), Const::Int(0)));
+                        run.push(RunParam {
+                            key,
+                            value: known_at_run_time,
+                            span: value.span,
+                        });
                     }
                 }
             }
@@ -4467,7 +4667,7 @@ impl<'a> Lowerer<'a> {
         }
         // Anything but a dict means `bounded` refused it and reported why.
         match self.bounded(Const::dict(entries), arg.span) {
-            value @ Val::Const(Const::Dict(..)) => Some(value),
+            value @ Val::Const(Const::Dict(..)) => Some((value, run)),
             _ => None,
         }
     }
@@ -4626,11 +4826,11 @@ impl<'a> Lowerer<'a> {
         let selected = rid
             .zip(sub)
             .map(|(rid, sub)| [&[sub as u8][..], &(rid as u16).to_be_bytes()].concat());
-        let params =
+        let (params, run) =
             match self.request_params(id, "routine", Some(0x31), selected.as_deref(), params_arg) {
-                None => None,
-                Some(Val::Const(Const::Dict(entries, _))) => Some(entries),
-                Some(Val::Const(other)) => {
+                None => (None, Vec::new()),
+                Some((Val::Const(Const::Dict(entries, _)), run)) => (Some(entries), run),
+                Some((Val::Const(other), _)) => {
                     self.error(
                         StarCode::UnsupportedSyntax,
                         params_arg.span,
@@ -4639,7 +4839,7 @@ impl<'a> Lowerer<'a> {
                             other.type_name()
                         ),
                     );
-                    None
+                    (None, Vec::new())
                 }
                 Some(_) => {
                     self.error(
@@ -4647,7 +4847,7 @@ impl<'a> Lowerer<'a> {
                         params_arg.span,
                         "`params` of `diag.routine` must be a dict known at ingestion (3.1)",
                     );
-                    None
+                    (None, Vec::new())
                 }
             };
         let profile = self.requests.profile;
@@ -4748,28 +4948,21 @@ impl<'a> Lowerer<'a> {
             };
             values.insert(&**key, value);
         }
-        match encode_request(&request, &values) {
-            // The instruction sends the sub-function and the identifier before its operand.
-            Ok(operand) if operand.starts_with(&selected) => {
-                let operand = self.pool(&operand[selected.len()..]);
-                Val::Run(
-                    Tys::from_service(Ty::Response, service),
-                    vec![
-                        (Ins::Op(Op::PushBytes(operand)), span),
-                        (Ins::Op(Op::RoutineControl { routine: rid, sub }), span),
-                    ],
-                )
-            }
-            Ok(_) => unreachable!("the selected request's prefix starts with them"),
-            Err(e) => {
-                self.error(
-                    StarCode::ArgumentOutOfRange,
-                    params_arg.span,
-                    format!("the request of `diag.routine` cannot be encoded: {e} (3.1)"),
-                );
-                Val::Run(Tys::of(Ty::Response), Vec::new())
-            }
-        }
+        // The instruction sends the sub-function and the identifier before its operand.
+        let Some(mut code) = self.request_operand(
+            id,
+            "routine",
+            &request,
+            values,
+            run,
+            &selected,
+            params_arg.span,
+            span,
+        ) else {
+            return Val::Run(Tys::of(Ty::Response), Vec::new());
+        };
+        code.push((Ins::Op(Op::RoutineControl { routine: rid, sub }), span));
+        Val::Run(Tys::from_service(Ty::Response, service), code)
     }
 
     /// The declared request prefix of the service `service` (a `Service.id`).

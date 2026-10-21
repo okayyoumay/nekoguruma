@@ -294,14 +294,23 @@ field that stores them.
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
 | `detail` of `diag.fail` | `str` expression, which may be built at run time |
 | `params` of `diag.hmi` | dict whose values are all constants (3.2) |
-| `params` of `diag.request` | dict known at ingestion whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`) |
-| `params` of `diag.routine` | dict known at ingestion whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
+| `params` of `diag.request` | dict literal whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`). The keys, and the values of the service's constants, are known at ingestion (`STAR_NON_CONSTANT_ARGUMENT`); a field's value may be known only at run time (below) |
+| `params` of `diag.routine` | dict literal whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`). Under the target contract of 3.2 (ADR-336) it must name a session of the target whose handle the call is made on, and its value is the RequestTransferExit response in the 3.4 shape without `fields` |
 
 A `diag.wait` whose duration is known at ingestion lowers to `Wait`, with the range checked then. One whose
 duration is an `int` computed at run time lowers to the code that pushes it, then `WaitFromStack` (ADR-233),
 which stops the run with `WaitOutOfRange` for a value outside the range; a run-time value of another type is
 rejected as a constant of that type is (`STAR_UNSUPPORTED_SYNTAX`).
+
+A request field's value of `diag.request` or `diag.routine` that is known only at run time is encoded when the
+call runs. The field must be a fixed-length `uint` (another field, `STAR_NOT_LOWERABLE`) and the value an `int`
+(another type, `STAR_UNSUPPORTED_SYNTAX`; one with several possible types, `STAR_NOT_LOWERABLE`). The rest of the
+request is encoded at ingestion with 0 in the field. When the call runs, its values are computed in source order,
+then each is checked against its field's width: a negative value, or one that does not fit, ends the procedure with
+`Fail` code `PARAM_OUT_OF_RANGE` and a detail that names the param, its width and the line, before anything is sent.
+The values' bits are then written into the request bytes as the ingestion-time encoding places them (ADR-308), and
+the instruction sends them.
 
 A `diag.log` whose message is a constant `str` lowers to `Log`, which takes it from the constant pool. One whose
 message is a `str` built at run time lowers to the code that pushes it, then `LogFromStack` (ADR-233); the VM
@@ -316,7 +325,7 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 
 | Function | Instruction | Run-time operands |
 |---|---|---|
-| `diag.request` | `ServiceRequest` | request payload (bytes): encoded at ingestion from `params` into a constant-pool entry and pushed before the instruction (ADR-313). The call's value is the response (3.4), kept as its bytes (ADR-317); a call used as a statement drops it; a `params` value known only at run time under a field's key is not lowered yet (`STAR_NOT_LOWERABLE`) |
+| `diag.request` | `ServiceRequest` | request payload (bytes): encoded at ingestion from `params` into a constant-pool entry and pushed before the instruction (ADR-313). The call's value is the response (3.4), kept as its bytes (ADR-317); a call used as a statement drops it. A `params` value known only at run time under a field's key is encoded at run time (below) |
 | `diag.read_dtc` | `SendReceive` | the complete request (bytes), built at ingestion from the profile's template with the `mask` constant, of the declared service the template selects (ADR-309 item 4, ADR-314 item 2); the call's value is the response, read under the profile's names (3.4) |
 | `diag.routine` | `RoutineControl` | the rest of the request after the sub-function and the routine identifier (bytes), built at ingestion from `params`; the instruction holds `routine_id` and `sub`, which select the variant's generated routine service through the profile (ADR-309 item 4, ADR-314). The call's value is the response, read under the response's declared names (3.4) |
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to the profile's three steps (ADR-309 item 4, ADR-314): the seed request (on UDS the SecurityAccess service with the odd sub-function `level`), `SecurityAccess`, which turns the seed into the key through the host, and the send-key request (on UDS sub-function `level + 1`) carrying that key. The profile decodes neither response through a declared service, so both requests are `ServiceRequest`s of the template's SID with the payload it gives, and the variant needs no declared service for them; the seed is the seed response after the profile's leading bytes (on UDS the response SID and the level). A negative seed response ends the call before the key step, like a failed `diag.request`, and is its value; otherwise the value is the send-key response, positive or negative |

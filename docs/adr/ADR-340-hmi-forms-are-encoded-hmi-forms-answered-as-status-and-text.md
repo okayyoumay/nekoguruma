@@ -140,7 +140,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    inquiry number to the request's state, as `wait_elapsed` keeps its timers: the first poll of an
    inquiry generates a `request_id` (UUIDv7, design 4.4), decodes the `HmiForm`, sends
    `EventBody::HmiRequest { job_id, generation, request_id, inquiry, kind, form }`, with
-   `inquiry` the VM's inquiry number (the server answers with `HmiAccepted`, item 6), `kind` `Form` or
+   `inquiry` the VM's inquiry number (the server answers with `HmiAccepted`, and later `HmiTimedOut` if its wait expires, item 6), `kind` `Form` or
    `Record`, `generation` the job's ownership generation (ADR-229: every job-scoped message
    carries it, and the server applies one only under the current owner and generation), and
    `form` typed (`id` and `params`, which serialize as JSON on the wire, an `Int` as a
@@ -149,11 +149,11 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    later polls return `Ok(None)` until the answer command `HmiAnswer { job_id, generation,
    request_id, ok, value }` arrives, then encode item 3's bytes and return `Some`, closing the
    inquiry. The agent takes an answer or refusal command only when its job, generation and request
-   id name the open inquiry, and drops any other as stale. The host holds the inquiry's HMI
-   deadline (item 6) and moves the inquiry from open to timed out under the same lock that takes
-   commands, so exactly one of the two wins: an answer taken before the deadline is returned even
-   if the poll comes later, and one that arrives after it is dropped as late (the server keeps it
-   as audit data) and the next poll returns the timed-out answer. The agent
+   id name the open inquiry, and drops any other as stale. The host moves the inquiry from
+   open to timed out (on `HmiTimedOut` or its own fallback clock, item 6) under the same lock that
+   takes commands, so exactly one of the two wins: an answer taken first is returned even if the
+   poll comes later, and one that arrives after the timeout is dropped as late (the server keeps
+   it as audit data) and the next poll returns the timed-out answer. The agent
    checks only the shape (`value` is text of at most 16 KiB minus one, empty when `ok` is false)
    when the command arrives, before any poll can return it; a command of another shape is refused
    to the server and the inquiry stays open, so the host never hands the VM a malformed answer;
@@ -183,7 +183,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    HMI timeout's included, or any other end of the run), before the job's final state is
    reported. The stream and Web API schemas change accordingly: `hmiRequest`
    carries the generation, `kind`, `id` and `params`; `hmiResponse` and the `POST
-   .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the acceptance, the refusal, the withdrawal and the run start
+   .../hmi/{requestId}` body are `{ ok: boolean, value: string }`; the acceptance, the timeout, the refusal, the withdrawal and the run start
    are messages of their own.
    Only the server can answer, since design 5.7.1 lets the browser's local connection to an
    offline agent start pre-fetched jobs and read their progress, nothing else. A job whose program
@@ -209,33 +209,29 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    Completed: when the procedure reaches its end while that cancel is still held, which ADR-330
    item 2 would let finish, the job ends as cancelled by the HMI timeout instead, as it would have
    at an interruptible point. Every instruction ran, and the job's outcome still says the operator
-   never answered. The timeout outlives a restart and a handover because
-   it is a deadline the server fixes and both sides keep. When the server accepts an
-   `HmiRequest` and shows the form, it fixes the deadline (its receipt time plus the job's HMI
-   timeout) and returns it in `HmiAccepted { job_id, generation, request_id, deadline }`; the
-   runner journals it as `Record::HmiDeadline { at }`, and journals `Record::HmiAnswered` when the
-   host returns the operator's answer, before that step's checkpoint. The wait for the operator
-   is the job's, not a form's: inquiries come one at a time, so at most one journaled deadline is
-   open (no `HmiAnswered` after it), and a run that opens an inquiry while one is open keeps that
-   deadline instead of getting a new one, whichever form it now asks, so no step counter is
-   needed to match them. An open deadline that has passed means the job has timed out: a run
-   that resumes with one starts with the cancel raised and the timeout as its reason, whether it
-   resumes from a checkpoint or starts again from the first instruction, so a crash between the
-   expiry and the timed-out answer loses nothing. The server keeps the deadline with the job's open
-   wait, not with one request id: a request that supersedes an accepted inquiry of the same job
-   that has no answer (a restart's new request id, or the same request sent again because its
-   acceptance never arrived) keeps that deadline, and the `HmiAccepted` for it returns it. The host
-   sends the request again until an acceptance arrives, so a lost `HmiAccepted`, or a crash before
-   the runner journaled it, still ends with the server's deadline in the journal. Until any
-   acceptance arrives, the host also counts the timeout in memory from its first send, so a
-   server that stays unreachable still ends the wait; that clock can end the wait earlier than
-   the server's deadline by at most the request's delivery time. If the server never accepted
-   the inquiry, the operator has not seen it, and a restart asks it with a fresh wait. A handover (ADR-229) follows the same rule from the
-   server's side, without any message from the failed device: the server marks the job timed out
-   when an inquiry it accepted has passed its deadline with no answer it relayed, and puts the
-   mark in the instruction it signs for the receiving device, whose run then starts with the
-   cancel raised; an inquiry it never accepted was never shown, and the receiving device asks it
-   with a fresh wait, as a same-device restart would. A procedure that ends by `diag.fail` or an error while the cancel is held ends
+   never answered. The server owns the deadline, so no device clock
+   is compared with a server time. When the server accepts an `HmiRequest` and shows the form it
+   starts the job's wait (its own clock, the job's HMI timeout) and answers `HmiAccepted { job_id,
+   generation, request_id }`; when the wait expires with no answer it closes the form, takes no
+   later answer, and sends `HmiTimedOut { job_id, generation, request_id }`. The wait belongs to
+   the job, not to one request id: a request that supersedes an accepted, unanswered inquiry of
+   the same job (a restart's new request id, or a resend after a lost acceptance) continues it,
+   and one that arrives after it expired is answered with `HmiTimedOut` again. The host resends
+   its request until it has an acceptance or a timeout. While the server cannot be reached the
+   host also times the wait on the agent's monotonic clock from its first send, so an unreachable
+   server still ends it. Either way the runner commits `Record::HmiTimedOut` to the journal
+   before it raises the cancel and before the host returns the timed-out answer, and
+   `Record::HmiAnswered` when the host returns the operator's answer, before that step's
+   checkpoint. A run that resumes with a `HmiTimedOut` record and no `HmiAnswered` after it starts
+   with the cancel raised and the timeout as its reason, whether it resumes from a checkpoint or
+   starts again from the first instruction; inquiries come one at a time, so the records need no
+   key. A handover (ADR-229) needs no message from the failed device: the server marks the job
+   timed out when its own wait expired, or when the failed device's withdrawal reported a timeout
+   (`timed_out` set), and puts the mark in the instruction it signs for the receiving device,
+   whose run then starts with the cancel raised. A timeout only the failed device's local clock
+   saw, and could not report, leaves the server's wait to decide, as it does for every
+   inquiry the server accepted; an inquiry it never accepted was never shown, and the receiving
+   device asks it with a fresh wait. A procedure that ends by `diag.fail` or an error while the cancel is held ends
    that way, as ADR-330 item 2 says. Where the timeout's value comes from (the job
    instruction or the agent's settings) is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer

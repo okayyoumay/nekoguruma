@@ -774,7 +774,7 @@ def main():
   expansion emits. The erase point is the `diag.routine` statement annotated `# @erase`, a single
   call and a top-level statement of the plan before the transfer; with no `erase-memory` step in
   the session `@erase` is refused and the erase point is the RequestDownload, and with one it is
-  required. Each of those two statements is the one call, or a name assigned from it, with no other `diag` call inside it (`STAR_PLAN_SHAPE`), so each boundary is one operation. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
+  required. Each of those two statements is the one call, or a name assigned from it, with no other `diag` call inside it, and no call to a function that makes one, itself or through a function it calls (`STAR_PLAN_SHAPE`), so each boundary is one operation. The `@erase` and `diag.flash_transfer` statements are top-level statements of the plan
   so no jump skips them; loops and `if`s between them are fine.
 - **Recovery-required point.** By default the plan requires on-site intervention from the erase
   point (no automatic restart after it). `recovery=never` declares that no step does.

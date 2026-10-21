@@ -2076,6 +2076,23 @@ fn the_erase_and_transfer_statements_hold_one_diag_call() {
         "flash_transfer(len(diag.log(1, \"\")))",
     ));
     assert_eq!(errors, [(Shape, 6)]);
+    // Nor a call to a function that makes one, directly or through another function.
+    let helper = "\ndef args():\n    return inner()\n\ndef inner():\n    return diag.wait(1)\n";
+    let erase = PLAN.replace(
+        "diag.routine(0xFF00, 1, {})",
+        "diag.routine(0xFF00, args(), {})",
+    ) + helper;
+    assert_eq!(codes(&erase), [(Shape, 4)]);
+    let transfer = PLAN.replace("flash_transfer(1)", "flash_transfer(args())") + helper;
+    assert_eq!(codes(&transfer), [(Shape, 6)]);
+    // A function that makes no `diag` call may be called there.
+    let pure = "\ndef one():\n    return 1\n";
+    passes(
+        &(PLAN.replace(
+            "diag.routine(0xFF00, 1, {})",
+            "diag.routine(0xFF00, one(), {})",
+        ) + pure),
+    );
     // The plain forms still pass.
     passes(PLAN);
 }

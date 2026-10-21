@@ -240,7 +240,7 @@ each call's value and how a decline, a timeout and a cancel surface; which check
   catalogs, so the server can refuse a package that names an id it does not have.
 - Implementation split. **PR A** (`diag-ir`, `diag-frontend`, docs): the `hmi` module and its
   bounds, `HmiRequestFromStack`, the VM and `Program::validate` checks, the dry-run helpers, the
-  lowering of both calls and of the two keys with tests against a scripted host (a constant form,
+  lowering of both calls and of the three keys with tests against a scripted host (a constant form,
   a form with constant and run-time parameters in mixed order, a record, a decline, a timed-out answer, a resume at
   the waiting instruction rebuilding identical bytes), subset 2.5, 3.1, 3.2, 3.4, design 8.2.4,
   this ADR and the index. **PR B** (`agent`, `shared-proto`, `api/`): the host's inquiry map and

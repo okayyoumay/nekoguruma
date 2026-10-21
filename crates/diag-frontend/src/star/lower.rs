@@ -916,10 +916,27 @@ impl<'a> Lowerer<'a> {
                     } if at == def
                 )
             });
-            let moved = checked
-                .annotations
-                .iter()
-                .any(|a| matches!(a, Annotation::RecoveryRequired { def: at, .. } if at == def));
+            // The erase point: the `@erase` statement, or without an erase step the transfer's
+            // statement, whose expansion begins with the RequestDownload. A marker moves the
+            // point to a restartable place only strictly after it (`allows_restart`).
+            let point = if erases {
+                checked.annotations.iter().find_map(|a| match a {
+                    Annotation::Erase {
+                        def: at,
+                        statement_at,
+                        ..
+                    } if at == def => Some(*statement_at),
+                    _ => None,
+                })
+            } else {
+                self.transfer_statement(*def)
+            };
+            let moved = point.is_some_and(|point| {
+                checked.annotations.iter().any(|a| {
+                    matches!(a, Annotation::RecoveryRequired { def: at, statement_at, .. }
+                        if at == def && *statement_at > point)
+                })
+            });
             if !on_site_from_entry && (*recovery_never || moved) && !absent.is_empty() {
                 errors.push((
                     StarCode::PlanShape,
@@ -935,6 +952,31 @@ impl<'a> Lowerer<'a> {
         for (code, span, hint) in errors {
             self.error(code, span, hint);
         }
+    }
+
+    /// Where the top-level statement of the plan on line `def` that holds its
+    /// `diag.flash_transfer` begins.
+    fn transfer_statement(&self, def: u32) -> Option<u32> {
+        let codemap = self
+            .checked
+            .module
+            .file_span(self.checked.module.statement().span)
+            .file;
+        self.top_level().into_iter().find_map(|stmt| {
+            let StmtP::Def(plan) = &stmt.node else {
+                return None;
+            };
+            if codemap.find_line(stmt.span.begin()) as u32 + 1 != def {
+                return None;
+            }
+            super::Checker::statements(&plan.body)
+                .into_iter()
+                .find(|inner| {
+                    super::direct_expr(inner)
+                        .is_some_and(|e| super::is_diag_call(e, "flash_transfer").is_some())
+                })
+                .map(|inner| inner.span.begin().get())
+        })
     }
 
     /// Numbers the top-level `def`s and gives each its slots and, for a section function, its

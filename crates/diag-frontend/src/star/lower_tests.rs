@@ -3502,7 +3502,12 @@ fn erase_is_required_exactly_when_the_session_erases() {
 #[test]
 fn a_restartable_flash_plan_needs_the_identity_rows() {
     let never = PLAN_NO_ERASE.replace("session=1", "session=1 recovery=never");
-    let marked = PLAN_NO_ERASE.replace("    res =", "    # @recoveryRequired\n    res =");
+    // A marker on a statement after the transfer, which a no-erase session's erase point
+    // (the RequestDownload) precedes.
+    let marked = PLAN_NO_ERASE.replace(
+        "    res = diag.flash_transfer(1)",
+        "    res = diag.flash_transfer(1)\n    # @recoveryRequired\n    diag.wait(2)",
+    );
     let all = ["vin", "hardware_part_number", "software_version"];
     for source in [&never, &marked] {
         // One error, naming the rows that are missing.
@@ -3521,9 +3526,42 @@ fn a_restartable_flash_plan_needs_the_identity_rows() {
         // With every row it goes on to the transfer's refusal.
         assert_eq!(
             flash_codes(source, Some(NO_ERASE), &flash_index(&all)),
-            [(StarCode::NotLowerable, 5 + u32::from(source == &marked))]
+            [(StarCode::NotLowerable, 5)]
         );
     }
+    // A marker that is not after the erase point leaves the default: no restart.
+    let wait_marked = |source: &str, before: &str| {
+        source.replace(before, &format!("    # @recoveryRequired\n{before}"))
+    };
+    let requests = flash_index(&[]);
+    for (source, steps) in [
+        // On the transfer's statement of a session without an erase step.
+        (
+            wait_marked(PLAN_NO_ERASE, "    res = diag.flash_transfer(1)"),
+            NO_ERASE,
+        ),
+        // Before the erase, and on the `@erase` statement itself.
+        (
+            PLAN_ERASE.replace(
+                "    # @erase",
+                "    # @recoveryRequired\n    diag.wait(0)\n    # @erase",
+            ),
+            WITH_ERASE,
+        ),
+        (
+            PLAN_ERASE.replace("    # @erase\n", "    # @erase\n    # @recoveryRequired\n"),
+            WITH_ERASE,
+        ),
+    ] {
+        let codes = flash_codes(&source, Some(steps), &requests);
+        assert!(!codes.contains(&(StarCode::PlanShape, 2)), "{codes:?}");
+    }
+    // After the erase and before the transfer it is restartable.
+    let between = wait_marked(PLAN_ERASE, "    res = diag.flash_transfer(1)");
+    assert_eq!(
+        flash_codes(&between, Some(WITH_ERASE), &requests),
+        [(StarCode::PlanShape, 2)]
+    );
     // The default point, at the erase, and a section that requires on-site intervention from
     // its entry allow no restart: the identity rows are not needed.
     let requests = flash_index(&[]);
@@ -3571,4 +3609,43 @@ fn a_flash_plan_is_for_uds_only() {
         over("def main():\n    diag.flash_transfer(1)\n"),
         [(StarCode::NotInProfile, 2)]
     );
+}
+
+#[test]
+fn the_documented_flash_plan_passes_every_check() {
+    let source = "\
+# @section uninterruptible expected=180000
+# @flashPlan session=1 maxResumes=3 recovery=never
+def write_application():
+    diag.request(0x10, {\"session\": 0x02})
+    diag.security_access(0x11)
+    # @erase
+    diag.routine(0xFF00, 0x01, {})
+    res = diag.flash_transfer(1)
+    if not res[\"ok\"]:
+        diag.fail(\"TRANSFER_EXIT_REFUSED\", \"\")
+    diag.routine(0xFF01, 0x01, {})
+    diag.request(0x11, {\"reset\": 0x01})
+
+# @preconditions voltage externalSupply ignition engine vehicleSpeed
+def main():
+    write_application()
+";
+    check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let all = ["vin", "hardware_part_number", "software_version"];
+    // The index has rows for the three mandatory preconditions only.
+    let source = &source.replace(" engine vehicleSpeed", "");
+    let codes = flash_codes(source, Some(WITH_ERASE), &flash_index(&all));
+    // Nothing of the plan's own checks; the empty variant's services and the transfer remain.
+    assert!(
+        codes.iter().all(|(code, _)| matches!(
+            code,
+            StarCode::UnknownService
+                | StarCode::NotLowerable
+                | StarCode::UnknownPrecondition
+                | StarCode::UnsupportedSyntax
+        )),
+        "{codes:?}"
+    );
+    assert!(codes.contains(&(StarCode::NotLowerable, 8)), "{codes:?}");
 }

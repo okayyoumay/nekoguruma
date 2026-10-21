@@ -1960,3 +1960,69 @@ fn flash_plan_codes_are_named_as_specified() {
         "\"STAR_UNKNOWN_FLASH_SESSION\""
     );
 }
+
+#[test]
+fn a_parameter_hides_a_constant_in_the_session_comparison() {
+    use StarCode::PlanShape as Shape;
+    // The parameter, not the constant, is what the transfer names: not compared.
+    let shadowed = "\
+SESSION = 1
+
+# @section uninterruptible
+# @flashPlan session=2
+def write(SESSION):
+    # @erase
+    diag.routine(0xFF00, 1, {})
+    diag.flash_transfer(SESSION)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write(2)
+";
+    passes(shadowed);
+    // Without the parameter the constant is compared.
+    assert_eq!(
+        codes(
+            &shadowed
+                .replace("write(SESSION)", "write()")
+                .replace("write(2)", "write()")
+        ),
+        [(Shape, 8)]
+    );
+}
+
+#[test]
+fn a_nested_recovery_required_marker_is_a_bad_annotation() {
+    let nested = PLAN.replace(
+        "    res = diag.flash_transfer(1)",
+        "    for i in range(2):\n        # @recoveryRequired\n        diag.wait(i)\n    res = diag.flash_transfer(1)",
+    );
+    assert_eq!(codes(&nested), [(StarCode::BadAnnotation, 7)]);
+}
+
+#[test]
+fn the_session_comparison_reads_signs_big_literals_and_chains() {
+    use StarCode::PlanShape as Shape;
+    let with = |constants: &str, arg: &str| {
+        codes(
+            &PLAN
+                .replace(
+                    "# @preconditions",
+                    &format!("{constants}\n# @preconditions"),
+                )
+                .replace("flash_transfer(1)", &format!("flash_transfer({arg})")),
+        )
+    };
+    assert_eq!(with("", "+1"), []);
+    assert_eq!(with("", "+2"), [(Shape, 6)]);
+    assert_eq!(
+        with("", "99999999999999999999999999999999999999999999"),
+        [(Shape, 6)]
+    );
+    assert_eq!(with("", "4294967296"), [(Shape, 6)]);
+    assert_eq!(with("A = 1\nB = A\nC = B\n", "C"), []);
+    assert_eq!(with("A = 2\nB = A\n", "B"), [(Shape, 6)]);
+    // A later constant, or anything computed, is not compared.
+    assert_eq!(with("B = A\nA = 2\n", "B"), []);
+    assert_eq!(with("", "1 + 1"), []);
+}

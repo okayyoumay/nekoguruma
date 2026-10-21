@@ -2498,10 +2498,11 @@ impl Checker<'_> {
         }
         // The top-level constants that are integer literals, which name a session.
         let mut constants: HashMap<&str, i128> = HashMap::new();
+        // In source order, so a constant bound to an earlier one resolves, and no cycle exists.
         for stmt in &top {
             if let StmtP::Assign(assign) = &stmt.node
                 && let AssignTargetP::Identifier(name) = &assign.lhs.node
-                && let Some(value) = literal_int(&assign.rhs, &HashMap::new())
+                && let Some(value) = literal_int(&assign.rhs, &constants)
             {
                 constants.insert(&name.node.ident, value);
             }
@@ -2582,6 +2583,14 @@ impl Checker<'_> {
             let body = Self::statements(&def.body);
             let mut locals = HashSet::new();
             collect_locals(&def.body, &mut locals, &mut HashSet::new());
+            for param in &def.params {
+                if let ParameterP::Normal(ident, ..)
+                | ParameterP::Args(ident, ..)
+                | ParameterP::KwArgs(ident, ..) = &param.node
+                {
+                    locals.insert(ident.node.ident.clone());
+                }
+            }
             let local_constants: HashMap<&str, i128> = constants
                 .iter()
                 .filter(|(name, _)| !locals.contains(**name))
@@ -2901,15 +2910,16 @@ fn find_diag_calls<'a>(expr: &'a AstExpr, method: &str, out: &mut Vec<&'a AstExp
     expr.visit_expr(|inner| find_diag_calls(inner, method, out));
 }
 
-/// The value of an integer literal, signed, or of a name in `constants`; `None` for any other
-/// expression and for a literal too large for an `i32`.
+/// The value of an integer literal, with a sign, or of a name in `constants`; `None` for any
+/// other expression. A literal beyond `i128` stands for `i128::MAX`, which no session id equals.
 fn literal_int(expr: &AstExpr, constants: &HashMap<&str, i128>) -> Option<i128> {
     match &expr.node {
         ExprP::Literal(AstLiteral::Int(int)) => match &int.node {
             TokenInt::I32(n) => Some(i128::from(*n)),
-            TokenInt::BigInt(_) => None,
+            TokenInt::BigInt(big) => Some(i128::try_from(big).unwrap_or(i128::MAX)),
         },
         ExprP::Minus(inner) => literal_int(inner, constants).map(|n| -n),
+        ExprP::Plus(inner) => literal_int(inner, constants),
         ExprP::Identifier(name) => constants.get(name.node.ident.as_str()).copied(),
         _ => None,
     }

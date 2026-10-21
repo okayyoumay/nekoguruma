@@ -418,14 +418,16 @@ carrying its own address byte.
   the ABI and the `unsigned long` width of each device, masked as the report masks. A VCI end must be a J2534 one: a
   D-PDU API end is refused with nothing sent.
 - **SocketCAN end (ADR-343).** One end may be a `socketcan` interface instead, on Linux only; any
-  other OS refuses the check before a device opens. The interface must be up at the profile's
-  baud rate already, since the harness changes no interface settings. The end is a
-  `guard::GuardedSocketCan` on a raw CAN socket, which offers only the T0 frame of its own end: the
-  end's `request_id` (as a 29-bit identifier when `id_bits` is 29), its address byte when the
-  addressing has one, then the payload, padded to 8 bytes with the end's `padding` byte when the
-  profile pads, as the VCI's frame-padding flag does on the bus. It takes no whole frame and no
+  other OS refuses the check before a device opens. The loopback must then be raw CAN (both
+  `protocol`s raw CAN names such as `CAN`): an ISO 15765 VCI channel frames each payload with the
+  transport's protocol control byte, which the SocketCAN end does not build, so an ISO 15765
+  SocketCAN end is refused. The interface must be up at the profile's baud rate already, since
+  the harness changes no interface settings. The end is a `guard::GuardedSocketCan` on a raw CAN
+  socket, which offers only the T0 frame of its own end: the end's `request_id` (a 29-bit
+  identifier when `id_bits` is 29), then a payload of 1 to 7 bytes. It takes no whole frame and no
   other identifier. It receives every frame other nodes send, skips error and remote frames, and
-  matches the other end's frame byte for byte, padded as that end pads. The result message names
+  matches the other end's frame byte for byte with the loopback's identifier width. Its drain ends
+  after 50 ms without a frame and fails after 2 s, as a VCI end's does. The result message names
   the interface.
 - **ABI check (design 7.1.2).** For each device the ABI read from the library file's header must
   be the worker's, and the width the launch passed to the worker must be the registration

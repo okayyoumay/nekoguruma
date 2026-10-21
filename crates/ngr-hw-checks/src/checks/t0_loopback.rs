@@ -305,6 +305,15 @@ pub async fn run(
             )));
         }
     }
+    // The SocketCAN end given must be the one the profile names: its frames are its own link's.
+    if let (Ends::VciAndSocketCan(_, can), Some(at)) = (&ends, socketcan)
+        && (can.link() != &profile_ends[at].link
+            || Some(can.interface()) != profile_ends[at].socketcan.as_deref())
+    {
+        return Err(CheckError::Refused(format!(
+            "the SocketCAN end given is not endpoint {at}'s"
+        )));
+    }
     let expected_devices = match ends {
         Ends::OneModule(_) | Ends::VciAndSocketCan(..) => 1,
         Ends::TwoModules(..) => 2,

@@ -30,31 +30,36 @@ The questions were:
 1. **A guard by construction.**
    - `guard::GuardedSocketCan` is the SocketCAN end a check gets. The harness opens it for a T0
      profile's SocketCAN endpoint, and only for that.
-   - Its only send call takes a payload of 1 to 7 bytes (6 under extended or mixed addressing). It
-     builds the frame from the endpoint's link: the `request_id`, as a 29-bit identifier when
-     `id_bits` is 29; the address byte when the addressing has one; and the `padding` byte up to 8
-     bytes when the profile pads.
+   - Its only send call takes a payload of 1 to 7 bytes. It builds the frame from the endpoint's
+     link: the `request_id`, as a 29-bit identifier when `id_bits` is 29, then the payload.
    - No call takes a whole frame or another identifier, so the end can send nothing but its own T0
-     frames, the same frames the worker guard lets a VCI end send in RawMode (ADR-333). There is no
-     decision function to keep in step with the VCI guard, and nothing for an unclassified frame to
-     slip through.
-2. **The same bytes as the VCI end.**
+     frames, the same frames the worker guard lets a raw CAN VCI end send in RawMode (ADR-333).
+     There is no decision function to keep in step with the VCI guard, and nothing for an
+     unclassified frame to slip through.
+2. **Raw CAN only, and the same bytes as the VCI end.**
+   - A SocketCAN end is refused unless its `protocol` is a raw CAN one. The profile already makes
+     both ends of a loopback share their framing. An ISO 15765 VCI channel frames each payload with
+     the transport's protocol control information (ISO 15765-2 (2024) clause 9.6), so an ISO 15765
+     SocketCAN end would have to build and parse that byte, and the address byte and padding that
+     go with it, to match the VCI on the bus. Raw CAN needs none of it, and the profile already
+     refuses padding and extended or mixed addressing on a raw CAN end.
    - The end writes and compares a frame as the J2534 worker's RawMode data is: the identifier in
      four bytes, most significant first, then the CAN data. `GuardedSocketCan::frame` and
      `GuardedHandle::raw_frame` give the same bytes for the same link, so the check computes the
      expected frame the same way whichever end sends.
-   - Padding is added on the bus, as the VCI's frame-padding flag adds it. A SocketCAN receiver
-     therefore matches the other end's frame padded as that end's link pads.
-   - The end receives every frame other nodes send, which is the raw socket's default, and none of
+   - The end matches a received frame on its identifier width too, which `CanFrame::bytes` leaves
+     out. It receives every frame other nodes send, which is the raw socket's default, and none of
      its own. It skips error and remote frames.
+   - Its drain ends once 50 ms pass without a frame, and fails when the bus has not gone quiet
+     within 2 s, as a VCI end's `raw_drain` does.
 3. **The check takes a VCI end and a SocketCAN end.**
    - `t0_loopback::Ends::VciAndSocketCan` gives the check one guarded handle and the SocketCAN end.
      The profile says which endpoint the SocketCAN end is.
    - The check drives both kinds of end through one internal `End`, with the same steps: listen,
      drain until quiet, send, then receive the exact frame within the timeout.
    - Its result message names the interface.
-   - A SocketCAN end given for a profile without one, or none given for a profile with one, is
-     refused with nothing sent.
+   - A SocketCAN end given for a profile without one, none given for a profile with one, or one
+     opened for another endpoint or interface than the profile's, is refused with nothing sent.
 4. **The bus is a trait.**
    - `GuardedSocketCan` sends and receives through `socketcan::CanBus`. On Linux the only
      implementation is a raw CAN socket (`PF_CAN`, `SOCK_RAW`, `CAN_RAW`, bound to the interface
@@ -63,7 +68,8 @@ The questions were:
      `ngr-hw-checks`' unit tests. The whole check also runs in `j2534-0404-service`'s mock suite
      against a bus wired to the mock's channel: what the VCI end writes arrives at the fake bus,
      and what the SocketCAN end sends is injected into the channel's receive queue.
-   - No CI test needs a `vcan` interface. The hosted runners cannot be relied on to load the
+   - The mock suite runs the check on a raw CAN loopback, as a SocketCAN profile must be. No CI test
+     needs a `vcan` interface. The hosted runners cannot be relied on to load the
      kernel module.
 5. **Linux only.** On any other operating system `GuardedSocketCan::open` refuses. The hardware
    test opens the SocketCAN end before any device, so the check is refused there before anything
@@ -83,5 +89,6 @@ The questions were:
   needs a multi-threaded runtime, which the hardware test and the mock suite already use.
 - The interface name appears unmasked in the result message: the report masks VCI serial numbers,
   and an interface name such as `can0` is none.
+- An ISO 15765 loopback still needs two VCI ends.
 - T1's SocketCAN front end of `sim-ecu` (ADR-275) is separate work. It serves the simulated ECU on
   an interface, which this end does not do.

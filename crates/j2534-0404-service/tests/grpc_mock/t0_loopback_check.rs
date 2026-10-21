@@ -237,13 +237,16 @@ async fn a_missing_frame_fails_the_loopback_check() {
     b.shutdown().await;
 }
 
-/// A T0 profile with one SocketCAN end and one VCI end.
+/// The raw CAN link of a loopback with a SocketCAN end, which carries raw CAN only (ADR-343).
+const RAW_LINK: &str = "protocol = \"CAN\"\nbaud_rate = 500000\npins = [6, 14]\nid_bits = 11\n\
+                        addressing = \"normal\"\n";
+
+/// A T0 profile with one SocketCAN end and one VCI end, on raw CAN.
 fn socketcan_end() -> Profile {
     profile::parse(&format!(
-        "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\nprotocol = \"ISO15765\"\n\
-         baud_rate = 500000\npins = [6, 14]\nid_bits = 11\naddressing = \"normal\"\n\
+        "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\n{RAW_LINK}\
          request_id = 0x123\nresponse_id = 0x124\n\
-         [[endpoint]]\n[endpoint.vci]\n{}[endpoint.link]\n{LINK}request_id = 0x124\nresponse_id = 0x123\n",
+         [[endpoint]]\n[endpoint.vci]\n{}[endpoint.link]\n{RAW_LINK}request_id = 0x124\nresponse_id = 0x123\n",
         vci_toml("Bench A", "J2534-2:a")
     ))
     .expect("a T0 profile with a SocketCAN end")
@@ -313,7 +316,7 @@ struct MockChannelBus {
 impl ngr_hw_checks::guard::socketcan::CanBus for MockChannelBus {
     fn send(&mut self, frame: &ngr_hw_checks::guard::socketcan::CanFrame) -> std::io::Result<()> {
         self.backdoor
-            .inject_rx(MOCK_CHANNEL_ID, &frame.bytes(), j2534_0404::ISO15765);
+            .inject_rx(MOCK_CHANNEL_ID, &frame.bytes(), j2534_0404::CAN);
         Ok(())
     }
 

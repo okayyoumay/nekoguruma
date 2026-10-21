@@ -4,9 +4,15 @@
 //! ("the VCI and a second CAN interface" in design 13.5's class table). That end is not on a
 //! worker, so [`decide`](super::decide) never sees its traffic. [`GuardedSocketCan`] is its guard:
 //! the harness opens it for the profile's SocketCAN endpoint, and a check can only send what T0
-//! allows from that end, a single frame with the end's own identifier, address byte and padding
-//! and a payload of 1 to 7 bytes (6 under extended or mixed addressing). It offers no call that
-//! takes a whole frame or another identifier, so the guard holds by construction.
+//! allows from that end: a frame with the end's own identifier and a payload of 1 to 7 bytes. It
+//! offers no call that takes a whole frame or another identifier, so the guard holds by
+//! construction.
+//!
+//! The end carries raw CAN frames only. On an ISO 15765 loopback the VCI end's channel frames each
+//! payload with the transport's protocol control information (ISO 15765-2 (2024) clause 9.6), which
+//! this end does not build or parse, so a SocketCAN end on such a profile is refused. A raw CAN
+//! end takes no padding and normal addressing only (the profile refuses the others), so its frame
+//! is the identifier and the payload.
 //!
 //! A frame is written as the J2534 worker's RawMode data is (design 13.5): the identifier in four
 //! bytes, most significant first, then the CAN data. A VCI end and a SocketCAN end therefore build
@@ -17,7 +23,7 @@
 
 use std::time::{Duration, Instant};
 
-use crate::profile::{Addressing, Class, Link, Profile, Setup};
+use crate::profile::{Addressing, Class, Framing, Link, Profile, Setup, framing};
 
 /// One classical CAN frame: its identifier, whether that is a 29-bit one, and up to 8 data bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -67,8 +73,6 @@ pub enum SocketCanError {
 pub struct GuardedSocketCan {
     interface: String,
     link: Link,
-    /// The other end's link: it decides the padding of the frames this end receives.
-    peer: Link,
     bus: Box<dyn CanBus>,
 }
 
@@ -85,7 +89,7 @@ impl GuardedSocketCan {
     /// at the profile's baud rate already: the harness changes no interface settings. Refused on
     /// an operating system other than Linux, which has no SocketCAN.
     pub fn open(profile: &Profile, endpoint: usize) -> Result<Self, SocketCanError> {
-        let (interface, _, _) = Self::endpoint(profile, endpoint)?;
+        let (interface, _) = Self::endpoint(profile, endpoint)?;
         #[cfg(target_os = "linux")]
         {
             let bus = raw::RawCanSocket::open(&interface)
@@ -108,20 +112,16 @@ impl GuardedSocketCan {
         endpoint: usize,
         bus: Box<dyn CanBus>,
     ) -> Result<Self, SocketCanError> {
-        let (interface, link, peer) = Self::endpoint(profile, endpoint)?;
+        let (interface, link) = Self::endpoint(profile, endpoint)?;
         Ok(Self {
             interface,
             link,
-            peer,
             bus,
         })
     }
 
-    /// The interface, link and peer link of a T0 profile's SocketCAN endpoint.
-    fn endpoint(
-        profile: &Profile,
-        endpoint: usize,
-    ) -> Result<(String, Link, Link), SocketCanError> {
+    /// The interface and link of a T0 profile's raw CAN SocketCAN endpoint.
+    fn endpoint(profile: &Profile, endpoint: usize) -> Result<(String, Link), SocketCanError> {
         if profile.class != Class::T0 {
             return Err(SocketCanError::Refused(
                 "a SocketCAN end is a T0 tool: the profile is not T0".to_owned(),
@@ -138,15 +138,23 @@ impl GuardedSocketCan {
         let interface = end.socketcan.clone().ok_or_else(|| {
             SocketCanError::Refused(format!("endpoint {endpoint} is not a SocketCAN end"))
         })?;
-        let peer = ends
-            .iter()
-            .enumerate()
-            .find(|(at, _)| *at != endpoint)
-            .map(|(_, end)| end.link.clone())
-            .ok_or_else(|| {
-                SocketCanError::Refused("the loopback has no other endpoint".to_owned())
-            })?;
-        Ok((interface, end.link.clone(), peer))
+        let link = &end.link;
+        if framing(&link.protocol) != Some(Framing::RawCan) {
+            return Err(SocketCanError::Refused(format!(
+                "endpoint {endpoint} is the SocketCAN interface {interface} on {:?}: a SocketCAN \
+                 end carries raw CAN frames only, and an ISO 15765 end's frames carry the \
+                 transport's protocol control byte, which it does not build",
+                link.protocol
+            )));
+        }
+        // The profile refuses both on a raw CAN end; checked again, since the frame has no room
+        // for them.
+        if link.padding.is_some() || link.addressing != Addressing::Normal {
+            return Err(SocketCanError::Refused(
+                "a raw CAN end takes no padding and normal addressing only".to_owned(),
+            ));
+        }
+        Ok((interface, link.clone()))
     }
 
     /// The interface name, such as `can0`.
@@ -154,47 +162,54 @@ impl GuardedSocketCan {
         &self.interface
     }
 
-    /// The frame this end sends for `payload`, as [`CanFrame::bytes`] writes it: the end's own
-    /// identifier, its address byte under extended or mixed addressing, then the payload. A VCI
-    /// end's `GuardedHandle::raw_frame` gives the same bytes for the same link. Padding is not
-    /// part of it: it is added on the bus.
-    pub fn frame(&self, payload: &[u8]) -> Result<Vec<u8>, SocketCanError> {
-        Ok(self.unpadded(payload)?.bytes())
+    /// The profile link the end sends with.
+    pub fn link(&self) -> &Link {
+        &self.link
     }
 
-    /// Sends one frame with `payload`, padded as the end's link pads.
+    /// The frame this end sends for `payload`, as [`CanFrame::bytes`] writes it: the end's own
+    /// identifier, then the payload. A VCI end's `GuardedHandle::raw_frame` gives the same bytes
+    /// for the same raw CAN link.
+    pub fn frame(&self, payload: &[u8]) -> Result<Vec<u8>, SocketCanError> {
+        Ok(self.own_frame(payload)?.bytes())
+    }
+
+    /// Sends one frame with `payload`.
     pub fn send(&mut self, payload: &[u8]) -> Result<(), SocketCanError> {
-        let mut frame = self.unpadded(payload)?;
-        if let Some(pad) = self.link.padding {
-            frame.data.resize(8, pad);
-        }
+        let frame = self.own_frame(payload)?;
         let result = self.bus.send(&frame);
         result.map_err(|source| self.io(source))
     }
 
     /// Discards what arrived so far, until a 50 ms window passes with no frame;
-    /// [`SocketCanError::NotQuiet`] when the bus has not gone quiet within about 2 s.
+    /// [`SocketCanError::NotQuiet`] when the bus has not gone quiet within 2 s.
     pub fn drain(&mut self) -> Result<(), SocketCanError> {
         const QUIET: Duration = Duration::from_millis(50);
-        const TRIES: usize = 40;
-        for _ in 0..TRIES {
-            match self.bus.recv(QUIET) {
+        const LIMIT: Duration = Duration::from_secs(2);
+        let give_up = Instant::now() + LIMIT;
+        let mut quiet_from = Instant::now();
+        loop {
+            let now = Instant::now();
+            let quiet_until = quiet_from + QUIET;
+            if now >= quiet_until {
+                return Ok(());
+            }
+            if now >= give_up {
+                return Err(SocketCanError::NotQuiet);
+            }
+            match self.bus.recv(quiet_until - now) {
                 Ok(None) => return Ok(()),
-                Ok(Some(_)) => {}
+                // A frame starts the quiet window again.
+                Ok(Some(_)) => quiet_from = Instant::now(),
                 Err(source) => return Err(self.io(source)),
             }
         }
-        Err(SocketCanError::NotQuiet)
     }
 
     /// Waits up to `timeout` for the frame whose bytes are `expected` (the other end's frame, as
-    /// its `raw_frame` writes it), padded as the other end's link pads. Other frames are skipped.
+    /// its `raw_frame` writes it), with the loopback's identifier width. Other frames are skipped.
     pub fn receive(&mut self, expected: &[u8], timeout: Duration) -> Result<(), SocketCanError> {
-        let mut wanted = expected.to_vec();
-        if let Some(pad) = self.peer.padding {
-            // Four identifier bytes, then the data padded to a whole frame.
-            wanted.resize(4 + 8, pad);
-        }
+        let extended = self.link.id_bits == 29;
         let deadline = Instant::now() + timeout;
         loop {
             let left = deadline.saturating_duration_since(Instant::now());
@@ -202,7 +217,9 @@ impl GuardedSocketCan {
                 return Err(SocketCanError::NoFrame);
             }
             match self.bus.recv(left) {
-                Ok(Some(frame)) if frame.bytes() == wanted => return Ok(()),
+                Ok(Some(frame)) if frame.extended == extended && frame.bytes() == expected => {
+                    return Ok(());
+                }
                 Ok(Some(_)) => {}
                 Ok(None) => return Err(SocketCanError::NoFrame),
                 Err(source) => return Err(self.io(source)),
@@ -210,13 +227,11 @@ impl GuardedSocketCan {
         }
     }
 
-    /// The end's frame for `payload` before padding, or why T0 does not allow it.
-    fn unpadded(&self, payload: &[u8]) -> Result<CanFrame, SocketCanError> {
-        let addressed = self.link.addressing != Addressing::Normal;
-        let most = if addressed { 6 } else { 7 };
-        if payload.is_empty() || payload.len() > most {
+    /// The end's frame for `payload`, or why T0 does not allow it.
+    fn own_frame(&self, payload: &[u8]) -> Result<CanFrame, SocketCanError> {
+        if payload.is_empty() || payload.len() > 7 {
             return Err(SocketCanError::Refused(format!(
-                "a T0 frame carries a payload of 1 to {most} bytes, not {}",
+                "a T0 frame carries a payload of 1 to 7 bytes, not {}",
                 payload.len()
             )));
         }
@@ -228,15 +243,10 @@ impl GuardedSocketCan {
                 self.link.request_id, self.link.id_bits
             )));
         }
-        let mut data = Vec::with_capacity(8);
-        if addressed {
-            data.push(self.link.address.unwrap_or(0));
-        }
-        data.extend_from_slice(payload);
         Ok(CanFrame {
             id: self.link.request_id,
             extended,
-            data,
+            data: payload.to_vec(),
         })
     }
 
@@ -336,13 +346,17 @@ mod raw {
         }
 
         fn recv(&mut self, timeout: Duration) -> std::io::Result<Option<CanFrame>> {
+            let deadline = std::time::Instant::now() + timeout;
             loop {
                 let mut poll = libc::pollfd {
                     fd: self.0.as_raw_fd(),
                     events: libc::POLLIN,
                     revents: 0,
                 };
-                let millis = i32::try_from(timeout.as_millis()).unwrap_or(i32::MAX);
+                // Rounded up, so a wait of under a millisecond still waits; after an interrupted
+                // poll, only the time left.
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                let millis = i32::try_from(left.as_micros().div_ceil(1_000)).unwrap_or(i32::MAX);
                 // SAFETY: one `pollfd`, alive across the call.
                 let ready = unsafe { libc::poll(&raw mut poll, 1, millis) };
                 if ready < 0 {

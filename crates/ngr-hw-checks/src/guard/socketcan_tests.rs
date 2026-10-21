@@ -110,29 +110,61 @@ fn the_end_sends_only_its_own_single_frames() {
     assert_eq!(bus.sent.lock().unwrap().len(), 2);
 }
 
-/// A 29-bit end, with mixed addressing and padding: the frame carries the address byte, is padded
-/// on the bus, and its identifier is a 29-bit one.
+/// A 29-bit raw CAN end: the frame's identifier is a 29-bit one, and a received frame must be
+/// one too.
 #[test]
-fn the_frame_follows_the_end_s_link() {
+fn a_29_bit_end_sends_and_receives_29_bit_frames() {
     let bus = FakeBus::default();
     let profile = profile_with(
-        "ISO15765",
-        "id_bits = 29\naddressing = \"mixed\"\naddress = 0x12\npadding = 0xCC",
-        "id_bits = 29\naddressing = \"mixed\"\naddress = 0x12\npadding = 0xCC",
+        "CAN",
+        "id_bits = 29\naddressing = \"normal\"",
+        "id_bits = 29\naddressing = \"normal\"",
     );
     let mut can = end(&profile, &bus);
-    assert_eq!(can.frame(&[0xA0]).unwrap(), [0, 0, 0x01, 0x23, 0x12, 0xA0]);
+    assert_eq!(can.frame(&[0xA0]).unwrap(), [0, 0, 0x01, 0x23, 0xA0]);
     can.send(&[0xA0]).unwrap();
     assert_eq!(
         *bus.sent.lock().unwrap(),
         [CanFrame {
             id: 0x123,
             extended: true,
-            data: vec![0x12, 0xA0, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC, 0xCC],
+            data: vec![0xA0],
         }]
     );
-    // An addressed frame leaves room for 6 payload bytes.
-    assert!(matches!(can.send(&[0; 7]), Err(SocketCanError::Refused(_))));
+    let expected = [0, 0, 0x01, 0x24, 0xB0];
+    let frame = |extended| CanFrame {
+        id: 0x124,
+        extended,
+        data: vec![0xB0],
+    };
+    // An 11-bit frame with the same identifier and data is another frame.
+    bus.inbound.lock().unwrap().push_back(frame(false));
+    assert!(matches!(
+        can.receive(&expected, Duration::from_millis(10)),
+        Err(SocketCanError::NoFrame)
+    ));
+    bus.inbound.lock().unwrap().push_back(frame(true));
+    can.receive(&expected, Duration::from_secs(1)).unwrap();
+}
+
+/// An ISO 15765 end is refused: the VCI's channel frames each payload with the transport's
+/// protocol control byte, which the SocketCAN end does not build.
+#[test]
+fn an_iso_15765_socketcan_end_is_refused() {
+    let profile = profile_with(
+        "ISO15765",
+        "id_bits = 11\naddressing = \"normal\"",
+        "id_bits = 11\naddressing = \"normal\"",
+    );
+    let refused = GuardedSocketCan::with_bus(&profile, 0, Box::new(FakeBus::default()));
+    assert!(
+        matches!(&refused, Err(SocketCanError::Refused(why)) if why.contains("raw CAN frames only")),
+        "{refused:?}"
+    );
+    assert!(matches!(
+        GuardedSocketCan::open(&profile, 0),
+        Err(SocketCanError::Refused(_))
+    ));
 }
 
 #[test]
@@ -166,34 +198,6 @@ fn the_end_receives_the_other_end_s_frame_exactly() {
     ));
 }
 
-/// A padding peer's frame arrives padded to a whole frame, and is matched as such.
-#[test]
-fn a_padding_peer_s_frame_is_matched_padded() {
-    let bus = FakeBus::default();
-    let profile = profile_with(
-        "ISO15765",
-        "id_bits = 11\naddressing = \"normal\"",
-        "id_bits = 11\naddressing = \"normal\"\npadding = 0xAA",
-    );
-    let mut can = end(&profile, &bus);
-    bus.inbound.lock().unwrap().push_back(CanFrame {
-        id: 0x124,
-        extended: false,
-        data: vec![0xB0],
-    });
-    assert!(matches!(
-        can.receive(&[0, 0, 0x01, 0x24, 0xB0], Duration::from_millis(10)),
-        Err(SocketCanError::NoFrame)
-    ));
-    bus.inbound.lock().unwrap().push_back(CanFrame {
-        id: 0x124,
-        extended: false,
-        data: vec![0xB0, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA, 0xAA],
-    });
-    can.receive(&[0, 0, 0x01, 0x24, 0xB0], Duration::from_secs(1))
-        .unwrap();
-}
-
 #[test]
 fn a_drain_empties_a_quiet_bus_and_gives_up_on_a_busy_one() {
     let bus = FakeBus::default();
@@ -203,6 +207,17 @@ fn a_drain_empties_a_quiet_bus_and_gives_up_on_a_busy_one() {
         data: vec![1],
     });
     let mut can = end(&profile(), &bus);
+    can.drain().unwrap();
+    assert!(bus.inbound.lock().unwrap().is_empty());
+    // A burst well past what one quiet window would allow, then quiet: the bus went quiet in
+    // time, so the drain succeeds.
+    for at in 0..200u32 {
+        bus.inbound.lock().unwrap().push_back(CanFrame {
+            id: at,
+            extended: false,
+            data: vec![1],
+        });
+    }
     can.drain().unwrap();
     assert!(bus.inbound.lock().unwrap().is_empty());
     let busy = FakeBus {

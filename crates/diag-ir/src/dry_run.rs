@@ -612,6 +612,24 @@ fn decoded_cost(fields: &[DecodedField]) -> usize {
     })
 }
 
+/// The heap a decoded form takes in the report: its id, and per parameter the pair, its name
+/// and any text, so a form of many small parameters is charged what it holds rather than its
+/// compact encoding.
+fn form_cost(form: &HmiForm) -> usize {
+    form.params
+        .iter()
+        .fold(form.id.len(), |total: usize, (key, value)| {
+            let text = match value {
+                hmi::HmiValue::Text(text) => text.len(),
+                hmi::HmiValue::Int(_) | hmi::HmiValue::Bool(_) => 0,
+            };
+            total
+                .saturating_add(size_of::<(String, hmi::HmiValue)>())
+                .saturating_add(key.len())
+                .saturating_add(text)
+        })
+}
+
 impl DiagHost for ScriptedHost<'_, '_> {
     type Error = DryRunError;
 
@@ -704,8 +722,10 @@ impl DiagHost for ScriptedHost<'_, '_> {
             self.next(Answers::Form, &script.forms)
                 .ok_or(DryRunError::NotScripted { what: "HMI answer" })?
         };
-        self.charge(form.len() + answer.len())?;
+        // Decoding is bounded by the form's 16 KiB (ADR-340 item 1); what the report keeps is
+        // the decoded form.
         let form = hmi::decode_form(form).map_err(|_| DryRunError::BadHmiForm)?;
+        self.charge(form_cost(&form).saturating_add(answer.len()))?;
         self.events.push(DryRunEvent::Hmi {
             form,
             answer: answer.clone(),
@@ -725,8 +745,8 @@ impl DiagHost for ScriptedHost<'_, '_> {
                     what: "record answer",
                 })?
         };
-        self.charge(template.len() + answer.len())?;
         let template = hmi::decode_form(template).map_err(|_| DryRunError::BadHmiForm)?;
+        self.charge(form_cost(&template).saturating_add(answer.len()))?;
         self.events.push(DryRunEvent::RecordInput {
             template,
             answer: answer.clone(),

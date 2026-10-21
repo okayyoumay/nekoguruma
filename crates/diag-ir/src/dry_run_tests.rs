@@ -838,3 +838,27 @@ fn an_input_the_script_does_not_set_is_not_established() {
     );
     assert_eq!(report.steps, 0);
 }
+
+#[test]
+fn a_decoded_form_is_charged_what_it_holds() {
+    use crate::hmi::{HmiForm, HmiValue};
+    let form = HmiForm {
+        id: "confirm".to_owned(),
+        params: (0..32)
+            .map(|n| (format!("p{n}"), HmiValue::Bool(true)))
+            .collect(),
+    };
+    let encoded = crate::hmi::encode_form(&form).unwrap().len();
+    let cost = form_cost(&form);
+    // Every parameter's pair counts, not just its few encoded bytes.
+    assert!(cost >= 32 * size_of::<(String, HmiValue)>(), "{cost}");
+    assert!(cost > 4 * encoded, "{cost} against {encoded} encoded");
+    let text = HmiForm {
+        id: "f".to_owned(),
+        params: vec![("t".to_owned(), HmiValue::Text("x".repeat(1000)))],
+    };
+    assert_eq!(
+        form_cost(&text),
+        1 + size_of::<(String, HmiValue)>() + 1 + 1000
+    );
+}

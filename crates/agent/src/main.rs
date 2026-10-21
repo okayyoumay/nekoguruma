@@ -152,11 +152,9 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
             }
             "--artifact-sha256" => {
                 artifact_sha256 = Some(
-                    parse_sha256(
-                        value
-                            .to_str()
-                            .ok_or_else(|| format!("--artifact-sha256 {value:?} is not UTF-8"))?,
-                    )
+                    parse_sha256(value.to_str().ok_or_else(|| {
+                        format!("--artifact-sha256 {value:?} is not valid UTF-8")
+                    })?)
                     .map_err(|error| format!("--artifact-sha256: {error}"))?,
                 )
             }
@@ -172,7 +170,7 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
     let artifact = match (artifact, artifact_sha256) {
         (Some(path), Some(sha256)) => Some((path, sha256)),
         (None, None) => None,
-        _ => return Err("--artifact and --artifact-sha256 are given together".to_owned()),
+        _ => return Err("--artifact and --artifact-sha256 must be given together".to_owned()),
     };
     Ok(RunArgs {
         api,

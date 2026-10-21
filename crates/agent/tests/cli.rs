@@ -191,6 +191,40 @@ fn a_document_that_cannot_run_exits_with_1_before_resolving_the_vci() {
     assert_fails_with(output, "carries no procedure");
 }
 
+/// The flash artifact is read and compared with the hash the command line names before a worker
+/// starts (ADR-336 item 1); the options come together.
+#[test]
+fn a_bad_artifact_exits_before_resolving_the_vci() {
+    let temp = TempDir::new("artifact");
+    let document = write_program(&temp.0, vec![Op::PushBytes(0), Op::Pop]);
+    let artifact = temp.0.join("flash.bin");
+    std::fs::write(&artifact, b"abc").expect("artifact should be writable");
+    let run = |artifact: &Path, sha256: &str| {
+        ngr_agent()
+            .args(["run", "--vci", "none", "--mode", "user", "--document"])
+            .arg(&document)
+            .arg("--artifact")
+            .arg(artifact)
+            .args(["--artifact-sha256", sha256])
+            .output()
+            .expect("ngr-agent should run")
+    };
+    // The SHA-256 of "abc" with its first digit changed.
+    let wrong = "aa7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
+    assert_fails_with(run(&artifact, wrong), "the job names");
+    assert_fails_with(run(&temp.0.join("missing.bin"), wrong), "cannot read");
+    // Only one of the two options is a usage error.
+    let output = ngr_agent()
+        .args(["run", "--vci", "none", "--mode", "user", "--document"])
+        .arg(&document)
+        .arg("--artifact")
+        .arg(&artifact)
+        .output()
+        .expect("ngr-agent should run");
+    assert_eq!(output.status.code(), Some(2));
+    assert!(String::from_utf8_lossy(&output.stderr).contains("must be given together"));
+}
+
 /// A release build refuses every write before a worker starts (ADR-235 item 8, ADR-247); a
 /// debug build allows them on the simulator, so it cannot refuse them up front.
 #[cfg(not(debug_assertions))]

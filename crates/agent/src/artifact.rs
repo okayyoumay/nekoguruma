@@ -21,7 +21,7 @@ pub const SHA256_LEN: usize = 32;
 /// change a block that is sent. Cloning shares the bytes.
 #[derive(Clone)]
 pub struct Artifact {
-    bytes: Arc<[u8]>,
+    bytes: Arc<Vec<u8>>,
     sha256: [u8; SHA256_LEN],
 }
 
@@ -41,10 +41,14 @@ impl Artifact {
     }
 
     /// An artifact of `bytes`.
-    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Self {
-        let bytes = bytes.into();
+    ///
+    /// The vector is moved, not copied, so the peak memory is about the file's size.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
         let sha256 = Sha256::digest(&bytes).into();
-        Self { bytes, sha256 }
+        Self {
+            bytes: Arc::new(bytes),
+            sha256,
+        }
     }
 
     pub fn len(&self) -> u64 {

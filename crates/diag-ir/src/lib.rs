@@ -1276,6 +1276,24 @@ pub fn flash_segment_extent(
     declared_segment(variant, session, segment).map(|(offset, _, length)| (offset, length))
 }
 
+/// The artifact range of every segment of flash session `session` (`FlashSession.id`), as
+/// [`flash_segment_extent`] gives each, in segment order; an empty list for a session that
+/// declares no segments. The error is that of the first segment that fails or, for a session the
+/// variant does not declare, [`VmError::UnknownFlashSession`] (ADR-336).
+pub fn flash_session_extents(
+    variant: &EcuVariant<'_>,
+    session: u32,
+) -> Result<Vec<(u64, u64)>, VmError> {
+    let declared = variant
+        .flash_sessions()
+        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
+        .ok_or(VmError::UnknownFlashSession { session })?;
+    let count = declared.segments().map_or(0, |segments| segments.len());
+    (0..count)
+        .map(|segment| flash_segment_extent(variant, session, segment as u32))
+        .collect()
+}
+
 /// The offset, block size and length of segment `segment` (an index into `segments`) of flash
 /// session `session` (`FlashSession.id`), with the segment's block size checked to be non-zero,
 /// its end not to overflow and its longest block to fit [`MAX_BYTES_LEN`].

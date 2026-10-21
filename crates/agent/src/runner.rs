@@ -70,8 +70,9 @@ impl Default for JobLimits {
 /// flash artifact its `Op::FlashBlock` reads from, if any.
 /// A program and a document come together only from the document itself, whose procedure is
 /// the program (design 8.2.6), so a job never decodes one variant's responses with another's
-/// declarations. The caller of a restart passes the same job again: the journal records neither
-/// the program nor the document (ADR-318).
+/// declarations. The caller of a restart passes the same job again, the artifact and the hash it
+/// names included: the journal records neither the program, the document nor the artifact
+/// (ADR-318).
 #[derive(Debug, Clone)]
 pub struct Job {
     program: Program,
@@ -222,17 +223,18 @@ pub enum JobError {
     /// The artifact's SHA-256 is not the one the job names (ADR-336 item 1).
     #[error("the artifact's SHA-256 is {actual}, not the {named} the job names")]
     ArtifactMismatch { named: String, actual: String },
-    /// The segment instruction `pc` reads (`session`, `segment`) ends at `end`, past the
-    /// artifact's `artifact_len` bytes, or its end overflows.
+    /// Segment `segment` of flash session `session`, which the program names at `pc` (a
+    /// `FlashBlock` of the session, or the session's plan, whose entry it is), ends at `end`,
+    /// past the artifact's `artifact_len` bytes.
     #[error(
-        "instruction {pc} reads flash segment {segment} of session {session}, which ends at \
-         {end:?}, past the artifact's {artifact_len} bytes"
+        "flash segment {segment} of session {session}, named at {pc}, ends at {end}, past the \
+         artifact's {artifact_len} bytes"
     )]
     SegmentOutsideArtifact {
         pc: u32,
         session: u32,
         segment: u32,
-        end: Option<u64>,
+        end: u64,
         artifact_len: u64,
     },
     /// Instruction `pc` decodes a field the job's document does not declare as a top-level
@@ -414,10 +416,13 @@ fn check_declared(job: &Job) -> Result<(), JobError> {
     }
 }
 
-/// The artifact part of [`check_job`] (ADR-336 item 1, design 8.2.5): an artifact the job gives
-/// hashes to the hash it names, a program with `Op::FlashBlock` has one, and every segment such an
-/// instruction reads lies inside it. Runs after the declarations, which it relies on to find the
-/// segments.
+/// The artifact part of [`check_job`] (ADR-336 items 1 and 12, design 8.2.5, 11.3): an artifact
+/// the job gives hashes to the hash it names, a program with `Op::FlashBlock` has one, and every
+/// segment of every flash session the program names lies inside it. A session is named by an
+/// `Op::FlashBlock` or by a flash recovery plan; all of its segments are checked, not only the
+/// ones a block read uses, since the document declares them for this artifact. A plan's session
+/// the document does not declare has no segments to check, and a job without an artifact has
+/// none to check them against. Runs after the declarations, which it relies on.
 fn check_artifact(job: &Job) -> Result<(), JobError> {
     if let Some((named, artifact)) = &job.artifact
         && named != artifact.sha256()
@@ -427,28 +432,53 @@ fn check_artifact(job: &Job) -> Result<(), JobError> {
             actual: to_hex(artifact.sha256()),
         });
     }
+    let reads = job
+        .program
+        .code
+        .iter()
+        .enumerate()
+        .filter_map(|(pc, op)| match op {
+            Op::FlashBlock { session, .. } => {
+                Some((u32::try_from(pc).unwrap_or(u32::MAX), *session))
+            }
+            _ => None,
+        });
+    let mut sessions: Vec<(u32, u32, bool)> =
+        reads.map(|(pc, session)| (pc, session, true)).collect();
+    sessions.extend(
+        job.program
+            .flash
+            .iter()
+            .map(|plan| (plan.boundaries.entry_pc, plan.flash_session, false)),
+    );
     let (Some(document), artifact) = (&job.document, job.artifact()) else {
         // Without a document, `check_declared` has refused any `FlashBlock`.
         return Ok(());
     };
     let variant = document.variant();
-    for (pc, op) in job.program.code.iter().enumerate() {
-        let Op::FlashBlock { session, segment } = op else {
+    for (pc, session, needs_artifact) in sessions {
+        let Some(artifact) = artifact else {
+            if needs_artifact {
+                return Err(JobError::NoArtifact);
+            }
             continue;
         };
-        let artifact = artifact.ok_or(JobError::NoArtifact)?;
-        let pc = u32::try_from(pc).unwrap_or(u32::MAX);
-        let (offset, length) = diag_ir::flash_segment_extent(&variant, *session, *segment)
-            .map_err(|source| JobError::Undeclared { pc, source })?;
-        let end = offset.checked_add(length);
-        if end.is_none_or(|end| end > artifact.len()) {
-            return Err(JobError::SegmentOutsideArtifact {
-                pc,
-                session: *session,
-                segment: *segment,
-                end,
-                artifact_len: artifact.len(),
-            });
+        let extents = match diag_ir::flash_session_extents(&variant, session) {
+            Ok(extents) => extents,
+            Err(VmError::UnknownFlashSession { .. }) if !needs_artifact => continue,
+            Err(source) => return Err(JobError::Undeclared { pc, source }),
+        };
+        for (segment, (offset, length)) in extents.into_iter().enumerate() {
+            let end = offset.saturating_add(length);
+            if end > artifact.len() {
+                return Err(JobError::SegmentOutsideArtifact {
+                    pc,
+                    session,
+                    segment: segment as u32,
+                    end,
+                    artifact_len: artifact.len(),
+                });
+            }
         }
     }
     Ok(())
@@ -1771,6 +1801,10 @@ mod tests {
         logs: Vec<String>,
         /// Set when this message is logged, as a dropped job future would.
         cancel_on_log: Option<(&'static str, Arc<AtomicBool>)>,
+        /// The job's artifact, which `artifact_bytes` serves; without one it fails.
+        artifact: Option<Artifact>,
+        /// The blocks `flash_transfer` was given, in order; without this list it fails.
+        transferred: Option<Vec<Vec<u8>>>,
     }
 
     impl DiagHost for FakeHost {
@@ -1802,8 +1836,14 @@ mod tests {
         ) -> Result<Option<Vec<u8>>, HostError> {
             Err(HostError::Unsupported("SecurityAccess"))
         }
-        fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), HostError> {
-            Err(HostError::Unsupported("FlashTransfer"))
+        fn flash_transfer(&mut self, _: u32, data: &[u8]) -> Result<(), HostError> {
+            match &mut self.transferred {
+                Some(blocks) => {
+                    blocks.push(data.to_vec());
+                    Ok(())
+                }
+                None => Err(HostError::Unsupported("FlashTransfer")),
+            }
         }
         fn wait(&mut self, _: u64, _: u32) -> Result<bool, HostError> {
             self.waits += 1;
@@ -1818,8 +1858,12 @@ mod tests {
         fn monitor_capture(&mut self, _: u32) -> Result<(), HostError> {
             Err(HostError::Unsupported("MonitorCapture"))
         }
-        fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, HostError> {
-            Err(HostError::Unsupported("FlashBlock"))
+        fn artifact_bytes(&mut self, offset: u64, len: u32) -> Result<Vec<u8>, HostError> {
+            let artifact = self.artifact.as_ref().ok_or(HostError::NoArtifact)?;
+            artifact
+                .slice(offset, len)
+                .map(<[u8]>::to_vec)
+                .ok_or(HostError::ArtifactRange { offset, len })
         }
         fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, HostError> {
             Err(HostError::InputNotEstablished(input))
@@ -13694,23 +13738,68 @@ def main():
         assert!(!guards.link_unconfirmed());
     }
 
-    /// A job that reads block 0 of `segment` of flash session 1 inside the plan of
-    /// [`flash_program`]. The document declares segment 0 at artifact offset 4, `length` bytes
-    /// long, in blocks of 4, and segment 1 at offset 0, 2 bytes long.
-    fn flash_job(segment: u32, length: u64) -> Job {
-        let mut program = flash_program();
-        let transfer = program
-            .code
-            .iter()
-            .position(|op| matches!(op, Op::FlashTransfer { .. }))
-            .expect("the fixture transfers");
-        program.code[transfer - 1] = Op::FlashBlock {
-            session: 1,
-            segment,
+    /// A plan of flash session 1 that downloads, with no erase, the blocks `reads` names, each
+    /// `(segment, index)` as a `FlashBlock` and a `FlashTransfer`, then RequestTransferExit.
+    fn flash_block_program(reads: &[(u32, i64)]) -> Program {
+        let mut code = vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x34 }];
+        for &(segment, index) in reads {
+            code.extend([
+                Op::PushI64(index),
+                Op::FlashBlock {
+                    session: 1,
+                    segment,
+                },
+                Op::FlashTransfer { block: 1 },
+            ]);
+        }
+        code.push(Op::PushBytes(0));
+        let exit = code.len() as u32;
+        code.push(Op::ServiceRequest { service: 0x37 });
+        let mut program = program(code);
+        let ecu = |field_id| diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id,
         };
-        program.validate().expect("the block sits in the plan");
-        let bytes = crate::document::tests::flash_document(&program, &[(4, length, 4), (0, 2, 4)]);
+        program.identity = diag_ir::IdentitySources {
+            vin: None,
+            hardware_part_number: Some(ecu(1)),
+            software_version: Some(ecu(2)),
+        };
+        program.flash.push(diag_ir::FlashRecovery {
+            flash_session: 1,
+            stage: 7,
+            max_resumes: 1,
+            recovery_required: diag_ir::RecoveryRequired::FromPc(1),
+            boundaries: diag_ir::RecoveryBoundaries {
+                entry_pc: 0,
+                erase_pc: 1,
+                transfer_exit_pc: exit,
+                post_transfer_end_pc: exit + 1,
+            },
+            timing: diag_ir::RecoveryTiming {
+                session_timeout_millis: SESSION_TIMEOUT_MS,
+                teardown_margin_millis: TEARDOWN_MARGIN_MS,
+                ecu_startup_millis: 0,
+                confirmation_window_millis: 0,
+            },
+            version_read_retries: 0,
+            no_application: None,
+        });
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// A job whose document declares flash session 1 with `segments` (artifact offset, length,
+    /// block size) and whose plan reads the blocks `reads` names.
+    fn flash_job_of(segments: &[(u64, u64, u32)], reads: &[(u32, i64)]) -> Job {
+        let bytes = crate::document::tests::flash_document(&flash_block_program(reads), segments);
         Job::from_document(JobDocument::new(bytes).unwrap()).unwrap()
+    }
+
+    /// A job that reads block 0 of `segment`. The document declares segment 0 at artifact offset
+    /// 4, `length` bytes long, in blocks of 4, and segment 1 at offset 0, 2 bytes long.
+    fn flash_job(segment: u32, length: u64) -> Job {
+        flash_job_of(&[(4, length, 4), (0, 2, 4)], &[(segment, 0)])
     }
 
     /// The artifact of ten bytes the flash jobs name.
@@ -13748,7 +13837,7 @@ def main():
     fn a_segment_outside_the_artifact_is_refused() {
         let artifact = ten_bytes();
         let named = *artifact.sha256();
-        // Ends exactly at the end: accepted. One byte past it: refused, at the instruction (pc 9 in the fixture).
+        // Ends exactly at the end: accepted. One byte past it: refused, at the instruction (pc 3 in the fixture).
         for (length, accepted) in [(6, true), (7, false)] {
             let job = flash_job(0, length).with_artifact(named, artifact.clone());
             let checked = check_job(&job, policy::build_ceiling());
@@ -13759,10 +13848,10 @@ def main():
                     matches!(
                         checked,
                         Err(JobError::SegmentOutsideArtifact {
-                            pc: 9,
+                            pc: 3,
                             session: 1,
                             segment: 0,
-                            end: Some(11),
+                            end: 11,
                             artifact_len: 10
                         })
                     ),
@@ -13832,5 +13921,105 @@ def main():
         })
         .await
         .unwrap();
+    }
+
+    /// Every segment of a session the program names is checked, also one no block read uses, and
+    /// one the plan names without any block read.
+    #[test]
+    fn every_segment_of_a_named_session_must_be_inside_the_artifact() {
+        let artifact = ten_bytes();
+        let named = *artifact.sha256();
+        // Segment 1 (offset 8, length 3) is past the end; the program reads only segment 0.
+        let job =
+            flash_job_of(&[(0, 4, 4), (8, 3, 4)], &[(0, 0)]).with_artifact(named, artifact.clone());
+        let refused = check_job(&job, policy::build_ceiling());
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::SegmentOutsideArtifact {
+                    session: 1,
+                    segment: 1,
+                    end: 11,
+                    artifact_len: 10,
+                    ..
+                })
+            ),
+            "{refused:?}"
+        );
+        // The same when the plan reads no block: the plan names the session.
+        let job = flash_job_of(&[(0, 4, 4), (8, 3, 4)], &[]).with_artifact(named, artifact.clone());
+        assert!(matches!(
+            check_job(&job, policy::build_ceiling()),
+            Err(JobError::SegmentOutsideArtifact { segment: 1, .. })
+        ));
+        // Both inside: accepted.
+        let job = flash_job_of(&[(0, 4, 4), (8, 2, 4)], &[(0, 0)]).with_artifact(named, artifact);
+        check_job(&job, policy::build_ceiling()).expect("inside");
+    }
+
+    /// An empty artifact holds a zero-length segment at offset 0 and nothing else.
+    #[test]
+    fn an_empty_artifact_and_zero_length_segments() {
+        let empty = Artifact::from_bytes(Vec::new());
+        let named = *empty.sha256();
+        let job = flash_job_of(&[(0, 0, 4)], &[]).with_artifact(named, empty.clone());
+        check_job(&job, policy::build_ceiling()).expect("a zero-length segment at 0 is inside");
+        let job = flash_job_of(&[(0, 1, 4)], &[(0, 0)]).with_artifact(named, empty.clone());
+        assert!(matches!(
+            check_job(&job, policy::build_ceiling()),
+            Err(JobError::SegmentOutsideArtifact {
+                end: 1,
+                artifact_len: 0,
+                ..
+            })
+        ));
+        // A zero-length segment at the end of a file is inside, one past it is not.
+        let ten = ten_bytes();
+        for (offset, accepted) in [(10, true), (11, false)] {
+            let job =
+                flash_job_of(&[(offset, 0, 4)], &[]).with_artifact(*ten.sha256(), ten.clone());
+            assert_eq!(
+                check_job(&job, policy::build_ceiling()).is_ok(),
+                accepted,
+                "offset {offset}"
+            );
+        }
+    }
+
+    /// The bytes a plan's `FlashTransfer`s get are the artifact's slices of the declared
+    /// segments: blocks of a segment that starts past offset 0, the last one short, and a second
+    /// segment. A host that ignored an offset would send other bytes.
+    #[test]
+    fn the_blocks_sent_are_the_artifacts_slices() {
+        let bytes: Vec<u8> = (0..20u8).map(|i| i * 7 + 3).collect();
+        let artifact = Artifact::from_bytes(bytes.clone());
+        // Segment 0: bytes 5..13 in blocks of 3 (3, 3, 2); segment 1: bytes 13..17 in one block.
+        let segments = [(5, 8, 3), (13, 4, 4)];
+        let reads = [(0, 0), (0, 1), (0, 2), (1, 0)];
+        let job =
+            flash_job_of(&segments, &reads).with_artifact(*artifact.sha256(), artifact.clone());
+        check_job(&job, policy::build_ceiling()).expect("the job is valid");
+        let mut host = FakeHost {
+            document: job.document().cloned(),
+            artifact: Some(artifact),
+            transferred: Some(Vec::new()),
+            ..FakeHost::default()
+        };
+        run_plain(
+            job.program(),
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+        )
+        .expect("the plan runs");
+        assert_eq!(
+            host.transferred,
+            Some(vec![
+                bytes[5..8].to_vec(),
+                bytes[8..11].to_vec(),
+                bytes[11..13].to_vec(),
+                bytes[13..17].to_vec(),
+            ])
+        );
     }
 }

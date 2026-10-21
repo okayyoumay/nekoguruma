@@ -224,7 +224,8 @@ pub(crate) struct TransferCounter {
     /// tracked.
     accepted: Option<u64>,
     /// The maxNumberOfBlockLength of the positive RequestDownload response that began the
-    /// transfer; `None` when the response did not carry one ([`max_block_length`]).
+    /// transfer; `None` when the response did not carry one ([`max_block_length`]). It counts
+    /// only while `accepted` is `Some`: every RequestDownload sets both.
     max_block_length: Option<u64>,
 }
 

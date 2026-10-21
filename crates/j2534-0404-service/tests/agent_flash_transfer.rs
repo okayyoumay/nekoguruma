@@ -282,6 +282,17 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .as_ref()
         .expect("a RequestTransferExit marker");
     assert!(exit.complete);
+
+    // The refused block was never sent, so the second job's journal records no block.
+    let journal =
+        Journal::read(&long_block_journal_dir, &long_block_job_key()).expect("the second journal");
+    let transfer = journal
+        .facts
+        .transfer
+        .as_ref()
+        .expect("a transfer-start marker");
+    assert_eq!(transfer.last_block, None);
+    assert!(transfer.exit.is_none());
 }
 
 /// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so

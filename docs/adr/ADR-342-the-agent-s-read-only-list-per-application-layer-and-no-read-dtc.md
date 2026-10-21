@@ -3,7 +3,7 @@
 **Date:** 2026-10-21
 **Status:** Accepted
 **Affects:** `agent` (`src/policy.rs`, `src/host.rs`, `src/link.rs`), ADR-309 item 4, ADR-321 item 6,
-ADR-235 items 2 and 8
+ADR-235 items 2 and 8, ADR-322 Consequences, ADR-328 item 2 and Consequences, ADR-333
 
 ## Context
 
@@ -51,7 +51,7 @@ Three questions were left open by ADR-309 item 4:
      the permission.
    - `WorkerHost::read_dtc` answers `Unsupported` instead of sending ReadDTCInformation, and
      `read_dtc_bytes` is gone.
-   - This supersedes ADR-321 item 6's "the agent keeps serving it". The encoding is unchanged:
+   - This supersedes ADR-321 item 6's "the agent keeps serving it". The dry run (ADR-328 item 2) still builds the instruction's UDS bytes, now the only place that does. The encoding is unchanged:
      `ReadDtc` stays an `Op` variant, the VM still executes it against any `DiagHost`, and the dry
      run and scripted test hosts may still answer it.
 

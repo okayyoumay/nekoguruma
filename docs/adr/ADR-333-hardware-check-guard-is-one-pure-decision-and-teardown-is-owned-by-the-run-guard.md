@@ -1,7 +1,7 @@
 # ADR-333: The Hardware-Check Guard Is One Pure Decision over the Profile, and Teardown Is Owned by the Run Guard
 
 **Date:** 2026-10-19
-**Status:** Accepted
+**Status:** Accepted (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342)
 **Affects:** `crates/ngr-hw-checks` (`guard`, `teardown`, `report::RunGuard`, `docs/hardware-profile.md`), design 13.5 ("Guarded VCI access", "Cleanup"); ADR-275 items 4 and 6; `crates/agent` `policy` (related, unchanged)
 
 ## Context

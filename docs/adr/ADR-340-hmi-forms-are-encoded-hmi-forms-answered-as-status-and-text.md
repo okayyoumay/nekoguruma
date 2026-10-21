@@ -139,8 +139,8 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 5. **The agent's host and the server.** The host keeps, per instance and in memory, a map from
    inquiry number to the request's state, as `wait_elapsed` keeps its timers: the first poll of an
    inquiry generates a `request_id` (UUIDv7, design 4.4), decodes the `HmiForm`, sends
-   `EventBody::HmiRequest { job_id, generation, request_id, inquiry, kind, form }`, with `inquiry`
-   the VM's inquiry number, `kind` `Form` or
+   `EventBody::HmiRequest { job_id, generation, request_id, inquiry, deadline, kind, form }`, with
+   `inquiry` the VM's inquiry number, `deadline` the inquiry's absolute HMI deadline (item 6), `kind` `Form` or
    `Record`, `generation` the job's ownership generation (ADR-229: every job-scoped message
    carries it, and the server applies one only under the current owner and generation), and
    `form` typed (`id` and `params`, which serialize as JSON on the wire, an `Int` as a
@@ -209,18 +209,21 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    Completed: when the procedure reaches its end while that cancel is still held, which ADR-330
    item 2 would let finish, the job ends as cancelled by the HMI timeout instead, as it would have
    at an interruptible point. Every instruction ran, and the job's outcome still says the operator
-   never answered. The timeout outlives a restart: the runner commits a journal record of it
-   (`Record::HmiTimedOut`) before the host returns the timed-out answer, so no checkpoint can
-   hold that answer without the record, and a restart that finds the record starts its run with
-   the cancel already raised and the timeout as its reason. The same rules then apply to the
-   resumed run, whether it resumes from a checkpoint or starts again from the first instruction,
-   so a repeated form answered after the restart cannot let the job end as Completed. A
-   handover to another device (ADR-229) keeps it too: the record is part of the checkpoint
-   summary the agent uploads, and the server, which also learns of it from the withdrawal
-   (`timed_out` set, item 5) before or without that summary, marks the job as timed out and
-   puts the mark in the instruction it signs for the receiving device, whose run then starts with
-   the cancel raised in the same way, whether it resumes from the summary's checkpoint or makes
-   a plain start (ADR-335). A procedure that ends by `diag.fail` or an error while the cancel is held ends
+   never answered. The timeout outlives a restart and a handover because
+   it is a deadline, not an event. When an inquiry opens, the runner commits its absolute
+   deadline to the journal (`Record::HmiDeadline { inquiry, at }`) before the host sends
+   `HmiRequest`, which carries the same `deadline`; the server keeps it with the inquiry. The
+   inquiry is timed out once that time has passed without an answer the host took, whoever
+   notices: a run that resumes with a journaled deadline already passed and no answer after it
+   starts with the cancel raised and the timeout as its reason, whether it resumes from a
+   checkpoint or starts again from the first instruction, so a crash between the expiry and the
+   timed-out answer loses nothing. A resumed run that reaches an inquiry with a journaled deadline
+   keeps that deadline under its new request id instead of starting a new one. For a handover (ADR-229) the server decides from its own copy:
+   an inquiry whose deadline has passed with no answer the server relayed counts as timed out,
+   and the server puts that mark in the instruction it signs for the receiving device, whose run
+   then starts with the cancel raised, so the mark does not depend on a message from the failed
+   device. An inquiry whose request never reached the server was never shown to the operator;
+   the receiving device asks it for the first time, which the timeout rule allows. A procedure that ends by `diag.fail` or an error while the cancel is held ends
    that way, as ADR-330 item 2 says. Where the timeout's value comes from (the job
    instruction or the agent's settings) is a separate decision.
 7. **The dry run keeps its contract.** `Script::form` and `Script::record` still take answer

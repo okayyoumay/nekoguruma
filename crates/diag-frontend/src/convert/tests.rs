@@ -430,8 +430,17 @@ impl diag_ir::DiagHost for Recording {
     fn read_dtc(&mut self, _: u8) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)
     }
-    fn routine_control(&mut self, _: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, NotSent> {
-        Err(NotSent)
+    // Recorded as the whole message after the SID, answered positively.
+    fn routine_control(
+        &mut self,
+        routine: u16,
+        sub: u8,
+        payload: &[u8],
+    ) -> Result<Vec<u8>, NotSent> {
+        let rid = routine.to_be_bytes();
+        self.0
+            .push((0x31, [&[sub, rid[0], rid[1]][..], payload].concat()));
+        Ok(vec![0x71, sub, rid[0], rid[1]])
     }
     fn security_access(&mut self, _: u64, _: u8, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
         Err(NotSent)
@@ -462,6 +471,28 @@ impl diag_ir::DiagHost for Recording {
 
 /// The SID and operand of each request sent.
 type Sent = Vec<(u16, Vec<u8>)>;
+
+/// The requests the first variant's program for `main.star` beside `files` sends, and the
+/// failure it ends in, if it fails.
+fn requests_sent_until_failure(
+    files: Vec<(String, Vec<u8>)>,
+    source: &str,
+) -> (Sent, Option<diag_ir::Failure>) {
+    let converted = convert(with(files, "main.star", source));
+    let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
+    let bytes = document.procedure().expect("a program");
+    let program: diag_ir::Program = postcard::from_bytes(bytes.bytes()).expect("a program");
+    let mut vm = diag_ir::Vm::new(&program);
+    let mut host = Recording::default();
+    loop {
+        match vm.step(&program, &mut host).expect("runs") {
+            diag_ir::StepOutcome::Continue => {}
+            diag_ir::StepOutcome::Finished => return (host.0, None),
+            diag_ir::StepOutcome::Failed(failure) => return (host.0, Some(failure)),
+            other => panic!("{other:?}"),
+        }
+    }
+}
 
 /// The requests each variant's program for `main.star` sends, by variant.
 fn requests_sent(source: &str) -> Vec<(String, Sent)> {
@@ -614,10 +645,10 @@ fn a_request_needs_its_arguments_at_ingestion() {
             "def f(n):\n    diag.request(0x22, {\"did\": n})\n\ndef main():\n    f(0xF190)\n",
             NonConstantArgument,
         ),
-        // A field's value would need encoding at run time.
+        // A field's value known only at run time is encoded then, but only for a uint field.
         (
-            "def f(n):\n    diag.request(0x19, {\"sub\": 2, \"statusMask\": n})\n\n\
-             def main():\n    f(0xFF)\n",
+            "def f(v):\n    diag.request(0x2E, {\"did\": 0xF190, \"vin\": v})\n\n\
+             def main():\n    f(\"NGRSIMECU00000003\")\n",
             NotLowerable,
         ),
         (
@@ -1415,7 +1446,7 @@ fn a_routine_is_checked_at_ingestion() {
     assert_eq!(found.len(), 1, "{found:?}");
     assert_eq!(found[0].0, NonConstantArgument);
     assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
-    // A run-time value for one of its fields is not encoded at ingestion.
+    // A run-time value for one of its fields is encoded at run time.
     let fields_with_level = format!(
         "{}\nroutine:checkProgrammingDependencies:start:request,level,0,,uint,8,,,,,,,,,\n",
         example()
@@ -1442,26 +1473,19 @@ fn a_routine_is_checked_at_ingestion() {
     };
     let found =
         level("def f(l):\n    diag.routine(0xFF01, 1, {\"level\": l})\n\ndef main():\n    f(3)\n");
-    assert_eq!(found.len(), 1, "{found:?}");
-    assert_eq!(found[0].0, NotLowerable);
-    assert!(found[0].1.contains("`diag.routine`"), "{found:?}");
+    assert_eq!(found, []);
     // Another routine's constant of the same name is not this routine's: the run-time value is
     // still a field's, not a selecting constant's.
     let other = format!(
         "{}routine:eraseMemory:start:request,level,0,,uint,8,,,,,,0x01,,,\n",
         fields_with_level
     );
-    let found: Vec<_> = procedures(with(
+    procedures(with(
         with(example(), "fields.csv", &other),
         "main.star",
         "def f(l):\n    diag.routine(0xFF01, 1, {\"level\": l})\n\ndef main():\n    f(3)\n",
     ))
-    .expect_err("rejected")
-    .errors
-    .into_iter()
-    .map(|e| e.code)
-    .collect();
-    assert_eq!(found, [NotLowerable]);
+    .expect("the field's value is encoded at run time");
     // A value the field cannot hold, and a sub-function out of range.
     let found = level("def main():\n    diag.routine(0xFF01, 1, {\"level\": 256})\n");
     assert_eq!(
@@ -1481,6 +1505,189 @@ fn a_routine_is_checked_at_ingestion() {
     assert_eq!(
         codes("def main():\n    diag.request(0x31, {})\n"),
         [UnknownService]
+    );
+}
+
+#[test]
+fn a_request_param_known_only_at_run_time_is_encoded_when_sent() {
+    // The status mask is the request's one byte after the sub-function.
+    let source = |value: &str| {
+        format!(
+            "def f(m):\n    diag.request(0x19, {{\"sub\": 2, \"statusMask\": m}})\n\n\
+             def main():\n    f({value})\n"
+        )
+    };
+    for (value, byte) in [("0", 0x00), ("0x5A", 0x5A), ("255", 0xFF)] {
+        let (sent, failure) = requests_sent_until_failure(example(), &source(value));
+        assert_eq!(failure, None, "{value}");
+        assert_eq!(sent, [(0x19, vec![0x02, byte])], "{value}");
+    }
+    // A value the field cannot hold ends the procedure before anything is sent.
+    for value in [
+        "256",
+        "-1",
+        "9223372036854775807",
+        "-9223372036854775807 - 1",
+    ] {
+        let (sent, failure) = requests_sent_until_failure(example(), &source(value));
+        assert_eq!(sent, [], "{value}");
+        let failure = failure.unwrap_or_else(|| panic!("{value} is refused"));
+        assert_eq!(failure.code, "PARAM_OUT_OF_RANGE", "{value}");
+        let detail = String::from_utf8(failure.detail).expect("UTF-8");
+        assert!(
+            detail.contains("`statusMask`")
+                && detail.contains("8-bit")
+                && detail.contains("line 2"),
+            "{detail}"
+        );
+    }
+}
+
+#[test]
+fn run_time_params_are_laid_out_as_the_constant_encoding_lays_them_out() {
+    // Fields of the routine's request after its identifier, given out of their order: `a` of 16
+    // bits, `b` of 8, `c` of 8 with a constant value, and `d` of 64 (request values are
+    // byte-aligned whole bytes, csv-tables 5.3).
+    let fields = format!(
+        "{}\n\
+         routine:checkProgrammingDependencies:start:request,a,0,,uint,16,,,,,,,,,\n\
+         routine:checkProgrammingDependencies:start:request,b,2,,uint,8,,,,,,,,,\n\
+         routine:checkProgrammingDependencies:start:request,c,3,,uint,8,,,,,,,,,\n\
+         routine:checkProgrammingDependencies:start:request,d,4,,uint,64,,,,,,,,,\n",
+        example()
+            .into_iter()
+            .find(|(n, _)| n == "fields.csv")
+            .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+            .expect("fields.csv")
+            .trim_end()
+    );
+    let files = with(example(), "fields.csv", &fields);
+    let call = |a: &str, b: &str, d: &str| {
+        format!("diag.routine(0xFF01, 1, {{\"b\": {b}, \"a\": {a}, \"c\": 9, \"d\": {d}}})")
+    };
+    for (a, b, d) in [
+        ("0xABCD", "0x5A", "0x0102030405060708"),
+        ("0xFFFF", "0xFF", "9223372036854775807"),
+        ("0", "0", "0"),
+        ("0x8001", "0x80", "1"),
+    ] {
+        let constant = requests_sent_until_failure(
+            files.clone(),
+            &format!("def main():\n    {}\n", call(a, b, d)),
+        );
+        let run_time = requests_sent_until_failure(
+            files.clone(),
+            &format!(
+                "def f(a, b, d):\n    {}\n\ndef main():\n    f({a}, {b}, {d})\n",
+                call("a", "b", "d")
+            ),
+        );
+        assert_eq!(constant.1, None);
+        assert_eq!(run_time, constant, "{a} {b} {d}");
+    }
+    // Each field's own width bounds its value; a 64-bit field takes every non-negative int.
+    for (a, b, d, field) in [
+        ("0x10000", "0", "0", "`a`"),
+        ("0", "256", "0", "`b`"),
+        ("0", "0", "-1", "`d`"),
+    ] {
+        let (sent, failure) = requests_sent_until_failure(
+            files.clone(),
+            &format!(
+                "def f(a, b, d):\n    {}\n\ndef main():\n    f({a}, {b}, {d})\n",
+                call("a", "b", "d")
+            ),
+        );
+        assert_eq!(sent, []);
+        let failure = failure.expect("refused");
+        assert_eq!(failure.code, "PARAM_OUT_OF_RANGE");
+        assert!(
+            String::from_utf8(failure.detail)
+                .expect("UTF-8")
+                .contains(field),
+            "{field}"
+        );
+    }
+}
+
+#[test]
+fn a_little_endian_run_time_param_is_laid_out_as_its_constant_is() {
+    // Every row gains an empty `byte_order`, and two 16-bit fields of the routine's request
+    // after its identifier take `little`; `b` stays big-endian.
+    let fields: String = example()
+        .into_iter()
+        .find(|(n, _)| n == "fields.csv")
+        .map(|(_, c)| String::from_utf8(c).expect("UTF-8"))
+        .expect("fields.csv")
+        .lines()
+        .enumerate()
+        .map(|(at, line)| {
+            if at == 0 {
+                format!("{line},byte_order\n")
+            } else {
+                format!("{line},\n")
+            }
+        })
+        .chain([
+            "routine:checkProgrammingDependencies:start:request,a,0,,uint,16,,,,,,,,,,little\n"
+                .to_owned(),
+            "routine:checkProgrammingDependencies:start:request,b,2,,uint,16,,,,,,,,,,\n"
+                .to_owned(),
+            "routine:checkProgrammingDependencies:start:request,c,4,,uint,32,,,,,,,,,,little\n"
+                .to_owned(),
+        ])
+        .collect();
+    let files = with(example(), "fields.csv", &fields);
+    let call = |a: &str, b: &str, c: &str| {
+        format!("diag.routine(0xFF01, 1, {{\"c\": {c}, \"a\": {a}, \"b\": {b}}})")
+    };
+    for (a, b, c) in [
+        ("0x1234", "0x1234", "0x01020304"),
+        ("0xFF00", "0x00FF", "0xFFFFFFFF"),
+    ] {
+        let constant = requests_sent_until_failure(
+            files.clone(),
+            &format!("def main():\n    {}\n", call(a, b, c)),
+        );
+        let run_time = requests_sent_until_failure(
+            files.clone(),
+            &format!(
+                "def f(a, b, c):\n    {}\n\ndef main():\n    f({a}, {b}, {c})\n",
+                call("a", "b", "c")
+            ),
+        );
+        assert_eq!(constant.1, None);
+        assert_eq!(run_time, constant, "{a} {b} {c}");
+    }
+    // The little-endian field's low byte goes first.
+    let (sent, _) = requests_sent_until_failure(
+        files,
+        "def f(a):\n    diag.routine(0xFF01, 1, {\"a\": a, \"b\": 0, \"c\": 0})\n\n\
+         def main():\n    f(0x1234)\n",
+    );
+    assert_eq!(sent[0].1[3..5], [0x34, 0x12]);
+}
+
+#[test]
+fn a_run_time_param_must_be_an_int_for_a_uint_field() {
+    use crate::star::StarCode::{NotLowerable, UnsupportedSyntax};
+    let codes =
+        |source: &str| -> Vec<_> { request_errors(source).into_iter().map(|e| e.0).collect() };
+    assert_eq!(
+        codes(
+            "def f(m):\n    diag.request(0x19, {\"sub\": 2, \"statusMask\": m})\n\n\
+             def main():\n    f(\"x\")\n"
+        ),
+        [UnsupportedSyntax]
+    );
+    // A value that may be an int or a str has no one type to encode.
+    assert_eq!(
+        codes(
+            "def f(m, c):\n    v = m\n    if c:\n        v = \"x\"\n    \
+             diag.request(0x19, {\"sub\": 2, \"statusMask\": v})\n\n\
+             def main():\n    f(1, False)\n"
+        ),
+        [NotLowerable]
     );
 }
 

@@ -1,7 +1,7 @@
 # ADR-313: Selecting a Request's Service from an Index of the Tables
 
 **Date:** 2026-10-16
-**Status:** Accepted (Decision item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6)
+**Status:** Accepted (Decision item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6; item 4 amended by ADR-341: a field's value known only at run time is encoded at run time into a fixed-length `uint` field)
 **Affects:** `diag-frontend` (`src/convert.rs`, `src/convert/services.rs`, `src/star.rs`,
 `src/star/lower.rs`), `crates/diag-frontend/docs/csv-tables.md` 5.3,
 `crates/diag-frontend/docs/starlark-subset.md` 3.1, 3.2 and 3.4; ADR-311 item 4

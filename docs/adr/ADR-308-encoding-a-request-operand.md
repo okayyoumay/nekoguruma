@@ -1,7 +1,7 @@
 # ADR-308: Encoding a Request Operand
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (the Consequences' run-time parameter decided by ADR-341)
 **Affects:** `diag-ir` (`src/encode.rs`, `schema/README.md`), design 8.2.2,
 `crates/diag-frontend/docs/csv-tables.md` 5.3
 

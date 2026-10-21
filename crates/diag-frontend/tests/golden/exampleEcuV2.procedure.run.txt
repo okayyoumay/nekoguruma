@@ -3,6 +3,7 @@ request 22 F1 90
 request 22 F1 86
 log 1 extended session
 log 1 uint round trip
+request 19 02 09
 send-receive 4 19 02 09
 log 1 all DTC status bits supported
 log 1 two DTCs

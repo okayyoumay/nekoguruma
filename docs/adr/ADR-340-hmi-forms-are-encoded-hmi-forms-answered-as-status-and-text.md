@@ -139,7 +139,8 @@ each call's value and how a decline, a timeout and a cancel surface; which check
 5. **The agent's host and the server.** The host keeps, per instance and in memory, a map from
    inquiry number to the request's state, as `wait_elapsed` keeps its timers: the first poll of an
    inquiry generates a `request_id` (UUIDv7, design 4.4), decodes the `HmiForm`, sends
-   `EventBody::HmiRequest { job_id, generation, request_id, kind, form }` with `kind` `Form` or
+   `EventBody::HmiRequest { job_id, generation, request_id, inquiry, kind, form }`, with `inquiry`
+   the VM's inquiry number, `kind` `Form` or
    `Record`, `generation` the job's ownership generation (ADR-229: every job-scoped message
    carries it, and the server applies one only under the current owner and generation), and
    `form` typed (`id` and `params`, which serialize as JSON on the wire), and returns `Ok(None)`;
@@ -154,7 +155,13 @@ each call's value and how a decline, a timeout and a cancel surface; which check
    (choices, criteria, required items) before it answers, and for a record stores the record
    itself (design 4.3.1); only the judgment reaches the agent. A new host instance, which every
    restart creates, opens a new `request_id` for the same inquiry number: the server supersedes
-   the job's open inquiry, and a late answer to a superseded id is audit data only. A server
+   the job's open inquiry, and a late answer to a superseded id is audit data only. Because a
+   restart may repeat the primitive (it is `Safe`, ADR-335) after the server stored a record but
+   before the agent's checkpoint after it, the server keeps one record per job and inquiry number:
+   a record entered under a later request id for the same job and inquiry number supersedes the
+   earlier one, which stays as audit data only, so the job's records hold no duplicate. A replay
+   from the start that reaches the same inquiry number again (ADR-335) is the same step of the
+   same job, so superseding is right there too; only the answer is never reused. A server
    refusal (an id the server does not have, params the form cannot take) is a command of its own,
    `HmiRefused { job_id, generation, request_id, reason }`: the next poll closes the inquiry and
    returns `HostError::HmiRefused`, a resumable host error and not an answer, so a resume at the

@@ -69,8 +69,9 @@ decisions behind them:
 1. **One log per job, an entry per exchange, in the reader's terms.** The agent writes a
    communication log for every job and ownership generation, as JSON Lines beside the job's
    journal and protected like it (design 5.5). A header at job start (listing the candidate
-   combinations with their document hashes, since the chosen one and its document are known only
-   after identification, ADR-325 item 7, and follow as an event), with the `vci_connected`
+   combinations with their document hashes and conversion identities, since the chosen one and
+   its document are known only after identification, ADR-325 item 7, and follow as an event),
+   with the `vci_connected`
    event and a `link_opened` event per link (a job may open several in turn, design 8.8.2), gives
    everything needed to read it. There is one entry for each request the agent sends or refuses
    before sending, from any origin; system events share the timeline. Each entry says, in
@@ -133,9 +134,9 @@ decisions behind them:
      point at the definition, the session, access or sequence, an attempt counter another tester
      may have used up, authentication, and codes with no known meaning;
    - no response is `vehicle` only with the send confirmed (or an answer of the ECU in the
-     exchange) on a link that has an answer of the ECU since its last link error and reported
-     none during the exchange; otherwise `undetermined`, since a wrong address, a response filter
-     or the VCI's receive path is not excluded;
+     exchange) on a link that has an answer of the ECU since its last link error, to a request
+     whose response the worker matches the same way, and reported none during the exchange; otherwise `undetermined`, since a wrong address, a response filter
+     or pattern (so a response the worker dropped) or the VCI's receive path is not excluded;
    - a timeout before the limit in force, or after it where no unseen pending can explain the
      delay, is `system`; a final response after it is `vehicle`;
    - a timeout or response later than P2 on a link whose VCI absorbs pendings, with none seen, is
@@ -150,7 +151,8 @@ decisions behind them:
      response;
    - a request that collects every answer takes the most severe of its answers' classifications,
      each answer judged on its own against the window, and silence is no fault only for the
-     functional presence request with its send confirmed (ADR-327 item 2); on a guard's request a second ECU is `vehicle`
+     functional presence request with its send confirmed and no link error in its window
+     (ADR-327 item 2); on a guard's request a second ECU is `vehicle`
      (design 8.9.1); a request meant for one ECU that gets more than
      one answer is `vehicle`;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
@@ -161,7 +163,8 @@ decisions behind them:
 7. **Responses after their exchange.** The agent reads the link's items while it waits and when
    it closes the link, so a response that the worker delivers after its exchange is a
    `late_response` entry referring to that exchange, judged on its own against that exchange's
-   limits. A primitive the agent stopped waiting for stays in flight, and its end, whatever it
+   limits: one that started within them is `system`, since the system missed an answer in time,
+   and settles the exchange. A primitive the agent stopped waiting for stays in flight, and its end, whatever it
    is, is a `primitive_ended` entry that settles the exchange: it carries that end as an exchange
    entry would, with every item of the primitive that came after the earlier entry (transmit
    indications, start-of-message indications, forwarded pendings), so the send and the limits are

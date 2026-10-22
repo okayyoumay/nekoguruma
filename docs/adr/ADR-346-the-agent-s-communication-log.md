@@ -198,7 +198,8 @@ decisions behind them:
      pendings a pending may precede it even within P2); after a pending the ECU
      owes its final response;
    - a request that collects every answer takes the most severe of its answers' classifications
-     and of any link error or possible pending during its window, each answer judged on its own against the window, and silence is no fault only for the
+     and of any link error or possible pending during its window (another link's error counts
+     as `undetermined`), each answer judged on its own against the window, and silence is no fault only for the
      functional presence request with its send confirmed, no link error in its window and no
      possible pending (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
@@ -231,7 +232,8 @@ decisions behind them:
      clock readings, the measured gap, the tolerance and each fit test, so a reader can redo it;
    - a response the worker delivers after the exchange ended (`late_response`): started within
      the limit less the margin it is `system`, since the system missed an answer in time; after
-     the limit plus the margin `vehicle`; otherwise `undetermined`; it belongs to the ended exchange it
+     the limit plus the margin `vehicle`, or its outcome's classification if that is more
+     severe; otherwise `undetermined`; it belongs to the ended exchange it
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication or forwarded pending that

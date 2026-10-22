@@ -214,6 +214,10 @@ decisions behind them:
      without a final response (a pending alone leaves one owed) and
      with a request that may have reached the ECU whole (not `not_sent` or `partial`), whose late
      answers they may be;
+   - an answer to an exchange made while an earlier exchange with the same match is still owed
+     its final response (one whose request may have reached the ECU whole) may be that one's late
+     answer, since the worker gives an answer to the primitive in flight, so the exchange is at
+     least `undetermined` and the earlier one stays unsettled;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
      the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when

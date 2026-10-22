@@ -194,9 +194,9 @@ decisions behind them:
    - a suppressed positive response, only for a service with a sub-function as the definition
      declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes after a confirmed send,
      with an earlier matched answer, no link error and no pending seen or possible, `vehicle` when one comes anyway, not late, on
-     a link that forwards pendings, and `undetermined` otherwise (on a link whose VCI absorbs
-     pendings a pending may precede it even within P2); after a pending the ECU
-     owes its final response;
+     a link that forwards pendings with none seen, fault-free after a forwarded pending (the ECU
+     then owes its final response), and `undetermined` on a link whose VCI absorbs pendings,
+     where a pending may precede it even within P2;
    - a request that collects every answer takes the most severe of its answers' classifications
      and of any link error or possible pending during its window (another link's error counts
      as `undetermined`), each answer judged on its own against the window, and silence is no fault only for the
@@ -224,8 +224,9 @@ decisions behind them:
    nothing. The settling entries
    are:
    - the end of a primitive the agent stopped waiting for (`primitive_ended`), with every item
-     that came after the entry, classified as if the agent had waited, except that an end that
-     would be fault-free is `system`, since the job gave up on it; an end by a lost VCI or a worker exit
+     that came after the entry, classified as if the agent had waited, except that an end within the
+     limit in force is `system` whatever its outcome, since the job gave up on an exchange that
+     ended in time; an end by a lost VCI or a worker exit
      takes that row;
    - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended, each
      with its own classification, with the

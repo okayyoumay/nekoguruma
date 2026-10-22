@@ -204,7 +204,7 @@ decisions behind them:
      and of any link error or possible pending during its window (another link's error counts
      as `undetermined`), each answer judged on its own against the window, and silence is no fault only for the
      functional presence request with its send confirmed, no link error in its window and no
-     possible pending (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
+     possible pending, and no pending seen (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
      unless an earlier exchange with the same match is still unanswered, whose late answer the
      extra one may be;
@@ -242,8 +242,9 @@ decisions behind them:
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link
      error of the exchange's time that comes after the entry (`late_item`); a forwarded pending after the VCI ended the exchange is
-     judged like a late response against the limit before it; a late start-of-message indication turns an exchange
-     that ended without a response into `response_incomplete`.
+     judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response,
+     and turns an exchange that ended without a response into `response_incomplete` only when its
+     time does not decide.
 
    The J2534 worker discards a frame no primitive expects (ADR-100), so on such links a late
    response does not reach the log; capturing it would need a receive-only primitive beside the

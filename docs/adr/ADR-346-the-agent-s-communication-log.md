@@ -120,7 +120,8 @@ decisions behind them:
    8.6), while no other exchange on the physical channel is in flight with that identifier and the
    API sends no tester present of its own on it, since the J2534 worker gives a TxDone to every
    link on the channel (ADR-151), and no ended exchange on that identifier could still own it
-   (one whose send is unknown and that nothing definite ended, within its limit in force).
+   (one whose send is unknown and that nothing definite ended, however long ago, since its
+   indication may come late; counted since the link's evidence last started over).
    Any answer of the ECU, a pending or a first frame included, confirms the send; a flow-control
    frame shows only that the first frame went out (`partial`). `not_sent` needs a definite refusal
    or a transmit error; a failed start of the primitive is `unknown`.

@@ -713,7 +713,7 @@ fn the_example_write_procedure_lowers_and_dry_runs_for_every_variant() {
             .response("securityAccess", [0x67, 0x01, 0x00, 0x00, 0x00, 0x00])
             .response("securityAccess", [0x67, 0x02])
             .response("eraseMemory.start", [0x71, 0x01, 0xFF, 0x00])
-            .response("requestDownload", [0x74, 0x20, 0x01, 0x00])
+            .response("requestDownload", [0x74, 0x20, 0x01, 0x02])
             .response("requestTransferExit", [0x77])
             .response(
                 "checkProgrammingDependencies.start",

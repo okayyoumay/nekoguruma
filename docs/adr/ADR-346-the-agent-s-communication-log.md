@@ -262,9 +262,9 @@ decisions behind them:
      identifier for a transmit indication or loopback echo, or its response identifier for a
      start or pending), a late link error also settling the later exchanges that relied on answers
      from before it (an owed request survives it); a forwarded pending after the VCI ended the exchange is
-     judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response,
-     and turns an exchange that ended without a response into `response_incomplete` only when its
-     time does not decide.
+     judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response
+     once that response completes; until then the exchange is `response_incomplete`
+     (`undetermined`), since an ECU that stopped and a frame lost on the way look the same.
 
    The J2534 worker discards a frame no primitive expects (ADR-100), so on such links a late
    response does not reach the log; capturing it would need a receive-only primitive beside the

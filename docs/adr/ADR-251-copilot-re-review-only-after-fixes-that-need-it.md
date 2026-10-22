@@ -1,7 +1,7 @@
 # ADR-251: Copilot Re-Review Only After Fixes That Need It
 
 **Date:** 2026-10-08
-**Status:** Accepted (applies to whichever reviewer the pull request has, Codex or Copilot, ADR-312; Decision item 1 amended: a sweep fix outside the round's findings also re-requests)
+**Status:** Accepted (applies to whichever reviewer the pull request has, Codex or Copilot, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 0, 4 and 5), `.github/copilot-instructions.md` ("Writing findings"), `CLAUDE.md` ("Pull requests")
 
 ## Context

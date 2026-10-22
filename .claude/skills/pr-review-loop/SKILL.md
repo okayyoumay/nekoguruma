@@ -236,7 +236,9 @@ spot that was named. Before the first review request (Step 0) and in every round
 (Step 3, before its checks), read the whole PR diff with the round's uncommitted edits in it
 (`git diff $(git merge-base origin/main HEAD)`, plus any new file `git status --short
 --untracked-files=all` lists), not only the round's
-fix, for each kind below, and fix what you find in the same push:
+fix. A diff holds no commit messages and no PR description, so read those too: the branch's
+messages (`git log origin/main..HEAD`), the round's draft message and the PR description. Check
+each kind below and fix what you find in the same push:
 
 - **Cross-document drift.** A rule stated in more than one place (an ADR item, a design
   section, the ADR's `docs/adr/INDEX.md` row and theme entry, the glossary, a crate's docs, a
@@ -378,7 +380,8 @@ fallback review in Step 0 is done:
    - any line the loop's fixes made untrue, such as a test count or a list of changes.
 
    Send the whole description with the update, never only the changed section; an update
-   replaces the body.
+   replaces the body. Before sending it, check the refreshed description for the sweep's
+   cross-document drift, dropped qualifiers and citations, since no later sweep reads it.
 5. **Hand over.** Mark the PR ready for review and tell the maintainer in the project thread that it is
    ready, listing anything accepted as a limitation, anything added to the backlog, and any
    fix the reviewer did not review because the loop ended without a re-request. The maintainer

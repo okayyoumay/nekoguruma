@@ -169,7 +169,8 @@ decisions behind them:
    by least delay, unwrapped from 32 bits (ISO 22900-2:2022 8.1.6.1), with a new epoch for a
    reset, a backward step or a reconnect whose clock did not carry on.
 9. **Per message, raw CAN deferred.** The log records messages (`layer: "message"`) with a
-   `frames` field reserved. Design 8.11 lists what it cannot place: transport-level faults
+   `frames` field reserved. Design 8.11 lists what it cannot place: the tester-present requests the API sends itself (the
+   log records that the setting is on and any error it reports), transport-level faults
    (ISO 15765-2:2024 9.6.5, 9.7, 9.8) beyond what the error information names, CAN-level causes, a
    response the worker drops as not matching, a late answer that matches the next request, and the
    timing inside absorbed pendings.

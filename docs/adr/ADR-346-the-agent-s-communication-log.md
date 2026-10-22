@@ -151,9 +151,11 @@ decisions behind them:
      no link error during the exchange, and never for a missing flow-control frame); and a
      pending the VCI absorbed (excluded on a link that forwards pendings, or by timing within P2
      judged on one clock; a pending is never presumed absent);
-   - one presumption is accepted, and only one: the VCI's own timer is presumed right where its
-     timing cannot be judged, since otherwise no silence could be placed on a link without
-     transmit times; an entry that rests on it says so;
+   - one presumption is accepted, and only one: the VCI's own timer and its handling of pendings
+     as configured (each pending restarts its wait) are presumed right where they cannot be
+     judged (so a timeout at P2 shows that no pending came), since otherwise no silence could be
+     placed on a link without transmit times or on one whose VCI absorbs pendings; an entry
+     that rests on it says so;
    - an exchange is `vehicle` when every reading the evidence leaves is a fault of the ECU or
      the vehicle network; `system` when every reading names a failed part of the system, or the evidence shows one (a refusal
      by the agent or the worker for its own reasons, a worker or RPC failure, lost events, a
@@ -223,7 +225,8 @@ decisions behind them:
      that came after the entry, classified as if the agent had waited, except that an end that
      would be fault-free is `system`, since the job gave up on it; an end by a lost VCI or a worker exit
      takes that row;
-   - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended, with the
+   - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended, each
+     with its own classification, with the
      clock readings, the measured gap, the tolerance and each fit test, so a reader can redo it;
    - a response the worker delivers after the exchange ended (`late_response`): started within
      the limit less the margin it is `system`, since the system missed an answer in time; after

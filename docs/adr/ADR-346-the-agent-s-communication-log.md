@@ -133,7 +133,8 @@ decisions behind them:
    the exchange. A receive timeout is an outcome of its exchange; only other error events, on
    any link of the same physical channel, count as link errors. The link sets
    `CP_RC21Handling` and `CP_RC23Handling` to 0, so the API repeats no request unseen on a busy
-   answer, and the agent never sets the suppress-positive-response transmit flag (ISO
+   answer, unless the profile declares the code a pending code (ADR-309 item 5), which the log
+   then treats as a pending, and the agent never sets the suppress-positive-response transmit flag (ISO
    22900-2:2022 Annex I.2.1), with which the API would end a silent exchange without a timeout
    and hide an unexpected positive response. A primitive past the agent's deadline holds its
    link (8.4.17.2), so the agent cancels it before the link's next request, and at job end after
@@ -146,7 +147,8 @@ decisions behind them:
      answer in the exchange); the worker dropped a response that did not match, or the address
      or filter is wrong (excluded by an answer in the exchange, or an earlier answer matched the
      same way, by the same response identifier and the same expected response patterns with
-     what they echo of the request, such as a data identifier, since the last link error on the physical channel and the target's last reset or
+     what they echo of the request, such as a data identifier, on the same opened link and since
+     the last link error on the physical channel and the target's last reset or
      session change); a frame lost in the transport or the VCI's receive path (excluded only by
      no link error during the exchange, and never for a missing flow-control frame); and a
      pending the VCI absorbed (excluded on a link that forwards pendings, or by timing within P2
@@ -297,7 +299,7 @@ decisions behind them:
 
 - **Implementation work.** The implementation, a backlog item of its own, needs:
   - the link to set `CP_TransmitIndEnable` and `CP_StartMsgIndEnable`, and `CP_RC21Handling` and
-    `CP_RC23Handling` to 0;
+    `CP_RC23Handling` to 0 unless the profile declares the code a pending code;
   - the agent to cancel a primitive past its deadline before the link's next request, and at job
     end after the longest transfer of the largest response its definition allows;
   - the worker to report why it refused a request (invalid parameters, a full queue, a request

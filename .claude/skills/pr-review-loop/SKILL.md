@@ -25,7 +25,8 @@ finding.
 After opening the PR, and after every fix push that Step 4's re-request rule lets through,
 request a review from the PR's reviewer. Before the first request, run the sweep ("Sweep: the
 kinds that recur", below) over the whole diff, and take what it fixes through Step 3's checks
-before pushing it. The reviewer is Codex until a case below switches the PR
+before pushing it. Then make the first request: Step 4's re-request rule governs only rounds
+after a review, so a push of sweep fixes never skips the first review. The reviewer is Codex until a case below switches the PR
 to Copilot; from then on it stays Copilot for the rest of the PR. Never switch back, and never ask
 both: each reviewer reads the whole diff again from scratch, so a second reviewer on the same PR
 adds a full round of new findings instead of converging.

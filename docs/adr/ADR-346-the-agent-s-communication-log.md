@@ -222,7 +222,7 @@ decisions behind them:
      power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
      the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
      the vehicle's supply drops. A clock that restarted does not decide it, nor does a
-     reconnected VCI with another serial number or a gap that spans an agent restart, and on
+     reconnected VCI with another serial number, or with none from the API on either connection, or a gap that spans an agent restart, and on
      J2534, whose frame clock has a vendor-defined origin (ADR-120), the loss stays
      `undetermined` unless a hardware profile (design 13.5) states how that VCI's clock behaves
      across a power loss.

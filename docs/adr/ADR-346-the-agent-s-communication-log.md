@@ -266,7 +266,8 @@ decisions behind them:
      primitive belongs to its exchange, and only an unbound one needs the single-owner test, with no exchange in flight using its request
      identifier for a transmit indication or loopback echo, or its response identifier for a
      start or pending), a late link error also settling the later exchanges that relied on answers
-     from before it (an owed request survives it), and one whose time cannot be placed on one
+     from before it (an owed request survives it; one whose time falls between exchanges settles
+     them as well), and one whose time cannot be placed on one
      clock (a J2534 error time) counting as possible in every exchange since the link's items
      were last read; a pending bound to its primitive and read late is placed in its exchange as
      if read in time, while one that came after the VCI ended the exchange is judged like a late

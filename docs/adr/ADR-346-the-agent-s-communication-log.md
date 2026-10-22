@@ -127,7 +127,8 @@ decisions behind them:
      response;
    - a request that collects every answer takes the most severe of its answers' classifications,
      each answer judged on its own against the window, and silence is no fault only for the
-     functional presence request (ADR-327 item 2); a request meant for one ECU that gets more than
+     functional presence request (ADR-327 item 2); on a guard's request a second ECU is `vehicle`
+     (design 8.9.1); a request meant for one ECU that gets more than
      one answer is `vehicle`;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`), since a VCI powered from the vehicle's connector drops off when
@@ -168,7 +169,7 @@ decisions behind them:
 - **Leave transmit indications off and rely on responses and loopback.** Every request without a
   response would then be `unknown`, so an ECU that stops answering could never be told from a
   request that never left the VCI. Loopback echoes the whole message and adds receive traffic,
-  and it stays a fallback for a library that refuses the indication.
+  and it counts as evidence only where the link has loopback on.
 - **Align the VCI clock with one `GetTimestamp` reading at link open.** On a J2534 link that call
   reads the worker's synthetic clock, not the frames' (ADR-120). Elsewhere a single sample has
   whatever delay it happened to get.
@@ -190,7 +191,8 @@ decisions behind them:
   - the worker interface's error events to carry their extra error information
     (`vci-service-interface`, both workers, `docs/rpc-api-guide.md`);
   - the host to tell its own deadline from a VCI-ended exchange without a response;
-  - each link to record its timing margin (the VCI's timestamp resolution and timer spread);
+  - each link to record its timing margin, from a configured default or a hardware profile
+    (design 13.5), since no API reports a VCI's timer spread;
   - the log's writer to log secrets and bulk data as length and hash, and to recover after a
     torn last line;
   - the agent to read the link's unbound items (transmit indications, link errors) and those of

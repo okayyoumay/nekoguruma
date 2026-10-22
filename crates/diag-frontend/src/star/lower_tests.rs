@@ -4236,6 +4236,19 @@ def f(n):
     return s
 ";
     assert_refused_reading(lower_in_loop(refused, "f(3)"), "x");
+    // A `continue` belongs to its own loop: in an inner loop it skips the inner assignment,
+    // which the outer loop's code after the inner loop must not count.
+    let nested = "\
+def f():
+    for a in range(1):
+        for u in range(2):
+            if u >= 0:
+                continue
+            z = u
+        r = z
+    return 0
+";
+    assert_refused_reading(lower_in_loop(nested, "f()"), "z");
 }
 
 #[test]
@@ -4261,6 +4274,8 @@ fn a_constant_range_loop_that_runs_assigns_for_the_code_after_it() {
     for helpers in [
         "def f():\n    for t in range(0):\n        y = t\n    return y\n",
         "def f():\n    for t in range(3, 1):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(0, 3, -1):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(3, 0, 1):\n        y = t\n    return y\n",
         "def f(n):\n    for t in range(n):\n        y = t\n    return y\n",
         "N = 3\n\ndef f(N):\n    for t in range(N):\n        y = t\n    return y\n",
         "def f():\n    for t in range(3):\n        y = t\n        if t == 2:\n            break\n    return y\n",

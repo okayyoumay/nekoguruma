@@ -204,10 +204,32 @@ fn invalid_program(
         .and_then(|section| program.sections.get(section))
         .map(|section| section.start_pc);
     // The section function that produced the section, and its call when it was expanded in place.
-    let origin = section
+    let mut origin = section
         .and_then(|section| origins.get(section))
         .cloned()
         .flatten();
+    // A section function expanded in place lays its pieces over the plan's, so a primitive can
+    // have a piece of each at one pc; the error then belongs to the innermost expansion there.
+    if origin.as_ref().is_none_or(|origin| origin.call.is_none())
+        && let Some(start) = start
+    {
+        let inner = program
+            .sections
+            .iter()
+            .zip(origins)
+            .filter(|(other, _)| other.start_pc == start)
+            .filter_map(|(other, origin)| {
+                origin
+                    .as_ref()
+                    .filter(|origin| origin.call.is_some())
+                    .map(|origin| (other.end_pc - other.start_pc, origin))
+            })
+            .min_by_key(|(len, _)| *len)
+            .map(|(_, origin)| origin.clone());
+        if inner.is_some() {
+            origin = inner;
+        }
+    }
     if let (Some(origin), Some(section)) = (&origin, section) {
         // The section's index in the program means nothing in the source; name its function.
         let name = &origin.function;

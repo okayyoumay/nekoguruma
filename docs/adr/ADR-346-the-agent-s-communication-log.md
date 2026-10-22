@@ -170,6 +170,11 @@ cannot place.
      on one clock, is `system`: the VCI stopped waiting too soon. The limit in force is P2 from the
      transmit until a pending is seen, then the earlier of P2* from the latest pending and the 0x78
      completion limit from the first.
+   - **Late final response.** A final response that arrived after the limit in force but before
+     the VCI ended the exchange, measured on one clock, is `vehicle` (the ECU answered late),
+     unless its outcome's own classification is more severe. On a link whose VCI absorbs pendings
+     only the completion limit counts, since a response beyond P2 there may follow pendings the
+     log cannot see.
    - **Deadline.** An agent deadline that passed while the VCI never ended the exchange is
      `system`, sent or not, since the VCI must end its own primitive within its limits. This rule comes before the no-response rules.
    - **Transmit and receive errors.** A transmit error or a missing acknowledge is `not_sent` and

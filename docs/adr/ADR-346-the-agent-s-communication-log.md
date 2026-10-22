@@ -141,6 +141,8 @@ decisions behind them:
    - a timeout or response later than P2 on a link whose VCI absorbs pendings, with none seen, is
      a possible pending: a hidden pending and a VCI waiting past P2 give the same times, so it
      neither counts as an answer of the ECU nor decides a no-response, which is `undetermined`;
+     a positive response in that span is `undetermined` too, since it is on time after a hidden
+     pending and late without one;
    - a suppressed positive response, only for a service with a sub-function as the definition
      declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes and no pending was seen
      or possible, `vehicle` when one comes anyway with none, and `undetermined` after a possible

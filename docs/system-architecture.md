@@ -1144,6 +1144,7 @@ An exchange entry is classified by the first row that matches; `outcome`, `sent`
 | `positive` to a request whose positive response is suppressed, with no pending seen and no possible pending | `vehicle` | The ECU sent a positive response although the request asked it not to (ISO 14229-1:2026 7.7.3) |
 | `positive` to a request whose positive response is suppressed, with a possible pending and `window` not `late` (a response past the bound is late on either history, below) | `undetermined` | The ECU answered after P2; whether a pending the VCI absorbed obliged it to answer cannot be seen |
 | A final response (`positive`, `negative` or `positive_unusable`) with `window` `late` | `vehicle`, or the classification of its outcome by the rows below if that is `system` or `undetermined` | The ECU answered after the limit in force, by how much, and the VCI still took the answer; the outcome is named as below |
+| `positive` with `window` `possible_pending` | `undetermined` | The ECU answered after P2 with no pending seen: on time after a pending the VCI absorbed, or late without one; the two give the same times (a negative response is classified by its code below either way) |
 | `positive` | `none` | |
 | `positive_unusable` | `undetermined` | The ECU's response does not match the definition, and how |
 | `negative`, `nrc_kind` `security_key` (0x35) | `system` | The ECU refused the key the server computed |

@@ -215,16 +215,16 @@ decisions behind them:
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
      unless, on each identifier, the extra answers are no more than the requests still owed on it
      (below), whose late answers they may be;
-   - an answer to an exchange made while an earlier exchange whose expected responses it matches is
-     still owed its final response (one whose request may have reached the ECU whole) may be that one's late
-     answer, since the worker gives an answer to the primitive in flight, so the exchange is at
-     least `undetermined` and the earlier one stays unsettled; whether an answer may be an owed request's is judged by the answer
-     matching that request's expected responses (a shared negative pattern included), and the
-     owed requests it meets are the most requests it could belong to (that may have reached the
-     ECU whole) that some assignment of the earlier final responses, each to one request it could
-     belong to and whichever exchange took it, leaves unpaid, counted since the target's last accepted ECUReset or session change,
-     and a link error or a reopened link does not end the count, since a response already on its
-     way can still arrive; such an answer is no evidence of the exchange's own send;
+   - the log never decides between possible owners: an earlier exchange whose request may have
+     reached the ECU whole stays owed until a final response is placed with it alone or the
+     target's ECUReset or session change is accepted (a link error or a reopened link does not
+     end it, since a response already on its way can still arrive); an answer that could belong
+     to an owed request (it matches that request's expected responses, a shared negative pattern
+     included) makes the exchange that received it at least `undetermined`, is no evidence of
+     its send and leaves both owed, and any item read late that more than one exchange could own
+     is unattached and makes each of them at least `undetermined`. Finer attribution (which
+     earlier response paid which request) is not decided here; tests of the implementation are
+     to show where it would pay;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
      the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
@@ -257,11 +257,9 @@ decisions behind them:
    - a response the worker delivers after the exchange ended (`late_response`): started within
      the limit less the margin it is `system`, since the system missed an answer in time; after
      the limit plus the margin `vehicle`, or its outcome's classification from the rows that do
-     not turn on timing if that is more severe; otherwise `undetermined`; it belongs to the ended exchange it
-     matches that some assignment of the earlier responses still leaves owed one and whose
-     request may have reached the ECU whole (not
-     `not_sent` or `partial`), however long ago it ended, and one that two ended
-     exchanges could own is unattached;
+     not turn on timing if that is more severe; otherwise `undetermined`; it belongs to the one ended exchange it
+     could belong to as an owed request, however long ago it ended, and one that two exchanges
+     could own is unattached and leaves each of them at least `undetermined`;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link
      error of the exchange's time that comes after the entry (`late_item`; an item bound to a
      primitive belongs to its exchange, and only an unbound one needs the single-owner test, with no exchange in flight using its request

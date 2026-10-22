@@ -220,9 +220,9 @@ decisions behind them:
      answer, since the worker gives an answer to the primitive in flight, so the exchange is at
      least `undetermined` and the earlier one stays unsettled; whether an answer may be an owed request's is judged by the answer
      matching that request's expected responses (a shared negative pattern included), and the
-     owed requests it meets are the requests it could belong to that may have reached the ECU
-     whole, less the final responses delivered that could have belonged to them, whichever
-     exchange took them, counted since the target's last accepted ECUReset or session change,
+     owed requests it meets are the most requests it could belong to (that may have reached the
+     ECU whole) that some assignment of the earlier final responses, each to one request it could
+     belong to and whichever exchange took it, leaves unpaid, counted since the target's last accepted ECUReset or session change,
      and a link error or a reopened link does not end the count, since a response already on its
      way can still arrive; such an answer is no evidence of the exchange's own send;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its

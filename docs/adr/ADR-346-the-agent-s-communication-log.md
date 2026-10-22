@@ -65,15 +65,20 @@ cannot place.
 1. **One log per job, an entry per exchange, in the reader's terms.**
    - The agent writes a communication log for every job and ownership generation, as JSON Lines
      beside the job's journal and protected like it (design 5.5).
-   - **Header.** It lists the job, the vehicle, each target's link with the ComParams in force,
-     the VCI's version data and the software versions, so the log needs no other document.
+   - **Header.** It lists the job, the vehicle, the targets, the VCI's version data and the
+     software versions. A job may open several links in turn (design 8.8.2), so what a link has in
+     force (its ComParams, whether it accepted the transmit indication, its confirmation sources,
+     whether it forwards pendings) is written when that link opens, in its `link_opened` event.
+     With those, the log needs no other document.
    - **Exchange entries.** There is one for each request the agent sends or refuses before
      sending, with its origin: the procedure, a repeat after a resume (design 8.2.5),
      identification, restart reads, an access program, or an access target's keep-alive.
    - **Several answers.** A request that collects every answer within its window (ADR-327's
      functional presence request), or on which more than one ECU answers, lists each answer with
-     its identifier, bytes, times and outcome, so none is dropped. Silence on such a request is
-     not a fault (ADR-327 item 2).
+     its identifier, bytes, times, outcome and its own classification, so none is dropped. An
+     answer the job acts on, such as a second ECU on the identifier a guard checks (design 8.9.1),
+     says so. The entry takes the most severe of its answers' classifications. Silence on such a
+     request is not a fault (ADR-327 item 2).
    - **System events.** Worker, VCI, link and job events, the identity values read, clock epochs,
      late responses, and events the log cannot attach to an exchange are entries on the same
      timeline.
@@ -153,6 +158,9 @@ cannot place.
    - **Suppressed responses.** A request with the positive-response suppression bit whose send is
      confirmed and that the VCI ended without a response is `none`. The host still ends such a
      request as having no response today; changing that is not part of this decision.
+   - **Early timeout.** A receive timeout that the VCI reports before the limit in force (P2 from
+     the transmit, or P2* from the latest pending), measured on one clock, is `system`: the VCI
+     stopped waiting too soon.
    - **Deadline.** An agent deadline that passed while the VCI never ended the exchange is
      `system`, sent or not, since the VCI must end its own primitive within its limits. This rule comes before the no-response rules.
    - **Transmit and receive errors.** A transmit error or a missing acknowledge is `not_sent` and

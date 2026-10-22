@@ -1075,16 +1075,18 @@ When a diagnostic run fails, the agent's communication log tells whether the veh
 
 **Header**
 
-The first line, written once the job's first link is open and before its first request (a job that ends earlier writes it with what it knows). It lists, so that no other document is needed to read the log:
+The first line, written once the job's first link is open and before its first request (a job that ends earlier writes it with what it knows). It lists, with the `link_opened` event of each link, so that no other document is needed to read the log:
 
 | Group | Content |
 |---|---|
 | Job | Job ID, ownership generation, procedure name, document hash (8.2.6), the variant or combination chosen |
 | Vehicle | The job's target VIN; the identity values read appear later as `identity` events |
-| Per target | Role, ECU definition, variant, link: protocol, baud rate, request and response IDs, the timing ComParams in force (`CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RC78CompletionTimeout`, `CP_TransmitIndEnable`), every other ComParam by name, the link's transmit-confirmation sources and whether it forwards pendings |
+| Per target | Role, ECU definition and variant, as far as known when the header is written |
 | VCI | The worker's version data: vendor, hardware name, serial number and version, firmware name and version, API library name and version, and the API: D-PDU (ISO 22900-2:2022 clause 8) or J2534 (SAE J2534-1 v04.04 clause 7) with its `unsigned long` width (7.1.2) |
 | Software | Agent, worker and IR schema versions and the conversion identity (8.2.4) |
 | Clock | One agent reading as monotonic microseconds since the log began and UTC wall clock, so a later wall-clock step shows |
+
+What a link has in force is only known once that link is open, and a job may open several in turn (8.8.2), so each `link_opened` event carries it: the target, protocol, baud rate, request and response IDs, the timing ComParams in force (`CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RC78CompletionTimeout`, `CP_TransmitIndEnable`, whether the library accepted it), every other ComParam by name, the link's transmit-confirmation sources and whether it forwards pendings. Every exchange entry names its link.
 
 **Exchange entry**
 
@@ -1095,7 +1097,7 @@ The first line, written once the job's first link is open and before its first r
 | `request` | Service ID and name (`0x31`, `RoutineControl`), the request bytes, and whether the positive response is suppressed |
 | `sent` | `confirmed`, `partial` (the first frame of a multi-frame request went out and the ECU sent no flow control), `not_sent` or `unknown`, with `sent_evidence`: `tx_indication` (bound to the primitive, or unbound while it is the only one on the link), `tx_done_time` on the response, `answer` (any response, a pending included), `refused` (by the agent, or by the worker after a lost VCI), `tx_error`, `flow_control_timeout`, or `none`; a refusal caused by an earlier response names that exchange in `caused_by` |
 | `outcome` | `positive`, `positive_unusable` (a wrong echo or a missing field), `negative` (code, name and `nrc_kind`), `no_response`, `no_flow_control` (the request was not completely sent), `response_incomplete` (the ECU began a response and did not finish it), `vci_did_not_end` (the agent's deadline passed before the VCI ended the exchange), `response_malformed` (a response that broke the transport's rules), `not_sent`, `vci_lost` or `unknown`; other receive errors on the link count as link errors in `link_history`; the final response bytes |
-| `answers` | For a request that collects every answer within its window instead of one final response (ADR-327's functional presence request, and any request on which more than one ECU answers, such as the second ECU a guard sees on the target's identifier), one item per answer: the response identifier, the bytes, the VCI and agent times, the response time and its own `outcome`. `outcome` then says how many answered; silence on such a request is no fault (ADR-327 item 2) |
+| `answers` | For a request that collects every answer within its window instead of one final response (ADR-327's functional presence request, and any request on which more than one ECU answers, such as the second ECU a guard sees on the target's identifier), one item per answer: the response identifier, the bytes, the VCI and agent times, the response time, and its own `outcome`, `classification` and `reason`. An answer the job acts on is named so: a second ECU answering on the identifier a guard checks (8.9.1, ADR-327) is `vehicle`, "a second ECU answers on the target's identifier". `outcome` then says how many answered; silence on such a request is no fault (ADR-327 item 2) |
 | `pending` | Each response pending (0x78) the agent saw, with its VCI and agent time and its interval from the transmit or the previous pending, and `pending_visibility`: `forwarded` when the worker passes them on, `absorbed_by_vci` when the API handles 0x78 itself and the list cannot show them |
 | `timing` | The measured response time and how it was measured (`vci_tx_done_to_rx_start`, `vci_tx_done_to_rx_end` or `agent`), the P2, P2* and 0x78 completion limits in force, the final response's interval from the latest pending seen, and `window`: within P2; after forwarded pendings, within P2* of the latest one (P2* restarts on each pending); beyond P2 with pendings absorbed by the VCI (an inference, marked as one); no response within P2; pendings, then no response within P2* of the latest one or within the completion limit |
 | `times` | Agent times (monotonic and wall) before and after the primitive was started, at the transmit confirmation and at the end; VCI times (transmit done, response start, response end, error) as raw microseconds, each with its clock (`device` for the VCI's own, `worker` for a worker's synthetic clock, ADR-120) |
@@ -1118,8 +1120,9 @@ An exchange entry is classified by the first row that matches; the `outcome` and
 | `vci_lost` | `undetermined` | The VCI was lost (and how, from the extra error information: USB disconnect, WLAN lost, no response); a VCI powered from the vehicle's connector is also lost when the vehicle's supply drops, so the vehicle is not excluded until the VCI reconnects; the last supply reading and its age are given |
 | `unknown`: worker exited or not answering, events lost, RPC failure | `system` | Named as such, with whether the request was sent (`unknown` while pending or when starting it failed, `not_sent` when refused) |
 | `vci_did_not_end` | `system` | The VCI did not end the exchange within its own timing |
+| `no_response` whose receive timeout came before the limit in force (P2 from the transmit, or P2* from the latest pending), measured on one clock | `system` | The VCI gave up waiting before the limit in force, by how much |
 | `no_response` to a request whose positive response is suppressed, `sent` `confirmed` | `none` | No response was expected |
-| A request that collects every answer (`answers`), ended by its window, `sent` `confirmed` | `none` | How many ECUs answered, and on which identifiers; each answer's negative response, if any, is named as in the rows below |
+| A request that collects every answer (`answers`), ended by its window, `sent` `confirmed` | The most severe of its answers' classifications (`system`, then `undetermined`, then `vehicle`), or `none` when all are `none` or none answered | How many ECUs answered, and on which identifiers, and the answer that set the classification; each answer is classified by the rows below, as an exchange of its own |
 | `positive` | `none` | |
 | `positive_unusable` | `undetermined` | The ECU's response does not match the definition, and how |
 | `negative`, `nrc_kind` `security_key` (0x35, 0x36) | `system` | The ECU refused the key the server computed |

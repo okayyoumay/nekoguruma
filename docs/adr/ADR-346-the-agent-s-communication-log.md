@@ -219,7 +219,8 @@ decisions behind them:
      that came after the entry, classified as if the agent had waited, except that an end that
      would be fault-free is `system`, since the job gave up on it; an end by a lost VCI or a worker exit
      takes that row;
-   - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended;
+   - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended, with the
+     clock readings, the measured gap, the tolerance and each fit test, so a reader can redo it;
    - a response the worker delivers after the exchange ended (`late_response`): started within
      the limit less the margin it is `system`, since the system missed an answer in time; after
      the limit plus the margin `vehicle`; otherwise `undetermined`; it belongs to the ended exchange it

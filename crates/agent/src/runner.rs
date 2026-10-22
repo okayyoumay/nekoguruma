@@ -218,7 +218,7 @@ pub enum JobError {
     #[error("the program needs the declarations, but the job has no document")]
     NoDeclarations,
     /// A source the program names (identity or precondition) is not one the job's document
-    /// declares in the shape the agent reads (ADR-336 item 1): nothing is sent.
+    /// declares in the shape the agent reads (ADR-345): nothing is sent.
     #[error("the job's document does not declare a readable source: {0}")]
     Sources(#[source] crate::inputs::TableError),
     /// The program has an `Op::FlashBlock` and the job names no flash artifact (ADR-336).
@@ -409,7 +409,7 @@ pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
 }
 
 /// The table of the `EcuService` sources a job reads, when the job has a document: built from
-/// the document ([`ServiceSources::from_document`], ADR-336 item 1), so the caller does not
+/// the document ([`ServiceSources::from_document`], ADR-345), so the caller does not
 /// repeat what the document declares. A job without a document has none, and its caller's table
 /// stays (`JournalSetup::sources`). Part of [`check_job`], which refuses a source the document
 /// declares in a shape the agent cannot read before anything is sent.
@@ -10241,7 +10241,7 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    // --------------------- sources from the job's document (ADR-336 item 1)
+    // --------------------- sources from the job's document (ADR-345)
 
     /// [`flash_program`] with its identity read through services 1 to 3, field 1 each: a
     /// document declares one data identifier per service, so the fixture's three fields of one
@@ -10384,6 +10384,78 @@ def main():
         assert_eq!(state.pc as usize, program.code.len());
         assert_eq!(from_the_erase(&host), redone_transfer());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The entry point a restart goes through takes the table from the job's document: with the
+    /// caller's table empty, a checkpoint resume of a job with a document sends the VIN read the
+    /// document declares (it reaches the worker; the fake worker then fails it, so the job ends
+    /// in `ProcedureIdentityNotEstablished`), while the same job without a document has no source
+    /// to read and sends nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_program_journaled_reads_the_identity_through_the_documents_table() {
+        use crate::document::tests::{document_of, read_service};
+        use diag_ir::declaration::DataKind;
+        let mut program = plain_steps(&[(0x22, Unsafe), (0x22, Safe)]);
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 1,
+        });
+        program.validate().expect("a valid program");
+        let with_document = |program: &Program| {
+            let services = vec![read_service(
+                1,
+                "readVin",
+                [0xF1, 0x90],
+                DataKind::Ascii,
+                17,
+            )];
+            let procedure = postcard::to_allocvec(program).unwrap();
+            Job::from_document(JobDocument::new(document_of(services, Some(procedure))).unwrap())
+                .unwrap()
+        };
+        let not_established = |result: &Result<VmState, JobError>| {
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ProcedureIdentityNotEstablished
+                ))
+            )
+        };
+        for documented in [true, false] {
+            let dir = journal_dir("resume-entry-document-table");
+            // The first read is not safe to repeat and completed; the run stopped after it.
+            cancelled_after(&program, &dir, Some(TARGET_VIN), 0x22);
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert!(
+                matches!(
+                    restart::classify(&program, Ok(&state)),
+                    RestartDecision::ResumeFromCheckpoint(_)
+                ),
+                "{:?}",
+                restart::classify(&program, Ok(&state))
+            );
+            let job = if documented {
+                with_document(&program)
+            } else {
+                Job::from(program.clone())
+            };
+            let mut setup = file_setup(&dir);
+            setup.sources = crate::inputs::ServiceSources::default();
+            let (client, calls) = fake_worker(false).await;
+            let (result, _guards) = resume_program_journaled(
+                client,
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                job,
+                JobLimits::default(),
+                setup,
+                vci_only_guards("resume-entry-document-table"),
+            )
+            .await;
+            assert!(not_established(&result), "{documented}: {result:?}");
+            let sent = calls.lock().unwrap().contains(&"StartComPrimitive");
+            assert_eq!(sent, documented, "{:?}", calls.lock().unwrap());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// A source the document declares in a shape the agent cannot read refuses the job at the

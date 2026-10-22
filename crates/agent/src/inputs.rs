@@ -13,7 +13,7 @@
 //!   readings, for tests and for later wiring.
 //! - [`Source::EcuService`]: a field of a diagnostic response, located through a
 //!   [`ServiceSources`] table. A job with a document gets its table from the document
-//!   ([`ServiceSources::from_document`], ADR-336 item 1), which declares the service and the
+//!   ([`ServiceSources::from_document`], ADR-345), which declares the service and the
 //!   field; a job without one keeps the table its caller builds by hand (ADR-245,
 //!   consequences). The table's shape (below) is all that is read, so a document source of
 //!   another shape is refused when the job is checked.
@@ -28,9 +28,7 @@ use std::time::Duration;
 
 use crate::client::WorkerApi;
 use crate::document::JobDocument;
-use diag_ir::declaration::{
-    ByteOrder, Compu, DataKind, EcuVariant, Field, LengthKind, Placement, Shape,
-};
+use diag_ir::declaration::{ByteOrder, DataKind, EcuVariant, Field, LengthKind, Placement, Shape};
 use diag_ir::encode::encode_request;
 use diag_ir::{DiagHost, Program, RuntimeInput, Source};
 use serde::{Deserialize, Serialize};
@@ -341,39 +339,52 @@ impl ServiceSources {
     }
 
     /// Builds the table of `program`'s `EcuService` sources (identity and precondition sources)
-    /// from the variant the job's `document` declares, one entry per distinct source (ADR-336
-    /// item 1). A source's service is a single-identifier ReadDataByIdentifier: its request is
+    /// from the variant the job's `document` declares, one entry per distinct source (ADR-345).
+    /// A source's service is a single-identifier ReadDataByIdentifier: its request is
     /// encoded as the runtime encodes it (`diag_ir::encode::encode_request`), the positive
     /// response echoes the identifier as its prefix, and the source's field is a fixed-length,
     /// byte-aligned ASCII text or unsigned big-endian integer that follows the echo and is the
-    /// last byte of the response, with no conversion. A source the document does not declare, or
+    /// last byte of the response. The field's conversion is not applied (ADR-345 item 1). A source
+    /// must also suit what reads it: the VIN is 17 bytes of ASCII text, a precondition is an
+    /// unsigned integer (ADR-345 item 3). A source the document does not declare, or
     /// declares in another shape (a terminated or variable-length field among them), is an
     /// error, and so is one the table's own checks refuse ([`ServiceSources::new`]).
     pub fn from_document(document: &JobDocument, program: &Program) -> Result<Self, TableError> {
         let variant = document.variant();
-        let mut named: Vec<(u32, u32)> = Vec::new();
-        for source in program_sources(program) {
+        // Each distinct source with the roles that read it.
+        let mut named: Vec<(u32, u32, Vec<Role>)> = Vec::new();
+        for (source, role) in program_sources(program) {
             if let Source::EcuService {
                 service_id,
                 field_id,
             } = source
-                && !named.contains(&(service_id, field_id))
             {
-                named.push((service_id, field_id));
+                match named
+                    .iter_mut()
+                    .find(|(s, f, _)| (*s, *f) == (service_id, field_id))
+                {
+                    Some((_, _, roles)) => roles.push(role),
+                    None => named.push((service_id, field_id, vec![role])),
+                }
             }
         }
         let fields = named
             .into_iter()
-            .map(|(service_id, field_id)| {
-                declared_field(&variant, service_id, field_id).map_err(|reason| {
-                    TableError::Document {
-                        service_id,
-                        field_id,
-                        reason,
-                    }
-                })
+            .map(|(service_id, field_id, roles)| {
+                let document_error = |reason: String| TableError::Document {
+                    service_id,
+                    field_id,
+                    reason,
+                };
+                let field =
+                    declared_field(&variant, service_id, field_id).map_err(document_error)?;
+                // A source used in two roles must suit both.
+                for role in roles {
+                    role.accepts(&field).map_err(document_error)?;
+                }
+                Ok(field)
             })
-            .collect::<Result<Vec<_>, _>>()?;
+            .collect::<Result<Vec<_>, TableError>>()?;
         Self::new(fields)
     }
 
@@ -384,19 +395,44 @@ impl ServiceSources {
     }
 }
 
-/// Every source `program` declares: the identity sources and the default- and
-/// programming-session sources of the preconditions.
-fn program_sources(program: &Program) -> Vec<Source> {
+/// What reads a source: it decides the kind of field the source may name.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Role {
+    /// The VIN identity: 17 bytes of ASCII text.
+    Vin,
+    /// The hardware part number or software version identity: ASCII text or an unsigned integer.
+    Version,
+    /// A precondition's value, compared with a range: an unsigned integer.
+    Precondition,
+}
+
+impl Role {
+    fn accepts(self, field: &ServiceField) -> Result<(), String> {
+        match (self, field.encoding) {
+            (Role::Vin, Encoding::Ascii) if field.length == 17 => Ok(()),
+            (Role::Vin, _) => Err("the VIN source must be 17 bytes of ASCII text".to_owned()),
+            (Role::Version, _) => Ok(()),
+            (Role::Precondition, Encoding::UnsignedBigEndian) => Ok(()),
+            (Role::Precondition, _) => {
+                Err("a precondition source must be an unsigned integer".to_owned())
+            }
+        }
+    }
+}
+
+/// Every source `program` declares with the role that reads it: the identity sources and the
+/// default- and programming-session sources of the preconditions.
+fn program_sources(program: &Program) -> Vec<(Source, Role)> {
     let identity = &program.identity;
     let preconditions = &program.preconditions;
-    let mut sources: Vec<Source> = [
-        identity.vin,
-        identity.hardware_part_number,
-        identity.software_version,
-    ]
-    .into_iter()
-    .flatten()
-    .collect();
+    let mut sources: Vec<(Source, Role)> = Vec::new();
+    sources.extend(identity.vin.map(|s| (s, Role::Vin)));
+    for source in [identity.hardware_part_number, identity.software_version]
+        .into_iter()
+        .flatten()
+    {
+        sources.push((source, Role::Version));
+    }
     for precondition in [
         &preconditions.voltage_mv,
         &preconditions.external_supply,
@@ -407,8 +443,15 @@ fn program_sources(program: &Program) -> Vec<Source> {
     .into_iter()
     .flatten()
     {
-        sources.extend(precondition.default_session);
-        sources.extend(precondition.programming_session);
+        for source in [
+            precondition.default_session,
+            precondition.programming_session,
+        ]
+        .into_iter()
+        .flatten()
+        {
+            sources.push((source, Role::Precondition));
+        }
     }
     sources
 }
@@ -476,11 +519,9 @@ fn declared_field(
     })
 }
 
-/// The table's encoding of `field`: ASCII text or a big-endian unsigned integer, as stored.
+/// The table's encoding of `field`: ASCII text or a big-endian unsigned integer, as stored. The
+/// field's conversion, if any, is not applied: the table reads the raw bytes (ADR-345 item 1).
 fn field_encoding(field: &Field<'_>) -> Result<Encoding, String> {
-    if !matches!(field.compu_type(), Compu::NONE | Compu::CompuIdentity) {
-        return Err("the field has a conversion".to_owned());
-    }
     match field.kind() {
         DataKind::Ascii => Ok(Encoding::Ascii),
         DataKind::Uint if field.byte_order() == ByteOrder::Big => Ok(Encoding::UnsignedBigEndian),
@@ -1284,21 +1325,174 @@ mod tests {
             // Not on a byte edge, or not a whole number of bytes.
             assert!(is_document(edit(&|f| f.bit_offset = 4)));
             assert!(is_document(edit(&|f| f.bit_length = 17 * 8 - 4)));
-            // Not text or an unsigned integer, or converted.
+            // Not text or an unsigned integer.
             assert!(is_document(edit(&|f| f.kind = DataKind::Bytes)));
             assert!(is_document(edit(&|f| f.kind = DataKind::Int)));
             assert!(is_document(edit(&|f| {
                 f.kind = DataKind::Uint;
                 f.byte_order = ByteOrder::Little;
             })));
-            // An integer field is at most 8 bytes: the table's own check.
+            // An integer field is at most 8 bytes: the table's own check (the hardware part
+            // number may be unsigned).
+            let mut wide = services();
+            let field = &mut wide[1].positive.as_mut().unwrap().fields.as_mut().unwrap()[0];
+            field.kind = DataKind::Uint;
+            field.bit_length = 9 * 8;
+            assert!(matches!(refused(wide), TableError::BadField { .. }));
+        }
+
+        #[test]
+        fn a_field_with_a_conversion_is_read_raw() {
+            use diag_ir::declaration::{CompuLinearT, CompuT};
+            let mut linear = CompuLinearT::default();
+            linear.numerator = 1.0;
+            linear.denominator = 10.0;
+            linear.offset = 5.0;
+            let mut services = services();
+            let positive = services[2].positive.as_mut().unwrap();
+            positive.fields.as_mut().unwrap()[0].compu = CompuT::CompuLinear(Box::new(linear));
+            let table = ServiceSources::from_document(&document(services), &named()).unwrap();
+            let field = table.get(3, 1).unwrap();
+            assert_eq!(field.encoding, Encoding::UnsignedBigEndian);
+            assert_eq!((field.offset, field.length), (2, 2));
+            // The raw bytes are the value; the conversion is not applied.
+            let mut host = Fake::answering(&[0x62, 0xF1, 0x00, 0x01, 0x02]);
+            assert_eq!(
+                resolve_source(ecu(3), &table, &mut host).unwrap(),
+                Reading::Value(0x0102)
+            );
+        }
+
+        #[test]
+        fn a_source_must_suit_the_role_that_reads_it() {
+            let is_document = |got: Result<ServiceSources, TableError>, service_id: u32| {
+                assert!(
+                    matches!(&got, Err(TableError::Document { service_id: s, .. }) if *s == service_id),
+                    "{got:?}"
+                );
+            };
+            let build = |services: Vec<ServiceT>, program: &Program| {
+                ServiceSources::from_document(&document(services), program)
+            };
+            // A VIN of 16 bytes, or an unsigned VIN.
+            let mut short = services();
+            short[0].positive.as_mut().unwrap().fields.as_mut().unwrap()[0].bit_length = 16 * 8;
+            is_document(build(short, &named()), 1);
+            let mut uint = services();
+            uint[0].positive.as_mut().unwrap().fields.as_mut().unwrap()[0].kind = DataKind::Uint;
+            uint[0].positive.as_mut().unwrap().fields.as_mut().unwrap()[0].bit_length = 17 * 8;
+            is_document(build(uint, &named()), 1);
+            // An ASCII precondition source, as the programming session's or the default's.
+            let mut ascii = services();
+            ascii[2].positive.as_mut().unwrap().fields.as_mut().unwrap()[0].kind = DataKind::Ascii;
+            is_document(build(ascii.clone(), &named()), 3);
+            let mut default_source = named();
+            let engine = default_source.preconditions.engine.as_mut().unwrap();
+            engine.default_session = Some(ecu(3));
+            engine.programming_session = None;
+            is_document(build(ascii, &default_source), 3);
+            // A version may be ASCII or unsigned.
+            let mut program = named();
+            program.identity.hardware_part_number = Some(ecu(3));
+            program.identity.software_version = Some(ecu(2));
+            assert!(build(services(), &program).is_ok());
+            // Shared between a precondition and a version: the version is ASCII, so the
+            // precondition refuses it.
+            let mut shared = named();
+            shared.identity.software_version = Some(ecu(2));
+            shared
+                .preconditions
+                .engine
+                .as_mut()
+                .unwrap()
+                .programming_session = Some(ecu(2));
+            is_document(build(services(), &shared), 2);
+            // Shared and unsigned on both sides is fine.
+            let mut both = named();
+            both.identity.software_version = Some(ecu(3));
+            assert!(build(services(), &both).is_ok());
+        }
+
+        #[test]
+        fn an_absolute_placement_is_read_at_its_byte_offset() {
+            use diag_ir::declaration::Placement;
+            let with_offset = |bit_offset: u32| {
+                let mut services = services();
+                let field = &mut services[0]
+                    .positive
+                    .as_mut()
+                    .unwrap()
+                    .fields
+                    .as_mut()
+                    .unwrap()[0];
+                field.placement = Placement::Absolute;
+                field.bit_offset = bit_offset;
+                ServiceSources::from_document(&document(services), &named())
+            };
+            // SID, then the two identifier bytes, then the field: bit 24.
+            let table = with_offset(24).unwrap();
+            let field = table.get(1, 1).unwrap();
+            assert_eq!((field.offset, field.length), (2, 17));
+            // Any other place is not the table's shape.
             assert!(matches!(
-                edit(&|f| {
-                    f.kind = DataKind::Uint;
-                    f.bit_length = 9 * 8;
-                }),
-                TableError::BadField { .. }
+                with_offset(32),
+                Err(TableError::Unsupported { service_id: 1, .. })
             ));
+            assert!(matches!(
+                with_offset(16),
+                Err(TableError::Unsupported { service_id: 1, .. })
+            ));
+        }
+
+        /// The example ECU as the converter emits it: its VIN source is read from the VIN
+        /// service at an absolute place.
+        #[test]
+        fn the_converted_example_gives_the_vin_read() {
+            use diag_frontend::convert::{lower_procedures, to_ir};
+            use diag_frontend::tables::{read_files, resolve};
+            let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+                .join("../diag-frontend/examples/example-ecu");
+            let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+                .expect("the example directory")
+                .map(|entry| {
+                    let entry = entry.expect("an entry");
+                    let name = entry.file_name().into_string().expect("a UTF-8 name");
+                    // A Windows checkout may have CRLF line ends.
+                    let text = std::fs::read_to_string(entry.path())
+                        .expect("a text file")
+                        .replace("\r\n", "\n");
+                    (name, text.into_bytes())
+                })
+                .collect();
+            files.push((
+                "main.star".to_owned(),
+                b"def main():\n    diag.log(1, \"a\")\n".to_vec(),
+            ));
+            files.sort();
+            let definition = resolve(read_files(files).expect("reads")).expect("resolves");
+            let procedures = lower_procedures(&definition).expect("lowers");
+            let converted = to_ir(&definition, &procedures);
+            assert!(!converted.documents.is_empty());
+            for converted in converted.documents {
+                let document = JobDocument::new(converted.bytes).expect("a document");
+                let program = document.program().expect("a program");
+                let vin = program
+                    .identity
+                    .vin
+                    .expect("the example names a VIN source");
+                let Source::EcuService {
+                    service_id,
+                    field_id,
+                } = vin
+                else {
+                    panic!("{vin:?}");
+                };
+                let table = ServiceSources::from_document(&document, &program).expect("a table");
+                let field = table.get(service_id, field_id).expect("the VIN entry");
+                assert_eq!(field.request, [0x22, 0xF1, 0x90]);
+                assert_eq!((field.offset, field.length), (2, 17));
+                assert_eq!(field.encoding, Encoding::Ascii);
+            }
         }
 
         #[test]

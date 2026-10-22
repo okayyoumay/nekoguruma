@@ -1,7 +1,7 @@
 # ADR-245: The IR's Restart Declaration Lives in the Procedure Part
 
 **Date:** 2026-10-07
-**Status:** Accepted (items 4 and 6 amended by ADR-250; the restart declaration's sources and plans name their target and `Program::validate` refuses cross-target flash steps since ADR-325 item 4; its sources and plans get their CSV and Starlark syntax, with the boundaries derived by the lowering, by ADR-336; the agent builds its source table from the job's document for a job with one, by ADR-336 item 1)
+**Status:** Accepted (items 4 and 6 amended by ADR-250; the restart declaration's sources and plans name their target and `Program::validate` refuses cross-target flash steps since ADR-325 item 4; its sources and plans get their CSV and Starlark syntax, with the boundaries derived by the lowering, by ADR-336; the agent builds its source table from the job's document for a job with one, by ADR-345)
 **Affects:** `crates/diag-ir` (`src/recovery.rs`, `Program`, `VmState`, `IR_SCHEMA_VERSION`, `schema/ir.fbs` `FlashSession`), `crates/agent` (`check_program`), `docs/system-architecture.md` (8.2.5, 8.9)
 
 ## Context

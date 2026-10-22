@@ -198,7 +198,7 @@ fn download_program(segments: &[Segment]) -> Program {
 
 /// Service `id` of the job's document: ReadDataByIdentifier of `did`, whose response echoes the
 /// identifier and then has one ASCII field of `length` bytes. The job reads its identity
-/// through these, so the caller gives no source table (ADR-336 item 1).
+/// through these, so the caller gives no source table (ADR-345).
 fn read_service(id: u32, did: u16, length: usize) -> ServiceT {
     let did = did.to_be_bytes().to_vec();
     let mut field = FieldT::default();

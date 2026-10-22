@@ -844,14 +844,19 @@ check as well.
 - Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
   big-endian integer, or printable ASCII). A job with a document gets its table from the
-  document (`ServiceSources::from_document`, ADR-336 item 1): one entry per distinct
+  document (`ServiceSources::from_document`, ADR-345): one entry per distinct
   `EcuService` source the program names (identity and precondition sources), each read from the
-  declared service, with the request encoded as the runtime encodes it. `check_job` builds it, so
+  declared service, with the request encoded as the runtime encodes it. The table reads the
+  field's raw bytes: a conversion the field declares is not applied, since a precondition range
+  and an identity check compare the value as read. `check_job` builds it, so
   a source the document does not declare, or declares as anything but a single-identifier
   ReadDataByIdentifier whose positive response echoes the identifier and ends in one
-  fixed-length, byte-aligned, unconverted ASCII or big-endian unsigned field, ends the job in
+  fixed-length, byte-aligned ASCII or big-endian unsigned field, ends the job in
   `JobError::Sources` before anything is sent (terminated and variable-length fields are not
-  read). The runner then uses that table, on a first run and a resume alike, in place of
+  read). So does a field whose kind does not fit the role that reads it: the VIN must be 17
+  bytes of ASCII, a precondition source an unsigned integer, and the hardware part number and
+  software version either; a source shared by two roles must fit both. The runner then uses that
+  table, on a first run and a resume alike, in place of
   `JournalSetup::sources`; a job without a document keeps the caller's table (hand-built
   programs and tests). A table accepts only single-identifier ReadDataByIdentifier entries
   (request `[0x22, hi, lo]`, offset 2): other services do not echo

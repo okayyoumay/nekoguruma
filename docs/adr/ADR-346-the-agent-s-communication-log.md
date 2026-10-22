@@ -88,9 +88,12 @@ cannot place.
    - The entry says whether the link can show pendings at all (`pending_visibility`: `forwarded`
      or `absorbed_by_vci`), so an empty list on a link whose VCI absorbs them is not read as
      "none".
-   - A response window is derived from the elapsed time against P2, P2* and the completion limit:
-     within P2, beyond P2 with absorbed pendings (marked as an inference), or no response within
-     each limit.
+   - A response window is derived against P2, P2* and the completion limit. P2 runs from the
+     transmit, and P2* restarts on each pending, so the entry records each pending's interval from
+     the one before and the final response's interval from the latest pending. The window is
+     within P2, within P2* of the latest forwarded pending, beyond P2 with absorbed pendings
+     (marked as an inference), or no response within each limit. A late response is judged
+     against the same limits.
    - A pending is an answer from the ECU: it confirms the send and counts in the link's history.
 3. **"Reached the bus": transmit indications on, and a three-valued answer with its evidence.**
    - **Setting.** The link turns transmit indications on (`CP_TransmitIndEnable` 1). If the

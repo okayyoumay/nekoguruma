@@ -1067,7 +1067,7 @@ When a diagnostic run fails, the agent's communication log tells whether the veh
 
 **Link settings for the log**
 
-- The link turns transmit indications on (`CP_TransmitIndEnable`, ISO 22900-2:2022 B.5.1); a library that refuses it opens the link without, and the header says the link has no transmit confirmation. SAE J2534 v04.04 gives the indication only on ISO 15765 (clause 8.6).
+- The link turns transmit indications on (`CP_TransmitIndEnable`, ISO 22900-2:2022 B.5.1); a library that refuses it opens the link without, and the header says the link has no transmit confirmation. SAE J2534 v04.04 gives the indication only on its `ISO15765` protocol (SAE J2534-1 v04.04 clause 8.6).
 - The API keeps handling response pending (`CP_RC78Handling` 1, ADR-235 item 3); a worker that sees a pending passes it on, bound to the primitive.
 - The worker's error events carry their extra error information (ISO 22900-2:2022 D.4.2), which tells a missing flow control or consecutive frame from no response.
 - The agent reads every item of the link: those of the running primitive, those with no primitive (transmit indications, link errors) and those of earlier primitives.
@@ -1122,6 +1122,7 @@ The limit in force for an exchange is P2 from the transmit until a pending is se
 | `vci_did_not_end` | `system` | The VCI did not end the exchange within its own timing |
 | `no_response` whose receive timeout came before the limit in force, measured on one clock | `system` | The VCI gave up waiting before the limit in force, by how much |
 | `no_response` to a request whose positive response is suppressed, `sent` `confirmed`, no pending seen, and the exchange ended within P2 | `none` | No response was expected (after a pending the ECU owes its final response even when suppression was asked, ISO 14229-1:2026 7.7.3; an exchange that ended beyond P2 on a link whose VCI absorbs pendings had one, so both are judged by the rows below) |
+| A request meant for one ECU that got more than one answer | `vehicle`, or the most severe of its answers' classifications if that is `system` or `undetermined` | More than one ECU answers on this identifier, with each answer |
 | A request that collects every answer (`answers`), ended by its window, `sent` `confirmed` | The most severe of its answers' classifications (`system`, then `undetermined`, then `vehicle`), or `none` when all are `none` or none answered | How many ECUs answered, and on which identifiers, and the answer that set the classification; each answer is classified by the rows below, as an exchange of its own |
 | `positive` | `none` | |
 | `positive_unusable` | `undetermined` | The ECU's response does not match the definition, and how |
@@ -1134,7 +1135,7 @@ The limit in force for an exchange is P2 from the transmit until a pending is se
 | `response_malformed` (`sent` `confirmed`) | `undetermined` | A response arrived but broke the transport's rules (a wrong sequence number, wrong padding); the ECU and the VCI's receive path are not told apart |
 | `not_sent` by a transmit error or a missing acknowledge (`TX_ERROR`, `CAN_NO_ACK`) | `undetermined` | The VCI could not put the request on the bus; `link_history` shows whether the network answered earlier |
 
-A `vci_connected` event after a loss in the job settles that loss: when the VCI's time base carried on (no new clock epoch), the VCI kept its power and the loss is `system`, the PC's connection to it; when the time base restarted, the VCI was powered off, so the vehicle's supply is not excluded and the loss stays `undetermined`. The event names the loss's entry.
+A loss is settled by the first reading of the VCI's own clock after it reconnects: when the time base carried on (no new clock epoch), the VCI kept its power and the loss is `system`, the PC's connection to it; when it restarted, the VCI was powered off, so the vehicle's supply is not excluded and the loss stays `undetermined`. On a D-PDU link that reading can be taken at the reconnect; on a J2534 link the device clock shows only in frame timestamps (`GetTimestamp` reads the worker's clock, ADR-120), so the `vci_connected` event records `power_kept: unknown` and a `vci_loss_settled` event follows with the first device-timestamped frame, or never. Either event names the loss's entry.
 
 A late response can be logged only when the worker delivers it: the J2534 worker discards a frame no primitive expects (ADR-100), and a D-PDU library may do the same, so on such links a response after the exchange ended is not seen, and the entry's `window` (no response within the limit) is all the log holds. A `late_response` entry is classified on its own, by its VCI time against the limit in force of the exchange it names: after the limit it is `vehicle` (the ECU answered late, by how much); in time, after that exchange ended for a system cause (lost events, the agent's deadline), it is `system` (the ECU answered in time and the system missed the answer). An item the log cannot attach to an exchange is not classified.
 

@@ -43,7 +43,8 @@ What the worker interface gives today:
     its timestamp flags (10.1.4.11.4, D.2.4; ADR-143), but a request that gets no response has no
     result item to carry it.
   - The J2534 worker passes a TxDone indication on only under the same ComParam (ADR-151). J2534
-    v04.04 gives one only on ISO 15765 (clauses 8.6, 8.7.1), and the worker forwards it without a
+    v04.04 gives one only on its `ISO15765` protocol (SAE J2534-1 v04.04 clauses 8.6, 8.7.1),
+    and the worker forwards it without a
     primitive handle.
   - The agent sets neither, and drops every item without a handle, link errors included,
     except a lost VCI, which ends the primitive (ADR-289). `sim-vci` gives no indication.
@@ -179,10 +180,15 @@ cannot place.
    - **Lost VCI.** A lost VCI is `undetermined`. A VCI powered from the vehicle's connector drops
      off USB or WLAN when the vehicle's supply drops, so the loss's kind does not show the side,
      and the agent knows no supply range of the VCI. The entry carries the extra error
-     information and the last supply reading with its age. When the VCI reconnects in the job, the
-     event says whether its time base carried on (it kept its power: the loss was the PC's
-     connection, `system`) or restarted from zero (ISO 22900-2:2022 8.1.6.1: it was powered off,
-     still `undetermined`), and names the loss.
+     information and the last supply reading with its age. After the VCI reconnects in the job,
+     the first reading of its own clock settles the loss: a time base that carried on means it
+     kept its power (the loss was the PC's connection, `system`); one that restarted from zero
+     (ISO 22900-2:2022 8.1.6.1) means it was powered off (still `undetermined`). On a J2534 link
+     the device clock shows only in frame timestamps (ADR-120), so the reconnect records the power
+     state as unknown and a later event settles it with the first such frame, or never.
+   - **Extra answers.** A request meant for one ECU that more than one ECU answers is `vehicle`
+     (more than one ECU answers on that identifier), unless an answer's own classification is
+     more severe.
    - **Other system failures.** A worker that exited or does not answer, lost events, an RPC
      failure and the agent's refusals are `system`.
 6. **Responses that come after their exchange.**
@@ -273,7 +279,8 @@ cannot place.
   - `sim-vci` to give transmit indications, so a test can show a confirmed send with no response;
   - `docs/rpc-api-guide.md` to state that a worker passes on a pending it sees, bound to the
     primitive.
-- **Links without confirmation.** A J2534 link on a protocol other than ISO 15765, and a library
+- **Links without confirmation.** A J2534 link on a protocol other than `ISO15765` (SAE J2534-1
+  v04.04 clause 8.6), and a library
   that refuses the indication, confirm only requests that got an answer. On those links an ECU
   that stops answering stays `undetermined`, and the entry says why.
 - **No pending counts on most links.** On a link whose VCI absorbs pendings, the log shows the

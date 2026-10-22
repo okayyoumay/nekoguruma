@@ -48,7 +48,8 @@ table cannot read is found, and what is read for a field that carries a conversi
    shape the table cannot read:
    - a request other than a single-DID ReadDataByIdentifier, or a response that does not echo it;
    - a field that is not byte-aligned, not fixed-length, not the end of the response, or of
-     another type than ASCII text or an unsigned big-endian integer of at most 8 bytes;
+     another type than ASCII text or an unsigned big-endian integer of at most 7 bytes (the
+     agent holds it as a signed 64-bit integer, as `csv-tables.md` 4.13 says);
    - a field whose kind does not fit what reads it: the VIN a 17-byte ASCII text, a precondition
      an unsigned integer.
 

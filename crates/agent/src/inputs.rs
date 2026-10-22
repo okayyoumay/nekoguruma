@@ -408,6 +408,11 @@ enum Role {
 
 impl Role {
     fn accepts(self, field: &ServiceField) -> Result<(), String> {
+        // The agent holds an unsigned value as a signed 64-bit integer, which every value of up
+        // to seven bytes fits (`csv-tables.md` 4.13).
+        if field.encoding == Encoding::UnsignedBigEndian && field.length > 7 {
+            return Err("an unsigned source is at most 7 bytes".to_owned());
+        }
         match (self, field.encoding) {
             (Role::Vin, Encoding::Ascii) if field.length == 17 => Ok(()),
             (Role::Vin, _) => Err("the VIN source must be 17 bytes of ASCII text".to_owned()),
@@ -1332,13 +1337,13 @@ mod tests {
                 f.kind = DataKind::Uint;
                 f.byte_order = ByteOrder::Little;
             })));
-            // An integer field is at most 8 bytes: the table's own check (the hardware part
-            // number may be unsigned).
+            // An integer field is at most 7 bytes, the most the agent's integer holds (the
+            // hardware part number may be unsigned); the table's own limit of 8 is never reached.
             let mut wide = services();
             let field = &mut wide[1].positive.as_mut().unwrap().fields.as_mut().unwrap()[0];
             field.kind = DataKind::Uint;
             field.bit_length = 9 * 8;
-            assert!(matches!(refused(wide), TableError::BadField { .. }));
+            assert!(matches!(refused(wide), TableError::Document { .. }));
         }
 
         #[test]
@@ -1411,6 +1416,22 @@ mod tests {
             let mut both = named();
             both.identity.software_version = Some(ecu(3));
             assert!(build(services(), &both).is_ok());
+            // The VIN may also be a version, but not a precondition.
+            let mut vin_version = named();
+            vin_version.identity.hardware_part_number = Some(ecu(1));
+            assert!(build(services(), &vin_version).is_ok());
+            let mut vin_precondition = named();
+            vin_precondition
+                .preconditions
+                .engine
+                .as_mut()
+                .unwrap()
+                .programming_session = Some(ecu(1));
+            is_document(build(services(), &vin_precondition), 1);
+            // An unsigned source of 8 bytes does not fit the agent's integer.
+            let mut wide = services();
+            wide[2].positive.as_mut().unwrap().fields.as_mut().unwrap()[0].bit_length = 8 * 8;
+            is_document(build(wide, &named()), 3);
         }
 
         #[test]

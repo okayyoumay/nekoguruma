@@ -185,10 +185,14 @@ cannot place.
      kept its power (the loss was the PC's connection, `system`); one that restarted from zero
      (ISO 22900-2:2022 8.1.6.1) means it was powered off (still `undetermined`). On a J2534 link
      the device clock shows only in frame timestamps (ADR-120), so the reconnect records the power
-     state as unknown and a later event settles it with the first such frame, or never.
-   - **Extra answers.** A request meant for one ECU that more than one ECU answers is `vehicle`
-     (more than one ECU answers on that identifier), unless an answer's own classification is
-     more severe.
+     state as unknown and a later event settles it with the first such frame, or never. A gap of
+     half the 32-bit wrap or more since the last device time leaves a restart and a wrap
+     indistinguishable, so the state stays unknown.
+   - **Extra answers.** A request meant for one ECU for which the worker delivered more than one
+     answer is `vehicle` (more than one ECU answers on that identifier), unless an answer's own
+     classification is more severe. An ordinary request ends at its first answer and the worker
+     discards a later one (ADR-100), so a second responder is usually not seen; catching it
+     needs the receive-only capture that item 6 leaves open.
    - **Other system failures.** A worker that exited or does not answer, lost events, an RPC
      failure and the agent's refusals are `system`.
 6. **Responses that come after their exchange.**

@@ -59,4 +59,5 @@ def main():
         diag.log(1, "unlocked")
     write_vin()
     write_application()
+    diag.wait(2000)
     diag.log(1, "done")

@@ -21,9 +21,10 @@ security-access 01 12 34
 request 27 02 C0 DE
 routine FF00 01
 request 34 00 44 00 00 00 00 00 01 00 00
-flash-transfer 256 blocks 65536 bytes sum 8189175
+flash-transfer 256 blocks 65536 bytes fnv1a 7df71ef445707abc
 request 37 
 routine FF01 01
 request 11 01
+wait 2000
 log 1 done
 finished

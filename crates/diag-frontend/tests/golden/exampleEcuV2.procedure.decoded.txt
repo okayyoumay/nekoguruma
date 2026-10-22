@@ -52,7 +52,7 @@ securityAccess [67 02]
 Ok(
     [],
 )
-requestDownload [74 20 01 00]
+requestDownload [74 20 01 02]
 Ok(
     [
         DecodedField {
@@ -68,7 +68,7 @@ Ok(
             id: 39,
             short_name: "maxBlockLength",
             value: Unsigned(
-                256,
+                258,
             ),
             text_id: 0,
             unit_id: 0,

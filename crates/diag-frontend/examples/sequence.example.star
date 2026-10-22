@@ -48,6 +48,10 @@ def main():
 
     write_image()
 
+    # The plan ends with the ECU reset; the agent waits the session's startup time only when it
+    # restarts a write, so the read-back waits for the ECU here.
+    diag.wait(2000)
+
     # Read-back verification
     after = read_sw_version()
     diag.log(1, "Version after write: " + after)

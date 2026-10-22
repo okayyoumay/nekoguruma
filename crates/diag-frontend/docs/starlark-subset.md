@@ -559,12 +559,12 @@ makes that function a **section function**:
 
 ```python
 # @section uninterruptible expected=120000
-def write_image():
+def write_vin():
     diag.security_access(0x11)
-    diag.flash_transfer(1)
+    diag.request(0x2E, {"did": 0xF190, "vin": "WVWZZZ1JZXW000001"})
 
 def main():
-    write_image()
+    write_vin()
 ```
 
 | Annotation | `Interruptible` |

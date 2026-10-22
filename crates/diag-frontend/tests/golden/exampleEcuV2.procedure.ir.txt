@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "81f7ee34987deef7e1dfdf9585f5ab294771b87b44d65614fb8f08547eb9f966",
+        "e716cebd096251b99b7f74547207297def41dd027476ba05f432e36a8168c661",
     ),
     variant: Some(
         EcuVariantT {
@@ -2619,7 +2619,7 @@ Program {
         },
         Pop,
         Call(
-            337,
+            338,
         ),
         PushBytes(
             1,
@@ -3230,7 +3230,7 @@ Program {
             message: 18,
         },
         Call(
-            341,
+            342,
         ),
         PushBytes(
             17,
@@ -3402,6 +3402,9 @@ Program {
             service: 17,
         },
         Pop,
+        Wait {
+            millis: 2000,
+        },
         Log {
             level: 1,
             message: 22,
@@ -3416,7 +3419,7 @@ Program {
         Pop,
         Ret,
         Call(
-            346,
+            347,
         ),
         PushBytes(
             23,
@@ -4152,35 +4155,35 @@ Program {
             expected_millis: 0,
         },
         Section {
-            start_pc: 338,
-            end_pc: 339,
+            start_pc: 336,
+            end_pc: 337,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 341,
-            end_pc: 343,
+            start_pc: 339,
+            end_pc: 340,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 342,
+            end_pc: 344,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 343,
-            end_pc: 344,
+            start_pc: 344,
+            end_pc: 345,
             interruptible: No,
             idempotency: Unsafe,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 344,
-            end_pc: 346,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 2000,
-        },
-        Section {
-            start_pc: 346,
+            start_pc: 345,
             end_pc: 347,
             interruptible: No,
             idempotency: CheckState,
@@ -4190,12 +4193,19 @@ Program {
             start_pc: 347,
             end_pc: 348,
             interruptible: No,
-            idempotency: Safe,
+            idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
             start_pc: 348,
-            end_pc: 350,
+            end_pc: 349,
+            interruptible: No,
+            idempotency: Safe,
+            expected_millis: 2000,
+        },
+        Section {
+            start_pc: 349,
+            end_pc: 351,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
@@ -4481,47 +4491,53 @@ Program {
         SourceSpan {
             pc: 336,
             file: 0,
-            line: 38,
+            line: 63,
             column: 5,
         },
         SourceSpan {
             pc: 337,
             file: 0,
-            line: 17,
+            line: 38,
             column: 5,
         },
         SourceSpan {
-            pc: 340,
+            pc: 338,
             file: 0,
-            line: 16,
+            line: 17,
             column: 5,
         },
         SourceSpan {
             pc: 341,
             file: 0,
-            line: 21,
+            line: 16,
             column: 5,
         },
         SourceSpan {
             pc: 342,
             file: 0,
-            line: 22,
+            line: 21,
             column: 5,
         },
         SourceSpan {
-            pc: 345,
+            pc: 343,
             file: 0,
-            line: 20,
+            line: 22,
             column: 5,
         },
         SourceSpan {
             pc: 346,
             file: 0,
+            line: 20,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 347,
+            file: 0,
             line: 17,
             column: 5,
         },
         SourceSpan {
-            pc: 349,
+            pc: 350,
             file: 0,
             line: 16,
             column: 5,

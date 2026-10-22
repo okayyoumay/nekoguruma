@@ -735,5 +735,37 @@ fn the_example_write_procedure_lowers_and_dry_runs_for_every_variant() {
             .filter(|event| matches!(event, DryRunEvent::FlashTransfer { .. }))
             .count();
         assert_eq!(blocks, 256);
+        // The read-back waits for the ECU's restart after the reset.
+        let waits: Vec<u32> = report
+            .events
+            .iter()
+            .filter_map(|event| match event {
+                DryRunEvent::Wait { millis } => Some(*millis),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(waits, [2000]);
+    }
+}
+
+/// `%` formatting of a run-time int is not lowered: the error names the instructions it waits
+/// for (subset 2.5), so the example procedure's messages are constant text.
+#[test]
+fn run_time_percent_formatting_is_not_lowerable() {
+    let source = "\
+def main():
+    res = diag.request(0x22, {\"did\": 0xF186})
+    diag.log(1, \"NRC=%d\" % res[\"fields\"][\"session\"])
+";
+    let errors = procedures(with(example(), "main.star", source))
+        .expect_err("rejected")
+        .errors;
+    assert!(!errors.is_empty());
+    for error in &errors {
+        assert_eq!(error.code, StarCode::NotLowerable, "{error:?}");
+        assert!(
+            error.hint.contains("string formatting instructions"),
+            "{error:?}"
+        );
     }
 }

@@ -85,21 +85,37 @@ struct Recording {
 }
 
 /// What the recording host has been given by `flash_transfer` since its last request.
-#[derive(Default)]
 struct Transfer {
     blocks: u32,
     bytes: usize,
-    sum: u64,
+    /// FNV-1a (64 bits) over every byte in the order sent, so a block out of order or from a
+    /// wrong offset changes it.
+    hash: u64,
+}
+
+impl Default for Transfer {
+    fn default() -> Self {
+        Self {
+            blocks: 0,
+            bytes: 0,
+            hash: 0xcbf2_9ce4_8422_2325,
+        }
+    }
 }
 
 impl Recording {
     /// Ends the transfer in progress, if any, with one line: the host sums the blocks instead of
     /// listing each, so the file stays short and still shows every byte the program sent.
     fn end_transfer(&mut self) {
-        if let Some(Transfer { blocks, bytes, sum }) = self.transfer.take() {
+        if let Some(Transfer {
+            blocks,
+            bytes,
+            hash,
+        }) = self.transfer.take()
+        {
             writeln!(
                 self.out,
-                "flash-transfer {blocks} blocks {bytes} bytes sum {sum}"
+                "flash-transfer {blocks} blocks {bytes} bytes fnv1a {hash:016x}"
             )
             .expect("a String");
         }
@@ -133,10 +149,15 @@ impl DiagHost for Recording {
         let sid = u8::try_from(service).expect("a one-byte SID");
         writeln!(self.out, "request {sid:02X} {}", hex(payload)).expect("a String");
         let mut response = vec![sid + 0x40];
-        // A RequestDownload's response does not echo its request, so it is matched on its SID.
-        if sid != 0x34 {
-            response.extend(payload.iter().take(2));
-        }
+        // A RequestDownload's response does not echo its request, so it is matched on its SID;
+        // a SecurityAccess response echoes the sub-function only (a send-key request goes on with
+        // the key).
+        let echoed = match sid {
+            0x34 => 0,
+            0x27 => 1,
+            _ => 2,
+        };
+        response.extend(payload.iter().take(echoed));
         Ok(self
             .answers
             .iter()
@@ -188,6 +209,7 @@ impl DiagHost for Recording {
         level: u8,
         seed: &[u8],
     ) -> Result<Option<Vec<u8>>, NotSent> {
+        self.end_transfer();
         writeln!(self.out, "security-access {level:02X} {}", hex(seed)).expect("a String");
         Ok(Some(GOLDEN_KEY.to_vec()))
     }
@@ -195,11 +217,15 @@ impl DiagHost for Recording {
         let transfer = self.transfer.get_or_insert_with(Transfer::default);
         transfer.blocks += 1;
         transfer.bytes += data.len();
-        transfer.sum += data.iter().map(|&byte| u64::from(byte)).sum::<u64>();
+        for &byte in data {
+            transfer.hash = (transfer.hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
         Ok(())
     }
-    fn wait(&mut self, _: u64, _: u32) -> Result<bool, NotSent> {
-        Err(NotSent)
+    fn wait(&mut self, _: u64, millis: u32) -> Result<bool, NotSent> {
+        self.end_transfer();
+        writeln!(self.out, "wait {millis}").expect("a String");
+        Ok(true)
     }
     fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
         Err(NotSent)
@@ -221,6 +247,7 @@ impl DiagHost for Recording {
         Err(NotSent)
     }
     fn log(&mut self, level: u8, message: &str) {
+        self.end_transfer();
         writeln!(self.out, "log {level} {message}").expect("a String");
     }
 }
@@ -305,6 +332,7 @@ fn run(program: &Program, variant: &EcuVariant<'_>, answers: Vec<Vec<u8>>) -> St
         match vm.step_with_declarations(program, Some(variant), &mut host) {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => {
+                host.end_transfer();
                 host.out.push_str("finished\n");
                 return host.out;
             }

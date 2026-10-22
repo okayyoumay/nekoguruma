@@ -4,7 +4,7 @@
 * programmingSession 50 02 00 32 01 F4
 * securityAccess 67 01 12 34
 * securityAccess 67 02
-* requestDownload 74 20 01 00
+* requestDownload 74 20 01 02
 * requestTransferExit 77
 * ecuReset 51 01
 * vin.read 62 F1 90 57 56 57 5A 5A 5A 31 4A 5A 58 57 30 30 30 30 30 31

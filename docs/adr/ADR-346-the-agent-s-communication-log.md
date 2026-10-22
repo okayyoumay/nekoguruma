@@ -125,7 +125,8 @@ decisions behind them:
      exchange) on a link that has an answer of the ECU since its last link error and reported
      none during the exchange; otherwise `undetermined`, since a wrong address, a response filter
      or the VCI's receive path is not excluded;
-   - a timeout before the limit in force is `system`; a final response after it is `vehicle`;
+   - a timeout before the limit in force, or after it where no unseen pending can explain the
+     delay, is `system`; a final response after it is `vehicle`;
    - a timeout or response later than P2 on a link whose VCI absorbs pendings, with none seen, is
      a possible pending: a hidden pending and a VCI waiting past P2 give the same times, so it
      neither counts as an answer of the ECU nor decides a no-response, which is `undetermined`;

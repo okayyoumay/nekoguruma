@@ -218,7 +218,10 @@ decisions behind them:
    - an answer to an exchange made while an earlier exchange with the same match is still owed
      its final response (one whose request may have reached the ECU whole) may be that one's late
      answer, since the worker gives an answer to the primitive in flight, so the exchange is at
-     least `undetermined` and the earlier one stays unsettled;
+     least `undetermined` and the earlier one stays unsettled; a request stays owed until a final
+     response is placed with it or the target's ECUReset or session change is accepted, and a link
+     error or a reopened link does not end it, since a response already on its way can still
+     arrive;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
      the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
@@ -258,7 +261,7 @@ decisions behind them:
      primitive belongs to its exchange, and only an unbound one needs the single-owner test, with no exchange in flight using its request
      identifier for a transmit indication or loopback echo, or its response identifier for a
      start or pending), a late link error also settling the later exchanges that relied on answers
-     from before it or were made `undetermined` by a request owed from before it; a forwarded pending after the VCI ended the exchange is
+     from before it (an owed request survives it); a forwarded pending after the VCI ended the exchange is
      judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response,
      and turns an exchange that ended without a response into `response_incomplete` only when its
      time does not decide.

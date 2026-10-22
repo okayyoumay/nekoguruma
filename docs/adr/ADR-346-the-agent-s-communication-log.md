@@ -86,9 +86,9 @@ decisions behind them:
    - a difference is taken only between times of one clock and epoch, and a limit is passed only
      beyond the link's timing margin;
    - a time is judged against a limit only from the VCI's transmit-done time to a VCI time of the
-     same clock (a response start, a single-frame response's end, a receive timeout); agent times,
-     which include the RPC and worker queuing, are reported but never decide lateness or an
-     early timeout;
+     same clock (a response start, a receive timeout); agent times, which include the RPC and
+     worker queuing, and a response's end, which includes its own transfer, are reported but
+     never decide lateness or an early timeout;
    - on a link whose VCI absorbs pendings, a limit that depends on the unseen pendings is bounded
      from the transmit and judged only where the bound decides;
    - an extra error code is used only when it names the case, since part of the codes are the
@@ -161,7 +161,10 @@ decisions behind them:
 7. **Responses after their exchange.** The agent reads the link's items while it waits and when
    it closes the link, so a response that the worker delivers after its exchange is a
    `late_response` entry referring to that exchange, judged on its own against that exchange's
-   limits. The earlier entry is never rewritten. The J2534 worker discards a frame no primitive
+   limits. A primitive the agent stopped waiting for stays in flight, and its end, whatever it
+   is, is a `primitive_ended` entry that settles the exchange: classified as if the agent had
+   waited, except that an end that would be fault-free is `system`, since the job gave up on it.
+   The earlier entry is never rewritten. The J2534 worker discards a frame no primitive
    expects (ADR-100), so on such links a late response does not reach the log; capturing it would
    need a receive-only primitive beside the exchanges, which is not decided here.
 8. **Times: raw, tagged, aligned per clock.** The entry keeps agent times (monotonic and wall)

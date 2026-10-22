@@ -137,7 +137,7 @@ decisions behind them:
    then treats as a pending, and the agent never sets the suppress-positive-response transmit flag (ISO
    22900-2:2022 Annex I.2.1), with which the API would end a silent exchange without a timeout
    and hide an unexpected positive response. A primitive past the agent's deadline holds its
-   link (8.4.17.2), so the agent cancels it before the link's next request, and at job end after
+   link (ISO 22900-2:2022 8.4.17.2), so the agent cancels it before the link's next request, and at job end after
    the longest transfer of the largest response its definition allows.
 6. **Classification on the communication axis, from one rule.** Each exchange is `vehicle`,
    `system`, `undetermined` or `none`, by the first matching row of design 8.11's table; the rows
@@ -241,7 +241,8 @@ decisions behind them:
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link
-     error of the exchange's time that comes after the entry (`late_item`); a forwarded pending after the VCI ended the exchange is
+     error of the exchange's time that comes after the entry (`late_item`), a late link error
+     also settling the later exchanges that relied on answers from before it; a forwarded pending after the VCI ended the exchange is
      judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response,
      and turns an exchange that ended without a response into `response_incomplete` only when its
      time does not decide.

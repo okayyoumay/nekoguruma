@@ -238,8 +238,8 @@ decisions behind them:
      severe; otherwise `undetermined`; it belongs to the ended exchange it
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
-   - a transmit indication, loopback echo, start-of-message indication or forwarded pending that
-     comes after the entry (`late_item`); a forwarded pending after the VCI ended the exchange is
+   - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link
+     error of the exchange's time that comes after the entry (`late_item`); a forwarded pending after the VCI ended the exchange is
      judged like a late response against the limit before it; a late start-of-message indication turns an exchange
      that ended without a response into `response_incomplete`.
 

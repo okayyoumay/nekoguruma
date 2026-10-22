@@ -243,8 +243,10 @@ spot that was named. Before the first review request (Step 0) and in every round
 (`git diff $(git merge-base origin/main HEAD)`, plus any new file `git status --short
 --untracked-files=all` lists), not only the round's
 fix. A diff holds no commit messages and no PR description, so read those too: the branch's
-messages (`git log origin/main..HEAD`), the round's draft message and the PR description. Check
-each kind below and fix what you find in the same push, routing a gap of the same shape as a
+messages (`git log origin/main..HEAD`), the round's draft message and the PR description. A message
+already pushed cannot be rewritten (no force-push on a loop branch); the PR merges by squash with
+its description as the message, so fix the gap in the description and name the pushed commit
+there for the maintainer. Check each kind below and fix what you find in the same push, routing a gap of the same shape as a
 finding already fixed as "Fix the kind, not the spot" says:
 
 - **Cross-document drift.** A rule stated in more than one place (an ADR item, a design

@@ -215,12 +215,14 @@ decisions behind them:
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
      unless, on each identifier, the extra answers are no more than the requests still owed on it
      (below), whose late answers they may be;
-   - an answer to an exchange made while an earlier exchange with the same match is still owed
-     its final response (one whose request may have reached the ECU whole) may be that one's late
+   - an answer to an exchange made while an earlier exchange whose expected responses it matches is
+     still owed its final response (one whose request may have reached the ECU whole) may be that one's late
      answer, since the worker gives an answer to the primitive in flight, so the exchange is at
-     least `undetermined` and the earlier one stays unsettled; owed requests are counted per match
-     as the requests that may have reached the ECU whole less the final responses delivered,
-     whichever exchange took them, since the target's last accepted ECUReset or session change,
+     least `undetermined` and the earlier one stays unsettled; whether an answer may be an owed request's is judged by the answer
+     matching that request's expected responses (a shared negative pattern included), and the
+     owed requests it meets are the requests it could belong to that may have reached the ECU
+     whole, less the final responses delivered that could have belonged to them, whichever
+     exchange took them, counted since the target's last accepted ECUReset or session change,
      and a link error or a reopened link does not end the count, since a response already on its
      way can still arrive; such an answer is no evidence of the exchange's own send;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
@@ -238,7 +240,8 @@ decisions behind them:
    latest entry referring to an exchange gives its standing classification. The earlier entry
    is never rewritten. A settling entry carries the facts of the settling entries before it (a
    give-up, a kept power), keeps any system-side fault an earlier entry observed (it takes the
-   most severe of that fault and its own classification), also reclassifies the later exchanges
+   most severe of that fault and its own classification), but not one only inferred from an item
+   not yet read, which the item replaces when it arrives, also reclassifies the later exchanges
    whose matched answers or owed requests it changes (an answer it adds to an earlier exchange,
    or a late link error), and a cancellation by the agent settles nothing. The settling entries
    are:

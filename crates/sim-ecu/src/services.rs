@@ -7,8 +7,9 @@ use crate::{
     DID_POWER_CYCLES, DID_SOFTWARE_VERSION, DID_SPARE_PART_NUMBER, DID_VIN, DTC_STATUS_AFTER_CLEAR,
     DTC_STATUS_AVAILABILITY_MASK, Download, FLASH_SIZE, FLASH_START, Fault, FlashPhase,
     MAX_BLOCK_LENGTH, MAX_DIDS_PER_READ, MAX_RESPONSE_LENGTH, MAX_SECURITY_ATTEMPTS, Nrc,
-    POSITIVE_RESPONSE_OFFSET, RID_CHECK_PROGRAMMING_DEPENDENCIES, RID_ERASE_MEMORY,
-    SUPPRESS_POS_RSP, ServiceResult, Session, SimEcu,
+    PART_NUMBER_LENGTH, POSITIVE_RESPONSE_OFFSET, RID_CHECK_PROGRAMMING_DEPENDENCIES,
+    RID_ERASE_MEMORY, SUPPRESS_POS_RSP, SW_VERSION_LENGTH, ServiceResult, Session, SimEcu,
+    fixed_width,
 };
 
 const SID_DIAGNOSTIC_SESSION_CONTROL: u8 = 0x10;
@@ -280,8 +281,10 @@ impl SimEcu {
     fn read_did(&self, did: u16) -> Option<Vec<u8>> {
         match did {
             DID_ACTIVE_DIAGNOSTIC_SESSION => Some(vec![self.session.code()]),
-            DID_SPARE_PART_NUMBER => Some(self.config.part_number.as_bytes().to_vec()),
-            DID_SOFTWARE_VERSION => Some(self.running_sw_version.as_bytes().to_vec()),
+            DID_SPARE_PART_NUMBER => {
+                Some(fixed_width(&self.config.part_number, PART_NUMBER_LENGTH))
+            }
+            DID_SOFTWARE_VERSION => Some(fixed_width(&self.running_sw_version, SW_VERSION_LENGTH)),
             DID_VIN => Some(self.config.vin.as_bytes().to_vec()),
             DID_FLASH_STATE => {
                 let received = self.download.map_or(0, |dl| dl.received);

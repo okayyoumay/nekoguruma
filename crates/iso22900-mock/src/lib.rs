@@ -618,7 +618,9 @@ fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>
         None => Ok(None),
         Some(path) => {
             let text = std::fs::read_to_string(path).map_err(|_| ())?;
-            serde_json::from_str(&text).map(Some).map_err(|_| ())
+            let config: EcuConfig = serde_json::from_str(&text).map_err(|_| ())?;
+            config.validate().map_err(|_| ())?;
+            Ok(Some(config))
         }
     }
 }
@@ -670,6 +672,7 @@ fn apply_sim_ecu_command(state: &mut MockState, command: SimEcuCommand) -> Resul
             }
             fields.extend(config);
             let config: EcuConfig = serde_json::from_value(merged).map_err(|_| ())?;
+            config.validate().map_err(|_| ())?;
             state.ecu = Some(SimEcu::new(config));
         }
         SimEcuCommand::Detach {} => state.ecu = None,

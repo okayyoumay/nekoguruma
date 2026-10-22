@@ -25,7 +25,7 @@ and the two stay separate crates (ADR-260). They differ where it matters:
   "Control"). On the first open of the process it creates the ECU with the
   `sim_ecu::EcuConfig` read from the JSON file named by `NGR_SIM_ECU_CONFIG`, or with a built-in
   configuration (VIN `NGRSIMECU00000001`, part number `NGR-SIM-ECU`, software version `1.0.0`)
-  when the variable is unset. An unreadable or invalid file makes the open fail with `ERR_FAILED`.
+  when the variable is unset. An unreadable or invalid file (also a part number or software version past the widths F187 and F189 answer with) makes the open fail with `ERR_FAILED`.
   The ECU's timers run on real time, so a non-default session ends after tS3_Server (5 s unless
   the configuration sets `s3_server_ms`) without a request, as on a vehicle.
   After an ECUReset it also answers nothing for `startup_ms` when the configuration sets it

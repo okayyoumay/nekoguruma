@@ -613,6 +613,61 @@ fn read_sw_version(ecu: &mut SimEcu) -> SimResponse {
     ecu.request(&[0x22, 0xF1, 0x89])
 }
 
+#[test]
+fn the_part_number_and_the_version_answer_with_a_fixed_width() {
+    let mut ecu = ecu();
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x87]),
+        pos(b"\x62\xF1\x871K0907115  ")
+    );
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042 "));
+    // Empty values and values cut at the width keep the length too.
+    let mut empty = SimEcu::new(EcuConfig::default());
+    for (did, width) in [(0x87, PART_NUMBER_LENGTH), (0x89, SW_VERSION_LENGTH)] {
+        match empty.request(&[0x22, 0xF1, did]) {
+            SimResponse::Positive(bytes) => assert_eq!(bytes.len(), 3 + width),
+            r => panic!("{r:?}"),
+        }
+    }
+    let mut long = SimEcu::new(EcuConfig {
+        sw_version: "1.2.3.4.5".into(),
+        ..config()
+    });
+    assert_eq!(read_sw_version(&mut long), pos(b"\x62\xF1\x891.2.3"));
+}
+
+#[test]
+fn validate_refuses_values_that_do_not_fit_the_fixed_widths() {
+    assert_eq!(config().validate(), Ok(()));
+    let exact = EcuConfig {
+        part_number: "A".repeat(PART_NUMBER_LENGTH),
+        sw_version: "B".repeat(SW_VERSION_LENGTH),
+        downloaded_sw_version: Some("C".repeat(SW_VERSION_LENGTH)),
+        ..config()
+    };
+    assert_eq!(exact.validate(), Ok(()));
+    for bad in [
+        EcuConfig {
+            part_number: "A".repeat(PART_NUMBER_LENGTH + 1),
+            ..config()
+        },
+        EcuConfig {
+            sw_version: "B".repeat(SW_VERSION_LENGTH + 1),
+            ..config()
+        },
+        EcuConfig {
+            downloaded_sw_version: Some("C".repeat(SW_VERSION_LENGTH + 1)),
+            ..config()
+        },
+        EcuConfig {
+            sw_version: "\u{e9}".into(),
+            ..config()
+        },
+    ] {
+        assert!(bad.validate().is_err(), "{bad:?}");
+    }
+}
+
 fn new_version_config() -> EcuConfig {
     EcuConfig {
         downloaded_sw_version: Some("0043".into()),
@@ -625,9 +680,9 @@ fn a_verified_download_reports_its_version_after_an_ecu_reset() {
     let mut ecu = SimEcu::new(new_version_config());
     assert_eq!(download_new_version(&mut ecu), 0x00);
     // The old software runs until the ECU restarts.
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042 "));
     assert_eq!(ecu.request(&[0x11, 0x01]), pos(&[0x51, 0x01]));
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890043"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890043 "));
     assert_eq!(ecu.running_sw_version, "0043");
 }
 
@@ -637,7 +692,7 @@ fn a_verified_download_reports_its_version_after_a_power_loss() {
     assert_eq!(download_new_version(&mut ecu), 0x00);
     ecu.inject(Fault::PowerLoss);
     ecu.reconnect();
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890043"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890043 "));
 }
 
 #[test]
@@ -648,7 +703,7 @@ fn a_failed_check_or_an_erase_keeps_the_old_version() {
     });
     assert_eq!(download_new_version(&mut ecu), 0x01);
     ecu.request(&[0x11, 0x01]);
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042 "));
 
     // A verified image erased before the restart is never installed.
     let mut ecu = SimEcu::new(new_version_config());
@@ -658,7 +713,7 @@ fn a_failed_check_or_an_erase_keeps_the_old_version() {
         pos(&[0x71, 0x01, 0xFF, 0x00])
     );
     ecu.request(&[0x11, 0x01]);
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042 "));
 
     // A check that fails after an earlier one passed withdraws the pending install.
     let mut ecu = SimEcu::new(new_version_config());
@@ -669,7 +724,7 @@ fn a_failed_check_or_an_erase_keeps_the_old_version() {
         pos(&[0x71, 0x01, 0xFF, 0x01, 0x01])
     );
     ecu.request(&[0x11, 0x01]);
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042 "));
 }
 
 #[test]
@@ -677,7 +732,7 @@ fn without_a_downloaded_version_f189_stays_at_the_configured_one() {
     let mut ecu = ecu();
     assert_eq!(download_new_version(&mut ecu), 0x00);
     ecu.request(&[0x11, 0x01]);
-    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042"));
+    assert_eq!(read_sw_version(&mut ecu), pos(b"\x62\xF1\x890042 "));
 }
 
 #[test]

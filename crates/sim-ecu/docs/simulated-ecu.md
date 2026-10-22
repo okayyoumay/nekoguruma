@@ -92,13 +92,15 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 | DID | Content |
 |---|---|
 | F186 | active session (diagnosticSessionType value) |
-| F187 | `EcuConfig::part_number` |
-| F189 | the running software version (`SimEcu::running_sw_version`): `EcuConfig::sw_version` at power-up, then the version of the last verified download (below) |
+| F187 | `EcuConfig::part_number`, always `PART_NUMBER_LENGTH` (11) bytes: padded with spaces when shorter, cut when longer |
+| F189 | the running software version (`SimEcu::running_sw_version`): `EcuConfig::sw_version` at power-up, then the version of the last verified download (below), always `SW_VERSION_LENGTH` (5) bytes, padded or cut as F187 is |
 | F190 | `EcuConfig::vin`; writable as 17 ASCII alphanumeric bytes, behind security access |
 | FD00 | flash state: phase code (1 byte), block number (4 bytes), bytes received of the current download (4 bytes), big endian |
 | FD01 | `SimEcu::power_cycles` (ECU resets, power losses, reconnections) as 4 bytes, big endian, saturating |
 | FD04 | a fixed battery voltage, `BATTERY_VOLTAGE_RAW` (0x007D), as 2 bytes, big endian; the example ECU definition reads it in 0.1 V units as 12.5 V |
 | FD05 | a fixed boot time, `BOOT_TIME_RAW` (0x002D), as 2 bytes, big endian; the example ECU definition reads it in 10 ms units as 450 ms |
+
+`EcuConfig::validate` refuses a part number, software version or `downloaded_sw_version` that is not ASCII or is longer than its width; `sim-vci` and `iso22900-mock` call it when they load or attach a configuration. A `SimEcu` built directly from a longer value cuts it, so the answer keeps its length.
 
 The example ECU definition (`crates/diag-frontend/examples/example-ecu`) also declares FD02 and
 FD03, which the simulator does not answer (RequestOutOfRange).

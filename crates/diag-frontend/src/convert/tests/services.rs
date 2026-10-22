@@ -166,17 +166,11 @@ fn did_services_share_the_record_fields() {
         (write.required_session, write.required_security_level),
         (0x03, 0x01)
     );
-    // A terminated record.
+    // A fixed-length text record of 11 bytes.
     let spare = &response(service(&documents[0], "sparePartNumber.read")).2[0];
     assert_eq!(
-        (
-            spare.length_kind,
-            spare.bit_length,
-            spare.min_bytes,
-            spare.max_bytes,
-            spare.termination
-        ),
-        (LengthKind::Terminated, 0, 1, 0, Termination::EndOfPdu)
+        (spare.length_kind, spare.bit_length),
+        (LengthKind::Fixed, 88)
     );
     // A text table.
     let session = &response(service(&documents[0], "activeSession.read")).2[0];

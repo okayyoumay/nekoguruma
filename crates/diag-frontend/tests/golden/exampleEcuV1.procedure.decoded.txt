@@ -149,6 +149,20 @@ Ok(
         },
     ],
 )
+sparePartNumber.read [62 F1 87 4E 47 52 2D 53 49 4D 2D 45 43 55]
+Ok(
+    [
+        DecodedField {
+            id: 21,
+            short_name: "sparePartNumber",
+            value: Text(
+                "NGR-SIM-ECU",
+            ),
+            text_id: 0,
+            unit_id: 0,
+        },
+    ],
+)
 flashState.read [62 FD 00 02 00 00 00 05 00 01 00 00]
 Ok(
     [

@@ -1470,10 +1470,10 @@ mod tests {
             ));
         }
 
-        /// The example ECU as the converter emits it: its VIN source is read from the VIN
-        /// service at an absolute place.
+        /// The example ECU as the converter emits it: its VIN, part number and software
+        /// version sources are read from their DID services at absolute places.
         #[test]
-        fn the_converted_example_gives_the_vin_read() {
+        fn the_converted_example_gives_the_three_identity_reads() {
             use diag_frontend::convert::{lower_procedures, to_ir};
             use diag_frontend::tables::{read_files, resolve};
             let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -1502,22 +1502,28 @@ mod tests {
             for converted in converted.documents {
                 let document = JobDocument::new(converted.bytes).expect("a document");
                 let program = document.program().expect("a program");
-                let vin = program
-                    .identity
-                    .vin
-                    .expect("the example names a VIN source");
-                let Source::EcuService {
-                    service_id,
-                    field_id,
-                } = vin
-                else {
-                    panic!("{vin:?}");
-                };
                 let table = ServiceSources::from_document(&document, &program).expect("a table");
-                let field = table.get(service_id, field_id).expect("the VIN entry");
-                assert_eq!(field.request, [0x22, 0xF1, 0x90]);
-                assert_eq!((field.offset, field.length), (2, 17));
-                assert_eq!(field.encoding, Encoding::Ascii);
+                // All three identity rows of the example are fixed-length ASCII reads.
+                let identity = &program.identity;
+                for (source, did, length) in [
+                    (identity.vin, 0xF190_u16, 17),
+                    (identity.hardware_part_number, 0xF187, 11),
+                    (identity.software_version, 0xF189, 5),
+                ] {
+                    let source = source.expect("the example names the source");
+                    let Source::EcuService {
+                        service_id,
+                        field_id,
+                    } = source
+                    else {
+                        panic!("{source:?}");
+                    };
+                    let field = table.get(service_id, field_id).expect("the entry");
+                    let [hi, lo] = did.to_be_bytes();
+                    assert_eq!(field.request, [0x22, hi, lo]);
+                    assert_eq!((field.offset, field.length), (2, length));
+                    assert_eq!(field.encoding, Encoding::Ascii);
+                }
             }
         }
 

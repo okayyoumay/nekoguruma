@@ -141,7 +141,8 @@ decisions behind them:
      evidence: the request never reached the bus (excluded by a confirmed or partial send, or an
      answer in the exchange); the worker dropped a response that did not match, or the address
      or filter is wrong (excluded by an answer in the exchange, or an earlier answer matched the
-     same way since the last link error on the physical channel and the target's last reset or
+     same way, by the same response identifier and the same expected response patterns with
+     what they echo of the request, such as a data identifier, since the last link error on the physical channel and the target's last reset or
      session change); a frame lost in the transport or the VCI's receive path (excluded only by
      no link error during the exchange, and never for a missing flow-control frame); and a
      pending the VCI absorbed (excluded on a link that forwards pendings, or by timing within P2

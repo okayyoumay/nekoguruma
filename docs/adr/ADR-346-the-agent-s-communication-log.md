@@ -210,7 +210,7 @@ decisions behind them:
      possible pending, and no pending seen (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
      unless the extra answers are no more than the earlier exchanges with the same match still
-     unanswered, whose late answers they may be;
+     without a final response (a pending alone leaves one owed), whose late answers they may be;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
      the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
@@ -244,7 +244,8 @@ decisions behind them:
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link
-     error of the exchange's time that comes after the entry (`late_item`), a late link error
+     error of the exchange's time that comes after the entry (`late_item`; an item bound to a
+     primitive belongs to its exchange, and only an unbound one needs the single-owner test), a late link error
      also settling the later exchanges that relied on answers from before it; a forwarded pending after the VCI ended the exchange is
      judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response,
      and turns an exchange that ended without a response into `response_incomplete` only when its

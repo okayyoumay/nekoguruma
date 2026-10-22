@@ -845,7 +845,7 @@ For each cause of interruption, the resume origin and whether resumption is poss
 **Cases where resumption must not occur**
 
 - The start deadline has passed (terminate as "expired", since another vehicle may be connected)
-- The resume is given another flash artifact than the journal recorded (a missing hash on either side counts as another): before the journal reached a flash plan the job is refused, from the plan on it needs on-site intervention, nothing is sent and no resume is counted, and a resume that already needs on-site intervention for another reason keeps that reason (ADR-344)
+- The resume is given another flash artifact than the journal recorded (a missing hash on either side counts as another): before the journal reached a flash plan the job is refused, from the plan on it needs on-site intervention, nothing is sent and no resume is counted, and a resume that already needs on-site intervention for another reason keeps that reason; the job check comes first, so a program that reads blocks and is given no artifact, or one too short for a segment, is refused there with the journal untouched (ADR-344)
 - A VIN or hardware identity mismatch on re-verification before resuming (abort): the abort is journaled as the job's last record, and a later resume ends in the same abort before the link is opened, sending nothing and counting no resume (ADR-286)
 - The number of resumes at the same stage has reached the limit (avoid infinite loops; escalate to on-site intervention)
 - The procedure ended itself as failed: a declared failure is terminal and journaled, and a restart does not resume the job (ADR-280)

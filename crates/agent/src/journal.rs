@@ -3165,6 +3165,7 @@ mod tests {
                 vm_state: Vec::new(),
             },
             Record::Request { at: at(0, 0) },
+            Record::ArtifactSha256([0; 32]),
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

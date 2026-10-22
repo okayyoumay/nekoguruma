@@ -4915,7 +4915,7 @@ def main():
         .expect("the job runs");
         let facts = Journal::read(&dir, &job_key()).unwrap().facts;
         assert_eq!(facts.artifact_sha256, Some(artifact_hash(1)));
-        let (client, _calls) = fake_worker(false).await;
+        let (client, calls) = fake_worker(false).await;
         let (result, _guards) = resume_program_journaled(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -4928,6 +4928,11 @@ def main():
         assert!(
             matches!(result, Err(JobError::ArtifactDiffersFromJournal)),
             "{result:?}"
+        );
+        assert!(
+            !calls.lock().unwrap().contains(&"StartComPrimitive"),
+            "no request reached the worker: {:?}",
+            calls.lock().unwrap()
         );
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -8370,6 +8375,102 @@ def main():
             "{result:?}"
         );
         assert_artifact_refused_untouched(&host, &dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The last step alone (no transfer marker, no request marker) reaches the plan when the
+    /// classification still starts the job plainly: another artifact then needs a person, and
+    /// the same artifact is not refused (ADR-344 items 2 and 3).
+    #[test]
+    fn a_last_step_inside_the_plan_reaches_on_site_through_a_plain_start() {
+        let mut program = flash_program_around(
+            Vec::new(),
+            vec![
+                Op::PushBytes(0),
+                Op::ServiceRequest { service: 0x3E },
+                Op::Pop,
+            ],
+        );
+        program
+            .sections
+            .push(plain_section(0, 3, diag_ir::Idempotency::Safe));
+        program.validate().expect("the fixture is a valid program");
+        let (first, other) = (artifact_hash(1), artifact_hash(2));
+        let dir = journal_dir("artifact-differs-last-step-plain-start");
+        let result = first_run_with_artifact(&program, &dir, Some(&first), false, Some(0x3E));
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.transfer.is_none());
+        let last = state.facts.last_step.expect("a step inside the plan");
+        assert!(restart::in_plan(&program, last.pc), "{last:?}");
+        assert!(matches!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::PlainStart
+        ));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_with_artifact(&program, &dir, &mut host, Some(&other));
+        assert!(
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ArtifactDiffers
+                ))
+            ),
+            "{result:?}"
+        );
+        assert_artifact_refused_untouched(&host, &dir);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_with_artifact(&program, &dir, &mut host, Some(&first));
+        assert!(
+            !matches!(
+                result,
+                Err(JobError::ArtifactDiffersFromJournal)
+                    | Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::ArtifactDiffers
+                    ))
+            ),
+            "{result:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A checkpoint resume of a plain procedure (no flash plan) given another artifact is
+    /// refused: the decision is one the artifact comparison covers (ADR-344 item 3).
+    #[test]
+    fn a_checkpoint_resume_given_another_artifact_is_refused() {
+        let program = resumable_program();
+        let (first, other) = (artifact_hash(1), artifact_hash(2));
+        let dir = journal_dir("artifact-differs-checkpoint-resume");
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_service = Some(0x3E);
+        let mut journal = JobJournal::create(file_setup(&dir), Some(&first)).unwrap();
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 7, .. })),
+            "{result:?}"
+        );
+        drop(journal);
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert_eq!(state.facts.artifact_sha256, Some(first));
+        assert!(matches!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::ResumeFromCheckpoint(_)
+        ));
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = resume_with_artifact(&program, &dir, &mut host, Some(&other));
+        assert!(
+            matches!(result, Err(JobError::ArtifactDiffersFromJournal)),
+            "{result:?}"
+        );
+        assert_artifact_refused_untouched(&host, &dir);
+        assert_eq!(plain_resumes(&dir), 0);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

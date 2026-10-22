@@ -291,6 +291,10 @@ step count, of the last completed step, the two transfer markers and the last re
 | no transfer-start marker | the plain procedure's classification (below): a plain start, a checkpoint-resume decision or `OnSiteInterventionRequired` |
 | transfer-start marker | `Restart`, for the plan of the marker's stage, with the VM state at its entry; `OnSiteInterventionRequired` if that plan never allows a restart |
 
+The runner then compares the journal's artifact hash with the resume's before it acts on a plain
+start, a checkpoint-resume decision or a `Restart` (ADR-344, "Restart entry" below); an
+`OnSiteInterventionRequired` decision stands as it is.
+
 A restart's entry state is the newest state the journal holds if it stands at the plan's entry (a
 run start included, so a plain start never inherits an earlier run's state). It is the state before
 the newest only when the newest stands at the plan's post-transfer end (the state of ADR-271 item
@@ -442,15 +446,18 @@ version record is appended without a format version change.
 The flash artifact is compared the same way (ADR-344): `Journal::create` takes the hash of the
 job's artifact and writes `Record::ArtifactSha256` in the creation prefix after the VIN and the
 intended version, once. A resume compares `RecoveryFacts::artifact_sha256` with the hash of the
-artifact it is given, right after the intended version and the classification, with nothing
-sent and no resume counted. It applies only where the classification would go on (a plain
-start, a checkpoint resume or a restart): an on-site decision of the classification stands, so
-another artifact never turns it into a refusal. Two hashes, or a hash on one side only, differ; two absent
-hashes (a job without an artifact) do not. A journal written before the record exists holds
-none. A difference ends in `JobError::ArtifactDiffersFromJournal` while the journal has not
-reached a flash plan (`restart::reached_flash_plan`: no transfer-start marker, and the last
-step and the newest request intent outside every plan's range), and in `OnSiteInterventionRequired(ArtifactDiffers)` once it
-has. An older agent reads the appended record as a corrupt journal (`UnreadableJournal`).
+artifact it is given, right after the intended version and the classification, with nothing sent
+and no resume counted. It applies only where the classification would go on (a plain start, a
+checkpoint resume or a restart): an on-site decision of the classification stands, so another
+artifact never turns it into a refusal. Two hashes, or a hash on one side only, differ; two absent
+hashes (a job without an artifact) do not. A journal written before the record exists holds none. A
+difference ends in `JobError::ArtifactDiffersFromJournal` while the journal has not reached a flash
+plan (`restart::reached_flash_plan`: no transfer-start marker, and the last step and the newest
+request intent outside every plan's range), and in `OnSiteInterventionRequired(ArtifactDiffers)`
+once it has. An older agent reads the appended record as a corrupt journal (`UnreadableJournal`).
+The job check runs first on a resume as on a first run, so a program that reads blocks and is given
+no artifact, or one too short for a segment, ends in `NoArtifact` or `SegmentOutsideArtifact` with
+the journal untouched, and a resume given the job's own artifact can still go on.
 
 `check_gates` is ADR-229 item 2 step 2 before the teardown (ADR-261). It reads only, and stops
 at the first gate that does not hold:

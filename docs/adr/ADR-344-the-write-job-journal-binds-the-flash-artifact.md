@@ -49,11 +49,16 @@ the plan is reported.
    the hash of the artifact it was given. The comparison applies only where the classification
    would go on with the job (a plain start, a resume from a checkpoint or a restart of the
    transfer): when it asks for on-site intervention, that decision and its reason stand, so
-   another artifact never turns a job that needs a person into one a server may issue again. They differ when the two hashes differ, when the
-   journal records one and the resume has no artifact, and when the resume has one and the
-   journal records none. A journal written before this decision records none, so a resume of it
+   another artifact never turns a job that needs a person into one a server may issue again.
+   They differ when the two hashes differ, when the journal records one and the resume has no
+   artifact, and when the resume has one and the journal records none. A journal written before this decision records none, so a resume of it
    given an artifact counts as differing. Nothing is sent and no resume is counted in either
-   outcome below.
+   outcome below. The job check comes before all of this, on a resume as on a first run
+   (ADR-336 item 12): a program that reads blocks and is given no artifact, or one that does not
+   hold a segment, is refused there (`NoArtifact`, `SegmentOutsideArtifact`) before the journal
+   is read. That refusal sends nothing and leaves the journal as it was, so a resume given the
+   job's own artifact still goes on, and one given another that passes the job check meets the
+   comparison.
 3. **Before a flash plan, a refusal; from the plan on, on-site intervention.** The journal has
    reached a flash plan when it records a transfer-start marker (`RecoveryFacts::transfer`) or
    its last completed step or its newest request intent (ADR-253) lies within a plan's
@@ -63,9 +68,11 @@ the plan is reported.
      new bytes, so a job's data cannot change between runs. A server may issue a new job with the
      new artifact.
    - **Reached:** the job ends in on-site intervention (`OnSiteReason::ArtifactDiffers`), as
-     ADR-327 decides for another document past the plan's entry. The erase may already have
-     destroyed the application that the first artifact was to replace, and the journal's
-     transfer facts belong to the first file.
+     ADR-327 decides for another document past the plan's entry. With a transfer-start marker
+     the erase may already have destroyed the application that the first artifact was to
+     replace, and the journal's transfer facts belong to the first file. Before the marker the
+     plan's own steps (its session change and unlock) have run for the first file; ADR-327's
+     line is the plan's entry, not its erase, and this decision keeps to it.
 4. **What it does not cover.** The comparison binds the artifact a resume is given to the one
    its journal was created with. Whether that artifact is the right one for the ECU stays with
    the job's signature and ADR-336's checks at job check. A job without a journal (a program

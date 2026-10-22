@@ -190,8 +190,8 @@ decisions behind them:
      with an earlier matched answer, no link error and no pending seen or possible, `vehicle` when one comes anyway within P2
      or on a link that forwards pendings, and `undetermined` otherwise; after a pending the ECU
      owes its final response;
-   - a request that collects every answer takes the most severe of its answers' classifications,
-     each answer judged on its own against the window, and silence is no fault only for the
+   - a request that collects every answer takes the most severe of its answers' classifications
+     and of any link error during its window, each answer judged on its own against the window, and silence is no fault only for the
      functional presence request with its send confirmed and no link error in its window
      (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,

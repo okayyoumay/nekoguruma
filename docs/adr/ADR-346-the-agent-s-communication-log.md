@@ -162,8 +162,11 @@ decisions behind them:
    it closes the link, so a response that the worker delivers after its exchange is a
    `late_response` entry referring to that exchange, judged on its own against that exchange's
    limits. A primitive the agent stopped waiting for stays in flight, and its end, whatever it
-   is, is a `primitive_ended` entry that settles the exchange: classified as if the agent had
-   waited, except that an end that would be fault-free is `system`, since the job gave up on it.
+   is, is a `primitive_ended` entry that settles the exchange: it carries that end as an exchange
+   entry would, with every item of the primitive that came after the earlier entry (transmit
+   indications, start-of-message indications, forwarded pendings), so the send and the limits are
+   judged from all the evidence. It is classified as if the agent had waited, except that an end
+   that would be fault-free is `system`, since the job gave up on it.
    The earlier entry is never rewritten. The J2534 worker discards a frame no primitive
    expects (ADR-100), so on such links a late response does not reach the log; capturing it would
    need a receive-only primitive beside the exchanges, which is not decided here.

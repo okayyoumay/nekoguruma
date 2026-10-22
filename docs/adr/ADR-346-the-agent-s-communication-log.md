@@ -85,8 +85,10 @@ decisions behind them:
    "not judged", never a guess. In particular:
    - a difference is taken only between times of one clock and epoch, and a limit is passed only
      beyond the link's timing margin;
-   - a response's lateness is judged only from its start (or the end of a single-frame response)
-     on one clock with the transmit;
+   - a time is judged against a limit only from the VCI's transmit-done time to a VCI time of the
+     same clock (a response start, a single-frame response's end, a receive timeout); agent times,
+     which include the RPC and worker queuing, are reported but never decide lateness or an
+     early timeout;
    - on a link whose VCI absorbs pendings, a limit that depends on the unseen pendings is bounded
      from the transmit and judged only where the bound decides;
    - an extra error code is used only when it names the case, since part of the codes are the

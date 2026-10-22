@@ -124,9 +124,13 @@ decisions behind them:
      none during the exchange; otherwise `undetermined`, since a wrong address, a response filter
      or the VCI's receive path is not excluded;
    - a timeout before the limit in force is `system`; a final response after it is `vehicle`;
+   - a timeout or response later than P2 on a link whose VCI absorbs pendings, with none seen, is
+     a possible pending: a hidden pending and a VCI waiting past P2 give the same times, so it
+     neither counts as an answer of the ECU nor decides a no-response, which is `undetermined`;
    - a suppressed positive response, only for a service with a sub-function as the definition
      declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes and no pending was seen
-     or inferred, and `vehicle` when one comes anyway; after a pending the ECU owes its final
+     or possible, `vehicle` when one comes anyway with none, and `undetermined` after a possible
+     pending; after a pending the ECU owes its final
      response;
    - a request that collects every answer takes the most severe of its answers' classifications,
      each answer judged on its own against the window, and silence is no fault only for the
@@ -135,8 +139,9 @@ decisions behind them:
      one answer is `vehicle`;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`), since a VCI powered from the vehicle's connector drops off when
-     the vehicle's supply drops. A clock that restarted does not decide it (on J2534 its origin is
-     the vendor's).
+     the vehicle's supply drops. A clock that restarted does not decide it, and on J2534, whose
+     frame clock has a vendor-defined origin (ADR-120), the loss stays `undetermined` unless a
+     hardware profile (design 13.5) states how that VCI's clock behaves across a power loss;
 7. **Responses after their exchange.** The agent reads the link's items while it waits and when
    it closes the link, so a response that the worker delivers after its exchange is a
    `late_response` entry referring to that exchange, judged on its own against that exchange's

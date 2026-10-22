@@ -1,7 +1,7 @@
 # ADR-251: Copilot Re-Review Only After Fixes That Need It
 
 **Date:** 2026-10-08
-**Status:** Accepted (applies to whichever reviewer the pull request has, Codex or Copilot, ADR-312)
+**Status:** Accepted (applies to whichever reviewer the pull request has, Codex or Copilot, ADR-312; Decision item 1 amended: a sweep fix outside the round's findings also re-requests)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Steps 0, 4 and 5), `.github/copilot-instructions.md` ("Writing findings"), `CLAUDE.md` ("Pull requests")
 
 ## Context
@@ -30,8 +30,10 @@ the number of re-reviews is the lever available to the session.
    loop re-requests a Copilot review only when the round fixed a finding Copilot rated above Low
    (or whose rating cannot be read), the fix went through `design-advisor`, the round newly
    declined a finding (which gets the same one follow-up review it gets in a round that changes
-   nothing), the push changes any file that is not Markdown, or the round merged `main` and
-   resolved a conflict. Otherwise the
+   nothing), the push changes any file that is not Markdown, the round merged `main` and
+   resolved a conflict, or the skill's sweep fixed a gap of a kind none of the round's findings
+   named (such a fix carries no reviewer rating; a sibling of a fixed finding takes that
+   finding's rating). Otherwise the
    loop ends after the round's replies and goes to close-out. Defining the exempt set as
    Markdown only, rather than listing executable file types, keeps a newly added kind of
    executable or data file on the re-review side by default.

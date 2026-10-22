@@ -233,7 +233,9 @@ The thread reply (Step 4) names the other places the fix covered.
 
 Reviewers find these kinds of gap one at a time, a round each, because a fix mends only the
 spot that was named. Before the first review request (Step 0) and in every round that pushes
-(Step 3, before its checks), read the whole PR diff (`git diff origin/main...HEAD`), not only the round's
+(Step 3, before its checks), read the whole PR diff with the round's uncommitted edits in it
+(`git diff $(git merge-base origin/main HEAD)`, plus any new file `git status --short
+--untracked-files=all` lists), not only the round's
 fix, for each kind below, and fix what you find in the same push:
 
 - **Cross-document drift.** A rule stated in more than one place (an ADR item, a design

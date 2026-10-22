@@ -36,7 +36,9 @@ def write_image():
     check = diag.routine(0xFF01, 0x01, {})
     if not check["ok"] or check["fields"]["result"] != 0:
         diag.fail("CHECK_FAILED", "the programming dependencies are not correct")
-    diag.request(0x11, {"reset": 0x01})
+    reset = diag.request(0x11, {"reset": 0x01})
+    if not reset["ok"]:
+        diag.fail("RESET_REFUSED", "the ECU reset was refused")
 
 # Preconditions (8.9): the program carries these three from preconditions.csv, and the agent
 # checks them before the plan's entry.

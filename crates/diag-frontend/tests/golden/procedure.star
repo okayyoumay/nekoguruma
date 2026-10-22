@@ -32,7 +32,9 @@ def write_application():
     if not exit["ok"]:
         diag.fail("TRANSFER_EXIT_REFUSED", "the transfer exit was refused")
     diag.routine(0xFF01, 0x01, {})
-    diag.request(0x11, {"reset": 0x01})
+    reset = diag.request(0x11, {"reset": 0x01})
+    if not reset["ok"]:
+        diag.fail("RESET_REFUSED", "the ECU reset was refused")
 
 # @preconditions voltage externalSupply ignition engine vehicleSpeed
 def main():

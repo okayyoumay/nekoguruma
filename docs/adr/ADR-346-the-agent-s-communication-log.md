@@ -190,8 +190,9 @@ decisions behind them:
      final response there that is not late is `undetermined`;
    - a suppressed positive response, only for a service with a sub-function as the definition
      declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes after a confirmed send,
-     with an earlier matched answer, no link error and no pending seen or possible, `vehicle` when one comes anyway within P2
-     or on a link that forwards pendings, and `undetermined` otherwise; after a pending the ECU
+     with an earlier matched answer, no link error and no pending seen or possible, `vehicle` when one comes anyway, not late, on
+     a link that forwards pendings, and `undetermined` otherwise (on a link whose VCI absorbs
+     pendings a pending may precede it even within P2); after a pending the ECU
      owes its final response;
    - a request that collects every answer takes the most severe of its answers' classifications
      and of any link error during its window, each answer judged on its own against the window, and silence is no fault only for the
@@ -230,7 +231,8 @@ decisions behind them:
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication or forwarded pending that
-     comes after the entry (`late_item`).
+     comes after the entry (`late_item`); a late start-of-message indication turns an exchange
+     that ended without a response into `response_incomplete`.
 
    The J2534 worker discards a frame no primitive expects (ADR-100), so on such links a late
    response does not reach the log; capturing it would need a receive-only primitive beside the

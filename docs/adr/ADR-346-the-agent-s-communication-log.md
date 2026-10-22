@@ -250,7 +250,8 @@ decisions behind them:
      limit in force is `system` whatever its outcome, since the job gave up on an exchange that
      ended in time; an end by a lost VCI or a worker exit
      takes that row;
-   - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended, each
+   - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended or caused (including requests
+     refused on the offline link afterwards, ADR-294), each
      with its own classification, with the
      clock readings, the measured gap, the tolerance and each fit test, so a reader can redo it;
    - a response the worker delivers after the exchange ended (`late_response`): started within

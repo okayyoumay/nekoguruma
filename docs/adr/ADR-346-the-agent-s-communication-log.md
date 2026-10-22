@@ -148,7 +148,7 @@ decisions behind them:
      response;
    - a request that collects every answer takes the most severe of its answers' classifications,
      each answer judged on its own against the window, and silence is no fault only for the
-     functional presence request (ADR-327 item 2); on a guard's request a second ECU is `vehicle`
+     functional presence request with its send confirmed (ADR-327 item 2); on a guard's request a second ECU is `vehicle`
      (design 8.9.1); a request meant for one ECU that gets more than
      one answer is `vehicle`;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its

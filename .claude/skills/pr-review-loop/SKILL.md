@@ -34,7 +34,8 @@ adds a full round of new findings instead of converging.
 **PRs that change only backlog files (ADR-251).** If every file the PR changes against `main`
 is a backlog file, `work/*backlog.md`, request no review. `scripts/check-backlog.sh`
 (which `repo-checks.yml` also runs) checks their format. Run the sweep first (below; with no review to
-come, it runs once), then the script and the Step 3 checks that apply, then go to Step 5. Other files in `work/` (`work/README.md`, the development plan) hold
+come, it runs once), then the script and the Step 3 checks that apply; commit and push what
+the sweep fixed as Step 4 does, then go to Step 5. Other files in `work/` (`work/README.md`, the development plan) hold
 contributor rules and milestones the script does not check, so a PR touching them is reviewed
 as usual. If a later push makes the PR change any other file, request a review at that point and
 run the loop as usual from Step 1.

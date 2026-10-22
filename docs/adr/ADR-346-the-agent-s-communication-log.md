@@ -112,8 +112,11 @@ cannot place.
    - **Values.** `sent` is `confirmed`, `partial` (the first frame of a multi-frame request went
      out and the ECU sent no flow control), `not_sent` or `unknown`. `sent_evidence` names the source,
      in this order:
-     1. a transmit indication for the exchange, bound to its primitive, or unbound on the link
-        while it is the only primitive running there;
+     1. a transmit indication for the exchange, bound to its primitive, or unbound and carrying
+        the exchange's request identifier (SAE J2534-1 v04.04 clause 8.6) while no other exchange
+        on the same physical channel is in flight with that identifier. The J2534 worker gives a
+        TxDone to every link on the channel (ADR-151), so an access target's keep-alive on a
+        sibling link is told apart by its identifier;
      2. a transmit-done time on the response;
      3. any answer, a pending included, which confirms the send without a time.
    - **Not sent.** `not_sent` needs a definite refusal: the agent's own, the worker's refusal
@@ -185,7 +188,13 @@ cannot place.
 6. **Responses that come after their exchange.**
    - The agent reads the link's events while it waits and when it closes the link. Items of an
      earlier primitive, or of none, are written as entries of their own.
-   - A response to an earlier exchange is a `late_response` entry linked to that exchange. It is
+   - A response is seen after its exchange only if the worker delivers it. The J2534 worker
+     discards a frame that no primitive expects (ADR-100), and a D-PDU library may too, so on such
+     links a late response does not reach the log, and the exchange's window (no response within
+     the limit) is all it holds. Capturing such frames would need a receive-only primitive beside
+     the exchanges, which is not decided here.
+   - A response to an earlier exchange that the worker does deliver is a `late_response` entry
+     linked to that exchange. It is
      classified on its own, not by the exchange rules, by its VCI time against the limits in
      force:
      - after the limit: `vehicle` ("answered N ms after the limit");

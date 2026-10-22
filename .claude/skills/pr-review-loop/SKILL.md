@@ -284,6 +284,14 @@ If a later check leads to another edit, sweep that edit too and run the checks a
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
    is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
    tests; `--lib` alone skips `tests/`).
+   **Tests that pull requests skip or run differently on Windows.** `core-windows` leaves out
+   on pull requests `j2534-0404-service`'s tests (all but `agent_restart_end_to_end`) and the
+   agent's `runner::` tests, and its `ci-windows` profile runs some tests alone
+   (`.config/nextest.toml`). When the PR changes such a test, or code only such tests exercise,
+   run it locally under that profile, alone and then beside the rest of its binary
+   (`cargo nextest run --profile ci-windows -p <crate> --test <binary>`), look for timing
+   assumptions it would make on a slower runner (fixed sleeps, timer windows, waits for a
+   process to exit), and say in the PR description that its Windows run happens only on main.
 2. Run `edge-case-hunter` on the round's fix when the fix meets its gate in `.claude/README.md`.
    A review-round fix is not exempt because the reviewer will look again: an unaudited fix tends to
    become the next round's finding.

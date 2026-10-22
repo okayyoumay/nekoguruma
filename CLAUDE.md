@@ -176,7 +176,9 @@ tests in a release build (`agent-release`, `cargo test -p agent --release`), sin
 read-only release agent rests on code that only a release build compiles; pull requests skip it
 to save a release build of the agent's dependencies, so a release-only failure shows on main.
 Check it locally with `RUSTFLAGS="-D warnings" cargo test -p agent --release --locked` when you
-change `cfg(not(debug_assertions))` code. The `fuzz` job runs the cargo-fuzz targets in `fuzz/` (its
+change `cfg(not(debug_assertions))` code, or a test whose outcome depends on the build's policy (one
+that asserts what a debug or a release agent allows or refuses, such as a simulator permission),
+since a debug run checks only the debug policy. The `fuzz` job runs the cargo-fuzz targets in `fuzz/` (its
 own workspace, on nightly; `fuzz/README.md`) for 60 seconds each against malformed IR, on main
 only; check a change to the IR or to `fuzz/` locally with the commands there. `core-linux` checks on
 every pull request that `fuzz/Cargo.lock` is current (`cargo metadata --locked`), since the fuzz

@@ -275,26 +275,39 @@ impl DiagHost for Recording {
     }
 }
 
-/// The lowering's sections (ADR-332): sorted and disjoint, one over each diagnostic primitive
-/// alone, the rest `CheckState` pieces that share their neighbours' interruptibility and
-/// expected duration, so each section function's copy is covered without a gap.
+/// The lowering's sections (ADR-332): sorted and either disjoint or nested, one over each
+/// diagnostic primitive alone, the rest `CheckState` pieces that share their neighbours'
+/// interruptibility and expected duration, so each section function's copy is covered without a
+/// gap. A section function a flash plan calls is expanded in place with its pieces inside the
+/// plan's (ADR-336 item 3), so a primitive there has a one-instruction section of each.
 fn assert_sections_split(program: &Program) {
     let primitive = |pc: u32| program.code[pc as usize].is_diagnostic_primitive();
-    let covering = |pc: u32| {
-        program
-            .sections
-            .iter()
-            .filter(|s| (s.start_pc..s.end_pc).contains(&pc))
-            .count()
+    let contains = |a: &diag_ir::Section, b: &diag_ir::Section| {
+        a.start_pc <= b.start_pc && b.end_pc <= a.end_pc
     };
     for pair in program.sections.windows(2) {
-        assert!(pair[0].end_pc <= pair[1].start_pc, "{pair:?}");
+        assert!(pair[0].start_pc <= pair[1].start_pc, "{pair:?}");
+    }
+    for (i, a) in program.sections.iter().enumerate() {
+        for b in &program.sections[i + 1..] {
+            let disjoint = a.end_pc <= b.start_pc || b.end_pc <= a.start_pc;
+            assert!(disjoint || contains(a, b) || contains(b, a), "{a:?} {b:?}");
+        }
     }
     let mut primitives = 0;
     for pc in 0..program.code.len() as u32 {
         if primitive(pc) {
             primitives += 1;
-            assert_eq!(covering(pc), 1, "the primitive at {pc}");
+            let covering: Vec<_> = program
+                .sections
+                .iter()
+                .filter(|s| (s.start_pc..s.end_pc).contains(&pc))
+                .collect();
+            assert!(!covering.is_empty(), "the primitive at {pc}");
+            assert!(
+                covering.iter().all(|s| s.end_pc == s.start_pc + 1),
+                "the primitive at {pc}: {covering:?}"
+            );
         }
     }
     assert!(primitives > 0);
@@ -309,6 +322,21 @@ fn assert_sections_split(program: &Program) {
             assert_eq!(section.end_pc, section.start_pc + 1, "{section:?}");
         }
     }
+    // The outermost layer: sections no longer section contains. An expanded section function's
+    // pieces, and the second one-instruction section of a primitive in it, lie inside it.
+    let mut outer: Vec<&diag_ir::Section> = Vec::new();
+    for section in &program.sections {
+        let inside = program.sections.iter().any(|other| {
+            contains(other, section)
+                && other.end_pc - other.start_pc > section.end_pc - section.start_pc
+        });
+        let repeated = outer
+            .iter()
+            .any(|kept| (kept.start_pc, kept.end_pc) == (section.start_pc, section.end_pc));
+        if !inside && !repeated {
+            outer.push(section);
+        }
+    }
     // A flash plan's expansion is laid in `main` between its own entry and end, with sections of
     // its own, so the code around it may differ in interruptibility (ADR-336 item 4).
     let plan_edges: Vec<u32> = program
@@ -321,9 +349,9 @@ fn assert_sections_split(program: &Program) {
             ]
         })
         .collect();
-    for pair in program.sections.windows(2) {
+    for pair in outer.windows(2) {
         if pair[0].end_pc == pair[1].start_pc
-            && (is_piece(&pair[0]) || is_piece(&pair[1]))
+            && (is_piece(pair[0]) || is_piece(pair[1]))
             && !plan_edges.contains(&pair[1].start_pc)
         {
             assert_eq!(
@@ -340,6 +368,16 @@ fn assert_sections_split(program: &Program) {
         }
     }
     assert!(program.sections.iter().any(is_piece), "a section function");
+    // The plan's expansion holds the section function it calls (`reset_ecu`), nested in it.
+    assert!(
+        program.sections.iter().any(|s| s.expected_millis == 500
+            && is_piece(s)
+            && program.flash.iter().any(|plan| {
+                plan.boundaries.entry_pc <= s.start_pc
+                    && s.end_pc <= plan.boundaries.post_transfer_end_pc
+            })),
+        "the plan's section function"
+    );
 }
 
 /// The requests and logs `program` produces with the declarations of `variant`, answered from

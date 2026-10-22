@@ -2,6 +2,7 @@ request 10 03
 request 22 F1 90
 request 22 F1 86
 log 1 extended session
+hmi confirm_session title="Confirm the session" session=3
 log 1 uint round trip
 request 19 02 09
 send-receive 4 19 02 09
@@ -26,5 +27,7 @@ request 37
 routine FF01 01
 request 11 01
 wait 2000
+record final_check
+log 1 record passed
 log 1 done
 finished

@@ -1,4 +1,5 @@
 use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document};
+use diag_ir::hmi::{self, HmiForm, HmiValue, decode_form};
 use diag_ir::{DiagHost, RuntimeInput, StepError, StepOutcome, Vm, VmError, WaitingOn};
 
 use super::*;
@@ -1850,8 +1851,6 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
         "def f(x):\n    return x[::2]\n\ndef main():\n    f(b\"ab\")\n",
         // A loop over bytes known only at run time.
         "def f(b):\n    for x in b:\n        pass\n\ndef main():\n    f(b\"\")\n",
-        // A primitive not lowered yet.
-        "def main():\n    diag.record(\"t\")\n",
     ];
     for source in cases {
         let found = codes(source);
@@ -1863,14 +1862,6 @@ fn what_the_ir_cannot_express_is_not_lowerable() {
             "{source}: {found:?}"
         );
     }
-}
-
-#[test]
-fn diag_functions_without_an_instruction_are_not_available() {
-    assert_eq!(
-        codes("def main():\n    diag.hmi(\"f\", {})\n"),
-        [(StarCode::NotLowerable, 2)]
-    );
 }
 
 #[test]
@@ -1983,7 +1974,7 @@ fn none_cannot_reach_run_time() {
 
 #[test]
 fn every_problem_is_reported() {
-    let found = codes("def main():\n    diag.record(\"t\")\n    diag.ecu_info()\n    x = [1]\n");
+    let found = codes("def main():\n    y = [2]\n    diag.ecu_info()\n    x = [1]\n");
     assert_eq!(
         found,
         [
@@ -2034,6 +2025,45 @@ struct ScriptedHost {
     inputs: Vec<(RuntimeInput, i64)>,
     /// The flash artifact `Op::FlashBlock` reads from.
     artifact: Vec<u8>,
+    /// The answers of `hmi_request` and `record_input`, in order, each given from the
+    /// `hmi_pending`-th inquiry on: the host answers `Ok(None)` before that.
+    answers: std::collections::VecDeque<Vec<u8>>,
+    hmi_pending: u32,
+    /// Every `hmi_request` (`"hmi"`) and `record_input` (`"record"`) call, polls included:
+    /// the inquiry number and the bytes sent.
+    sent: Vec<(&'static str, u64, Vec<u8>)>,
+}
+
+impl ScriptedHost {
+    fn ask(
+        &mut self,
+        kind: &'static str,
+        inquiry: u64,
+        bytes: &[u8],
+    ) -> Result<Option<Vec<u8>>, NoHostError> {
+        self.sent.push((kind, inquiry, bytes.to_vec()));
+        if self.hmi_pending > 0 {
+            self.hmi_pending -= 1;
+            return Ok(None);
+        }
+        Ok(Some(self.answers.pop_front().expect("a scripted answer")))
+    }
+
+    /// A host that answers the HMI inquiries with `answers`.
+    fn answering(answers: &[Vec<u8>]) -> Self {
+        ScriptedHost {
+            answers: answers.iter().cloned().collect(),
+            ..ScriptedHost::default()
+        }
+    }
+
+    /// The forms sent, decoded, polls included.
+    fn forms(&self) -> Vec<(&'static str, HmiForm)> {
+        self.sent
+            .iter()
+            .map(|(kind, _, bytes)| (*kind, decode_form(bytes).expect("a form")))
+            .collect()
+    }
 }
 
 fn hex(bytes: &[u8]) -> String {
@@ -2082,11 +2112,15 @@ impl DiagHost for ScriptedHost {
         self.calls.push(format!("wait {millis}"));
         Ok(true)
     }
-    fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
-        unreachable!("not lowered yet")
+    fn hmi_request(&mut self, inquiry: u64, form: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
+        self.ask("hmi", inquiry, form)
     }
-    fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NoHostError> {
-        unreachable!("not lowered yet")
+    fn record_input(
+        &mut self,
+        inquiry: u64,
+        template: &[u8],
+    ) -> Result<Option<Vec<u8>>, NoHostError> {
+        self.ask("record", inquiry, template)
     }
     fn monitor_capture(&mut self, back_millis: u32) -> Result<(), NoHostError> {
         self.calls.push(format!("capture {back_millis}"));
@@ -2120,7 +2154,9 @@ fn run_on(source: &str, host: &mut ScriptedHost) -> u32 {
         match vm.step(&program, host) {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => return waited,
-            Ok(StepOutcome::Waiting(WaitingOn::Timer | WaitingOn::SeedKey)) => waited += 1,
+            Ok(StepOutcome::Waiting(WaitingOn::Timer | WaitingOn::SeedKey | WaitingOn::Hmi)) => {
+                waited += 1
+            }
             other => panic!("{other:?}"),
         }
     }
@@ -2861,7 +2897,7 @@ def spin(n):
         for i in range(n):
             pass
     for k in [1, 2, 3, 4, 5]:
-        diag.record(\"t\")
+        z = [k]
 
 def main():
     spin(1)
@@ -4196,4 +4232,516 @@ def main():
     }
     let logged: Vec<_> = host.calls.iter().filter(|c| c.starts_with("log")).collect();
     assert_eq!(logged, ["log 1 plan x=one", "log 1 main kept x"]);
+}
+
+// ---------------------------------------------------------------- diag.hmi and diag.record
+// (subset 3.1, 3.2, 3.4, ADR-340)
+
+fn form(id: &str, params: &[(&str, HmiValue)]) -> HmiForm {
+    HmiForm {
+        id: id.to_owned(),
+        params: params
+            .iter()
+            .map(|(key, value)| ((*key).to_owned(), value.clone()))
+            .collect(),
+    }
+}
+
+fn text(value: &str) -> HmiValue {
+    HmiValue::Text(value.to_owned())
+}
+
+#[test]
+fn a_form_with_constant_params_lowers_to_hmi_request_and_reaches_the_host_decoded() {
+    let source = "\
+def main():
+    ans = diag.hmi(\"confirm\", {\"title\": \"Ignition off\", \"count\": 2, \"strict\": True})
+    if ans[\"ok\"]:
+        diag.log(1, \"ok \" + ans[\"value\"])
+    if ans[\"timed_out\"]:
+        diag.log(1, \"timed out\")
+";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(
+        program
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::HmiRequest { .. }))
+    );
+    assert!(
+        !program
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::HmiRequestFromStack { .. }))
+    );
+    let mut host = ScriptedHost::answering(&[hmi::answered("yes")]);
+    run_on(source, &mut host);
+    assert_eq!(
+        host.forms(),
+        [(
+            "hmi",
+            form(
+                "confirm",
+                &[
+                    ("title", text("Ignition off")),
+                    ("count", HmiValue::Int(2)),
+                    ("strict", HmiValue::Bool(true)),
+                ]
+            )
+        )]
+    );
+    assert_eq!(host.calls, ["log 1 ok yes"]);
+}
+
+#[test]
+fn hmi_and_record_are_safe_primitives_with_a_section_each() {
+    let source = "def main():\n    diag.hmi(\"f\", {})\n    diag.record(\"t\")\n";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    program.validate().expect("valid");
+    assert_sections_split(&program);
+    assert_eq!(primitives_of(&program), ["Safe", "Safe"]);
+    let position = |wanted: fn(&Op) -> bool| program.code.iter().position(wanted);
+    assert!(
+        position(|op| matches!(op, Op::HmiRequest { .. }))
+            < position(|op| matches!(op, Op::RecordInput { .. }))
+    );
+}
+
+#[test]
+fn constant_and_run_time_params_are_filled_in_source_order() {
+    let source = "\
+def ask(n, who, on):
+    ans = diag.hmi(\"mixed\", {\"a\": 1, \"n\": n, \"b\": \"x\", \"who\": who, \"on\": on, \"c\": False})
+    diag.log(1, \"value \" + ans[\"value\"])
+
+def main():
+    ask(7, \"ecu\", True)
+    ask(-3, \"\", False)
+";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(
+        program
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::HmiRequestFromStack { .. }))
+    );
+    let mut host = ScriptedHost::answering(&[hmi::answered("one"), hmi::answered("two")]);
+    run_on(source, &mut host);
+    let filled = |n, who: &str, on| {
+        (
+            "hmi",
+            form(
+                "mixed",
+                &[
+                    ("a", HmiValue::Int(1)),
+                    ("n", HmiValue::Int(n)),
+                    ("b", text("x")),
+                    ("who", text(who)),
+                    ("on", HmiValue::Bool(on)),
+                    ("c", HmiValue::Bool(false)),
+                ],
+            ),
+        )
+    };
+    assert_eq!(
+        host.forms(),
+        [filled(7, "ecu", true), filled(-3, "", false)]
+    );
+    assert_eq!(host.calls, ["log 1 value one", "log 1 value two"]);
+}
+
+#[test]
+fn a_run_time_param_is_computed_before_the_instruction_in_source_order() {
+    let source = "\
+def ask(n):
+    diag.hmi(\"f\", {\"first\": n + 1, \"second\": n * 2})
+
+def main():
+    ask(5)
+";
+    let mut host = ScriptedHost::answering(&[hmi::answered("")]);
+    run_on(source, &mut host);
+    assert_eq!(
+        host.forms(),
+        [(
+            "hmi",
+            form(
+                "f",
+                &[("first", HmiValue::Int(6)), ("second", HmiValue::Int(10))]
+            )
+        )]
+    );
+}
+
+#[test]
+fn a_record_lowers_to_record_input_and_its_value_is_the_judgment() {
+    let source = "\
+def main():
+    ans = diag.record(\"final_check\")
+    if ans[\"ok\"] and ans[\"value\"] == \"ok\":
+        diag.log(1, \"passed\")
+    else:
+        diag.log(1, \"not passed\")
+";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(
+        program
+            .code
+            .iter()
+            .any(|op| matches!(op, Op::RecordInput { .. }))
+    );
+    let mut host = ScriptedHost::answering(&[hmi::answered("ok")]);
+    run_on(source, &mut host);
+    assert_eq!(host.forms(), [("record", form("final_check", &[]))]);
+    assert_eq!(host.calls, ["log 1 passed"]);
+    let mut host = ScriptedHost::answering(&[hmi::answered("ng")]);
+    run_on(source, &mut host);
+    assert_eq!(host.calls, ["log 1 not passed"]);
+}
+
+/// Logs what an answer reads as.
+const READ_ANSWER: &str = "\
+def main():
+    ans = diag.hmi(\"f\", {})
+    diag.log(1, \"ok \" + (\"yes\" if ans[\"ok\"] else \"no\"))
+    diag.log(1, \"timed_out \" + (\"yes\" if ans[\"timed_out\"] else \"no\"))
+    diag.log(1, \"value [\" + ans[\"value\"] + \"]\")
+";
+
+fn answer_reads(answer: Vec<u8>) -> Vec<String> {
+    let mut host = ScriptedHost::answering(&[answer]);
+    run_on(READ_ANSWER, &mut host);
+    host.calls
+}
+
+#[test]
+fn a_decline_reads_as_not_ok_with_an_empty_value() {
+    assert_eq!(
+        answer_reads(hmi::declined()),
+        ["log 1 ok no", "log 1 timed_out no", "log 1 value []"]
+    );
+}
+
+#[test]
+fn a_timed_out_answer_is_read_through_timed_out() {
+    assert_eq!(
+        answer_reads(hmi::timed_out()),
+        ["log 1 ok no", "log 1 timed_out yes", "log 1 value []"]
+    );
+}
+
+#[test]
+fn an_operator_answer_reads_as_ok_with_its_text() {
+    assert_eq!(
+        answer_reads(hmi::answered("12.5")),
+        ["log 1 ok yes", "log 1 timed_out no", "log 1 value [12.5]"]
+    );
+    assert_eq!(
+        answer_reads(hmi::answered("")),
+        ["log 1 ok yes", "log 1 timed_out no", "log 1 value []"]
+    );
+}
+
+#[test]
+fn the_answer_reads_are_total_over_bytes_that_break_the_contract() {
+    // An empty answer and one with an unknown status are not ok; `value` is what follows the
+    // first byte (ADR-340 item 3).
+    assert_eq!(
+        answer_reads(Vec::new()),
+        ["log 1 ok no", "log 1 timed_out no", "log 1 value []"]
+    );
+    assert_eq!(
+        answer_reads(b"\x07rest".to_vec()),
+        ["log 1 ok no", "log 1 timed_out no", "log 1 value [rest]"]
+    );
+}
+
+#[test]
+fn a_form_that_is_not_answered_yet_is_polled_with_the_same_bytes_and_inquiry() {
+    let source = "\
+def ask(n):
+    ans = diag.hmi(\"f\", {\"fixed\": 1, \"n\": n})
+    diag.log(1, \"value \" + ans[\"value\"])
+
+def main():
+    ask(4)
+";
+    let mut host = ScriptedHost {
+        hmi_pending: 2,
+        ..ScriptedHost::answering(&[hmi::answered("done")])
+    };
+    let waited = run_on(source, &mut host);
+    assert_eq!(waited, 2);
+    assert_eq!(host.sent.len(), 3);
+    assert!(host.sent.iter().all(|sent| *sent == host.sent[0]));
+    assert_eq!(host.calls, ["log 1 value done"]);
+    // The same holds for a record.
+    let mut host = ScriptedHost {
+        hmi_pending: 1,
+        ..ScriptedHost::answering(&[hmi::answered("")])
+    };
+    run_on("def main():\n    diag.record(\"t\")\n", &mut host);
+    assert_eq!(host.sent.len(), 2);
+    assert_eq!(host.sent[0], host.sent[1]);
+}
+
+#[test]
+fn an_answer_can_be_kept_and_read_later_and_a_form_id_may_be_128_bytes() {
+    let id = "f".repeat(128);
+    let source = format!(
+        "def main():\n    ans = diag.hmi(\"{id}\", {{\"_k1\": \"\"}})\n    diag.wait(1)\n    if ans[\"ok\"]:\n        diag.log(1, \"kept\")\n"
+    );
+    let mut host = ScriptedHost::answering(&[hmi::answered("")]);
+    run_on(&source, &mut host);
+    assert_eq!(host.forms(), [("hmi", form(&id, &[("_k1", text(""))]))]);
+    assert_eq!(host.calls, ["wait 1", "log 1 kept"]);
+}
+
+#[test]
+fn hmi_and_record_take_exactly_their_arguments() {
+    for source in [
+        "def main():\n    diag.hmi(\"f\")\n",
+        "def main():\n    diag.hmi()\n",
+        "def main():\n    diag.hmi(\"f\", {}, 1)\n",
+        "def main():\n    diag.record()\n",
+        "def main():\n    diag.record(\"t\", {})\n",
+        // The params are a dict literal, not a name.
+        "P = {\"a\": 1}\n\ndef main():\n    diag.hmi(\"f\", P)\n",
+        "def main():\n    diag.hmi(\"f\", 1)\n",
+    ] {
+        assert_eq!(
+            codes(source),
+            [(
+                StarCode::UnsupportedSyntax,
+                if source.starts_with("P") { 4 } else { 2 }
+            )],
+            "{source}"
+        );
+    }
+}
+
+#[test]
+fn the_id_of_hmi_and_record_is_a_constant_string_of_1_to_128_bytes() {
+    let too_long = "x".repeat(129);
+    for (source, expected) in [
+        (
+            "def f(x):\n    diag.hmi(x, {})\n\ndef main():\n    f(\"a\")\n".to_owned(),
+            StarCode::NonConstantArgument,
+        ),
+        (
+            "def f(x):\n    diag.record(x)\n\ndef main():\n    f(\"a\")\n".to_owned(),
+            StarCode::NonConstantArgument,
+        ),
+        (
+            "def main():\n    diag.hmi(1, {})\n".to_owned(),
+            StarCode::UnsupportedSyntax,
+        ),
+        (
+            "def main():\n    diag.record(b\"t\")\n".to_owned(),
+            StarCode::UnsupportedSyntax,
+        ),
+        (
+            "def main():\n    diag.hmi(\"\", {})\n".to_owned(),
+            StarCode::ArgumentOutOfRange,
+        ),
+        (
+            "def main():\n    diag.record(\"\")\n".to_owned(),
+            StarCode::ArgumentOutOfRange,
+        ),
+        (
+            format!("def main():\n    diag.hmi(\"{too_long}\", {{}})\n"),
+            StarCode::ArgumentOutOfRange,
+        ),
+    ] {
+        assert_eq!(codes(&source), [(expected, 2)], "{source}");
+    }
+}
+
+#[test]
+fn the_param_names_of_a_form_are_unique_identifiers_of_at_most_64_bytes() {
+    let long = "k".repeat(65);
+    let many = (0..33)
+        .map(|i| format!("\"k{i}\": {i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let at_most = (0..32)
+        .map(|i| format!("\"k{i}\": {i}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    for (params, expected) in [
+        ("{\"a b\": 1}".to_owned(), Some(StarCode::UnsupportedSyntax)),
+        ("{\"1a\": 1}".to_owned(), Some(StarCode::UnsupportedSyntax)),
+        ("{\"\": 1}".to_owned(), Some(StarCode::UnsupportedSyntax)),
+        ("{\"a-b\": 1}".to_owned(), Some(StarCode::UnsupportedSyntax)),
+        (
+            "{\"a\" + \"b\": 1}".to_owned(),
+            Some(StarCode::DynamicKeyNotAllowed),
+        ),
+        ("{1: 1}".to_owned(), Some(StarCode::DynamicKeyNotAllowed)),
+        (
+            format!("{{\"{long}\": 1}}"),
+            Some(StarCode::ArgumentOutOfRange),
+        ),
+        (format!("{{\"{}\": 1}}", "k".repeat(64)), None),
+        (
+            "{\"a\": 1, \"a\": 2}".to_owned(),
+            Some(StarCode::ArgumentOutOfRange),
+        ),
+        (format!("{{{many}}}"), Some(StarCode::ArgumentOutOfRange)),
+        (format!("{{{at_most}}}"), None),
+    ] {
+        let source = format!("def main():\n    diag.hmi(\"f\", {params})\n");
+        let found = match check("t.star", &source) {
+            Ok(checked) => match lower_for_a_variant(&checked) {
+                Ok(_) => None,
+                Err(errors) => {
+                    assert_eq!(errors.len(), 1, "{source}: {errors:?}");
+                    Some(errors[0].code)
+                }
+            },
+            // The checker refuses a computed key before the lowering sees it.
+            Err(errors) => Some(errors[0].code),
+        };
+        assert_eq!(found, expected, "{params}");
+    }
+}
+
+#[test]
+fn a_param_value_is_an_int_a_bool_or_a_str() {
+    for value in ["1.5", "b\"x\"", "[1]", "{}"] {
+        let source = format!("def main():\n    diag.hmi(\"f\", {{\"a\": {value}}})\n");
+        assert_eq!(
+            codes(&source),
+            [(StarCode::UnsupportedSyntax, 2)],
+            "{value}"
+        );
+    }
+    // The same at run time, and an answer or its parts.
+    for (param, argument) in [("x", "1.5"), ("x", "b\"x\"")] {
+        let source = format!(
+            "def f({param}):\n    diag.hmi(\"f\", {{\"a\": x}})\n\ndef main():\n    f({argument})\n"
+        );
+        assert_eq!(
+            codes(&source),
+            [(StarCode::UnsupportedSyntax, 2)],
+            "{argument}"
+        );
+    }
+    assert_eq!(
+        codes("def main():\n    a = diag.hmi(\"f\", {})\n    diag.hmi(\"g\", {\"a\": a})\n"),
+        [(StarCode::UnsupportedSyntax, 3)]
+    );
+    // A value that can be two types is not one slot.
+    assert_eq!(
+        codes(
+            "def f(x):\n    diag.hmi(\"f\", {\"a\": x})\n\ndef main():\n    f(1)\n    f(\"s\")\n"
+        ),
+        [(StarCode::NotLowerable, 2)]
+    );
+}
+
+#[test]
+fn a_form_that_encodes_to_more_than_16_kib_is_refused() {
+    let big = "x".repeat(4000);
+    let params = (0..5)
+        .map(|i| format!("\"k{i}\": \"{big}\""))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let source = format!("def main():\n    diag.hmi(\"f\", {{{params}}})\n");
+    assert_eq!(codes(&source), [(StarCode::ArgumentOutOfRange, 2)]);
+}
+
+/// The 16 KiB bound is on the encoding: a form of exactly 16 KiB lowers, one byte more does not.
+#[test]
+fn a_form_of_exactly_16_kib_lowers() {
+    let encoded = |n: usize| {
+        hmi::encode_template(&hmi::HmiTemplate {
+            id: "f".to_owned(),
+            params: vec![(
+                "k".to_owned(),
+                hmi::HmiParam::Const(HmiValue::Text("x".repeat(n))),
+            )],
+        })
+        .map(|bytes| bytes.len())
+    };
+    let n = (0..hmi::MAX_HMI_FORM_LEN)
+        .find(|&n| encoded(n) == Ok(hmi::MAX_HMI_FORM_LEN))
+        .expect("a text length that encodes to exactly 16 KiB");
+    let source = |n: usize| {
+        format!(
+            "def main():\n    diag.hmi(\"f\", {{\"k\": \"{}\"}})\n",
+            "x".repeat(n)
+        )
+    };
+    assert_eq!(codes(&source(n)), []);
+    assert_eq!(codes(&source(n + 1)), [(StarCode::ArgumentOutOfRange, 2)]);
+}
+
+/// The id bound counts bytes of UTF-8, for a record template as for a form.
+#[test]
+fn a_record_template_id_is_1_to_128_bytes_of_utf8() {
+    for (id, expected) in [
+        ("t".repeat(128), vec![]),
+        ("t".repeat(129), vec![(StarCode::ArgumentOutOfRange, 2)]),
+        ("\u{e9}".repeat(64), vec![]),
+        (
+            format!("{}t", "\u{e9}".repeat(64)),
+            vec![(StarCode::ArgumentOutOfRange, 2)],
+        ),
+    ] {
+        let source = format!("def main():\n    diag.record(\"{id}\")\n");
+        assert_eq!(codes(&source), expected, "{id}");
+    }
+}
+
+#[test]
+fn an_answer_is_read_only_by_its_three_literal_keys() {
+    assert_eq!(
+        codes("def main():\n    ans = diag.hmi(\"f\", {})\n    x = ans[\"number\"]\n"),
+        [(StarCode::UnsupportedSyntax, 3)]
+    );
+    assert_eq!(
+        codes("def main():\n    x = diag.record(\"t\")[\"fields\"]\n"),
+        [(StarCode::UnsupportedSyntax, 2)]
+    );
+    // A computed key is refused by the checker where it sees the answer, and by the lowering
+    // where the answer came through a function.
+    let errors = check(
+        "t.star",
+        "def main():\n    k = \"ok\"\n    ans = diag.hmi(\"f\", {})\n    x = ans[k]\n",
+    )
+    .expect_err("a computed key");
+    assert!(
+        errors
+            .iter()
+            .any(|e| e.code == StarCode::DynamicKeyNotAllowed)
+    );
+    assert_eq!(
+        codes(
+            "def read(a, k):\n    return a[k]\n\ndef main():\n    read(diag.hmi(\"f\", {}), \"ok\")\n"
+        ),
+        [(StarCode::DynamicKeyNotAllowed, 2)]
+    );
+}
+
+#[test]
+fn an_answer_cannot_be_used_as_a_value() {
+    for body in [
+        "if ans:\n        pass",
+        "x = not ans",
+        "x = ans == 1",
+        "x = ans + \"a\"",
+        "x = ans and True",
+        "x = 1 if ans else 2",
+    ] {
+        let source = format!("def main():\n    ans = diag.hmi(\"f\", {{}})\n    {body}\n");
+        let found = codes(&source);
+        assert!(
+            !found.is_empty()
+                && found
+                    .iter()
+                    .all(|(code, _)| *code == StarCode::NotLowerable),
+            "{body}: {found:?}"
+        );
+    }
 }

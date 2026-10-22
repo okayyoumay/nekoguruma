@@ -13,6 +13,7 @@ use diag_frontend::convert::{lower_procedures, to_ir};
 use diag_frontend::tables::{read_files, resolve};
 use diag_ir::declaration::{EcuVariant, load_ecu_document};
 use diag_ir::decode::decode_positive_response;
+use diag_ir::hmi::{HmiForm, HmiValue, decode_form};
 use diag_ir::{DiagHost, Program, StepOutcome, Vm};
 
 fn crate_dir() -> PathBuf {
@@ -136,6 +137,20 @@ impl std::fmt::Display for NotSent {
 
 impl std::error::Error for NotSent {}
 
+/// A form as one line: its id, then each param as `name=value`, in the order given.
+fn describe(form: &HmiForm) -> String {
+    let mut line = form.id.clone();
+    for (name, value) in &form.params {
+        match value {
+            HmiValue::Int(n) => write!(line, " {name}={n}"),
+            HmiValue::Bool(b) => write!(line, " {name}={b}"),
+            HmiValue::Text(text) => write!(line, " {name}={text:?}"),
+        }
+        .expect("a String");
+    }
+    line
+}
+
 fn hex(bytes: &[u8]) -> String {
     let parts: Vec<String> = bytes.iter().map(|b| format!("{b:02X}")).collect();
     parts.join(" ")
@@ -227,11 +242,19 @@ impl DiagHost for Recording {
         writeln!(self.out, "wait {millis}").expect("a String");
         Ok(true)
     }
-    fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
-        Err(NotSent)
+    /// The operator confirms every form (ADR-340 item 3), with no text.
+    fn hmi_request(&mut self, _: u64, form: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        self.end_transfer();
+        let form = decode_form(form).expect("a form");
+        writeln!(self.out, "hmi {}", describe(&form)).expect("a String");
+        Ok(Some(diag_ir::hmi::answered("")))
     }
-    fn record_input(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
-        Err(NotSent)
+    /// The record passes its criteria: its judgment is `ok`.
+    fn record_input(&mut self, _: u64, template: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
+        self.end_transfer();
+        let form = decode_form(template).expect("a form");
+        writeln!(self.out, "record {}", describe(&form)).expect("a String");
+        Ok(Some(diag_ir::hmi::answered("ok")))
     }
     fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
         Err(NotSent)

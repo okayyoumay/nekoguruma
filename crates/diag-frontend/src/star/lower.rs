@@ -14,17 +14,24 @@
 //! A flash plan that calls no function is expanded in place at its one call in `main`, with its
 //! `diag.flash_transfer`, and gets its `FlashRecovery` (4.9, ADR-336).
 //!
-//! Not lowered yet, each its own backlog item: the other `diag` functions (`hmi` and `record`);
-//! the functions a flash plan calls. The built-ins and string methods on values known only at run time that
-//! have no lowering (`abs`, `str`, `find`, ...) name the instruction they wait for. Each is
-//! rejected with `STAR_NOT_LOWERABLE` (or `STAR_API_NOT_AVAILABLE` for a `diag` function without
-//! an instruction), so nothing is lowered silently wrong.
+//! `diag.hmi` and `diag.record` lower to `HmiRequest`, `HmiRequestFromStack` and `RecordInput`
+//! with an encoded `HmiTemplate` constant, and their answer is read by the keys `ok`,
+//! `timed_out` and `value` (ADR-340).
+//!
+//! Not lowered yet, each its own backlog item: the functions a flash plan calls. The built-ins
+//! and string methods on values known only at run time that have no lowering (`abs`, `str`,
+//! `find`, ...) name the instruction they wait for. Each is rejected with `STAR_NOT_LOWERABLE`,
+//! so nothing is lowered silently wrong.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 use diag_ir::declaration::{DataKind, EcuVariant, FlashStep, LengthKind, Request};
 use diag_ir::encode::{ParamValue, encode_request};
+use diag_ir::hmi::{
+    HmiParam, HmiTemplate, HmiValue, MAX_HMI_ID_LEN, MAX_HMI_KEY_LEN, MAX_HMI_PARAMS,
+    encode_template,
+};
 use diag_ir::{
     FlashRecovery, IR_SCHEMA_VERSION, Idempotency, Interruptible, MAX_BYTES_LEN, NoApplication, Op,
     PreconditionKind, Preconditions, Program, ProgramError, RecoveryBoundaries, RecoveryRequired,
@@ -238,9 +245,12 @@ enum Ty {
     DtcList,
     /// One DTC record of a `DtcList`: its bytes, read by the literal keys `code` and `status`.
     Dtc,
+    /// The answer of `diag.hmi` or `diag.record` (subset 3.4, ADR-340): a status byte and the
+    /// answer's text, read only by the literal keys `ok`, `timed_out` and `value`.
+    HmiAnswer,
 }
 
-const TYS: [Ty; 9] = [
+const TYS: [Ty; 10] = [
     Ty::Int,
     Ty::Float,
     Ty::Bool,
@@ -250,6 +260,7 @@ const TYS: [Ty; 9] = [
     Ty::Fields,
     Ty::DtcList,
     Ty::Dtc,
+    Ty::HmiAnswer,
 ];
 
 impl Ty {
@@ -264,6 +275,7 @@ impl Ty {
             Ty::Fields => 64,
             Ty::DtcList => 128,
             Ty::Dtc => 256,
+            Ty::HmiAnswer => 512,
         }
     }
 
@@ -278,6 +290,7 @@ impl Ty {
             Ty::Fields => "response fields",
             Ty::DtcList => "DTC records",
             Ty::Dtc => "DTC record",
+            Ty::HmiAnswer => "HMI answer",
         }
     }
 }
@@ -2175,6 +2188,15 @@ impl<'a> Lowerer<'a> {
                         };
                         self.dtc_key(id, code, key, span)
                     }
+                    Val::Run(tys, code) if tys.one() == Some(Ty::HmiAnswer) => {
+                        let literal = matches!(&index.node, ExprP::Literal(AstLiteral::String(_)));
+                        let key = if literal {
+                            b
+                        } else {
+                            Val::Run(Tys::default(), Vec::new())
+                        };
+                        self.hmi_key(code, key, span)
+                    }
                     Val::Run(tys, code) if tys.one() == Some(Ty::DtcList) => {
                         self.dtc_at(id, code, b, span)
                     }
@@ -2401,6 +2423,13 @@ impl<'a> Lowerer<'a> {
                 );
                 return None;
             }
+            Ty::HmiAnswer => {
+                self.not_lowerable(
+                    span,
+                    "an HMI answer is always true; test `ans[\"ok\"]` instead (3.4)",
+                );
+                return None;
+            }
         };
         Some(ops.into_iter().map(|op| (Ins::Op(op), span)).collect())
     }
@@ -2595,16 +2624,16 @@ impl<'a> Lowerer<'a> {
         }
         if [&a, &b]
             .iter()
-            .any(|v| matches!(v, Val::Run(tys, _) if [Ty::Response, Ty::Fields, Ty::DtcList, Ty::Dtc].into_iter().any(|ty| tys.has(ty))))
+            .any(|v| matches!(v, Val::Run(tys, _) if [Ty::Response, Ty::Fields, Ty::DtcList, Ty::Dtc, Ty::HmiAnswer].into_iter().any(|ty| tys.has(ty))))
         {
             // Starlark would compare the dict, which a procedure that left out `["raw"]` gets
             // wrong silently (ADR-317 item 3).
             self.not_lowerable(
                 span,
                 format!(
-                    "`{}` does not take a response, DTC records or a DTC record: read it \
-                     through its keys, such as `res[\"raw\"]` or `dtc[\"code\"]`, or count \
-                     the records with `len` (3.4)",
+                    "`{}` does not take a response, DTC records, a DTC record or an HMI \
+                     answer: read it through its keys, such as `res[\"raw\"]`, \
+                     `dtc[\"code\"]` or `ans[\"ok\"]`, or count the records with `len` (3.4)",
                     binop_symbol(op)
                 ),
             );
@@ -4540,11 +4569,266 @@ impl<'a> Lowerer<'a> {
                 Val::Run(Tys::default(), Vec::new())
             }
             "flash_transfer" => self.diag_flash_transfer(id, args, span),
+            "hmi" | "record" => self.diag_hmi(id, name, args, span),
             _ => {
                 self.not_lowerable(span, format!("`diag.{name}` is not lowered yet (3.2)"));
                 Val::Run(Tys::default(), Vec::new())
             }
         }
+    }
+
+    /// `diag.hmi(form_id, params)` and `diag.record(template_id)` (subset 3.1, 3.2, ADR-340
+    /// item 4): the form is an encoded `HmiTemplate` in the constant pool, whose constant
+    /// parameters are in it and whose run-time ones are slots filled from the stack by
+    /// `HmiRequestFromStack`, their code emitted in source order before it. The value is the
+    /// answer ([`Ty::HmiAnswer`]).
+    fn diag_hmi(&mut self, id: Option<usize>, name: &str, args: &[&AstExpr], span: Span) -> Val {
+        let answer = || Val::Run(Tys::of(Ty::HmiAnswer), Vec::new());
+        let record = name == "record";
+        let (id_arg, params_arg) = match (record, args) {
+            (false, [form, params]) => (*form, Some(*params)),
+            (true, [template]) => (*template, None),
+            _ => {
+                let takes = if record {
+                    "a template id"
+                } else {
+                    "a form id and a params dict"
+                };
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    span,
+                    format!("`diag.{name}` takes {takes} (3.1)"),
+                );
+                return answer();
+            }
+        };
+        let mut failed = false;
+        let form_id = match self.expr(id, id_arg) {
+            Val::Const(Const::Str(text)) if (1..=MAX_HMI_ID_LEN).contains(&text.len()) => {
+                Some(text)
+            }
+            Val::Const(Const::Str(_)) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    id_arg.span,
+                    format!("the id of `diag.{name}` is 1 to {MAX_HMI_ID_LEN} bytes (3.1)"),
+                );
+                None
+            }
+            Val::Const(other) => {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    id_arg.span,
+                    format!(
+                        "the id of `diag.{name}` is a str, not a {} (3.1)",
+                        other.type_name()
+                    ),
+                );
+                None
+            }
+            _ => {
+                self.error(
+                    StarCode::NonConstantArgument,
+                    id_arg.span,
+                    format!("the id of `diag.{name}` is a string constant (3.1)"),
+                );
+                None
+            }
+        };
+        failed |= form_id.is_none();
+        let mut params = Vec::new();
+        let mut code: Code = Vec::new();
+        let mut runtime = false;
+        if let Some(arg) = params_arg {
+            if let ExprP::Dict(pairs) = &arg.node {
+                if pairs.len() > MAX_HMI_PARAMS {
+                    self.error(
+                        StarCode::ArgumentOutOfRange,
+                        arg.span,
+                        format!("`diag.hmi` takes at most {MAX_HMI_PARAMS} params (3.1)"),
+                    );
+                    failed = true;
+                }
+                let mut keys = HashSet::new();
+                for (key, value) in pairs {
+                    let key_ok = self.hmi_param_key(id, key, &mut keys);
+                    let param = match self.expr(id, value) {
+                        Val::Const(Const::Int(n)) => Some(HmiParam::Const(HmiValue::Int(n))),
+                        Val::Const(Const::Bool(b)) => Some(HmiParam::Const(HmiValue::Bool(b))),
+                        Val::Const(Const::Str(text)) => {
+                            Some(HmiParam::Const(HmiValue::Text(text.to_string())))
+                        }
+                        Val::Const(other) => {
+                            self.hmi_param_type(value.span, other.type_name());
+                            None
+                        }
+                        run => match self.single(run, value.span, "a `diag.hmi` param") {
+                            Some((Ty::Int | Ty::Bool | Ty::Str, value_code)) => {
+                                code.extend(value_code);
+                                runtime = true;
+                                Some(HmiParam::Runtime)
+                            }
+                            Some((ty, _)) => {
+                                self.hmi_param_type(value.span, ty.name());
+                                None
+                            }
+                            None => None,
+                        },
+                    };
+                    match (key_ok, param) {
+                        (Some(key), Some(param)) => params.push((key, param)),
+                        _ => failed = true,
+                    }
+                }
+            } else {
+                self.error(
+                    StarCode::UnsupportedSyntax,
+                    arg.span,
+                    "the params of `diag.hmi` are a dict literal (3.1)",
+                );
+                failed = true;
+            }
+        }
+        let Some(form_id) = form_id.filter(|_| !failed) else {
+            return answer();
+        };
+        let template = HmiTemplate {
+            id: form_id.to_string(),
+            params,
+        };
+        let bytes = match encode_template(&template) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                self.error(
+                    StarCode::ArgumentOutOfRange,
+                    span,
+                    format!("the form of `diag.{name}` is refused: {error} (3.1)"),
+                );
+                return answer();
+            }
+        };
+        let index = self.pool(&bytes);
+        let op = match (runtime, record) {
+            (true, _) => Op::HmiRequestFromStack { form: index },
+            (false, false) => Op::HmiRequest { form: index },
+            (false, true) => Op::RecordInput { template: index },
+        };
+        code.push((Ins::Op(op), span));
+        Val::Run(Tys::of(Ty::HmiAnswer), code)
+    }
+
+    /// The name of one `diag.hmi` param: a string literal that is an identifier of at most
+    /// [`MAX_HMI_KEY_LEN`] bytes and not in `seen`, or `None` after an error.
+    fn hmi_param_key(
+        &mut self,
+        id: Option<usize>,
+        key: &AstExpr,
+        seen: &mut HashSet<Rc<str>>,
+    ) -> Option<String> {
+        let literal = matches!(&key.node, ExprP::Literal(AstLiteral::String(_)));
+        let Val::Const(Const::Str(text)) = self.expr(id, key) else {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                key.span,
+                "a `diag.hmi` param name is a string literal (3.1)",
+            );
+            return None;
+        };
+        if !literal {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                key.span,
+                "a `diag.hmi` param name is a string literal (3.1)",
+            );
+            return None;
+        }
+        let mut bytes = text.bytes();
+        let identifier = bytes
+            .next()
+            .is_some_and(|b| b.is_ascii_alphabetic() || b == b'_')
+            && bytes.all(|b| b.is_ascii_alphanumeric() || b == b'_');
+        if !identifier {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                key.span,
+                format!(
+                    "the `diag.hmi` param name {text:?} is not an identifier \
+                     ([A-Za-z_][A-Za-z0-9_]*) (3.1)"
+                ),
+            );
+            return None;
+        }
+        if text.len() > MAX_HMI_KEY_LEN {
+            self.error(
+                StarCode::ArgumentOutOfRange,
+                key.span,
+                format!("a `diag.hmi` param name is at most {MAX_HMI_KEY_LEN} bytes (3.1)"),
+            );
+            return None;
+        }
+        if !seen.insert(text.clone()) {
+            self.error(
+                StarCode::ArgumentOutOfRange,
+                key.span,
+                format!("the `diag.hmi` param name {text:?} is given twice (3.1)"),
+            );
+            return None;
+        }
+        Some(text.to_string())
+    }
+
+    fn hmi_param_type(&mut self, span: Span, found: &str) {
+        self.error(
+            StarCode::UnsupportedSyntax,
+            span,
+            format!("a `diag.hmi` param is an int, a bool or a str, not a {found} (3.1)"),
+        );
+    }
+
+    /// `ans["ok"]`, `ans["timed_out"]` or `ans["value"]` of a `diag.hmi` or `diag.record` answer
+    /// (subset 3.4, ADR-340 item 3): `code` pushes the answer bytes, whose first byte is the
+    /// status and the rest the text. Each read is total over any bytes.
+    fn hmi_key(&mut self, code: Code, key: Val, span: Span) -> Val {
+        let Val::Const(Const::Str(key)) = key else {
+            self.error(
+                StarCode::DynamicKeyNotAllowed,
+                span,
+                "an HMI answer is read with a string literal key (3.4, 4.1)",
+            );
+            return Val::Run(Tys::default(), Vec::new());
+        };
+        let mut code = code;
+        let status = match &*key {
+            "ok" => Some(diag_ir::hmi::ANSWERED),
+            "timed_out" => Some(diag_ir::hmi::TIMED_OUT),
+            _ => None,
+        };
+        if let Some(status) = status {
+            let expected = self.pool(&[status]);
+            code.extend(
+                [
+                    Op::PushI64(0),
+                    Op::PushI64(1),
+                    Op::Slice,
+                    Op::PushBytes(expected),
+                    Op::CmpEq,
+                ]
+                .map(|op| (Ins::Op(op), span)),
+            );
+            return Val::Run(Tys::of(Ty::Bool), code);
+        }
+        if &*key == "value" {
+            code.extend(
+                [Op::PushI64(1), Op::PushI64(i64::MAX), Op::Slice].map(|op| (Ins::Op(op), span)),
+            );
+            return Val::Run(Tys::of(Ty::Str), code);
+        }
+        self.error(
+            StarCode::UnsupportedSyntax,
+            span,
+            format!("an HMI answer has the keys `ok`, `timed_out` and `value`, not `{key}` (3.4)"),
+        );
+        Val::Run(Tys::default(), Vec::new())
     }
 
     /// The arguments of `object` when it is a call to `diag.ecu_info`, which an index reads

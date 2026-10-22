@@ -94,13 +94,20 @@ pub(crate) struct JobJournal<S = FileStore> {
 impl JobJournal {
     /// Creates the job's journal. An existing journal of the same key is an error: a job that
     /// ran before goes on through `resume_program_journaled`, not a first run.
-    pub(crate) fn create(setup: JournalSetup) -> Result<Self, JournalError> {
+    ///
+    /// `artifact_sha256` is the hash of the job's flash artifact, recorded in the creating write
+    /// so every resume can compare it with the artifact it is given (ADR-344).
+    pub(crate) fn create(
+        setup: JournalSetup,
+        artifact_sha256: Option<&[u8; 32]>,
+    ) -> Result<Self, JournalError> {
         Ok(Self::new(
             Journal::create(
                 &setup.dir,
                 &setup.key,
                 setup.vin.as_ref(),
                 setup.intended_software_version.as_deref(),
+                artifact_sha256,
             )?,
             setup.sources,
         ))

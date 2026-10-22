@@ -378,7 +378,7 @@ A `ResumeFromCheckpoint` decision runs in this order, each failure ending the jo
    this, as for every restart, a journal another run holds ends the job (`InUse`), a recorded
    failure, identity abort or stop ends it in its own error, and a target VIN or intended
    software version that differs from the journal's is `OnSiteInterventionRequired`
-   (`TargetVinDiffers`, `IntendedVersionDiffers`), all with nothing sent.
+   (`TargetVinDiffers`, `IntendedVersionDiffers`), all with nothing sent; the artifact's hash is compared there too (below).
 
 ## Restart entry
 
@@ -438,6 +438,19 @@ journal's creation prefix: the target VIN only first, the intended version only 
 after the VIN, each at most once; a file that breaks this is corrupt. An empty intended
 version is refused, since it would match an ECU that answers with an empty field. Like the VIN record, the
 version record is appended without a format version change.
+
+The flash artifact is compared the same way (ADR-344): `Journal::create` takes the hash of the
+job's artifact and writes `Record::ArtifactSha256` in the creation prefix after the VIN and the
+intended version, once. A resume compares `RecoveryFacts::artifact_sha256` with the hash of the
+artifact it is given, right after the intended version and the classification, with nothing
+sent and no resume counted. It applies only where the classification would go on (a plain
+start, a checkpoint resume or a restart): an on-site decision of the classification stands, so
+another artifact never turns it into a refusal. Two hashes, or a hash on one side only, differ; two absent
+hashes (a job without an artifact) do not. A journal written before the record exists holds
+none. A difference ends in `JobError::ArtifactDiffersFromJournal` while the journal has not
+reached a flash plan (`restart::reached_flash_plan`: no transfer-start marker, and the last
+step and the newest request intent outside every plan's range), and in `OnSiteInterventionRequired(ArtifactDiffers)` once it
+has. An older agent reads the appended record as a corrupt journal (`UnreadableJournal`).
 
 `check_gates` is ADR-229 item 2 step 2 before the teardown (ADR-261). It reads only, and stops
 at the first gate that does not hold:

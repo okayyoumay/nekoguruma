@@ -130,6 +130,11 @@ pub struct RecoveryFacts {
     /// target VIN, so a resume can tell that the job's own data changed (ADR-268). `None` when
     /// the job named none.
     pub intended_software_version: Option<Vec<u8>>,
+    /// The SHA-256 of the flash artifact the job was created with, recorded at the first run
+    /// right after the target VIN and the intended software version, so a resume can tell that
+    /// it was handed another artifact (ADR-344). `None` when the job carried none, and in a
+    /// journal written before that decision.
+    pub artifact_sha256: Option<[u8; 32]>,
     /// The procedure ended itself as failed (`Op::Fail`, ADR-280). Terminal: no record follows
     /// it, and a restart does not resume the job.
     pub procedure_failed: Option<ProcedureFailure>,
@@ -187,6 +192,7 @@ impl RecoveryFacts {
             last_intent: None,
             target_vin: None,
             intended_software_version: None,
+            artifact_sha256: None,
             procedure_failed: None,
             identity_mismatch: None,
             run_stopped: None,
@@ -237,6 +243,14 @@ impl RecoveryFacts {
                     return Err("the intended software version is empty");
                 }
                 self.intended_software_version = Some(version.clone());
+            }
+            Record::ArtifactSha256(hash) => {
+                // Where it may appear is `creation_prefix_allowed`'s rule; a second one is
+                // refused here as well.
+                if self.artifact_sha256.is_some() {
+                    return Err("the artifact hash is already set");
+                }
+                self.artifact_sha256 = Some(*hash);
             }
             Record::RunStart { at, .. } => {
                 // It names no request and changes no fact; only its place is checked.
@@ -546,6 +560,10 @@ enum Record {
     Request {
         at: StepRef,
     },
+    /// The SHA-256 of the job's flash artifact (ADR-344); only in the creation prefix, after the
+    /// target VIN and the intended software version when there are any. Appended last: the
+    /// variant index is part of the encoding.
+    ArtifactSha256([u8; 32]),
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -661,13 +679,15 @@ impl Journal<FileStore> {
     /// header is written and synced under a temporary name, then linked to the journal's name,
     /// which fails if that name exists. The journal's writer lock is taken first, so another
     /// writer of the same job gets [`JournalError::InUse`]. The job's `target_vin`, when it names
-    /// one, is the first record and, as is the job's `intended_software_version` (next, or first
-    /// without a VIN), part of the same write, so the journal exists with them or not at all.
+    /// one, is the first record and, as are the job's `intended_software_version` (next, or first
+    /// without a VIN) and `artifact_sha256` (after both, ADR-344), part of the same write, so the
+    /// journal exists with them or not at all.
     pub fn create(
         dir: &Path,
         key: &JobKey,
         target_vin: Option<&Vin>,
         intended_software_version: Option<&[u8]>,
+        artifact_sha256: Option<&[u8; 32]>,
     ) -> Result<Self, JournalError> {
         let path = journal_path(dir, key)?;
         let writer = WriterLock::take(&path)?;
@@ -686,7 +706,8 @@ impl Journal<FileStore> {
         let prefix = target_vin
             .map(|vin| Record::TargetVin(vin.clone()))
             .into_iter()
-            .chain(intended_software_version.map(|v| Record::IntendedSoftwareVersion(v.to_vec())));
+            .chain(intended_software_version.map(|v| Record::IntendedSoftwareVersion(v.to_vec())))
+            .chain(artifact_sha256.map(|hash| Record::ArtifactSha256(*hash)));
         for record in prefix {
             facts.apply(&record).map_err(JournalError::Invariant)?;
             let entry = Entry {
@@ -1052,8 +1073,9 @@ impl JournalState {
 
 /// Where the creation-prefix records may sit, on commit and on read-back alike, with
 /// `records_so_far` records and `facts` before `record`: the target VIN only as the first record;
-/// the intended software version only as the first, or as the second after a target VIN. A second
-/// one of either is refused by `RecoveryFacts::apply`. Other records fit anywhere.
+/// the intended software version only as the first, or as the second after a target VIN; the
+/// artifact hash only after those two when set and nothing else (ADR-344). A second one of any
+/// is refused by `RecoveryFacts::apply`. Other records fit anywhere.
 fn creation_prefix_allowed(
     record: &Record,
     records_so_far: u64,
@@ -1069,6 +1091,15 @@ fn creation_prefix_allowed(
             if records_so_far != 0 && !(records_so_far == 1 && facts.target_vin.is_some()) =>
         {
             Err("the intended software version must follow only the target VIN")
+        }
+        // Only the target VIN and the intended version precede it, so the record count equals
+        // how many of the two are set.
+        Record::ArtifactSha256(_)
+            if records_so_far
+                != u64::from(facts.target_vin.is_some())
+                    + u64::from(facts.intended_software_version.is_some()) =>
+        {
+            Err("the artifact hash must follow only the target VIN and the intended version")
         }
         _ => Ok(()),
     }
@@ -1399,7 +1430,7 @@ mod tests {
     #[test]
     fn reads_back_what_it_committed() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         script(&mut journal, |_| {});
         let (state, summary) = (journal.state().clone(), journal.summary());
         drop(journal);
@@ -1434,7 +1465,7 @@ mod tests {
     #[test]
     fn reads_back_the_checkpoints_and_requests() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         script_of(&mut journal, true, |_| {});
         let state = journal.state().clone();
         drop(journal);
@@ -1593,7 +1624,8 @@ mod tests {
             .flat_map(|vin| [(vin, false), (vin, true)])
         {
             let dir = TempDir::new();
-            let mut journal = Journal::create(&dir.0, &key(), target_vin, None).expect("create");
+            let mut journal =
+                Journal::create(&dir.0, &key(), target_vin, None, None).expect("create");
             let mut boundaries = vec![(journal.store.len as usize, journal.state().clone())];
             script_of(&mut journal, new_records, |j| {
                 boundaries.push((j.store.len as usize, j.state().clone()));
@@ -1657,7 +1689,7 @@ mod tests {
         for whole in [false, true] {
             let dir = TempDir::new();
             let vin = Vin::new("WDB12345678901234".to_owned());
-            drop(Journal::create(&dir.0, &key(), Some(&vin), None).expect("create"));
+            drop(Journal::create(&dir.0, &key(), Some(&vin), None, None).expect("create"));
             let mut bytes = fs::read(path(&dir)).expect("read");
             let FrameRead::Ok { next, .. } = read_frame(&bytes, PREAMBLE) else {
                 panic!("header");
@@ -1691,7 +1723,7 @@ mod tests {
             frame
         }] {
             let dir = TempDir::new();
-            let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+            let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
             journal.commit_block(0).expect_err("no transfer yet");
             journal
                 .commit_ecu_hardware_part_number(b"HW-1")
@@ -1720,7 +1752,7 @@ mod tests {
     #[test]
     fn a_damaged_record_with_records_after_it_is_corrupt() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         let header_end = journal.store.len as usize;
         script(&mut journal, |_| {});
         drop(journal);
@@ -1737,7 +1769,7 @@ mod tests {
     #[test]
     fn refuses_a_file_it_cannot_trust() {
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
         let good = fs::read(path(&dir)).expect("read");
 
         let other = JobKey {
@@ -1781,9 +1813,9 @@ mod tests {
             Journal::open(&dir.0, &key()),
             Err(JournalError::NotFound)
         ));
-        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, None),
+            Journal::create(&dir.0, &key(), None, None, None),
             Err(JournalError::AlreadyExists)
         ));
         // The journal and its writer lock's sidecar; no temporary file is left.
@@ -1810,7 +1842,7 @@ mod tests {
             };
             assert!(
                 matches!(
-                    Journal::create(&dir.0, &key, None, None),
+                    Journal::create(&dir.0, &key, None, None, None),
                     Err(JournalError::InvalidJobId(_))
                 ),
                 "{id:?}"
@@ -1822,7 +1854,7 @@ mod tests {
     fn the_target_vin_is_the_first_record_and_reads_back() {
         let dir = TempDir::new();
         let vin = Vin::new("WDB12345678901234".to_owned());
-        let mut j = Journal::create(&dir.0, &key(), Some(&vin), None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), Some(&vin), None, None).expect("create");
         assert_eq!(j.state().facts.target_vin.as_ref(), Some(&vin));
         assert_eq!(j.state().records, 1);
         // A second target VIN is refused.
@@ -1840,7 +1872,7 @@ mod tests {
 
         // A journal made without one has none.
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
         assert_eq!(
             Journal::read(&dir.0, &key())
                 .expect("read")
@@ -1875,7 +1907,7 @@ mod tests {
     fn a_file_with_a_late_target_vin_is_corrupt() {
         let dir = TempDir::new();
         let vin = Vin::new("WDB12345678901234".to_owned());
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         j.commit_step(at(1, 1), None).expect("step");
         drop(j);
         let mut frame = Vec::new();
@@ -1920,7 +1952,8 @@ mod tests {
         let vin = Vin::new("WDB12345678901234".to_owned());
         for target_vin in [Some(&vin), None] {
             let dir = TempDir::new();
-            let mut j = Journal::create(&dir.0, &key(), target_vin, Some(VERSION)).expect("create");
+            let mut j =
+                Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None).expect("create");
             assert_eq!(
                 j.state().facts.intended_software_version.as_deref(),
                 Some(VERSION)
@@ -1946,7 +1979,7 @@ mod tests {
 
         // A journal made without one has none.
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
         let state = Journal::read(&dir.0, &key()).expect("read");
         assert_eq!(state.facts.intended_software_version, None);
     }
@@ -1994,13 +2027,103 @@ mod tests {
     fn an_empty_intended_version_is_refused_and_creates_nothing() {
         let dir = TempDir::new();
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, Some(&[])),
+            Journal::create(&dir.0, &key(), None, Some(&[]), None),
             Err(JournalError::Invariant(_))
         ));
         assert!(!path(&dir).exists());
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
         append_entry(&dir, 0, Record::IntendedSoftwareVersion(Vec::new()));
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+    }
+
+    #[test]
+    fn the_artifact_hash_is_journaled_in_the_creating_write_and_reads_back() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let hash = [0xA5u8; 32];
+        for (target_vin, version) in [
+            (Some(&vin), Some(VERSION)),
+            (Some(&vin), None),
+            (None, Some(VERSION)),
+            (None, None),
+        ] {
+            let dir = TempDir::new();
+            let j =
+                Journal::create(&dir.0, &key(), target_vin, version, Some(&hash)).expect("create");
+            assert_eq!(j.state().facts.artifact_sha256, Some(hash));
+            drop(j);
+            let reopened = Journal::open(&dir.0, &key()).expect("open");
+            let facts = &reopened.state().facts;
+            assert_eq!(facts.artifact_sha256, Some(hash));
+            assert_eq!(facts.target_vin.as_ref(), target_vin);
+            assert_eq!(facts.intended_software_version.as_deref(), version);
+            assert_eq!(Journal::read(&dir.0, &key()).unwrap().facts, *facts);
+        }
+        // A journal created without one reads none.
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION), None).expect("create"));
+        let facts = Journal::read(&dir.0, &key()).unwrap().facts;
+        assert_eq!(facts.artifact_sha256, None);
+    }
+
+    #[test]
+    fn the_artifact_hash_is_refused_outside_the_creation_prefix_and_twice() {
+        let vin = Vin::new("WDB12345678901234".to_owned());
+        let hash = [7u8; 32];
+        let refused = |result: Result<(), JournalError>| {
+            assert!(
+                matches!(result, Err(JournalError::Invariant(_))),
+                "{result:?}"
+            );
+        };
+        // First, or after the VIN and the version: fine, once.
+        let mut j = memory();
+        j.commit(Record::ArtifactSha256(hash)).expect("first");
+        refused(j.commit(Record::ArtifactSha256(hash)));
+        let mut j = memory();
+        j.commit_target_vin(&vin).expect("vin");
+        j.commit_intended_software_version(VERSION)
+            .expect("version");
+        j.commit(Record::ArtifactSha256(hash)).expect("hash");
+        refused(j.commit(Record::ArtifactSha256(hash)));
+        // Before the version, the VIN or the version after it: refused.
+        let mut j = memory();
+        j.commit(Record::ArtifactSha256(hash)).expect("hash");
+        refused(j.commit_intended_software_version(VERSION));
+        refused(j.commit_target_vin(&vin));
+        // After a step, or a VIN that leaves a gap, or another record: refused.
+        let mut j = memory();
+        j.commit_step(at(1, 1), None).expect("step");
+        refused(j.commit(Record::ArtifactSha256(hash)));
+        let mut j = memory();
+        j.commit_ecu_hardware_part_number(b"HW-1").expect("record");
+        refused(j.commit(Record::ArtifactSha256(hash)));
+        let mut j = memory();
+        j.commit_target_vin(&vin).expect("vin");
+        j.commit_step(at(1, 1), None).expect("step");
+        refused(j.commit(Record::ArtifactSha256(hash)));
+        // On read-back the same rule makes the file corrupt.
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), None, None, Some(&hash)).expect("create"));
+        append_entry(&dir, 1, Record::ArtifactSha256(hash));
+        assert!(matches!(
+            Journal::read(&dir.0, &key()),
+            Err(JournalError::Corrupt { .. })
+        ));
+        let dir = TempDir::new();
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
+        append_entry(
+            &dir,
+            0,
+            Record::Step {
+                at: at(1, 1),
+                vm_state: None,
+            },
+        );
+        append_entry(&dir, 1, Record::ArtifactSha256(hash));
         assert!(matches!(
             Journal::read(&dir.0, &key()),
             Err(JournalError::Corrupt { .. })
@@ -2045,7 +2168,8 @@ mod tests {
         ];
         for (name, target_vin, created_version, appended) in cases {
             let dir = TempDir::new();
-            let j = Journal::create(&dir.0, &key(), target_vin, created_version).expect("create");
+            let j =
+                Journal::create(&dir.0, &key(), target_vin, created_version, None).expect("create");
             let first = j.state().records;
             drop(j);
             for (seq, record) in (first..).zip(appended) {
@@ -2070,7 +2194,10 @@ mod tests {
         for target_vin in [Some(&vin), None] {
             for whole in [false, true] {
                 let dir = TempDir::new();
-                drop(Journal::create(&dir.0, &key(), target_vin, Some(VERSION)).expect("create"));
+                drop(
+                    Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None)
+                        .expect("create"),
+                );
                 let mut bytes = fs::read(path(&dir)).expect("read");
                 let FrameRead::Ok { mut next, .. } = read_frame(&bytes, PREAMBLE) else {
                     panic!("header");
@@ -2102,7 +2229,7 @@ mod tests {
         for whole in [false, true] {
             let dir = TempDir::new();
             let vin = Vin::new("WDB12345678901234".to_owned());
-            drop(Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION)).expect("create"));
+            drop(Journal::create(&dir.0, &key(), Some(&vin), Some(VERSION), None).expect("create"));
             let mut bytes = fs::read(path(&dir)).expect("read");
             let FrameRead::Ok { next: vin_at, .. } = read_frame(&bytes, PREAMBLE) else {
                 panic!("header");
@@ -2122,7 +2249,7 @@ mod tests {
     #[test]
     fn records_out_of_order_are_refused() {
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         let refused = |result: Result<(), JournalError>| {
             assert!(
                 matches!(result, Err(JournalError::Invariant(_))),
@@ -2210,7 +2337,7 @@ mod tests {
     #[test]
     fn damage_with_records_after_it_is_not_a_torn_tail() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         let header_end = journal.store.len as usize;
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
@@ -2266,7 +2393,7 @@ mod tests {
     #[test]
     fn damage_followed_by_records_and_a_torn_tail_is_corrupt() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2303,7 +2430,7 @@ mod tests {
     #[test]
     fn a_record_numbered_u64_max_does_not_panic() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2339,7 +2466,7 @@ mod tests {
     #[test]
     fn a_frame_inside_a_torn_payload_is_not_a_later_record() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2396,7 +2523,7 @@ mod tests {
     #[test]
     fn read_leaves_a_torn_tail_in_place() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW-1")
             .expect("commit");
@@ -2503,7 +2630,7 @@ mod tests {
         assert_eq!(j.summary().last_intent, Some(at(3, 11)));
 
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         journal.commit_intent(at(7, 70)).expect("intent");
         drop(journal);
         let reopened = Journal::open(&dir.0, &key()).expect("open");
@@ -2516,7 +2643,7 @@ mod tests {
     #[test]
     fn a_journal_has_one_writer() {
         let dir = TempDir::new();
-        let mut journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         journal
             .commit_ecu_hardware_part_number(b"HW")
             .expect("commit");
@@ -2526,7 +2653,7 @@ mod tests {
             Err(JournalError::InUse)
         ));
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, None),
+            Journal::create(&dir.0, &key(), None, None, None),
             Err(JournalError::InUse)
         ));
         assert_eq!(fs::read(path(&dir)).expect("read"), bytes);
@@ -2536,7 +2663,7 @@ mod tests {
         );
         drop(journal);
         assert!(matches!(
-            Journal::create(&dir.0, &key(), None, None),
+            Journal::create(&dir.0, &key(), None, None, None),
             Err(JournalError::AlreadyExists)
         ));
         let reopened = Journal::open(&dir.0, &key()).expect("open after the writer is gone");
@@ -2554,7 +2681,7 @@ mod tests {
     #[test]
     fn a_dropped_writer_releases_the_lock_a_shared_handle_still_holds() {
         let dir = TempDir::new();
-        let journal = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         let shared = journal
             .store
             ._writer
@@ -2583,7 +2710,8 @@ mod tests {
         let vin = Vin::new("WDB12345678901234".to_owned());
         for target_vin in [Some(&vin), None] {
             let dir = TempDir::new();
-            let mut j = Journal::create(&dir.0, &key(), target_vin, Some(VERSION)).expect("create");
+            let mut j =
+                Journal::create(&dir.0, &key(), target_vin, Some(VERSION), None).expect("create");
             let facts = j.summary();
             let prefix = j.state().records;
             j.commit_run_start(at(0, 0), b"initial").expect("run start");
@@ -2615,7 +2743,7 @@ mod tests {
         j.commit_run_start(at(0, 6), b"s").expect("after the step");
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         j.commit_step(at(2, 5), None).expect("step");
         drop(j);
         append_entry(
@@ -2671,7 +2799,7 @@ mod tests {
         assert_eq!(j.state().records, records);
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         j.commit_step(at(3, 1), None).expect("step");
         j.commit_procedure_failed(at(4, 2), "E", "d")
             .expect("failure");
@@ -2744,7 +2872,7 @@ mod tests {
         assert_eq!(j.summary().identity_mismatch, None);
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         j.commit_step(at(3, 1), None).expect("step");
         j.commit_identity_mismatch(IdentityKind::Vin)
             .expect("abort");
@@ -2825,7 +2953,7 @@ mod tests {
         assert_eq!(j.summary().run_stopped, None);
 
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         j.commit_step(at(3, 1), None).expect("step");
         j.commit_run_stopped(at(4, 2), RunStop::StepLimit)
             .expect("stop");
@@ -2854,7 +2982,7 @@ mod tests {
     #[test]
     fn a_torn_run_stop_reads_back_as_the_state_before_it() {
         let dir = TempDir::new();
-        let mut j = Journal::create(&dir.0, &key(), None, None).expect("create");
+        let mut j = Journal::create(&dir.0, &key(), None, None, None).expect("create");
         j.commit_step(at(3, 1), Some(b"vm")).expect("step");
         let before = (j.store.len as usize, j.state().clone());
         j.commit_run_stopped(at(4, 2), RunStop::Vm(VmError::Overflow))
@@ -2895,7 +3023,7 @@ mod tests {
             .expect("at the limits");
 
         let dir = TempDir::new();
-        drop(Journal::create(&dir.0, &key(), None, None).expect("create"));
+        drop(Journal::create(&dir.0, &key(), None, None, None).expect("create"));
         append_entry(
             &dir,
             0,

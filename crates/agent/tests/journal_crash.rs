@@ -81,7 +81,7 @@ const SCRIPT: &[(&str, Commit)] = &[
 /// Creates the journal in `dir` and makes the first `commits` commits.
 fn run_script(dir: &Path, commits: usize) -> Journal {
     let mut journal =
-        Journal::create(dir, &key(), None, None).expect("the journal should be created");
+        Journal::create(dir, &key(), None, None, None).expect("the journal should be created");
     for (name, commit) in &SCRIPT[..commits] {
         commit(&mut journal).unwrap_or_else(|error| panic!("{name}: {error}"));
     }
@@ -164,6 +164,7 @@ fn check_named_point(commits: usize, state: &JournalState) -> Option<&'static st
                 last_intent: None,
                 target_vin: None,
                 intended_software_version: None,
+                artifact_sha256: None,
                 procedure_failed: None,
                 identity_mismatch: None,
                 run_stopped: None,
@@ -313,7 +314,7 @@ fn the_creating_write_holds_the_vin_and_the_intended_version() {
     ] {
         let dir = temp_dir("creation-prefix");
         let vin = vin.map(|vin| Vin::new(vin.to_owned()));
-        drop(Journal::create(&dir.0, &key(), vin.as_ref(), version).expect("create"));
+        drop(Journal::create(&dir.0, &key(), vin.as_ref(), version, None).expect("create"));
         let state = Journal::read(&dir.0, &key()).expect("read");
         assert_eq!(state.facts.target_vin, vin);
         assert_eq!(state.facts.intended_software_version.as_deref(), version);

@@ -319,6 +319,9 @@ least one of these holds:
 - the round fixed a finding the reviewer rated above Low (Codex P0, P1 or P2; Copilot Medium,
   High or Critical), or one whose severity you cannot read from the review;
 - the round's fix went through `design-advisor` (2b);
+- the round's sweep fixed a gap of a kind no finding of the round named (a sibling of a fixed
+  finding takes that finding's rating; any other sweep fix has none, so it counts as
+  unreadable, as above);
 - the round newly declined a finding (2d), as a no-change round with one would (Step 3);
 - the push changes any file that is not Markdown (`*.md`): code, scripts, hooks, workflows,
   build and configuration files, schemas, examples and other data files all count;

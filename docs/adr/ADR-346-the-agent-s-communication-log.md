@@ -291,7 +291,7 @@ decisions behind them:
 - **Classify a confirmed request with no response as vehicle side always.** The VCI's response
   filters and buffers can drop a response that was on the bus. Without an earlier answer on the
   link, the log cannot exclude that.
-- **A raw CAN channel now.** Both workers run UDS through the API's own ISO-TP, and a second
+- **A raw CAN channel now.** Both workers run UDS through the API's own ISO-TP (ISO 15765-2:2024 clause 9), and a second
   channel on the same pins conflicts with the diagnostic one on most devices. Whether a device can
   run both is a hardware-profile question (design 13.5), so the channel waits for a device that
   shows it.

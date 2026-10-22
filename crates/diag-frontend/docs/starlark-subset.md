@@ -132,7 +132,7 @@ onto them as follows; anything else exists only at ingestion.
 | `bytes` | `Bytes` | A slice without a step lowers at run time to the IR's slice instruction, with Starlark's clamping of negative and out-of-range indexes; a string is sliced only when it is a constant, since its indexes count characters |
 | `str` | constant only, or UTF-8 `Bytes` when built at run time | Two strings, or two bytes values, known only at run time are joined with `+` through the IR's concatenation instruction, which ends the procedure with a VM error past 16 MiB; a string built by `%` formatting or `str(x)` needs the conversion instructions the IR does not have yet |
 | `list` | none | List literals are constants: a `for` over one is unrolled, and an index into one must be a constant. No mutation |
-| `dict` | none | A dict literal appears only as a `params` argument (3.1), which the transpiler encodes into the request bytes. The response (3.4) is accessed only through literal key chains, which the transpiler resolves to the response bytes and the declaration part's decode plan for each field |
+| `dict` | none | A dict literal appears only as a `params` argument (3.1), which the transpiler encodes into the request bytes. The response (3.4) is accessed only through literal key chains, which the transpiler resolves to the response bytes and the declaration part's decode plan for each field. The answer of `diag.hmi` and `diag.record` (3.4) is likewise a status byte and text read through its literal keys, never a value of its own |
 | `None` | none | Not supported in version 1 (`STAR_UNSUPPORTED_SYNTAX`) |
 
 A construct whose lowering needs an instruction the IR does not have yet is rejected at
@@ -262,8 +262,8 @@ diag.routine(routine_id, sub, params)   # Routine control
 diag.security_access(level)             # Send seed -> receive key (online required)
 diag.flash_transfer(session_id)         # Flash transfer (carries section attributes)
 diag.wait(millis)                       # Wait
-diag.hmi(form_id, params)               # HMI request -> input value
-diag.record(template_id)                # Request input for a record template
+diag.hmi(form_id, params)               # HMI request -> the operator's answer (3.4)
+diag.record(template_id)                # Request input for a record template -> its answer
 diag.capture(back_millis)               # Capture a monitoring window
 diag.log(level, message)                # Log output
 diag.ecu_info()["key"]                  # Variant, VIN, part number, SW version (read-only; a literal key reads it)
@@ -271,7 +271,8 @@ diag.precondition(name)                 # Current value of an execution precondi
 diag.fail(code, detail)                 # Abnormal end of the procedure
 ```
 
-`params` is a dict literal with string keys.
+`params` is a dict literal with string keys. The `params` of `diag.hmi` are a dict literal too, never a
+name or a constant dict, and `diag.record` takes the template id alone.
 
 Arguments that the instruction, or the request built at ingestion, holds as a fixed field must
 be constant at ingestion and in the range below; otherwise the call is rejected (`STAR_NON_CONSTANT_ARGUMENT` or
@@ -287,13 +288,13 @@ field that stores them.
 | `level` | `int`, odd, 0x01 to 0x7D (the seed sub-function; the key is sent with `level + 1`; ISO 14229-1 (2026) 9.4 gives the seed requests that range, and a sub-function's bit 7 asks the server not to answer) |
 | `millis` of `diag.wait` | `int`, 0 to 2^32 - 1; may be an expression known only at run time, whose value the VM checks against that range when the wait runs (`WaitOutOfRange`) |
 | `back_millis` | `int`, 0 to 2^32 - 1 |
-| `form_id`, `template_id` | `str` naming the form or record template |
+| `form_id`, `template_id` | `str` constant of 1 to 128 bytes naming the form or record template (ADR-340 item 4): a value known only at run time is `STAR_NON_CONSTANT_ARGUMENT`, a constant of another type `STAR_UNSUPPORTED_SYNTAX`, another length `STAR_ARGUMENT_OUT_OF_RANGE`. Both calls take exactly their arguments (`STAR_UNSUPPORTED_SYNTAX` otherwise) |
 | `name` of `diag.precondition` | `str` constant, one of `voltage`, `externalSupply`, `ignition`, `engine`, `vehicleSpeed` (the names `# @preconditions` takes, 4.9); another `str` is `STAR_ARGUMENT_OUT_OF_RANGE`, a value known only at run time `STAR_NON_CONSTANT_ARGUMENT` and a constant of another type `STAR_UNSUPPORTED_SYNTAX`. The name need not be in `# @preconditions` |
 | `level` of `diag.log` | `int`, 0 to 255 |
 | `message` of `diag.log` | `str` expression, which may be built at run time |
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
 | `detail` of `diag.fail` | `str` expression, which may be built at run time |
-| `params` of `diag.hmi` | dict whose values are all constants (3.2) |
+| `params` of `diag.hmi` | dict literal of at most 32 entries (ADR-340 item 4). A key is a string literal that is an identifier (`[A-Za-z_][A-Za-z0-9_]*`) of at most 64 bytes, unique in the dict; a computed key, or one that is not a string, is `STAR_DYNAMIC_KEY_NOT_ALLOWED` as for every dict literal (4.1), a string literal that is not an identifier `STAR_UNSUPPORTED_SYNTAX`, one past a bound, a repeated key or more than 32 entries `STAR_ARGUMENT_OUT_OF_RANGE`. A value is an `int`, `bool` or `str`, a constant or known only at run time (one inferred type, 4.8, else `STAR_NOT_LOWERABLE`); a value of another type, constant or not (`float`, `bytes`, a list, a dict, a response or an answer), is `STAR_UNSUPPORTED_SYNTAX`. The form, constants included, encodes to at most 16 KiB (`STAR_ARGUMENT_OUT_OF_RANGE`) (3.2) |
 | `params` of `diag.request` | dict literal whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`). The keys, and the values of the service's constants, are known at ingestion (`STAR_NON_CONSTANT_ARGUMENT`); a field's value may be known only at run time (below) |
 | `params` of `diag.routine` | dict literal whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
 | `session_id` | `int` naming a flash session declared in the declaration part (`FlashSession` in `ir.fbs`); an unknown session is rejected (`STAR_UNKNOWN_FLASH_SESSION`) only for a plan's session, the `@flashPlan` annotation's; the call must be a plan function's one transfer (4.9), and its `session_id` any constant expression, which the lowering evaluates and compares with the annotation's (`STAR_PLAN_SHAPE` for another session, `STAR_NON_CONSTANT_ARGUMENT` for a value known only at run time). Under the target contract of 3.2 (ADR-336) it must name a session of the target whose handle the call is made on. The call's value is the RequestTransferExit response in the 3.4 shape without `fields` (reading one is `STAR_NOT_IN_PROFILE`) |
@@ -319,9 +320,9 @@ rejected whether it is a constant or computed at run time (`STAR_UNSUPPORTED_SYN
 
 ### 3.2 Lowering
 
-The instruction set does not cover this whole API yet. Missing instructions are added by
-appending `Op` variants, which keeps existing programs valid (ADR-233); until a function's
-instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`).
+Every function of this API has an instruction since ADR-340. An instruction a later function
+needs is added by appending an `Op` variant, which keeps existing programs valid (ADR-233);
+until it exists, the transpiler rejects calls to that function (`STAR_NOT_LOWERABLE`).
 
 | Function | Instruction | Run-time operands |
 |---|---|---|
@@ -331,8 +332,8 @@ instruction exists, the transpiler rejects calls to it (`STAR_API_NOT_AVAILABLE`
 | `diag.security_access` | `ServiceRequest`, `SecurityAccess`, `ServiceRequest` | expands to the profile's three steps (ADR-309 item 4, ADR-314): the seed request (on UDS the SecurityAccess service with the odd sub-function `level`), `SecurityAccess`, which turns the seed into the key through the host, and the send-key request (on UDS sub-function `level + 1`) carrying that key. The profile decodes neither response through a declared service, so both requests are `ServiceRequest`s of the template's SID with the payload it gives, and the variant needs no declared service for them; the seed is the seed response after the profile's leading bytes (on UDS the response SID and the level). A negative seed response ends the call before the key step, like a failed `diag.request`, and is its value; otherwise the value is the send-key response, positive or negative |
 | `diag.flash_transfer` | `FlashTransfer` | `PushBytes`, `ServiceRequest` (0x34, then 0x37), `FlashBlock`, `FlashTransfer` and a counter loop (ADR-336), only inside a flash plan function (4.9): the call expands to RequestDownload, a loop of `FlashBlock` and `FlashTransfer` over the session's one segment, and RequestTransferExit, whose run-time operands are the block index for `FlashBlock` and the block bytes it leaves for `FlashTransfer` (the contract is below). Outside a plan function the call is `STAR_PLAN_SHAPE`, and in a variant whose application layer is not UDS `STAR_NOT_IN_PROFILE` |
 | `diag.wait` | `Wait`, or `WaitFromStack` | none for a constant duration; for a duration known only at run time, the duration in milliseconds (`int`), pushed before `WaitFromStack` |
-| `diag.hmi` | `HmiRequest` | none: the instruction sends a constant, so the transpiler encodes the form and its constant `params` into one constant-pool entry; parameters known only at run time need a variant that takes them from the stack |
-| `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry |
+| `diag.hmi` | `HmiRequest`, or `HmiRequestFromStack` | the transpiler encodes the form id and the `params` into one constant-pool entry, an `HmiTemplate` (ADR-340 items 1, 2). A call whose `params` are all constants lowers to `HmiRequest`, which takes no operand: the host receives the form as encoded. A value known only at run time is a slot of the template, its code emitted in source order before `HmiRequestFromStack`, which pops one operand per slot (the first slot deepest), fills the slots and sends the completed form. The call's value is the answer (3.4) |
+| `diag.record` | `RecordInput` | none: the template reference is a constant-pool entry holding the template id with no params. The call's value is the answer (3.4) |
 | `diag.capture` | `MonitorCapture` | none |
 | `diag.log` | `Log`, or `LogFromStack` | none for a constant message; for a message built at run time, the message (`str`, as bytes), pushed before `LogFromStack` |
 | `diag.ecu_info` | none; `PushBytes`, `SendReceive`, `DecodeField` per read key | no new instruction (ADR-339). The call has no value of its own: it is read through a string-literal key applied directly to it, `diag.ecu_info()["vin"]`, with the keys of 3.4's dict-with-fixed-keys spelling. `variant` is the short name of the variant the program is lowered for, a `str` constant that sends nothing. `vin`, `part_number` and `software_version` each read the variant's `identity.csv` row of kind `vin`, `hardware_part_number` and `software_version` (`csv-tables.md` 4.13), lowered as a service source of `diag.precondition` is: the request (bytes) is built at ingestion and pushed before `SendReceive`, then `DecodeField` reads the field. The value is a `str` for an ASCII field and an `int` for an unsigned integer one. **Each key read is a separate request, made at the point of access**: nothing is cached or read in advance, so two reads of a key may differ if the ECU changes in between; keep a value in a variable to use it twice. A key whose row the variant lacks is `STAR_UNKNOWN_IDENTITY`; a call that no literal key reads (a statement, a variable, an argument), is `STAR_NOT_LOWERABLE`; a key that is not a string literal is `STAR_DYNAMIC_KEY_NOT_ALLOWED`; another key, or an argument, is `STAR_UNSUPPORTED_SYNTAX`; a row whose service the variant does not declare with a request that has no fields is `STAR_NOT_LOWERABLE`. The reads are `Safe` (4.6). A key read must be made while the ECU is in a session that answers the DID read (normally the default session); a negative answer or one that does not decode ends the run as a field read without a check does, with a `VmError`, which is terminal |
@@ -429,6 +430,40 @@ if res["ok"]:
 - Each `res["fields"]["dtcs"]` decodes the response again, so store the records once before a
   loop rather than reading them in it. The loop limit in the example allows 1023 records, the
   most a 4095-byte response holds.
+
+**HMI answers (ADR-340).** The value of `diag.hmi(...)` and `diag.record(...)` is the operator's
+answer: one status byte, then the answer's text. It is read only through three literal keys,
+each lowered where it is read:
+
+- `ans["ok"]` is a `bool`: true when the status says the operator answered. A declined form or
+  record is false.
+- `ans["timed_out"]` is a `bool`: true when the HMI timeout expired before an answer (design
+  5.6). A decline and a timeout both read `ok` as false, and only a timeout reads `timed_out`
+  as true.
+- `ans["value"]` is a `str`: the text after the status byte, empty for a decline and a
+  timeout. What the text holds is the server's to fill by the kind of form: empty for a
+  confirmation, the entered text for a text input, the number as decimal text for a number
+  input (there is no key that reads it as an `int`), the chosen option's value for a choice,
+  and for a record template the judgment of its pass criteria, `ok` or `ng`, or empty when it
+  has none. Compare it with `==` against string constants.
+
+The reads are total: an empty answer, or one whose first byte is not the answered status, reads
+`ok` as false. Another string key is `STAR_UNSUPPORTED_SYNTAX`, a key that is not a string
+literal `STAR_DYNAMIC_KEY_NOT_ALLOWED`, and any other use of the answer (its truth value, an
+operator, a built-in) `STAR_NOT_LOWERABLE`; as a `diag.hmi` param it is
+`STAR_UNSUPPORTED_SYNTAX` (3.1). A procedure tests `ans["ok"]` and
+usually ends with `diag.fail` when the operator declined:
+
+```python
+ans = diag.hmi("confirm_ignition_off", {"title": "Switch the ignition off", "attempt": n})
+if not ans["ok"]:
+    diag.fail("OPERATOR_DECLINED", "the operator did not confirm")
+```
+
+A run whose HMI timeout fired never ends as completed, so a procedure that tests `timed_out`
+only decides what it does before the run ends (ADR-340 item 6). The call waits for the
+answer: it is a diagnostic primitive, `Safe` by default (4.6), with its own one-instruction
+section.
 
 ---
 

@@ -11,7 +11,8 @@
 //! `fields` key, a declared flash session, an instruction the IR lacks, the range of a constant
 //! argument) is left to the lowering. Computed dict keys (2.3) are found on the expressions known
 //! to be dicts without type inference: dict literals, the responses of `diag.request`,
-//! `diag.routine` and `diag.read_dtc`, a response's `"fields"`, and names assigned from those.
+//! `diag.routine` and `diag.read_dtc`, the answers of `diag.hmi` and `diag.record`, a response's
+//! `"fields"`, and names assigned from those.
 //! A name assigned on only some paths (one branch of an `if`, the body of a `for`) counts as a
 //! dict after it when it is one on any path.
 
@@ -424,8 +425,9 @@ const DIAG_FUNCTIONS: &[&str] = &[
     "fail",
 ];
 
-/// The `diag` functions whose result is a response dict (3.4).
-const DIAG_RESPONSES: &[&str] = &["request", "routine", "read_dtc"];
+/// The `diag` functions whose result is a response dict (3.4), or, for `hmi` and `record`, an
+/// answer read by literal keys the same way (ADR-340).
+const DIAG_RESPONSES: &[&str] = &["request", "routine", "read_dtc", "hmi", "record"];
 
 /// Built-ins 2.3 names as not allowed.
 const FORBIDDEN_BUILTINS: &[&str] = &["print", "getattr", "hasattr", "dir"];

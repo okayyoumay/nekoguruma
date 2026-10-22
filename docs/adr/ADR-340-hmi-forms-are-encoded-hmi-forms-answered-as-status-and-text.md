@@ -1,7 +1,7 @@
 # ADR-340: HMI Forms and Record Templates Are Encoded `HmiForm`s, Answered as a Status Byte and Text
 
 **Date:** 2026-10-21
-**Status:** Accepted
+**Status:** Accepted (item 4: a computed `params` key, or one that is not a string, is `STAR_DYNAMIC_KEY_NOT_ALLOWED` by Starlark subset 4.1's rule for every dict literal; item 3: an answer may be passed to and returned from a user function, as a response may under ADR-317)
 **Affects:** `diag-ir` (new `hmi` module, `Op::HmiRequestFromStack`, `IR_SCHEMA_VERSION` 18 to 19,
 `Program::validate`, `VmError`, `dry_run::Script`), `diag-frontend` (the lowering of `diag.hmi`
 and `diag.record` and of the answer's keys), `agent` (`host.rs`, `runner.rs`, `policy.rs`; the

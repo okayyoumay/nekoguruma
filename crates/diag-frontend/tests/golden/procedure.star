@@ -11,7 +11,10 @@
 # `write_application` is a flash plan for session 1 of the example ECU (subset 4.9, ADR-336): the
 # lowering expands it in place at its call in `main`, the program holds its `FlashRecovery`
 # (`Program.flash`) and the transfer's loop of `FlashBlock` and `FlashTransfer`, and the host
-# serves a fake artifact and sums the blocks it is given.
+# serves a fake artifact and sums the blocks it is given. `diag.hmi` asks the operator to confirm
+# the session, with a constant and a run-time param, so it lowers to `HmiRequestFromStack`, and
+# `diag.record` lowers to `RecordInput`; the host writes each form it is given and answers it
+# (subset 3.1, 3.4, ADR-340).
 
 def read_vin():
     diag.request(0x22, {"did": 0xF190})
@@ -43,6 +46,9 @@ def main():
     session = diag.request(0x22, {"did": 0xF186})
     if session["fields"]["session"] == 3:
         diag.log(1, "extended session")
+    confirm = diag.hmi("confirm_session", {"title": "Confirm the session", "session": session["fields"]["session"]})
+    if not confirm["ok"]:
+        diag.fail("OPERATOR_DECLINED", "the operator did not confirm the session")
     frame = write_uint(b"\x00\x00\x00", session["fields"]["session"] - 3, 16, 0x1234)
     if read_uint(frame, 0, 16) == 0x1234:
         diag.log(1, "uint round trip")
@@ -62,4 +68,7 @@ def main():
     write_vin()
     write_application()
     diag.wait(2000)
+    record = diag.record("final_check")
+    if record["ok"] and record["value"] == "ok":
+        diag.log(1, "record passed")
     diag.log(1, "done")

@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "857b84dd4dae81e1a864b028a3d7bcb0e2aede3c077c6bc0d9e2f6a5bdd9dfbf",
+        "39db40be86c40c7f034c99ea6163fdb0a666579d5bf93989010256aad96dad6d",
     ),
     variant: Some(
         EcuVariantT {
@@ -2532,7 +2532,7 @@ Program {
         },
         Pop,
         Call(
-            349,
+            382,
         ),
         PushBytes(
             1,
@@ -2541,10 +2541,10 @@ Program {
             service: 34,
         },
         StoreLocal(
-            4,
+            6,
         ),
         LoadLocal(
-            4,
+            6,
         ),
         DecodeField {
             service: 9,
@@ -2561,221 +2561,15 @@ Program {
             level: 1,
             message: 2,
         },
-        PushBytes(
-            3,
-        ),
-        StoreLocal(
-            6,
-        ),
         LoadLocal(
-            4,
+            6,
         ),
         DecodeField {
             service: 9,
             field: 20,
         },
-        PushI64(
-            3,
-        ),
-        Sub,
-        StoreLocal(
-            7,
-        ),
-        PushI64(
-            4660,
-        ),
-        StoreLocal(
-            8,
-        ),
-        LoadLocal(
-            8,
-        ),
-        PushI64(
-            16,
-        ),
-        Shr,
-        PushI64(
-            0,
-        ),
-        CmpEq,
-        Not,
-        JumpIfFalse(
-            31,
-        ),
-        PushBytes(
-            5,
-        ),
-        Fail {
-            code: 4,
-        },
-        LoadLocal(
-            6,
-        ),
-        LoadLocal(
-            7,
-        ),
-        LoadLocal(
-            8,
-        ),
-        PushI64(
-            8,
-        ),
-        Shr,
-        PushI64(
-            255,
-        ),
-        BitAnd,
-        IndexSet,
-        LoadLocal(
-            7,
-        ),
-        PushI64(
-            1,
-        ),
-        Add,
-        LoadLocal(
-            8,
-        ),
-        PushI64(
-            0,
-        ),
-        Shr,
-        PushI64(
-            255,
-        ),
-        BitAnd,
-        IndexSet,
-        PushI64(
-            0,
-        ),
-        StoreLocal(
-            6,
-        ),
-        StoreLocal(
-            2,
-        ),
-        LoadLocal(
-            2,
-        ),
-        StoreLocal(
-            9,
-        ),
-        PushI64(
-            0,
-        ),
-        StoreLocal(
-            10,
-        ),
-        PushI64(
-            0,
-        ),
-        LoadLocal(
-            9,
-        ),
-        LoadLocal(
-            10,
-        ),
-        IndexGet,
-        Swap,
-        Pop,
-        BitOr,
-        PushI64(
-            8,
-        ),
-        Shl,
-        LoadLocal(
-            9,
-        ),
-        LoadLocal(
-            10,
-        ),
-        PushI64(
-            1,
-        ),
-        Add,
-        IndexGet,
-        Swap,
-        Pop,
-        BitOr,
-        PushI64(
-            0,
-        ),
-        StoreLocal(
-            9,
-        ),
-        PushI64(
-            4660,
-        ),
-        CmpEq,
-        JumpIfFalse(
-            78,
-        ),
-        Log {
-            level: 1,
-            message: 6,
-        },
-        LoadLocal(
-            4,
-        ),
-        DecodeField {
-            service: 9,
-            field: 20,
-        },
-        PushI64(
-            6,
-        ),
-        Add,
-        StoreLocal(
-            11,
-        ),
-        LoadLocal(
-            11,
-        ),
-        PushI64(
-            8,
-        ),
-        Shr,
-        PushI64(
-            0,
-        ),
-        CmpEq,
-        Not,
-        JumpIfFalse(
-            92,
-        ),
-        PushBytes(
-            8,
-        ),
-        Fail {
-            code: 7,
-        },
-        PushBytes(
-            9,
-        ),
-        PushI64(
-            1,
-        ),
-        PushI64(
-            0,
-        ),
-        LoadLocal(
-            11,
-        ),
-        PushI64(
-            255,
-        ),
-        BitAnd,
-        BitOr,
-        IndexSet,
-        ServiceRequest {
-            service: 25,
-        },
-        Pop,
-        PushBytes(
-            10,
-        ),
-        SendReceive {
-            service: 4,
+        HmiRequestFromStack {
+            form: 3,
         },
         StoreLocal(
             1,
@@ -2791,17 +2585,260 @@ Program {
         ),
         Slice,
         PushBytes(
+            4,
+        ),
+        CmpEq,
+        Not,
+        JumpIfFalse(
+            27,
+        ),
+        PushBytes(
+            6,
+        ),
+        Fail {
+            code: 5,
+        },
+        PushBytes(
+            7,
+        ),
+        StoreLocal(
+            8,
+        ),
+        LoadLocal(
+            6,
+        ),
+        DecodeField {
+            service: 9,
+            field: 20,
+        },
+        PushI64(
+            3,
+        ),
+        Sub,
+        StoreLocal(
+            9,
+        ),
+        PushI64(
+            4660,
+        ),
+        StoreLocal(
+            10,
+        ),
+        LoadLocal(
+            10,
+        ),
+        PushI64(
+            16,
+        ),
+        Shr,
+        PushI64(
+            0,
+        ),
+        CmpEq,
+        Not,
+        JumpIfFalse(
+            45,
+        ),
+        PushBytes(
+            9,
+        ),
+        Fail {
+            code: 8,
+        },
+        LoadLocal(
+            8,
+        ),
+        LoadLocal(
+            9,
+        ),
+        LoadLocal(
+            10,
+        ),
+        PushI64(
+            8,
+        ),
+        Shr,
+        PushI64(
+            255,
+        ),
+        BitAnd,
+        IndexSet,
+        LoadLocal(
+            9,
+        ),
+        PushI64(
+            1,
+        ),
+        Add,
+        LoadLocal(
+            10,
+        ),
+        PushI64(
+            0,
+        ),
+        Shr,
+        PushI64(
+            255,
+        ),
+        BitAnd,
+        IndexSet,
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            8,
+        ),
+        StoreLocal(
+            3,
+        ),
+        LoadLocal(
+            3,
+        ),
+        StoreLocal(
             11,
+        ),
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            12,
+        ),
+        PushI64(
+            0,
+        ),
+        LoadLocal(
+            11,
+        ),
+        LoadLocal(
+            12,
+        ),
+        IndexGet,
+        Swap,
+        Pop,
+        BitOr,
+        PushI64(
+            8,
+        ),
+        Shl,
+        LoadLocal(
+            11,
+        ),
+        LoadLocal(
+            12,
+        ),
+        PushI64(
+            1,
+        ),
+        Add,
+        IndexGet,
+        Swap,
+        Pop,
+        BitOr,
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            11,
+        ),
+        PushI64(
+            4660,
+        ),
+        CmpEq,
+        JumpIfFalse(
+            92,
+        ),
+        Log {
+            level: 1,
+            message: 10,
+        },
+        LoadLocal(
+            6,
+        ),
+        DecodeField {
+            service: 9,
+            field: 20,
+        },
+        PushI64(
+            6,
+        ),
+        Add,
+        StoreLocal(
+            13,
+        ),
+        LoadLocal(
+            13,
+        ),
+        PushI64(
+            8,
+        ),
+        Shr,
+        PushI64(
+            0,
+        ),
+        CmpEq,
+        Not,
+        JumpIfFalse(
+            106,
+        ),
+        PushBytes(
+            12,
+        ),
+        Fail {
+            code: 11,
+        },
+        PushBytes(
+            13,
+        ),
+        PushI64(
+            1,
+        ),
+        PushI64(
+            0,
+        ),
+        LoadLocal(
+            13,
+        ),
+        PushI64(
+            255,
+        ),
+        BitAnd,
+        BitOr,
+        IndexSet,
+        ServiceRequest {
+            service: 25,
+        },
+        Pop,
+        PushBytes(
+            14,
+        ),
+        SendReceive {
+            service: 4,
+        },
+        StoreLocal(
+            2,
+        ),
+        LoadLocal(
+            2,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            15,
         ),
         CmpEq,
         Not,
         Dup,
         JumpIfFalse(
-            119,
+            133,
         ),
         Pop,
         LoadLocal(
-            1,
+            2,
         ),
         DecodeField {
             service: 4,
@@ -2812,14 +2849,14 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            215,
+            229,
         ),
         Log {
             level: 1,
-            message: 12,
+            message: 16,
         },
         LoadLocal(
-            1,
+            2,
         ),
         Dup,
         DecodeField {
@@ -2835,10 +2872,10 @@ Program {
         ),
         Slice,
         StoreLocal(
-            3,
+            5,
         ),
         LoadLocal(
-            3,
+            5,
         ),
         Length,
         Swap,
@@ -2853,11 +2890,11 @@ Program {
         CmpEq,
         Dup,
         JumpIfFalse(
-            183,
+            197,
         ),
         Pop,
         LoadLocal(
-            3,
+            5,
         ),
         PushI64(
             1,
@@ -2867,15 +2904,15 @@ Program {
         ),
         Mul,
         StoreLocal(
-            12,
+            14,
         ),
         LoadLocal(
-            12,
+            14,
         ),
         IndexGet,
         Pop,
         LoadLocal(
-            12,
+            14,
         ),
         Dup,
         PushI64(
@@ -2884,7 +2921,7 @@ Program {
         Add,
         Slice,
         StoreLocal(
-            13,
+            15,
         ),
         PushI64(
             0,
@@ -2894,7 +2931,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            13,
+            15,
         ),
         PushI64(
             0,
@@ -2908,7 +2945,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            13,
+            15,
         ),
         PushI64(
             1,
@@ -2922,7 +2959,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            13,
+            15,
         ),
         PushI64(
             2,
@@ -2935,7 +2972,7 @@ Program {
             0,
         ),
         StoreLocal(
-            13,
+            15,
         ),
         PushI64(
             12648430,
@@ -2943,11 +2980,11 @@ Program {
         CmpEq,
         Dup,
         JumpIfFalse(
-            213,
+            227,
         ),
         Pop,
         LoadLocal(
-            3,
+            5,
         ),
         PushI64(
             1,
@@ -2957,15 +2994,15 @@ Program {
         ),
         Mul,
         StoreLocal(
-            14,
+            16,
         ),
         LoadLocal(
-            14,
+            16,
         ),
         IndexGet,
         Pop,
         LoadLocal(
-            14,
+            16,
         ),
         Dup,
         PushI64(
@@ -2974,7 +3011,7 @@ Program {
         Add,
         Slice,
         StoreLocal(
-            15,
+            17,
         ),
         PushI64(
             0,
@@ -2984,7 +3021,7 @@ Program {
         ),
         Shl,
         LoadLocal(
-            15,
+            17,
         ),
         PushI64(
             3,
@@ -2997,21 +3034,21 @@ Program {
             0,
         ),
         StoreLocal(
-            15,
+            17,
         ),
         PushI64(
             40,
         ),
         CmpEq,
         JumpIfFalse(
-            215,
+            229,
         ),
         Log {
             level: 1,
-            message: 13,
+            message: 17,
         },
         PushBytes(
-            14,
+            18,
         ),
         RoutineControl {
             routine: 65281,
@@ -3031,13 +3068,13 @@ Program {
         ),
         Slice,
         PushBytes(
-            11,
+            15,
         ),
         CmpEq,
         Not,
         Dup,
         JumpIfFalse(
-            232,
+            246,
         ),
         Pop,
         LoadLocal(
@@ -3052,23 +3089,23 @@ Program {
         ),
         CmpEq,
         JumpIfFalse(
-            234,
+            248,
         ),
         Log {
             level: 1,
-            message: 15,
+            message: 19,
         },
         PushBytes(
-            16,
+            4,
         ),
         ServiceRequest {
             service: 39,
         },
         StoreLocal(
-            16,
+            18,
         ),
         LoadLocal(
-            16,
+            18,
         ),
         PushI64(
             0,
@@ -3078,18 +3115,18 @@ Program {
         ),
         Slice,
         PushBytes(
-            11,
+            15,
         ),
         CmpEq,
         Not,
         JumpIfFalse(
-            254,
+            268,
         ),
         PushBytes(
-            17,
+            20,
         ),
         LoadLocal(
-            16,
+            18,
         ),
         PushI64(
             2,
@@ -3106,22 +3143,22 @@ Program {
             service: 39,
         },
         StoreLocal(
-            16,
+            18,
         ),
         LoadLocal(
-            16,
+            18,
         ),
         PushI64(
             0,
         ),
         StoreLocal(
-            16,
+            18,
         ),
         StoreLocal(
-            5,
+            7,
         ),
         LoadLocal(
-            5,
+            7,
         ),
         PushI64(
             0,
@@ -3131,38 +3168,38 @@ Program {
         ),
         Slice,
         PushBytes(
-            11,
+            15,
         ),
         CmpEq,
         Not,
         JumpIfFalse(
-            267,
+            281,
         ),
         Log {
             level: 1,
-            message: 18,
+            message: 21,
         },
         Call(
-            353,
+            386,
         ),
         PushBytes(
-            17,
+            20,
         ),
         ServiceRequest {
             service: 16,
         },
         Pop,
         PushBytes(
-            16,
+            4,
         ),
         ServiceRequest {
             service: 39,
         },
         StoreLocal(
-            19,
+            21,
         ),
         LoadLocal(
-            19,
+            21,
         ),
         PushI64(
             0,
@@ -3172,18 +3209,18 @@ Program {
         ),
         Slice,
         PushBytes(
-            11,
+            15,
         ),
         CmpEq,
         Not,
         JumpIfFalse(
-            291,
+            305,
         ),
         PushBytes(
-            17,
+            20,
         ),
         LoadLocal(
-            19,
+            21,
         ),
         PushI64(
             2,
@@ -3200,20 +3237,20 @@ Program {
             service: 39,
         },
         StoreLocal(
-            19,
+            21,
         ),
         LoadLocal(
-            19,
+            21,
         ),
         PushI64(
             0,
         ),
         StoreLocal(
-            19,
+            21,
         ),
         Pop,
         PushBytes(
-            14,
+            18,
         ),
         RoutineControl {
             routine: 65280,
@@ -3221,7 +3258,7 @@ Program {
         },
         Pop,
         PushBytes(
-            19,
+            22,
         ),
         ServiceRequest {
             service: 52,
@@ -3231,20 +3268,20 @@ Program {
             0,
         ),
         StoreLocal(
-            20,
+            22,
         ),
         LoadLocal(
-            20,
+            22,
         ),
         PushI64(
             256,
         ),
         CmpLt,
         JumpIfFalse(
-            315,
+            329,
         ),
         LoadLocal(
-            20,
+            22,
         ),
         FlashBlock {
             session: 1,
@@ -3254,29 +3291,29 @@ Program {
             block: 0,
         },
         LoadLocal(
-            20,
+            22,
         ),
         PushI64(
             1,
         ),
         Add,
         StoreLocal(
-            20,
+            22,
         ),
         Jump(
-            303,
+            317,
         ),
         PushBytes(
-            14,
+            18,
         ),
         ServiceRequest {
             service: 55,
         },
         StoreLocal(
-            17,
+            19,
         ),
         LoadLocal(
-            17,
+            19,
         ),
         PushI64(
             0,
@@ -3286,22 +3323,22 @@ Program {
         ),
         Slice,
         PushBytes(
-            11,
+            15,
         ),
         CmpEq,
         Not,
         Not,
         JumpIfFalse(
-            329,
+            343,
         ),
         PushBytes(
-            21,
+            24,
         ),
         Fail {
-            code: 20,
+            code: 23,
         },
         PushBytes(
-            14,
+            18,
         ),
         RoutineControl {
             routine: 65281,
@@ -3309,16 +3346,16 @@ Program {
         },
         Pop,
         PushBytes(
-            16,
+            4,
         ),
         ServiceRequest {
             service: 17,
         },
         StoreLocal(
-            18,
+            20,
         ),
         LoadLocal(
-            18,
+            20,
         ),
         PushI64(
             0,
@@ -3328,30 +3365,76 @@ Program {
         ),
         Slice,
         PushBytes(
-            11,
+            15,
         ),
         CmpEq,
         Not,
         Not,
         JumpIfFalse(
-            346,
+            360,
         ),
         PushBytes(
-            23,
+            26,
         ),
         Fail {
-            code: 22,
+            code: 25,
         },
         Wait {
             millis: 2000,
         },
+        RecordInput {
+            template: 27,
+        },
+        StoreLocal(
+            4,
+        ),
+        LoadLocal(
+            4,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            4,
+        ),
+        CmpEq,
+        Dup,
+        JumpIfFalse(
+            378,
+        ),
+        Pop,
+        LoadLocal(
+            4,
+        ),
+        PushI64(
+            1,
+        ),
+        PushI64(
+            9223372036854775807,
+        ),
+        Slice,
+        PushBytes(
+            28,
+        ),
+        CmpEq,
+        JumpIfFalse(
+            380,
+        ),
         Log {
             level: 1,
-            message: 24,
+            message: 29,
+        },
+        Log {
+            level: 1,
+            message: 30,
         },
         Ret,
         PushBytes(
-            26,
+            32,
         ),
         ServiceRequest {
             service: 34,
@@ -3359,10 +3442,10 @@ Program {
         Pop,
         Ret,
         Call(
-            358,
+            391,
         ),
         PushBytes(
-            25,
+            31,
         ),
         ServiceRequest {
             service: 46,
@@ -3370,7 +3453,7 @@ Program {
         Pop,
         Ret,
         PushBytes(
-            26,
+            32,
         ),
         ServiceRequest {
             service: 34,
@@ -3395,6 +3478,126 @@ Program {
             100,
             101,
             100,
+            32,
+            115,
+            101,
+            115,
+            115,
+            105,
+            111,
+            110,
+        ],
+        [
+            15,
+            99,
+            111,
+            110,
+            102,
+            105,
+            114,
+            109,
+            95,
+            115,
+            101,
+            115,
+            115,
+            105,
+            111,
+            110,
+            2,
+            5,
+            116,
+            105,
+            116,
+            108,
+            101,
+            0,
+            2,
+            19,
+            67,
+            111,
+            110,
+            102,
+            105,
+            114,
+            109,
+            32,
+            116,
+            104,
+            101,
+            32,
+            115,
+            101,
+            115,
+            115,
+            105,
+            111,
+            110,
+            7,
+            115,
+            101,
+            115,
+            115,
+            105,
+            111,
+            110,
+            1,
+        ],
+        [
+            1,
+        ],
+        [
+            79,
+            80,
+            69,
+            82,
+            65,
+            84,
+            79,
+            82,
+            95,
+            68,
+            69,
+            67,
+            76,
+            73,
+            78,
+            69,
+            68,
+        ],
+        [
+            116,
+            104,
+            101,
+            32,
+            111,
+            112,
+            101,
+            114,
+            97,
+            116,
+            111,
+            114,
+            32,
+            100,
+            105,
+            100,
+            32,
+            110,
+            111,
+            116,
+            32,
+            99,
+            111,
+            110,
+            102,
+            105,
+            114,
+            109,
+            32,
+            116,
+            104,
+            101,
             32,
             115,
             101,
@@ -3450,8 +3653,8 @@ Program {
             110,
             101,
             32,
-            52,
-            54,
+            53,
+            50,
             32,
             119,
             97,
@@ -3584,8 +3787,8 @@ Program {
             110,
             101,
             32,
-            52,
-            57,
+            53,
+            53,
             32,
             119,
             97,
@@ -3728,9 +3931,6 @@ Program {
             116,
         ],
         [
-            1,
-        ],
-        [
             2,
         ],
         [
@@ -3852,6 +4052,40 @@ Program {
             100,
         ],
         [
+            11,
+            102,
+            105,
+            110,
+            97,
+            108,
+            95,
+            99,
+            104,
+            101,
+            99,
+            107,
+            0,
+        ],
+        [
+            111,
+            107,
+        ],
+        [
+            114,
+            101,
+            99,
+            111,
+            114,
+            100,
+            32,
+            112,
+            97,
+            115,
+            115,
+            101,
+            100,
+        ],
+        [
             100,
             111,
             110,
@@ -3906,71 +4140,71 @@ Program {
             expected_millis: 0,
         },
         Section {
-            start_pc: 77,
-            end_pc: 78,
+            start_pc: 15,
+            end_pc: 16,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 100,
-            end_pc: 101,
+            start_pc: 91,
+            end_pc: 92,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 103,
-            end_pc: 104,
+            start_pc: 114,
+            end_pc: 115,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 120,
-            end_pc: 121,
+            start_pc: 117,
+            end_pc: 118,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 214,
-            end_pc: 215,
+            start_pc: 134,
+            end_pc: 135,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 216,
-            end_pc: 217,
+            start_pc: 228,
+            end_pc: 229,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 230,
+            end_pc: 231,
             interruptible: Yes,
             idempotency: CheckState,
             expected_millis: 0,
         },
         Section {
-            start_pc: 233,
-            end_pc: 234,
+            start_pc: 247,
+            end_pc: 248,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 235,
-            end_pc: 236,
+            start_pc: 249,
+            end_pc: 250,
             interruptible: Yes,
             idempotency: CheckState,
             expected_millis: 0,
         },
         Section {
-            start_pc: 250,
-            end_pc: 251,
-            interruptible: Yes,
-            idempotency: CheckState,
-            expected_millis: 0,
-        },
-        Section {
-            start_pc: 252,
-            end_pc: 253,
+            start_pc: 264,
+            end_pc: 265,
             interruptible: Yes,
             idempotency: CheckState,
             expected_millis: 0,
@@ -3979,39 +4213,39 @@ Program {
             start_pc: 266,
             end_pc: 267,
             interruptible: Yes,
+            idempotency: CheckState,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 280,
+            end_pc: 281,
+            interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 268,
-            end_pc: 269,
+            start_pc: 282,
+            end_pc: 283,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 269,
-            end_pc: 270,
+            start_pc: 283,
+            end_pc: 284,
             interruptible: No,
             idempotency: Safe,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 270,
-            end_pc: 272,
+            start_pc: 284,
+            end_pc: 286,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 272,
-            end_pc: 273,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 120000,
-        },
-        Section {
-            start_pc: 273,
+            start_pc: 286,
             end_pc: 287,
             interruptible: No,
             idempotency: CheckState,
@@ -4019,62 +4253,34 @@ Program {
         },
         Section {
             start_pc: 287,
-            end_pc: 288,
+            end_pc: 301,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 288,
-            end_pc: 289,
+            start_pc: 301,
+            end_pc: 302,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 289,
-            end_pc: 290,
+            start_pc: 302,
+            end_pc: 303,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 290,
-            end_pc: 296,
+            start_pc: 303,
+            end_pc: 304,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 296,
-            end_pc: 297,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 120000,
-        },
-        Section {
-            start_pc: 297,
-            end_pc: 299,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 120000,
-        },
-        Section {
-            start_pc: 299,
-            end_pc: 300,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 120000,
-        },
-        Section {
-            start_pc: 300,
-            end_pc: 309,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 120000,
-        },
-        Section {
-            start_pc: 309,
+            start_pc: 304,
             end_pc: 310,
             interruptible: No,
             idempotency: CheckState,
@@ -4082,20 +4288,41 @@ Program {
         },
         Section {
             start_pc: 310,
-            end_pc: 316,
+            end_pc: 311,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 316,
-            end_pc: 317,
+            start_pc: 311,
+            end_pc: 313,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 317,
+            start_pc: 313,
+            end_pc: 314,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 314,
+            end_pc: 323,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 323,
+            end_pc: 324,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 324,
             end_pc: 330,
             interruptible: No,
             idempotency: CheckState,
@@ -4110,84 +4337,112 @@ Program {
         },
         Section {
             start_pc: 331,
-            end_pc: 333,
+            end_pc: 344,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 333,
-            end_pc: 334,
+            start_pc: 344,
+            end_pc: 345,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 120000,
         },
         Section {
-            start_pc: 334,
-            end_pc: 346,
-            interruptible: No,
-            idempotency: CheckState,
-            expected_millis: 120000,
-        },
-        Section {
-            start_pc: 346,
+            start_pc: 345,
             end_pc: 347,
-            interruptible: Yes,
-            idempotency: Safe,
-            expected_millis: 0,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
         },
         Section {
             start_pc: 347,
             end_pc: 348,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 348,
+            end_pc: 360,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 360,
+            end_pc: 361,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 350,
-            end_pc: 351,
+            start_pc: 361,
+            end_pc: 362,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 353,
-            end_pc: 355,
+            start_pc: 379,
+            end_pc: 380,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 380,
+            end_pc: 381,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 383,
+            end_pc: 384,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 386,
+            end_pc: 388,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 355,
-            end_pc: 356,
+            start_pc: 388,
+            end_pc: 389,
             interruptible: No,
             idempotency: Unsafe,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 356,
-            end_pc: 358,
+            start_pc: 389,
+            end_pc: 391,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 358,
-            end_pc: 359,
+            start_pc: 391,
+            end_pc: 392,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 359,
-            end_pc: 360,
+            start_pc: 392,
+            end_pc: 393,
             interruptible: No,
             idempotency: Safe,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 360,
-            end_pc: 362,
+            start_pc: 393,
+            end_pc: 395,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
@@ -4197,355 +4452,421 @@ Program {
         SourceSpan {
             pc: 0,
             file: 0,
-            line: 41,
+            line: 44,
             column: 5,
         },
         SourceSpan {
             pc: 3,
             file: 0,
-            line: 42,
+            line: 45,
             column: 5,
         },
         SourceSpan {
             pc: 4,
             file: 0,
-            line: 43,
+            line: 46,
             column: 15,
         },
         SourceSpan {
             pc: 7,
             file: 0,
-            line: 44,
+            line: 47,
             column: 8,
         },
         SourceSpan {
             pc: 12,
             file: 0,
-            line: 45,
+            line: 48,
             column: 9,
         },
         SourceSpan {
             pc: 13,
             file: 0,
-            line: 46,
-            column: 13,
+            line: 49,
+            column: 87,
         },
         SourceSpan {
             pc: 15,
             file: 0,
-            line: 46,
-            column: 41,
-        },
-        SourceSpan {
-            pc: 19,
-            file: 0,
-            line: 46,
-            column: 13,
-        },
-        SourceSpan {
-            pc: 51,
-            file: 0,
-            line: 47,
-            column: 18,
-        },
-        SourceSpan {
-            pc: 52,
-            file: 0,
-            line: 47,
-            column: 8,
-        },
-        SourceSpan {
-            pc: 77,
-            file: 0,
-            line: 48,
-            column: 9,
-        },
-        SourceSpan {
-            pc: 78,
-            file: 0,
             line: 49,
-            column: 52,
+            column: 15,
         },
         SourceSpan {
-            pc: 92,
-            file: 0,
-            line: 49,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 102,
+            pc: 17,
             file: 0,
             line: 50,
             column: 12,
         },
         SourceSpan {
-            pc: 105,
+            pc: 23,
             file: 0,
-            line: 51,
+            line: 50,
             column: 8,
         },
         SourceSpan {
-            pc: 115,
+            pc: 25,
             file: 0,
             line: 51,
-            column: 23,
+            column: 40,
+        },
+        SourceSpan {
+            pc: 26,
+            file: 0,
+            line: 51,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 27,
+            file: 0,
+            line: 52,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 29,
+            file: 0,
+            line: 52,
+            column: 41,
+        },
+        SourceSpan {
+            pc: 33,
+            file: 0,
+            line: 52,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 65,
+            file: 0,
+            line: 53,
+            column: 18,
+        },
+        SourceSpan {
+            pc: 66,
+            file: 0,
+            line: 53,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 91,
+            file: 0,
+            line: 54,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 92,
+            file: 0,
+            line: 55,
+            column: 52,
+        },
+        SourceSpan {
+            pc: 106,
+            file: 0,
+            line: 55,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 116,
+            file: 0,
+            line: 56,
+            column: 12,
         },
         SourceSpan {
             pc: 119,
             file: 0,
-            line: 51,
+            line: 57,
             column: 8,
-        },
-        SourceSpan {
-            pc: 120,
-            file: 0,
-            line: 52,
-            column: 9,
-        },
-        SourceSpan {
-            pc: 121,
-            file: 0,
-            line: 53,
-            column: 19,
         },
         SourceSpan {
             pc: 129,
             file: 0,
-            line: 54,
-            column: 16,
+            line: 57,
+            column: 23,
         },
         SourceSpan {
-            pc: 130,
-            file: 0,
-            line: 54,
-            column: 12,
-        },
-        SourceSpan {
-            pc: 140,
-            file: 0,
-            line: 54,
-            column: 34,
-        },
-        SourceSpan {
-            pc: 183,
-            file: 0,
-            line: 54,
-            column: 12,
-        },
-        SourceSpan {
-            pc: 186,
-            file: 0,
-            line: 54,
-            column: 69,
-        },
-        SourceSpan {
-            pc: 213,
-            file: 0,
-            line: 54,
-            column: 12,
-        },
-        SourceSpan {
-            pc: 214,
-            file: 0,
-            line: 55,
-            column: 13,
-        },
-        SourceSpan {
-            pc: 215,
-            file: 0,
-            line: 56,
-            column: 13,
-        },
-        SourceSpan {
-            pc: 218,
+            pc: 133,
             file: 0,
             line: 57,
             column: 8,
         },
         SourceSpan {
-            pc: 228,
-            file: 0,
-            line: 57,
-            column: 24,
-        },
-        SourceSpan {
-            pc: 232,
-            file: 0,
-            line: 57,
-            column: 8,
-        },
-        SourceSpan {
-            pc: 233,
+            pc: 134,
             file: 0,
             line: 58,
             column: 9,
         },
         SourceSpan {
-            pc: 234,
+            pc: 135,
             file: 0,
             line: 59,
-            column: 14,
+            column: 19,
         },
         SourceSpan {
-            pc: 258,
+            pc: 143,
             file: 0,
             line: 60,
+            column: 16,
+        },
+        SourceSpan {
+            pc: 144,
+            file: 0,
+            line: 60,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 154,
+            file: 0,
+            line: 60,
+            column: 34,
+        },
+        SourceSpan {
+            pc: 197,
+            file: 0,
+            line: 60,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 200,
+            file: 0,
+            line: 60,
+            column: 69,
+        },
+        SourceSpan {
+            pc: 227,
+            file: 0,
+            line: 60,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 228,
+            file: 0,
+            line: 61,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 229,
+            file: 0,
+            line: 62,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 232,
+            file: 0,
+            line: 63,
             column: 8,
         },
         SourceSpan {
-            pc: 266,
+            pc: 242,
             file: 0,
-            line: 61,
+            line: 63,
+            column: 24,
+        },
+        SourceSpan {
+            pc: 246,
+            file: 0,
+            line: 63,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 247,
+            file: 0,
+            line: 64,
             column: 9,
         },
         SourceSpan {
-            pc: 267,
+            pc: 248,
             file: 0,
-            line: 62,
+            line: 65,
+            column: 14,
+        },
+        SourceSpan {
+            pc: 272,
+            file: 0,
+            line: 66,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 280,
+            file: 0,
+            line: 67,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 281,
+            file: 0,
+            line: 68,
             column: 5,
         },
         SourceSpan {
-            pc: 268,
-            file: 0,
-            line: 27,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 271,
-            file: 0,
-            line: 28,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 295,
+            pc: 282,
             file: 0,
             line: 30,
             column: 5,
         },
         SourceSpan {
-            pc: 298,
+            pc: 285,
             file: 0,
             line: 31,
-            column: 12,
+            column: 5,
         },
         SourceSpan {
-            pc: 318,
-            file: 0,
-            line: 32,
-            column: 12,
-        },
-        SourceSpan {
-            pc: 325,
-            file: 0,
-            line: 32,
-            column: 8,
-        },
-        SourceSpan {
-            pc: 327,
+            pc: 309,
             file: 0,
             line: 33,
-            column: 44,
+            column: 5,
         },
         SourceSpan {
-            pc: 328,
-            file: 0,
-            line: 33,
-            column: 9,
-        },
-        SourceSpan {
-            pc: 329,
+            pc: 312,
             file: 0,
             line: 34,
-            column: 5,
+            column: 12,
         },
         SourceSpan {
             pc: 332,
             file: 0,
             line: 35,
-            column: 13,
+            column: 12,
         },
         SourceSpan {
-            pc: 335,
+            pc: 339,
+            file: 0,
+            line: 35,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 341,
             file: 0,
             line: 36,
-            column: 12,
+            column: 44,
         },
         SourceSpan {
             pc: 342,
             file: 0,
             line: 36,
-            column: 8,
-        },
-        SourceSpan {
-            pc: 344,
-            file: 0,
-            line: 37,
-            column: 36,
-        },
-        SourceSpan {
-            pc: 345,
-            file: 0,
-            line: 37,
             column: 9,
+        },
+        SourceSpan {
+            pc: 343,
+            file: 0,
+            line: 37,
+            column: 5,
         },
         SourceSpan {
             pc: 346,
             file: 0,
-            line: 64,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 347,
-            file: 0,
-            line: 65,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 348,
-            file: 0,
-            line: 40,
-            column: 5,
+            line: 38,
+            column: 13,
         },
         SourceSpan {
             pc: 349,
             file: 0,
-            line: 17,
-            column: 5,
+            line: 39,
+            column: 12,
         },
         SourceSpan {
-            pc: 352,
+            pc: 356,
             file: 0,
-            line: 16,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 353,
-            file: 0,
-            line: 21,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 354,
-            file: 0,
-            line: 22,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 357,
-            file: 0,
-            line: 20,
-            column: 5,
+            line: 39,
+            column: 8,
         },
         SourceSpan {
             pc: 358,
             file: 0,
-            line: 17,
+            line: 40,
+            column: 36,
+        },
+        SourceSpan {
+            pc: 359,
+            file: 0,
+            line: 40,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 360,
+            file: 0,
+            line: 70,
             column: 5,
         },
         SourceSpan {
             pc: 361,
             file: 0,
-            line: 16,
+            line: 71,
+            column: 14,
+        },
+        SourceSpan {
+            pc: 363,
+            file: 0,
+            line: 72,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 372,
+            file: 0,
+            line: 72,
+            column: 25,
+        },
+        SourceSpan {
+            pc: 378,
+            file: 0,
+            line: 72,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 379,
+            file: 0,
+            line: 73,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 380,
+            file: 0,
+            line: 74,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 381,
+            file: 0,
+            line: 43,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 382,
+            file: 0,
+            line: 20,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 385,
+            file: 0,
+            line: 19,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 386,
+            file: 0,
+            line: 24,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 387,
+            file: 0,
+            line: 25,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 390,
+            file: 0,
+            line: 23,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 391,
+            file: 0,
+            line: 20,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 394,
+            file: 0,
+            line: 19,
             column: 5,
         },
     ],
@@ -4657,13 +4978,13 @@ Program {
             stage: 1,
             max_resumes: 3,
             recovery_required: FromPc(
-                296,
+                310,
             ),
             boundaries: RecoveryBoundaries {
-                entry_pc: 268,
-                erase_pc: 296,
-                transfer_exit_pc: 316,
-                post_transfer_end_pc: 346,
+                entry_pc: 282,
+                erase_pc: 310,
+                transfer_exit_pc: 330,
+                post_transfer_end_pc: 360,
             },
             timing: RecoveryTiming {
                 session_timeout_millis: 5000,

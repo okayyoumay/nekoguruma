@@ -335,6 +335,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-343](ADR-343-the-guarded-socketcan-end-of-a-t0-loopback.md) | The Guarded SocketCAN End of a T0 Loopback | Accepted | `ngr-hw-checks` guard and T0 check, `j2534-0404-service` hardware and mock tests, design 13.5; ADR-275, ADR-333 |
 | [ADR-344](ADR-344-the-write-job-journal-binds-the-flash-artifact.md) | The Write-Job Journal Binds the Flash Artifact's Hash | Accepted | `agent` journal (`Record::ArtifactSha256`), runner restart order, restart (`OnSiteReason::ArtifactDiffers`), design 8.2.5 and 11.3; ADR-229, ADR-244, ADR-261, ADR-268, ADR-318, ADR-327, ADR-336 |
 | [ADR-345](ADR-345-the-agent-builds-its-source-table-from-the-job-s-document.md) | The Agent Builds Its Source Table From the Job's Document | Accepted | `agent` (`ServiceSources::from_document`, `check_job`, `JobError::Sources`, journal setup's table), design 8.9; ADR-245, ADR-336, ADR-338 |
+| [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
 
 ## Status Legend
 
@@ -606,6 +607,7 @@ the predecessor repository these ADRs came from.
 - ADR-135 (superseded by ADR-187)
 - ADR-139
 - ADR-187
+- ADR-346
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)

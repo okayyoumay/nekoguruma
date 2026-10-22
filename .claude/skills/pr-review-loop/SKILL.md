@@ -23,15 +23,19 @@ finding.
 ## Step 0: request a review
 
 After opening the PR, and after every fix push that Step 4's re-request rule lets through,
-request a review from the PR's reviewer. The reviewer is Codex until a case below switches the PR
+request a review from the PR's reviewer. Before the first request, run the sweep ("Sweep: the
+kinds that recur", below) over the whole diff, and take what it fixes through Step 3's checks
+before pushing it. Then make the first request: Step 4's re-request rule governs only rounds
+after a review, so a push of sweep fixes never skips the first review. The reviewer is Codex until a case below switches the PR
 to Copilot; from then on it stays Copilot for the rest of the PR. Never switch back, and never ask
 both: each reviewer reads the whole diff again from scratch, so a second reviewer on the same PR
 adds a full round of new findings instead of converging.
 
 **PRs that change only backlog files (ADR-251).** If every file the PR changes against `main`
 is a backlog file, `work/*backlog.md`, request no review. `scripts/check-backlog.sh`
-(which `repo-checks.yml` also runs) checks their format; run it and the Step 3 checks that
-apply, then go to Step 5. Other files in `work/` (`work/README.md`, the development plan) hold
+(which `repo-checks.yml` also runs) checks their format. Run the sweep first (below; with no review to
+come, it runs once), then the script and the Step 3 checks that apply; commit and push what
+the sweep fixed as Step 4 does, then go to Step 5. Other files in `work/` (`work/README.md`, the development plan) hold
 contributor rules and milestones the script does not check, so a PR touching them is reviewed
 as usual. If a later push makes the PR change any other file, request a review at that point and
 run the loop as usual from Step 1.
@@ -222,15 +226,60 @@ and make sure you can state the failure scenario yourself. Then pick one path fr
 When a new finding lands on a mechanism `design-advisor` already analysed in this session,
 continue that agent with `SendMessage` rather than spawning a fresh one.
 
+**Fix the kind, not the spot.** A finding names one place; the same gap usually sits in its
+siblings too. For each finding you fix, search the whole diff for the same kind (the same term,
+the same rule stated elsewhere, the same shape of case) and fix those places in the same push.
+A sibling of the same *shape* in code or design is a second instance, which
+[reference/finding-routing.md](reference/finding-routing.md) sends to 2b unless `design-advisor`
+already decided the pattern: route it there before applying the first fix to it, since a second
+instance may mean the first fix is wrong. Siblings in documents (drift, a dropped qualifier, a
+citation) are fixed directly. The thread reply (Step 4) names the other places the fix covered.
+
+## Sweep: the kinds that recur
+
+Reviewers find these kinds of gap one at a time, a round each, because a fix mends only the
+spot that was named. Before the first review request (Step 0) and in every round that pushes
+(Step 3, before its checks), read the whole PR diff with the round's uncommitted edits in it
+(`git diff $(git merge-base origin/main HEAD)`, plus any new file `git status --short
+--untracked-files=all` lists), not only the round's
+fix. A diff holds no commit messages and no PR description, so read those too: the branch's
+messages (`git log origin/main..HEAD`), the round's draft message and the PR description. A message
+already pushed cannot be rewritten (no force-push on a loop branch); the PR merges by squash with
+its description as the message, so fix the gap in the description and name the pushed commit
+there for the maintainer. Check each kind below and fix what you find in the same push, routing a gap of the same shape as a
+finding already fixed as "Fix the kind, not the spot" says:
+
+- **Cross-document drift.** A rule stated in more than one place (an ADR item, a design
+  section, the ADR's `docs/adr/INDEX.md` row and theme entry, the glossary, a crate's docs, a
+  backlog item the PR adds or edits, the PR description) says the same in each place.
+- **Dropped qualifiers.** A summary or paraphrase keeps every condition of the rule it
+  restates: its scope, its exceptions, "only when", units and limits.
+- **Siblings.** A rule, check or fix applied to one case covers every case built the same way:
+  the other rows of a table, the other kinds of entry or item, the other callers of a function,
+  the other workers and targets, the other branch of a condition.
+- **Restart binding.** What a journaled marker binds to at a restart (the instruction, the
+  request bytes, the target, the identity read) is the same in the code that writes it, the code
+  that reads it and the documents that describe it.
+- **Safety invariants.** On a write, flash or routine-control path, the preconditions and
+  guards of design 5.5, 5.6 and 8.9 and the authorization levels of section 6 hold on every
+  path, resume and error paths included.
+- **Citations.** Every citation of a standard names the standard and the clause, and a citation
+  of ISO 22900-2 also its edition (2009 or 2022), as the review guidelines require, in code, documents, commit messages and the PR description
+  alike.
+
 ## Step 3: verify before the push
 
 Handle **every** finding of the round before pushing; one push per round, never one per
 finding. A round where every finding was declined (2d) or answered by pointing at an earlier
-reply changes no file: skip checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
+reply changes no file: skip the sweep, checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
 newly declined finding *and* this head has not been re-requested after a no-change round
 before. Otherwise the loop ends: go to Step 5 after the replies. So the same head is
 re-requested at most once.
+
+First run the sweep ("Sweep: the kinds that recur") over the whole diff as it stands after the
+round's fixes, and make its fixes, so that checks 1 to 5 below verify the tree that is pushed.
+If a later check leads to another edit, sweep that edit too and run the checks again on it.
 
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
    is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
@@ -252,15 +301,15 @@ re-requested at most once.
    committing or updating the PR. A search for quotation marks alone misses unquoted copies.
    Include untracked files (`git status --short --untracked-files=all`).
 5. **Base branch.** `git fetch origin main`. In a round that pushes, merge `origin/main` into the branch
-   if it moved and run checks 1 to 4 on the merged tree; a PR that conflicts with its base gets
+   if it moved and run the sweep and checks 1 to 4 on the merged tree; a PR that conflicts with its base gets
    no CI run at all. In a no-change round, merge only if the PR conflicts with `main`; that merge
-   makes it a changed round, so run checks 1 to 4 and push it.
+   makes it a changed round, so run the sweep and checks 1 to 4 and push it.
 
 ## Step 4: commit, push, answer, re-request
 
 - The commit message explains the bug and why the fix is right, not "address review feedback".
-- After the push (if the round has one), reply on **each** finding's own thread in a couple of sentences: what changed,
-  or why not (with the ADR or backlog item for 2c, the trace for 2d). Take the comment ID from a
+- After the push (if the round has one), reply on **each** finding's own thread in a couple of sentences: what changed
+  (and which other places of the same kind the fix covered), or why not (with the ADR or backlog item for 2c, the trace for 2d). Take the comment ID from a
   `get_review_comments` result fetched in this turn, never from memory.
 - Every reply ends with the attribution footer GitHub posts from Claude carry.
 - Never mention either reviewer with an at-sign in a thread reply (Step 0).
@@ -277,6 +326,9 @@ least one of these holds:
 - the round fixed a finding the reviewer rated above Low (Codex P0, P1 or P2; Copilot Medium,
   High or Critical), or one whose severity you cannot read from the review;
 - the round's fix went through `design-advisor` (2b);
+- the round's sweep fixed a gap of a kind no finding of the round named (a sibling of a fixed
+  finding takes that finding's rating; any other sweep fix has none, so it counts as
+  unreadable, as above);
 - the round newly declined a finding (2d), as a no-change round with one would (Step 3);
 - the push changes any file that is not Markdown (`*.md`): code, scripts, hooks, workflows,
   build and configuration files, schemas, examples and other data files all count;
@@ -340,7 +392,8 @@ fallback review in Step 0 is done:
    - any line the loop's fixes made untrue, such as a test count or a list of changes.
 
    Send the whole description with the update, never only the changed section; an update
-   replaces the body.
+   replaces the body. Before sending it, check the refreshed description for the sweep's
+   cross-document drift, dropped qualifiers and citations, since no later sweep reads it.
 5. **Hand over.** Mark the PR ready for review and tell the maintainer in the project thread that it is
    ready, listing anything accepted as a limitation, anything added to the backlog, and any
    fix the reviewer did not review because the loop ended without a re-request. The maintainer

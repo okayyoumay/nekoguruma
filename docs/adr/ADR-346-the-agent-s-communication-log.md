@@ -110,8 +110,8 @@ decisions behind them:
    (`pending_visibility`), so an empty list on a link whose VCI absorbs them is not read as
    "none". P2* restarts on each pending and the completion limit runs from the first, as the
    API's handling does (ISO 22900-2:2022 Annex I.1.2, Figure I.4); each forwarded pending is
-   judged against the limit before it, and one past it makes the exchange late, as a final
-   response would.
+   judged against the limit before it, and one past it makes the exchange `system` whatever
+   follows, since the ECU was late and the VCI did not end its wait.
 4. **"Reached the bus": transmit indications on, and a three-valued answer with its evidence.**
    The link turns transmit indications on (`CP_TransmitIndEnable` 1, ISO 22900-2:2022 B.5.1); a
    library that refuses it opens the link without, and `link_opened` says so. `sent` is

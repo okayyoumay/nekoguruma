@@ -288,10 +288,12 @@ If a later check leads to another edit, sweep that edit too and run the checks a
    on pull requests `j2534-0404-service`'s tests (all but `agent_restart_end_to_end`) and the
    agent's `runner::` tests, and its `ci-windows` profile runs some tests alone
    (`.config/nextest.toml`). When the PR changes such a test, or code only such tests exercise,
-   run it locally under that profile, alone (`-E 'test(<name>)'`) and then beside the rest of
-   its binary: an integration test with `cargo nextest run --profile ci-windows -p <crate>
-   --test <binary>`, the agent's `runner::` unit tests with `cargo nextest run --profile
-   ci-windows -p agent --lib -E 'test(/^runner::/)'`. Look for timing
+   run it locally under the profile `core-windows` gives it (`ci-windows-parallel` for the
+   agent's tests, `ci-windows` for the rest), alone (`-E 'test(<name>)'`) and then beside the
+   rest of its test binary: `cargo nextest run --profile <profile> -p <crate> <binary>`, where
+   `<binary>` is `--lib` for the crate's unit tests and `--test <name>` for an integration
+   test. The agent's `runner::` tests are part of its library binary, so the run beside them is
+   `cargo nextest run --profile ci-windows-parallel -p agent --lib`. Look for timing
    assumptions it would make on a slower runner (fixed sleeps, timer windows, waits for a
    process to exit), and say in the PR's test plan that you ran it this way and that its Windows run happens
    only on main.

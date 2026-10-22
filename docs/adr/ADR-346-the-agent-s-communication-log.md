@@ -174,8 +174,13 @@ cannot place.
    - **Late final response.** A final response that arrived after the limit in force but before
      the VCI ended the exchange, measured on one clock, is `vehicle` (the ECU answered late),
      unless its outcome's own classification is more severe. On a link whose VCI absorbs pendings
-     only the completion limit counts, since a response beyond P2 there may follow pendings the
-     log cannot see.
+     the first pending is unseen; it came within P2 of the transmit, and the completion limit runs
+     from it, so a response is late there only after the transmit plus P2 plus the completion
+     limit.
+   - **Other primitive errors.** A primitive that ends without a response after another error
+     event of its own is `link_error`: `system` for a VCI hardware fault, an initialisation error
+     or a locked resource, `undetermined` for a receive or protocol error, which the vehicle
+     network and the VCI's receive path can both cause.
    - **Deadline.** An agent deadline that passed while the VCI never ended the exchange is
      `system`, sent or not, since the VCI must end its own primitive within its limits. This rule comes before the no-response rules.
    - **Transmit and receive errors.** A transmit error or a missing acknowledge is `not_sent` and

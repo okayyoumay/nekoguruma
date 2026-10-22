@@ -109,6 +109,10 @@ decisions behind them:
    link on the channel (ADR-151). Any answer of the ECU, a pending or a first frame included,
    confirms the send. `not_sent` needs a definite refusal or a transmit error; a failed start of
    the primitive is `unknown`.
+   The link turns start-of-message indications on as well (`CP_StartMsgIndEnable`), since they
+   carry the only start time of a multi-frame response; an unbound one counts for an exchange only
+   by its response identifier, under the same exclusivity, since the J2534 worker gives it to
+   every link on the channel too.
 5. **Error detail reaches the agent.** The worker's error events carry their extra error
    information, and the host tells its own deadline from the VCI ending the exchange. A receive
    timeout is an outcome of its exchange; only other error events count as link errors.
@@ -205,7 +209,7 @@ decisions behind them:
 ## Consequences
 
 - **Implementation work.** The implementation, a backlog item of its own, needs:
-  - the link to set `CP_TransmitIndEnable`;
+  - the link to set `CP_TransmitIndEnable` and `CP_StartMsgIndEnable`;
   - the worker interface's error events to carry their extra error information
     (`vci-service-interface`, both workers, `docs/rpc-api-guide.md`);
   - the host to tell its own deadline from a VCI-ended exchange without a response, and to read

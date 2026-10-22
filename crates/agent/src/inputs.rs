@@ -502,6 +502,11 @@ fn declared_field(
         edge = byte + (u64::from(bit) + u64::from(width)).div_ceil(8) as usize;
         end_of_response = end_of_response.max(edge);
         if field.id() == field_id {
+            // The VM decodes the first field of an id (`diag_ir`); a second one would make the
+            // table and the procedure read different bytes for the same source.
+            if target.is_some() {
+                return Err("the response declares the field twice".to_owned());
+            }
             target = Some((field, byte, bit, edge));
         }
     }
@@ -1531,6 +1536,25 @@ mod tests {
             // The response prefix is not the request's identifier.
             let mut services = self::services();
             services[0].positive.as_mut().unwrap().prefix = Some(vec![0xF1, 0x86]);
+            assert!(matches!(
+                refused(services),
+                TableError::Document { service_id: 1, .. }
+            ));
+            // Two fields of the source's id: the VM decodes the first, so a later one that
+            // would fit the table is not taken in its place.
+            let mut services = self::services();
+            let fields = services[0]
+                .positive
+                .as_mut()
+                .unwrap()
+                .fields
+                .as_mut()
+                .unwrap();
+            let mut later = fields[0].clone();
+            later.placement = diag_ir::declaration::Placement::Absolute;
+            later.bit_offset = 24;
+            fields[0].bit_length = 8;
+            fields.push(later);
             assert!(matches!(
                 refused(services),
                 TableError::Document { service_id: 1, .. }

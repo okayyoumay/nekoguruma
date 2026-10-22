@@ -201,8 +201,8 @@ decisions behind them:
      unless the previous exchange with the same match went unanswered, whose late answer the
      extra one may be;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
-     power (only then `system`; the reading is compared within the margin plus a recorded drift
-     bound over the gap), since a VCI powered from the vehicle's connector drops off when
+     power (only then `system`; the reading is compared within a VCI-wide clock margin plus a
+     recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
      the vehicle's supply drops. A clock that restarted does not decide it, nor does a
      reconnected VCI with another serial number or a gap that spans an agent restart, and on
      J2534, whose frame clock has a vendor-defined origin (ADR-120), the loss stays
@@ -295,7 +295,7 @@ decisions behind them:
     (`vci-service-interface`, both workers, `docs/rpc-api-guide.md`);
   - the host to tell its own deadline from a VCI-ended exchange without a response, and to read
     the VCI's clock (`GetTimestamp`) at that deadline on a D-PDU link;
-  - each link to record its timing margin, and each VCI connection its clock drift bound, from a
+  - each link to record its timing margin, and each VCI connection its clock margin and drift bound, from a
     configured default or a hardware profile (design 13.5), since no API reports a VCI's timer
     spread or drift;
   - the log's writer to log secrets as length only (with a seed's all-zero flag) and bulk data

@@ -116,8 +116,12 @@ decisions behind them:
    `undetermined` or `none`, by the first matching row of design 8.11's table; system-side
    failures come first, and a last row makes any other case `undetermined`. The principles:
    - a refusal by the agent, a worker or RPC failure, lost events, and a VCI fault of its own are
-     `system`; an agent deadline is `system` only when the VCI's own limits had passed after a
-     confirmed send, since a long transfer can outlast the deadline;
+     `system`; an agent deadline is `system` only when a reading of the VCI's device clock at the
+     deadline shows the VCI's own limits had passed after a confirmed send, since a long
+     transfer can outlast the deadline (on J2534 no such reading exists, ADR-120);
+   - a response the ECU began and did not finish is `undetermined`, since a frame lost in the
+     network or the VCI's receive path cannot be told from the ECU stopping;
+   - a lost VCI keeps the `sent` that the evidence before the loss gave it;
    - a negative response is the ECU's answer: `vehicle` for its own state, `undetermined` when the
      code points at the definition, the session or access state, or the sequence, and `system`
      for a refused key, which the server's key service computed (design 8.10);
@@ -201,7 +205,8 @@ decisions behind them:
   - the link to set `CP_TransmitIndEnable`;
   - the worker interface's error events to carry their extra error information
     (`vci-service-interface`, both workers, `docs/rpc-api-guide.md`);
-  - the host to tell its own deadline from a VCI-ended exchange without a response;
+  - the host to tell its own deadline from a VCI-ended exchange without a response, and to read
+    the VCI's clock (`GetTimestamp`) at that deadline on a D-PDU link;
   - each link to record its timing margin, from a configured default or a hardware profile
     (design 13.5), since no API reports a VCI's timer spread;
   - the log's writer to log secrets as length only and bulk data as length and hash, and to

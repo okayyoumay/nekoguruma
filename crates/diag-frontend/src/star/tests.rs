@@ -21,7 +21,13 @@ fn the_example_procedure_passes() {
         .iter()
         .filter(|a| matches!(a, Annotation::Section { .. }))
         .collect();
-    assert_eq!(sections.len(), 2);
+    assert_eq!(sections.len(), 1);
+    assert!(
+        checked
+            .annotations
+            .iter()
+            .any(|a| matches!(a, Annotation::FlashPlan { .. }))
+    );
 }
 
 #[test]

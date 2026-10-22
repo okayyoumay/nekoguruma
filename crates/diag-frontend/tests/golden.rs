@@ -75,10 +75,51 @@ fn check(name: &str, actual: &str) {
 /// those bytes, enough for the program to go on. A generic send-receive's request starts with
 /// its SID, so it is matched on the positive response SID and the one byte after the SID; a
 /// `RoutineControl` on the positive response SID, its sub-function and its routine identifier.
-/// A seed is answered with [`GOLDEN_KEY`].
+/// A seed is answered with [`GOLDEN_KEY`]. A flash transfer is served a fake artifact and
+/// recorded as one line, the blocks' count, bytes and sum.
 struct Recording {
     out: String,
     answers: Vec<Vec<u8>>,
+    /// The blocks of a flash transfer in progress: their count, bytes and a sum of the bytes.
+    transfer: Option<Transfer>,
+}
+
+/// What the recording host has been given by `flash_transfer` since its last request.
+struct Transfer {
+    blocks: u32,
+    bytes: usize,
+    /// FNV-1a (64 bits) over every byte in the order sent, so a block out of order or from a
+    /// wrong offset changes it.
+    hash: u64,
+}
+
+impl Default for Transfer {
+    fn default() -> Self {
+        Self {
+            blocks: 0,
+            bytes: 0,
+            hash: 0xcbf2_9ce4_8422_2325,
+        }
+    }
+}
+
+impl Recording {
+    /// Ends the transfer in progress, if any, with one line: the host sums the blocks instead of
+    /// listing each, so the file stays short and still shows every byte the program sent.
+    fn end_transfer(&mut self) {
+        if let Some(Transfer {
+            blocks,
+            bytes,
+            hash,
+        }) = self.transfer.take()
+        {
+            writeln!(
+                self.out,
+                "flash-transfer {blocks} blocks {bytes} bytes fnv1a {hash:016x}"
+            )
+            .expect("a String");
+        }
+    }
 }
 
 /// The key the recording host gives for any seed.
@@ -104,10 +145,19 @@ impl DiagHost for Recording {
     type Error = NotSent;
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, NotSent> {
+        self.end_transfer();
         let sid = u8::try_from(service).expect("a one-byte SID");
         writeln!(self.out, "request {sid:02X} {}", hex(payload)).expect("a String");
         let mut response = vec![sid + 0x40];
-        response.extend(payload.iter().take(2));
+        // A RequestDownload's response does not echo its request, so it is matched on its SID;
+        // a SecurityAccess response echoes the sub-function only (a send-key request goes on with
+        // the key).
+        let echoed = match sid {
+            0x34 => 0,
+            0x27 => 1,
+            _ => 2,
+        };
+        response.extend(payload.iter().take(echoed));
         Ok(self
             .answers
             .iter()
@@ -116,6 +166,7 @@ impl DiagHost for Recording {
             .unwrap_or(response))
     }
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, NotSent> {
+        self.end_transfer();
         writeln!(self.out, "send-receive {service} {}", hex(request)).expect("a String");
         let (&sid, rest) = request.split_first().ok_or(NotSent)?;
         let mut response = vec![sid + 0x40];
@@ -136,6 +187,7 @@ impl DiagHost for Recording {
         sub: u8,
         payload: &[u8],
     ) -> Result<Vec<u8>, NotSent> {
+        self.end_transfer();
         let payload = if payload.is_empty() {
             String::new()
         } else {
@@ -157,14 +209,23 @@ impl DiagHost for Recording {
         level: u8,
         seed: &[u8],
     ) -> Result<Option<Vec<u8>>, NotSent> {
+        self.end_transfer();
         writeln!(self.out, "security-access {level:02X} {}", hex(seed)).expect("a String");
         Ok(Some(GOLDEN_KEY.to_vec()))
     }
-    fn flash_transfer(&mut self, _: u32, _: &[u8]) -> Result<(), NotSent> {
-        Err(NotSent)
+    fn flash_transfer(&mut self, _: u32, data: &[u8]) -> Result<(), NotSent> {
+        let transfer = self.transfer.get_or_insert_with(Transfer::default);
+        transfer.blocks += 1;
+        transfer.bytes += data.len();
+        for &byte in data {
+            transfer.hash = (transfer.hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        Ok(())
     }
-    fn wait(&mut self, _: u64, _: u32) -> Result<bool, NotSent> {
-        Err(NotSent)
+    fn wait(&mut self, _: u64, millis: u32) -> Result<bool, NotSent> {
+        self.end_transfer();
+        writeln!(self.out, "wait {millis}").expect("a String");
+        Ok(true)
     }
     fn hmi_request(&mut self, _: u64, _: &[u8]) -> Result<Option<Vec<u8>>, NotSent> {
         Err(NotSent)
@@ -175,13 +236,18 @@ impl DiagHost for Recording {
     fn monitor_capture(&mut self, _: u32) -> Result<(), NotSent> {
         Err(NotSent)
     }
-    fn artifact_bytes(&mut self, _: u64, _: u32) -> Result<Vec<u8>, NotSent> {
-        Err(NotSent)
+    /// A fake artifact: the byte at offset `n` is `n % 251`, so a block read from a wrong
+    /// offset changes the sum.
+    fn artifact_bytes(&mut self, offset: u64, len: u32) -> Result<Vec<u8>, NotSent> {
+        Ok((offset..offset + u64::from(len))
+            .map(|at| (at % 251) as u8)
+            .collect())
     }
     fn runtime_input(&mut self, _: diag_ir::RuntimeInput) -> Result<i64, NotSent> {
         Err(NotSent)
     }
     fn log(&mut self, level: u8, message: &str) {
+        self.end_transfer();
         writeln!(self.out, "log {level} {message}").expect("a String");
     }
 }
@@ -220,8 +286,23 @@ fn assert_sections_split(program: &Program) {
             assert_eq!(section.end_pc, section.start_pc + 1, "{section:?}");
         }
     }
+    // A flash plan's expansion is laid in `main` between its own entry and end, with sections of
+    // its own, so the code around it may differ in interruptibility (ADR-336 item 4).
+    let plan_edges: Vec<u32> = program
+        .flash
+        .iter()
+        .flat_map(|plan| {
+            [
+                plan.boundaries.entry_pc,
+                plan.boundaries.post_transfer_end_pc,
+            ]
+        })
+        .collect();
     for pair in program.sections.windows(2) {
-        if pair[0].end_pc == pair[1].start_pc && (is_piece(&pair[0]) || is_piece(&pair[1])) {
+        if pair[0].end_pc == pair[1].start_pc
+            && (is_piece(&pair[0]) || is_piece(&pair[1]))
+            && !plan_edges.contains(&pair[1].start_pc)
+        {
             assert_eq!(
                 (
                     format!("{:?}", pair[0].interruptible),
@@ -245,11 +326,13 @@ fn run(program: &Program, variant: &EcuVariant<'_>, answers: Vec<Vec<u8>>) -> St
     let mut host = Recording {
         out: String::new(),
         answers,
+        transfer: None,
     };
     for _ in 0..100_000 {
         match vm.step_with_declarations(program, Some(variant), &mut host) {
             Ok(StepOutcome::Continue) => {}
             Ok(StepOutcome::Finished) => {
+                host.end_transfer();
                 host.out.push_str("finished\n");
                 return host.out;
             }

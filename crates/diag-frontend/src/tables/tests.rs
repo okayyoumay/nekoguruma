@@ -103,7 +103,7 @@ fn the_example_definition_reads_from_its_directory() {
         (0x7E0, 0x7E8, 0x7DF, false)
     );
     assert_eq!(tables.texts.len(), 13);
-    assert_eq!(tables.fields.len(), 43);
+    assert_eq!(tables.fields.len(), 47);
     let session = tables
         .conversions
         .iter()
@@ -821,7 +821,7 @@ fn the_example_definition_resolves_into_two_variants() {
         assert_eq!(variant.comparams, vec![0, 1]);
         assert_eq!(variant.routines, vec![0, 1]);
         assert_eq!(variant.dtcs, vec![0, 1]);
-        assert_eq!(variant.services.len(), 4);
+        assert_eq!(variant.services.len(), 8);
         assert_eq!(variant.nrcs.len(), 5);
         assert_eq!(variant.flash_sessions, vec![0]);
     }
@@ -1841,13 +1841,13 @@ fn services_one_call_cannot_tell_apart_are_rejected() {
         ],
     );
     assert!(first_field > 1);
-    // services.csv: the header, the example's four services, then the added ones from line 6.
+    // services.csv: the header, the example's eight services, then the added ones from line 10.
     assert_eq!(
         resolved(files),
         vec![
-            at(Duplicate, "services.csv", Some(7), Some("name")),
-            at(Duplicate, "services.csv", Some(8), Some("name")),
-            at(Duplicate, "services.csv", Some(9), Some("name")),
+            at(Duplicate, "services.csv", Some(11), Some("name")),
+            at(Duplicate, "services.csv", Some(12), Some("name")),
+            at(Duplicate, "services.csv", Some(13), Some("name")),
         ]
     );
 }
@@ -1941,9 +1941,9 @@ fn constants_are_compared_by_value_across_services() {
             // A broken constant is reported once, with no clash made up from it.
             at(BadValue, "fields.csv", Some(first + 1), Some("const")),
             // 0x0001 in 16 bits is the value 1, as is defaultSession's 0x01.
-            at(Duplicate, "services.csv", Some(6), Some("name")),
+            at(Duplicate, "services.csv", Some(10), Some("name")),
             // The same request fields as the generated vin.write.
-            at(Duplicate, "services.csv", Some(9), Some("name")),
+            at(Duplicate, "services.csv", Some(13), Some("name")),
         ]
     );
 }

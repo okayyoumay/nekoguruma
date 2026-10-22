@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "70eed12dc6de8aed6dddf96840e8e9e6dc67aae5e50400baddfc496ca68b1f94",
+        "857b84dd4dae81e1a864b028a3d7bcb0e2aede3c077c6bc0d9e2f6a5bdd9dfbf",
     ),
     variant: Some(
         EcuVariantT {
@@ -25,7 +25,7 @@ EcuDocumentT {
             patterns: Some(
                 [
                     VariantPatternT {
-                        service_id: 7,
+                        service_id: 11,
                         field_id: 22,
                         expected: Some(
                             [
@@ -546,6 +546,317 @@ EcuDocumentT {
                     ServiceT {
                         id: 5,
                         short_name: Some(
+                            "ecuReset",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 17,
+                                prefix: Some(
+                                    [],
+                                ),
+                                params: Some(
+                                    [
+                                        FieldT {
+                                            id: 36,
+                                            short_name: Some(
+                                                "reset",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 8,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 81,
+                                prefix: Some(
+                                    [],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 37,
+                                            short_name: Some(
+                                                "reset",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 8,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 6,
+                        short_name: Some(
+                            "securityAccess",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 39,
+                                prefix: Some(
+                                    [],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 103,
+                                prefix: Some(
+                                    [],
+                                ),
+                                fields: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 7,
+                        short_name: Some(
+                            "requestDownload",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 52,
+                                prefix: Some(
+                                    [],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 116,
+                                prefix: Some(
+                                    [],
+                                ),
+                                fields: Some(
+                                    [
+                                        FieldT {
+                                            id: 38,
+                                            short_name: Some(
+                                                "lengthFormat",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 8,
+                                            length_kind: Fixed,
+                                            bit_length: 8,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                        FieldT {
+                                            id: 39,
+                                            short_name: Some(
+                                                "maxBlockLength",
+                                            ),
+                                            placement: Absolute,
+                                            bit_offset: 16,
+                                            length_kind: Fixed,
+                                            bit_length: 16,
+                                            kind: Uint,
+                                            byte_order: Big,
+                                            compu: CompuIdentity(
+                                                CompuIdentityT,
+                                            ),
+                                            unit_id: 0,
+                                            length_field_id: 0,
+                                            min_bytes: 0,
+                                            max_bytes: 0,
+                                            termination: EndOfPdu,
+                                            shape: NONE,
+                                        },
+                                    ],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 8,
+                        short_name: Some(
+                            "requestTransferExit",
+                        ),
+                        request: Some(
+                            RequestT {
+                                sid: 55,
+                                prefix: Some(
+                                    [],
+                                ),
+                                params: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        positive: Some(
+                            PositiveResponseT {
+                                sid: 119,
+                                prefix: Some(
+                                    [],
+                                ),
+                                fields: Some(
+                                    [],
+                                ),
+                            },
+                        ),
+                        negatives: Some(
+                            [
+                                NegativeResponseT {
+                                    nrc: 18,
+                                    message_id: 10,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 34,
+                                    message_id: 11,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 49,
+                                    message_id: 12,
+                                    retryable: false,
+                                },
+                                NegativeResponseT {
+                                    nrc: 51,
+                                    message_id: 13,
+                                    retryable: false,
+                                },
+                            ],
+                        ),
+                        required_session: 0,
+                        required_security_level: 0,
+                        p2_millis: 50,
+                        p2_star_millis: 5000,
+                    },
+                    ServiceT {
+                        id: 9,
+                        short_name: Some(
                             "activeSession.read",
                         ),
                         request: Some(
@@ -649,7 +960,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 6,
+                        id: 10,
                         short_name: Some(
                             "sparePartNumber.read",
                         ),
@@ -733,7 +1044,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 7,
+                        id: 11,
                         short_name: Some(
                             "softwareVersion.read",
                         ),
@@ -817,7 +1128,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 8,
+                        id: 12,
                         short_name: Some(
                             "vin.read",
                         ),
@@ -901,7 +1212,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 9,
+                        id: 13,
                         short_name: Some(
                             "vin.write",
                         ),
@@ -985,7 +1296,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 10,
+                        id: 14,
                         short_name: Some(
                             "flashState.read",
                         ),
@@ -1111,7 +1422,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 11,
+                        id: 15,
                         short_name: Some(
                             "powerCycles.read",
                         ),
@@ -1195,7 +1506,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 12,
+                        id: 16,
                         short_name: Some(
                             "supplyVoltage.read",
                         ),
@@ -1283,7 +1594,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 13,
+                        id: 17,
                         short_name: Some(
                             "lastResetReason.read",
                         ),
@@ -1420,7 +1731,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 14,
+                        id: 18,
                         short_name: Some(
                             "batteryVoltage.read",
                         ),
@@ -1508,7 +1819,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 15,
+                        id: 19,
                         short_name: Some(
                             "bootTime.read",
                         ),
@@ -1596,7 +1907,7 @@ EcuDocumentT {
                         p2_star_millis: 5000,
                     },
                     ServiceT {
-                        id: 16,
+                        id: 20,
                         short_name: Some(
                             "eraseMemory.start",
                         ),
@@ -1660,7 +1971,7 @@ EcuDocumentT {
                         p2_star_millis: 10000,
                     },
                     ServiceT {
-                        id: 17,
+                        id: 21,
                         short_name: Some(
                             "checkProgrammingDependencies.start",
                         ),
@@ -2308,7 +2619,7 @@ Program {
         },
         Pop,
         Call(
-            270,
+            349,
         ),
         PushBytes(
             1,
@@ -2323,7 +2634,7 @@ Program {
             4,
         ),
         DecodeField {
-            service: 5,
+            service: 9,
             field: 20,
         },
         PushI64(
@@ -2347,7 +2658,7 @@ Program {
             4,
         ),
         DecodeField {
-            service: 5,
+            service: 9,
             field: 20,
         },
         PushI64(
@@ -2494,7 +2805,7 @@ Program {
             4,
         ),
         DecodeField {
-            service: 5,
+            service: 9,
             field: 20,
         },
         PushI64(
@@ -2820,7 +3131,7 @@ Program {
             0,
         ),
         DecodeField {
-            service: 17,
+            service: 21,
             field: 29,
         },
         PushI64(
@@ -2919,15 +3230,215 @@ Program {
             message: 18,
         },
         Call(
-            274,
+            353,
         ),
+        PushBytes(
+            17,
+        ),
+        ServiceRequest {
+            service: 16,
+        },
+        Pop,
+        PushBytes(
+            16,
+        ),
+        ServiceRequest {
+            service: 39,
+        },
+        StoreLocal(
+            19,
+        ),
+        LoadLocal(
+            19,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            11,
+        ),
+        CmpEq,
+        Not,
+        JumpIfFalse(
+            291,
+        ),
+        PushBytes(
+            17,
+        ),
+        LoadLocal(
+            19,
+        ),
+        PushI64(
+            2,
+        ),
+        PushI64(
+            9223372036854775807,
+        ),
+        Slice,
+        SecurityAccess {
+            level: 1,
+        },
+        Concat,
+        ServiceRequest {
+            service: 39,
+        },
+        StoreLocal(
+            19,
+        ),
+        LoadLocal(
+            19,
+        ),
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            19,
+        ),
+        Pop,
+        PushBytes(
+            14,
+        ),
+        RoutineControl {
+            routine: 65280,
+            sub: 1,
+        },
+        Pop,
+        PushBytes(
+            19,
+        ),
+        ServiceRequest {
+            service: 52,
+        },
+        Pop,
+        PushI64(
+            0,
+        ),
+        StoreLocal(
+            20,
+        ),
+        LoadLocal(
+            20,
+        ),
+        PushI64(
+            256,
+        ),
+        CmpLt,
+        JumpIfFalse(
+            315,
+        ),
+        LoadLocal(
+            20,
+        ),
+        FlashBlock {
+            session: 1,
+            segment: 0,
+        },
+        FlashTransfer {
+            block: 0,
+        },
+        LoadLocal(
+            20,
+        ),
+        PushI64(
+            1,
+        ),
+        Add,
+        StoreLocal(
+            20,
+        ),
+        Jump(
+            303,
+        ),
+        PushBytes(
+            14,
+        ),
+        ServiceRequest {
+            service: 55,
+        },
+        StoreLocal(
+            17,
+        ),
+        LoadLocal(
+            17,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            11,
+        ),
+        CmpEq,
+        Not,
+        Not,
+        JumpIfFalse(
+            329,
+        ),
+        PushBytes(
+            21,
+        ),
+        Fail {
+            code: 20,
+        },
+        PushBytes(
+            14,
+        ),
+        RoutineControl {
+            routine: 65281,
+            sub: 1,
+        },
+        Pop,
+        PushBytes(
+            16,
+        ),
+        ServiceRequest {
+            service: 17,
+        },
+        StoreLocal(
+            18,
+        ),
+        LoadLocal(
+            18,
+        ),
+        PushI64(
+            0,
+        ),
+        PushI64(
+            1,
+        ),
+        Slice,
+        PushBytes(
+            11,
+        ),
+        CmpEq,
+        Not,
+        Not,
+        JumpIfFalse(
+            346,
+        ),
+        PushBytes(
+            23,
+        ),
+        Fail {
+            code: 22,
+        },
+        Wait {
+            millis: 2000,
+        },
         Log {
             level: 1,
-            message: 19,
+            message: 24,
         },
         Ret,
         PushBytes(
-            21,
+            26,
         ),
         ServiceRequest {
             service: 34,
@@ -2935,10 +3446,10 @@ Program {
         Pop,
         Ret,
         Call(
-            279,
+            358,
         ),
         PushBytes(
-            20,
+            25,
         ),
         ServiceRequest {
             service: 46,
@@ -2946,7 +3457,7 @@ Program {
         Pop,
         Ret,
         PushBytes(
-            21,
+            26,
         ),
         ServiceRequest {
             service: 34,
@@ -3026,8 +3537,8 @@ Program {
             110,
             101,
             32,
-            50,
-            55,
+            52,
+            54,
             32,
             119,
             97,
@@ -3160,8 +3671,8 @@ Program {
             110,
             101,
             32,
-            51,
-            48,
+            52,
+            57,
             32,
             119,
             97,
@@ -3320,6 +3831,114 @@ Program {
             100,
         ],
         [
+            0,
+            68,
+            0,
+            0,
+            0,
+            0,
+            0,
+            1,
+            0,
+            0,
+        ],
+        [
+            84,
+            82,
+            65,
+            78,
+            83,
+            70,
+            69,
+            82,
+            95,
+            69,
+            88,
+            73,
+            84,
+            95,
+            82,
+            69,
+            70,
+            85,
+            83,
+            69,
+            68,
+        ],
+        [
+            116,
+            104,
+            101,
+            32,
+            116,
+            114,
+            97,
+            110,
+            115,
+            102,
+            101,
+            114,
+            32,
+            101,
+            120,
+            105,
+            116,
+            32,
+            119,
+            97,
+            115,
+            32,
+            114,
+            101,
+            102,
+            117,
+            115,
+            101,
+            100,
+        ],
+        [
+            82,
+            69,
+            83,
+            69,
+            84,
+            95,
+            82,
+            69,
+            70,
+            85,
+            83,
+            69,
+            68,
+        ],
+        [
+            116,
+            104,
+            101,
+            32,
+            69,
+            67,
+            85,
+            32,
+            114,
+            101,
+            115,
+            101,
+            116,
+            32,
+            119,
+            97,
+            115,
+            32,
+            114,
+            101,
+            102,
+            117,
+            115,
+            101,
+            100,
+        ],
+        [
             100,
             111,
             110,
@@ -3453,55 +4072,209 @@ Program {
         Section {
             start_pc: 268,
             end_pc: 269,
-            interruptible: Yes,
-            idempotency: Safe,
-            expected_millis: 0,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
         },
         Section {
-            start_pc: 271,
+            start_pc: 269,
+            end_pc: 270,
+            interruptible: No,
+            idempotency: Safe,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 270,
             end_pc: 272,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 272,
+            end_pc: 273,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 273,
+            end_pc: 287,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 287,
+            end_pc: 288,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 288,
+            end_pc: 289,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 289,
+            end_pc: 290,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 290,
+            end_pc: 296,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 296,
+            end_pc: 297,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 297,
+            end_pc: 299,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 299,
+            end_pc: 300,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 300,
+            end_pc: 309,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 309,
+            end_pc: 310,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 310,
+            end_pc: 316,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 316,
+            end_pc: 317,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 317,
+            end_pc: 330,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 330,
+            end_pc: 331,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 331,
+            end_pc: 333,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 333,
+            end_pc: 334,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 334,
+            end_pc: 346,
+            interruptible: No,
+            idempotency: CheckState,
+            expected_millis: 120000,
+        },
+        Section {
+            start_pc: 346,
+            end_pc: 347,
             interruptible: Yes,
             idempotency: Safe,
             expected_millis: 0,
         },
         Section {
-            start_pc: 274,
-            end_pc: 276,
+            start_pc: 347,
+            end_pc: 348,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 350,
+            end_pc: 351,
+            interruptible: Yes,
+            idempotency: Safe,
+            expected_millis: 0,
+        },
+        Section {
+            start_pc: 353,
+            end_pc: 355,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 276,
-            end_pc: 277,
+            start_pc: 355,
+            end_pc: 356,
             interruptible: No,
             idempotency: Unsafe,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 277,
-            end_pc: 279,
+            start_pc: 356,
+            end_pc: 358,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 279,
-            end_pc: 280,
+            start_pc: 358,
+            end_pc: 359,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 280,
-            end_pc: 281,
+            start_pc: 359,
+            end_pc: 360,
             interruptible: No,
             idempotency: Safe,
             expected_millis: 2000,
         },
         Section {
-            start_pc: 281,
-            end_pc: 283,
+            start_pc: 360,
+            end_pc: 362,
             interruptible: No,
             idempotency: CheckState,
             expected_millis: 2000,
@@ -3511,272 +4284,362 @@ Program {
         SourceSpan {
             pc: 0,
             file: 0,
-            line: 22,
+            line: 41,
             column: 5,
         },
         SourceSpan {
             pc: 3,
             file: 0,
-            line: 23,
+            line: 42,
             column: 5,
         },
         SourceSpan {
             pc: 4,
             file: 0,
-            line: 24,
+            line: 43,
             column: 15,
         },
         SourceSpan {
             pc: 7,
             file: 0,
-            line: 25,
+            line: 44,
             column: 8,
         },
         SourceSpan {
             pc: 12,
             file: 0,
-            line: 26,
+            line: 45,
             column: 9,
         },
         SourceSpan {
             pc: 13,
             file: 0,
-            line: 27,
+            line: 46,
             column: 13,
         },
         SourceSpan {
             pc: 15,
             file: 0,
-            line: 27,
+            line: 46,
             column: 41,
         },
         SourceSpan {
             pc: 19,
             file: 0,
-            line: 27,
+            line: 46,
             column: 13,
         },
         SourceSpan {
             pc: 51,
             file: 0,
-            line: 28,
+            line: 47,
             column: 18,
         },
         SourceSpan {
             pc: 52,
             file: 0,
-            line: 28,
+            line: 47,
             column: 8,
         },
         SourceSpan {
             pc: 77,
             file: 0,
-            line: 29,
+            line: 48,
             column: 9,
         },
         SourceSpan {
             pc: 78,
             file: 0,
-            line: 30,
+            line: 49,
             column: 52,
         },
         SourceSpan {
             pc: 92,
             file: 0,
-            line: 30,
+            line: 49,
             column: 5,
         },
         SourceSpan {
             pc: 102,
             file: 0,
-            line: 31,
+            line: 50,
             column: 12,
         },
         SourceSpan {
             pc: 105,
             file: 0,
-            line: 32,
+            line: 51,
             column: 8,
         },
         SourceSpan {
             pc: 115,
             file: 0,
-            line: 32,
+            line: 51,
             column: 23,
         },
         SourceSpan {
             pc: 119,
             file: 0,
-            line: 32,
+            line: 51,
             column: 8,
         },
         SourceSpan {
             pc: 120,
             file: 0,
-            line: 33,
+            line: 52,
             column: 9,
         },
         SourceSpan {
             pc: 121,
             file: 0,
-            line: 34,
+            line: 53,
             column: 19,
         },
         SourceSpan {
             pc: 129,
             file: 0,
-            line: 35,
+            line: 54,
             column: 16,
         },
         SourceSpan {
             pc: 130,
             file: 0,
-            line: 35,
+            line: 54,
             column: 12,
         },
         SourceSpan {
             pc: 140,
             file: 0,
-            line: 35,
+            line: 54,
             column: 34,
         },
         SourceSpan {
             pc: 183,
             file: 0,
-            line: 35,
+            line: 54,
             column: 12,
         },
         SourceSpan {
             pc: 186,
             file: 0,
-            line: 35,
+            line: 54,
             column: 69,
         },
         SourceSpan {
             pc: 213,
             file: 0,
-            line: 35,
+            line: 54,
             column: 12,
         },
         SourceSpan {
             pc: 214,
             file: 0,
-            line: 36,
+            line: 55,
             column: 13,
         },
         SourceSpan {
             pc: 215,
             file: 0,
-            line: 37,
+            line: 56,
             column: 13,
         },
         SourceSpan {
             pc: 218,
             file: 0,
-            line: 38,
+            line: 57,
             column: 8,
         },
         SourceSpan {
             pc: 228,
             file: 0,
-            line: 38,
+            line: 57,
             column: 24,
         },
         SourceSpan {
             pc: 232,
             file: 0,
-            line: 38,
+            line: 57,
             column: 8,
         },
         SourceSpan {
             pc: 233,
             file: 0,
-            line: 39,
+            line: 58,
             column: 9,
         },
         SourceSpan {
             pc: 234,
             file: 0,
-            line: 40,
+            line: 59,
             column: 14,
         },
         SourceSpan {
             pc: 258,
             file: 0,
-            line: 41,
+            line: 60,
             column: 8,
         },
         SourceSpan {
             pc: 266,
             file: 0,
-            line: 42,
+            line: 61,
             column: 9,
         },
         SourceSpan {
             pc: 267,
             file: 0,
-            line: 43,
+            line: 62,
             column: 5,
         },
         SourceSpan {
             pc: 268,
             file: 0,
-            line: 44,
+            line: 27,
             column: 5,
         },
         SourceSpan {
-            pc: 269,
+            pc: 271,
             file: 0,
-            line: 21,
+            line: 28,
             column: 5,
         },
         SourceSpan {
-            pc: 270,
+            pc: 295,
             file: 0,
-            line: 13,
+            line: 30,
             column: 5,
         },
         SourceSpan {
-            pc: 273,
+            pc: 298,
             file: 0,
-            line: 12,
+            line: 31,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 318,
+            file: 0,
+            line: 32,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 325,
+            file: 0,
+            line: 32,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 327,
+            file: 0,
+            line: 33,
+            column: 44,
+        },
+        SourceSpan {
+            pc: 328,
+            file: 0,
+            line: 33,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 329,
+            file: 0,
+            line: 34,
             column: 5,
         },
         SourceSpan {
-            pc: 274,
+            pc: 332,
+            file: 0,
+            line: 35,
+            column: 13,
+        },
+        SourceSpan {
+            pc: 335,
+            file: 0,
+            line: 36,
+            column: 12,
+        },
+        SourceSpan {
+            pc: 342,
+            file: 0,
+            line: 36,
+            column: 8,
+        },
+        SourceSpan {
+            pc: 344,
+            file: 0,
+            line: 37,
+            column: 36,
+        },
+        SourceSpan {
+            pc: 345,
+            file: 0,
+            line: 37,
+            column: 9,
+        },
+        SourceSpan {
+            pc: 346,
+            file: 0,
+            line: 64,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 347,
+            file: 0,
+            line: 65,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 348,
+            file: 0,
+            line: 40,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 349,
             file: 0,
             line: 17,
             column: 5,
         },
         SourceSpan {
-            pc: 275,
-            file: 0,
-            line: 18,
-            column: 5,
-        },
-        SourceSpan {
-            pc: 278,
+            pc: 352,
             file: 0,
             line: 16,
             column: 5,
         },
         SourceSpan {
-            pc: 279,
+            pc: 353,
             file: 0,
-            line: 13,
+            line: 21,
             column: 5,
         },
         SourceSpan {
-            pc: 282,
+            pc: 354,
             file: 0,
-            line: 12,
+            line: 22,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 357,
+            file: 0,
+            line: 20,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 358,
+            file: 0,
+            line: 17,
+            column: 5,
+        },
+        SourceSpan {
+            pc: 361,
+            file: 0,
+            line: 16,
             column: 5,
         },
     ],
     identity: IdentitySources {
         vin: Some(
             EcuService {
-                service_id: 8,
+                service_id: 12,
                 field_id: 23,
             },
         ),
@@ -3875,5 +4738,32 @@ Program {
             },
         ),
     },
-    flash: [],
+    flash: [
+        FlashRecovery {
+            flash_session: 1,
+            stage: 1,
+            max_resumes: 3,
+            recovery_required: FromPc(
+                296,
+            ),
+            boundaries: RecoveryBoundaries {
+                entry_pc: 268,
+                erase_pc: 296,
+                transfer_exit_pc: 316,
+                post_transfer_end_pc: 346,
+            },
+            timing: RecoveryTiming {
+                session_timeout_millis: 5000,
+                teardown_margin_millis: 1000,
+                ecu_startup_millis: 2000,
+                confirmation_window_millis: 3000,
+            },
+            version_read_retries: 3,
+            no_application: Some(
+                Nrc(
+                    34,
+                ),
+            ),
+        },
+    ],
 }

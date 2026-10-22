@@ -82,26 +82,30 @@ fn the_example_services_have_ids_in_row_order() {
         (2, "extendedSession"),
         (3, "programmingSession"),
         (4, "readDtcByStatusMask"),
-        (5, "activeSession.read"),
-        (6, "sparePartNumber.read"),
-        (7, "softwareVersion.read"),
-        (8, "vin.read"),
-        (9, "vin.write"),
-        (10, "flashState.read"),
-        (11, "powerCycles.read"),
-        (12, "supplyVoltage.read"),
-        (13, "lastResetReason.read"),
-        (14, "batteryVoltage.read"),
-        (15, "bootTime.read"),
-        (16, "eraseMemory.start"),
-        (17, "checkProgrammingDependencies.start"),
+        (5, "ecuReset"),
+        (6, "securityAccess"),
+        (7, "requestDownload"),
+        (8, "requestTransferExit"),
+        (9, "activeSession.read"),
+        (10, "sparePartNumber.read"),
+        (11, "softwareVersion.read"),
+        (12, "vin.read"),
+        (13, "vin.write"),
+        (14, "flashState.read"),
+        (15, "powerCycles.read"),
+        (16, "supplyVoltage.read"),
+        (17, "lastResetReason.read"),
+        (18, "batteryVoltage.read"),
+        (19, "bootTime.read"),
+        (20, "eraseMemory.start"),
+        (21, "checkProgrammingDependencies.start"),
     ]
     .into_iter()
     .map(|(id, name)| (id, name.to_owned()))
     .collect();
     assert_eq!(ids(&documents[1]), expected);
     // The supply voltage DID is only in the second variant; the ids stay the same.
-    expected.retain(|(id, _)| *id != 12);
+    expected.retain(|(id, _)| *id != 16);
     assert_eq!(ids(&documents[0]), expected);
 }
 
@@ -329,7 +333,7 @@ fn variant_patterns_name_the_service_and_field() {
             .flatten()
             .map(|p| (p.service_id, p.field_id, p.expected.clone().expect("bytes")))
             .collect();
-        assert_eq!(patterns, [(7, version.id, expected.to_vec())]);
+        assert_eq!(patterns, [(11, version.id, expected.to_vec())]);
     }
 }
 
@@ -721,13 +725,13 @@ fn every_routine_part_and_did_record_constants_convert() {
     let files = appended(files, "dids.csv", &[",rec,0x1234,yes,yes,,,"]);
     let documents = documents(&convert(files));
     let document = &documents[0];
-    // After the example's 17 services and rec's read and write.
+    // After the example's 21 services and rec's read and write.
     let parts = [
         ("start", 0x01, "s"),
         ("stop", 0x02, "t"),
         ("results", 0x03, "u"),
     ];
-    for (n, (part, sub, field_name)) in (20..).zip(parts) {
+    for (n, (part, sub, field_name)) in (24..).zip(parts) {
         let s = service(document, &format!("cycle.{part}"));
         assert_eq!(s.id, n);
         assert_eq!(request(s), (0x31, &[sub, 0xAB, 0x01][..], &[][..]));

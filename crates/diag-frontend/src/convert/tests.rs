@@ -564,16 +564,20 @@ fn a_request_is_selected_by_a_bytes_constant_and_may_have_no_fields() {
         example(),
         "fields.csv",
         &[
-            "request:ecuReset,sub,0,,uint,8,,,,,,0x01,,,",
+            "request:customMode,sub,0,,uint,8,,,,,,0x01,,,",
             "request:customRead,tag,0,,bytes,16,,,,,,A1B2,,,",
             "request:customRead,mode,2,,uint,8,,,,,,,,,",
         ],
     );
-    let files = services::appended(files, "services.csv", &["ecuReset,0x11", "customRead,0xBA"]);
+    let files = services::appended(
+        files,
+        "services.csv",
+        &["customMode,0xBB", "customRead,0xBA"],
+    );
     // `params` may also be a global constant.
     let source = "P = {\"mode\": 7, \"tag\": b\"\\xa1\\xb2\"}\n\n\
-                  def main():\n    diag.request(0x11, {\"sub\": 1})\n    diag.request(0xBA, P)\n";
-    let sent = vec![(0x11, vec![0x01]), (0xBA, vec![0xA1, 0xB2, 0x07])];
+                  def main():\n    diag.request(0xBB, {\"sub\": 1})\n    diag.request(0xBA, P)\n";
+    let sent = vec![(0xBB, vec![0x01]), (0xBA, vec![0xA1, 0xB2, 0x07])];
     assert_eq!(
         requests_sent_by(files.clone(), source),
         [

@@ -135,7 +135,8 @@ decisions behind them:
    `CP_RC21Handling` and `CP_RC23Handling` to 0, so the API repeats no request unseen on a busy
    answer, unless the profile declares the code a pending code (ADR-309 item 5); the API then repeats
    the request unseen, so a response after such a code is not judged against the original
-   transmit and the code counts like an absorbed pending, and the agent never sets the suppress-positive-response transmit flag (ISO
+   transmit and the code counts like an absorbed pending; such a link counts as one whose VCI
+   absorbs pendings for every rule, though its worker forwards 0x78, and the agent never sets the suppress-positive-response transmit flag (ISO
    22900-2:2022 Annex I.2.1), with which the API would end a silent exchange without a timeout
    and hide an unexpected positive response. A primitive past the agent's deadline holds its
    link (ISO 22900-2:2022 8.4.17.2), so the agent cancels it before the link's next request, and at job end after

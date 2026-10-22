@@ -187,7 +187,9 @@ cannot place.
      which. A difference is taken only between times of one clock.
    - **Alignment.** VCI times are aligned with the agent's clock per clock, by the least delay
      seen between a VCI time and the agent receiving it. The 32-bit values are unwrapped, and a
-     reset, a reconnect or a backward step opens a new epoch, which the log records.
+     reset or a backward step that is not a wrap opens a new epoch, which the log records. A
+     reconnect opens one only when the time base restarted, so a VCI that kept its power keeps
+     its epoch (item 5, Lost VCI).
 8. **Per message, raw CAN deferred.**
    - The log records messages (`layer: "message"`), and a `frames` field is reserved.
    - It cannot place these faults:

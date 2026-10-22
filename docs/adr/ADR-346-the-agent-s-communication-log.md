@@ -157,9 +157,10 @@ cannot place.
      - without a confirmation, since the VCI's receive path can lose a response that was on the
        bus.
    - **Suppressed responses.** A request with the positive-response suppression bit whose send is
-     confirmed, with no pending seen, and that the VCI ended without a response is `none`. After a
-     pending the ECU owes its final response even then (ISO 14229-1:2026 7.7.3), so such an
-     exchange is judged as any other. The host still ends such a
+     confirmed, with no pending seen, and that the VCI ended within P2 without a response is
+     `none`. After a pending the ECU owes its final response even then (ISO 14229-1:2026 7.7.3),
+     and an exchange that ended beyond P2 on a link whose VCI absorbs pendings had one, so both
+     are judged as any other. The host still ends such a
      request as having no response today; changing that is not part of this decision.
    - **Early timeout.** A receive timeout that the VCI reports before the limit in force, measured
      on one clock, is `system`: the VCI stopped waiting too soon. The limit in force is P2 from the

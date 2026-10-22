@@ -76,9 +76,10 @@ decisions behind them:
    before sending, from any origin; system events share the timeline. Each entry says, in
    vehicle-communication terms, whether the request reached the bus, what happened, and the
    response time beside the limits in force; it names the service and the negative response code
-   beside their bytes, and keeps the internal names in a separate `detail` field. Secrets and bulk
-   data (SecurityAccess seeds and keys, Authentication data, TransferData) are logged as length
-   and hash.
+   beside their bytes, and keeps the internal names in a separate `detail` field. Secrets
+   (SecurityAccess seeds and keys, Authentication data) are logged as their length only, since a
+   key with few possible values could be recovered from any digest of it; bulk TransferData is
+   logged as length and hash.
 2. **Where the evidence does not decide, the entry says so.** Every judgement rests on what the
    agent can observe, and a question the evidence leaves open is `unknown`, `undetermined` or
    "not judged", never a guess. In particular:
@@ -195,7 +196,8 @@ decisions behind them:
   - the host to tell its own deadline from a VCI-ended exchange without a response;
   - each link to record its timing margin, from a configured default or a hardware profile
     (design 13.5), since no API reports a VCI's timer spread;
-  - the log's writer to log secrets and bulk data as length and hash, and to recover after a
+  - the log's writer to log secrets as length only and bulk data as length and hash, and to
+    recover after a
     torn last line;
   - the agent to read the link's unbound items (transmit indications, link errors) and those of
     earlier primitives, instead of dropping them;

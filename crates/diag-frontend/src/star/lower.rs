@@ -11,17 +11,19 @@
 //! run time has one type, inferred at ingestion (ADR-304); an operation the IR cannot express
 //! for its operands is `STAR_NOT_LOWERABLE`.
 //!
-//! A flash plan that calls no function is expanded in place at its one call in `main`, with its
-//! `diag.flash_transfer`, and gets its `FlashRecovery` (4.9, ADR-336).
+//! A flash plan is expanded in place at its one call in `main`, with its `diag.flash_transfer`,
+//! and gets its `FlashRecovery` (4.9, ADR-336). Every function it calls, directly or not, is
+//! expanded in place at its call too (`Lowerer::inline_call`): its `Ret`s jump to the join, its
+//! locals take fresh slots in the caller's frame, and a section function's pieces are laid over
+//! its range.
 //!
 //! `diag.hmi` and `diag.record` lower to `HmiRequest`, `HmiRequestFromStack` and `RecordInput`
 //! with an encoded `HmiTemplate` constant, and their answer is read by the keys `ok`,
 //! `timed_out` and `value` (ADR-340).
 //!
-//! Not lowered yet, each its own backlog item: the functions a flash plan calls. The built-ins
-//! and string methods on values known only at run time that have no lowering (`abs`, `str`,
-//! `find`, ...) name the instruction they wait for. Each is rejected with `STAR_NOT_LOWERABLE`,
-//! so nothing is lowered silently wrong.
+//! Not lowered yet, each its own backlog item: the built-ins and string methods on values known
+//! only at run time that have no lowering (`abs`, `str`, `find`, ...) name the instruction they
+//! wait for. Each is rejected with `STAR_NOT_LOWERABLE`, so nothing is lowered silently wrong.
 
 use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
@@ -138,6 +140,15 @@ const MAX_TYPE_PASSES: usize = 256;
 /// The longest `diag.fail` code (subset 3.1).
 const MAX_FAIL_CODE_LEN: usize = 64;
 
+/// The message of a program that needs more copies of functions than the budgets of 2.6 allow.
+fn specialization_limit() -> String {
+    format!(
+        "the sections and the flash plans' in-place expansions need more than {MAX_COPIES} copies \
+         of the functions they reach, or more than {MAX_COPIED_INSTRUCTIONS} instructions in them \
+         (2.6, 4.5, 4.9)"
+    )
+}
+
 /// Lowers `checked`, the procedure in `file`, to a program for `variant`, against whose
 /// declarations it is lowered: every procedure goes with every variant, and is lowered once per
 /// variant (ADR-307, ADR-311). Every reason the procedure cannot be lowered is reported, in
@@ -200,6 +211,11 @@ fn lower_here<'a>(
     if lowerer.errors.is_empty() {
         lowerer.infer();
         lowerer.reject_if_exhausted();
+        if let Some(span) = lowerer.inline_limit
+            && lowerer.errors.is_empty()
+        {
+            lowerer.error(StarCode::SpecializationLimit, span, specialization_limit());
+        }
     }
     if lowerer.errors.is_empty() {
         lowerer.emit_all();
@@ -536,6 +552,11 @@ enum Ins {
     /// The instruction after it is the boundary of the plan being expanded; no instruction of its
     /// own.
     Boundary(Boundary),
+    /// The instructions up to the matching [`Ins::SectionEnd`] are the in-place expansion of the
+    /// section function `.0` inside a flash plan (ADR-336 item 3); no instruction of its own.
+    SectionBegin(usize),
+    /// The end of the expansion a [`Ins::SectionBegin`] opened.
+    SectionEnd,
 }
 
 /// Which boundary of a flash plan the next instruction is (ADR-336 item 4).
@@ -554,7 +575,12 @@ impl Ins {
     fn is_pseudo(&self) -> bool {
         matches!(
             self,
-            Ins::Mark(_) | Ins::PlanBegin(_) | Ins::PlanEnd | Ins::Boundary(_)
+            Ins::Mark(_)
+                | Ins::PlanBegin(_)
+                | Ins::PlanEnd
+                | Ins::Boundary(_)
+                | Ins::SectionBegin(_)
+                | Ins::SectionEnd
         )
     }
 }
@@ -701,10 +727,20 @@ struct Lowerer<'a> {
     preconditions: Preconditions,
     /// The flash plans, by the function that holds each (4.9).
     plans: HashMap<usize, PlanInfo>,
-    /// The plan whose body is being expanded in place, if any: no function it calls is lowered
-    /// yet, its `diag.request`s default to `CheckState` (4.6) and it holds the one
-    /// `diag.flash_transfer` (4.9).
+    /// The plan whose body is being expanded in place, if any: the functions it calls are
+    /// expanded in place too ([`Lowerer::inline_call`]), its `diag.request`s default to
+    /// `CheckState` (4.6) and it holds the one `diag.flash_transfer` (4.9).
     active_plan: Option<usize>,
+    /// The functions being expanded in place, outermost first, so a call chain that closes on one
+    /// of them cannot be expanded.
+    inline_stack: Vec<usize>,
+    /// The in-place expansions of functions made, and the instructions they hold, in the current
+    /// pass over the function bodies: they count toward the copy limits with the sections' copies
+    /// (subset 2.6, 4.5).
+    inline_copies: usize,
+    inline_size: usize,
+    /// Where an inference pass first found those limits passed, which the emission reports.
+    inline_limit: Option<Span>,
 }
 
 /// Where `break` and `continue` jump in the loop being lowered.
@@ -786,6 +822,10 @@ impl<'a> Lowerer<'a> {
             preconditions: Preconditions::default(),
             plans: HashMap::new(),
             active_plan: None,
+            inline_stack: Vec::new(),
+            inline_copies: 0,
+            inline_size: 0,
+            inline_limit: None,
         }
     }
 
@@ -1217,6 +1257,8 @@ impl<'a> Lowerer<'a> {
             self.changed = false;
             self.built = self.globals_built;
             self.unrolled = 0;
+            self.inline_copies = 0;
+            self.inline_size = 0;
             for id in 0..self.funcs.len() {
                 if !reached[id] {
                     continue;
@@ -1255,6 +1297,8 @@ impl<'a> Lowerer<'a> {
         };
         self.built = self.globals_built;
         self.unrolled = 0;
+        self.inline_copies = 0;
+        self.inline_size = 0;
         let mut pending = vec![main];
         let mut emitted = vec![false; self.funcs.len()];
         emitted[main] = true;
@@ -1295,12 +1339,14 @@ impl<'a> Lowerer<'a> {
         let first = self.copy_for(main, None);
         let mut listed: HashSet<FuncCopy> = HashSet::from([first]);
         self.copies = vec![first];
-        let mut specialized = usize::from(first.section.is_some());
-        let mut copied = if first.section.is_some() {
-            self.funcs[main].code.len()
-        } else {
-            0
-        };
+        // The in-place expansions of the emission pass count with the copies (ADR-336 item 3).
+        let mut specialized = usize::from(first.section.is_some()) + self.inline_copies;
+        let mut copied = self.inline_size
+            + if first.section.is_some() {
+                self.funcs[main].code.len()
+            } else {
+                0
+            };
         let mut next = 0;
         while next < self.copies.len() {
             let copy = self.copies[next];
@@ -1330,15 +1376,7 @@ impl<'a> Lowerer<'a> {
                 if target.section.is_some() {
                     let size = self.funcs[callee].code.len();
                     if specialized == MAX_COPIES || copied + size > MAX_COPIED_INSTRUCTIONS {
-                        self.error(
-                            StarCode::SpecializationLimit,
-                            span,
-                            format!(
-                                "the sections need more than {MAX_COPIES} copies of the \
-                                 functions they reach, or more than {MAX_COPIED_INSTRUCTIONS} \
-                                 instructions in them (2.6, 4.5)"
-                            ),
-                        );
+                        self.error(StarCode::SpecializationLimit, span, specialization_limit());
                         return;
                     }
                     specialized += 1;
@@ -1350,12 +1388,25 @@ impl<'a> Lowerer<'a> {
         }
     }
 
-    /// Lowers one function's body.
+    /// Lowers one function: its entry label, its body, and the closing `Ret`.
     fn function(&mut self, id: usize) -> Code {
+        let span = self.funcs[id].def.name.span;
+        let mut code: Code = vec![(Ins::Mark(self.funcs[id].label), span)];
+        self.body(id, &mut code);
+        // Unreachable after a function that returns on every path, but it keeps every label a
+        // jump can name inside the code.
+        code.push((Ins::Op(Op::Ret), span));
+        code
+    }
+
+    /// Lowers the body of function `id` into `code`, in the function's own frame: the stores of
+    /// the parameters from the stack, then the statements, each `return` as a `Ret`. A call
+    /// lowers it with an entry label and a closing `Ret` ([`Self::function`]); a flash plan's
+    /// expansion lowers it in place ([`Self::inline_call`]).
+    fn body(&mut self, id: usize, code: &mut Code) {
         let def = self.funcs[id].def;
         let span = def.name.span;
         self.funcs[id].temps = self.funcs[id].slots.len() as u16;
-        let mut code: Code = vec![(Ins::Mark(self.funcs[id].label), span)];
         // The caller pushed the arguments in order.
         for at in (0..self.funcs[id].params.len()).rev() {
             code.push((Ins::Op(Op::StoreLocal(at as u16)), span));
@@ -1372,11 +1423,8 @@ impl<'a> Lowerer<'a> {
             {
                 continue;
             }
-            self.stmt(id, stmt, &mut code);
+            self.stmt(id, stmt, code);
         }
-        // Unreachable after a function that returns on every path, but it keeps every label a
-        // jump can name inside the code.
-        code.push((Ins::Op(Op::Ret), span));
         if self.funcs[id].returns_value && !always_returns(&def.body) {
             self.error(
                 StarCode::UnsupportedSyntax,
@@ -1389,7 +1437,6 @@ impl<'a> Lowerer<'a> {
                 ),
             );
         }
-        code
     }
 
     // ------------------------------------------------------------ Statements
@@ -3931,16 +3978,7 @@ impl<'a> Lowerer<'a> {
             return self.expand_plan(id, callee, args, span);
         }
         if self.active_plan.is_some() {
-            // The functions a plan calls are to be expanded in it, which is not lowered yet.
-            self.not_lowerable(
-                span,
-                format!(
-                    "`{}` is called from a flash plan, whose called functions are not expanded in \
-                     place yet (4.9, ADR-336 item 3)",
-                    self.funcs[callee].name
-                ),
-            );
-            return Val::Run(Tys::default(), Vec::new());
+            return self.inline_call(id, callee, args, span);
         }
         self.called.push(callee);
         let mut code = Vec::new();
@@ -3966,6 +4004,124 @@ impl<'a> Lowerer<'a> {
             self.widen_slot(callee, at as u16, tys);
         }
         code.push((Ins::Call(callee), span));
+        if self.funcs[callee].returns_value {
+            Val::Run(self.funcs[callee].ret, code)
+        } else {
+            Val::Void(code)
+        }
+    }
+
+    /// A call inside a flash plan's expansion (4.9, ADR-336 item 3): the callee is lowered in
+    /// place instead of called, so the plan holds no `Call` or `Ret` (ADR-245 item 4). The
+    /// arguments are evaluated in the caller and left on the stack, the callee's body stores them
+    /// into its parameters, and each `return` of the body jumps to the join after it, with the
+    /// value on the stack where a call would leave it. The callee's locals and temporaries take
+    /// fresh slots in the caller's frame after the ones it has used so far, so a function called
+    /// twice has two sets. A section function's expansion is bracketed by
+    /// [`Ins::SectionBegin`] and [`Ins::SectionEnd`], which the assembly turns into the section's
+    /// pieces over the range, entered by fallthrough. What a statement around the call says does
+    /// not reach in: its `@idempotency`, its loops' `break` and `continue`, and the constants an
+    /// unrolled loop of the caller binds. A call chain that closes on a function being expanded
+    /// is recursion, which the checker rejects already (4.1).
+    fn inline_call(
+        &mut self,
+        id: Option<usize>,
+        callee: usize,
+        args: &[&AstExpr],
+        span: Span,
+    ) -> Val {
+        let failed = || Val::Run(Tys::default(), Vec::new());
+        let Some(caller) = id else {
+            self.not_lowerable(
+                span,
+                "a flash plan's calls are expanded in a function (4.9)",
+            );
+            return failed();
+        };
+        if self.active_plan == Some(callee) || self.inline_stack.contains(&callee) {
+            self.not_lowerable(
+                span,
+                format!(
+                    "`{}` calls itself, directly or not, and a function a flash plan calls is \
+                     expanded in place, which a recursive call cannot be (4.1, 4.9)",
+                    self.funcs[callee].name
+                ),
+            );
+            return failed();
+        }
+        if args.len() != self.funcs[callee].params.len() {
+            self.error(
+                StarCode::UnsupportedSyntax,
+                span,
+                format!(
+                    "`{}` takes {} arguments, not {}",
+                    self.funcs[callee].name,
+                    self.funcs[callee].params.len(),
+                    args.len()
+                ),
+            );
+            return failed();
+        }
+        let mut code = Vec::new();
+        for (at, arg) in args.iter().enumerate() {
+            let value = self.expr(id, arg);
+            let Some((tys, more)) = self.force(value, arg.span) else {
+                return failed();
+            };
+            code.extend(more);
+            self.widen_slot(callee, at as u16, tys);
+        }
+        // The copies of the sections and the expansions share the budgets of 2.6, checked before
+        // the body is lowered so that a chain of calls that doubles at each level stops early.
+        if self.inline_copies >= MAX_COPIES || self.inline_size > MAX_COPIED_INSTRUCTIONS {
+            self.inline_limit.get_or_insert(span);
+            self.error(StarCode::SpecializationLimit, span, specialization_limit());
+            return failed();
+        }
+        self.inline_copies += 1;
+        let annotated = std::mem::take(&mut self.annotated);
+        let loops = std::mem::take(&mut self.loops);
+        let bound = std::mem::take(&mut self.bound);
+        self.inline_stack.push(callee);
+        let mut body: Code = Vec::new();
+        self.body(callee, &mut body);
+        self.inline_stack.pop();
+        self.annotated = annotated;
+        self.loops = loops;
+        self.bound = bound;
+        self.inline_size += body.iter().filter(|(ins, _)| !ins.is_pseudo()).count();
+        // The callee's frame moves into the caller's, after the slots the caller has used.
+        let (base, size) = (self.funcs[caller].temps, self.funcs[callee].temps);
+        let Some(end) = base.checked_add(size) else {
+            self.not_lowerable(
+                span,
+                "the locals and temporaries of a function a flash plan calls do not fit what is \
+                 left of the caller's 65,535 locals (4.9)",
+            );
+            return failed();
+        };
+        let frame = &mut self.funcs[caller];
+        frame.temps = end;
+        while frame.slot_tys.len() < usize::from(end) {
+            frame.slot_tys.push(Tys::of(Ty::Int));
+        }
+        let join = self.label();
+        for (ins, _) in &mut body {
+            match ins {
+                Ins::Op(Op::LoadLocal(slot) | Op::StoreLocal(slot)) => *slot += base,
+                Ins::Op(Op::Ret) => *ins = Ins::Jump(join),
+                _ => {}
+            }
+        }
+        let section = self.funcs[callee].section.is_some();
+        if section {
+            code.push((Ins::SectionBegin(callee), span));
+        }
+        code.extend(body);
+        code.push((Ins::Mark(join), span));
+        if section {
+            code.push((Ins::SectionEnd, span));
+        }
         if self.funcs[callee].returns_value {
             Val::Run(self.funcs[callee].ret, code)
         } else {
@@ -6447,6 +6603,10 @@ impl<'a> Lowerer<'a> {
             let mut primitives: Vec<(u32, Idempotency)> = Vec::new();
             let mut open: Option<PlanRange> = None;
             let first_plan = plan_ranges.len();
+            // The section functions expanded in place in a plan: the ones still open, and the
+            // ranges of those closed, each with the function's attributes (ADR-336 item 3).
+            let mut expanding: Vec<(u32, usize)> = Vec::new();
+            let mut expanded: Vec<(u32, u32, (Interruptible, u32))> = Vec::new();
             for (ins, span) in &self.funcs[copy.func].code {
                 match ins {
                     Ins::PlanBegin(plan) => {
@@ -6473,6 +6633,16 @@ impl<'a> Lowerer<'a> {
                                 Boundary::TransferExit => &mut range.exit,
                             };
                             slot.get_or_insert(pc);
+                        }
+                    }
+                    Ins::SectionBegin(function) => expanding.push((pc, *function)),
+                    Ins::SectionEnd => {
+                        if let Some((from, function)) = expanding.pop()
+                            && from < pc
+                        {
+                            let attributes =
+                                self.funcs[function].section.expect("a section function");
+                            expanded.push((from, pc, attributes));
                         }
                     }
                     Ins::Primitive(_, idempotency) => primitives.push((pc, *idempotency)),
@@ -6512,6 +6682,10 @@ impl<'a> Lowerer<'a> {
                     .unwrap_or((Interruptible::No, 0));
                 covered.push((range.entry, range.end, attributes));
             }
+            // A section function expanded in a plan has its own pieces over its range, inside
+            // the plan's: a reader that combines the covering sections takes the plan's
+            // uninterruptibility with the function's attributes (ADR-336 item 3, ADR-330).
+            covered.extend(expanded);
             let mut pieces: Vec<Section> = Vec::new();
             for &(from, to, attributes) in &covered {
                 let mut cursor = from;
@@ -6566,7 +6740,12 @@ impl<'a> Lowerer<'a> {
         let mut spans = Vec::with_capacity(pc as usize);
         for (ins, span, at) in code {
             let op = match ins {
-                Ins::Mark(_) | Ins::PlanBegin(_) | Ins::PlanEnd | Ins::Boundary(_) => continue,
+                Ins::Mark(_)
+                | Ins::PlanBegin(_)
+                | Ins::PlanEnd
+                | Ins::Boundary(_)
+                | Ins::SectionBegin(_)
+                | Ins::SectionEnd => continue,
                 Ins::Op(op) | Ins::Primitive(op, _) => op,
                 Ins::Jump(label) => Op::Jump(positions[&(at, label)]),
                 Ins::JumpIfFalse(label) => Op::JumpIfFalse(positions[&(at, label)]),

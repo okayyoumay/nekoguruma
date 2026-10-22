@@ -625,7 +625,8 @@ authentication time (8.10.1) each time the function is called.
   argument and calls (2.6). The lowering gives each such function a copy that only the section
   reaches and covers that copy with the same attributes; a function also called outside the
   section keeps its own copy there. These copies count toward the specialization budget of 2.6,
-  in copies and in instructions: the call that would pass it is `STAR_SPECIALIZATION_LIMIT`.
+  in copies and in instructions: the call that would pass it is `STAR_SPECIALIZATION_LIMIT`. The
+  in-place expansions of a flash plan's calls (4.9) count toward the same budget.
 - **Idempotency.** A section says nothing about whether its steps may be repeated: that is an
   attribute of each `diag` call (4.6). The lowering cuts each covered copy's range around its
   diagnostic primitives. A primitive's one-instruction range carries the call's idempotency. The
@@ -758,7 +759,7 @@ type, so the transpiler infers at ingestion which types each value can have (ADR
 
 ### 4.9 Flash plans and preconditions
 
-**Lowering (ADR-336).** The converter implements `# @preconditions`, the copy of `identity.csv` into every program (below), the flash plan's annotations and shape rules (the syntax of `@flashPlan`, `@erase` and `@recoveryRequired` and their placement, the shape rules and the mandatory preconditions, per file; the session, the `@erase` against the session's steps, the recovery facts of the session's row, the identity rows of a restartable plan and the UDS layer, per variant), and the lowering of a plan that calls no function: the body is expanded in place at its call in `main`, `diag.flash_transfer` expands as 3.2 says, the `CheckState` default of 4.6 applies inside it, and the plan gets its `FlashRecovery`. Not lowered yet: a plan that calls any function (`STAR_NOT_LOWERABLE` at that call, since the called functions are to be expanded in place, as the Coverage item below describes) and a plan function that takes parameters (`STAR_NOT_LOWERABLE` at the call).
+**Lowering (ADR-336).** The converter implements `# @preconditions`, the copy of `identity.csv` into every program (below), the flash plan's annotations and shape rules (the syntax of `@flashPlan`, `@erase` and `@recoveryRequired` and their placement, the shape rules and the mandatory preconditions, per file; the session, the `@erase` against the session's steps, the recovery facts of the session's row, the identity rows of a restartable plan and the UDS layer, per variant), and the lowering of a plan: the body is expanded in place at its call in `main`, every function it calls is expanded in place at its call (Coverage below), `diag.flash_transfer` expands as 3.2 says, the `CheckState` default of 4.6 applies inside it, and the plan gets its `FlashRecovery`. Not lowered yet: a plan function that takes parameters (`STAR_NOT_LOWERABLE` at the call).
 
 Where each check runs. The per-file checks run on the syntax alone, whatever the variants declare, and are reported once. They are: the annotation placement (`STAR_BAD_ANNOTATION`) and ranges (`STAR_ARGUMENT_OUT_OF_RANGE`, which also refuses the reserved maximum session id); every rule of the shape list (`STAR_PLAN_SHAPE`); and the mandatory preconditions. The per-variant checks need the variant's tables and run in the lowering, before any instruction is emitted: `STAR_UNKNOWN_FLASH_SESSION`, the `erase-memory` cross-check of `@erase` and the identity rows (`STAR_PLAN_SHAPE`), and `STAR_NOT_IN_PROFILE`. A `diag.flash_transfer` whose session is an integer literal (with a `+` or `-` sign, of any size), or a top-level constant bound to such a literal or to an earlier constant that is, and not hidden by a parameter or local of the plan, is compared with the annotation's session by the per-file check; any other expression is evaluated by the lowering of the call, which refuses a session other than the annotation's as `STAR_PLAN_SHAPE` at the argument (and a value known only at run time as `STAR_NON_CONSTANT_ARGUMENT`). The lowering also refuses a `diag.flash_transfer` outside a plan function as `STAR_PLAN_SHAPE` (one in a function nothing reaches from `main`, which the lowering never sees, is refused by the per-file check with the same code), and a plan whose session's row in `flash_sessions.csv` lacks `session_timeout_ms`, `teardown_margin_ms`, `ecu_startup_ms`, `confirmation_window_ms` or `version_read_retries` as `STAR_PLAN_SHAPE` at the annotation (`csv-tables.md` 4.12).
 
@@ -789,7 +790,7 @@ def main():
 The example write procedure, `examples/sequence.example.star`, is a plan of this shape for session 1
 of `examples/example-ecu/`, called once from `main` with `# @preconditions voltage externalSupply
 ignition`: it enters the programming session, unlocks, erases (`# @erase`), transfers, checks with
-`checkProgrammingDependencies` and resets the ECU, calls no function, and keeps the default
+`checkProgrammingDependencies` and resets the ECU, calls no function (a plan may, as Coverage below says), and keeps the default
 recovery point at the erase, so it needs no identity rows. The golden procedure
 (`tests/golden/procedure.star`) holds such a plan too, so the golden files record its expansion
 and `Program.flash`.
@@ -813,12 +814,25 @@ and `Program.flash`.
   annotation, or the plan has no `diag.flash_transfer` call or more than one; a `diag.flash_transfer` in a function the plan calls, directly or not, section functions included, is refused at that call, since the expansion would make a second download.
 - **Coverage.** Everything that runs during the call is in the plan. Functions it calls, directly
   or not, section functions included, are expanded in place, not copied and called: a plan
-  contains no `Call` or `Ret` (ADR-245 item 4). A `Ret` becomes a jump to the join, locals get
-  fresh slots in `main`'s frame, and the copies count toward the specialization budget of 2.6.
-  Not lowered yet: a plan that calls any function is refused at the call (`STAR_NOT_LOWERABLE`).
-  A plan that calls none has no frame of its own: its locals and the transfer's loop counter take
-  fresh slots in `main`'s frame, and its section covers the whole expansion, each primitive in a
-  piece of its own with its idempotency (4.5, ADR-332).
+  contains no `Call` or `Ret` (ADR-245 item 4). The plan has no frame of its own: its locals and
+  the transfer's loop counter take fresh slots in `main`'s frame, and its section covers the whole
+  expansion, each primitive in a piece of its own with its idempotency (4.5, ADR-332). At a call
+  the arguments are evaluated and left on the stack, the callee's body stores them into its
+  parameters, a `return` becomes a jump to the join after the body with its value on the stack as
+  a call leaves it (so a `return` inside a loop is a jump out of it), and the callee's parameters,
+  locals and temporaries take fresh slots after those the caller has used. A function called twice
+  is expanded twice, each with slots of its own. A section function's expansion has its section's
+  pieces laid over its range (4.5), entered by fallthrough at the first (the parameter stores),
+  inside the plan's pieces; `Program::validate`'s rules for sections apply as to any: a
+  `recoveryRequired` section function over the part of the plan before the recovery point is
+  refused (`ContradictoryInterruptibility`, `STAR_NOT_LOWERABLE`, see Validation). The statement
+  around a call does not reach into the expansion: its `# @idempotency` (4.6) does not apply to
+  the callee's calls, a call in an annotated statement that lowers to no `diag` call there is
+  `STAR_BAD_ANNOTATION`, and no `break` or `continue` crosses it. Recursion is refused by the
+  checker as everywhere (4.1); a transfer, `@erase` or `@recoveryRequired` in a callee is refused
+  by the shape rules above, so each boundary is a top-level statement of the plan itself. The
+  expansions count toward the specialization budget of 2.6 in copies and instructions
+  (`STAR_SPECIALIZATION_LIMIT`).
 - **Boundaries.** Derived from the lowered code. The entry is the first instruction of the
   expansion and the post-transfer end the pc after its last. The transfer exit is the RequestTransferExit the `diag.flash_transfer`
   expansion emits. The erase point is the `diag.routine` statement annotated `# @erase`, a single

@@ -63,198 +63,97 @@ cannot place.
 
 ## Decision
 
-1. **One log per job, an entry per exchange, in the reader's terms.**
-   - The agent writes a communication log for every job and ownership generation, as JSON Lines
-     beside the job's journal and protected like it (design 5.5).
-   - **Header.** It lists the job with its candidate variants or combinations (the one chosen
-     follows as an event once identification picks it), the vehicle, the targets, the VCI's version data and the
-     software versions. A job may open several links in turn (design 8.8.2), so what a link has in
-     force (its ComParams, whether it accepted the transmit indication, its confirmation sources,
-     whether it forwards pendings) is written when that link opens, in its `link_opened` event.
-     With those, the log needs no other document.
-   - **Exchange entries.** There is one for each request the agent sends or refuses before
-     sending, with its origin: the procedure, a repeat after a resume (design 8.2.5),
-     identification, restart reads, an access program, or an access target's keep-alive.
-   - **Several answers.** A request that collects every answer within its window (ADR-327's
-     functional presence request), or on which more than one ECU answers, lists each answer with
-     its identifier, bytes, times, outcome and its own classification, so none is dropped. An
-     answer the job acts on, such as a second ECU on the identifier a guard checks (design 8.9.1),
-     says so. The entry takes the most severe of its answers' classifications. Silence on such a
-     request is not a fault (ADR-327 item 2).
-   - **System events.** Worker, VCI, link and job events, the identity values read, clock epochs,
-     late responses, and events the log cannot attach to an exchange are entries on the same
-     timeline.
-   - **Wording.** Each entry says, in vehicle-communication terms:
-     - whether the request reached the bus;
-     - what happened;
-     - the measured response time beside the P2 and P2* limits in force.
+Design 8.11 holds the fields, the terms, the ordered classification table and example logs. The
+decisions behind them:
 
-     It names the service and the negative response code beside their bytes, and keeps the
-     internal names in a separate `detail` field.
-   - Design 8.11 defines the fields and gives example logs.
-2. **Response pending: logged as seen, never assumed absent.**
-   - The API keeps handling 0x78 (`CP_RC78Handling` 1).
-   - The entry lists each pending the agent sees, with its time. A worker that sees a pending
-     passes it on, bound to the primitive.
-   - The entry says whether the link can show pendings at all (`pending_visibility`: `forwarded`
-     or `absorbed_by_vci`), so an empty list on a link whose VCI absorbs them is not read as
-     "none".
-   - A response window is derived against P2, P2* and the completion limit. P2 runs from the
-     transmit, and P2* restarts on each pending, so the entry records each pending's interval from
-     the one before and the final response's interval from the latest pending. The window is
-     within P2, within P2* of the latest forwarded pending, beyond P2 with absorbed pendings
-     (marked as an inference), or no response within each limit. A late response is judged
-     against the same limits.
-   - A pending is an answer from the ECU: it confirms the send and counts in the link's history.
-3. **"Reached the bus": transmit indications on, and a three-valued answer with its evidence.**
-   - **Setting.** The link turns transmit indications on (`CP_TransmitIndEnable` 1). If the
-     library refuses the ComParam, the link opens without it, and the header records that the
-     link has no transmit confirmation.
-   - **Values.** `sent` is `confirmed`, `partial` (the first frame of a multi-frame request went
-     out and the ECU sent no flow control), `not_sent` or `unknown`. `sent_evidence` names the source,
-     in this order:
-     1. a transmit indication for the exchange, bound to its primitive, or unbound and carrying
-        the exchange's request identifier (SAE J2534-1 v04.04 clause 8.6) while no other exchange
-        on the same physical channel is in flight with that identifier. The J2534 worker gives a
-        TxDone to every link on the channel (ADR-151), so an access target's keep-alive on a
-        sibling link is told apart by its identifier;
-     2. a transmit-done time on the response;
-     3. any answer, a pending included, which confirms the send without a time.
-   - **Not sent.** `not_sent` needs a definite refusal: the agent's own, the worker's refusal
-     after a lost VCI (ADR-294), a transmit error event or a missing acknowledge. A refusal that an earlier response
-     caused (a RequestDownload answer without the block length) names that exchange.
-   - **Unknown.** An RPC that failed or timed out while starting the primitive, and every case
-     without evidence, give `unknown`.
-   - **Confirmation sources.** The header names each link's sources, so "unknown on a link that
-     confirms its requests" reads differently from "unknown on a link that has no confirmation".
-4. **Error detail reaches the agent.** The worker's error event carries its extra error
-   information, by name. A receive timeout is then told apart:
-   - a missing flow control: the request was not completely sent;
-   - a missing consecutive frame: the ECU began a response and did not finish it;
-   - no response at all.
-
-   Without that information, the entry says which of these it cannot tell. The host also tells
-   its own deadline passing from the VCI ending the exchange (`vci_did_not_end`).
-5. **Classification on the communication axis.** Each exchange is `vehicle`, `system`,
-   `undetermined` or `none` (completed without fault), with its reason. Design 8.11's table lists
-   the rules for exchange entries in order, and the first that matches applies. The system-side
-   failures come first, so a suppressed response or an answer never hides one.
-   - **Negative responses.** A negative response is the ECU's answer, and `nrc_kind` sorts it:
-     - the ECU's own state (busy, conditions, programming state): `vehicle`;
-     - a request that does not fit the ECU as the definition built it (0x11, 0x12, 0x13, and
-       0x14 and 0x31, which may mean either): `undetermined`;
-     - not supported in the active session (0x7E, 0x7F: a lapsed session, or a definition that
-       places the service in the wrong session): `undetermined`;
-     - out of sequence (0x24, 0x73, which a repeat after a resume can cause): `undetermined`;
-     - a key the ECU refused (0x35, 0x36): `system`, since the key comes from the server's key
-       service (design 8.10).
-   - **Unusable positive responses.** A positive response the agent cannot use (a wrong block
-     echo, a missing length field), and the refusal of a later request it causes, are
-     `undetermined`.
-   - **No response.** A confirmed request with no response, an unfinished response, or a
-     multi-frame request whose flow control never came, on a link that answered since its last
-     error and reported no error during the exchange, is `vehicle`; a pending in the exchange
-     itself counts as an answer of the link. It is `undetermined` in three cases:
-     - when the link has not answered since its last error, its first exchanges included, since
-       a wrong address or response filter is not excluded;
-     - during a link error;
-     - without a confirmation, since the VCI's receive path can lose a response that was on the
-       bus.
-   - **Suppressed responses.** A request with the positive-response suppression bit whose send is
-     confirmed, with no pending seen, and that the VCI ended within P2 without a response is
-     `none`. After a pending the ECU owes its final response even then (ISO 14229-1:2026 7.7.3),
-     and an exchange that ended beyond P2 on a link whose VCI absorbs pendings had one, so both
-     are judged as any other. A positive response to such a request, with no pending, is
-     `vehicle`: the ECU answered although asked not to. The host still ends such a
-     request as having no response today; changing that is not part of this decision.
-   - **Early timeout.** A receive timeout that the VCI reports before the limit in force, measured
-     on one clock, is `system`: the VCI stopped waiting too soon. The limit in force is P2 from the
-     transmit until a pending is seen, then the earlier of P2* from the latest pending and the 0x78
-     completion limit from the first.
-   - **Late final response.** A final response that arrived after the limit in force but before
-     the VCI ended the exchange, measured on one clock, is `vehicle` (the ECU answered late),
-     unless its outcome's own classification is more severe. On a link whose VCI absorbs pendings
-     the first pending is unseen; it came within P2 of the transmit, and the completion limit runs
-     from it, so a response is late there only after the transmit plus P2 plus the completion
-     limit.
-   - **Other primitive errors.** A primitive that ends without a response after another error
-     event of its own is `link_error`: `system` for a VCI hardware fault, an initialisation error
-     or a locked resource, `undetermined` for a receive or protocol error, which the vehicle
-     network and the VCI's receive path can both cause.
-   - **Deadline.** An agent deadline that passed while the VCI never ended the exchange is
-     `system`, sent or not, since the VCI must end its own primitive within its limits. This rule comes before the no-response rules.
-   - **Transmit and receive errors.** A transmit error or a missing acknowledge is `not_sent` and
-     `undetermined`. A response that broke the transport's rules (a wrong sequence number, wrong
-     padding) is `response_malformed` with the send confirmed, `undetermined`, since the ECU and
-     the VCI's receive path are not told apart. Other receive errors count as link errors. The entry's count of earlier answers on the link tells a network that went
-     away from one never reached.
-   - **Lost VCI.** A lost VCI is `undetermined`. A VCI powered from the vehicle's connector drops
-     off USB or WLAN when the vehicle's supply drops, so the loss's kind does not show the side,
-     and the agent knows no supply range of the VCI. The entry carries the extra error
-     information and the last supply reading with its age. After the VCI reconnects in the job,
-     the first reading of its own clock settles the loss: a time base that carried on means it
-     kept its power (the loss was the PC's connection, `system`); one that restarted from zero
-     (ISO 22900-2:2022 8.1.6.1) means it was powered off (still `undetermined`). On a J2534 link
-     the device clock shows only in frame timestamps (ADR-120), so the reconnect records the power
-     state as unknown and a later event settles it with the first such frame, or never. The
-     reading must fit one timeline only: a clock that carried on reads the last device time plus
-     the gap the agent measured (modulo the 32-bit wrap), one that restarted reads no more than
-     the gap. A reading that fits both, as after a wrap or across a long gap, or neither, leaves
-     the state unknown.
-   - **Extra answers.** A request meant for one ECU for which the worker delivered more than one
-     answer is `vehicle` (more than one ECU answers on that identifier), unless an answer's own
-     classification is more severe. An ordinary request ends at its first answer and the worker
-     discards a later one (ADR-100), so a second responder is usually not seen; catching it
-     needs the receive-only capture that item 6 leaves open.
-   - **Other system failures.** A worker that exited or does not answer, lost events, an RPC
-     failure and the agent's refusals are `system`.
-6. **Responses that come after their exchange.**
-   - The agent reads the link's events while it waits and when it closes the link. Items of an
-     earlier primitive, or of none, are written as entries of their own.
-   - A response is seen after its exchange only if the worker delivers it. The J2534 worker
-     discards a frame that no primitive expects (ADR-100), and a D-PDU library may too, so on such
-     links a late response does not reach the log, and the exchange's window (no response within
-     the limit) is all it holds. Capturing such frames would need a receive-only primitive beside
-     the exchanges, which is not decided here.
-   - A response to an earlier exchange that the worker does deliver is a `late_response` entry
-     linked to that exchange. It is
-     classified on its own, not by the exchange rules, by its VCI time against the limits in
-     force:
-     - after the limit: `vehicle` ("answered N ms after the limit");
-     - in time, after the exchange ended for a system cause (lost events, the agent's deadline):
-       that cause's `system`, as an answer the system missed.
-   - The earlier entry is not rewritten.
-   - Matching an unbound indication to the exchange by time holds only while one primitive runs
-     on the link. Until the host cancels a primitive whose deadline passed, an unbound item after
-     such a deadline is written unattached.
-7. **Times: raw, tagged, aligned per clock.**
-   - **Agent times.** Each entry has the agent's monotonic and wall-clock times at the start of
-     the primitive, after it was started, at the transmit confirmation and at the end.
-   - **VCI times.** It has the VCI times as raw values, each tagged with its clock: `device` for
-     the VCI's own, `worker` for a worker's synthetic clock.
-   - **Response latency.** Measured at the VCI, it is the response start less the transmit done,
-     the points the client's P2 timing is measured between (ISO 14229-2:2021 clause 9). It
-     includes the vehicle network and any gateway, not only the ECU. When that is missing, the
-     response end less the transmit done is used, then the agent's times, and the entry names
-     which. A difference is taken only between times of one clock.
-   - **Alignment.** VCI times are aligned with the agent's clock per clock, by the least delay
-     seen between a VCI time and the agent receiving it. The 32-bit values are unwrapped, and a
-     reset or a backward step that is not a wrap opens a new epoch, which the log records. A
-     reconnect opens one only when the time base restarted, so a VCI that kept its power keeps
-     its epoch (item 5, Lost VCI).
-8. **Per message, raw CAN deferred.**
-   - The log records messages (`layer: "message"`), and a `frames` field is reserved.
-   - It cannot place these faults:
-     - ISO-TP flow control and pacing (ISO 15765-2:2024 9.6.5, 9.7, 9.8), beyond what the error's
-       extra information names;
-     - CAN-level causes;
-     - a response on an unexpected identifier;
-     - the timing inside a chain of pendings the VCI absorbed.
-   - A raw CAN channel for those is not decided here (alternatives below).
-9. **The log does not steer the job.**
-   - A failure to write it stops the log and marks the job's result as having an incomplete
-     communication log. It never ends or changes the job.
-   - The journal stays the only record a resume reads.
+1. **One log per job, an entry per exchange, in the reader's terms.** The agent writes a
+   communication log for every job and ownership generation, as JSON Lines beside the job's
+   journal and protected like it (design 5.5). A header at job start, with the `vci_connected`
+   event and a `link_opened` event per link (a job may open several in turn, design 8.8.2), gives
+   everything needed to read it. There is one entry for each request the agent sends or refuses
+   before sending, from any origin; system events share the timeline. Each entry says, in
+   vehicle-communication terms, whether the request reached the bus, what happened, and the
+   response time beside the limits in force; it names the service and the negative response code
+   beside their bytes, and keeps the internal names in a separate `detail` field. Secrets and bulk
+   data (SecurityAccess seeds and keys, Authentication data, TransferData) are logged as length
+   and hash.
+2. **Where the evidence does not decide, the entry says so.** Every judgement rests on what the
+   agent can observe, and a question the evidence leaves open is `unknown`, `undetermined` or
+   "not judged", never a guess. In particular:
+   - a difference is taken only between times of one clock and epoch, and a limit is passed only
+     beyond the link's timing margin;
+   - a response's lateness is judged only from its start (or the end of a single-frame response)
+     on one clock with the transmit;
+   - on a link whose VCI absorbs pendings, a limit that depends on the unseen pendings is bounded
+     from the transmit and judged only where the bound decides;
+   - an extra error code is used only when it names the case, since part of the codes are the
+     vendor's (ISO 22900-2:2022 D.4.2).
+3. **Response pending: logged as seen, never assumed absent.** The API keeps handling 0x78
+   (`CP_RC78Handling` 1); a worker that sees a pending passes it on, bound to the primitive. The
+   entry lists the pendings seen and says whether the link can show them at all
+   (`pending_visibility`), so an empty list on a link whose VCI absorbs them is not read as
+   "none". P2* restarts on each pending and the completion limit runs from the first, as the
+   API's handling does (ISO 22900-2:2022 Annex I.1.2, Figure I.4).
+4. **"Reached the bus": transmit indications on, and a three-valued answer with its evidence.**
+   The link turns transmit indications on (`CP_TransmitIndEnable` 1, ISO 22900-2:2022 B.5.1); a
+   library that refuses it opens the link without, and `link_opened` says so. `sent` is
+   `confirmed`, `partial`, `not_sent` or `unknown`, with the evidence that set it. An unbound
+   indication counts for an exchange only by its request identifier (SAE J2534-1 v04.04 clause
+   8.6), while no other exchange on the physical channel is in flight with that identifier and the
+   API sends no tester present of its own on it, since the J2534 worker gives a TxDone to every
+   link on the channel (ADR-151). Any answer of the ECU, a pending or a first frame included,
+   confirms the send. `not_sent` needs a definite refusal or a transmit error; a failed start of
+   the primitive is `unknown`.
+5. **Error detail reaches the agent.** The worker's error events carry their extra error
+   information, and the host tells its own deadline from the VCI ending the exchange. A receive
+   timeout is an outcome of its exchange; only other error events count as link errors.
+6. **Classification on the communication axis.** Each exchange is `vehicle`, `system`,
+   `undetermined` or `none`, by the first matching row of design 8.11's table; system-side
+   failures come first, and a last row makes any other case `undetermined`. The principles:
+   - a refusal by the agent, a worker or RPC failure, lost events, and a VCI fault of its own are
+     `system`; an agent deadline is `system` only when the VCI's own limits had passed after a
+     confirmed send, since a long transfer can outlast the deadline;
+   - a negative response is the ECU's answer: `vehicle` for its own state, `undetermined` when the
+     code points at the definition, the session or access state, or the sequence, and `system`
+     for a refused key, which the server's key service computed (design 8.10);
+   - no response is `vehicle` only with the send confirmed (or an answer of the ECU in the
+     exchange) on a link that has an answer of the ECU since its last link error and reported
+     none during the exchange; otherwise `undetermined`, since a wrong address, a response filter
+     or the VCI's receive path is not excluded;
+   - a timeout before the limit in force is `system`; a final response after it is `vehicle`;
+   - a suppressed positive response, only for a service with a sub-function as the definition
+     declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes and no pending was seen
+     or inferred, and `vehicle` when one comes anyway; after a pending the ECU owes its final
+     response;
+   - a request that collects every answer takes the most severe of its answers' classifications,
+     each answer judged on its own against the window, and silence is no fault only for the
+     functional presence request (ADR-327 item 2); a request meant for one ECU that gets more than
+     one answer is `vehicle`;
+   - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
+     power (only then `system`), since a VCI powered from the vehicle's connector drops off when
+     the vehicle's supply drops. A clock that restarted does not decide it (on J2534 its origin is
+     the vendor's).
+7. **Responses after their exchange.** The agent reads the link's items while it waits and when
+   it closes the link, so a response that the worker delivers after its exchange is a
+   `late_response` entry referring to that exchange, judged on its own against that exchange's
+   limits. The earlier entry is never rewritten. The J2534 worker discards a frame no primitive
+   expects (ADR-100), so on such links a late response does not reach the log; capturing it would
+   need a receive-only primitive beside the exchanges, which is not decided here.
+8. **Times: raw, tagged, aligned per clock.** The entry keeps agent times (monotonic and wall)
+   and VCI times as raw values tagged with their clock (`device` or `worker`, ADR-120) and epoch.
+   The response latency is the VCI's response start less its transmit done (ISO 14229-2:2021
+   clause 9), which includes the vehicle network and any gateway. VCI times are aligned per clock
+   by least delay, unwrapped from 32 bits (ISO 22900-2:2022 8.1.6.1), with a new epoch for a
+   reset, a backward step or a reconnect whose clock did not carry on.
+9. **Per message, raw CAN deferred.** The log records messages (`layer: "message"`) with a
+   `frames` field reserved. Design 8.11 lists what it cannot place: transport-level faults
+   (ISO 15765-2:2024 9.6.5, 9.7, 9.8) beyond what the error information names, CAN-level causes, a
+   response the worker drops as not matching, a late answer that matches the next request, and the
+   timing inside absorbed pendings.
+10. **The log does not steer the job.** A failure to write it stops the log and marks the job's
+    result as having an incomplete communication log; a torn last line after a power loss is
+    dropped and marks it incomplete too. It never ends or changes the job, and the journal stays
+    the only record a resume reads.
 
 ## Alternatives rejected
 
@@ -291,6 +190,9 @@ cannot place.
   - the worker interface's error events to carry their extra error information
     (`vci-service-interface`, both workers, `docs/rpc-api-guide.md`);
   - the host to tell its own deadline from a VCI-ended exchange without a response;
+  - each link to record its timing margin (the VCI's timestamp resolution and timer spread);
+  - the log's writer to log secrets and bulk data as length and hash, and to recover after a
+    torn last line;
   - the agent to read the link's unbound items (transmit indications, link errors) and those of
     earlier primitives, instead of dropping them;
   - `sim-vci` to give transmit indications, so a test can show a confirmed send with no response;
@@ -298,7 +200,8 @@ cannot place.
     primitive.
 - **Links without confirmation.** A J2534 link on a protocol other than `ISO15765` (SAE J2534-1
   v04.04 clause 8.6), and a library
-  that refuses the indication, confirm only requests that got an answer. On those links an ECU
+  that refuses the indication, confirm only requests that got an answer, unless the link has
+  loopback on. On those links an ECU
   that stops answering stays `undetermined`, and the entry says why.
 - **No pending counts on most links.** On a link whose VCI absorbs pendings, the log shows the
   response window but not how many pendings came.

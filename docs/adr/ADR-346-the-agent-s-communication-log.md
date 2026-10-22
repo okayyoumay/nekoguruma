@@ -40,7 +40,7 @@ What the worker interface gives today:
 - **Transmit confirmation.** It is off by default.
   - A D-PDU link gives a transmit indication only when `CP_TransmitIndEnable` is on (an optional
     ComParam, ISO 22900-2:2022 B.5.1). A result item may also carry a transmit-done time behind
-    its timestamp flags (10.1.4.11.4, D.2.4; ADR-143), but a request that gets no response has no
+    its timestamp flags (ISO 22900-2:2022 10.1.4.11.4, D.2.4; ADR-143), but a request that gets no response has no
     result item to carry it.
   - The J2534 worker passes a TxDone indication on only under the same ComParam (ADR-151). J2534
     v04.04 gives one only on its `ISO15765` protocol (SAE J2534-1 v04.04 clauses 8.6, 8.7.1),
@@ -209,8 +209,8 @@ decisions behind them:
      functional presence request with its send confirmed, no link error in its window and no
      possible pending, and no pending seen (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
-     unless an earlier exchange with the same match is still unanswered, whose late answer the
-     extra one may be;
+     unless the extra answers are no more than the earlier exchanges with the same match still
+     unanswered, whose late answers they may be;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
      the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when

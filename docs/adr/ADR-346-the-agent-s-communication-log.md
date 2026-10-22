@@ -173,7 +173,8 @@ decisions behind them:
    - a negative response is the ECU's answer: `vehicle` only for the codes that name the ECU's
      or the vehicle's own state (ISO 14229-1:2026 Annex A.1: busy, conditions not correct and its
      ranges, programming state); `none` for a code the definition declares definitive for an
-     identification or guard read (ADR-327), unless a pending is possible, when it may be late; `undetermined` for every other code, an invalid key
+     identification or guard read (ADR-327); any of these after a possible pending is
+     `undetermined` (below); `undetermined` for every other code, an invalid key
      (0x35) included, since the key service, the variant's secret and the seed are not told
      apart, and for those that point at the definition, the session, access or sequence, an
      attempt counter another tester may have used up, secured data transmission,
@@ -185,8 +186,8 @@ decisions behind them:
      its timer is judged wrong beside the ECU's lateness, and one the worker delivers after the
      VCI ended the exchange is `vehicle`;
    - on a link whose VCI absorbs pendings, a timeout or response later than P2, or one whose
-     timing cannot be judged, with no pending seen, is a possible pending: a no-response or a
-     positive response there is `undetermined`;
+     timing cannot be judged, with no pending seen, is a possible pending: a no-response or any
+     final response there that is not late is `undetermined`;
    - a suppressed positive response, only for a service with a sub-function as the definition
      declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes after a confirmed send,
      with an earlier matched answer, no link error and no pending seen or possible, `vehicle` when one comes anyway within P2

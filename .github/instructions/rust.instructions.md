@@ -30,6 +30,14 @@ Flag as P1:
   - FFI stale bindings: a header change without regenerated bindings. Accepted only when the
     same PR records the deferred regeneration as a backlog item in `work/`; a note in the PR
     description is not enough.
+- **Main-only test failures not checked locally**: a PR that changes `cfg(not(debug_assertions))`
+  code, or a test whose outcome depends on the build's policy (what a debug or a release agent
+  allows or refuses), whose description does not show the release-build agent tests run
+  locally (CLAUDE.md, "Building and testing"); `agent-release` runs only on main. Likewise a PR
+  that changes a test pull requests skip or run alone on Windows (`j2534-0404-service`'s tests
+  other than `agent_restart_end_to_end`, the agent's `runner::` tests, the `ci-windows`
+  overrides in `.config/nextest.toml`) whose description does not say its Windows run happens
+  only on main.
 - **Warnings silenced the wrong way**: `#[allow(...)]` for code that is unused only until later
   work lands. Use `#[expect(..., reason = "...")]`, which fails once the code is used.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC

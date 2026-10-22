@@ -202,8 +202,8 @@ decisions behind them:
      declares it (ISO 14229-1:2026 7.7.3), is fault-free when none comes after a confirmed send,
      with an earlier matched answer, no link error and no pending seen or possible, `vehicle` when one comes anyway, not late, on
      a link that forwards pendings with none seen, fault-free after a forwarded pending (the ECU
-     then owes its final response), and `undetermined` on a link whose VCI absorbs pendings,
-     where a pending may precede it even within P2;
+     then owes its final response, on any link), and otherwise `undetermined` on a link whose VCI
+     absorbs pendings, where a pending may precede it even within P2;
    - a request that collects every answer takes the most severe of its answers' classifications
      and of any link error or possible pending during its window (another link's error counts
      as `undetermined`), each answer judged on its own against the window, and silence is no fault only for the
@@ -233,8 +233,9 @@ decisions behind them:
    latest entry referring to an exchange gives its standing classification. The earlier entry
    is never rewritten. A settling entry carries the facts of the settling entries before it (a
    give-up, a kept power), keeps any system-side fault an earlier entry observed (it takes the
-   most severe of that fault and its own classification), and a cancellation by the agent settles
-   nothing. The settling entries
+   most severe of that fault and its own classification), also reclassifies the later exchanges
+   whose matched answers or owed requests it changes (an answer it adds to an earlier exchange,
+   or a late link error), and a cancellation by the agent settles nothing. The settling entries
    are:
    - the end of a primitive the agent stopped waiting for (`primitive_ended`), with every item
      that came after the entry, classified as if the agent had waited, except that an end within the

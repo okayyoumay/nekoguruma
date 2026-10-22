@@ -1062,7 +1062,7 @@ When a diagnostic run fails, the agent's communication log tells whether the veh
 
 - One log per job and ownership generation, as JSON Lines (one JSON object per line) in local storage beside the job's journal and with the journal's protection (5.5), since it holds the VIN and ECU data. Upload and retention are not decided yet.
 - One entry per exchange: each request the agent sends through the worker host, and each it refuses before sending. Logging is per UDS message, not per CAN frame (`layer: "message"`; the field `frames` is reserved for a later raw-frame channel).
-- Events of the system share the timeline as entries of their own: job start, resume (with the journal's origin, 8.2.5) and end; worker start, exit and restart; VCI connect and loss; link open and close; the identity values read; a late response; a new VCI clock epoch; an item of the link the log cannot attach to an exchange.
+- Events of the system share the timeline as entries of their own: job start, the variant or combination chosen, resume (with the journal's origin, 8.2.5) and end; worker start, exit and restart; VCI connect and loss; link open and close; the identity values read; a late response; a new VCI clock epoch; an item of the link the log cannot attach to an exchange.
 - The log never changes a job's outcome. A write failure stops the log and marks the job's result "communication log incomplete"; the journal stays the record a resume uses.
 
 **Link settings for the log**
@@ -1079,7 +1079,7 @@ The first line, written once the job's first link is open and before its first r
 
 | Group | Content |
 |---|---|
-| Job | Job ID, ownership generation, procedure name, document hash (8.2.6), the variant or combination chosen |
+| Job | Job ID, ownership generation, procedure name, document hash (8.2.6), the candidate variants or combinations; the one chosen is a `combination_chosen` event once identification has picked it (8.2.4) |
 | Vehicle | The job's target VIN; the identity values read appear later as `identity` events |
 | Per target | Role, ECU definition and variant, as far as known when the header is written |
 | VCI | The worker's version data: vendor, hardware name, serial number and version, firmware name and version, API library name and version, and the API: D-PDU (ISO 22900-2:2022 clause 8) or J2534 (SAE J2534-1 v04.04 clause 7) with its `unsigned long` width (7.1.2) |
@@ -1111,7 +1111,7 @@ The response latency measured at the VCI is its response start less its transmit
 
 **Classification**
 
-An exchange entry is classified by the first row that matches; the `outcome` and `sent` values are those of the entry.
+The limit in force for an exchange is P2 from the transmit until a pending is seen; after one, it is the earlier of P2* from the latest pending and the 0x78 completion limit from the first. An exchange entry is classified by the first row that matches; the `outcome` and `sent` values are those of the entry.
 
 | Outcome | Classification | Reason, in the entry's terms |
 |---|---|---|
@@ -1120,8 +1120,8 @@ An exchange entry is classified by the first row that matches; the `outcome` and
 | `vci_lost` | `undetermined` | The VCI was lost (and how, from the extra error information: USB disconnect, WLAN lost, no response); a VCI powered from the vehicle's connector is also lost when the vehicle's supply drops, so the vehicle is not excluded until the VCI reconnects; the last supply reading and its age are given |
 | `unknown`: worker exited or not answering, events lost, RPC failure | `system` | Named as such, with whether the request was sent (`unknown` while pending or when starting it failed, `not_sent` when refused) |
 | `vci_did_not_end` | `system` | The VCI did not end the exchange within its own timing |
-| `no_response` whose receive timeout came before the limit in force (P2 from the transmit, or P2* from the latest pending), measured on one clock | `system` | The VCI gave up waiting before the limit in force, by how much |
-| `no_response` to a request whose positive response is suppressed, `sent` `confirmed` | `none` | No response was expected |
+| `no_response` whose receive timeout came before the limit in force, measured on one clock | `system` | The VCI gave up waiting before the limit in force, by how much |
+| `no_response` to a request whose positive response is suppressed, `sent` `confirmed`, no pending seen | `none` | No response was expected (after a pending the ECU owes its final response even when suppression was asked, ISO 14229-1:2026 7.7.3, so such an exchange is judged by the rows below) |
 | A request that collects every answer (`answers`), ended by its window, `sent` `confirmed` | The most severe of its answers' classifications (`system`, then `undetermined`, then `vehicle`), or `none` when all are `none` or none answered | How many ECUs answered, and on which identifiers, and the answer that set the classification; each answer is classified by the rows below, as an exchange of its own |
 | `positive` | `none` | |
 | `positive_unusable` | `undetermined` | The ECU's response does not match the definition, and how |
@@ -1136,7 +1136,7 @@ An exchange entry is classified by the first row that matches; the `outcome` and
 
 A `vci_connected` event after a loss in the job settles that loss: when the VCI's time base carried on (no new clock epoch), the VCI kept its power and the loss is `system`, the PC's connection to it; when the time base restarted, the VCI was powered off, so the vehicle's supply is not excluded and the loss stays `undetermined`. The event names the loss's entry.
 
-A `late_response` entry is classified on its own, by its VCI time against the limits in force of the exchange it names (P2 from the transmit, or P2* from the latest pending seen, and the completion limit): after the limit it is `vehicle` (the ECU answered late, by how much); in time, after that exchange ended for a system cause (lost events, the agent's deadline), it is `system` (the ECU answered in time and the system missed the answer). An item the log cannot attach to an exchange is not classified.
+A `late_response` entry is classified on its own, by its VCI time against the limit in force of the exchange it names: after the limit it is `vehicle` (the ECU answered late, by how much); in time, after that exchange ended for a system cause (lost events, the agent's deadline), it is `system` (the ECU answered in time and the system missed the answer). An item the log cannot attach to an exchange is not classified.
 
 Per-message logging cannot place faults inside the transport: ISO-TP flow control and pacing (ISO 15765-2:2024 9.6.5, 9.7, 9.8) beyond what the extra error information names, CAN-level causes (no acknowledge against lost arbitration, error frames), a response on an unexpected identifier, or the timing inside a chain of pendings the VCI absorbed. A raw CAN channel for those is deferred: it would be a second channel on the same pins, which most VCIs cannot open beside the diagnostic one, and is a capability a hardware profile would have to show (13.5).
 

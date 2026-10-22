@@ -65,7 +65,8 @@ cannot place.
 1. **One log per job, an entry per exchange, in the reader's terms.**
    - The agent writes a communication log for every job and ownership generation, as JSON Lines
      beside the job's journal and protected like it (design 5.5).
-   - **Header.** It lists the job, the vehicle, the targets, the VCI's version data and the
+   - **Header.** It lists the job with its candidate variants or combinations (the one chosen
+     follows as an event once identification picks it), the vehicle, the targets, the VCI's version data and the
      software versions. A job may open several links in turn (design 8.8.2), so what a link has in
      force (its ComParams, whether it accepted the transmit indication, its confirmation sources,
      whether it forwards pendings) is written when that link opens, in its `link_opened` event.
@@ -156,11 +157,14 @@ cannot place.
      - without a confirmation, since the VCI's receive path can lose a response that was on the
        bus.
    - **Suppressed responses.** A request with the positive-response suppression bit whose send is
-     confirmed and that the VCI ended without a response is `none`. The host still ends such a
+     confirmed, with no pending seen, and that the VCI ended without a response is `none`. After a
+     pending the ECU owes its final response even then (ISO 14229-1:2026 7.7.3), so such an
+     exchange is judged as any other. The host still ends such a
      request as having no response today; changing that is not part of this decision.
-   - **Early timeout.** A receive timeout that the VCI reports before the limit in force (P2 from
-     the transmit, or P2* from the latest pending), measured on one clock, is `system`: the VCI
-     stopped waiting too soon.
+   - **Early timeout.** A receive timeout that the VCI reports before the limit in force, measured
+     on one clock, is `system`: the VCI stopped waiting too soon. The limit in force is P2 from the
+     transmit until a pending is seen, then the earlier of P2* from the latest pending and the 0x78
+     completion limit from the first.
    - **Deadline.** An agent deadline that passed while the VCI never ended the exchange is
      `system`, sent or not, since the VCI must end its own primitive within its limits. This rule comes before the no-response rules.
    - **Transmit and receive errors.** A transmit error or a missing acknowledge is `not_sent` and

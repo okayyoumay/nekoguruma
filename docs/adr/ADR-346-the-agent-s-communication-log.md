@@ -161,7 +161,8 @@ decisions behind them:
      by the agent or the worker for its own reasons, a worker or RPC failure, lost events, a
      VCI fault of its own, a timer judged wrong), or the system gave up on or missed an exchange
      that ended well; `none` when every reading is fault-free; otherwise `undetermined`. Faults
-     seen together take the most severe; alternative readings never combine.
+     seen together take the most severe, a link error the exchange's own link reported
+     during it included; alternative readings never combine.
 
    What this gives, in particular:
    - an agent deadline is `system` only when a reading of the VCI's device clock at the

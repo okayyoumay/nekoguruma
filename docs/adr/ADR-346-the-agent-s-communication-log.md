@@ -133,8 +133,9 @@ decisions behind them:
    the exchange. A receive timeout is an outcome of its exchange; only other error events, on
    any link of the same physical channel, count as link errors. The link sets
    `CP_RC21Handling` and `CP_RC23Handling` to 0, so the API repeats no request unseen on a busy
-   answer, unless the profile declares the code a pending code (ADR-309 item 5), which the log
-   then treats as a pending, and the agent never sets the suppress-positive-response transmit flag (ISO
+   answer, unless the profile declares the code a pending code (ADR-309 item 5); the API then repeats
+   the request unseen, so a response after such a code is not judged against the original
+   transmit and the code counts like an absorbed pending, and the agent never sets the suppress-positive-response transmit flag (ISO
    22900-2:2022 Annex I.2.1), with which the API would end a silent exchange without a timeout
    and hide an unexpected positive response. A primitive past the agent's deadline holds its
    link (ISO 22900-2:2022 8.4.17.2), so the agent cancels it before the link's next request, and at job end after
@@ -151,8 +152,9 @@ decisions behind them:
      the last link error on the physical channel and the target's last reset or
      session change); a frame lost in the transport or the VCI's receive path (excluded only by
      no link error during the exchange, and never for a missing flow-control frame); and a
-     pending the VCI absorbed (excluded on a link that forwards pendings, or by timing within P2
-     judged on one clock; a pending is never presumed absent);
+     pending the VCI absorbed (excluded on a link that forwards pendings, or by a receive timeout at
+     or within P2 judged on one clock, since a pending restarts the wait; a final response within
+     P2 does not exclude a prompt pending before it; a pending is never presumed absent);
    - one presumption is accepted, and only one: the VCI's own timer and its handling of pendings
      as configured (each pending restarts its wait) are presumed right where they cannot be
      judged (so a timeout at P2 shows that no pending came), since otherwise no silence could be
@@ -169,7 +171,8 @@ decisions behind them:
    What this gives, in particular:
    - an agent deadline is `system` only when a reading of the VCI's device clock at the
      deadline, less its round trip, shows the VCI's own limits had passed after a confirmed send
-     with no response under way, and even then only until the primitive's end settles it (item
+     with no response under way (by more than a single frame's transfer, which gives no start
+     indication), and even then only until the primitive's end settles it (item
      7); on J2534 no such reading exists (ADR-120);
    - a response the ECU began and did not finish, and a missing flow-control frame, are
      `undetermined`; only a flow-control wait past its limit that the extra error information

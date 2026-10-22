@@ -204,7 +204,7 @@ decisions behind them:
      functional presence request with its send confirmed, no link error in its window and no
      possible pending (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
-     unless the previous exchange with the same match went unanswered, whose late answer the
+     unless the earlier exchange with the same match is still unanswered, whose late answer the
      extra one may be;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
      power (only then `system`; the reading is compared within a VCI-wide clock margin plus a

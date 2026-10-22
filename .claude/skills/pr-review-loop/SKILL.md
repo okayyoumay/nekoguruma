@@ -229,7 +229,11 @@ continue that agent with `SendMessage` rather than spawning a fresh one.
 **Fix the kind, not the spot.** A finding names one place; the same gap usually sits in its
 siblings too. For each finding you fix, search the whole diff for the same kind (the same term,
 the same rule stated elsewhere, the same shape of case) and fix those places in the same push.
-The thread reply (Step 4) names the other places the fix covered.
+A sibling of the same *shape* in code or design is a second instance, which
+[reference/finding-routing.md](reference/finding-routing.md) sends to 2b unless `design-advisor`
+already decided the pattern: route it there before applying the first fix to it, since a second
+instance may mean the first fix is wrong. Siblings in documents (drift, a dropped qualifier, a
+citation) are fixed directly. The thread reply (Step 4) names the other places the fix covered.
 
 ## Sweep: the kinds that recur
 
@@ -240,7 +244,8 @@ spot that was named. Before the first review request (Step 0) and in every round
 --untracked-files=all` lists), not only the round's
 fix. A diff holds no commit messages and no PR description, so read those too: the branch's
 messages (`git log origin/main..HEAD`), the round's draft message and the PR description. Check
-each kind below and fix what you find in the same push:
+each kind below and fix what you find in the same push, routing a gap of the same shape as a
+finding already fixed as "Fix the kind, not the spot" says:
 
 - **Cross-document drift.** A rule stated in more than one place (an ADR item, a design
   section, the ADR's `docs/adr/INDEX.md` row and theme entry, the glossary, a crate's docs, a

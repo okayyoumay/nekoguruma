@@ -36,8 +36,9 @@ Flag as P1:
   locally (CLAUDE.md, "Building and testing"); `agent-release` runs only on main. Likewise a PR
   that changes a test pull requests skip or run alone on Windows (`j2534-0404-service`'s tests
   other than `agent_restart_end_to_end`, the agent's `runner::` tests, the `ci-windows`
-  overrides in `.config/nextest.toml`) whose description does not say its Windows run happens
-  only on main.
+  overrides in `.config/nextest.toml`), or code only such tests exercise, whose description
+  does not show the test run locally under the `ci-windows` profile and say that its Windows
+  run happens only on main (`pr-review-loop`, Step 3).
 - **Warnings silenced the wrong way**: `#[allow(...)]` for code that is unused only until later
   work lands. Use `#[expect(..., reason = "...")]`, which fails once the code is used.
 - **Out-of-scope targets**: Windows workers target `*-pc-windows-gnullvm` only (ADR-227). An MSVC

@@ -293,7 +293,8 @@ If a later check leads to another edit, sweep that edit too and run the checks a
    --test <binary>`, the agent's `runner::` unit tests with `cargo nextest run --profile
    ci-windows -p agent --lib -E 'test(/^runner::/)'`. Look for timing
    assumptions it would make on a slower runner (fixed sleeps, timer windows, waits for a
-   process to exit), and say in the PR description that its Windows run happens only on main.
+   process to exit), and say in the PR's test plan that you ran it this way and that its Windows run happens
+   only on main.
 2. Run `edge-case-hunter` on the round's fix when the fix meets its gate in `.claude/README.md`.
    A review-round fix is not exempt because the reviewer will look again: an unaudited fix tends to
    become the next round's finding.

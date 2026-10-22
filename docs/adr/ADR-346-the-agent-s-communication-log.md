@@ -209,8 +209,8 @@ decisions behind them:
      unless an earlier exchange with the same match is still unanswered, whose late answer the
      extra one may be;
    - a lost VCI is `undetermined` until its clock, after it reconnects, shows that it kept its
-     power (only then `system`; the reading is compared within a VCI-wide clock margin plus a
-     recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
+     power (only then `system`; the reading is compared within a VCI-wide clock margin for each of
+     the two readings plus a recorded drift bound over the gap), since a VCI powered from the vehicle's connector drops off when
      the vehicle's supply drops. A clock that restarted does not decide it, nor does a
      reconnected VCI with another serial number or a gap that spans an agent restart, and on
      J2534, whose frame clock has a vendor-defined origin (ADR-120), the loss stays
@@ -236,8 +236,8 @@ decisions behind them:
      clock readings, the measured gap, the tolerance and each fit test, so a reader can redo it;
    - a response the worker delivers after the exchange ended (`late_response`): started within
      the limit less the margin it is `system`, since the system missed an answer in time; after
-     the limit plus the margin `vehicle`, or its outcome's classification if that is more
-     severe; otherwise `undetermined`; it belongs to the ended exchange it
+     the limit plus the margin `vehicle`, or its outcome's classification from the rows that do
+     not turn on timing if that is more severe; otherwise `undetermined`; it belongs to the ended exchange it
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link

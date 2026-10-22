@@ -263,8 +263,8 @@ finding already fixed as "Fix the kind, not the spot" says:
 - **Safety invariants.** On a write, flash or routine-control path, the preconditions and
   guards of design 5.5, 5.6 and 8.9 and the authorization levels of section 6 hold on every
   path, resume and error paths included.
-- **Citations.** Every citation of a standard names the standard, its edition (for ISO 22900-2,
-  2009 or 2022) and the clause, in code, documents, commit messages and the PR description
+- **Citations.** Every citation of a standard names the standard and the clause, and a citation
+  of ISO 22900-2 also its edition (2009 or 2022), as the review guidelines require, in code, documents, commit messages and the PR description
   alike.
 
 ## Step 3: verify before the push

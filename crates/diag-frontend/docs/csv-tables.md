@@ -496,7 +496,7 @@ without the row cannot use that key. A kind is given once per variant
 |---|---|---|---|
 | `kind` | `vin`, `hardware_part_number` or `software_version` | yes | The value read; one row per kind per variant |
 | `service` | service name | yes | A generated DID read of the variant (`vin.read`, a ReadDataByIdentifier of one DID, 4.7), the request shape the agent's source table reads; any other service is `CSV_BAD_VALUE`, one the variant does not have `CSV_UNKNOWN_REFERENCE` |
-| `field` | name | yes | The top-level response field that holds the value: the DID's only response field, so that it is the whole data record after the echoed identifier (the response shape the agent's source table decodes), of an ASCII text or unsigned integer type, the encodings the agent's source table decodes; for `vin`, a fixed 17-byte ASCII text field only, since the agent's VIN checks compare a 17-character text. A DID of several fields, or a field of another type, is `CSV_BAD_VALUE`; a field the response lacks is `CSV_UNKNOWN_REFERENCE` |
+| `field` | name | yes | The top-level response field that holds the value: the DID's only response field, so that it is the whole data record after the echoed identifier (the response shape the agent's source table decodes), of an ASCII text or unsigned integer type, the encodings the agent's source table decodes; an ASCII text field of every kind must be of fixed length (no terminator, no length prefix) and of whole bytes, since the agent's source table reads a field of one fixed length; for `vin`, it is a fixed 17-byte (136-bit) field only, since the agent's VIN checks compare a 17-character text. A DID of several fields, or a field of another type, is `CSV_BAD_VALUE`; a field the response lacks is `CSV_UNKNOWN_REFERENCE` |
 
 The field starts at byte 0 of the record (no `byte` other than 0, no `bit`). The unsigned integer
 is a `uint` field of whole bytes, up to seven, in big-endian order, the one encoding the agent
@@ -849,7 +849,7 @@ does not have:
 - `variants.csv` and `variant_patterns.csv`: the variants are told apart by the first two
   characters of the software version (DID 0xF189).
 - `dids.csv`: the session (a text table), the spare part number and software version
-  (`terminated` ASCII to the end of the message), the VIN (writable outside the default session, behind security access),
+  (fixed-length ASCII of 11 and 5 bytes, so that an identity row can name them), the VIN (writable outside the default session, behind security access),
   the flash state (three fields at fixed positions), the power cycle count and, in the second variant only, a supply
   voltage with a linear conversion and a unit; and a last reset reason whose details are a
   `select` on the reason (`select_cases.csv`): no data, the `watchdogReset` layout, or a range of
@@ -872,10 +872,11 @@ does not have:
   the recovery facts (the timings, the version read retries and the no-application NRC) and the
   RequestDownload format bytes. The session lists every step, `erase-memory` included, so the
   example write procedure marks its erase with `# @erase`.
-- `identity.csv`: the VIN, the one field of its DID. The spare part number and software version
-  DIDs are terminated text, which an identity row refuses (4.13), so they have no row. The
-  example write procedure keeps the default recovery point at the erase, which allows no restart
-  after it and so needs no identity rows (`starlark-subset.md` 4.9).
+- `identity.csv`: all three kinds, each the one field of a fixed-length ASCII DID: the VIN
+  (17 bytes), the spare part number (11) and the software version (5). A procedure whose flash plan
+  allows a restart therefore finds the three rows `Program::validate` requires
+  (`starlark-subset.md` 4.9). The example write procedure keeps the default recovery point at the
+  erase, which allows no restart after it.
 - `preconditions.csv`: the five preconditions, all read from the agent's inputs.
 
 A row of `fields.csv` from it, the VIN in its data record:

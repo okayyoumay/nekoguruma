@@ -33,6 +33,13 @@ pub const DID_ACTIVE_DIAGNOSTIC_SESSION: u16 = 0xF186;
 pub const DID_SPARE_PART_NUMBER: u16 = 0xF187;
 pub const DID_SOFTWARE_VERSION: u16 = 0xF189;
 pub const DID_VIN: u16 = 0xF190;
+/// Length in bytes of the answer to [`DID_SPARE_PART_NUMBER`]: `EcuConfig::part_number` padded
+/// with spaces. The example ECU definition declares the DID as fixed-length text of this width,
+/// since the agent's identity table reads only fixed-length fields.
+pub const PART_NUMBER_LENGTH: usize = 11;
+/// Length in bytes of the answer to [`DID_SOFTWARE_VERSION`], padded as [`PART_NUMBER_LENGTH`]
+/// is.
+pub const SW_VERSION_LENGTH: usize = 5;
 /// Simulator-specific DID (system supplier range) reporting the flash state, so that a resume can
 /// start with a state check (8.2.5). Record: phase code (1 byte), block number (4 bytes) and
 /// bytes received of the current download (4 bytes), big endian.
@@ -159,6 +166,39 @@ pub struct EcuConfig {
     /// startup in progress). `None` answers at once, as the simulator always did.
     #[serde(default)]
     pub startup_ms: Option<u32>,
+}
+
+impl EcuConfig {
+    /// Checks that the VIN is exactly 17 ASCII bytes (F190), and that the part number and the
+    /// software versions fit the fixed widths F187 and F189 answer with ([`PART_NUMBER_LENGTH`],
+    /// [`SW_VERSION_LENGTH`]): ASCII, at most that long (a shorter value is padded with spaces when read). The loaders of a configuration file
+    /// call it; [`SimEcu`] itself cuts an over-long value to the width, so its answers keep the
+    /// length either way.
+    pub fn validate(&self) -> Result<(), String> {
+        let check = |name: &str, value: &str, width: usize| {
+            if value.is_ascii() && value.len() <= width {
+                Ok(())
+            } else {
+                Err(format!("{name} must be at most {width} ASCII characters"))
+            }
+        };
+        if self.vin.len() != 17 || !self.vin.is_ascii() {
+            return Err("vin must be exactly 17 ASCII characters".into());
+        }
+        check("part_number", &self.part_number, PART_NUMBER_LENGTH)?;
+        check("sw_version", &self.sw_version, SW_VERSION_LENGTH)?;
+        if let Some(version) = &self.downloaded_sw_version {
+            check("downloaded_sw_version", version, SW_VERSION_LENGTH)?;
+        }
+        Ok(())
+    }
+}
+
+/// `value` as exactly `width` bytes: padded with spaces, or cut when longer.
+pub(crate) fn fixed_width(value: &str, width: usize) -> Vec<u8> {
+    let mut bytes = value.as_bytes().to_vec();
+    bytes.resize(width, b' ');
+    bytes
 }
 
 // ---------------------------------------------------------------- Clock

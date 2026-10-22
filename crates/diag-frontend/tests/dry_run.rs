@@ -210,8 +210,8 @@ fn answers_built_from_the_declarations_reach_the_procedure() {
     };
     assert_eq!(code, "SESSION");
 
-    // With the session scripted, the spare part number is built as the fewest bytes its
-    // terminated field decodes from, which the procedure's check then refuses.
+    // With the session scripted, the spare part number is built as the fixed 11 bytes its
+    // field decodes from, which the procedure's check then refuses.
     let script = Script::new().response("activeSession.read", read_did(0xF186, &[0x01]));
     let report = run(&document("read.star", "exampleEcuV1"), None, &script);
     assert_eq!(
@@ -231,7 +231,7 @@ fn answers_built_from_the_declarations_reach_the_procedure() {
 fn a_scripted_answer_takes_the_procedures_failure_path() {
     let script = Script::new()
         .response("activeSession.read", read_did(0xF186, &[0x01]))
-        .response("sparePartNumber.read", read_did(0xF187, b"OTHER"));
+        .response("sparePartNumber.read", read_did(0xF187, b"OTHER      "));
     let report = run(&document("read.star", "exampleEcuV1"), None, &script);
     let DryRunEnd::Failed(Failure { code, .. }) = &report.end else {
         panic!("{report:#?}");

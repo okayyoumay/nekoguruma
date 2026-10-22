@@ -95,7 +95,7 @@ While an ECU is attached, and while other ComPrimitives still wait or run after 
 An ECU is attached in one of two ways:
 
 - `__mock_sim_ecu_control` (below), for tests that load the mock in their own process;
-- `NGR_SIM_ECU_CONFIG`, the variable `sim-vci` reads: when it names a `sim_ecu::EcuConfig` JSON file at `PDUConstruct` and no ECU is attached, the mock attaches one with that configuration. A file that cannot be read or parsed makes `PDUConstruct` fail with `PDU_ERR_FCT_FAILED`.
+- `NGR_SIM_ECU_CONFIG`, the variable `sim-vci` reads: when it names a `sim_ecu::EcuConfig` JSON file at `PDUConstruct` and no ECU is attached, the mock attaches one with that configuration. A file that cannot be read or parsed, or that holds a value `EcuConfig::validate` refuses (a part number or software version that is not ASCII or is too long, a VIN that is not 17 ASCII bytes), makes `PDUConstruct` fail with `PDU_ERR_FCT_FAILED`.
 
 `__mock_reset` detaches the ECU.
 
@@ -115,7 +115,7 @@ All back-door functions are exported with C ABI using the `__mock_` prefix.
 
 | Function | Description |
 |----------|-------------|
-| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with the `sim_ecu::EcuConfig` fields given set over that default (for example `{"response_delay_ms":500}`; a field `EcuConfig` does not have returns 1); `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
+| `__mock_sim_ecu_control(command)` | Applies a NUL-terminated JSON command; returns 0 when it applied, 1 otherwise. `{"attach":{}}` attaches an ECU with `sim-vci`'s default configuration, `{"attach":{"config":{...}}}` one with the `sim_ecu::EcuConfig` fields given set over that default (for example `{"response_delay_ms":500}`; a field `EcuConfig` does not have, or a value `EcuConfig::validate` refuses such as a software version longer than 5 bytes, returns 1); `{"detach":{}}` detaches it; `{"inject_fault":{"fault":...}}` arms a `sim_ecu::Fault`, with an optional `"service"` (SID) or `"request"` (byte prefix) to wait for, not both. A fault with no ECU attached returns 1. |
 
 ### Call Counters
 

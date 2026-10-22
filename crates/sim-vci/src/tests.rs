@@ -1540,6 +1540,37 @@ impl Drop for StateDir {
 }
 
 #[test]
+fn a_config_file_with_an_over_long_value_is_refused() {
+    let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    let dir = StateDir::new("config");
+    let file = dir.0.join("ecu.json");
+    let write = |config: &EcuConfig| {
+        std::fs::write(&file, serde_json::to_string(config).unwrap()).unwrap();
+    };
+    // SAFETY: the tests that read the environment hold `SERIAL`, as this one does.
+    unsafe { std::env::set_var(ECU_CONFIG_ENV, &file) };
+    write(&default_ecu_config());
+    let accepted = load_ecu_config();
+    write(&EcuConfig {
+        sw_version: "1.0.0.1".into(),
+        ..default_ecu_config()
+    });
+    let refused = load_ecu_config();
+    // Open creates the ECU from the file, so it fails the same way.
+    {
+        let mut bus = lock();
+        bus.ecu = None;
+    }
+    let mut device = 0;
+    let opened = unsafe { PassThruOpen(ptr::null(), &mut device) };
+    unsafe { std::env::remove_var(ECU_CONFIG_ENV) };
+    assert!(accepted.is_some());
+    assert!(refused.is_none());
+    assert_eq!(opened, ERR_FAILED);
+    reset(default_ecu_config());
+}
+
+#[test]
 fn the_state_file_round_trips_the_ecu() {
     let dir = StateDir::new("round-trip");
     let mut ecu = SimEcu::new(default_ecu_config());

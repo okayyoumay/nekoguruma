@@ -19,8 +19,19 @@ fn the_example_declares_its_identity_preconditions_and_recovery_facts() {
         .collect();
     assert_eq!(
         identity,
-        // The part number and version DIDs are terminated text, which no identity row takes.
-        [(IdentityKind::Vin, "vin", "vin")]
+        [
+            (IdentityKind::Vin, "vin", "vin"),
+            (
+                IdentityKind::HardwarePartNumber,
+                "sparePartNumber",
+                "sparePartNumber"
+            ),
+            (
+                IdentityKind::SoftwareVersion,
+                "softwareVersion",
+                "softwareVersion"
+            ),
+        ]
     );
     let kinds: Vec<_> = tables.preconditions.iter().map(|r| r.kind).collect();
     assert_eq!(
@@ -42,7 +53,7 @@ fn the_example_declares_its_identity_preconditions_and_recovery_facts() {
     assert_eq!(voltage.programming_source, None);
     // Both variants hold every row.
     for variant in &definition.variants {
-        assert_eq!(variant.identity, [0]);
+        assert_eq!(variant.identity, [0, 1, 2]);
         assert_eq!(variant.preconditions, [0, 1, 2, 3, 4]);
     }
     let session = &tables.flash_sessions[0];

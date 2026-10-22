@@ -459,7 +459,9 @@ fn load_ecu_config() -> Option<EcuConfig> {
         None => Some(default_ecu_config()),
         Some(path) => {
             let text = std::fs::read_to_string(path).ok()?;
-            serde_json::from_str(&text).ok()
+            let config: EcuConfig = serde_json::from_str(&text).ok()?;
+            config.validate().ok()?;
+            Some(config)
         }
     }
 }

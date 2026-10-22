@@ -66,18 +66,26 @@ fn every_program_of_a_variant_carries_its_identity_and_the_named_preconditions()
         let names = |kind: IdentityKind| {
             let source = match kind {
                 IdentityKind::Vin => identity.vin,
-                _ => unreachable!("the example declares only the VIN"),
+                IdentityKind::HardwarePartNumber => identity.hardware_part_number,
+                IdentityKind::SoftwareVersion => identity.software_version,
             };
             source_names(document, source.expect("a source"))
         };
-        assert_eq!(
-            names(IdentityKind::Vin),
-            ("vin.read".into(), "vin".into()),
-            "{index}"
-        );
-        // The part number and version DIDs of the example are terminated text: no row.
-        assert_eq!(identity.hardware_part_number, None);
-        assert_eq!(identity.software_version, None);
+        for (kind, service, field) in [
+            (IdentityKind::Vin, "vin.read", "vin"),
+            (
+                IdentityKind::HardwarePartNumber,
+                "sparePartNumber.read",
+                "sparePartNumber",
+            ),
+            (
+                IdentityKind::SoftwareVersion,
+                "softwareVersion.read",
+                "softwareVersion",
+            ),
+        ] {
+            assert_eq!(names(kind), (service.into(), field.into()), "{index}");
+        }
         let named = index % 2 == 0;
         let p = &program.preconditions;
         assert_eq!(p.voltage_mv.is_some(), named, "{index}");
@@ -306,6 +314,15 @@ fn vin_answer() -> Vec<u8> {
     answer
 }
 
+/// The example with the VIN as its only identity row.
+pub(super) fn vin_only_table() -> Vec<(String, Vec<u8>)> {
+    with(
+        example(),
+        "identity.csv",
+        "variants,kind,service,field,note\n,vin,vin.read,vin,\n",
+    )
+}
+
 /// The example's identity table with a part number and a software version as integer reads.
 pub(super) fn identity_table() -> Vec<(String, Vec<u8>)> {
     with(
@@ -416,12 +433,13 @@ fn an_ecu_info_read_is_a_safe_send_receive_the_declarations_accept() {
 
 #[test]
 fn an_ecu_info_key_without_an_identity_row_is_unknown() {
-    // The example declares only the VIN: its part number and version are terminated text.
+    // A variant without those rows: only the VIN stays.
     for key in ["part_number", "software_version"] {
         let source =
             format!("def main():\n    diag.log(1, \"x\")\n    diag.ecu_info()[\"{key}\"]\n");
-        let definition = resolve(read_files(with(example(), "a.star", &source)).expect("reads"))
-            .expect("resolves");
+        let definition =
+            resolve(read_files(with(vin_only_table(), "a.star", &source)).expect("reads"))
+                .expect("resolves");
         let rejected = lower_procedures(&definition).expect_err("rejected");
         assert!(
             rejected

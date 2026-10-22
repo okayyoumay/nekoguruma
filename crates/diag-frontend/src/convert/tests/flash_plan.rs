@@ -7,7 +7,7 @@ use diag_ir::{
     RecoveryTiming,
 };
 
-use super::restart::identity_table;
+use super::restart::{identity_table, vin_only_table};
 use super::services::appended;
 use super::*;
 use crate::star::StarCode;
@@ -180,7 +180,7 @@ fn recovery_never_and_a_marker_after_the_erase_allow_a_restart_with_the_identity
     assert!(program.identity.hardware_part_number.is_some());
     assert!(program.identity.software_version.is_some());
     // Without the identity rows the plan is refused before anything is lowered.
-    let errors = lowered(example(), &never).expect_err("refused");
+    let errors = lowered(vin_only_table(), &never).expect_err("refused");
     assert_eq!(
         errors.iter().map(|e| e.code).collect::<Vec<_>>(),
         [StarCode::PlanShape]
@@ -198,6 +198,20 @@ fn recovery_never_and_a_marker_after_the_erase_allow_a_restart_with_the_identity
     assert_eq!(plan.recovery_required, RecoveryRequired::FromPc(check - 1));
     assert!(plan.boundaries.transfer_exit_pc < check - 1);
     assert!(plan.allows_restart());
+}
+
+#[test]
+fn a_restartable_plan_lowers_against_the_examples_own_identity_rows() {
+    let never = PLAN.replace("session=1", "session=1 recovery=never");
+    let programs = lowered(example(), &never).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(programs.len() > 1, "both variants");
+    for program in &programs {
+        program.validate().expect("valid");
+        assert!(program.flash[0].allows_restart());
+        assert!(program.identity.vin.is_some());
+        assert!(program.identity.hardware_part_number.is_some());
+        assert!(program.identity.software_version.is_some());
+    }
 }
 
 #[test]
@@ -720,7 +734,10 @@ fn the_example_write_procedure_lowers_and_dry_runs_for_every_variant() {
                 [0x71, 0x01, 0xFF, 0x01, 0x00],
             )
             .response("ecuReset", [0x51, 0x01])
-            .response("softwareVersion.read", [0x62, 0xF1, 0x89, b'1', b'.', b'0']);
+            .response(
+                "softwareVersion.read",
+                [0x62, 0xF1, 0x89, b'1', b'.', b'0', b'.', b'1'],
+            );
         let report = dry_run(
             &program,
             &document.variant().expect("a variant"),

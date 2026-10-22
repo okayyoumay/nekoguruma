@@ -11,6 +11,7 @@
 * activeSession.read 62 F1 86 03
 * activeSession.read 62 F1 86 7F
 * softwareVersion.read 62 F1 89 31 2E 30 2E 31
+* sparePartNumber.read 62 F1 87 4E 47 52 2D 53 49 4D 2D 45 43 55
 * flashState.read 62 FD 00 02 00 00 00 05 00 01 00 00
 * powerCycles.read 62 FD 01 00 00 04 D2
 * lastResetReason.read 62 FD 03 01

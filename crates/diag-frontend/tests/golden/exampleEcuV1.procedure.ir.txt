@@ -4,7 +4,7 @@ EcuDocumentT {
         "csv-starlark",
     ),
     source_digest: Some(
-        "39db40be86c40c7f034c99ea6163fdb0a666579d5bf93989010256aad96dad6d",
+        "efd83517d3b73e069e1d30e4b4526ffe3f8d2ea7115168c1469b5d6accb323b7",
     ),
     variant: Some(
         EcuVariantT {
@@ -997,8 +997,8 @@ EcuDocumentT {
                                             ),
                                             placement: Absolute,
                                             bit_offset: 24,
-                                            length_kind: Terminated,
-                                            bit_length: 0,
+                                            length_kind: Fixed,
+                                            bit_length: 88,
                                             kind: Ascii,
                                             byte_order: Big,
                                             compu: CompuIdentity(
@@ -1006,7 +1006,7 @@ EcuDocumentT {
                                             ),
                                             unit_id: 0,
                                             length_field_id: 0,
-                                            min_bytes: 1,
+                                            min_bytes: 0,
                                             max_bytes: 0,
                                             termination: EndOfPdu,
                                             shape: NONE,
@@ -1081,8 +1081,8 @@ EcuDocumentT {
                                             ),
                                             placement: Absolute,
                                             bit_offset: 24,
-                                            length_kind: Terminated,
-                                            bit_length: 0,
+                                            length_kind: Fixed,
+                                            bit_length: 40,
                                             kind: Ascii,
                                             byte_order: Big,
                                             compu: CompuIdentity(
@@ -1090,7 +1090,7 @@ EcuDocumentT {
                                             ),
                                             unit_id: 0,
                                             length_field_id: 0,
-                                            min_bytes: 1,
+                                            min_bytes: 0,
                                             max_bytes: 0,
                                             termination: EndOfPdu,
                                             shape: NONE,
@@ -4877,8 +4877,18 @@ Program {
                 field_id: 23,
             },
         ),
-        hardware_part_number: None,
-        software_version: None,
+        hardware_part_number: Some(
+            EcuService {
+                service_id: 10,
+                field_id: 21,
+            },
+        ),
+        software_version: Some(
+            EcuService {
+                service_id: 11,
+                field_id: 22,
+            },
+        ),
     },
     preconditions: Preconditions {
         voltage_mv: Some(

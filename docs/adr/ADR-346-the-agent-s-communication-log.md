@@ -93,8 +93,10 @@ decisions behind them:
      echo's, which the VCI takes at the transmit's end) to a VCI time of the same clock. A
      response start or a receive timeout is judged both ways. A response's end includes its own
      transfer, so it is judged one way only: within the limit it proves the response on time,
-     and it proves it late only past the limit plus the margin plus the longest transfer of that
-     length at the link's speed. A single-frame response on CAN usually has only its end, since
+     and it proves it late only for a response sent as one frame or one UART message, past the
+     limit plus the margin plus the longest transfer of that length at the link's speed (a
+     multi-frame response's end includes flow control the log does not see, so it never proves
+     it late). A single-frame response on CAN usually has only its end, since
      start-of-message indications come only for a first frame or a UART first byte (ISO
      22900-2:2022 8.1.6.3, 8.1.6.5). Agent times, which include the RPC and worker queuing, are
      reported but never decide lateness or an early timeout;
@@ -169,7 +171,7 @@ decisions behind them:
    - a negative response is the ECU's answer: `vehicle` only for the codes that name the ECU's
      or the vehicle's own state (ISO 14229-1:2026 Annex A.1: busy, conditions not correct and its
      ranges, programming state); `none` for a code the definition declares definitive for an
-     identification or guard read (ADR-327); `undetermined` for every other code, an invalid key
+     identification or guard read (ADR-327), unless a pending is possible, when it may be late; `undetermined` for every other code, an invalid key
      (0x35) included, since the key service, the variant's secret and the seed are not told
      apart, and for those that point at the definition, the session, access or sequence, an
      attempt counter another tester may have used up, secured data transmission,

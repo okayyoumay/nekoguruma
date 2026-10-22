@@ -24,15 +24,16 @@ finding.
 
 After opening the PR, and after every fix push that Step 4's re-request rule lets through,
 request a review from the PR's reviewer. Before the first request, run the sweep ("Sweep: the
-kinds that recur", below) over the whole diff and push what it fixes. The reviewer is Codex until a case below switches the PR
+kinds that recur", below) over the whole diff, and take what it fixes through Step 3's checks
+before pushing it. The reviewer is Codex until a case below switches the PR
 to Copilot; from then on it stays Copilot for the rest of the PR. Never switch back, and never ask
 both: each reviewer reads the whole diff again from scratch, so a second reviewer on the same PR
 adds a full round of new findings instead of converging.
 
 **PRs that change only backlog files (ADR-251).** If every file the PR changes against `main`
 is a backlog file, `work/*backlog.md`, request no review. `scripts/check-backlog.sh`
-(which `repo-checks.yml` also runs) checks their format; run it, the Step 3 checks that
-apply and the sweep (below; with no review to come, it runs once), then go to Step 5. Other files in `work/` (`work/README.md`, the development plan) hold
+(which `repo-checks.yml` also runs) checks their format. Run the sweep first (below; with no review to
+come, it runs once), then the script and the Step 3 checks that apply, then go to Step 5. Other files in `work/` (`work/README.md`, the development plan) hold
 contributor rules and milestones the script does not check, so a PR touching them is reviewed
 as usual. If a later push makes the PR change any other file, request a review at that point and
 run the loop as usual from Step 1.
@@ -232,7 +233,7 @@ The thread reply (Step 4) names the other places the fix covered.
 
 Reviewers find these kinds of gap one at a time, a round each, because a fix mends only the
 spot that was named. Before the first review request (Step 0) and in every round that pushes
-(Step 3, check 6), read the whole PR diff (`git diff origin/main...HEAD`), not only the round's
+(Step 3, before its checks), read the whole PR diff (`git diff origin/main...HEAD`), not only the round's
 fix, for each kind below, and fix what you find in the same push:
 
 - **Cross-document drift.** A rule stated in more than one place (an ADR item, a design
@@ -257,11 +258,15 @@ fix, for each kind below, and fix what you find in the same push:
 
 Handle **every** finding of the round before pushing; one push per round, never one per
 finding. A round where every finding was declined (2d) or answered by pointing at an earlier
-reply changes no file: skip checks 1 to 4 and 6 below and the push (still do check 5, the base), never make an empty commit, and go straight to
+reply changes no file: skip the sweep, checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
 newly declined finding *and* this head has not been re-requested after a no-change round
 before. Otherwise the loop ends: go to Step 5 after the replies. So the same head is
 re-requested at most once.
+
+First run the sweep ("Sweep: the kinds that recur") over the whole diff as it stands after the
+round's fixes, and make its fixes, so that checks 1 to 5 below verify the tree that is pushed.
+If a later check leads to another edit, sweep that edit too and run the checks again on it.
 
 1. Run what CLAUDE.md's "Building and testing" lists, delegated to `cargo-runner` when the output
    is long. Run the whole changed crate (`cargo test -p <crate>` runs unit and integration
@@ -286,8 +291,6 @@ re-requested at most once.
    if it moved and run checks 1 to 4 on the merged tree; a PR that conflicts with its base gets
    no CI run at all. In a no-change round, merge only if the PR conflicts with `main`; that merge
    makes it a changed round, so run checks 1 to 4 and push it.
-6. **Sweep.** Run the sweep ("Sweep: the kinds that recur") over the whole diff as it stands
-   after the round's fixes, and include what it fixes in the same push.
 
 ## Step 4: commit, push, answer, re-request
 

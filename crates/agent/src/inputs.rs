@@ -12,8 +12,11 @@
 //!   the battery voltage (ADR-238). [`FixedInputs`] holds fixed
 //!   readings, for tests and for later wiring.
 //! - [`Source::EcuService`]: a field of a diagnostic response, located through a
-//!   [`ServiceSources`] table. The table stands in until the declaration part has a decoder
-//!   (ADR-245, consequences).
+//!   [`ServiceSources`] table. A job with a document gets its table from the document
+//!   ([`ServiceSources::from_document`], ADR-336 item 1), which declares the service and the
+//!   field; a job without one keeps the table its caller builds by hand (ADR-245,
+//!   consequences). The table's shape (below) is all that is read, so a document source of
+//!   another shape is refused when the job is checked.
 //!
 //! "Cannot be established" and "cannot be decoded" are readings, not errors. A caller treats
 //! either as a failed check (ADR-229). A failure to reach or use the worker (a transport
@@ -24,7 +27,12 @@ use std::collections::HashMap;
 use std::time::Duration;
 
 use crate::client::WorkerApi;
-use diag_ir::{DiagHost, RuntimeInput, Source};
+use crate::document::JobDocument;
+use diag_ir::declaration::{
+    ByteOrder, Compu, DataKind, EcuVariant, Field, LengthKind, Placement, Shape,
+};
+use diag_ir::encode::encode_request;
+use diag_ir::{DiagHost, Program, RuntimeInput, Source};
 use serde::{Deserialize, Serialize};
 use tokio::runtime::Handle;
 use vci_service_interface::{
@@ -267,6 +275,16 @@ pub enum TableError {
          (at most 8 for an integer)"
     )]
     BadField { service_id: u32, field_id: u32 },
+    /// The job's document does not declare the source in the table's shape
+    /// ([`ServiceSources::from_document`]).
+    #[error(
+        "service {service_id} field {field_id}: the document's declaration cannot be read: {reason}"
+    )]
+    Document {
+        service_id: u32,
+        field_id: u32,
+        reason: String,
+    },
 }
 
 /// The table that maps `EcuService` sources to requests and response fields.
@@ -322,10 +340,151 @@ impl ServiceSources {
         Self::try_from(fields)
     }
 
+    /// Builds the table of `program`'s `EcuService` sources (identity and precondition sources)
+    /// from the variant the job's `document` declares, one entry per distinct source (ADR-336
+    /// item 1). A source's service is a single-identifier ReadDataByIdentifier: its request is
+    /// encoded as the runtime encodes it (`diag_ir::encode::encode_request`), the positive
+    /// response echoes the identifier as its prefix, and the source's field is a fixed-length,
+    /// byte-aligned ASCII text or unsigned big-endian integer that follows the echo and is the
+    /// last byte of the response, with no conversion. A source the document does not declare, or
+    /// declares in another shape (a terminated or variable-length field among them), is an
+    /// error, and so is one the table's own checks refuse ([`ServiceSources::new`]).
+    pub fn from_document(document: &JobDocument, program: &Program) -> Result<Self, TableError> {
+        let variant = document.variant();
+        let mut named: Vec<(u32, u32)> = Vec::new();
+        for source in program_sources(program) {
+            if let Source::EcuService {
+                service_id,
+                field_id,
+            } = source
+                && !named.contains(&(service_id, field_id))
+            {
+                named.push((service_id, field_id));
+            }
+        }
+        let fields = named
+            .into_iter()
+            .map(|(service_id, field_id)| {
+                declared_field(&variant, service_id, field_id).map_err(|reason| {
+                    TableError::Document {
+                        service_id,
+                        field_id,
+                        reason,
+                    }
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        Self::new(fields)
+    }
+
     pub fn get(&self, service_id: u32, field_id: u32) -> Option<&ServiceField> {
         self.fields
             .iter()
             .find(|f| f.service_id == service_id && f.field_id == field_id)
+    }
+}
+
+/// Every source `program` declares: the identity sources and the default- and
+/// programming-session sources of the preconditions.
+fn program_sources(program: &Program) -> Vec<Source> {
+    let identity = &program.identity;
+    let preconditions = &program.preconditions;
+    let mut sources: Vec<Source> = [
+        identity.vin,
+        identity.hardware_part_number,
+        identity.software_version,
+    ]
+    .into_iter()
+    .flatten()
+    .collect();
+    for precondition in [
+        &preconditions.voltage_mv,
+        &preconditions.external_supply,
+        &preconditions.ignition,
+        &preconditions.engine,
+        &preconditions.vehicle_speed,
+    ]
+    .into_iter()
+    .flatten()
+    {
+        sources.extend(precondition.default_session);
+        sources.extend(precondition.programming_session);
+    }
+    sources
+}
+
+/// The table entry for field `field_id` of service `service_id` in `variant`, or what keeps the
+/// declaration from the table's shape.
+fn declared_field(
+    variant: &EcuVariant<'_>,
+    service_id: u32,
+    field_id: u32,
+) -> Result<ServiceField, String> {
+    let service = variant
+        .services()
+        .and_then(|services| services.iter().find(|s| s.id() == service_id))
+        .ok_or("the document declares no such service")?;
+    let request = service.request().ok_or("the service declares no request")?;
+    let positive = service
+        .positive()
+        .ok_or("the service declares no positive response")?;
+    // The operand, after the SID; a request with parameters has no values to encode here.
+    let operand = encode_request(&request, &std::collections::HashMap::new())
+        .map_err(|error| format!("the request cannot be encoded without parameters: {error}"))?;
+    let mut bytes = vec![request.sid()];
+    bytes.extend_from_slice(&operand);
+    let prefix = positive.prefix().map_or(&[][..], |p| p.bytes());
+    if positive.sid() != request.sid().wrapping_add(0x40) || prefix != operand.as_slice() {
+        return Err("the positive response does not echo the request".to_owned());
+    }
+    // Where each field of the response lies, in bytes from the SID.
+    let mut edge = 1 + prefix.len();
+    let mut end_of_response = 0;
+    let mut target = None;
+    for field in positive.fields().into_iter().flatten() {
+        if field.shape_type() != Shape::NONE || field.length_kind() != LengthKind::Fixed {
+            return Err("the response has a field that is not of fixed length".to_owned());
+        }
+        let (byte, bit) = match field.placement() {
+            Placement::Absolute => ((field.bit_offset() / 8) as usize, field.bit_offset() % 8),
+            Placement::AfterPrevious if field.bit_offset() <= 7 => (edge, field.bit_offset()),
+            _ => return Err("the response has a field with an unusable placement".to_owned()),
+        };
+        let width = field.bit_length();
+        edge = byte + (u64::from(bit) + u64::from(width)).div_ceil(8) as usize;
+        end_of_response = end_of_response.max(edge);
+        if field.id() == field_id {
+            target = Some((field, byte, bit, edge));
+        }
+    }
+    let (field, byte, bit, end) = target.ok_or("the service's response declares no such field")?;
+    if bit != 0 || field.bit_length() == 0 || field.bit_length() % 8 != 0 {
+        return Err("the field is not a whole number of bytes at a byte edge".to_owned());
+    }
+    if end != end_of_response {
+        return Err("another field of the response reaches past the field".to_owned());
+    }
+    let encoding = field_encoding(&field)?;
+    Ok(ServiceField {
+        service_id,
+        field_id,
+        request: bytes,
+        // From the byte after the SID; the table checks it is the echo's length.
+        offset: byte.saturating_sub(1),
+        length: (field.bit_length() / 8) as usize,
+        encoding,
+    })
+}
+
+/// The table's encoding of `field`: ASCII text or a big-endian unsigned integer, as stored.
+fn field_encoding(field: &Field<'_>) -> Result<Encoding, String> {
+    if !matches!(field.compu_type(), Compu::NONE | Compu::CompuIdentity) {
+        return Err("the field has a conversion".to_owned());
+    }
+    match field.kind() {
+        DataKind::Ascii => Ok(Encoding::Ascii),
+        DataKind::Uint if field.byte_order() == ByteOrder::Big => Ok(Encoding::UnsignedBigEndian),
+        _ => Err("the field is neither ASCII text nor a big-endian unsigned integer".to_owned()),
     }
 }
 
@@ -950,5 +1109,228 @@ mod tests {
             decode_field(&field(7), 0x22, &response(7)),
             Reading::Value(0x00FF_FFFF_FFFF_FFFF)
         );
+    }
+
+    // ------------------------------------------------ a table from the job's document
+
+    mod from_document {
+        use super::*;
+        use crate::document::tests::{document_of, empty_program, read_service};
+        use diag_ir::declaration::{ByteOrder, DataKind, LengthKind, ServiceT};
+        use diag_ir::{IdentitySources, Precondition, Satisfied};
+
+        fn ecu(service_id: u32) -> Source {
+            Source::EcuService {
+                service_id,
+                field_id: 1,
+            }
+        }
+
+        fn document(services: Vec<ServiceT>) -> JobDocument {
+            JobDocument::new(document_of(services, None)).unwrap()
+        }
+
+        /// A program that reads its VIN through service 1, the hardware part number through
+        /// service 2, and an engine precondition's programming source through service 3.
+        fn named() -> Program {
+            let mut program = empty_program();
+            program.identity = IdentitySources {
+                vin: Some(ecu(1)),
+                hardware_part_number: Some(ecu(2)),
+                software_version: None,
+            };
+            program.preconditions.engine = Some(Precondition {
+                satisfied: Satisfied { lower: 0, upper: 0 },
+                default_session: Some(Source::RuntimeInput(RuntimeInput::EngineRunning)),
+                programming_session: Some(ecu(3)),
+            });
+            program
+        }
+
+        fn services() -> Vec<ServiceT> {
+            vec![
+                read_service(1, "readVin", [0xF1, 0x90], DataKind::Ascii, 17),
+                read_service(2, "readHardware", [0xF1, 0x91], DataKind::Ascii, 8),
+                read_service(3, "readCounter", [0xF1, 0x00], DataKind::Uint, 2),
+            ]
+        }
+
+        fn refused(services: Vec<ServiceT>) -> TableError {
+            ServiceSources::from_document(&document(services), &named()).unwrap_err()
+        }
+
+        #[test]
+        fn fixed_length_reads_give_a_table_that_resolves_the_sources() {
+            let table = ServiceSources::from_document(&document(services()), &named()).unwrap();
+            let expected = ServiceSources::new(vec![
+                ServiceField {
+                    service_id: 1,
+                    field_id: 1,
+                    request: vec![0x22, 0xF1, 0x90],
+                    offset: 2,
+                    length: 17,
+                    encoding: Encoding::Ascii,
+                },
+                ServiceField {
+                    service_id: 2,
+                    field_id: 1,
+                    request: vec![0x22, 0xF1, 0x91],
+                    offset: 2,
+                    length: 8,
+                    encoding: Encoding::Ascii,
+                },
+                ServiceField {
+                    service_id: 3,
+                    field_id: 1,
+                    request: vec![0x22, 0xF1, 0x00],
+                    offset: 2,
+                    length: 2,
+                    encoding: Encoding::UnsignedBigEndian,
+                },
+            ])
+            .unwrap();
+            assert_eq!(table, expected);
+            let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
+            assert_eq!(
+                resolve_source(ecu(1), &table, &mut host).unwrap(),
+                Reading::Text("WVWZZZ1JZXW000001".to_owned())
+            );
+            assert_eq!(host.sent, [(0x22, vec![0xF1, 0x90])]);
+            let mut host = Fake::answering(&[0x62, 0xF1, 0x00, 0x01, 0x02]);
+            assert_eq!(
+                resolve_source(ecu(3), &table, &mut host).unwrap(),
+                Reading::Value(0x0102)
+            );
+        }
+
+        #[test]
+        fn a_source_named_twice_is_one_entry_and_services_nobody_names_are_left_out() {
+            let mut program = named();
+            program.identity.software_version = Some(ecu(1));
+            let mut services = services();
+            // A service the program does not name may be of any shape.
+            services[1].request.as_mut().unwrap().sid = 0x19;
+            program.identity.hardware_part_number = None;
+            let table = ServiceSources::from_document(&document(services), &program).unwrap();
+            assert!(table.get(1, 1).is_some() && table.get(3, 1).is_some());
+            assert!(table.get(2, 1).is_none());
+            // Nothing named: an empty table.
+            assert_eq!(
+                ServiceSources::from_document(&document(Vec::new()), &empty_program()),
+                Ok(ServiceSources::default())
+            );
+        }
+
+        #[test]
+        fn a_source_the_document_does_not_declare_is_refused() {
+            let mut services = services();
+            services.pop();
+            assert!(matches!(
+                refused(services),
+                TableError::Document {
+                    service_id: 3,
+                    field_id: 1,
+                    ..
+                }
+            ));
+            // A field the service does not have.
+            let mut program = named();
+            program.identity.vin = Some(Source::EcuService {
+                service_id: 1,
+                field_id: 2,
+            });
+            let got = ServiceSources::from_document(&document(self::services()), &program);
+            assert!(
+                matches!(got, Err(TableError::Document { field_id: 2, .. })),
+                "{got:?}"
+            );
+        }
+
+        #[test]
+        fn a_read_of_several_identifiers_or_another_service_is_refused_by_the_table() {
+            let mut multi = services();
+            let two = Some(vec![0xF1, 0x90, 0xF1, 0x86]);
+            multi[0].request.as_mut().unwrap().prefix = two.clone();
+            multi[0].positive.as_mut().unwrap().prefix = two;
+            assert!(matches!(
+                refused(multi),
+                TableError::Unsupported { service_id: 1, .. }
+            ));
+            let mut other = services();
+            other[0].request.as_mut().unwrap().sid = 0x19;
+            other[0].positive.as_mut().unwrap().sid = 0x59;
+            assert!(matches!(
+                refused(other),
+                TableError::Unsupported { service_id: 1, .. }
+            ));
+        }
+
+        #[test]
+        fn a_field_that_is_not_fixed_aligned_and_plain_is_refused() {
+            let edit = |change: &dyn Fn(&mut diag_ir::declaration::FieldT)| {
+                let mut services = services();
+                let positive = services[0].positive.as_mut().unwrap();
+                change(&mut positive.fields.as_mut().unwrap()[0]);
+                refused(services)
+            };
+            let is_document = |error: TableError| matches!(error, TableError::Document { .. });
+            // Terminated or led by a length: the length is not known before the response.
+            assert!(is_document(edit(
+                &|f| f.length_kind = LengthKind::Terminated
+            )));
+            assert!(is_document(edit(
+                &|f| f.length_kind = LengthKind::LeadingLength
+            )));
+            // Not on a byte edge, or not a whole number of bytes.
+            assert!(is_document(edit(&|f| f.bit_offset = 4)));
+            assert!(is_document(edit(&|f| f.bit_length = 17 * 8 - 4)));
+            // Not text or an unsigned integer, or converted.
+            assert!(is_document(edit(&|f| f.kind = DataKind::Bytes)));
+            assert!(is_document(edit(&|f| f.kind = DataKind::Int)));
+            assert!(is_document(edit(&|f| {
+                f.kind = DataKind::Uint;
+                f.byte_order = ByteOrder::Little;
+            })));
+            // An integer field is at most 8 bytes: the table's own check.
+            assert!(matches!(
+                edit(&|f| {
+                    f.kind = DataKind::Uint;
+                    f.bit_length = 9 * 8;
+                }),
+                TableError::BadField { .. }
+            ));
+        }
+
+        #[test]
+        fn a_response_that_has_more_than_the_field_or_does_not_echo_is_refused() {
+            // The field is not the last of the response.
+            let mut services = services();
+            let positive = services[0].positive.as_mut().unwrap();
+            let mut more = positive.fields.as_ref().unwrap()[0].clone();
+            more.id = 2;
+            positive.fields.as_mut().unwrap().push(more);
+            assert!(matches!(
+                refused(services),
+                TableError::Document { service_id: 1, .. }
+            ));
+            // The response prefix is not the request's identifier.
+            let mut services = self::services();
+            services[0].positive.as_mut().unwrap().prefix = Some(vec![0xF1, 0x86]);
+            assert!(matches!(
+                refused(services),
+                TableError::Document { service_id: 1, .. }
+            ));
+            // A request that takes a parameter has no value to send.
+            let mut services = self::services();
+            let mut param = diag_ir::declaration::FieldT::default();
+            param.id = 1;
+            param.short_name = Some("p".into());
+            param.bit_length = 8;
+            services[0].request.as_mut().unwrap().params = Some(vec![param]);
+            assert!(matches!(
+                refused(services),
+                TableError::Document { service_id: 1, .. }
+            ));
+        }
     }
 }

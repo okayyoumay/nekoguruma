@@ -161,8 +161,8 @@ changes the file. The journal only records; committing an intent marker before t
 commit fails, are the job runner's duties.
 
 `agent::run_program_journaled` is the runner that keeps it (ADR-252). It takes a
-`JournalSetup` (directory, job key, the `ServiceSources` table for the ECU's identity, and
-the VIN the job targets, which a first run records as the journal's first record and a
+`JournalSetup` (directory, job key, the `ServiceSources` table for the ECU's identity, which
+only a job without a document uses (below), and the VIN the job targets, which a first run records as the journal's first record and a
 restart compares against, and the software version the job intends to write, recorded right
 after it in the same creating write and compared the same way, ADR-268) and the job's guards ("Job guards"
 below), which it returns with the result, and,
@@ -843,9 +843,18 @@ check as well.
   `sim-vci` simulates only the battery voltage (ADR-238). So they read "cannot be established". `FixedInputs` holds fixed readings for tests.
 - Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
-  big-endian integer, or printable ASCII). It is a stand-in until the declaration part has a
-  decoder (ADR-245, consequences). Until then a table accepts only single-identifier
-  ReadDataByIdentifier entries (request `[0x22, hi, lo]`, offset 2): other services do not echo
+  big-endian integer, or printable ASCII). A job with a document gets its table from the
+  document (`ServiceSources::from_document`, ADR-336 item 1): one entry per distinct
+  `EcuService` source the program names (identity and precondition sources), each read from the
+  declared service, with the request encoded as the runtime encodes it. `check_job` builds it, so
+  a source the document does not declare, or declares as anything but a single-identifier
+  ReadDataByIdentifier whose positive response echoes the identifier and ends in one
+  fixed-length, byte-aligned, unconverted ASCII or big-endian unsigned field, ends the job in
+  `JobError::Sources` before anything is sent (terminated and variable-length fields are not
+  read). The runner then uses that table, on a first run and a resume alike, in place of
+  `JournalSetup::sources`; a job without a document keeps the caller's table (hand-built
+  programs and tests). A table accepts only single-identifier ReadDataByIdentifier entries
+  (request `[0x22, hi, lo]`, offset 2): other services do not echo
   their request in a form the table can check, and a request for several identifiers lets the
   ECU leave some out. Building a table also refuses a duplicate id pair. The response must be
   exactly the positive SID, the echoed identifier and the field. A source missing from the

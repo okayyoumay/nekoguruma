@@ -185,9 +185,11 @@ cannot place.
      kept its power (the loss was the PC's connection, `system`); one that restarted from zero
      (ISO 22900-2:2022 8.1.6.1) means it was powered off (still `undetermined`). On a J2534 link
      the device clock shows only in frame timestamps (ADR-120), so the reconnect records the power
-     state as unknown and a later event settles it with the first such frame, or never. A gap of
-     half the 32-bit wrap or more since the last device time leaves a restart and a wrap
-     indistinguishable, so the state stays unknown.
+     state as unknown and a later event settles it with the first such frame, or never. The
+     reading must fit one timeline only: a clock that carried on reads the last device time plus
+     the gap the agent measured (modulo the 32-bit wrap), one that restarted reads no more than
+     the gap. A reading that fits both, as after a wrap or across a long gap, or neither, leaves
+     the state unknown.
    - **Extra answers.** A request meant for one ECU for which the worker delivered more than one
      answer is `vehicle` (more than one ECU answers on that identifier), unless an answer's own
      classification is more severe. An ordinary request ends at its first answer and the worker

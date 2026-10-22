@@ -104,7 +104,7 @@ cannot place.
      2. a transmit-done time on the response;
      3. any answer, a pending included, which confirms the send without a time.
    - **Not sent.** `not_sent` needs a definite refusal: the agent's own, the worker's refusal
-     after a lost VCI (ADR-294), or a transmit error event. A refusal that an earlier response
+     after a lost VCI (ADR-294), a transmit error event or a missing acknowledge. A refusal that an earlier response
      caused (a RequestDownload answer without the block length) names that exchange.
    - **Unknown.** An RPC that failed or timed out while starting the primitive, and every case
      without evidence, give `unknown`.
@@ -138,23 +138,28 @@ cannot place.
      multi-frame request whose flow control never came, on a link that answered since its last
      error and reported no error during the exchange, is `vehicle`. It is `undetermined` in
      three cases:
-     - on the link's first exchange, since a wrong address or response filter is not excluded;
-     - after or during a link error;
+     - when the link has not answered since its last error, its first exchanges included, since
+       a wrong address or response filter is not excluded;
+     - during a link error;
      - without a confirmation, since the VCI's receive path can lose a response that was on the
        bus.
    - **Suppressed responses.** A request with the positive-response suppression bit whose send is
      confirmed and that the VCI ended without a response is `none`. The host still ends such a
      request as having no response today; changing that is not part of this decision.
-   - **Deadline.** An agent deadline that passed while the VCI, having confirmed the send, never
-     ended the exchange is `system`. This rule comes before the no-response rules.
-   - **Transmit errors.** A transmit or network error (no acknowledge, network fault) is
-     `undetermined`. The entry's count of earlier answers on the link tells a network that went
+   - **Deadline.** An agent deadline that passed while the VCI never ended the exchange is
+     `system`, sent or not, since the VCI must end its own primitive within its limits. This rule comes before the no-response rules.
+   - **Transmit and receive errors.** A transmit error or a missing acknowledge is `not_sent` and
+     `undetermined`. A response that broke the transport's rules (a wrong sequence number, wrong
+     padding) is `response_malformed` with the send confirmed, `undetermined`, since the ECU and
+     the VCI's receive path are not told apart. Other receive errors count as link errors. The entry's count of earlier answers on the link tells a network that went
      away from one never reached.
-   - **Lost VCI.** A lost VCI is `system` when the error's extra information names the PC's
-     connection to the VCI (a USB disconnect, a lost WLAN). Otherwise it is `undetermined`: a VCI
-     powered from the vehicle's connector is lost when the vehicle's supply drops, and the agent
-     knows no supply range of the VCI. The entry carries the last supply reading and its age when
-     there is one.
+   - **Lost VCI.** A lost VCI is `undetermined`. A VCI powered from the vehicle's connector drops
+     off USB or WLAN when the vehicle's supply drops, so the loss's kind does not show the side,
+     and the agent knows no supply range of the VCI. The entry carries the extra error
+     information and the last supply reading with its age. When the VCI reconnects in the job, the
+     event says whether its time base carried on (it kept its power: the loss was the PC's
+     connection, `system`) or restarted from zero (ISO 22900-2:2022 8.1.6.1: it was powered off,
+     still `undetermined`), and names the loss.
    - **Other system failures.** A worker that exited or does not answer, lost events, an RPC
      failure and the agent's refusals are `system`.
 6. **Responses that come after their exchange.**

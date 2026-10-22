@@ -5,7 +5,7 @@
 **Affects:** design 8.11 (new); `agent` (`WorkerHost::send_recv` / `send_recv_async` and the
 link's event handling in `host.rs`, the ComParams `link.rs` sets, the job runner); the worker
 interface's error events (`vci-service-interface`, `docs/rpc-api-guide.md`); `sim-vci`
-(transmit indications); ADR-235 item 3, ADR-236, ADR-289, ADR-294
+(transmit indications); ADR-235 item 3, ADR-236, ADR-289, ADR-294, ADR-309 item 5
 
 ## Context
 
@@ -253,8 +253,10 @@ decisions behind them:
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link
      error of the exchange's time that comes after the entry (`late_item`; an item bound to a
-     primitive belongs to its exchange, and only an unbound one needs the single-owner test), a late link error
-     also settling the later exchanges that relied on answers from before it; a forwarded pending after the VCI ended the exchange is
+     primitive belongs to its exchange, and only an unbound one needs the single-owner test, with no exchange in flight using its request
+     identifier for a transmit indication or loopback echo, or its response identifier for a
+     start or pending), a late link error also settling the later exchanges that relied on answers
+     from before it or were made `undetermined` by a request owed from before it; a forwarded pending after the VCI ended the exchange is
      judged like a late response against the limit before it; a late start-of-message indication is judged by its time like a late response,
      and turns an exchange that ended without a response into `response_incomplete` only when its
      time does not decide.

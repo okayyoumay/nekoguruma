@@ -122,9 +122,12 @@ decisions behind them:
    - a response the ECU began and did not finish is `undetermined`, since a frame lost in the
      network or the VCI's receive path cannot be told from the ECU stopping;
    - a lost VCI keeps the `sent` that the evidence before the loss gave it;
-   - a negative response is the ECU's answer: `vehicle` for its own state, `undetermined` when the
-     code points at the definition, the session or access state, or the sequence, and `system`
-     for a refused key, which the server's key service computed (design 8.10);
+   - a negative response is the ECU's answer: `vehicle` only for the codes that name the ECU's
+     or the vehicle's own state (ISO 14229-1:2026 Annex A.1: busy, conditions not correct and its
+     ranges, programming state); `system` for an invalid key (0x35), which the server's key
+     service computed (design 8.10); `undetermined` for every other code, including those that
+     point at the definition, the session, access or sequence, an attempt counter another tester
+     may have used up, authentication, and codes with no known meaning;
    - no response is `vehicle` only with the send confirmed (or an answer of the ECU in the
      exchange) on a link that has an answer of the ECU since its last link error and reported
      none during the exchange; otherwise `undetermined`, since a wrong address, a response filter

@@ -201,6 +201,20 @@ fn recovery_never_and_a_marker_after_the_erase_allow_a_restart_with_the_identity
 }
 
 #[test]
+fn a_restartable_plan_lowers_against_the_examples_own_identity_rows() {
+    let never = PLAN.replace("session=1", "session=1 recovery=never");
+    let programs = lowered(example(), &never).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    assert!(programs.len() > 1, "both variants");
+    for program in &programs {
+        program.validate().expect("valid");
+        assert!(program.flash[0].allows_restart());
+        assert!(program.identity.vin.is_some());
+        assert!(program.identity.hardware_part_number.is_some());
+        assert!(program.identity.software_version.is_some());
+    }
+}
+
+#[test]
 fn a_session_without_an_erase_step_has_the_download_as_its_erase_point() {
     let (program, plan) = one_plan(with_steps(NO_ERASE_STEPS), PLAN_NO_ERASE);
     let download = find(&program, 0, service(0x34));

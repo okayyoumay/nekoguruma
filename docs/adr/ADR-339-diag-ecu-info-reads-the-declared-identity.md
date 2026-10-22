@@ -1,7 +1,7 @@
 # ADR-339: `diag.ecu_info` Reads the Declared Identity Through a Literal Key
 
 **Date:** 2026-10-20
-**Status:** Accepted
+**Status:** Accepted (the example ECU declares all three identity rows since its fixed-length part number and version DIDs, so `part_number` and `software_version` read there)
 **Affects:** `diag-frontend` (the lowering of `diag.ecu_info`, `STAR_UNKNOWN_IDENTITY`), Starlark subset 3.2, 3.4, 4.6 and 5, `csv-tables.md` 4.13; ADR-254, ADR-336, ADR-338
 
 ## Context

@@ -169,9 +169,9 @@ pub struct EcuConfig {
 }
 
 impl EcuConfig {
-    /// Checks that the part number and the software versions fit the fixed widths F187 and F189
-    /// answer with ([`PART_NUMBER_LENGTH`], [`SW_VERSION_LENGTH`]): ASCII, at most that long
-    /// (a shorter value is padded with spaces when read). The loaders of a configuration file
+    /// Checks that the VIN is exactly 17 ASCII bytes (F190), and that the part number and the
+    /// software versions fit the fixed widths F187 and F189 answer with ([`PART_NUMBER_LENGTH`],
+    /// [`SW_VERSION_LENGTH`]): ASCII, at most that long (a shorter value is padded with spaces when read). The loaders of a configuration file
     /// call it; [`SimEcu`] itself cuts an over-long value to the width, so its answers keep the
     /// length either way.
     pub fn validate(&self) -> Result<(), String> {
@@ -182,6 +182,9 @@ impl EcuConfig {
                 Err(format!("{name} must be at most {width} ASCII characters"))
             }
         };
+        if self.vin.len() != 17 || !self.vin.is_ascii() {
+            return Err("vin must be exactly 17 ASCII characters".into());
+        }
         check("part_number", &self.part_number, PART_NUMBER_LENGTH)?;
         check("sw_version", &self.sw_version, SW_VERSION_LENGTH)?;
         if let Some(version) = &self.downloaded_sw_version {

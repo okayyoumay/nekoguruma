@@ -612,7 +612,7 @@ fn ecu_events(
 }
 
 /// The `EcuConfig` in the file `path` names, if it names one (`NGR_SIM_ECU_CONFIG`); `Err` when
-/// the file cannot be read or parsed.
+/// the file cannot be read or parsed, or holds a value `EcuConfig::validate` refuses.
 fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>, ()> {
     match path {
         None => Ok(None),
@@ -1299,7 +1299,7 @@ exported_fn!(__mock_reset() -> T_PDU_ERROR {
 
 // Exported FFI back-door: controls the simulated ECU (ADR-299). `command` is a NUL-terminated
 // JSON `SimEcuCommand`; returns 0 when it applied, 1 when it did not parse or could not apply
-// (a fault with no ECU attached, or both `service` and `request`).
+// (a fault with no ECU attached, both `service` and `request`, an `attach` with a field `EcuConfig` lacks, or one with a value `EcuConfig::validate` refuses).
 exported_fn!(__mock_sim_ecu_control(command: *const c_char) -> UNUM32 {
     if command.is_null() {
         return 1;
@@ -1727,6 +1727,13 @@ mod sim_ecu_tests {
         assert_eq!(config.vin, "WVWZZZ1KZAW000001");
         let invalid = temp_file("invalid", "not json");
         assert!(ecu_config_from(Some(invalid.clone().into_os_string())).is_err());
+        let too_long = EcuConfig {
+            part_number: "NGR-SIM-ECU-X".into(),
+            ..default_ecu_config()
+        };
+        let too_long = temp_file("too-long", &serde_json::to_string(&too_long).unwrap());
+        assert!(ecu_config_from(Some(too_long.clone().into_os_string())).is_err());
+        std::fs::remove_file(too_long).unwrap();
         let missing = std::env::temp_dir().join("iso22900-mock-no-such-config.json");
         assert!(ecu_config_from(Some(missing.into_os_string())).is_err());
         std::fs::remove_file(valid).unwrap();
@@ -1752,6 +1759,10 @@ mod sim_ecu_tests {
         let known = r#"{"attach":{"config":{"s3_server_ms":300}}}"#;
         apply_sim_ecu_command(&mut state, command(known)).unwrap();
         assert!(state.ecu.is_some());
+        let too_long = r#"{"attach":{"config":{"sw_version":"1.0.0.1"}}}"#;
+        state.ecu = None;
+        assert!(apply_sim_ecu_command(&mut state, command(too_long)).is_err());
+        assert!(state.ecu.is_none());
     }
 
     #[test]

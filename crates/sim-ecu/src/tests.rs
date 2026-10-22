@@ -660,6 +660,14 @@ fn validate_refuses_values_that_do_not_fit_the_fixed_widths() {
             ..config()
         },
         EcuConfig {
+            vin: "WVWZZZ1KZAW00000".into(),
+            ..config()
+        },
+        EcuConfig {
+            vin: "WVWZZZ1KZAW0000012".into(),
+            ..config()
+        },
+        EcuConfig {
             sw_version: "\u{e9}".into(),
             ..config()
         },

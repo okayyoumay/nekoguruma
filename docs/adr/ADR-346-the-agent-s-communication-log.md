@@ -210,7 +210,9 @@ decisions behind them:
    the link, origin and request), is classified from every item known at that point, and the
    latest entry referring to an exchange gives its standing classification. The earlier entry
    is never rewritten. A settling entry carries the facts of the settling entries before it (a
-   give-up, a kept power), and a cancellation by the agent settles nothing. The settling entries
+   give-up, a kept power), keeps any system-side fault an earlier entry observed (it takes the
+   most severe of that fault and its own classification), and a cancellation by the agent settles
+   nothing. The settling entries
    are:
    - the end of a primitive the agent stopped waiting for (`primitive_ended`), with every item
      that came after the entry, classified as if the agent had waited, except that an end that
@@ -219,8 +221,9 @@ decisions behind them:
    - the settling of a lost VCI (`vci_loss_settled`), for every exchange the loss ended;
    - a response the worker delivers after the exchange ended (`late_response`): started within
      the limit less the margin it is `system`, since the system missed an answer in time; after
-     the limit plus the margin `vehicle`; otherwise `undetermined`; one that two ended exchanges
-     could own is unattached;
+     the limit plus the margin `vehicle`; otherwise `undetermined`; it belongs to the ended exchange it
+     matches that has no response yet, however long ago it ended, and one that two ended
+     exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication or forwarded pending that
      comes after the entry (`late_item`).
 

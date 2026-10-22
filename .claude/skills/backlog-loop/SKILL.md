@@ -1,6 +1,6 @@
 ---
 name: backlog-loop
-description: Work through the nekoguruma backlog one item at a time. Handle open Dependabot pull requests first, then pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. Run only when the maintainer asks for it.
+description: Work through the nekoguruma backlog one item at a time. Handle open Dependabot pull requests first, then pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. The final report ends with a retrospective on the loop itself. Run only when the maintainer asks for it.
 disable-model-invocation: true
 argument-hint: "[max items, default 3] [lowest priority to include: P1 (default) or P2] | pr=<number of the PR to resume>"
 ---
@@ -264,4 +264,32 @@ One message to the maintainer:
   loop: both need the maintainer;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
   without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, a Dependabot replacement the loop could not finish (with the
-  branch the maintainer should delete), or three backlog-only PRs).
+  branch the maintainer should delete), or three backlog-only PRs);
+- the retrospective (below).
+
+### Retrospective
+
+The last part of the final report looks for ways to improve the loop itself (this skill,
+`pr-review-loop`, the agents and rules they use, CI). It reads only what the run already left
+behind, and looks only for these signs:
+
+- **Long review.** A PR of this run that took five or more review rounds (its description's review
+  summary, `pr-review-loop` Step 5). Read its findings and name what made it long: findings of one
+  kind arriving one at a time, an item too big for one PR, a rule the implementation missed.
+- **Repeated finding.** Findings of the same kind (the same rule broken, or the same kind of gap)
+  in two or more PRs of this run.
+- **Failure only on `main`.** A CI run on `main` that failed on the merge of one of this run's
+  PRs, in a job or test that pull requests do not run, or a PR outside the loop merged during
+  the run to fix such a failure. Name the check that would have caught it before the merge.
+- **Stop.** The run stopped for a reason other than its items running out or nothing being
+  eligible.
+
+When none of these shows, the retrospective is one line saying so. Otherwise give at most three
+proposals. Each one names the PRs and findings or check runs it rests on, the file it would
+change and how, and is a question the maintainer can answer in a word. Leave out a proposal that
+has no such evidence: a general lesson with no PR behind it is not worth the maintainer's time.
+Do not propose what an open backlog item already covers; name that item instead.
+
+The loop never makes these changes itself, and never edits a skill, an agent or a rule during
+the run. A proposal the maintainer accepts becomes a P1 development-process item in the
+backlog (`backlog` skill) and goes through the loop like any other item.

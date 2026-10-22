@@ -841,7 +841,13 @@ and `Program.flash`.
   `STAR_NOT_LOWERABLE` when the callee, or a function it expands in turn, has a local that a
   path may read before it assigns it. The check is conservative: parameters are assigned; an `if`
   keeps what both branches assign; a loop body assigns nothing for the code after the loop, and
-  its variable only inside it; a `return`, `break`, `continue` or `diag.fail` ends a path.
+  its variable only inside it; a `return`, `break`, `continue` or `diag.fail` ends a path, which
+  does not count against the join of an `if`. An augmented assignment reads its target. The one
+  loop whose body assigns for the code after it is a `range` loop whose bounds and step are
+  constants known at ingestion (literals, top-level constants, or folds of them), that yields at
+  least one value, and whose body has no `break`: the names every path to the end of an
+  iteration assigns, a `continue` path included, are assigned after it, its variable too. A
+  bound known only at run time keeps the rule above.
   A call outside every run-time loop, and one in a loop over a constant list or dict (each pass
   of which is expanded again), is not refused.
 - **Boundaries.** Derived from the lowered code. The entry is the first instruction of the

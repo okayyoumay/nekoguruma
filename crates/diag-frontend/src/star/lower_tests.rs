@@ -4170,6 +4170,136 @@ fn a_callee_that_may_read_an_unset_local_is_not_expanded_in_a_loop() {
     lower_plan(&inner_loop, vec![plan_segment()]).expect_err("refused");
 }
 
+/// Lowers the plan whose body calls `call` in a `range` loop, with `helpers` before it.
+fn lower_in_loop(helpers: &str, call: &str) -> Result<Program, Vec<StarError>> {
+    let source = plan_calling(
+        helpers,
+        &format!(
+            "    r = 0\n    for i in range(2):\n        r = {call}\n    res = diag.flash_transfer(1)\n"
+        ),
+    );
+    lower_plan(&source, vec![plan_segment()])
+}
+
+/// The hint of the one error of a refused call in a loop, which must be about `name`.
+fn assert_refused_reading(result: Result<Program, Vec<StarError>>, name: &str) {
+    let errors = result.expect_err("refused");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(errors[0].code, StarCode::NotLowerable);
+    assert!(
+        errors[0].hint.contains(&format!("reads `{name}`")),
+        "{}",
+        errors[0].hint
+    );
+}
+
+#[test]
+fn an_augmented_assignment_reads_its_target_in_the_unset_analysis() {
+    // `x += 1` reads `x`, which the `if` leaves unset on one path.
+    let helpers = "def f(c):\n    if c:\n        x = 1\n    x += 1\n    return x\n";
+    assert_refused_reading(lower_in_loop(helpers, "f(i == 0)"), "x");
+    // Assigned on every path first, the same update is fine.
+    let fine = "def f(c):\n    x = 0\n    if c:\n        x = 1\n    x += 1\n    return x\n";
+    lower_in_loop(fine, "f(i == 0)").expect("lowers");
+}
+
+#[test]
+fn a_path_ended_by_diag_fail_does_not_count_against_the_join() {
+    let helpers = "def f(c):\n    if c:\n        x = 1\n    else:\n        diag.fail(\"E\", \"d\")\n    return x\n";
+    lower_in_loop(helpers, "f(i == 0)").expect("lowers");
+}
+
+#[test]
+fn a_path_ended_by_continue_does_not_count_against_the_join() {
+    // The read after the branch is reached only when `x` was assigned.
+    let lowers = "\
+def f(n):
+    s = 0
+    for j in range(n):
+        if j == 1:
+            continue
+        x = j
+        s = s + x
+    return s
+";
+    lower_in_loop(lowers, "f(3)").expect("lowers");
+    // Here a path reaches the read with `x` unassigned: only the `continue` path is dropped.
+    let refused = "\
+def f(n):
+    s = 0
+    for j in range(n):
+        if j == 1:
+            continue
+        if j == 2:
+            x = j
+        s = s + x
+    return s
+";
+    assert_refused_reading(lower_in_loop(refused, "f(3)"), "x");
+}
+
+#[test]
+fn a_constant_range_loop_that_runs_assigns_for_the_code_after_it() {
+    let tail = "    return y\n";
+    for over in [
+        "range(3)",
+        "range(1, 4)",
+        "range(0, 3, 1)",
+        "range(5, 0, -2)",
+        "range(N)",
+        "range(M - 1)",
+    ] {
+        let helpers =
+            format!("N = 3\nM = N + 1\n\ndef f():\n    for t in {over}:\n        y = t\n{tail}");
+        lower_in_loop(&helpers, "f()").unwrap_or_else(|e| panic!("{over}: {e:#?}"));
+    }
+    // The assignment past a `continue` on some iteration is not certain for the last one.
+    let skipped = "def f():\n    for t in range(3):\n        if t == 2:\n            continue\n        y = t\n    return y\n";
+    assert_refused_reading(lower_in_loop(skipped, "f()"), "y");
+    // A loop that may not run, a bound known at run time, a hidden constant, and a `break`
+    // keep the rule that the body assigns nothing after the loop.
+    for helpers in [
+        "def f():\n    for t in range(0):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(3, 1):\n        y = t\n    return y\n",
+        "def f(n):\n    for t in range(n):\n        y = t\n    return y\n",
+        "N = 3\n\ndef f(N):\n    for t in range(N):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(3):\n        y = t\n        if t == 2:\n            break\n    return y\n",
+    ] {
+        let call = if helpers.contains("f(n)") || helpers.contains("f(N)") {
+            "f(3)"
+        } else {
+            "f()"
+        };
+        assert_refused_reading(lower_in_loop(helpers, call), "y");
+    }
+}
+
+#[test]
+fn a_section_error_lands_on_the_call_that_produced_the_section() {
+    // `outer` requires recovery before the recovery point; `inner`, called inside it, is
+    // interruptible. The refusal is at the plan's call of `outer`, not at the call of `inner`.
+    let helpers = "\
+# @section interruptible expected=5
+def inner():
+    diag.wait(7)
+
+# @section recoveryRequired expected=9
+def outer():
+    inner()
+    diag.wait(8)
+";
+    let source = plan_calling(helpers, "    outer()\n    res = diag.flash_transfer(1)\n");
+    let errors = lower_plan(&source, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, line_of(&source, "    outer()"))],
+        "{errors:#?}"
+    );
+    // The hint names the function, not an index of the lowered program.
+    assert!(errors[0].hint.contains("`outer`"), "{}", errors[0].hint);
+    assert!(!errors[0].hint.contains("section 0"), "{}", errors[0].hint);
+}
+
 #[test]
 fn a_callee_that_assigns_before_it_reads_runs_right_in_a_loop() {
     // `g` assigns on both branches, `h` reads its loop variable inside the loop only, and `p`

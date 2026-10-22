@@ -183,10 +183,10 @@ fn invalid_program(
     checked: &Checked,
     program: &Program,
     spans: &[Span],
-    expansions: &[(u32, u32, Span)],
+    origins: &[Option<Origin>],
     error: &ProgramError,
 ) -> Pending {
-    let hint = format!("the lowered program is not valid: {error}");
+    let mut hint = format!("the lowered program is not valid: {error}");
     if let Some(span) = error.pc().and_then(|pc| spans.get(pc as usize)) {
         return Pending {
             code: StarCode::PlanInvalid,
@@ -203,17 +203,27 @@ fn invalid_program(
     let start = section
         .and_then(|section| program.sections.get(section))
         .map(|section| section.start_pc);
-    // The innermost in-place expansion of a section function holding the piece, at its call.
-    let call = start.and_then(|start| {
-        expansions
-            .iter()
-            .filter(|(from, to, _)| (*from..*to).contains(&start))
-            .min_by_key(|(from, to, _)| to - from)
-            .map(|(_, _, call)| call)
-    });
-    let at = call.or_else(|| start.and_then(|start| spans.get(start as usize)));
+    // The section function that produced the section, and its call when it was expanded in place.
+    let origin = section
+        .and_then(|section| origins.get(section))
+        .cloned()
+        .flatten();
+    if let (Some(origin), Some(section)) = (&origin, section) {
+        // The section's index in the program means nothing in the source; name its function.
+        let name = &origin.function;
+        hint = format!(
+            "the lowered program is not valid: {}",
+            error.to_string().replace(
+                &format!("section {section}"),
+                &format!("the section of `{name}`")
+            )
+        );
+    }
+    let at = origin
+        .and_then(|origin| origin.call)
+        .or_else(|| start.and_then(|start| spans.get(start as usize).copied()));
     let span = match at {
-        Some(span) => *span,
+        Some(span) => span,
         None => {
             let span = checked.module.statement().span;
             Span::new(span.begin(), span.begin())
@@ -225,6 +235,19 @@ fn invalid_program(
         hint,
     }
 }
+
+/// The section function behind a section of the lowered program: for one expanded in place, the
+/// call it was expanded at.
+#[derive(Clone)]
+struct Origin {
+    /// The section function's name.
+    function: Rc<str>,
+    call: Option<Span>,
+}
+
+/// A range of a copy's code whose pieces are cut as sections, with the section function's
+/// attributes and its origin.
+type Covered = (u32, u32, (Interruptible, u32), Origin);
 
 fn lower_here<'a>(
     file: &str,
@@ -257,7 +280,7 @@ fn lower_here<'a>(
         let errors = std::mem::take(&mut lowerer.errors);
         return Err(resolve(file, &checked.module, errors));
     }
-    let (program, spans, expansions) = lowerer.assemble();
+    let (program, spans, origins) = lowerer.assemble();
     // `validate` still refuses what the source can ask for and the lowering does not look at:
     // a section function that requires intervention before the recovery point, an unsafe
     // section in a restartable plan's replay, the identity rows.
@@ -265,13 +288,7 @@ fn lower_here<'a>(
         return Err(resolve(
             file,
             &checked.module,
-            vec![invalid_program(
-                checked,
-                &program,
-                &spans,
-                &expansions,
-                &error,
-            )],
+            vec![invalid_program(checked, &program, &spans, &origins, &error)],
         ));
     }
     let warnings = std::mem::take(&mut lowerer.warnings);
@@ -4218,7 +4235,10 @@ impl<'a> Lowerer<'a> {
         let func = &self.funcs[callee];
         let mut unset = Unset {
             locals: &func.slots,
+            globals: &self.globals,
             found: None,
+            continues: Vec::new(),
+            breaks: 0,
         };
         let mut state = Some(func.params.iter().cloned().collect::<HashSet<String>>());
         unset.stmt(&func.def.body, &mut state);
@@ -6680,7 +6700,7 @@ impl<'a> Lowerer<'a> {
     /// between them (ADR-329), all with that section function's interruptibility and expected
     /// duration (ADR-301). A primitive outside every section is `Yes` with duration 0. The
     /// sections never overlap (ADR-332).
-    fn assemble(&mut self) -> (Program, Vec<Span>, Vec<(u32, u32, Span)>) {
+    fn assemble(&mut self) -> (Program, Vec<Span>, Vec<Option<Origin>>) {
         // Labels are unique within a function's body, so a copy's are told apart by its index.
         let index: HashMap<FuncCopy, usize> = self
             .copies
@@ -6695,9 +6715,9 @@ impl<'a> Lowerer<'a> {
         let mut sections: Vec<Section> = Vec::new();
         // Where each flash plan's expansion begins and ends, and its boundaries (ADR-336 item 4).
         let mut plan_ranges: Vec<PlanRange> = Vec::new();
-        // The range and the call of each section function expanded in place, to locate a refusal
-        // that names one of its pieces.
-        let mut expansions: Vec<(u32, u32, Span)> = Vec::new();
+        // The section function, and for one expanded in place its call, that produced each
+        // section, to locate a refusal that names one of them.
+        let mut origins: Vec<Option<Origin>> = Vec::new();
         let mut pc = 0u32;
         for (at, copy) in self.copies.iter().enumerate() {
             let start = pc;
@@ -6707,7 +6727,7 @@ impl<'a> Lowerer<'a> {
             // The section functions expanded in place in a plan: the ones still open, and the
             // ranges of those closed, each with the function's attributes (ADR-336 item 3).
             let mut expanding: Vec<(u32, usize, Span)> = Vec::new();
-            let mut expanded: Vec<(u32, u32, (Interruptible, u32))> = Vec::new();
+            let mut expanded: Vec<Covered> = Vec::new();
             for (ins, span) in &self.funcs[copy.func].code {
                 match ins {
                     Ins::PlanBegin(plan) => {
@@ -6741,10 +6761,17 @@ impl<'a> Lowerer<'a> {
                         if let Some((from, function, call)) = expanding.pop()
                             && from < pc
                         {
-                            expansions.push((from, pc, call));
                             let attributes =
                                 self.funcs[function].section.expect("a section function");
-                            expanded.push((from, pc, attributes));
+                            expanded.push((
+                                from,
+                                pc,
+                                attributes,
+                                Origin {
+                                    function: Rc::from(self.funcs[function].name.as_str()),
+                                    call: Some(call),
+                                },
+                            ));
                         }
                     }
                     Ins::Primitive(_, idempotency) => primitives.push((pc, *idempotency)),
@@ -6773,58 +6800,86 @@ impl<'a> Lowerer<'a> {
             // a section, and each plan's expansion, which the plan function's section covers
             // whole, inlined code included (ADR-336 items 3 and 4). The pieces between the
             // primitives cover none and say nothing about idempotency.
-            let mut covered: Vec<(u32, u32, (Interruptible, u32))> = Vec::new();
-            if copy.section.is_some() {
-                covered.push((start, pc, (interruptible, expected_millis)));
+            let mut covered: Vec<Covered> = Vec::new();
+            if let Some(function) = copy.section {
+                covered.push((
+                    start,
+                    pc,
+                    (interruptible, expected_millis),
+                    Origin {
+                        function: Rc::from(self.funcs[function].name.as_str()),
+                        call: None,
+                    },
+                ));
             }
             for range in &plan_ranges[first_plan..] {
                 // A plan function without a section is refused by the checker.
                 let attributes = self.funcs[range.plan]
                     .section
                     .unwrap_or((Interruptible::No, 0));
-                covered.push((range.entry, range.end, attributes));
+                covered.push((
+                    range.entry,
+                    range.end,
+                    attributes,
+                    Origin {
+                        function: Rc::from(self.funcs[range.plan].name.as_str()),
+                        call: None,
+                    },
+                ));
             }
             // A section function expanded in a plan has its own pieces over its range, inside
             // the plan's: a reader that combines the covering sections takes the plan's
             // uninterruptibility with the function's attributes (ADR-336 item 3, ADR-330).
             covered.extend(expanded);
-            let mut pieces: Vec<Section> = Vec::new();
-            for &(from, to, attributes) in &covered {
+            let mut pieces: Vec<(Section, Option<Origin>)> = Vec::new();
+            for (from, to, attributes, origin) in &covered {
+                let (from, to, attributes) = (*from, *to, *attributes);
+                let origin = Some(origin.clone());
                 let mut cursor = from;
                 for &(primitive, idempotency) in &primitives {
                     if primitive < from || primitive >= to {
                         continue;
                     }
                     if cursor < primitive {
-                        pieces.push(section(
-                            cursor,
-                            primitive,
-                            attributes,
-                            Idempotency::CheckState,
+                        pieces.push((
+                            section(cursor, primitive, attributes, Idempotency::CheckState),
+                            origin.clone(),
                         ));
                     }
-                    pieces.push(section(primitive, primitive + 1, attributes, idempotency));
+                    pieces.push((
+                        section(primitive, primitive + 1, attributes, idempotency),
+                        origin.clone(),
+                    ));
                     cursor = primitive + 1;
                 }
                 if cursor < to {
-                    pieces.push(section(cursor, to, attributes, Idempotency::CheckState));
+                    pieces.push((
+                        section(cursor, to, attributes, Idempotency::CheckState),
+                        origin,
+                    ));
                 }
             }
             for &(primitive, idempotency) in &primitives {
                 if !covered
                     .iter()
-                    .any(|&(from, to, _)| (from..to).contains(&primitive))
+                    .any(|&(from, to, _, _)| (from..to).contains(&primitive))
                 {
-                    pieces.push(section(
-                        primitive,
-                        primitive + 1,
-                        (interruptible, expected_millis),
-                        idempotency,
+                    pieces.push((
+                        section(
+                            primitive,
+                            primitive + 1,
+                            (interruptible, expected_millis),
+                            idempotency,
+                        ),
+                        None,
                     ));
                 }
             }
-            pieces.sort_by_key(|piece| piece.start_pc);
-            sections.extend(pieces);
+            pieces.sort_by_key(|(piece, _)| piece.start_pc);
+            for (piece, origin) in pieces {
+                sections.push(piece);
+                origins.push(origin);
+            }
         }
         // Positions of labels, counting only real instructions.
         let mut positions: HashMap<(usize, Label), u32> = HashMap::new();
@@ -6875,7 +6930,7 @@ impl<'a> Lowerer<'a> {
             preconditions: self.preconditions.clone(),
             flash,
         };
-        (program, spans, expansions)
+        (program, spans, origins)
     }
 
     /// The recovery plan of the flash plan laid out as `range` (ADR-336 items 1, 4 and 7): the
@@ -7168,11 +7223,19 @@ impl Items {
 /// `diag.fail`), which assigns everything for what follows. Parameters are assigned at the start;
 /// an `if` keeps what both branches assign (a branch that ends does not count against it); a loop
 /// body assigns nothing for the code after the loop, since it may not run, and its variable is
-/// assigned inside the body only. A name that is not a local (a constant, a builtin) is never
+/// assigned inside the body only; the exception is a `range` loop whose bounds are constants known
+/// at ingestion and that runs at least once, with no `break` in its body: what every path to the
+/// end of an iteration (a `continue` included) assigned holds after it. A name that is not a local (a constant, a builtin) is never
 /// reported.
 struct Unset<'f> {
     locals: &'f HashMap<String, u16>,
+    /// The constants of the top level, which a `range` bound may name.
+    globals: &'f HashMap<String, Const>,
     found: Option<String>,
+    /// For each loop being walked, what the paths that `continue` it assigned, joined.
+    continues: Vec<Assigned>,
+    /// The `break`s seen so far, whichever loop they leave.
+    breaks: usize,
 }
 
 type Assigned = Option<HashSet<String>>;
@@ -7209,6 +7272,63 @@ impl Unset<'_> {
         };
     }
 
+    /// The value of `expr` when it is an int fixed at ingestion: a literal, a top-level constant
+    /// that no local hides, or a fold of those (the lowering folds the same).
+    fn const_int(&self, expr: &AstExpr) -> Option<i64> {
+        match &expr.node {
+            ExprP::Literal(AstLiteral::Int(int)) => match &int.node {
+                TokenInt::I32(n) => Some(i64::from(*n)),
+                TokenInt::BigInt(big) => i64::try_from(big).ok(),
+            },
+            ExprP::Identifier(ident) => {
+                let name = &ident.node.ident;
+                match self.globals.get(name) {
+                    Some(Const::Int(n)) if !self.locals.contains_key(name) => Some(*n),
+                    _ => None,
+                }
+            }
+            ExprP::Minus(inner) => self.const_int(inner)?.checked_neg(),
+            ExprP::Op(lhs, op, rhs) => {
+                let (a, b) = (self.const_int(lhs)?, self.const_int(rhs)?);
+                match fold(*op, &Const::Int(a), &Const::Int(b)) {
+                    Ok(Const::Int(n)) => Some(n),
+                    _ => None,
+                }
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether `over` is a `range` call whose bounds and step are constants and that yields at
+    /// least one value.
+    fn runs_at_least_once(&self, over: &AstExpr) -> bool {
+        let ExprP::Call(function, args) = &over.node else {
+            return false;
+        };
+        if !matches!(&function.node, ExprP::Identifier(f) if f.node.ident == "range")
+            || self.locals.contains_key("range")
+            || self.globals.contains_key("range")
+        {
+            return false;
+        }
+        let mut bounds = Vec::new();
+        for arg in &args.args {
+            match &arg.node {
+                ArgumentP::Positional(expr) => match self.const_int(expr) {
+                    Some(n) => bounds.push(n),
+                    None => return false,
+                },
+                _ => return false,
+            }
+        }
+        match bounds[..] {
+            [stop] => 0 < stop,
+            [start, stop] => start < stop,
+            [start, stop, step] => (step > 0 && start < stop) || (step < 0 && start > stop),
+            _ => false,
+        }
+    }
+
     fn stmt(&mut self, stmt: &AstStmt, state: &mut Assigned) {
         match &stmt.node {
             StmtP::Statements(list) => {
@@ -7243,7 +7363,16 @@ impl Unset<'_> {
                 }
                 *state = None;
             }
-            StmtP::Break | StmtP::Continue => *state = None,
+            StmtP::Break => {
+                self.breaks += 1;
+                *state = None;
+            }
+            StmtP::Continue => {
+                if let Some(joined) = self.continues.last_mut() {
+                    Self::join(joined, state.take());
+                }
+                *state = None;
+            }
             StmtP::If(cond, then) => {
                 self.expr(cond, state);
                 let mut taken = state.clone();
@@ -7264,7 +7393,15 @@ impl Unset<'_> {
                 if let AssignTargetP::Identifier(name) = &for_.var.node {
                     Self::assign(&name.node.ident, &mut inside);
                 }
+                let breaks = self.breaks;
+                self.continues.push(None);
                 self.stmt(&for_.body, &mut inside);
+                let continued = self.continues.pop().flatten();
+                if self.runs_at_least_once(&for_.over) && self.breaks == breaks {
+                    // The end of an iteration: the body's fall-through and its `continue`s.
+                    Self::join(&mut inside, continued);
+                    *state = inside;
+                }
             }
             StmtP::Pass | StmtP::Def(_) | StmtP::Load(_) => {}
         }

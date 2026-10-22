@@ -203,6 +203,13 @@ pub enum OnSiteReason {
     /// job's first run (none included), so the job's own data changed between runs. Nothing is
     /// sent and no resume is counted (ADR-268).
     IntendedVersionDiffers,
+    /// The resume was given another flash artifact than the journal recorded at the job's first
+    /// run (none on one side included), and the journal had reached a flash plan: it holds a
+    /// transfer-start marker, or its last step or request intent lies within a plan's range, so
+    /// the erase may already have destroyed the application and the journal's transfer facts
+    /// belong to the first file. Nothing is sent and no resume is counted (ADR-344). Before a plan the same
+    /// difference is [`JobError::ArtifactDiffersFromJournal`].
+    ArtifactDiffers,
     /// Test builds only: the restart order of a redone transfer passed steps 1 to 4b-3 and the
     /// tests' `resume_to_erase` stopped it there, before the erase (step 4c), so the tests can see
     /// the teardown's outcome (`teardown`), the default-session confirmation (`confirmed`) and the
@@ -1585,6 +1592,16 @@ pub(crate) fn in_plan(program: &Program, pc: u32) -> bool {
         .flash
         .iter()
         .any(|plan| (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&pc))
+}
+
+/// Whether the journal had reached a flash plan (ADR-344): it records a transfer-start marker, or
+/// its last completed step or its newest request intent lies within a plan's range.
+pub(crate) fn reached_flash_plan(program: &Program, facts: &RecoveryFacts) -> bool {
+    facts.transfer.is_some()
+        || [facts.last_step, facts.last_intent]
+            .into_iter()
+            .flatten()
+            .any(|at| in_plan(program, at.pc))
 }
 
 /// Whether `pc` is an interruptible point in ADR-330's sense: a cancel is taken there. It is not

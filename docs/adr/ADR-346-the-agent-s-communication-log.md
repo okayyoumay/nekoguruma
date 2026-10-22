@@ -68,7 +68,9 @@ decisions behind them:
 
 1. **One log per job, an entry per exchange, in the reader's terms.** The agent writes a
    communication log for every job and ownership generation, as JSON Lines beside the job's
-   journal and protected like it (design 5.5). A header at job start, with the `vci_connected`
+   journal and protected like it (design 5.5). A header at job start (listing the candidate
+   combinations with their document hashes, since the chosen one and its document are known only
+   after identification, ADR-325 item 7, and follow as an event), with the `vci_connected`
    event and a `link_opened` event per link (a job may open several in turn, design 8.8.2), gives
    everything needed to read it. There is one entry for each request the agent sends or refuses
    before sending, from any origin; system events share the timeline. Each entry says, in

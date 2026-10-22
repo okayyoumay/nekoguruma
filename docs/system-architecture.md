@@ -1080,7 +1080,7 @@ The first line, written when the job starts. With the `vci_connected` and `link_
 
 | Group | Content |
 |---|---|
-| Job | Job ID, ownership generation, procedure name, document hash (8.2.6), the candidate variants or combinations (the one chosen follows as `combination_chosen`, 8.2.4) |
+| Job | Job ID, ownership generation, procedure name, the candidate variants or combinations with each one's document hash (8.2.6); the one chosen, with its document hash, follows as `combination_chosen` once identification picks it (8.2.4, ADR-325 item 7) |
 | Vehicle | The job's target VIN; the identity values read follow as `identity` events |
 | Per target | Role, ECU definition and variant, as far as known |
 | Software | Agent, worker and IR schema versions and the conversion identity (8.2.4) |

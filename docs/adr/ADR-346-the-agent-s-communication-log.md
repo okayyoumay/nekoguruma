@@ -257,7 +257,8 @@ decisions behind them:
      the limit less the margin it is `system`, since the system missed an answer in time; after
      the limit plus the margin `vehicle`, or its outcome's classification from the rows that do
      not turn on timing if that is more severe; otherwise `undetermined`; it belongs to the ended exchange it
-     matches that has no response yet and whose request may have reached the ECU whole (not
+     matches that some assignment of the earlier responses still leaves owed one and whose
+     request may have reached the ECU whole (not
      `not_sent` or `partial`), however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication, forwarded pending or link

@@ -70,6 +70,10 @@ cannot place.
    - **Exchange entries.** There is one for each request the agent sends or refuses before
      sending, with its origin: the procedure, a repeat after a resume (design 8.2.5),
      identification, restart reads, an access program, or an access target's keep-alive.
+   - **Several answers.** A request that collects every answer within its window (ADR-327's
+     functional presence request), or on which more than one ECU answers, lists each answer with
+     its identifier, bytes, times and outcome, so none is dropped. Silence on such a request is
+     not a fault (ADR-327 item 2).
    - **System events.** Worker, VCI, link and job events, the identity values read, clock epochs,
      late responses, and events the log cannot attach to an exchange are entries on the same
      timeline.

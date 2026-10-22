@@ -183,7 +183,8 @@ decisions behind them:
      attempt counter another tester may have used up, secured data transmission,
      authentication, and codes with no known meaning;
    - no response is `vehicle` only with the send confirmed (or an answer of the ECU in the
-     exchange), an earlier matched answer, and no link error during the exchange;
+     exchange), an earlier matched answer or a pending seen in the exchange, and no link error
+     during the exchange;
    - a timeout before the limit in force, or after it where no unseen pending can explain the
      delay, is `system`; a final response after it that the VCI still took is `system` too, since
      its timer is judged wrong beside the ECU's lateness, and one the worker delivers after the
@@ -238,7 +239,8 @@ decisions behind them:
      matches that has no response yet, however long ago it ended, and one that two ended
      exchanges could own is unattached;
    - a transmit indication, loopback echo, start-of-message indication or forwarded pending that
-     comes after the entry (`late_item`); a late start-of-message indication turns an exchange
+     comes after the entry (`late_item`); a forwarded pending after the VCI ended the exchange is
+     judged like a late response against the limit before it; a late start-of-message indication turns an exchange
      that ended without a response into `response_incomplete`.
 
    The J2534 worker discards a frame no primitive expects (ADR-100), so on such links a late

@@ -3234,6 +3234,7 @@ def main():
 fn a_validate_refusal_naming_a_pc_is_plan_invalid_at_its_span() {
     let source = "def main():\n    diag.wait(1)\n    diag.wait(2)\n";
     let checked = check("t.star", source).expect("checks");
+    let program = lowered(source).expect("lowers");
     let module = &checked.module;
     let base = module.statement().span.begin().get();
     let second = source.find("diag.wait(2)").expect("the second call") as u32;
@@ -3251,7 +3252,7 @@ fn a_validate_refusal_naming_a_pc_is_plan_invalid_at_its_span() {
     let found = resolve(
         "t.star",
         module,
-        vec![invalid_program(&checked, &spans, &error)],
+        vec![invalid_program(&checked, &program, &spans, &[], &error)],
     );
     assert_eq!(found.len(), 1);
     assert_eq!(found[0].code, StarCode::PlanInvalid);
@@ -3267,6 +3268,7 @@ fn a_validate_refusal_naming_a_pc_is_plan_invalid_at_its_span() {
 fn a_validate_refusal_naming_no_pc_is_not_lowerable() {
     let source = "def main():\n    diag.wait(1)\n";
     let checked = check("t.star", source).expect("checks");
+    let program = lowered(source).expect("lowers");
     let spans = vec![checked.module.statement().span];
     for error in [
         ProgramError::BoundaryOutOfOrder { flash_session: 1 },
@@ -3279,7 +3281,7 @@ fn a_validate_refusal_naming_no_pc_is_not_lowerable() {
         let found = resolve(
             "t.star",
             &checked.module,
-            vec![invalid_program(&checked, &spans, &error)],
+            vec![invalid_program(&checked, &program, &spans, &[], &error)],
         );
         assert_eq!(found[0].code, StarCode::NotLowerable);
         assert_eq!((found[0].line, found[0].column), (1, 1));
@@ -3754,28 +3756,784 @@ fn a_plan_in_an_if_is_entered_at_its_first_instruction_only() {
     assert_eq!(skip, plan.boundaries.post_transfer_end_pc);
 }
 
+/// The plan `body` (after the `def write():` line, indented) for session 1 without an erase step,
+/// with `helpers` before it, called by `main`.
+fn plan_calling(helpers: &str, body: &str) -> String {
+    format!(
+        "{helpers}\n# @section uninterruptible expected=1000\n# @flashPlan session=1\n\
+         def write():\n{body}\n# @preconditions voltage externalSupply ignition\n\
+         def main():\n    write()\n"
+    )
+}
+
+/// Lowers `source` with `lower_plan`, validates it and runs it against a host that serves the
+/// plan's download, transfer and artifact; the host's log of the calls.
+fn run_plan(source: &str) -> (Program, Vec<String>) {
+    let bytes = flash_document_with(Some(NO_ERASE), vec![plan_segment()]);
+    let document = load_ecu_document(&bytes).expect("the document loads");
+    let variant = document.variant().expect("a variant");
+    let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let program = lower("t.star", &checked, variant, &flash_index(&[]))
+        .unwrap_or_else(|errors| panic!("{errors:#?}"))
+        .program;
+    program.validate().expect("valid");
+    let mut host = ScriptedHost {
+        // The RequestDownload's and the RequestTransferExit's responses.
+        responses: [vec![0x74, 0x20, 0x01, 0x00], vec![0x77]].into(),
+        artifact: vec![0; 64],
+        ..ScriptedHost::default()
+    };
+    let mut vm = Vm::new(&program);
+    for _ in 0..10_000 {
+        match vm.step_with_declarations(&program, Some(&variant), &mut host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Finished) => return (program, host.calls),
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("the procedure did not end")
+}
+
+/// The pcs of the plan's range `[entry, end)` of the only plan of `program`.
+fn plan_range(program: &Program) -> std::ops::Range<usize> {
+    let boundaries = &program.flash[0].boundaries;
+    boundaries.entry_pc as usize..boundaries.post_transfer_end_pc as usize
+}
+
 #[test]
-fn a_plan_that_calls_a_function_is_refused_as_not_lowered_yet() {
-    let source = "\
-def helper():
-    diag.wait(3)
-
-# @section uninterruptible expected=1000
-# @flashPlan session=1
-def write():
-    helper()
-    res = diag.flash_transfer(1)
-
-# @preconditions voltage externalSupply ignition
-def main():
-    write()
+fn a_plan_expands_the_plain_functions_it_calls_in_place() {
+    let helpers = "\
+def scale(a, b):
+    c = a * b
+    return c + 1
 ";
-    let errors = lower_plan(source, vec![plan_segment()]).expect_err("refused");
+    let body = r#"
+    x = scale(3, 4)
+    if x == 13:
+        diag.log(1, "scaled")
+    y = scale(x, 2)
+    if y == 27:
+        diag.log(1, "twice")
+    res = diag.flash_transfer(1)
+"#;
+    let (program, calls) = run_plan(&plan_calling(helpers, body));
+    // The return values reached the plan: 3 * 4 + 1, then 13 * 2 + 1.
+    let logged: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with("log"))
+        .collect();
+    assert_eq!(logged, ["log 1 scaled", "log 1 twice"], "{calls:?}");
+    // No call or return stands in the plan, and `main`'s closing return is the program's only one.
+    assert!(
+        program.code[plan_range(&program)]
+            .iter()
+            .all(|op| !matches!(op, Op::Call(_) | Op::Ret))
+    );
+    assert!(!program.code.iter().any(|op| matches!(op, Op::Call(_))));
+    assert_eq!(program.code.iter().filter(|op| **op == Op::Ret).count(), 1);
+    // The function called twice has a set of slots for each call: three for each (a, b, c), and
+    // the plan's x, y, res and the transfer's counter, none shared.
+    let stored: std::collections::HashSet<u16> = program
+        .code
+        .iter()
+        .filter_map(|op| match op {
+            Op::StoreLocal(slot) => Some(*slot),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(stored.len(), 10, "{:?}", program.code);
+    // The boundaries are the plan's own: its first instruction, the download as the erase point
+    // of a session with no erase step, the exit, and the end before `main`'s return.
+    let boundaries = &program.flash[0].boundaries;
+    let download = position(&program, 0, |op| {
+        matches!(op, Op::ServiceRequest { service: 0x34 })
+    });
+    assert_eq!(boundaries.entry_pc, 0);
+    assert_eq!(boundaries.erase_pc, download);
+    assert_eq!(
+        boundaries.transfer_exit_pc,
+        position(&program, 0, |op| matches!(
+            op,
+            Op::ServiceRequest { service: 0x37 }
+        ))
+    );
+    assert_eq!(
+        boundaries.post_transfer_end_pc,
+        program.code.len() as u32 - 1
+    );
+    assert_eq!(
+        program.flash[0].recovery_required,
+        diag_ir::RecoveryRequired::FromPc(download)
+    );
+    // The blocks were transferred.
+    assert_eq!(
+        calls.iter().filter(|c| c.starts_with("transfer")).count(),
+        3
+    );
+}
+
+#[test]
+fn nested_calls_and_a_return_in_a_loop_are_expanded_with_their_jumps_inside_the_plan() {
+    let helpers = "\
+def find(limit):
+    for i in range(10):
+        if i * i > limit:
+            return i
+    return 99
+
+def leaf(a):
+    return a + 1
+
+def inner(a):
+    b = leaf(a)
+    return find(leaf(b)) * 2
+
+def outer(a):
+    c = inner(a)
+    return c + leaf(0)
+";
+    // Before the transfer and after it, so that the jumps of both stages are checked.
+    let body = r#"
+    x = outer(1)
+    if x == 5:
+        diag.log(1, "before")
+    res = diag.flash_transfer(1)
+    y = find(5)
+    if y == 3:
+        diag.log(1, "after")
+"#;
+    let (program, calls) = run_plan(&plan_calling(helpers, body));
+    // outer(1) = inner(1) + leaf(0): b = leaf(1) = 2, find(leaf(2)) is the first i with
+    // i * i > 3, which is 2, doubled is 4, and 4 + 1 = 5.
+    assert!(calls.contains(&"log 1 before".to_owned()), "{calls:?}");
+    // find(5): the first i with i * i > 5 is 3.
+    assert!(calls.contains(&"log 1 after".to_owned()), "{calls:?}");
+    assert!(
+        program.code[plan_range(&program)]
+            .iter()
+            .all(|op| !matches!(op, Op::Call(_) | Op::Ret))
+    );
+}
+
+#[test]
+fn a_plan_expands_a_section_function_with_its_pieces_inside_the_plans() {
+    let helpers = "\
+def tail():
+    diag.log(1, \"tail\")
+
+# @section interruptible expected=500
+def hold(n):
+    diag.wait(7)
+    tail()
+    return n + 1
+";
+    let body = r#"
+    x = hold(1)
+    if x == 2:
+        diag.log(1, "held")
+    res = diag.flash_transfer(1)
+"#;
+    let (program, calls) = run_plan(&plan_calling(helpers, body));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.starts_with("wait") || c.starts_with("log"))
+            .collect::<Vec<_>>(),
+        ["wait 7", "log 1 tail", "log 1 held"],
+        "{calls:?}"
+    );
+    assert!(
+        program.code[plan_range(&program)]
+            .iter()
+            .all(|op| !matches!(op, Op::Call(_) | Op::Ret))
+    );
+    // The function's pieces keep its attributes, cover its expansion without a gap from its
+    // first instruction (the store of its parameter, entered by fallthrough), and lie inside the
+    // plan.
+    let mut held: Vec<_> = program
+        .sections
+        .iter()
+        .filter(|s| s.expected_millis == 500)
+        .collect();
+    held.sort_by_key(|s| s.start_pc);
+    assert!(
+        held.iter()
+            .all(|s| matches!(s.interruptible, diag_ir::Interruptible::Yes)),
+        "{held:?}"
+    );
+    assert!(matches!(
+        program.code[held[0].start_pc as usize],
+        Op::StoreLocal(_)
+    ));
+    for pair in held.windows(2) {
+        assert_eq!(pair[0].end_pc, pair[1].start_pc, "no gap: {held:?}");
+    }
+    let range = plan_range(&program);
+    assert!(range.contains(&(held[0].start_pc as usize)));
+    assert!(range.contains(&(held.last().expect("pieces").end_pc as usize - 1)));
+    // The wait and the log inside each have a one-instruction section of the function, and one
+    // of the plan: the plan stays uninterruptible over the whole expansion.
+    for pc in 0..program.code.len() as u32 {
+        if !range.contains(&(pc as usize)) {
+            continue;
+        }
+        let covering: Vec<_> = program
+            .sections
+            .iter()
+            .filter(|s| (s.start_pc..s.end_pc).contains(&pc))
+            .collect();
+        assert!(
+            covering
+                .iter()
+                .any(|s| matches!(s.interruptible, diag_ir::Interruptible::No)
+                    && s.expected_millis == 1000),
+            "pc {pc}: {covering:?}"
+        );
+        if program.code[pc as usize].is_diagnostic_primitive()
+            && held.iter().any(|s| s.start_pc <= pc && pc < s.end_pc)
+        {
+            assert!(
+                covering
+                    .iter()
+                    .any(|s| s.expected_millis == 500 && s.end_pc - s.start_pc == 1),
+                "pc {pc}: {covering:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_section_function_that_requires_intervention_cannot_stand_before_the_recovery_point() {
+    // `Program::validate` refuses a `recoveryRequired` section over the part of the plan before
+    // the recovery point (here, the erase point), as it refuses a plan whose own section is one
+    // and which takes a marker; after the point it validates.
+    let helpers = "\
+# @section recoveryRequired
+def hold():
+    diag.wait(7)
+";
+    let before = plan_calling(helpers, "    hold()\n    res = diag.flash_transfer(1)\n");
+    let errors = lower_plan(&before, vec![plan_segment()]).expect_err("refused");
+    // The error is at the call that expanded the section function, not at the file's start.
     assert_eq!(
         errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
-        [(StarCode::NotLowerable, 7)]
+        [(StarCode::NotLowerable, line_of(&before, "    hold()"))]
     );
-    assert!(errors[0].hint.contains("not expanded in place yet"));
+    assert!(errors[0].hint.contains("not valid"), "{}", errors[0].hint);
+    let after = plan_calling(helpers, "    res = diag.flash_transfer(1)\n    hold()\n");
+    lower_plan(&after, vec![plan_segment()])
+        .expect("lowers")
+        .validate()
+        .expect("valid");
+}
+
+#[test]
+fn what_a_plan_call_is_refused_for() {
+    let check_codes = |source: &str| -> Vec<(StarCode, u32)> {
+        match check("t.star", source) {
+            Ok(_) => Vec::new(),
+            Err(errors) => errors.iter().map(|e| (e.code, e.line)).collect(),
+        }
+    };
+    // Recursion a plan reaches is the checker's, as anywhere (4.1).
+    let recursive = plan_calling(
+        "def a():\n    b()\n\ndef b():\n    a()\n",
+        "    a()\n    res = diag.flash_transfer(1)\n",
+    );
+    assert!(
+        check_codes(&recursive)
+            .iter()
+            .all(|(code, _)| *code == StarCode::UnboundedNotAllowed)
+            && !check_codes(&recursive).is_empty()
+    );
+    // A transfer in a function the plan calls twice, an `@erase` in one, and a plan called from a
+    // function the plan calls.
+    let twice = plan_calling(
+        "def again():\n    diag.flash_transfer(1)\n",
+        "    again()\n    again()\n    res = diag.flash_transfer(1)\n",
+    );
+    assert!(
+        check_codes(&twice)
+            .iter()
+            .any(|(code, _)| *code == StarCode::PlanShape),
+        "{:?}",
+        check_codes(&twice)
+    );
+    let erase = plan_calling(
+        "def erasing():\n    # @erase\n    diag.routine(0xFF00, 1, {})\n",
+        "    erasing()\n    res = diag.flash_transfer(1)\n",
+    );
+    assert!(
+        check_codes(&erase)
+            .iter()
+            .any(|(code, _)| *code == StarCode::BadAnnotation),
+        "{:?}",
+        check_codes(&erase)
+    );
+    // An `@idempotency` does not reach the function a statement calls, which has its own.
+    let annotated = plan_calling(
+        "def quiet():\n    diag.wait(1)\n",
+        "    # @idempotency unsafe\n    quiet()\n    res = diag.flash_transfer(1)\n",
+    );
+    let errors = lower_plan(&annotated, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::BadAnnotation, 8)]
+    );
+    // A function whose calls double at each level passes the copy limits (2.6).
+    let mut helpers = String::new();
+    for level in 0..11 {
+        helpers += &format!(
+            "def f{level}():\n    f{}()\n    f{}()\n\n",
+            level + 1,
+            level + 1
+        );
+    }
+    helpers += "def f11():\n    diag.wait(1)\n";
+    let doubling = plan_calling(&helpers, "    f0()\n    res = diag.flash_transfer(1)\n");
+    let errors = lower_plan(&doubling, vec![plan_segment()]).expect_err("refused");
+    assert!(
+        !errors.is_empty()
+            && errors
+                .iter()
+                .all(|e| e.code == StarCode::SpecializationLimit),
+        "{errors:#?}"
+    );
+}
+
+/// The line (1-based) of the first line of `source` that holds `needle`.
+fn line_of(source: &str, needle: &str) -> u32 {
+    source
+        .lines()
+        .position(|line| line.contains(needle))
+        .expect("the line") as u32
+        + 1
+}
+
+/// The log calls of `calls`, as `log <level> <text>`.
+fn logs(calls: &[String]) -> Vec<&str> {
+    calls
+        .iter()
+        .filter(|c| c.starts_with("log"))
+        .map(String::as_str)
+        .collect()
+}
+
+#[test]
+fn a_callee_that_may_read_an_unset_local_is_not_expanded_in_a_loop() {
+    let helpers = "def f(c):\n    if c:\n        x = 1\n    return x\n";
+    let tail = "    res = diag.flash_transfer(1)\n";
+    let looped = plan_calling(
+        helpers,
+        &format!("    r = 0\n    for i in range(2):\n        r = f(i == 0)\n{tail}"),
+    );
+    let errors = lower_plan(&looped, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, line_of(&looped, "r = f(i"))]
+    );
+    assert!(errors[0].hint.contains("reads `x`"), "{}", errors[0].hint);
+    // The same call outside a loop lowers: the expansion runs once.
+    let once = plan_calling(helpers, &format!("    r = f(True)\n{tail}"));
+    lower_plan(&once, vec![plan_segment()]).expect("lowers");
+    // A constant loop unrolls into an expansion for each pass, so it is no loop here.
+    let unrolled = plan_calling(
+        helpers,
+        &format!("    for k in [1, 2]:\n        r = f(k == 1)\n{tail}"),
+    );
+    lower_plan(&unrolled, vec![plan_segment()]).expect("lowers");
+    // The loop variable of a loop that may not run is unset after it.
+    let zero = plan_calling(
+        "def k(n):\n    for j in range(n):\n        pass\n    return j\n",
+        &format!("    for i in range(2):\n        r = k(i)\n{tail}"),
+    );
+    let errors = lower_plan(&zero, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(errors[0].code, StarCode::NotLowerable);
+    assert!(errors[0].hint.contains("reads `j`"), "{}", errors[0].hint);
+    // A callee that calls one, and one called in a loop of the callee's own caller, are refused
+    // at the call that would run again.
+    let nested = plan_calling(
+        &format!("{helpers}\ndef g(c):\n    return f(c)\n"),
+        &format!("    for i in range(2):\n        r = g(i == 0)\n{tail}"),
+    );
+    let errors = lower_plan(&nested, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, line_of(&nested, "return f(c)"))]
+    );
+    let inner_loop = plan_calling(
+        helpers,
+        &format!(
+            "    r = 0\n    for i in range(2):\n        for j in range(2):\n            r = f(j == 0)\n{tail}"
+        ),
+    );
+    lower_plan(&inner_loop, vec![plan_segment()]).expect_err("refused");
+}
+
+/// Lowers the plan whose body calls `call` in a `range` loop, with `helpers` before it.
+fn lower_in_loop(helpers: &str, call: &str) -> Result<Program, Vec<StarError>> {
+    let source = plan_calling(
+        helpers,
+        &format!(
+            "    r = 0\n    for i in range(2):\n        r = {call}\n    res = diag.flash_transfer(1)\n"
+        ),
+    );
+    lower_plan(&source, vec![plan_segment()])
+}
+
+/// The hint of the one error of a refused call in a loop, which must be about `name`.
+fn assert_refused_reading(result: Result<Program, Vec<StarError>>, name: &str) {
+    let errors = result.expect_err("refused");
+    assert_eq!(errors.len(), 1, "{errors:#?}");
+    assert_eq!(errors[0].code, StarCode::NotLowerable);
+    assert!(
+        errors[0].hint.contains(&format!("reads `{name}`")),
+        "{}",
+        errors[0].hint
+    );
+}
+
+#[test]
+fn an_augmented_assignment_reads_its_target_in_the_unset_analysis() {
+    // `x += 1` reads `x`, which the `if` leaves unset on one path.
+    let helpers = "def f(c):\n    if c:\n        x = 1\n    x += 1\n    return x\n";
+    assert_refused_reading(lower_in_loop(helpers, "f(i == 0)"), "x");
+    // Assigned on every path first, the same update is fine.
+    let fine = "def f(c):\n    x = 0\n    if c:\n        x = 1\n    x += 1\n    return x\n";
+    lower_in_loop(fine, "f(i == 0)").expect("lowers");
+}
+
+#[test]
+fn a_path_ended_by_diag_fail_does_not_count_against_the_join() {
+    let helpers = "def f(c):\n    if c:\n        x = 1\n    else:\n        diag.fail(\"E\", \"d\")\n    return x\n";
+    lower_in_loop(helpers, "f(i == 0)").expect("lowers");
+}
+
+#[test]
+fn a_path_ended_by_continue_does_not_count_against_the_join() {
+    // The read after the branch is reached only when `x` was assigned.
+    let lowers = "\
+def f(n):
+    s = 0
+    for j in range(n):
+        if j == 1:
+            continue
+        x = j
+        s = s + x
+    return s
+";
+    lower_in_loop(lowers, "f(3)").expect("lowers");
+    // Here a path reaches the read with `x` unassigned: only the `continue` path is dropped.
+    let refused = "\
+def f(n):
+    s = 0
+    for j in range(n):
+        if j == 1:
+            continue
+        if j == 2:
+            x = j
+        s = s + x
+    return s
+";
+    assert_refused_reading(lower_in_loop(refused, "f(3)"), "x");
+    // A `continue` belongs to its own loop: in an inner loop it skips the inner assignment,
+    // which the outer loop's code after the inner loop must not count.
+    let nested = "\
+def f():
+    for a in range(1):
+        for u in range(2):
+            if u >= 0:
+                continue
+            z = u
+        r = z
+    return 0
+";
+    assert_refused_reading(lower_in_loop(nested, "f()"), "z");
+}
+
+#[test]
+fn a_constant_range_loop_that_runs_assigns_for_the_code_after_it() {
+    let tail = "    return y\n";
+    for over in [
+        "range(3)",
+        "range(1, 4)",
+        "range(0, 3, 1)",
+        "range(5, 0, -2)",
+        "range(N)",
+        "range(M - 1)",
+    ] {
+        let helpers =
+            format!("N = 3\nM = N + 1\n\ndef f():\n    for t in {over}:\n        y = t\n{tail}");
+        lower_in_loop(&helpers, "f()").unwrap_or_else(|e| panic!("{over}: {e:#?}"));
+    }
+    // The assignment past a `continue` on some iteration is not certain for the last one.
+    let skipped = "def f():\n    for t in range(3):\n        if t == 2:\n            continue\n        y = t\n    return y\n";
+    assert_refused_reading(lower_in_loop(skipped, "f()"), "y");
+    // A loop that may not run, a bound known at run time, a hidden constant, and a `break`
+    // keep the rule that the body assigns nothing after the loop.
+    for helpers in [
+        "def f():\n    for t in range(0):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(3, 1):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(0, 3, -1):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(3, 0, 1):\n        y = t\n    return y\n",
+        "def f(n):\n    for t in range(n):\n        y = t\n    return y\n",
+        "N = 3\n\ndef f(N):\n    for t in range(N):\n        y = t\n    return y\n",
+        "def f():\n    for t in range(3):\n        y = t\n        if t == 2:\n            break\n    return y\n",
+    ] {
+        let call = if helpers.contains("f(n)") || helpers.contains("f(N)") {
+            "f(3)"
+        } else {
+            "f()"
+        };
+        assert_refused_reading(lower_in_loop(helpers, call), "y");
+    }
+}
+
+#[test]
+fn a_section_error_lands_on_the_call_that_produced_the_section() {
+    // `outer` requires recovery before the recovery point; `inner`, called inside it, is
+    // interruptible. The refusal is at the plan's call of `outer`, not at the call of `inner`.
+    let helpers = "\
+# @section interruptible expected=5
+def inner():
+    diag.wait(7)
+
+# @section recoveryRequired expected=9
+def outer():
+    inner()
+    diag.wait(8)
+";
+    let source = plan_calling(helpers, "    outer()\n    res = diag.flash_transfer(1)\n");
+    let errors = lower_plan(&source, vec![plan_segment()]).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::NotLowerable, line_of(&source, "    outer()"))],
+        "{errors:#?}"
+    );
+    // The hint names the function, not an index of the lowered program.
+    assert!(errors[0].hint.contains("`outer`"), "{}", errors[0].hint);
+    assert!(!errors[0].hint.contains("section 0"), "{}", errors[0].hint);
+}
+
+#[test]
+fn a_callee_that_assigns_before_it_reads_runs_right_in_a_loop() {
+    // `g` assigns on both branches, `h` reads its loop variable inside the loop only, and `p`
+    // reads a parameter: none may read a stale value on the second pass.
+    let helpers = "\
+def g(c):
+    if c:
+        x = 1
+    else:
+        x = 2
+    return x
+
+def h(n):
+    s = 0
+    for j in range(n):
+        s = s + j
+    return s
+
+def p(a):
+    if a > 5:
+        return 0
+    y = a
+    return y + 10
+";
+    let body = r#"
+    r = 0
+    for i in range(2):
+        r = r + g(i == 0) + h(3) + p(i)
+    if r == 33:
+        diag.log(1, "right")
+    res = diag.flash_transfer(1)
+"#;
+    // Pass 0: 1 + 3 + 10 = 14; pass 1: 2 + 3 + 11 = 16; together 30.
+    let (_, calls) = run_plan(&plan_calling(helpers, &body.replace("r == 33", "r == 30")));
+    assert_eq!(logs(&calls), ["log 1 right"], "{calls:?}");
+}
+
+/// Lowers `source` as `lower_plan` does, with `max_copied` as the instruction budget.
+fn lower_plan_limited(source: &str, max_copied: usize) -> Result<Program, Vec<StarError>> {
+    let bytes = flash_document_with(Some(NO_ERASE), vec![plan_segment()]);
+    let variant = load_ecu_document(&bytes)
+        .expect("the document loads")
+        .variant()
+        .expect("a variant");
+    let checked = check("t.star", source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let requests = flash_index(&[]);
+    crate::star::on_parser_stack(|| lower_here("t.star", &checked, variant, &requests, max_copied))
+        .map(|lowered| lowered.program)
+}
+
+#[test]
+fn the_instruction_budget_counts_each_expansion_once() {
+    let wait = "    diag.wait(1)\n";
+    let tail = "    res = diag.flash_transfer(1)\n";
+    // A chain of 300 functions over a leaf of 200 waits holds about 400 instructions in all.
+    // Counted again at each level, as the whole body of each caller, it would pass 100,000.
+    let mut helpers = String::new();
+    for level in 0..300 {
+        helpers += &format!("def c{level}():\n    c{}()\n\n", level + 1);
+    }
+    helpers += &format!("def c300():\n{}", wait.repeat(200));
+    let chain = plan_calling(&helpers, &format!("    c0()\n{tail}"));
+    let program = lower_plan_limited(&chain, 5000).expect("lowers");
+    program.validate().expect("valid");
+    assert!(program.code.len() < 1000, "{}", program.code.len());
+    // The last expansion is charged too: one call of a body past the budget is refused, at the
+    // call, and the same call passes a larger budget.
+    let big = plan_calling(
+        &format!("def leaf():\n{}", wait.repeat(100)),
+        &format!("    leaf()\n{tail}"),
+    );
+    let errors = lower_plan_limited(&big, 50).expect_err("refused");
+    assert_eq!(
+        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
+        [(StarCode::SpecializationLimit, line_of(&big, "    leaf()"))]
+    );
+    lower_plan_limited(&big, 100_000).expect("lowers");
+    // Many calls of a modest body pass the budget as well.
+    let many = plan_calling(
+        &format!("def leaf():\n{}", wait.repeat(50)),
+        &format!("{}{tail}", "    leaf()\n".repeat(20)),
+    );
+    let errors = lower_plan_limited(&many, 900).expect_err("refused");
+    assert!(
+        errors
+            .iter()
+            .all(|e| e.code == StarCode::SpecializationLimit),
+        "{errors:#?}"
+    );
+    lower_plan_limited(&many, 100_000).expect("lowers");
+}
+
+/// The idempotency of the single-instruction sections at `pc`, one for each section covering it
+/// with a piece of its own.
+fn pieces_at(program: &Program, pc: usize) -> Vec<String> {
+    program
+        .sections
+        .iter()
+        .filter(|s| s.start_pc as usize == pc && s.end_pc as usize == pc + 1)
+        .map(|s| format!("{:?}", s.idempotency))
+        .collect()
+}
+
+#[test]
+fn an_annotation_in_a_callee_applies_to_its_primitive() {
+    // The `CheckState` default of a write request in a callee is checked against the example
+    // ECU's services in `tests/plan_callees.rs`.
+    let tail = "    res = diag.flash_transfer(1)\n";
+    // The annotation reaches the callee's first wait only: not its second, nor the caller's.
+    let helpers =
+        "def quiet():\n    # @idempotency checkState\n    diag.wait(1)\n    diag.wait(2)\n";
+    let program = lower_plan(
+        &plan_calling(helpers, &format!("    quiet()\n    diag.wait(3)\n{tail}")),
+        vec![plan_segment()],
+    )
+    .expect("lowers");
+    let waits: Vec<usize> = (0..program.code.len())
+        .filter(|&pc| matches!(program.code[pc], Op::Wait { .. }))
+        .collect();
+    let found: Vec<_> = waits.iter().map(|&pc| pieces_at(&program, pc)).collect();
+    assert_eq!(
+        found,
+        [["CheckState"], ["Safe"], ["Safe"]],
+        "{:?}",
+        program.code
+    );
+}
+
+#[test]
+fn break_and_continue_do_not_cross_an_expansion() {
+    let tail = "    res = diag.flash_transfer(1)\n";
+    // A callee's own loop keeps its `break`; the caller's loop is not reachable from it.
+    let own = plan_calling(
+        "def first(n):\n    i = 0\n    for i in range(n):\n        if i == 2:\n            break\n    return i\n",
+        &format!("    for k in range(2):\n        r = first(5)\n{tail}"),
+    );
+    lower_plan(&own, vec![plan_segment()]).expect("lowers");
+    let outside = plan_calling(
+        "def stop():\n    break\n",
+        &format!("    for k in range(2):\n        stop()\n{tail}"),
+    );
+    // Either the checker or the lowering refuses it; it never jumps out of the expansion.
+    match check("t.star", &outside) {
+        Err(errors) => assert!(!errors.is_empty()),
+        Ok(_) => {
+            let errors = lower_plan(&outside, vec![plan_segment()]).expect_err("refused");
+            assert_eq!(errors[0].code, StarCode::NotLowerable);
+            assert!(
+                errors[0].hint.contains("belong in a loop"),
+                "{}",
+                errors[0].hint
+            );
+        }
+    }
+}
+
+#[test]
+fn a_section_function_in_another_section_function_keeps_both_sets_of_pieces() {
+    let helpers = "\
+# @section recoveryRequired expected=700
+def inner():
+    diag.wait(7)
+
+# @section interruptible expected=500
+def outer():
+    diag.wait(6)
+    inner()
+    diag.wait(5)
+";
+    let body = "    res = diag.flash_transfer(1)\n    outer()\n";
+    let (program, calls) = run_plan(&plan_calling(helpers, body));
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| c.starts_with("wait"))
+            .collect::<Vec<_>>(),
+        ["wait 6", "wait 7", "wait 5"],
+        "{calls:?}"
+    );
+    let covering = |pc: u32| -> Vec<(u32, String)> {
+        let mut found: Vec<_> = program
+            .sections
+            .iter()
+            .filter(|s| (s.start_pc..s.end_pc).contains(&pc))
+            .map(|s| (s.expected_millis, format!("{:?}", s.interruptible)))
+            .collect();
+        found.sort();
+        found
+    };
+    let waits: Vec<u32> = (0..program.code.len() as u32)
+        .filter(|&pc| matches!(program.code[pc as usize], Op::Wait { .. }))
+        .collect();
+    // The waits of `outer` lie in the plan's and in `outer`'s sections, the inner one also in
+    // `inner`'s.
+    let plan = (1000, "No".to_owned());
+    let outer = (500, "Yes".to_owned());
+    let inner = (700, "RecoveryRequired".to_owned());
+    let (first, middle, last) = (
+        waits[waits.len() - 3],
+        waits[waits.len() - 2],
+        waits[waits.len() - 1],
+    );
+    assert_eq!(covering(first), [outer.clone(), plan.clone()]);
+    assert_eq!(covering(middle), [outer.clone(), inner, plan.clone()]);
+    assert_eq!(covering(last), [outer, plan]);
+}
+
+#[test]
+fn main_locals_keep_their_values_across_a_plan_with_callees() {
+    let helpers = "def twice(a):\n    b = a * 2\n    return b\n";
+    let source = format!(
+        "{helpers}\n# @section uninterruptible expected=1000\n# @flashPlan session=1\n\
+         def write():\n    c = twice(4)\n    d = twice(c)\n    res = diag.flash_transfer(1)\n\n\
+         # @preconditions voltage externalSupply ignition\n\
+         def main():\n    a = 5\n    b = 7\n    write()\n    if a == 5 and b == 7:\n        \
+         diag.log(1, \"kept\")\n    a = twice(a)\n    if a == 10:\n        diag.log(1, \"after\")\n"
+    );
+    let (_, calls) = run_plan(&source);
+    assert_eq!(logs(&calls), ["log 1 kept", "log 1 after"], "{calls:?}");
 }
 
 #[test]

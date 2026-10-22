@@ -340,11 +340,11 @@ def main():
     let unannotated = source.replace("    # @idempotency unsafe\n", "");
     one_plan(identity_table(), &unannotated);
     let errors = lowered(identity_table(), source).expect_err("refused");
-    // The refusal names a section, not a pc: it stays not lowerable, at the file's first
-    // statement.
+    // The refusal names a section, not a pc: it stays not lowerable, at the source of the
+    // section's instruction (the unsafe request).
     assert_eq!(
         errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
-        [(StarCode::NotLowerable, 3)]
+        [(StarCode::NotLowerable, 8)]
     );
     assert!(errors[0].hint.contains("unsafe"), "{}", errors[0].hint);
 }
@@ -397,16 +397,90 @@ def main():
 }
 
 #[test]
-fn a_plan_that_calls_a_function_is_refused_as_not_lowered_yet() {
-    let source = PLAN.replace(
-        "    res = diag.flash_transfer(1)",
-        "    helper()\n    res = diag.flash_transfer(1)",
-    ) + "\ndef helper():\n    diag.wait(1)\n";
-    let errors = lowered(example(), &source).expect_err("refused");
-    assert_eq!(
-        errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
-        [(StarCode::NotLowerable, 8)]
+fn a_plan_that_calls_functions_is_expanded_in_place_and_runs() {
+    // A plain function the plan calls before the erase, and a section function after the
+    // transfer that calls another plain function, which the example's services can select.
+    let source = "\
+def enter_programming():
+    diag.request(0x10, {\"sub\": 0x02})
+
+def check_dependencies():
+    diag.routine(0xFF01, 0x01, {})
+
+# @section uninterruptible expected=1000
+def finish(done):
+    check_dependencies()
+    diag.request(0x11, {\"reset\": 0x01})
+    return done
+
+# @section uninterruptible expected=180000
+# @flashPlan session=1
+def write():
+    enter_programming()
+    # @erase
+    diag.routine(0xFF00, 0x01, {})
+    res = diag.flash_transfer(1)
+    if finish(1) == 1:
+        diag.log(1, \"finished\")
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+";
+    let files = with_segment(example(), "0x08000000", "0x25", "0x10", "0x44");
+    let converted = convert(with(files, "main.star", source));
+    let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
+    let program: Program =
+        postcard::from_bytes(document.procedure().expect("a program").bytes()).expect("a program");
+    program.validate().expect("valid");
+    let plan = &program.flash[0];
+    let inside = plan.boundaries.entry_pc as usize..plan.boundaries.post_transfer_end_pc as usize;
+    assert!(
+        program.code[inside.clone()]
+            .iter()
+            .all(|op| !matches!(op, Op::Call(_) | Op::Ret)),
+        "{:?}",
+        program.code
     );
+    // The functions' requests are inside the plan, the erase and the exit where the code puts
+    // them.
+    let erase = find(&program, 0, routine(0xFF00));
+    let check = find(&program, 0, routine(0xFF01));
+    assert_eq!(plan.boundaries.erase_pc, erase);
+    assert!(erase > find(&program, 0, service(0x10)));
+    assert!(plan.boundaries.transfer_exit_pc < check);
+    assert!(inside.contains(&(find(&program, 0, service(0x11)) as usize)));
+    // The section function's pieces keep its 1000 ms inside the plan's 180000.
+    assert!(program.sections.iter().any(|s| {
+        s.expected_millis == 1000
+            && s.start_pc <= check
+            && check < s.end_pc
+            && matches!(s.interruptible, Interruptible::No)
+    }));
+    // A run: the blocks go out between the erase and the functions' requests.
+    let mut host = PlanHost {
+        artifact: (0..64u8).collect(),
+        log: Vec::new(),
+    };
+    let mut vm = diag_ir::Vm::new(&program);
+    for _ in 0..10_000 {
+        match vm.step_with_declarations(&program, document.variant().as_ref(), &mut host) {
+            Ok(diag_ir::StepOutcome::Continue) => {}
+            Ok(diag_ir::StepOutcome::Finished) => break,
+            other => panic!("{other:?}"),
+        }
+    }
+    let log: Vec<&str> = host.log.iter().map(String::as_str).collect();
+    let at = |prefix: &str| {
+        log.iter()
+            .position(|entry| entry.starts_with(prefix))
+            .unwrap_or_else(|| panic!("{prefix}: {log:?}"))
+    };
+    assert!(at("request 10") < at("routine ff00"));
+    assert!(at("routine ff00") < at("request 34"));
+    assert!(at("request 37") < at("routine ff01"));
+    assert!(at("routine ff01") < at("request 11"));
+    assert_eq!(log.iter().filter(|e| e.starts_with("transfer")).count(), 3);
 }
 
 #[test]

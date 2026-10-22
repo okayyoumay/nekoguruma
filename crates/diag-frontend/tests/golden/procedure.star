@@ -14,7 +14,9 @@
 # serves a fake artifact and sums the blocks it is given. `diag.hmi` asks the operator to confirm
 # the session, with a constant and a run-time param, so it lowers to `HmiRequestFromStack`, and
 # `diag.record` lowers to `RecordInput`; the host writes each form it is given and answers it
-# (subset 3.1, 3.4, ADR-340).
+# (subset 3.1, 3.4, ADR-340). The plan calls a plain helper with a parameter and a return value,
+# twice, and a section function, all expanded in place in the plan (subset 4.9, ADR-336 item 3):
+# the plan's range holds no call, and the section function's pieces lie inside the plan's.
 
 def read_vin():
     diag.request(0x22, {"did": 0xF190})
@@ -23,6 +25,18 @@ def read_vin():
 def write_vin():
     read_vin()
     diag.request(0x2E, {"did": 0xF190, "vin": "WVWZZZ1JZXW000001"})
+
+def routine_passed(what):
+    result = diag.routine(0xFF01, 0x01, {})
+    if not result["ok"]:
+        diag.log(1, what + " refused")
+    return result["ok"]
+
+# @section uninterruptible expected=500
+def reset_ecu():
+    reset = diag.request(0x11, {"reset": 0x01})
+    if not reset["ok"]:
+        diag.fail("RESET_REFUSED", "the ECU reset was refused")
 
 # @section uninterruptible expected=120000
 # @flashPlan session=1
@@ -34,10 +48,11 @@ def write_application():
     exit = diag.flash_transfer(1)
     if not exit["ok"]:
         diag.fail("TRANSFER_EXIT_REFUSED", "the transfer exit was refused")
-    diag.routine(0xFF01, 0x01, {})
-    reset = diag.request(0x11, {"reset": 0x01})
-    if not reset["ok"]:
-        diag.fail("RESET_REFUSED", "the ECU reset was refused")
+    if not routine_passed("the dependencies check"):
+        diag.fail("CHECK_FAILED", "the programming dependencies check failed")
+    if not routine_passed("the second check"):
+        diag.fail("CHECK_FAILED", "the second dependencies check failed")
+    reset_ecu()
 
 # @preconditions voltage externalSupply ignition engine vehicleSpeed
 def main():

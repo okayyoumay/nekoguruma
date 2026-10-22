@@ -163,7 +163,7 @@ pub fn lower(
     variant: EcuVariant<'_>,
     requests: &RequestIndex,
 ) -> Result<Lowered, Vec<StarError>> {
-    super::on_parser_stack(|| lower_here(file, checked, variant, requests))
+    super::on_parser_stack(|| lower_here(file, checked, variant, requests, MAX_COPIED_INSTRUCTIONS))
 }
 
 /// A lowered procedure and the warnings its lowering reported (such as
@@ -175,24 +175,54 @@ pub struct Lowered {
 }
 
 /// The error for a program `validate` refused (ADR-336 item 4): `STAR_PLAN_INVALID` at the source
-/// span of the instruction the error names, and `STAR_NOT_LOWERABLE` at the start of the file for
-/// one that names none (or one past the code). `spans` holds each instruction's source span.
-fn invalid_program(checked: &Checked, spans: &[Span], error: &ProgramError) -> Pending {
+/// span of the instruction the error names. One that names a section, not an instruction, is
+/// `STAR_NOT_LOWERABLE` at the call of the section function the section is a piece of, when it
+/// was expanded in place, and otherwise at the source of its first instruction; one that names
+/// neither is `STAR_NOT_LOWERABLE` at the start of the file. `spans` holds each instruction's source span.
+fn invalid_program(
+    checked: &Checked,
+    program: &Program,
+    spans: &[Span],
+    expansions: &[(u32, u32, Span)],
+    error: &ProgramError,
+) -> Pending {
     let hint = format!("the lowered program is not valid: {error}");
-    match error.pc().and_then(|pc| spans.get(pc as usize)) {
-        Some(span) => Pending {
+    if let Some(span) = error.pc().and_then(|pc| spans.get(pc as usize)) {
+        return Pending {
             code: StarCode::PlanInvalid,
             span: *span,
             hint,
-        },
+        };
+    }
+    let section = match error {
+        ProgramError::ContradictoryInterruptibility { section, .. }
+        | ProgramError::UnsafeSectionInReplay { section, .. }
+        | ProgramError::InvalidSection { section } => Some(*section),
+        _ => None,
+    };
+    let start = section
+        .and_then(|section| program.sections.get(section))
+        .map(|section| section.start_pc);
+    // The innermost in-place expansion of a section function holding the piece, at its call.
+    let call = start.and_then(|start| {
+        expansions
+            .iter()
+            .filter(|(from, to, _)| (*from..*to).contains(&start))
+            .min_by_key(|(from, to, _)| to - from)
+            .map(|(_, _, call)| call)
+    });
+    let at = call.or_else(|| start.and_then(|start| spans.get(start as usize)));
+    let span = match at {
+        Some(span) => *span,
         None => {
             let span = checked.module.statement().span;
-            Pending {
-                code: StarCode::NotLowerable,
-                span: Span::new(span.begin(), span.begin()),
-                hint,
-            }
+            Span::new(span.begin(), span.begin())
         }
+    };
+    Pending {
+        code: StarCode::NotLowerable,
+        span,
+        hint,
     }
 }
 
@@ -201,8 +231,10 @@ fn lower_here<'a>(
     checked: &'a Checked,
     variant: EcuVariant<'a>,
     requests: &'a RequestIndex,
+    max_copied: usize,
 ) -> Result<Lowered, Vec<StarError>> {
     let mut lowerer = Lowerer::new(checked, variant, requests);
+    lowerer.max_copied = max_copied;
     lowerer.constants();
     lowerer.globals_built = lowerer.built;
     lowerer.functions();
@@ -225,13 +257,21 @@ fn lower_here<'a>(
         let errors = std::mem::take(&mut lowerer.errors);
         return Err(resolve(file, &checked.module, errors));
     }
-    let (program, spans) = lowerer.assemble();
-    // Every check `validate` makes is one the lowering guarantees by construction.
+    let (program, spans, expansions) = lowerer.assemble();
+    // `validate` still refuses what the source can ask for and the lowering does not look at:
+    // a section function that requires intervention before the recovery point, an unsafe
+    // section in a restartable plan's replay, the identity rows.
     if let Err(error) = program.validate() {
         return Err(resolve(
             file,
             &checked.module,
-            vec![invalid_program(checked, &spans, &error)],
+            vec![invalid_program(
+                checked,
+                &program,
+                &spans,
+                &expansions,
+                &error,
+            )],
         ));
     }
     let warnings = std::mem::take(&mut lowerer.warnings);
@@ -739,6 +779,15 @@ struct Lowerer<'a> {
     /// (subset 2.6, 4.5).
     inline_copies: usize,
     inline_size: usize,
+    /// The instruction budget of [`Lowerer::inline_size`] and of the sections' copies; tests
+    /// lower with a smaller one.
+    max_copied: usize,
+    /// How many run-time loops (`range`) enclose what is being lowered, the loops of the
+    /// callers of an expansion included. An expansion inside one runs more than once.
+    run_loops: u32,
+    /// The first local each function may read before every path assigns it, if any, by
+    /// function (4.9).
+    maybe_unset: HashMap<usize, Option<String>>,
     /// Where an inference pass first found those limits passed, which the emission reports.
     inline_limit: Option<Span>,
 }
@@ -825,6 +874,9 @@ impl<'a> Lowerer<'a> {
             inline_stack: Vec::new(),
             inline_copies: 0,
             inline_size: 0,
+            max_copied: MAX_COPIED_INSTRUCTIONS,
+            run_loops: 0,
+            maybe_unset: HashMap::new(),
             inline_limit: None,
         }
     }
@@ -1375,7 +1427,7 @@ impl<'a> Lowerer<'a> {
                 }
                 if target.section.is_some() {
                     let size = self.funcs[callee].code.len();
-                    if specialized == MAX_COPIES || copied + size > MAX_COPIED_INSTRUCTIONS {
+                    if specialized == MAX_COPIES || copied + size > self.max_copied {
                         self.error(StarCode::SpecializationLimit, span, specialization_limit());
                         return;
                     }
@@ -1966,7 +2018,9 @@ impl<'a> Lowerer<'a> {
             }
         }
         self.loops.push(LoopLabels { end, next });
+        self.run_loops += 1;
         self.stmt(id, body, code);
+        self.run_loops -= 1;
         self.loops.pop();
         // A value one step on would leave the int range only when it is past every stop
         // anyway, so the loop ends there instead of overflowing.
@@ -4022,7 +4076,9 @@ impl<'a> Lowerer<'a> {
     /// pieces over the range, entered by fallthrough. What a statement around the call says does
     /// not reach in: its `@idempotency`, its loops' `break` and `continue`, and the constants an
     /// unrolled loop of the caller binds. A call chain that closes on a function being expanded
-    /// is recursion, which the checker rejects already (4.1).
+    /// is recursion, which the checker rejects already (4.1). An expansion inside a run-time
+    /// loop runs more than once with the locals of the pass before, so a callee that may read a
+    /// local before assigning it is refused there ([`Self::maybe_unset_local`]).
     fn inline_call(
         &mut self,
         id: Option<usize>,
@@ -4071,9 +4127,22 @@ impl<'a> Lowerer<'a> {
             code.extend(more);
             self.widen_slot(callee, at as u16, tys);
         }
+        if self.run_loops > 0
+            && let Some(name) = self.maybe_unset_local(callee)
+        {
+            self.not_lowerable(
+                span,
+                format!(
+                    "a function a flash plan calls inside a loop reads `{name}` before every path \
+                     assigns it; a call would fail there, and the plan's expansion would read the \
+                     previous pass's value (4.9)"
+                ),
+            );
+            return failed();
+        }
         // The copies of the sections and the expansions share the budgets of 2.6, checked before
         // the body is lowered so that a chain of calls that doubles at each level stops early.
-        if self.inline_copies >= MAX_COPIES || self.inline_size > MAX_COPIED_INSTRUCTIONS {
+        if self.inline_copies >= MAX_COPIES || self.inline_size > self.max_copied {
             self.inline_limit.get_or_insert(span);
             self.error(StarCode::SpecializationLimit, span, specialization_limit());
             return failed();
@@ -4083,13 +4152,23 @@ impl<'a> Lowerer<'a> {
         let loops = std::mem::take(&mut self.loops);
         let bound = std::mem::take(&mut self.bound);
         self.inline_stack.push(callee);
-        let mut body: Code = Vec::new();
+        let (before, mut body): (usize, Code) = (self.inline_size, Vec::new());
         self.body(callee, &mut body);
         self.inline_stack.pop();
         self.annotated = annotated;
         self.loops = loops;
         self.bound = bound;
-        self.inline_size += body.iter().filter(|(ins, _)| !ins.is_pseudo()).count();
+        // The body holds the expansions nested in it, which charged themselves already: this
+        // expansion adds only its own instructions, so each is counted once however deep the
+        // chain of calls.
+        let nested = self.inline_size - before;
+        let held = body.iter().filter(|(ins, _)| !ins.is_pseudo()).count();
+        self.inline_size += held.saturating_sub(nested);
+        if self.inline_size > self.max_copied {
+            self.inline_limit.get_or_insert(span);
+            self.error(StarCode::SpecializationLimit, span, specialization_limit());
+            return failed();
+        }
         // The callee's frame moves into the caller's, after the slots the caller has used.
         let (base, size) = (self.funcs[caller].temps, self.funcs[callee].temps);
         let Some(end) = base.checked_add(size) else {
@@ -4127,6 +4206,25 @@ impl<'a> Lowerer<'a> {
         } else {
             Val::Void(code)
         }
+    }
+
+    /// The first local of `callee`, or of a function it calls, that a path of its body may read
+    /// before the path assigns it (4.9), if any. A call fails at such a read ("undefined
+    /// variable"), but an expansion's slots keep the value of the pass before.
+    fn maybe_unset_local(&mut self, callee: usize) -> Option<String> {
+        if let Some(known) = self.maybe_unset.get(&callee) {
+            return known.clone();
+        }
+        let func = &self.funcs[callee];
+        let mut unset = Unset {
+            locals: &func.slots,
+            found: None,
+        };
+        let mut state = Some(func.params.iter().cloned().collect::<HashSet<String>>());
+        unset.stmt(&func.def.body, &mut state);
+        let found = unset.found;
+        self.maybe_unset.insert(callee, found.clone());
+        found
     }
 
     /// The call of the flash plan `plan` in `main` (4.9, ADR-336 items 2 and 4): its body is
@@ -6582,7 +6680,7 @@ impl<'a> Lowerer<'a> {
     /// between them (ADR-329), all with that section function's interruptibility and expected
     /// duration (ADR-301). A primitive outside every section is `Yes` with duration 0. The
     /// sections never overlap (ADR-332).
-    fn assemble(&mut self) -> (Program, Vec<Span>) {
+    fn assemble(&mut self) -> (Program, Vec<Span>, Vec<(u32, u32, Span)>) {
         // Labels are unique within a function's body, so a copy's are told apart by its index.
         let index: HashMap<FuncCopy, usize> = self
             .copies
@@ -6597,6 +6695,9 @@ impl<'a> Lowerer<'a> {
         let mut sections: Vec<Section> = Vec::new();
         // Where each flash plan's expansion begins and ends, and its boundaries (ADR-336 item 4).
         let mut plan_ranges: Vec<PlanRange> = Vec::new();
+        // The range and the call of each section function expanded in place, to locate a refusal
+        // that names one of its pieces.
+        let mut expansions: Vec<(u32, u32, Span)> = Vec::new();
         let mut pc = 0u32;
         for (at, copy) in self.copies.iter().enumerate() {
             let start = pc;
@@ -6605,7 +6706,7 @@ impl<'a> Lowerer<'a> {
             let first_plan = plan_ranges.len();
             // The section functions expanded in place in a plan: the ones still open, and the
             // ranges of those closed, each with the function's attributes (ADR-336 item 3).
-            let mut expanding: Vec<(u32, usize)> = Vec::new();
+            let mut expanding: Vec<(u32, usize, Span)> = Vec::new();
             let mut expanded: Vec<(u32, u32, (Interruptible, u32))> = Vec::new();
             for (ins, span) in &self.funcs[copy.func].code {
                 match ins {
@@ -6635,11 +6736,12 @@ impl<'a> Lowerer<'a> {
                             slot.get_or_insert(pc);
                         }
                     }
-                    Ins::SectionBegin(function) => expanding.push((pc, *function)),
+                    Ins::SectionBegin(function) => expanding.push((pc, *function, *span)),
                     Ins::SectionEnd => {
-                        if let Some((from, function)) = expanding.pop()
+                        if let Some((from, function, call)) = expanding.pop()
                             && from < pc
                         {
+                            expansions.push((from, pc, call));
                             let attributes =
                                 self.funcs[function].section.expect("a section function");
                             expanded.push((from, pc, attributes));
@@ -6773,7 +6875,7 @@ impl<'a> Lowerer<'a> {
             preconditions: self.preconditions.clone(),
             flash,
         };
-        (program, spans)
+        (program, spans, expansions)
     }
 
     /// The recovery plan of the flash plan laid out as `range` (ADR-336 items 1, 4 and 7): the
@@ -7056,6 +7158,115 @@ impl Items {
         match self {
             Items::List(items) => items[at].clone(),
             Items::Keys(entries) => Const::Str(entries[at].0.clone()),
+        }
+    }
+}
+
+/// A conservative definite-assignment analysis of one function body (4.9): the first local that
+/// some path may read before it assigns it. A path state is the set of names assigned on every
+/// way to it, or `None` once the path has ended (a `return`, `break`, `continue` or
+/// `diag.fail`), which assigns everything for what follows. Parameters are assigned at the start;
+/// an `if` keeps what both branches assign (a branch that ends does not count against it); a loop
+/// body assigns nothing for the code after the loop, since it may not run, and its variable is
+/// assigned inside the body only. A name that is not a local (a constant, a builtin) is never
+/// reported.
+struct Unset<'f> {
+    locals: &'f HashMap<String, u16>,
+    found: Option<String>,
+}
+
+type Assigned = Option<HashSet<String>>;
+
+impl Unset<'_> {
+    fn read(&mut self, name: &str, state: &Assigned) {
+        if let Some(assigned) = state
+            && self.found.is_none()
+            && self.locals.contains_key(name)
+            && !assigned.contains(name)
+        {
+            self.found = Some(name.to_owned());
+        }
+    }
+
+    fn expr(&mut self, expr: &AstExpr, state: &Assigned) {
+        if let ExprP::Identifier(ident) = &expr.node {
+            self.read(&ident.node.ident, state);
+        }
+        expr.visit_expr(|inner| self.expr(inner, state));
+    }
+
+    fn assign(name: &str, state: &mut Assigned) {
+        if let Some(assigned) = state {
+            assigned.insert(name.to_owned());
+        }
+    }
+
+    fn join(state: &mut Assigned, other: Assigned) {
+        *state = match (state.take(), other) {
+            (Some(a), Some(b)) => Some(a.intersection(&b).cloned().collect()),
+            (Some(a), None) | (None, Some(a)) => Some(a),
+            (None, None) => None,
+        };
+    }
+
+    fn stmt(&mut self, stmt: &AstStmt, state: &mut Assigned) {
+        match &stmt.node {
+            StmtP::Statements(list) => {
+                for inner in list {
+                    self.stmt(inner, state);
+                }
+            }
+            StmtP::Expression(expr) => {
+                self.expr(expr, state);
+                if is_diag_fail(expr) {
+                    *state = None;
+                }
+            }
+            StmtP::Assign(assign) => {
+                self.expr(&assign.rhs, state);
+                if let AssignTargetP::Identifier(name) = &assign.lhs.node {
+                    Self::assign(&name.node.ident, state);
+                }
+            }
+            StmtP::AssignModify(target, _, rhs) => {
+                if let AssignTargetP::Identifier(name) = &target.node {
+                    self.read(&name.node.ident, state);
+                }
+                self.expr(rhs, state);
+                if let AssignTargetP::Identifier(name) = &target.node {
+                    Self::assign(&name.node.ident, state);
+                }
+            }
+            StmtP::Return(value) => {
+                if let Some(value) = value {
+                    self.expr(value, state);
+                }
+                *state = None;
+            }
+            StmtP::Break | StmtP::Continue => *state = None,
+            StmtP::If(cond, then) => {
+                self.expr(cond, state);
+                let mut taken = state.clone();
+                self.stmt(then, &mut taken);
+                Self::join(state, taken);
+            }
+            StmtP::IfElse(cond, branches) => {
+                self.expr(cond, state);
+                let (mut then, mut otherwise) = (state.clone(), state.clone());
+                self.stmt(&branches.0, &mut then);
+                self.stmt(&branches.1, &mut otherwise);
+                Self::join(&mut then, otherwise);
+                *state = then;
+            }
+            StmtP::For(for_) => {
+                self.expr(&for_.over, state);
+                let mut inside = state.clone();
+                if let AssignTargetP::Identifier(name) = &for_.var.node {
+                    Self::assign(&name.node.ident, &mut inside);
+                }
+                self.stmt(&for_.body, &mut inside);
+            }
+            StmtP::Pass | StmtP::Def(_) | StmtP::Load(_) => {}
         }
     }
 }

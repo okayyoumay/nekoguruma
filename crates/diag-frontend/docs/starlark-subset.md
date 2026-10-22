@@ -831,8 +831,19 @@ and `Program.flash`.
   `STAR_BAD_ANNOTATION`, and no `break` or `continue` crosses it. Recursion is refused by the
   checker as everywhere (4.1); a transfer, `@erase` or `@recoveryRequired` in a callee is refused
   by the shape rules above, so each boundary is a top-level statement of the plan itself. The
-  expansions count toward the specialization budget of 2.6 in copies and instructions
-  (`STAR_SPECIALIZATION_LIMIT`).
+  expansions count toward the specialization budget of 2.6 in copies and instructions, each
+  expansion's own instructions once however deep the chain of calls, and the limit is checked
+  after each expansion, at its call (`STAR_SPECIALIZATION_LIMIT`).
+  An expansion has slots of its own but no fresh frame, so one that runs more than once would
+  start with the locals of the pass before, where a call starts with none (reading a local
+  before assigning it is `VmError::UndefinedVariable`). A call inside a run-time loop (a `range`
+  loop of the plan, or of a function the plan calls that is itself expanded) is therefore
+  `STAR_NOT_LOWERABLE` when the callee, or a function it expands in turn, has a local that a
+  path may read before it assigns it. The check is conservative: parameters are assigned; an `if`
+  keeps what both branches assign; a loop body assigns nothing for the code after the loop, and
+  its variable only inside it; a `return`, `break`, `continue` or `diag.fail` ends a path.
+  A call outside every run-time loop, and one in a loop over a constant list or dict (each pass
+  of which is expanded again), is not refused.
 - **Boundaries.** Derived from the lowered code. The entry is the first instruction of the
   expansion and the post-transfer end the pc after its last. The transfer exit is the RequestTransferExit the `diag.flash_transfer`
   expansion emits. The erase point is the `diag.routine` statement annotated `# @erase`, a single
@@ -879,8 +890,10 @@ and `Program.flash`.
   program's (above).
 - **Validation.** `Program::validate` runs on every lowered program. A refusal that names a pc is
   `STAR_PLAN_INVALID` at the source of that pc; one without a pc stays `STAR_NOT_LOWERABLE`, at the
-  first statement of the file (an unsafe section in the replay of a restartable plan is one:
-  the error names a section, not a pc).
+  first statement of the file, except that one naming a section (an unsafe section in the replay
+  of a restartable plan, a `recoveryRequired` section before the recovery point) is at the call
+  that expanded the section function, or at the section's first instruction when it is no
+  expansion.
 - **Layout.** `main`'s body is emitted at pc 0 and ends in a `Ret`, so no `Call` leads to a plan
   (ADR-336 item 5, amending ADR-304 item 1).
 

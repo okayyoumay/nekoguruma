@@ -340,11 +340,11 @@ def main():
     let unannotated = source.replace("    # @idempotency unsafe\n", "");
     one_plan(identity_table(), &unannotated);
     let errors = lowered(identity_table(), source).expect_err("refused");
-    // The refusal names a section, not a pc: it stays not lowerable, at the file's first
-    // statement.
+    // The refusal names a section, not a pc: it stays not lowerable, at the source of the
+    // section's instruction (the unsafe request).
     assert_eq!(
         errors.iter().map(|e| (e.code, e.line)).collect::<Vec<_>>(),
-        [(StarCode::NotLowerable, 3)]
+        [(StarCode::NotLowerable, 8)]
     );
     assert!(errors[0].hint.contains("unsafe"), "{}", errors[0].hint);
 }

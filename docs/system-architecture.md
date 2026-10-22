@@ -1071,6 +1071,7 @@ When a diagnostic run fails, the agent's communication log tells whether the veh
 - The API keeps handling response pending (`CP_RC78Handling` 1, ADR-235 item 3); a worker that sees a pending passes it on, bound to the primitive.
 - The worker's error events carry their extra error information (ISO 22900-2:2022 D.4.2), which tells a missing flow control or consecutive frame from no response.
 - The agent reads every item of the link: those of the running primitive, those with no primitive (transmit indications, link errors) and those of earlier primitives.
+- The host tells its own deadline passing from the VCI ending the exchange without a response.
 
 **Header**
 
@@ -1092,13 +1093,13 @@ The first line, written once the job's first link is open and before its first r
 | `seq`, `target`, `origin` | Sequence number in the log; the target role; who sent it (`procedure`, `repeat` after a resume (8.2.5), `identification`, `restart_check`, `access_program`, `keep_alive`) |
 | `at` | VM position: pc and step count, and the Starlark source position from the program's source map (8.4); the section attributes in force (8.10.1) |
 | `request` | Service ID and name (`0x31`, `RoutineControl`), the request bytes, and whether the positive response is suppressed |
-| `sent` | `confirmed`, `not_sent` or `unknown`, with `sent_evidence`: `tx_indication` (bound to the primitive, or unbound while it is the only one on the link), `tx_done_time` on the response, `answer` (any response, a pending included), `refused` (by the agent, or by the worker after a lost VCI), `tx_error`, or `none` |
-| `outcome` | `positive`, `positive_unusable` (a wrong echo or a missing field), `negative` (code, name and `nrc_kind`), `no_response`, `no_flow_control` (the request was not completely sent), `response_incomplete` (the ECU began a response and did not finish it), `not_sent`, `vci_lost` or `unknown`; the final response bytes |
+| `sent` | `confirmed`, `partial` (the first frame of a multi-frame request went out and the ECU sent no flow control), `not_sent` or `unknown`, with `sent_evidence`: `tx_indication` (bound to the primitive, or unbound while it is the only one on the link), `tx_done_time` on the response, `answer` (any response, a pending included), `refused` (by the agent, or by the worker after a lost VCI), `tx_error`, `flow_control_timeout`, or `none`; a refusal caused by an earlier response names that exchange in `caused_by` |
+| `outcome` | `positive`, `positive_unusable` (a wrong echo or a missing field), `negative` (code, name and `nrc_kind`), `no_response`, `no_flow_control` (the request was not completely sent), `response_incomplete` (the ECU began a response and did not finish it), `vci_did_not_end` (the agent's deadline passed before the VCI ended the exchange), `not_sent`, `vci_lost` or `unknown`; the final response bytes |
 | `pending` | Each response pending (0x78) the agent saw, with its VCI and agent time, and `pending_visibility`: `forwarded` when the worker passes them on, `absorbed_by_vci` when the API handles 0x78 itself and the list cannot show them |
 | `timing` | The measured response time and how it was measured (`vci_tx_done_to_rx_start`, `vci_tx_done_to_rx_end` or `agent`), the P2, P2* and 0x78 completion limits in force, and `window`: within P2; beyond P2 with pendings absorbed by the VCI (an inference, marked as one); no response within P2; pendings, then no response within P2* or the completion limit |
 | `times` | Agent times (monotonic and wall) before and after the primitive was started, at the transmit confirmation and at the end; VCI times (transmit done, response start, response end, error) as raw microseconds, each with its clock (`device` for the VCI's own, `worker` for a worker's synthetic clock, ADR-120) |
 | `link_history` | How many exchanges on this link got an answer earlier in this log, and how many since the link's last error |
-| `supply_voltage` | The last supply-voltage reading of the VCI (8.9), when one was taken |
+| `supply_voltage` | The last supply-voltage reading of the VCI (8.9) in millivolts and its age, when one was taken |
 | `text` | One sentence in vehicle-communication terms, such as "sent on the bus; no response within P2 (50 ms)" |
 | `classification`, `reason` | `vehicle`, `system`, `undetermined` or `none`, with the reason in the same terms |
 | `detail` | For developers: the host error, the D-PDU error event and its extra error information by name (`RX_TIMEOUT_NO_RSP`, `FC_TIMEOUT`, `CF_TIMEOUT`, ...), gRPC status, worker error detail and native return code |
@@ -1107,26 +1108,28 @@ The response latency measured at the VCI is its response start less its transmit
 
 **Classification**
 
-The rules apply in order; the first that matches decides.
+An exchange entry is classified by the first row that matches; the `outcome` and `sent` values are those of the entry.
 
 | Outcome | Classification | Reason, in the entry's terms |
 |---|---|---|
-| Positive response | `none` | |
-| No response to a request whose positive response is suppressed | `none` | No response was expected |
-| Refused by the agent before sending (policy, block length, undeclared service) | `system` | Not sent: the agent refused it, and why |
-| VCI lost, with a supply-voltage reading below the VCI's range before the loss | `undetermined` | The VCI was lost; the vehicle's supply may have dropped |
-| VCI lost, worker exited or not answering, events lost, RPC failure | `system` | Named as such, with whether the request was sent (`unknown` while pending or when starting it failed, `not_sent` when refused) |
-| The agent's deadline passed, the send confirmed, the VCI never ended the exchange | `system` | The VCI did not end the exchange within its own timing |
-| Negative response, `nrc_kind` `security_key` (0x35, 0x36) | `system` | The ECU refused the key the server computed |
-| Negative response, `nrc_kind` `definition_mismatch` (0x11, 0x12, 0x13), `ambiguous` (0x14, 0x31), `session` (0x7E, 0x7F) or `sequence` (0x24, 0x73) | `undetermined` | The ECU does not accept the request as the definition built it, in the active session, or at this point of the sequence (a repeat after a resume can cause it), named and given as bytes |
-| Negative response, any other code (`nrc_kind` `ecu_state`: busy, conditions, programming state, and codes not listed above) | `vehicle` | The ECU answered and refused the request, named and given as bytes |
-| Positive response the agent cannot use | `undetermined` | The ECU's response does not match the definition, and how |
-| No response, flow control missing, or response incomplete; send confirmed; the link answered since its last error and reported none during the exchange | `vehicle` | Sent on the bus; no response (or no flow control, or an unfinished response) within the limit in force |
-| The same with the send confirmed but on the link's first exchange, or after or during a link error | `undetermined` | Sent on the bus, but this ECU has not answered on this link (a wrong address or response filter is not excluded), or the link reported errors |
-| The same with the send `unknown` | `undetermined` | No transmit confirmation on this link |
-| Transmit or network error (no acknowledge, network fault; reported as a transmit or a receive error) | `undetermined` | The VCI could not put the request on the bus; `link_history` shows whether the network answered earlier |
-| Late response (`late_response` entry, linked to the exchange), after the limit by its VCI time | `vehicle` | The ECU answered after the limit in force, by how much |
-| Late response in time by its VCI time, after the exchange ended for a system cause | `system` | The ECU answered in time; the system missed the answer |
+| `not_sent`, refused by the agent because of an earlier response (no block length in the RequestDownload's answer) | `undetermined` | Not sent: the ECU's earlier response, named in `caused_by`, does not give what the next request needs |
+| `not_sent`, refused by the agent (policy, block length, undeclared service) | `system` | Not sent: the agent refused it, and why |
+| `vci_lost`, with extra error information naming the PC's connection to the VCI (USB disconnect, WLAN lost) | `system` | The connection between the PC and the VCI was lost |
+| `vci_lost` otherwise (the VCI stopped answering, or no extra information) | `undetermined` | The VCI stopped answering; a VCI powered from the vehicle's connector is lost when the vehicle's supply drops, so the vehicle is not excluded; the last supply reading and its age are given |
+| `unknown`: worker exited or not answering, events lost, RPC failure | `system` | Named as such, with whether the request was sent (`unknown` while pending or when starting it failed, `not_sent` when refused) |
+| `vci_did_not_end` | `system` | The VCI did not end the exchange within its own timing |
+| `no_response` to a request whose positive response is suppressed, `sent` `confirmed` | `none` | No response was expected |
+| `positive` | `none` | |
+| `positive_unusable` | `undetermined` | The ECU's response does not match the definition, and how |
+| `negative`, `nrc_kind` `security_key` (0x35, 0x36) | `system` | The ECU refused the key the server computed |
+| `negative`, `nrc_kind` `definition_mismatch` (0x11, 0x12, 0x13), `ambiguous` (0x14, 0x31), `session` (0x7E, 0x7F) or `sequence` (0x24, 0x73) | `undetermined` | The ECU does not accept the request as the definition built it, in the active session, or at this point of the sequence (a repeat after a resume can cause it), named and given as bytes |
+| `negative`, any other code (`nrc_kind` `ecu_state`: busy, conditions, programming state, and codes not listed above) | `vehicle` | The ECU answered and refused the request, named and given as bytes |
+| `no_response` or `response_incomplete` with `sent` `confirmed`, or `no_flow_control` (`sent` `partial`); the link answered since its last error and reported none during the exchange | `vehicle` | Sent on the bus; no response, an unfinished response, or no flow control after the first frame, within the limit in force |
+| The same on the link's first exchange, or after or during a link error | `undetermined` | Sent on the bus, but this ECU has not answered on this link (a wrong address or response filter is not excluded), or the link reported errors |
+| `no_response` or `response_incomplete` with `sent` `unknown` | `undetermined` | No transmit confirmation on this link |
+| `not_sent` by a transmit or network error (no acknowledge, network fault; reported as a transmit or a receive error) | `undetermined` | The VCI could not put the request on the bus; `link_history` shows whether the network answered earlier |
+
+A `late_response` entry is classified on its own, by its VCI time against the limits in force of the exchange it names: after the limit it is `vehicle` (the ECU answered late, by how much); in time, after that exchange ended for a system cause (lost events, the agent's deadline), it is `system` (the ECU answered in time and the system missed the answer). An item the log cannot attach to an exchange is not classified.
 
 Per-message logging cannot place faults inside the transport: ISO-TP flow control and pacing (ISO 15765-2:2024 9.6.5, 9.7, 9.8) beyond what the extra error information names, CAN-level causes (no acknowledge against lost arbitration, error frames), a response on an unexpected identifier, or the timing inside a chain of pendings the VCI absorbed. A raw CAN channel for those is deferred: it would be a second channel on the same pins, which most VCIs cannot open beside the diagnostic one, and is a capability a hardware profile would have to show (13.5).
 
@@ -1147,7 +1150,7 @@ An ECU that stops answering:
 A lost VCI:
 
 ```json
-{"kind":"exchange","seq":21,"target":"primary","origin":"procedure","at":{"pc":301,"steps":2604,"source":"procedure.star:71:9"},"request":{"sid":"0x2e","service":"WriteDataByIdentifier","bytes":"2e f1 98 00 00 12 34"},"sent":"unknown","sent_evidence":"none","outcome":{"result":"vci_lost"},"pending":[],"pending_visibility":"absorbed_by_vci","link_history":{"answered":20,"answered_since_error":20},"supply_voltage":{"volts":12.6},"text":"Communication with the VCI was lost while waiting for the response; whether the request reached the bus is unknown.","classification":"system","reason":"The diagnostic system lost its VCI with the vehicle's supply in range; the vehicle was not reachable from that point.","detail":{"host_error":"VciLost","error_event":"PDU_ERR_EVT_LOST_COMM_TO_VCI"}}
+{"kind":"exchange","seq":21,"target":"primary","origin":"procedure","at":{"pc":301,"steps":2604,"source":"procedure.star:71:9"},"request":{"sid":"0x2e","service":"WriteDataByIdentifier","bytes":"2e f1 98 00 00 12 34"},"sent":"unknown","sent_evidence":"none","outcome":{"result":"vci_lost"},"pending":[],"pending_visibility":"absorbed_by_vci","link_history":{"answered":20,"answered_since_error":20},"text":"The USB connection between the PC and the VCI was lost while waiting for the response; whether the request reached the bus is unknown.","classification":"system","reason":"The diagnostic system lost its connection to the VCI; the vehicle was not reachable from that point.","detail":{"host_error":"VciLost","error_event":"PDU_ERR_EVT_LOST_COMM_TO_VCI","extra_error_info":"USB_DISCONNECT"}}
 {"kind":"event","event":"vci_lost","seq":22,"text":"The VCI stopped answering the worker.","classification":"system"}
 ```
 

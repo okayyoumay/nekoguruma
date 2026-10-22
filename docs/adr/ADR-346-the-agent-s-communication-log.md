@@ -27,7 +27,7 @@ by the agent. Its outcomes are the host errors:
 - an unresponsive worker or event stream, or an RPC failure;
 - the agent's own refusals before sending.
 
-When the agent's deadline passes, the host returns without cancelling the primitive.
+When the agent's deadline passes, the host returns the same no-response error as for a VCI's receive timeout, without cancelling the primitive.
 
 The person who places a fault knows vehicle communication and the vehicle, but not this system.
 What the worker interface gives today:
@@ -45,8 +45,8 @@ What the worker interface gives today:
   - The J2534 worker passes a TxDone indication on only under the same ComParam (ADR-151). J2534
     v04.04 gives one only on ISO 15765 (clauses 8.6, 8.7.1), and the worker forwards it without a
     primitive handle.
-  - The agent sets neither, and drops every item without a handle, link errors included.
-    `sim-vci` gives no indication.
+  - The agent sets neither, and drops every item without a handle, link errors included,
+    except a lost VCI, which ends the primitive (ADR-289). `sim-vci` gives no indication.
 - **Error detail.** An error event reaches the agent as the bare event. Its extra error
   information (ISO 22900-2:2022 D.4.2) travels only with a failed RPC's error detail. That
   information tells a receive timeout with no response from a missing flow control or a missing
@@ -96,14 +96,16 @@ cannot place.
    - **Setting.** The link turns transmit indications on (`CP_TransmitIndEnable` 1). If the
      library refuses the ComParam, the link opens without it, and the header records that the
      link has no transmit confirmation.
-   - **Values.** `sent` is `confirmed`, `not_sent` or `unknown`. `sent_evidence` names the source,
+   - **Values.** `sent` is `confirmed`, `partial` (the first frame of a multi-frame request went
+     out and the ECU sent no flow control), `not_sent` or `unknown`. `sent_evidence` names the source,
      in this order:
      1. a transmit indication for the exchange, bound to its primitive, or unbound on the link
         while it is the only primitive running there;
      2. a transmit-done time on the response;
      3. any answer, a pending included, which confirms the send without a time.
    - **Not sent.** `not_sent` needs a definite refusal: the agent's own, the worker's refusal
-     after a lost VCI (ADR-294), or a transmit error event.
+     after a lost VCI (ADR-294), or a transmit error event. A refusal that an earlier response
+     caused (a RequestDownload answer without the block length) names that exchange.
    - **Unknown.** An RPC that failed or timed out while starting the primitive, and every case
      without evidence, give `unknown`.
    - **Confirmation sources.** The header names each link's sources, so "unknown on a link that
@@ -114,10 +116,12 @@ cannot place.
    - a missing consecutive frame: the ECU began a response and did not finish it;
    - no response at all.
 
-   Without that information, the entry says which of these it cannot tell.
+   Without that information, the entry says which of these it cannot tell. The host also tells
+   its own deadline passing from the VCI ending the exchange (`vci_did_not_end`).
 5. **Classification on the communication axis.** Each exchange is `vehicle`, `system`,
    `undetermined` or `none` (completed without fault), with its reason. Design 8.11's table lists
-   the rules in order, and the first that matches applies.
+   the rules for exchange entries in order, and the first that matches applies. The system-side
+   failures come first, so a suppressed response or an answer never hides one.
    - **Negative responses.** A negative response is the ECU's answer, and `nrc_kind` sorts it:
      - the ECU's own state (busy, conditions, programming state): `vehicle`;
      - a request that does not fit the ECU as the definition built it (0x11, 0x12, 0x13, and
@@ -128,31 +132,37 @@ cannot place.
      - a key the ECU refused (0x35, 0x36): `system`, since the key comes from the server's key
        service (design 8.10).
    - **Unusable positive responses.** A positive response the agent cannot use (a wrong block
-     echo, a missing length field) is `undetermined`.
-   - **No response.** A confirmed request with no response, on a link that answered since its
-     last error and reported no error during the exchange, is `vehicle`. It is `undetermined` in
+     echo, a missing length field), and the refusal of a later request it causes, are
+     `undetermined`.
+   - **No response.** A confirmed request with no response, an unfinished response, or a
+     multi-frame request whose flow control never came, on a link that answered since its last
+     error and reported no error during the exchange, is `vehicle`. It is `undetermined` in
      three cases:
      - on the link's first exchange, since a wrong address or response filter is not excluded;
      - after or during a link error;
      - without a confirmation, since the VCI's receive path can lose a response that was on the
        bus.
-   - **Suppressed responses.** A request with the positive-response suppression bit that gets no
-     response is `none`.
+   - **Suppressed responses.** A request with the positive-response suppression bit whose send is
+     confirmed and that the VCI ended without a response is `none`. The host still ends such a
+     request as having no response today; changing that is not part of this decision.
    - **Deadline.** An agent deadline that passed while the VCI, having confirmed the send, never
      ended the exchange is `system`. This rule comes before the no-response rules.
    - **Transmit errors.** A transmit or network error (no acknowledge, network fault) is
      `undetermined`. The entry's count of earlier answers on the link tells a network that went
      away from one never reached.
-   - **Lost VCI.** A lost VCI is `system`. It is `undetermined` when the last supply-voltage
-     reading before the loss was below the VCI's range, since a VCI powered from the vehicle's
-     connector is lost when the vehicle's supply drops. The entry carries that reading.
+   - **Lost VCI.** A lost VCI is `system` when the error's extra information names the PC's
+     connection to the VCI (a USB disconnect, a lost WLAN). Otherwise it is `undetermined`: a VCI
+     powered from the vehicle's connector is lost when the vehicle's supply drops, and the agent
+     knows no supply range of the VCI. The entry carries the last supply reading and its age when
+     there is one.
    - **Other system failures.** A worker that exited or does not answer, lost events, an RPC
      failure and the agent's refusals are `system`.
 6. **Responses that come after their exchange.**
    - The agent reads the link's events while it waits and when it closes the link. Items of an
      earlier primitive, or of none, are written as entries of their own.
    - A response to an earlier exchange is a `late_response` entry linked to that exchange. It is
-     judged by its VCI time against the limits in force:
+     classified on its own, not by the exchange rules, by its VCI time against the limits in
+     force:
      - after the limit: `vehicle` ("answered N ms after the limit");
      - in time, after the exchange ended for a system cause (lost events, the agent's deadline):
        that cause's `system`, as an answer the system missed.
@@ -221,6 +231,7 @@ cannot place.
   - the link to set `CP_TransmitIndEnable`;
   - the worker interface's error events to carry their extra error information
     (`vci-service-interface`, both workers, `docs/rpc-api-guide.md`);
+  - the host to tell its own deadline from a VCI-ended exchange without a response;
   - the agent to read the link's unbound items (transmit indications, link errors) and those of
     earlier primitives, instead of dropping them;
   - `sim-vci` to give transmit indications, so a test can show a confirmed send with no response;

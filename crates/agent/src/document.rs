@@ -78,8 +78,8 @@ pub trait Declarations {
 pub(crate) mod tests {
     use diag_ir::IR_SCHEMA_VERSION;
     use diag_ir::declaration::{
-        DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement, PositiveResponseT, ServiceT,
-        encode_ecu_document,
+        DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement, PositiveResponseT, RequestT,
+        ServiceT, encode_ecu_document,
     };
 
     use super::*;
@@ -91,25 +91,48 @@ pub(crate) mod tests {
     }
 
     pub(crate) fn vin_document_with(procedure: Option<Vec<u8>>) -> Vec<u8> {
-        let mut vin = FieldT::default();
-        vin.id = 1;
-        vin.short_name = Some("vin".into());
-        vin.placement = Placement::AfterPrevious;
-        vin.bit_length = 17 * 8;
-        vin.kind = DataKind::Ascii;
+        let service = read_service(1, "readVin", [0xF1, 0x90], DataKind::Ascii, 17);
+        document_of(vec![service], procedure)
+    }
+
+    /// Service `id`, a single-identifier ReadDataByIdentifier of `did`, with a request that
+    /// carries the identifier and a positive response that echoes it and then has field 1 of
+    /// `bytes` bytes of `kind`, placed after the echo.
+    pub(crate) fn read_service(
+        id: u32,
+        name: &str,
+        did: [u8; 2],
+        kind: DataKind,
+        bytes: u32,
+    ) -> ServiceT {
+        let mut field = FieldT::default();
+        field.id = 1;
+        field.short_name = Some("value".into());
+        field.placement = Placement::AfterPrevious;
+        field.bit_length = bytes * 8;
+        field.kind = kind;
+        let mut request = RequestT::default();
+        request.sid = 0x22;
+        request.prefix = Some(did.to_vec());
         let mut positive = PositiveResponseT::default();
         positive.sid = 0x62;
-        positive.prefix = Some(vec![0xF1, 0x90]);
-        positive.fields = Some(vec![vin]);
+        positive.prefix = Some(did.to_vec());
+        positive.fields = Some(vec![field]);
         let mut service = ServiceT::default();
-        service.id = 1;
-        service.short_name = Some("readVin".into());
+        service.id = id;
+        service.short_name = Some(name.into());
+        service.request = Some(Box::new(request));
         service.positive = Some(Box::new(positive));
+        service
+    }
+
+    /// A document whose variant declares `services` and carries `procedure`, if any.
+    pub(crate) fn document_of(services: Vec<ServiceT>, procedure: Option<Vec<u8>>) -> Vec<u8> {
         let mut variant = EcuVariantT::default();
         variant.id = 1;
         variant.short_name = Some("v".into());
         variant.protocols = Some(vec![uds_on_can()]);
-        variant.services = Some(vec![service]);
+        variant.services = Some(services);
         let mut document = EcuDocumentT::default();
         document.schema_version = IR_SCHEMA_VERSION;
         document.source_format = Some("csv-starlark".into());
@@ -142,6 +165,11 @@ pub(crate) mod tests {
         variant.short_name = Some("v".into());
         variant.protocols = Some(vec![uds_on_can()]);
         variant.flash_sessions = Some(vec![session]);
+        // The identity reads the flash fixtures' plans name: service 1 and 2, field 1 each.
+        variant.services = Some(vec![
+            read_service(1, "readHardware", [0xF1, 0x91], DataKind::Ascii, 8),
+            read_service(2, "readSoftware", [0xF1, 0x89], DataKind::Ascii, 8),
+        ]);
         let mut document = EcuDocumentT::default();
         document.schema_version = IR_SCHEMA_VERSION;
         document.source_format = Some("csv-starlark".into());
@@ -163,7 +191,7 @@ pub(crate) mod tests {
         protocol
     }
 
-    fn program() -> Program {
+    pub(crate) fn empty_program() -> Program {
         Program {
             schema_version: IR_SCHEMA_VERSION,
             code: Vec::new(),
@@ -178,7 +206,7 @@ pub(crate) mod tests {
 
     #[test]
     fn a_document_gives_its_procedure_and_declarations() {
-        let mut program = program();
+        let mut program = empty_program();
         program.code = vec![diag_ir::Op::PushI64(7)];
         let document = JobDocument::new(vin_document(Some(&program))).unwrap();
         assert_eq!(document.program().unwrap().code, program.code);
@@ -201,7 +229,7 @@ pub(crate) mod tests {
             document.program(),
             Err(DocumentError::Procedure(_))
         ));
-        let mut procedure = postcard::to_allocvec(&program()).unwrap();
+        let mut procedure = postcard::to_allocvec(&empty_program()).unwrap();
         procedure.push(0);
         let document = JobDocument::new(vin_document_with(Some(procedure))).unwrap();
         assert!(matches!(

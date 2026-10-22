@@ -32,14 +32,15 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::inputs::{Encoding, ServiceField, ServiceSources};
+use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal};
 use agent::{
     Artifact, HostError, Job, JobDocument, JobError, JobLimits, JournalSetup, LinkConfig,
     run_program_journaled,
 };
 use diag_ir::declaration::{
-    EcuDocumentT, EcuVariantT, FlashSegmentT, FlashSessionT, ProtocolT, encode_ecu_document,
+    DataKind, EcuDocumentT, EcuVariantT, FieldT, FlashSegmentT, FlashSessionT, Placement,
+    PositiveResponseT, ProtocolT, RequestT, ServiceT, encode_ecu_document,
 };
 use diag_ir::{
     FlashRecovery, IR_SCHEMA_VERSION, IdentitySources, Op, Program, RecoveryBoundaries,
@@ -186,8 +187,8 @@ fn download_program(segments: &[Segment]) -> Program {
                 field_id: 1,
             }),
             software_version: Some(Source::EcuService {
-                service_id: 1,
-                field_id: 2,
+                service_id: 2,
+                field_id: 1,
             }),
         },
         preconditions: Default::default(),
@@ -195,21 +196,30 @@ fn download_program(segments: &[Segment]) -> Program {
     }
 }
 
-/// The identity fields: ReadDataByIdentifier F187 and F189, as long as the ECU's values.
-fn identity_sources() -> ServiceSources {
-    let field = |field_id, did: u16, length| ServiceField {
-        service_id: 1,
-        field_id,
-        request: [&[0x22][..], &did.to_be_bytes()].concat(),
-        offset: 2,
-        length,
-        encoding: Encoding::Ascii,
-    };
-    ServiceSources::new(vec![
-        field(1, 0xF187, PART_NUMBER.len()),
-        field(2, 0xF189, SW_VERSION.len()),
-    ])
-    .expect("identity table")
+/// Service `id` of the job's document: ReadDataByIdentifier of `did`, whose response echoes the
+/// identifier and then has one ASCII field of `length` bytes. The job reads its identity
+/// through these, so the caller gives no source table (ADR-345).
+fn read_service(id: u32, did: u16, length: usize) -> ServiceT {
+    let did = did.to_be_bytes().to_vec();
+    let mut field = FieldT::default();
+    field.id = 1;
+    field.short_name = Some("value".into());
+    field.placement = Placement::AfterPrevious;
+    field.bit_length = u32::try_from(length * 8).expect("a short field");
+    field.kind = DataKind::Ascii;
+    let mut request = RequestT::default();
+    request.sid = 0x22;
+    request.prefix = Some(did.clone());
+    let mut positive = PositiveResponseT::default();
+    positive.sid = 0x62;
+    positive.prefix = Some(did);
+    positive.fields = Some(vec![field]);
+    let mut service = ServiceT::default();
+    service.id = id;
+    service.short_name = Some(format!("read{id}"));
+    service.request = Some(Box::new(request));
+    service.positive = Some(Box::new(positive));
+    service
 }
 
 /// One-byte blocks past the counter's wrap (segment 0), then one block as long as the ECU
@@ -276,6 +286,11 @@ fn download_job(segments: &[Segment], artifact_path: &std::path::Path) -> Job {
     variant.short_name = Some("sim".into());
     variant.protocols = Some(vec![protocol]);
     variant.flash_sessions = Some(vec![session]);
+    // The identity fields: F187 and F189, as long as the ECU's values.
+    variant.services = Some(vec![
+        read_service(1, 0xF187, PART_NUMBER.len()),
+        read_service(2, 0xF189, SW_VERSION.len()),
+    ]);
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
     document.source_format = Some("csv-starlark".into());
@@ -480,7 +495,7 @@ async fn run_the_jobs(
             JournalSetup {
                 dir,
                 key,
-                sources: identity_sources(),
+                sources: ServiceSources::default(),
                 vin: None,
                 intended_software_version: None,
             },

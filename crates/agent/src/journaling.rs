@@ -64,7 +64,10 @@ pub struct JournalSetup {
     /// The directory of the journal file (ADR-244 item 7).
     pub dir: PathBuf,
     pub key: JobKey,
-    /// The table that maps the program's identity sources to requests (`inputs`).
+    /// The table that maps the program's identity sources to requests (`inputs`). Used only for
+    /// a job without a document: a job with one reads its sources through its document, and the
+    /// runner replaces this table with the one built from it
+    /// (`ServiceSources::from_document`, ADR-345).
     pub sources: ServiceSources,
     /// The VIN the job targets. A first run records it as the journal's first record, and a
     /// resume must name the same one (ADR-261); the restart's gates compare the ECU's VIN

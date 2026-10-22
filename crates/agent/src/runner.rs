@@ -217,6 +217,10 @@ pub enum JobError {
     /// ADR-321; `Op::FlashBlock`, ADR-336) but the job has no document to give it.
     #[error("the program needs the declarations, but the job has no document")]
     NoDeclarations,
+    /// A source the program names (identity or precondition) is not one the job's document
+    /// declares in the shape the agent reads (ADR-345): nothing is sent.
+    #[error("the job's document does not declare a readable source: {0}")]
+    Sources(#[source] crate::inputs::TableError),
     /// The program has an `Op::FlashBlock` and the job names no flash artifact (ADR-336).
     #[error("the program reads flash blocks, but the job has no artifact")]
     NoArtifact,
@@ -387,6 +391,7 @@ fn check_runnable(program: &Program) -> Result<(), JobError> {
 pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
     check_runnable(&job.program)?;
     check_declared(job)?;
+    job_sources(job)?;
     check_artifact(job)?;
     let variant = job.document.as_ref().map(JobDocument::variant);
     if let (Some(variant), Some(pc)) = (
@@ -401,6 +406,33 @@ pub fn check_job(job: &Job, permission: Permission) -> Result<(), JobError> {
             .map_err(|(pc, source)| JobError::Refused { pc, source })?;
     }
     refuse_beyond(&job.program, variant.as_ref(), permission)
+}
+
+/// The table of the `EcuService` sources a job reads, when the job has a document: built from
+/// the document ([`ServiceSources::from_document`], ADR-345), so the caller does not
+/// repeat what the document declares. A job without a document has none, and its caller's table
+/// stays (`JournalSetup::sources`). Part of [`check_job`], which refuses a source the document
+/// declares in a shape the agent cannot read before anything is sent.
+fn job_sources(job: &Job) -> Result<Option<crate::inputs::ServiceSources>, JobError> {
+    job.document
+        .as_ref()
+        .map(|document| crate::inputs::ServiceSources::from_document(document, &job.program))
+        .transpose()
+        .map_err(JobError::Sources)
+}
+
+/// `journal` with the table the job's document gives in place of the caller's, for a job that
+/// has a document (the table of a first run and of a resume alike); anything else is as given.
+fn use_document_sources(
+    job: &Job,
+    mut journal: Option<JournalMode>,
+) -> Result<Option<JournalMode>, JobError> {
+    if let Some(table) = job_sources(job)?
+        && let Some(JournalMode::Create(setup) | JournalMode::Resume(setup)) = &mut journal
+    {
+        setup.sources = table;
+    }
+    Ok(journal)
 }
 
 /// The declarations part of [`check_job`].
@@ -767,6 +799,9 @@ async fn run_program_within<C: WorkerApi>(
         return Err(JobError::LinkUnconfirmed);
     }
     check_job(&job, ceiling)?;
+    // A job with a document reads its sources through the document, whatever table the caller
+    // put in the journal's setup.
+    let journal = use_document_sources(&job, journal)?;
     // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
     let holds_slot = guards
         .lock()
@@ -10206,6 +10241,286 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    // --------------------- sources from the job's document (ADR-345)
+
+    /// [`flash_program`] with its identity read through services 1 to 3, field 1 each: a
+    /// document declares one data identifier per service, so the fixture's three fields of one
+    /// service cannot be declared there. The requests are the same.
+    fn document_sourced_program() -> Program {
+        let mut program = flash_program();
+        let ecu = |service_id| diag_ir::Source::EcuService {
+            service_id,
+            field_id: 1,
+        };
+        program.identity = diag_ir::IdentitySources {
+            vin: Some(ecu(3)),
+            hardware_part_number: Some(ecu(1)),
+            software_version: Some(ecu(2)),
+        };
+        program.validate().expect("still a valid program");
+        program
+    }
+
+    /// The services of [`document_sourced_program`] as `edit` leaves them.
+    fn identity_document_job(
+        program: &Program,
+        edit: impl FnOnce(&mut Vec<diag_ir::declaration::ServiceT>),
+    ) -> Job {
+        use crate::document::tests::{document_of, read_service};
+        use diag_ir::declaration::DataKind;
+        let mut services = vec![
+            read_service(1, "readHardware", [0xF1, 0x91], DataKind::Ascii, 4),
+            read_service(2, "readSoftware", [0xF1, 0x95], DataKind::Ascii, 4),
+            read_service(3, "readVin", [0xF1, 0x90], DataKind::Ascii, 17),
+        ];
+        edit(&mut services);
+        let procedure = postcard::to_allocvec(program).unwrap();
+        Job::from_document(JobDocument::new(document_of(services, Some(procedure))).unwrap())
+            .unwrap()
+    }
+
+    fn journal_mode_with_empty_table(dir: &std::path::Path, resume: bool) -> JournalMode {
+        let mut setup = file_setup(dir);
+        setup.sources = crate::inputs::ServiceSources::default();
+        if resume {
+            JournalMode::Resume(setup)
+        } else {
+            JournalMode::Create(setup)
+        }
+    }
+
+    fn sources_of(mode: Option<JournalMode>) -> crate::inputs::ServiceSources {
+        match mode {
+            Some(JournalMode::Create(setup) | JournalMode::Resume(setup)) => setup.sources,
+            None => panic!("a journal was given"),
+        }
+    }
+
+    /// A job with a document takes its table from the document whatever the caller's setup
+    /// holds, on a first run and on a resume; a job without one keeps the caller's.
+    #[test]
+    fn a_job_with_a_document_replaces_the_callers_table_and_one_without_keeps_it() {
+        let program = document_sourced_program();
+        let job = identity_document_job(&program, |_| {});
+        let dir = journal_dir("document-sources-replace");
+        for resume in [false, true] {
+            let mode =
+                use_document_sources(&job, Some(journal_mode_with_empty_table(&dir, resume)))
+                    .unwrap();
+            let table = sources_of(mode);
+            let vin = table.get(3, 1).expect("the VIN source is in the table");
+            assert_eq!(vin.request, [0x22, 0xF1, 0x90]);
+            assert_eq!((vin.offset, vin.length), (2, 17));
+            assert_eq!(
+                table.get(1, 1).map(|f| f.request.clone()),
+                Some(vec![0x22, 0xF1, 0x91])
+            );
+            assert_eq!(
+                table.get(2, 1).map(|f| f.request.clone()),
+                Some(vec![0x22, 0xF1, 0x95])
+            );
+        }
+        // No document: the caller's table, even an empty one.
+        let plain = Job::from(program.clone());
+        let mode =
+            use_document_sources(&plain, Some(journal_mode_with_empty_table(&dir, false))).unwrap();
+        assert_eq!(sources_of(mode), crate::inputs::ServiceSources::default());
+        let mut setup = file_setup(&dir);
+        setup.sources = identity_sources();
+        let mode = use_document_sources(&plain, Some(JournalMode::Resume(setup))).unwrap();
+        assert_eq!(sources_of(mode), identity_sources());
+        // No journal: nothing to replace.
+        assert!(use_document_sources(&job, None).unwrap().is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A restart of a job with a document passes the checks of its steps 2 to 4 reading the
+    /// sources the document declares, though the caller's table is empty: the transfer is redone.
+    #[test]
+    fn a_restart_reads_its_sources_through_the_document_not_the_callers_table() {
+        let program = document_sourced_program();
+        let job = identity_document_job(&program, |_| {});
+        let dir = journal_dir("document-sources-restart");
+        let table = || {
+            sources_of(
+                use_document_sources(&job, Some(journal_mode_with_empty_table(&dir, false)))
+                    .unwrap(),
+            )
+        };
+        let mut setup = file_setup(&dir);
+        setup.sources = table();
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.lose_routine = Some(0xFF00);
+        let mut journal = JobJournal::create(setup, None).unwrap();
+        let first = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(first, Err(JobError::Host { pc: ERASE, .. })),
+            "{first:?}"
+        );
+        drop(journal);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let state = resume_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Journal::open(&dir, &job_key()),
+            sources_of(
+                use_document_sources(&job, Some(journal_mode_with_empty_table(&dir, true)))
+                    .unwrap(),
+            ),
+            Some(&target()),
+            None,
+            None,
+            &dir_slot(&dir),
+        )
+        .expect("the restarted job completes");
+        assert_eq!(state.pc as usize, program.code.len());
+        assert_eq!(from_the_erase(&host), redone_transfer());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The entry point a restart goes through takes the table from the job's document: with the
+    /// caller's table empty, a checkpoint resume of a job with a document sends the VIN read the
+    /// document declares (it reaches the worker; the fake worker then fails it, so the job ends
+    /// in `ProcedureIdentityNotEstablished`), while the same job without a document has no source
+    /// to read and sends nothing.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn resume_program_journaled_reads_the_identity_through_the_documents_table() {
+        use crate::document::tests::{document_of, read_service};
+        use diag_ir::declaration::DataKind;
+        let mut program = plain_steps(&[(0x22, Unsafe), (0x22, Safe)]);
+        program.identity.vin = Some(diag_ir::Source::EcuService {
+            service_id: 1,
+            field_id: 1,
+        });
+        program.validate().expect("a valid program");
+        let with_document = |program: &Program| {
+            let services = vec![read_service(
+                1,
+                "readVin",
+                [0xF1, 0x90],
+                DataKind::Ascii,
+                17,
+            )];
+            let procedure = postcard::to_allocvec(program).unwrap();
+            Job::from_document(JobDocument::new(document_of(services, Some(procedure))).unwrap())
+                .unwrap()
+        };
+        let not_established = |result: &Result<VmState, JobError>| {
+            matches!(
+                result,
+                Err(JobError::OnSiteInterventionRequired(
+                    OnSiteReason::ProcedureIdentityNotEstablished
+                ))
+            )
+        };
+        for documented in [true, false] {
+            let dir = journal_dir("resume-entry-document-table");
+            // The first read is not safe to repeat and completed; the run stopped after it.
+            cancelled_after(&program, &dir, Some(TARGET_VIN), 0x22);
+            let state = Journal::read(&dir, &job_key()).unwrap();
+            assert!(
+                matches!(
+                    restart::classify(&program, Ok(&state)),
+                    RestartDecision::ResumeFromCheckpoint(_)
+                ),
+                "{:?}",
+                restart::classify(&program, Ok(&state))
+            );
+            let job = if documented {
+                with_document(&program)
+            } else {
+                Job::from(program.clone())
+            };
+            let mut setup = file_setup(&dir);
+            setup.sources = crate::inputs::ServiceSources::default();
+            let (client, calls) = fake_worker(false).await;
+            let (result, _guards) = resume_program_journaled(
+                client,
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                job,
+                JobLimits::default(),
+                setup,
+                vci_only_guards("resume-entry-document-table"),
+            )
+            .await;
+            assert!(not_established(&result), "{documented}: {result:?}");
+            let sent = calls.lock().unwrap().contains(&"StartComPrimitive");
+            assert_eq!(sent, documented, "{:?}", calls.lock().unwrap());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A source the document declares in a shape the agent cannot read refuses the job at the
+    /// check, before a worker is reached.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_source_the_document_declares_unreadably_refuses_the_job_before_anything_is_sent() {
+        use diag_ir::declaration::{LengthKind, ServiceT};
+        let program = document_sourced_program();
+        let variable = |services: &mut Vec<ServiceT>| {
+            let positive = services[2].positive.as_mut().unwrap();
+            positive.fields.as_mut().unwrap()[0].length_kind = LengthKind::Terminated;
+        };
+        let multi_did = |services: &mut Vec<ServiceT>| {
+            services[0].request.as_mut().unwrap().prefix = Some(vec![0xF1, 0x91, 0xF1, 0x92]);
+            services[0].positive.as_mut().unwrap().prefix = Some(vec![0xF1, 0x91, 0xF1, 0x92]);
+        };
+        let not_22 = |services: &mut Vec<ServiceT>| {
+            services[1].request.as_mut().unwrap().sid = 0x19;
+            services[1].positive.as_mut().unwrap().sid = 0x59;
+        };
+        let unaligned = |services: &mut Vec<ServiceT>| {
+            services[2]
+                .positive
+                .as_mut()
+                .unwrap()
+                .fields
+                .as_mut()
+                .unwrap()[0]
+                .bit_offset = 4;
+        };
+        let undeclared = |services: &mut Vec<ServiceT>| {
+            services.pop();
+        };
+        type Edit = Box<dyn FnOnce(&mut Vec<ServiceT>)>;
+        let cases: Vec<(&str, Edit)> = vec![
+            ("variable", Box::new(variable)),
+            ("multi-did", Box::new(multi_did)),
+            ("not-22", Box::new(not_22)),
+            ("unaligned", Box::new(unaligned)),
+            ("undeclared", Box::new(undeclared)),
+        ];
+        for (name, edit) in cases {
+            let job = identity_document_job(&program, edit);
+            let refused = check_job(&job, Permission::ReadOnly);
+            assert!(
+                matches!(refused, Err(JobError::Sources(_))),
+                "{name}: {refused:?}"
+            );
+            let (result, _guards) = run_guarded(
+                unreachable_client(),
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                job,
+                JobLimits::default(),
+                Permission::ReadOnly,
+                None,
+                vci_only_guards(&format!("sources-{name}")),
+            )
+            .await;
+            assert!(
+                matches!(result, Err(JobError::Sources(_))),
+                "{name}: {result:?}"
+            );
+        }
+    }
+
     // --------------------- restart step 4c (ADR-276)
 
     /// The part of a log from the restart's erase on.
@@ -14269,9 +14584,9 @@ def main():
         let exit = code.len() as u32;
         code.push(Op::ServiceRequest { service: 0x37 });
         let mut program = program(code);
-        let ecu = |field_id| diag_ir::Source::EcuService {
-            service_id: 1,
-            field_id,
+        let ecu = |service_id| diag_ir::Source::EcuService {
+            service_id,
+            field_id: 1,
         };
         program.identity = diag_ir::IdentitySources {
             vin: None,

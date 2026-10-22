@@ -109,7 +109,9 @@ decisions behind them:
    entry lists the pendings seen and says whether the link can show them at all
    (`pending_visibility`), so an empty list on a link whose VCI absorbs them is not read as
    "none". P2* restarts on each pending and the completion limit runs from the first, as the
-   API's handling does (ISO 22900-2:2022 Annex I.1.2, Figure I.4).
+   API's handling does (ISO 22900-2:2022 Annex I.1.2, Figure I.4); each forwarded pending is
+   judged against the limit before it, and one past it makes the exchange late, as a final
+   response would.
 4. **"Reached the bus": transmit indications on, and a three-valued answer with its evidence.**
    The link turns transmit indications on (`CP_TransmitIndEnable` 1, ISO 22900-2:2022 B.5.1); a
    library that refuses it opens the link without, and `link_opened` says so. `sent` is
@@ -192,8 +194,8 @@ decisions behind them:
      owes its final response;
    - a request that collects every answer takes the most severe of its answers' classifications
      and of any link error during its window, each answer judged on its own against the window, and silence is no fault only for the
-     functional presence request with its send confirmed and no link error in its window
-     (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
+     functional presence request with its send confirmed, no link error in its window and no
+     possible pending (ADR-327 item 2); on a guard's request a second ECU is `vehicle` or the most severe of its
      answers (design 8.9.1), and so is a request meant for one ECU that gets more than one answer,
      unless the previous exchange with the same match went unanswered, whose late answer the
      extra one may be;

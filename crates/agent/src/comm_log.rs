@@ -36,6 +36,14 @@ use crate::runner::JobError;
 #[cfg_attr(not(test), expect(dead_code, reason = "the exchange entries use it"))]
 pub(crate) mod redaction;
 
+/// The exchange entry, its evidence, the per-link history and the classification (design 8.11,
+/// ADR-346 items 2, 3 and 6).
+#[cfg_attr(
+    not(test),
+    expect(dead_code, reason = "the host's exchange entries use it")
+)]
+pub(crate) mod exchange;
+
 /// Where a job keeps its communication log and under which key. The journaled entry points
 /// derive it from the journal's setup (same directory and key); a job without a journal gets one
 /// only through `Job::with_comm_log`.

@@ -763,9 +763,11 @@ async fn set_indication<C: WorkerApi>(
     name: &'static str,
     set: &mut Vec<u32>,
 ) -> Result<bool, HostError> {
+    // A D-PDU library may answer an unknown name with an error rather than `PDU_ID_UNDEF`.
     let id = match comparam_id(client, deadline, name).await {
         Ok(id) => id,
         Err(HostError::DeclaredLink(_)) => return Ok(false),
+        Err(HostError::Rpc { status, .. }) if refused(&status) => return Ok(false),
         Err(error) => return Err(error),
     };
     if set.contains(&id) {

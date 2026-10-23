@@ -363,6 +363,21 @@ pub(super) fn check_param(
             };
             uds::check_tester_present(ctx.profile.class, message)?;
         }
+        // The agent's link turns off the API's repeat on a busy (0x21) or not-yet-complete
+        // (0x23) answer; a repeat would send the request again unseen by the guard.
+        "cp_rc21handling" | "cp_rc23handling" => match value {
+            Some(0) => {}
+            _ => {
+                return Err(wrong(
+                    "repeats a request on a busy answer; only 0 is allowed",
+                ));
+            }
+        },
+        // The indications the agent's link turns on for its communication log only report.
+        "cp_transmitindenable" | "cp_startmsgindenable" => match value {
+            Some(0 | 1) => {}
+            _ => return Err(wrong("is not 0 or 1")),
+        },
         // A protocol or timing ComParam on the allow-list (what a profile may fix is on it too).
         other if ALLOWED.contains(&other) => {}
         _ => {

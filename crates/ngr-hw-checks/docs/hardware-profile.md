@@ -222,7 +222,9 @@ Anything it cannot classify is refused.
   resolved, the request's class field ignored): a ComParam no rule covers passes only when it is
   a listed protocol or timing ComParam (P2, P2*, ISO 15765-2 timing and flow control, response
   pending, tester-present timing) (only ones the J2534 worker can set: `CP_TesterPresentImmed` is not on its lists, so it is
-  refused) and every other name is refused. The tester-present message must also be set before
+  refused), `CP_RC21Handling` and `CP_RC23Handling` pass only at 0 (the agent's link turns the
+  API's repeat on a busy answer off), `CP_TransmitIndEnable` and `CP_StartMsgIndEnable` at 0 or
+  1, and every other name is refused. The tester-present message must also be set before
   a T1 to T3 link connects, and only as `3E 00` or `3E 80`. `COPT_RESTORE_PARAM` is refused.
 - **Requests.** T1 passes every request. T0 creates RawMode links only, passes only raw frames with the sending end's own
   `request_id` and, under extended or mixed addressing, its `address` as the fifth byte and refuses `COPT_STARTCOMM`/`COPT_STOPCOMM` (no communication to start). On a

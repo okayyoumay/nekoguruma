@@ -21,6 +21,13 @@ pub(crate) struct LoggedMessage {
     data: Option<Redacted>,
 }
 
+impl LoggedMessage {
+    /// The bytes that stay in clear, hex-encoded.
+    pub(crate) fn clear(&self) -> &str {
+        &self.clear
+    }
+}
+
 /// The part of a message that is not written.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]

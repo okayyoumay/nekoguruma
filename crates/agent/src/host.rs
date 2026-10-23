@@ -556,7 +556,7 @@ fn expected_responses(progress: &Progress) -> Vec<ExpectedResponseData> {
 /// of the request (ISO 14229-1:2026 clauses 9.4, 9.7, 10.2 and 11.3). A sub-function is echoed
 /// without its suppress bit. A DID is matched only when one was requested, since the
 /// standard does not fix the order of several in the response.
-fn positive_prefix(request: &[u8]) -> Vec<u8> {
+pub(crate) fn positive_prefix(request: &[u8]) -> Vec<u8> {
     match request {
         [0x22, hi, lo] => vec![0x62, *hi, *lo],
         [0x19, sub, ..] => vec![0x59, sub & 0x7F],

@@ -24,6 +24,7 @@ use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
 use serde::Serialize;
 
 use super::redaction::{Direction, LoggedMessage, redact};
+use crate::host::positive_prefix;
 
 /// The `event` of an exchange entry.
 const EVENT: &str = "exchange";
@@ -96,14 +97,15 @@ pub(crate) struct At {
     pub sections: Vec<SectionAttrs>,
 }
 
-/// Who the request was meant for (design 8.11, `target`).
+/// Who the request was meant for (design 8.11, `target`): a role serializes as a plain string
+/// (`"primary"`), an endpoint as an object.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[serde(untagged)]
 pub(crate) enum Target {
     /// An exchange sent before roles are bound: the link and the addresses.
     Endpoint { link: u32, tx_id: u32, rx_id: u32 },
     /// The target's role, once bound.
-    Role { role: String },
+    Role(String),
 }
 
 /// Whether the request reached the bus (design 8.11, `sent`).
@@ -212,8 +214,13 @@ pub(crate) enum Window {
     NotJudged,
 }
 
-/// The reason today's evidence gives for `not_judged`: no link gives a transmit time yet.
-const NO_TRANSMIT_TIME: &str = "no transmit time on this link";
+/// Why a window is `not_judged` (design 8.11, `timing`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum NotJudgedReason {
+    /// No link gives a transmit time yet.
+    NoTransmitTime,
+}
 
 /// The entry's timing group (design 8.11, `timing`).
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -226,7 +233,7 @@ pub(crate) struct Timing {
     pub window_by_ms: Option<f64>,
     /// Why the window is `not_judged`.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub not_judged_reason: Option<String>,
+    pub not_judged_reason: Option<NotJudgedReason>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2_ms: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -248,7 +255,7 @@ impl Timing {
             measured_by: MeasuredBy::Agent,
             window: Window::NotJudged,
             window_by_ms: None,
-            not_judged_reason: Some(NO_TRANSMIT_TIME.to_owned()),
+            not_judged_reason: Some(NotJudgedReason::NoTransmitTime),
             p2_ms: None,
             p2_star_ms: None,
             completion_ms: None,
@@ -304,19 +311,29 @@ pub(crate) struct SupplyVoltage {
 
 /// The internal names, for developers (design 8.11, `detail`). Nothing else in the entry
 /// carries one.
+///
+/// A producer puts names and codes here, never message bytes: the host error is the error's
+/// variant name, not its text (which prints response bytes, and would carry a seed or a key past
+/// [`redact`]), and the strings that are not `&'static str` are for a name or a code the producer
+/// reads off the error, not for its message.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize)]
 pub(crate) struct Detail {
+    /// The host error's variant name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub host_error: Option<String>,
+    pub host_error: Option<&'static str>,
+    /// The D-PDU error event's name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_event: Option<String>,
+    pub error_event: Option<&'static str>,
     /// The D-PDU error event's extra error information (ISO 22900-2:2022 D.4.2), by name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_error_info: Option<String>,
+    pub extra_error_info: Option<&'static str>,
+    /// The gRPC status code's name.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub grpc_status: Option<String>,
+    pub grpc_status: Option<&'static str>,
+    /// The worker's error detail: a name or a code, never a message.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub worker_detail: Option<String>,
+    /// The native library's return code, as a name or a number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_return_code: Option<String>,
 }
@@ -381,20 +398,19 @@ impl LinkErrorKind {
 }
 
 /// Why the system did not send a request (design 8.11, `not_sent`).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum RefusalCause {
-    /// The ECU's earlier response, in the exchange `caused_by`, does not give what this request
-    /// needs (no block length in a RequestDownload answer).
-    EarlierResponse {
-        caused_by: u64,
-    },
+    /// The ECU's earlier response, in the exchange the entry's `caused_by` names, does not give
+    /// what this request needs (no block length in a RequestDownload answer).
+    EarlierResponse,
     Policy,
     BlockTooLong,
     PreparationError,
     NoTransferActive,
-    BadService,
     EmptyRequest,
+    /// The job's definition does not declare the service, or its number is not one a request
+    /// can carry (it does not fit a byte).
     UndeclaredService,
     /// The worker refused it for its own reasons: invalid parameters, a full queue, a request
     /// the protocol cannot carry.
@@ -402,11 +418,16 @@ pub(crate) enum RefusalCause {
 }
 
 impl RefusalCause {
-    fn phrase(&self) -> String {
+    /// `caused_by` is the entry of the response that caused an `EarlierResponse` refusal.
+    fn phrase(self, caused_by: Option<u64>) -> String {
         match self {
-            Self::EarlierResponse { caused_by } => format!(
-                "the ECU's earlier response (entry {caused_by}) does not give what this request needs"
-            ),
+            Self::EarlierResponse => match caused_by {
+                Some(entry) => format!(
+                    "the ECU's earlier response (entry {entry}) does not give what this request needs"
+                ),
+                None => "the ECU's earlier response does not give what this request needs"
+                    .to_owned(),
+            },
             Self::Policy => "the agent's request policy does not allow this service".to_owned(),
             Self::BlockTooLong => {
                 "the request would be longer than the block length the ECU allows".to_owned()
@@ -415,10 +436,9 @@ impl RefusalCause {
             Self::NoTransferActive => {
                 "no download is in progress, so there is no transfer to continue".to_owned()
             }
-            Self::BadService => "the service number is not a diagnostic service".to_owned(),
             Self::EmptyRequest => "the request has no bytes".to_owned(),
             Self::UndeclaredService => {
-                "the job's definition does not declare this service".to_owned()
+                "the job's definition does not declare this service, or its number is not one a request can carry".to_owned()
             }
             Self::SystemOwnReasons => "the system refused it for its own reasons (invalid parameters, a full queue or a request the protocol cannot carry)".to_owned(),
         }
@@ -430,8 +450,8 @@ impl RefusalCause {
 #[serde(rename_all = "snake_case")]
 pub(crate) enum UnknownCause {
     RpcFailure,
-    WorkerUnresponsive,
-    EventStreamEnded,
+    WorkerNotAnswering,
+    EventsEnded,
     EventsLost,
     PrimitiveFailedToStart,
 }
@@ -439,11 +459,13 @@ pub(crate) enum UnknownCause {
 impl UnknownCause {
     fn phrase(self) -> &'static str {
         match self {
-            Self::RpcFailure => "a request to the link service failed",
-            Self::WorkerUnresponsive => "the link service did not answer in time",
-            Self::EventStreamEnded => "the link service stopped reporting",
+            Self::RpcFailure => "a request to the diagnostic interface's software failed",
+            Self::WorkerNotAnswering => {
+                "the diagnostic interface's software did not answer in time"
+            }
+            Self::EventsEnded => "the diagnostic interface's software stopped reporting",
             Self::EventsLost => {
-                "the link service lost some of the link's reports, so the request may have been answered"
+                "the diagnostic interface's software lost some of the link's reports, so the request may have been answered"
             }
             Self::PrimitiveFailedToStart => "the request could not be started on the link",
         }
@@ -533,16 +555,16 @@ impl Outcome {
             End::NoResponse => Self::NoResponse,
             End::VciDidNotEnd => Self::VciDidNotEnd,
             End::LinkError(error) => Self::LinkError { error: *error },
-            End::NotSent(cause) => Self::NotSent {
-                cause: cause.clone(),
-            },
+            End::NotSent(cause) => Self::NotSent { cause: *cause },
             End::VciLost { .. } => Self::VciLost,
             End::Unknown(cause) => Self::Unknown { cause: *cause },
         }
     }
 }
 
-/// The code of a negative response, when it has one.
+/// The code of a negative response, when it has one. It assumes the UDS negative shape (`7F`,
+/// the SID, the code), as every profile the agent sends today uses; a profile with another
+/// negative shape (ADR-321) would need its own reading of the code.
 fn negative_code(response: &[u8]) -> Option<u8> {
     match response {
         [SID_NEGATIVE, _, code, ..] => Some(*code),
@@ -620,8 +642,8 @@ pub(crate) fn nrc_kind(code: u8) -> NrcKind {
 }
 
 /// The standard's identifier for a code (ISO 14229-1:2026 Annex A.1), for the codes it gives
-/// one. The authentication codes 0x50 to 0x5D have a title and a short form there, no
-/// identifier, so they have no name here.
+/// one, spelled as the table spells it (punctuation included). The authentication codes 0x50 to
+/// 0x5D have a title and a short form there, no identifier, so they have no name here.
 pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
     Some(match code {
         0x10 => "generalReject",
@@ -647,7 +669,7 @@ pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
         0x71 => "transferDataSuspended",
         0x72 => "generalProgrammingFailure",
         0x73 => "wrongBlockSequenceCounter",
-        0x78 => "requestCorrectlyReceivedResponsePending",
+        0x78 => "requestCorrectlyReceived-ResponsePending",
         0x7E => "SubFunctionNotSupportedInActiveSession",
         0x7F => "serviceNotSupportedInActiveSession",
         0x81 => "rpmTooHigh",
@@ -659,11 +681,11 @@ pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
         0x87 => "temperatureTooLow",
         0x88 => "vehicleSpeedTooHigh",
         0x89 => "vehicleSpeedTooLow",
-        0x8A => "throttlePedalTooHigh",
-        0x8B => "throttlePedalTooLow",
+        0x8A => "throttle/PedalTooHigh",
+        0x8B => "throttle/PedalTooLow",
         0x8C => "transmissionRangeNotInNeutral",
         0x8D => "transmissionRangeNotInGear",
-        0x8F => "brakeSwitchesNotClosed",
+        0x8F => "brakeSwitch(es)NotClosed",
         0x90 => "shifterLeverNotInPark",
         0x91 => "torqueConverterClutchLocked",
         0x92 => "voltageTooHigh",
@@ -675,7 +697,8 @@ pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
     })
 }
 
-/// The standard's name of a diagnostic service (ISO 14229-1:2026, the service clauses).
+/// The standard's name of a diagnostic service (ISO 14229-1:2026, the service clauses and the
+/// service identifier table, 7.4). 0x83 is reserved there, so it has no name.
 pub(crate) fn service_name(sid: u8) -> Option<&'static str> {
     Some(match sid {
         0x10 => "DiagnosticSessionControl",
@@ -700,7 +723,6 @@ pub(crate) fn service_name(sid: u8) -> Option<&'static str> {
         0x38 => "RequestFileTransfer",
         0x3D => "WriteMemoryByAddress",
         0x3E => "TesterPresent",
-        0x83 => "AccessTimingParameter",
         0x84 => "SecuredDataTransmission",
         0x85 => "ControlDTCSetting",
         0x86 => "ResponseOnEvent",
@@ -718,19 +740,18 @@ pub(crate) struct Expected {
 }
 
 impl Expected {
-    /// UDS's rule for `request`: the positive response SID followed by the first `echo` bytes
-    /// after the request's SID (a data identifier, a sub-function), and `7F` with the SID.
-    pub(crate) fn uds(request: &[u8], echo: usize) -> Self {
-        let Some((&sid, rest)) = request.split_first() else {
+    /// UDS's rule for `request`: the positive response's prefix as the worker is given it (the
+    /// host's own rule: a data identifier or a sub-function echoed, without its suppress bit),
+    /// and `7F` with the SID.
+    pub(crate) fn uds(request: &[u8]) -> Self {
+        let Some(&sid) = request.first() else {
             return Self {
                 positive_prefix: Vec::new(),
                 negative_pattern: Vec::new(),
             };
         };
-        let mut positive_prefix = vec![sid.wrapping_add(0x40)];
-        positive_prefix.extend(rest.iter().take(echo));
         Self {
-            positive_prefix,
+            positive_prefix: positive_prefix(request),
             negative_pattern: vec![SID_NEGATIVE, sid],
         }
     }
@@ -760,6 +781,8 @@ pub(crate) struct Evidence {
     pub expected: Expected,
     pub pending_visibility: PendingVisibility,
     pub end: End,
+    /// The exchange whose response caused a `not_sent` refusal (`EarlierResponse`).
+    pub caused_by: Option<u64>,
     /// The pendings the agent saw. On a link that absorbs them the list is empty and proves
     /// nothing.
     pub pending: Vec<Pending>,
@@ -789,7 +812,7 @@ impl Evidence {
         request: Vec<u8>,
         end: End,
     ) -> Self {
-        let expected = Expected::uds(&request, 0);
+        let expected = Expected::uds(&request);
         Self {
             origin,
             at: None,
@@ -801,6 +824,7 @@ impl Evidence {
             expected,
             pending_visibility: PendingVisibility::AbsorbedByVci,
             end,
+            caused_by: None,
             pending: Vec::new(),
             timing: Timing::not_judged(),
             times: Times {
@@ -859,13 +883,10 @@ impl Evidence {
         self.pending_visibility == PendingVisibility::AbsorbedByVci
     }
 
-    /// Whether the evidence holds something only a row not implemented yet can classify.
-    fn beyond_the_rows(&self) -> bool {
-        !self.answers.is_empty()
-            || matches!(
-                self.timing.window,
-                Window::Late | Window::TimeoutEarly | Window::TimeoutLate
-            )
+    /// Whether a link error was reported on this exchange's link (during it, besides its
+    /// outcome) or on any other link of the same physical channel (design 8.11 "Link error").
+    fn any_link_error(&self) -> bool {
+        !self.link_errors.is_empty() || !self.channel_link_errors.is_empty()
     }
 }
 
@@ -888,7 +909,9 @@ impl MatchKey {
     }
 }
 
-/// An owed request (design 8.11 "Owed request").
+/// An owed request (design 8.11 "Owed request"). The list of them grows with every unanswered
+/// request on the link until an ECUReset or session change ends it; a loop of unanswered
+/// requests is bounded only by the job.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Owed {
     seq: u64,
@@ -943,13 +966,31 @@ struct LinkEffect {
     owners: Vec<u64>,
     final_response: bool,
     positive: bool,
+    /// The final response is one the agent cannot use.
+    unusable: bool,
     suppressed: bool,
+    /// The request is a session change or an ECUReset of a type that restarts the ECU.
+    restarts_ecu: bool,
+    /// A link error of this exchange's link or of another link of its channel.
     link_error: Option<LinkErrorKind>,
 }
 
-/// The evidence of one opened link that later exchanges on it use (design 8.11 "Matched
-/// answer", "Owed request"). A link that is opened again, a worker restart or a VCI reconnect
-/// starts a new one.
+/// Whether `request` is one after which the ECU may restart and so forget earlier requests: a
+/// DiagnosticSessionControl, or an ECUReset of type hardReset, keyOffOnReset or softReset
+/// (ISO 14229-1:2026 9.3, Table 33; the suppress bit is not part of the type). The rapid power
+/// shutdown types and every other value restart nothing.
+fn restarts_ecu(request: &[u8]) -> bool {
+    match request {
+        [SID_SESSION_CONTROL, ..] => true,
+        [SID_ECU_RESET, sub, ..] => matches!(sub & 0x7F, 0x01..=0x03),
+        _ => false,
+    }
+}
+
+/// The evidence of one link that later exchanges on it use (design 8.11 "Matched answer",
+/// "Owed request"). A link that is opened again, a worker restart or a VCI reconnect starts the
+/// matched answers over ([`LinkState::reopened`]) and keeps the owed requests, since a response
+/// already on its way can still arrive.
 #[derive(Debug, Default)]
 pub(crate) struct LinkState {
     answered: u32,
@@ -990,28 +1031,40 @@ impl LinkState {
         }
     }
 
+    /// The link was opened again, the worker restarted or the VCI reconnected (design 8.11
+    /// "Matched answer"): the matched answers start over, since the link may now be set up
+    /// differently. The owed requests and the counts `answered` and `answered_since_error` stay
+    /// ("Owed request": a response already on its way can still arrive).
+    pub(crate) fn reopened(&mut self) {
+        self.matched.clear();
+    }
+
     /// Takes in an exchange that was logged.
     ///
     /// - An answer counts in `answered` and `answered_since_error`. It is a matched answer for
     ///   its key only when no owed request could own it and it did not accept an ECUReset or a
     ///   session change (that answer does not count for the exchanges after it).
-    /// - A link error ends the matched answers and the count since the error, not the owed
-    ///   requests.
-    /// - An accepted ECUReset (0x11) or DiagnosticSessionControl (0x10), or one sent with its
-    ///   positive response suppressed and classified `none`, ends the matched answers and the
-    ///   owed requests: all of them when its answer could belong to none, otherwise those sent
-    ///   before the earliest request it could belong to.
+    /// - A link error, on the exchange's own link or on another link of its physical channel,
+    ///   ends the matched answers and the count since the error, not the owed requests.
+    /// - An accepted DiagnosticSessionControl (0x10) or ECUReset (0x11) of a type that restarts
+    ///   the ECU (hardReset, keyOffOnReset, softReset), or one sent with its positive response
+    ///   suppressed and classified `none`, ends the matched answers and the owed requests: all
+    ///   of them when its answer could belong to none, otherwise those sent before the earliest
+    ///   request it could belong to. An ECUReset of another type ends nothing.
+    /// - A response to such a request that was accepted but is unusable (a bad field) ends the
+    ///   matched answers only, since the ECU may be restarting but the agent cannot tell.
     /// - The exchange is owed when its request may have reached the ECU whole (`sent`
     ///   `confirmed` or `unknown`) and no final response is placed with it alone.
     pub(crate) fn record(&mut self, entry: &ExchangeEntry) {
         let effect = &entry.effect;
-        let accepting = matches!(effect.sid, Some(SID_SESSION_CONTROL | SID_ECU_RESET))
+        let accepting = effect.restarts_ecu
             && ((effect.positive && effect.final_response)
                 || (effect.suppressed && entry.classification == Classification::None));
+        let unsure_restart = effect.restarts_ecu && effect.unusable;
         if effect.this_exchange {
             self.answered += 1;
             self.answered_since_error += 1;
-            if !accepting && effect.owners.is_empty() {
+            if !accepting && !unsure_restart && effect.owners.is_empty() {
                 *self.matched.entry(effect.key.clone()).or_insert(0) += 1;
             }
         }
@@ -1027,6 +1080,8 @@ impl LinkState {
             }
             self.matched.clear();
             self.last_reset = Some(entry.seq);
+        } else if unsure_restart {
+            self.matched.clear();
         }
         let placed_alone = effect.owners.is_empty() && (effect.final_response || accepting);
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
@@ -1086,6 +1141,9 @@ pub(crate) struct ExchangeEntry {
     pub request: Request,
     pub sent: Sent,
     pub sent_evidence: SentEvidence,
+    /// The exchange whose response caused a refusal (`not_sent`, `earlier_response`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub caused_by: Option<u64>,
     pub outcome: Outcome,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<AnswerItem>,
@@ -1121,10 +1179,16 @@ impl ExchangeEntry {
             owners: history.owners.clone(),
             final_response: evidence.final_response().is_some(),
             positive: matches!(evidence.end, End::Positive(_)),
+            unusable: matches!(evidence.end, End::PositiveUnusable(_)),
             suppressed: evidence.suppressed,
+            restarts_ecu: restarts_ecu(&evidence.request),
             link_error: match evidence.end {
                 End::LinkError(kind) => Some(kind),
-                _ => evidence.link_errors.first().copied(),
+                _ => evidence
+                    .link_errors
+                    .first()
+                    .or_else(|| evidence.channel_link_errors.first())
+                    .copied(),
             },
         };
         Self {
@@ -1142,6 +1206,7 @@ impl ExchangeEntry {
             },
             sent,
             sent_evidence,
+            caused_by: evidence.caused_by,
             outcome: Outcome::of(&evidence.end),
             answers: evidence.answers,
             pending: evidence.pending,
@@ -1163,7 +1228,9 @@ impl ExchangeEntry {
 /// - `not_sent` by a refusal of the agent, or of the worker after a lost VCI (ADR-294);
 /// - `confirmed` by a transmit confirmation, or by an answer of the ECU that no owed request
 ///   could own;
-/// - `partial` by a flow-control frame of the ECU;
+/// - `partial` by a flow-control frame of the ECU, when the exchange ended without any response
+///   of the ECU (no final response, no pending, no answer): an exchange that got one is not
+///   `partial`;
 /// - otherwise `unknown`.
 pub(crate) fn sent_of(evidence: &Evidence, history: &LinkHistory) -> (Sent, SentEvidence) {
     if matches!(
@@ -1181,7 +1248,7 @@ pub(crate) fn sent_of(evidence: &Evidence, history: &LinkHistory) -> (Sent, Sent
     if history.this_exchange && history.owed_matching == 0 {
         return (Sent::Confirmed, SentEvidence::Answer);
     }
-    if evidence.flow_control {
+    if evidence.flow_control && !history.this_exchange && evidence.answers.is_empty() {
         return (Sent::Partial, SentEvidence::FlowControl);
     }
     (Sent::Unknown, SentEvidence::None)
@@ -1191,7 +1258,7 @@ pub(crate) fn sent_of(evidence: &Evidence, history: &LinkHistory) -> (Sent, Sent
 pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
     let (sent, sent_evidence) = sent_of(evidence, history);
     if let End::NotSent(cause) = &evidence.end {
-        return format!("Not sent: {}.", cause.phrase());
+        return format!("Not sent: {}.", cause.phrase(evidence.caused_by));
     }
     let sent_phrase = match (sent, sent_evidence) {
         (Sent::Confirmed, SentEvidence::Answer) => {
@@ -1255,8 +1322,10 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
 /// never decides between possible owners).
 ///
 /// The rows are in the table's order. A row that today's evidence cannot reach is named by a
-/// comment where it would stand; an entry that holds what only such a row could classify (an
-/// answers list, a window `late`, `timeout_early` or `timeout_late`) takes the last row.
+/// comment where it would stand; evidence that only such a row could classify (a late pending
+/// before any outcome, a window `timeout_early` or `timeout_late`, an answers list, a final
+/// response with a window `late`) takes the last row at the place where that row stands, so a
+/// row before it (a refusal, a lost VCI, a failure of the system, a link error) still decides.
 pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
     let (mut classification, mut reason) = row(evidence, history);
     for kind in &evidence.link_errors {
@@ -1275,6 +1344,9 @@ pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
             " The answer could also belong to {} earlier request(s) that never got a final response, and the log does not decide between them.",
             history.owed_matching
         ));
+        if sent_of(evidence, history).0 != Sent::Confirmed {
+            reason.push_str(" So it is not known whether this request reached the bus.");
+        }
     }
     Verdict {
         classification,
@@ -1292,6 +1364,63 @@ fn severity_word(classification: Classification) -> &'static str {
     }
 }
 
+const READING_H1: &str = "the request may not have reached the bus (H1)";
+const READING_H2: &str = "a wrong address or filter may have hidden a negative response (H2)";
+const READING_H3: &str = "a link error may have lost a frame (H3)";
+
+/// The hidden causes H1 to H3 (design 8.11 "Classification") that the evidence leaves open for
+/// an exchange: H1 unless `sent` is `confirmed` or `partial`, H2 unless the ECU answered in
+/// this exchange or a matched answer counts, H3 when a link error was reported on the exchange's
+/// link or on another link of its channel. H4 is the caller's, since its test depends on the
+/// row.
+fn open_readings(
+    evidence: &Evidence,
+    history: &LinkHistory,
+    sent: Sent,
+    with_h1: bool,
+) -> Vec<&'static str> {
+    let mut open = Vec::new();
+    if with_h1 && !matches!(sent, Sent::Confirmed | Sent::Partial) {
+        open.push(READING_H1);
+    }
+    if !history.this_exchange && history.answered_same_match == 0 {
+        open.push(READING_H2);
+    }
+    if evidence.any_link_error() {
+        open.push(READING_H3);
+    }
+    open
+}
+
+/// The code of a negative response with its name, as a reason gives it.
+fn named_code(code: Option<u8>) -> String {
+    match code {
+        Some(code) => match nrc_name(code) {
+            Some(name) => format!("{name} ({code:#04x})"),
+            None => format!("code {code:#04x}"),
+        },
+        None => "no code".to_owned(),
+    }
+}
+
+/// The bytes a message shows in the log: the part of its redacted form that stays in clear.
+fn clear_bytes(direction: Direction, message: &[u8]) -> String {
+    redact(direction, message).clear().to_owned()
+}
+
+/// What a reason adds for a negative response code that makes an exchange `undetermined`.
+fn negative_note(code: Option<u8>) -> &'static str {
+    match code {
+        Some(0x35) => {
+            " The key the system computed does not match the one the ECU expects; the key service, the variant's secret and the seed it was given are not told apart (a zero seed shows a level that is already unlocked)."
+        }
+        Some(0x36 | 0x37) => {
+            " The attempt counter or its delay may come from an earlier job or another tester."
+        }
+        _ => "",
+    }
+}
+
 /// The rows of the table, in its order, for the exchange's own outcome.
 fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
     use Classification::{None as NoFault, System, Undetermined, Vehicle};
@@ -1302,33 +1431,35 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
     let this_exchange = history.this_exchange;
     let window = evidence.timing.window;
     let late = window == Window::Late;
+    let timed_out_unjudged = matches!(window, Window::TimeoutEarly | Window::TimeoutLate);
+    let answers_listed = !evidence.answers.is_empty();
     // On an absorbing link a time that is not judged, or past P2 on a link that cannot show the
     // pendings, may hide one (design 8.11 "Possible pending").
     let possible_pending =
         absorbing && matches!(window, Window::NotJudged | Window::PossiblePending);
-    let own_link_error = !evidence.link_errors.is_empty();
+    let any_link_error = evidence.any_link_error();
     let suppressed = evidence.suppressed;
     let to_owned = |text: &str| text.to_owned();
 
-    if evidence.beyond_the_rows() {
-        return last_row();
-    }
     match &evidence.end {
         // Refused by the agent because of an earlier response.
-        End::NotSent(cause @ RefusalCause::EarlierResponse { .. }) => {
-            (Undetermined, format!("Not sent: {}.", cause.phrase()))
-        }
+        End::NotSent(cause @ RefusalCause::EarlierResponse) => (
+            Undetermined,
+            format!("Not sent: {}.", cause.phrase(evidence.caused_by)),
+        ),
         // Refused by the agent, or by the worker for its own reasons.
         End::NotSent(cause) => (
             System,
             format!(
                 "Not sent: the diagnostic system refused the request: {}.",
-                cause.phrase()
+                cause.phrase(evidence.caused_by)
             ),
         ),
-        // Not implemented: any outcome after a forwarded pending past the limit in force before
-        // it. Needs a judged pending (the transmit time and the limits in force, no producer
-        // yet).
+        // Not implemented, and standing here: any outcome after a forwarded pending past the
+        // limit in force before it (`system`). It needs a judged pending (the transmit time and
+        // the limits in force, no producer yet), so a window `late` after a pending takes the
+        // last row.
+        _ if late && pending_seen => last_row(),
         End::VciLost { refused_after_loss } => {
             let mut reason = if *refused_after_loss {
                 to_owned(
@@ -1365,36 +1496,35 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         ),
         End::LinkError(kind) => kind.judge(),
         // Not implemented: `no_response` with `window` `timeout_early` or `timeout_late`
-        // (`system`). Needs a judged window.
-        End::NoResponse if suppressed && !this_exchange => {
+        // (`system`). Needs a judged window; evidence with one takes the last row. A window
+        // `late` without a pending seen has no row for a missing response either.
+        End::NoResponse if timed_out_unjudged || late => last_row(),
+        End::NoResponse if suppressed && !this_exchange && !answers_listed => {
             // Not implemented, and standing here: a suppressed no-response that is `none`. It
             // needs `sent` `confirmed`, a matched answer and a judged timeout (or a forwarding
             // link), which no evidence gives together yet.
-            let mut hidden = Vec::new();
-            if !matches!(sent, Sent::Confirmed | Sent::Partial) {
-                hidden.push("the request may not have reached the bus (H1)");
-            }
-            if history.answered_same_match == 0 {
-                hidden.push("a wrong address or filter may have hidden a negative response (H2)");
-            }
-            if own_link_error || !evidence.channel_link_errors.is_empty() {
-                hidden.push("a link error may have lost a frame (H3)");
-            }
+            let mut hidden = open_readings(evidence, history, sent, true);
             if absorbing && !matches!(window, Window::TimeoutAtLimit | Window::WithinP2) {
                 hidden.push("a pending the VCI absorbed may have obliged an answer (H4)");
             }
-            let named = if hidden.is_empty() {
-                to_owned("the evidence does not show that no response was expected and none came")
+            if hidden.is_empty() {
+                (
+                    Undetermined,
+                    to_owned(
+                        "No response was expected and none came, and no hidden cause (H1 to H4) is open; the log still does not decide, since not every condition that would show that nothing was missed can be checked yet.",
+                    ),
+                )
             } else {
-                hidden.join("; ")
-            };
-            (
-                Undetermined,
-                format!("No response was expected, but {named}."),
-            )
+                (
+                    Undetermined,
+                    format!("No response was expected, but {}.", hidden.join("; ")),
+                )
+            }
         }
         // Not implemented: both `answers` rows, and a request meant for one ECU with more than
-        // one answer. Needs the answers of a request that collects every answer.
+        // one answer. Needs the answers of a request that collects every answer. Evidence of
+        // one, or a window `timeout_early` or `timeout_late` on any outcome, takes the last row.
+        _ if answers_listed || timed_out_unjudged => last_row(),
         End::Positive(_) if suppressed && !pending_seen && !late => {
             if absorbing {
                 (
@@ -1413,9 +1543,10 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
         }
         // Not implemented: a final response with `window` `late` (`system`). Needs a judged
-        // window.
+        // window; evidence with one takes the last row.
+        End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_) if late => last_row(),
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
-            if possible_pending && !pending_seen && !late =>
+            if possible_pending && !pending_seen =>
         {
             (
                 Undetermined,
@@ -1441,59 +1572,95 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         End::Negative(response) => {
             let code = negative_code(response);
             let kind = code.map_or(NrcKind::UnknownCode, nrc_kind);
-            let named = match code {
-                Some(code) => match nrc_name(code) {
-                    Some(name) => format!("{name} ({code:#04x})"),
-                    None => format!("code {code:#04x}"),
-                },
-                None => "no code".to_owned(),
-            };
+            let named = named_code(code);
+            let bytes = clear_bytes(Direction::Response, response);
             if kind == NrcKind::EcuState {
                 (
                     Vehicle,
-                    format!("The ECU answered and refused the request: {named}."),
+                    format!(
+                        "The ECU answered and refused the request: {named}; response bytes {bytes}."
+                    ),
                 )
             } else {
                 (
                     Undetermined,
                     format!(
-                        "The ECU does not accept the request as the definition built it, in the active session or access state, or at this point of the sequence: {named}."
+                        "The ECU does not accept the request as the definition built it, in the active session or access state, or at this point of the sequence (a repeat after a resume can cause it): {named}; response bytes {bytes}.{}",
+                        negative_note(code)
                     ),
                 )
             }
         }
-        End::NoResponse if possible_pending && !pending_seen => (
-            Undetermined,
-            to_owned(
+        End::NoResponse if possible_pending && !pending_seen => {
+            let mut reason = to_owned(
                 "The VCI ended the wait later than P2, or at a time that is not judged: either the ECU answered with a pending the VCI absorbed and then fell silent, or the VCI waited past P2; the two give the same times (H4).",
-            ),
-        ),
+            );
+            let open = open_readings(evidence, history, sent, true);
+            if !open.is_empty() {
+                reason.push_str(&format!(
+                    " Other readings stay open as well: {}.",
+                    open.join("; ")
+                ));
+            }
+            (Undetermined, reason)
+        }
         // Not implemented: `response_incomplete`, and `no_flow_control` (`vehicle` after a
         // flow-control wait past its limit, otherwise `undetermined`). Need the transport's
         // extra error information.
-        End::NoResponse if this_exchange && !own_link_error => (
-            Vehicle,
-            to_owned(
-                "The ECU answered with a pending and then sent no response within the limit in force; the pending shows that the address, the filter and the response patterns match this ECU.",
-            ),
-        ),
+        End::NoResponse if this_exchange && !any_link_error => {
+            if history.owed_matching == 0 {
+                (
+                    Vehicle,
+                    to_owned(
+                        "The ECU answered with a pending and then sent no response within the limit in force; the pending shows that the address, the filter and the response patterns match this ECU.",
+                    ),
+                )
+            } else {
+                (
+                    Vehicle,
+                    to_owned(
+                        "The ECU answered with a pending and then sent no response within the limit in force, but the pending could belong to an earlier request, so it is not known whether this request reached the bus, nor whether the address, the filter and the response patterns match this ECU.",
+                    ),
+                )
+            }
+        }
         End::NoResponse if this_exchange => (
             Undetermined,
-            to_owned(
-                "Sent on the bus, and the ECU answered with a pending, but a link error came during the exchange and may have lost a frame (H3).",
+            format!(
+                "{}, and the ECU answered with a pending, but a link error came on this link or another link of its channel and may have lost a frame (H3).",
+                send_phrase(sent)
             ),
         ),
         // Not implemented: the two `no_response` rows that stand on `sent` `confirmed` without
         // an answer of this exchange, or on a matched answer (`vehicle` when the ECU has
         // answered requests matched this way, `undetermined` otherwise). Need a transmit
         // confirmation.
-        End::NoResponse if sent == Sent::Unknown => (
-            Undetermined,
-            to_owned("There is no evidence that the request reached the bus (H1)."),
-        ),
+        End::NoResponse if sent == Sent::Unknown => {
+            let mut reason =
+                to_owned("There is no evidence that the request reached the bus (H1).");
+            let open = open_readings(evidence, history, sent, false);
+            if !open.is_empty() {
+                reason.push_str(&format!(
+                    " Other readings stay open as well: {}.",
+                    open.join("; ")
+                ));
+            }
+            (Undetermined, reason)
+        }
         // Not implemented: `response_malformed`, and `not_sent` by a transmit error (they need
         // the extra error information that names the case).
         _ => last_row(),
+    }
+}
+
+/// How a reason words the send: from `sent` alone, so that "sent on the bus" is said only for a
+/// confirmed send.
+fn send_phrase(sent: Sent) -> &'static str {
+    match sent {
+        Sent::Confirmed => "Sent on the bus",
+        Sent::Partial => "Only the first frame of the request went out",
+        Sent::NotSent => "Not sent",
+        Sent::Unknown => "It is not known whether the request reached the bus",
     }
 }
 
@@ -1564,10 +1731,7 @@ mod tests {
     const READ_F186: [u8; 3] = [0x22, 0xF1, 0x86];
 
     fn read(did: [u8; 2], end: End) -> Evidence {
-        let request = [0x22, did[0], did[1]];
-        let mut evidence = evidence(&request, end);
-        evidence.expected = Expected::uds(&request, 2);
-        evidence
+        evidence(&[0x22, did[0], did[1]], end)
     }
 
     #[test]
@@ -1638,7 +1802,7 @@ mod tests {
         assert_eq!(nrc_name(0x10), Some("generalReject"));
         assert_eq!(
             nrc_name(0x78),
-            Some("requestCorrectlyReceivedResponsePending")
+            Some("requestCorrectlyReceived-ResponsePending")
         );
         assert_eq!(nrc_name(0x7F), Some("serviceNotSupportedInActiveSession"));
         assert_eq!(
@@ -1743,8 +1907,8 @@ mod tests {
         assert_eq!(entry.sent_evidence, SentEvidence::None);
         assert_eq!(entry.timing.window, Window::NotJudged);
         assert_eq!(
-            entry.timing.not_judged_reason.as_deref(),
-            Some("no transmit time on this link")
+            entry.timing.not_judged_reason,
+            Some(NotJudgedReason::NoTransmitTime)
         );
         assert_eq!(entry.timing.measured_by, MeasuredBy::Agent);
         // On an absorbing link the possible-pending row comes first and names H4.
@@ -1752,6 +1916,17 @@ mod tests {
         let verdict = verdict_of(&evidence);
         assert_eq!(verdict.0, Classification::Undetermined);
         assert!(verdict.1.contains("H4"));
+        // The reason lists every reading the evidence leaves open: the send is not known (H1)
+        // and no matched answer counts (H2), as well as the two readings of H4.
+        assert!(verdict.1.contains("H1"), "{}", verdict.1);
+        assert!(verdict.1.contains("H2"), "{}", verdict.1);
+        assert!(!verdict.1.contains("H3"), "{}", verdict.1);
+        // A confirmed send closes H1 and a link error opens H3.
+        let mut confirmed = evidence.clone();
+        confirmed.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        confirmed.channel_link_errors = vec![LinkErrorKind::Receive];
+        let reason = verdict_of(&confirmed).1;
+        assert!(!reason.contains("H1") && reason.contains("H3"), "{reason}");
         // With a timeout judged at the limit, H4 is out and H1 stands.
         evidence.timing.window = Window::TimeoutAtLimit;
         let verdict = verdict_of(&evidence);
@@ -1806,7 +1981,6 @@ mod tests {
             RefusalCause::BlockTooLong,
             RefusalCause::PreparationError,
             RefusalCause::NoTransferActive,
-            RefusalCause::BadService,
             RefusalCause::EmptyRequest,
             RefusalCause::UndeclaredService,
             RefusalCause::SystemOwnReasons,
@@ -1817,18 +1991,19 @@ mod tests {
             assert_eq!(entry.sent, Sent::NotSent);
             assert_eq!(entry.sent_evidence, SentEvidence::Refused);
         }
-        let evidence = evidence(
-            &[0x36, 1],
-            End::NotSent(RefusalCause::EarlierResponse { caused_by: 9 }),
-        );
+        let mut evidence = evidence(&[0x36, 1], End::NotSent(RefusalCause::EarlierResponse));
+        evidence.caused_by = Some(9);
         let entry = ExchangeEntry::build(10, evidence, LinkHistory::empty());
         assert_eq!(entry.classification, Classification::Undetermined);
         assert!(entry.reason.contains("entry 9"));
         let json = serde_json::to_value(&entry).unwrap();
+        // The refused exchange's cause is a name; the exchange that caused it is the entry's own
+        // `caused_by`.
         assert_eq!(
             json["outcome"],
-            json!({ "result": "not_sent", "cause": { "kind": "earlier_response", "caused_by": 9 } })
+            json!({ "result": "not_sent", "cause": "earlier_response" })
         );
+        assert_eq!(json["caused_by"], 9);
     }
 
     #[test]
@@ -1878,8 +2053,8 @@ mod tests {
     fn failures_of_the_system_are_system() {
         for cause in [
             UnknownCause::RpcFailure,
-            UnknownCause::WorkerUnresponsive,
-            UnknownCause::EventStreamEnded,
+            UnknownCause::WorkerNotAnswering,
+            UnknownCause::EventsEnded,
             UnknownCause::EventsLost,
             UnknownCause::PrimitiveFailedToStart,
         ] {
@@ -2248,14 +2423,13 @@ mod tests {
             End::NotSent(RefusalCause::BlockTooLong),
             End::NotSent(RefusalCause::PreparationError),
             End::NotSent(RefusalCause::NoTransferActive),
-            End::NotSent(RefusalCause::BadService),
             End::NotSent(RefusalCause::EmptyRequest),
             End::NotSent(RefusalCause::UndeclaredService),
             End::NotSent(RefusalCause::SystemOwnReasons),
-            End::NotSent(RefusalCause::EarlierResponse { caused_by: 3 }),
+            End::NotSent(RefusalCause::EarlierResponse),
             End::Unknown(UnknownCause::RpcFailure),
-            End::Unknown(UnknownCause::WorkerUnresponsive),
-            End::Unknown(UnknownCause::EventStreamEnded),
+            End::Unknown(UnknownCause::WorkerNotAnswering),
+            End::Unknown(UnknownCause::EventsEnded),
             End::Unknown(UnknownCause::EventsLost),
             End::Unknown(UnknownCause::PrimitiveFailedToStart),
             End::Negative(vec![0x7F, 0x22]),
@@ -2293,6 +2467,10 @@ mod tests {
                             millivolts: 12_000,
                             age_ms: 5,
                         });
+                        cases.push(case.clone());
+                        case.flow_control = true;
+                        cases.push(case.clone());
+                        case.transmit_evidence = Some(TransmitEvidence::TxIndication);
                         cases.push(case);
                     }
                 }
@@ -2349,6 +2527,15 @@ mod tests {
                 }
             }
             assert!(!entry.text.is_empty() && !entry.reason.is_empty());
+            // The send is worded from `sent`: "sent on the bus" only for a confirmed one.
+            for field in [&entry.text, &entry.reason] {
+                assert!(
+                    entry.sent == Sent::Confirmed || !field.contains("Sent on the bus"),
+                    "{:?} {:?}: {field:?}",
+                    entry.sent,
+                    entry.outcome
+                );
+            }
         }
     }
 
@@ -2376,6 +2563,7 @@ mod tests {
             "request",
             "sent",
             "sent_evidence",
+            "caused_by",
             "outcome",
             "answers",
             "pending",
@@ -2421,6 +2609,7 @@ mod tests {
             reason: "x".to_owned(),
         }];
         full.pending = vec![pending()];
+        full.caused_by = Some(3);
         let json = entry_json(full);
         assert_eq!(keys(&json), all);
         assert_eq!(json["event"], "exchange");
@@ -2429,7 +2618,7 @@ mod tests {
         // reading.
         let json = entry_json(evidence(&READ_F186, End::NoResponse));
         let mut required: Vec<&str> = all.clone();
-        required.retain(|key| !["at", "answers", "supply_voltage"].contains(key));
+        required.retain(|key| !["at", "answers", "supply_voltage", "caused_by"].contains(key));
         assert_eq!(keys(&json), required);
         assert_eq!(json["detail"], json!({}));
         assert_eq!(json["request"]["sid"], "0x22");
@@ -2447,10 +2636,40 @@ mod tests {
             ]
         );
         assert_eq!(json["timing"]["window"], "not_judged");
+        assert_eq!(json["timing"]["not_judged_reason"], "no_transmit_time");
         assert_eq!(json["classification"], "undetermined");
+        // The groups: each carries the keys of design 8.11's table and no more.
+        assert_eq!(
+            keys(&json["request"]),
+            ["bytes", "service", "sid", "suppressed"]
+        );
+        assert_eq!(keys(&json["request"]["bytes"]), ["clear"]);
+        assert_eq!(keys(&json["outcome"]), ["result"]);
+        assert_eq!(
+            keys(&json["timing"]),
+            ["measured_by", "not_judged_reason", "response_ms", "window"]
+        );
+        assert_eq!(keys(&json["times"]), ["agent"]);
+        assert_eq!(
+            keys(&json["times"]["agent"]),
+            ["before_us", "end_us", "epoch"]
+        );
+        assert_eq!(keys(&json["target"]), ["link", "rx_id", "tx_id"]);
+        let negative = entry_json(evidence(&READ_F186, End::Negative(vec![0x7F, 0x22, 0x22])));
+        assert_eq!(
+            keys(&negative["outcome"]),
+            ["nrc", "nrc_kind", "nrc_name", "response", "result"]
+        );
+        assert_eq!(
+            negative["outcome"]["response"],
+            json!({ "clear": "7f2222" })
+        );
+        let mut roled = evidence(&READ_F186, End::NoResponse);
+        roled.target = Target::Role("primary".to_owned());
+        assert_eq!(entry_json(roled)["target"], "primary");
         assert_eq!(
             json["target"],
-            json!({ "kind": "endpoint", "link": 1, "tx_id": 0x7E0, "rx_id": RX })
+            json!({ "link": 1, "tx_id": 0x7E0, "rx_id": RX })
         );
     }
 
@@ -2490,11 +2709,19 @@ mod tests {
         ] {
             assert_eq!(got, json!(want));
         }
-        let role = serde_json::to_value(Target::Role {
-            role: "primary".to_owned(),
+        // A role is a plain string, an endpoint an object (design 8.11's examples).
+        let role = serde_json::to_value(Target::Role("primary".to_owned())).unwrap();
+        assert_eq!(role, json!("primary"));
+        let endpoint = serde_json::to_value(Target::Endpoint {
+            link: 2,
+            tx_id: 0x7DF,
+            rx_id: 0x7E8,
         })
         .unwrap();
-        assert_eq!(role, json!({ "kind": "role", "role": "primary" }));
+        assert_eq!(
+            endpoint,
+            json!({ "link": 2, "tx_id": 0x7DF, "rx_id": 0x7E8 })
+        );
         let times = serde_json::to_value(Times {
             agent: AgentTimes {
                 epoch: 1,
@@ -2524,10 +2751,10 @@ mod tests {
         .unwrap();
         assert_eq!(pending["clock"], "worker");
         let detail = serde_json::to_value(Detail {
-            host_error: Some("a".to_owned()),
-            error_event: Some("b".to_owned()),
-            extra_error_info: Some("c".to_owned()),
-            grpc_status: Some("d".to_owned()),
+            host_error: Some("a"),
+            error_event: Some("b"),
+            extra_error_info: Some("c"),
+            grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
             native_return_code: Some("f".to_owned()),
         })
@@ -2559,7 +2786,433 @@ mod tests {
             attrs.interruptible,
             Interruptible::RecoveryRequired
         ));
-        assert_eq!(Expected::uds(&[], 2).positive_prefix, Vec::<u8>::new());
+        assert_eq!(Expected::uds(&[]).positive_prefix, Vec::<u8>::new());
+    }
+
+    /// An answers-list item, for the entries that hold one.
+    fn an_answer() -> AnswerItem {
+        AnswerItem {
+            rx_id: RX,
+            response: redact(Direction::Response, &[0x62, 0xF1, 0x86]),
+            vci_us: None,
+            agent_us: 1,
+            response_ms: None,
+            outcome: Outcome::NoResponse,
+            classification: Classification::None,
+            reason: "x".to_owned(),
+        }
+    }
+
+    /// The matched answers and owed requests a link state gives a read of F186 and of F189.
+    fn counts(state: &LinkState) -> (u32, u32) {
+        let matched = state
+            .history_for(&read([0xF1, 0x86], End::NoResponse))
+            .answered_same_match;
+        let owed = state
+            .history_for(&read([0xF1, 0x89], End::Positive(vec![0x62, 0xF1, 0x89])))
+            .owed_matching;
+        (matched, owed)
+    }
+
+    /// A link with a matched answer (a read of F186) and an owed request (a read of F189),
+    /// which then logs `request` as line 3 with `end`.
+    fn link_after(request: &[u8], end: End) -> LinkState {
+        let mut state = LinkState::default();
+        log(&mut state, 1, read([0xF1, 0x89], End::NoResponse));
+        log(
+            &mut state,
+            2,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        assert_eq!(counts(&state), (1, 1));
+        log(&mut state, 3, evidence(request, end));
+        state
+    }
+
+    #[test]
+    fn an_owed_request_survives_a_reopened_link_and_only_the_matched_answers_start_over() {
+        let mut state = LinkState::default();
+        log(&mut state, 1, read([0xF1, 0x89], End::NoResponse));
+        log(
+            &mut state,
+            2,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        assert_eq!(counts(&state), (1, 1));
+        state.reopened();
+        // The matched answer is gone, the owed request and the counts are not.
+        assert_eq!(counts(&state), (0, 1));
+        let history = state.history_for(&read([0xF1, 0x86], End::NoResponse));
+        assert_eq!((history.answered, history.answered_since_error), (1, 1));
+        // A later answer the owed request could own stays undetermined, with it counted.
+        let late = log(
+            &mut state,
+            3,
+            read([0xF1, 0x89], End::Positive(vec![0x62, 0xF1, 0x89, 7])),
+        );
+        assert_eq!(late.link_history.owed_matching, 1);
+        assert_eq!(late.classification, Classification::Undetermined);
+        assert_eq!(late.sent, Sent::Unknown);
+    }
+
+    #[test]
+    fn a_link_error_on_the_channel_counts_for_h3_and_ends_the_matched_answers() {
+        // A pending then silence is `vehicle` only when no link error came on the link or on
+        // another link of its channel.
+        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        silent.pending = vec![pending()];
+        assert_eq!(verdict_of(&silent).0, Classification::Vehicle);
+        silent.channel_link_errors = vec![LinkErrorKind::Receive];
+        let (class, reason) = verdict_of(&silent);
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.contains("H3"), "{reason}");
+        // The channel's error is evidence only: it adds no fault to an exchange that ended well.
+        let mut positive = forwarding(evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86])));
+        positive.channel_link_errors = vec![LinkErrorKind::VciHardwareFault];
+        assert_eq!(verdict_of(&positive).0, Classification::None);
+        // It ends the matched answers and the count since the error, not the owed requests.
+        let mut state = LinkState::default();
+        log(&mut state, 1, read([0xF1, 0x89], End::NoResponse));
+        log(
+            &mut state,
+            2,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        let mut other = read([0xF1, 0x90], End::NoResponse);
+        other.channel_link_errors = vec![LinkErrorKind::Frame];
+        log(&mut state, 3, other);
+        assert_eq!(state.last_link_error(), Some((3, LinkErrorKind::Frame)));
+        assert_eq!(counts(&state), (0, 1));
+        let history = state.history_for(&read([0xF1, 0x86], End::NoResponse));
+        assert_eq!((history.answered, history.answered_since_error), (1, 0));
+    }
+
+    #[test]
+    fn a_suppressed_silence_with_no_open_reading_does_not_contradict_itself() {
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            evidence(&[0x3E, 0x00], End::Positive(vec![0x7E, 0x00])),
+        );
+        let mut silent = evidence(&[0x3E, 0x80], End::NoResponse);
+        silent.suppressed = true;
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        silent.timing.window = Window::TimeoutAtLimit;
+        silent.timing.not_judged_reason = None;
+        let entry = log(&mut state, 2, silent);
+        assert_eq!(entry.link_history.answered_same_match, 1);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(!entry.reason.contains("but the evidence does not show"));
+        assert!(entry.reason.contains("no hidden cause"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn evidence_only_an_unimplemented_row_could_classify_takes_the_last_row_where_it_stands() {
+        // A row before it still decides: a failure of the system with a window `timeout_late`,
+        // a VCI fault with answers, a lost VCI with a window `late` and no pending.
+        let mut failed = evidence(&READ_F186, End::Unknown(UnknownCause::RpcFailure));
+        failed.timing.window = Window::TimeoutLate;
+        assert_eq!(verdict_of(&failed).0, Classification::System);
+        let mut fault = evidence(&READ_F186, End::LinkError(LinkErrorKind::VciHardwareFault));
+        fault.answers = vec![an_answer()];
+        assert_eq!(verdict_of(&fault).0, Classification::System);
+        let mut refused = evidence(&READ_F186, End::NotSent(RefusalCause::Policy));
+        refused.answers = vec![an_answer()];
+        refused.timing.window = Window::TimeoutEarly;
+        assert_eq!(verdict_of(&refused).0, Classification::System);
+        let mut lost = evidence(
+            &READ_F186,
+            End::VciLost {
+                refused_after_loss: false,
+            },
+        );
+        lost.timing.window = Window::Late;
+        let (class, reason) = verdict_of(&lost);
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.contains("lost"), "{reason}");
+        // The rows after it still take the last row: a silence with a window `timeout_late`, an
+        // answers list on a final response, a final response with a window `late`.
+        for case in [
+            {
+                let mut e = evidence(&READ_F186, End::NoResponse);
+                e.timing.window = Window::TimeoutLate;
+                e
+            },
+            {
+                let mut e = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
+                e.answers = vec![an_answer()];
+                e
+            },
+            {
+                let mut e = evidence(&READ_F186, End::Negative(vec![0x7F, 0x22, 0x22]));
+                e.timing.window = Window::Late;
+                e
+            },
+        ] {
+            let (class, reason) = verdict_of(&case);
+            assert_eq!(class, Classification::Undetermined);
+            assert!(reason.contains("could not decide"), "{reason}");
+        }
+    }
+
+    #[test]
+    fn an_echoed_sub_function_is_matched_without_its_suppress_bit() {
+        let mut state = LinkState::default();
+        let mut owed = evidence(&[0x3E, 0x80], End::NoResponse);
+        owed.suppressed = true;
+        log(&mut state, 1, owed);
+        let answer = evidence(&[0x3E, 0x00], End::Positive(vec![0x7E, 0x00]));
+        assert_eq!(state.history_for(&answer).owed_matching, 1);
+        assert_eq!(Expected::uds(&[0x3E, 0x80]).positive_prefix, [0x7E, 0x00]);
+        assert_eq!(
+            Expected::uds(&[0x22, 0xF1, 0x86]).positive_prefix,
+            [0x62, 0xF1, 0x86]
+        );
+        assert_eq!(
+            Expected::uds(&[0x19, 0x82, 5]).positive_prefix,
+            [0x59, 0x02]
+        );
+        assert_eq!(Expected::uds(&[0x27, 0x81]).positive_prefix, [0x67, 0x01]);
+        assert_eq!(Expected::uds(&[0x31, 0x01, 0xFF]).positive_prefix, [0x71]);
+        assert_eq!(Expected::uds(&[0x31]).negative_pattern, [0x7F, 0x31]);
+    }
+
+    #[test]
+    fn a_flow_control_frame_is_partial_only_when_the_ecu_gave_no_response() {
+        let mut silent = evidence(&READ_F186, End::NoResponse);
+        silent.flow_control = true;
+        assert_eq!(
+            sent_of(&silent, &LinkHistory::empty()),
+            (Sent::Partial, SentEvidence::FlowControl)
+        );
+        // An answer no owed request could own confirms the send.
+        let mut answered = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
+        answered.flow_control = true;
+        let history = LinkState::default().history_for(&answered);
+        assert_eq!(
+            sent_of(&answered, &history),
+            (Sent::Confirmed, SentEvidence::Answer)
+        );
+        // One an owed request could own leaves the send unknown, not partial.
+        let mut state = LinkState::default();
+        log(&mut state, 1, read([0xF1, 0x86], End::NoResponse));
+        let history = state.history_for(&answered);
+        assert_eq!(history.owed_matching, 1);
+        assert_eq!(
+            sent_of(&answered, &history),
+            (Sent::Unknown, SentEvidence::None)
+        );
+        // So does a pending, and an answers list.
+        let mut pending_seen = evidence(&READ_F186, End::NoResponse);
+        pending_seen.flow_control = true;
+        pending_seen.pending = vec![pending()];
+        assert_eq!(sent_of(&pending_seen, &history).0, Sent::Unknown);
+        let mut listed = evidence(&READ_F186, End::NoResponse);
+        listed.flow_control = true;
+        listed.answers = vec![an_answer()];
+        assert_eq!(sent_of(&listed, &LinkHistory::empty()).0, Sent::Unknown);
+    }
+
+    #[test]
+    fn a_pending_an_owed_request_could_own_does_not_say_the_request_was_sent() {
+        let mut state = LinkState::default();
+        log(&mut state, 1, read([0xF1, 0x86], End::NoResponse));
+        let mut stalled = forwarding(read([0xF1, 0x86], End::NoResponse));
+        stalled.pending = vec![pending()];
+        let entry = log(&mut state, 2, stalled.clone());
+        assert_eq!(entry.sent, Sent::Unknown);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(
+            !entry.reason.contains("Sent on the bus"),
+            "{}",
+            entry.reason
+        );
+        assert!(!entry.text.contains("Sent on the bus"), "{}", entry.text);
+        assert!(
+            entry.reason.contains("not known whether"),
+            "{}",
+            entry.reason
+        );
+        // With a link error as well, the undetermined row words the send the same way.
+        stalled.link_errors = vec![LinkErrorKind::Receive];
+        let entry = log(&mut state, 3, stalled);
+        assert!(
+            !entry.reason.contains("Sent on the bus"),
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("not known whether"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn a_response_in_the_entry_passes_through_redaction_by_its_direction() {
+        // A seed response shows its length only; a key request, the same.
+        let seed = entry_json(evidence(
+            &[0x27, 0x01],
+            End::Positive(vec![0x67, 0x01, 0xDE, 0xAD, 0xBE, 0xEF]),
+        ));
+        assert_eq!(
+            seed["outcome"]["response"],
+            json!({ "clear": "6701", "data": { "kind": "secret", "len": 4, "all_zero": false } })
+        );
+        assert_eq!(seed["request"]["bytes"], json!({ "clear": "2701" }));
+        assert!(!seed.to_string().contains("deadbeef"));
+        let key = entry_json(forwarding(evidence(
+            &[0x27, 0x02, 1, 2, 3, 4, 5],
+            End::Negative(vec![0x7F, 0x27, 0x35]),
+        )));
+        assert_eq!(
+            key["request"]["bytes"],
+            json!({ "clear": "2702", "data": { "kind": "secret", "len": 5 } })
+        );
+        assert!(!key.to_string().contains("0102030405"));
+        // A negative response stays whole, and the reason carries its bytes.
+        assert_eq!(key["outcome"]["response"], json!({ "clear": "7f2735" }));
+        assert!(key["reason"].as_str().unwrap().contains("7f2735"));
+    }
+
+    #[test]
+    fn the_detail_holds_names_and_the_host_error_is_a_variant_name() {
+        let mut with_detail = evidence(&READ_F186, End::NoResponse);
+        with_detail.detail = Detail {
+            host_error: Some("NoResponse"),
+            error_event: Some("PDU_ERR_EVT_RX_TIMEOUT"),
+            extra_error_info: Some("RX_TIMEOUT_NO_RSP"),
+            ..Detail::default()
+        };
+        let json = entry_json(with_detail);
+        assert_eq!(
+            json["detail"],
+            json!({
+                "host_error": "NoResponse",
+                "error_event": "PDU_ERR_EVT_RX_TIMEOUT",
+                "extra_error_info": "RX_TIMEOUT_NO_RSP",
+            })
+        );
+    }
+
+    #[test]
+    fn the_causes_are_named_in_the_designs_words() {
+        let cause = |end: End| entry_json(evidence(&READ_F186, end))["outcome"]["cause"].clone();
+        assert_eq!(cause(End::Unknown(UnknownCause::RpcFailure)), "rpc_failure");
+        assert_eq!(
+            cause(End::Unknown(UnknownCause::WorkerNotAnswering)),
+            "worker_not_answering"
+        );
+        assert_eq!(
+            cause(End::Unknown(UnknownCause::EventsEnded)),
+            "events_ended"
+        );
+        assert_eq!(cause(End::Unknown(UnknownCause::EventsLost)), "events_lost");
+        assert_eq!(
+            cause(End::NotSent(RefusalCause::UndeclaredService)),
+            "undeclared_service"
+        );
+        // No reason says "link service", which is the wording of an internal component.
+        for cause in [
+            UnknownCause::RpcFailure,
+            UnknownCause::WorkerNotAnswering,
+            UnknownCause::EventsEnded,
+            UnknownCause::EventsLost,
+            UnknownCause::PrimitiveFailedToStart,
+        ] {
+            assert!(!cause.phrase().contains("link service"), "{cause:?}");
+        }
+    }
+
+    #[test]
+    fn only_a_reset_that_restarts_the_ecu_ends_the_evidence() {
+        // hardReset, keyOffOnReset and softReset, with or without the suppress bit, end the
+        // matched answers and the owed requests.
+        for sub in [0x01, 0x02, 0x03] {
+            let state = link_after(&[0x11, sub], End::Positive(vec![0x51, sub]));
+            assert_eq!(counts(&state), (0, 0), "{sub:#04x}");
+            assert_eq!(state.last_reset(), Some(3), "{sub:#04x}");
+        }
+        let state = link_after(&[0x11, 0x81], End::Positive(vec![0x51, 0x01]));
+        assert_eq!(counts(&state), (0, 0));
+        // The rapid power shutdown types and every other value end nothing.
+        for sub in [0x04, 0x05, 0x00, 0x06, 0x40, 0x60, 0x7F] {
+            let state = link_after(&[0x11, sub], End::Positive(vec![0x51, sub]));
+            assert_eq!(counts(&state), (1, 1), "{sub:#04x}");
+            assert_eq!(state.last_reset(), None, "{sub:#04x}");
+        }
+        let state = link_after(&[0x11], End::Positive(vec![0x51]));
+        assert_eq!(counts(&state), (1, 1));
+        // A session change always ends them.
+        let state = link_after(&[0x10, 0x02], End::Positive(vec![0x50, 0x02]));
+        assert_eq!(counts(&state), (0, 0));
+    }
+
+    #[test]
+    fn an_unusable_answer_to_a_restart_ends_the_matched_answers_but_no_owed_request() {
+        let state = link_after(&[0x10, 0x03], End::PositiveUnusable(vec![0x50]));
+        assert_eq!(counts(&state), (0, 1));
+        assert_eq!(state.last_reset(), None);
+        let state = link_after(&[0x11, 0x01], End::PositiveUnusable(vec![0x51]));
+        assert_eq!(counts(&state), (0, 1));
+        // An ECUReset type that restarts nothing ends nothing, unusable or not.
+        let state = link_after(&[0x11, 0x04], End::PositiveUnusable(vec![0x51]));
+        assert_eq!(counts(&state), (1, 1));
+        // Another service's unusable answer ends nothing.
+        let state = link_after(&[0x31, 0x01], End::PositiveUnusable(vec![0x71]));
+        assert_eq!(counts(&state), (1, 1));
+    }
+
+    #[test]
+    fn the_standards_names_are_spelled_as_annex_a_1_and_the_service_table_spell_them() {
+        assert_eq!(
+            nrc_name(0x78),
+            Some("requestCorrectlyReceived-ResponsePending")
+        );
+        assert_eq!(nrc_name(0x8A), Some("throttle/PedalTooHigh"));
+        assert_eq!(nrc_name(0x8B), Some("throttle/PedalTooLow"));
+        assert_eq!(nrc_name(0x8F), Some("brakeSwitch(es)NotClosed"));
+        assert_eq!(nrc_name(0x94), Some("ResourceTemporarilyNotAvailable"));
+        // 0x83 is reserved in the service identifier table; its neighbours are services.
+        assert_eq!(service_name(0x83), None);
+        for sid in [0x84, 0x85, 0x86, 0x87] {
+            assert!(service_name(sid).is_some(), "{sid:#04x}");
+        }
+        assert_eq!(service_name(0x38), Some("RequestFileTransfer"));
+        assert_eq!(service_name(0x3D), Some("WriteMemoryByAddress"));
+    }
+
+    #[test]
+    fn the_negative_reasons_carry_the_response_bytes_and_the_notes_of_the_table() {
+        let reason = |request: &[u8], code: u8| {
+            let evidence = forwarding(evidence(
+                request,
+                End::Negative(vec![0x7F, request[0], code]),
+            ));
+            verdict_of(&evidence).1
+        };
+        let key = reason(&[0x27, 0x02, 1, 2], 0x35);
+        assert!(key.contains("7f2735"), "{key}");
+        assert!(key.contains("invalidKey (0x35)"), "{key}");
+        assert!(key.contains("key the system computed"), "{key}");
+        assert!(key.contains("not told apart"), "{key}");
+        assert!(key.contains("zero seed"), "{key}");
+        for code in [0x36, 0x37] {
+            let attempts = reason(&[0x27, 0x01], code);
+            assert!(
+                attempts.contains("earlier job or another tester"),
+                "{attempts}"
+            );
+            assert!(attempts.contains(&format!("7f27{code:02x}")), "{attempts}");
+        }
+        let state = reason(&READ_F186, 0x22);
+        assert!(state.contains("7f2222"), "{state}");
+        let other = reason(&READ_F186, 0x31);
+        assert!(
+            !other.contains("zero seed") && !other.contains("earlier job"),
+            "{other}"
+        );
     }
 
     mod erased {

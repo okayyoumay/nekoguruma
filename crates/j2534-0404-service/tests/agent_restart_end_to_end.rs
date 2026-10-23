@@ -392,15 +392,26 @@ def main():
     write_application()
 ";
 
-/// The example's flash session: its one segment's length and block size
-/// (`flash_segments.csv`), so the image has [`CONVERTED_BLOCKS`] blocks.
-const CONVERTED_IMAGE_LEN: usize = 0x1_0000;
-const CONVERTED_BLOCKS: u32 = 0x100;
+/// The converted session's one segment, of [`CONVERTED_BLOCKS`] blocks of the example's 0x100
+/// bytes: the test's copy of `flash_segments.csv` shortens the example's 0x10000 bytes, whose
+/// 256 blocks the restart redoes in about 16 s on a Linux debug build, too close to the
+/// harness's 120 s guard on a loaded Windows runner. 32 blocks still leave the first run's
+/// transfer running for a while after block [`KILL_AFTER_BLOCK`], where the kill comes.
+const CONVERTED_IMAGE_LEN: usize = 0x2000;
+const CONVERTED_BLOCKS: u32 = 0x20;
+
+/// `text` with `from` replaced by `to`; `from` must be in it, so a change to the example's
+/// tables fails here rather than leaving the copy as it was.
+fn replaced(text: &str, from: &str, to: &str) -> String {
+    assert!(text.contains(from), "the example's table holds {from:?}");
+    text.replace(from, to)
+}
 
 /// The example ECU definition (`crates/diag-frontend/examples/example-ecu`) with
 /// [`CONVERTED_PROCEDURE`], its external-supply and ignition preconditions read from the ECU
 /// (`sim-ecu`'s DIDs FD06 and FD07) instead of the runtime inputs the agent cannot read
-/// (`WorkerHost` reads the supply voltage alone), converted as the server would.
+/// (`WorkerHost` reads the supply voltage alone), and its segment shortened to
+/// [`CONVERTED_IMAGE_LEN`] bytes, converted as the server would.
 fn converted_document() -> Vec<u8> {
     let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../diag-frontend/examples/example-ecu");
@@ -424,15 +435,21 @@ fn converted_document() -> Vec<u8> {
                     text + "did:externalSupply,externalSupply,0,,uint,8,,,,,,,,,\n\
                             did:ignition,ignition,0,,uint,8,,,,,,,,,\n"
                 }
-                "preconditions.csv" => text
-                    .replace(
+                "preconditions.csv" => replaced(
+                    &replaced(
+                        &text,
                         ",external_supply,1,1,input:external_supply,,",
                         ",external_supply,1,1,externalSupply.read.externalSupply,,",
-                    )
-                    .replace(
-                        ",ignition,1,1,input:ignition_on,,",
-                        ",ignition,1,1,ignition.read.ignition,,",
                     ),
+                    ",ignition,1,1,input:ignition_on,,",
+                    ",ignition,1,1,ignition.read.ignition,,",
+                ),
+                "flash_segments.csv" => replaced(
+                    &text,
+                    "application,app,0x00000000,0x00010000,0,0x0100,",
+                    &format!("application,app,0x00000000,{CONVERTED_IMAGE_LEN:#010X},0,0x0100,")
+                        .replace("0X", "0x"),
+                ),
                 _ => text,
             };
             (name, text.into_bytes())
@@ -1695,12 +1712,16 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
     let spec = converted_spec();
     let env = Env::with_variant("converted", ENTRY, CONVERTED, &ecu_config(60_000));
     let agent = env.spawn_agent();
-    let journal = env.wait_for_block(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
+    env.wait_for_block(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
     let status = agent.kill();
     assert!(
         restart::died_of_kill(status),
         "the agent should be killed mid-transfer, not end by itself: {status}"
     );
+    // The journal as the kill left it: the transfer ran on after block 4, so the block it
+    // reached is read back, not known in advance.
+    let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+    assert!(journal.facts.resume_counts.is_empty());
     let first_attempt = journal.facts.transfer.expect("a transfer attempt");
     let killed_at = first_attempt.last_block.expect("a journaled block");
     assert!(
@@ -1711,11 +1732,18 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
     let plan = &spec.program.flash[0];
     assert!(plan.allows_restart(), "the plan allows a restart");
     assert_eq!(first_attempt.started_at.pc, plan.boundaries.erase_pc);
+    // The ECU waits for the block after the last journaled one, or for the one after that when
+    // it took a block whose response the kill kept from the journal.
     let before = env.probe();
     assert_eq!(
         (before.session, before.flash_phase),
         (2, 2),
         "the ECU should still be in its programming session, transferring: {before:?}"
+    );
+    assert!(
+        [killed_at + 1, killed_at + 2].contains(&before.flash_block),
+        "the ECU expects block {} after block {killed_at} was journaled",
+        before.flash_block
     );
 
     let state = env
@@ -1731,29 +1759,42 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
         "a new attempt"
     );
     assert_eq!(transfer.last_block, Some(CONVERTED_BLOCKS));
+    assert!(!transfer.interrupted);
     assert!(transfer.exit.expect("an exit marker").complete);
 
-    // The restart reset the ECU once, read the external supply and the ignition from it, and
-    // redid the whole transfer after the reset: one erase, one RequestDownload, every block and
-    // one RequestTransferExit, then the integrity check.
+    // The restart's requests in order, as [`assert_restart_order`] reads them: the gates, each
+    // precondition check reading the external supply and the ignition from the ECU after the
+    // supply voltage, the ECUReset, the default-session confirmation, the identity and the
+    // software version, the replayed programming session, the erase, the whole transfer and
+    // the integrity check.
+    const PRECONDITIONS: [&str; 3] = ["vbatt", "uds 22 FD06", "uds 22 FD07"];
+    let mut expected = vec!["vbatt", "uds 22 F190", "uds 22 F187"];
+    expected.extend(PRECONDITIONS);
+    expected.extend([
+        "uds 11 01",
+        "uds 22 F186",
+        "uds 22 F190",
+        "uds 22 F187",
+        "uds 22 F189",
+    ]);
+    expected.extend(PRECONDITIONS);
+    expected.push("uds 10 02");
+    expected.extend(PRECONDITIONS);
+    expected.extend(["uds 31 01 FF00", "uds 34"]);
+    let blocks: Vec<String> = (1..=CONVERTED_BLOCKS)
+        .map(|block| format!("uds 36 {block:02X}"))
+        .collect();
+    expected.extend(blocks.iter().map(String::as_str));
+    expected.extend(["uds 37", "uds 31 01 FF01"]);
     let trace = env.trace();
-    let count = |line: &str| trace.iter().filter(|seen| *seen == line).count();
-    assert_eq!(count("uds 11 01"), 1, "{trace:#?}");
-    assert!(
-        count("uds 22 FD06") > 0 && count("uds 22 FD07") > 0,
-        "{trace:#?}"
-    );
-    let reset = trace
-        .iter()
-        .position(|line| line == "uds 11 01")
-        .expect("the ECUReset");
-    let redo = &trace[reset..];
-    let redone = |prefix: &str| redo.iter().filter(|line| line.starts_with(prefix)).count();
-    assert_eq!(redone("uds 31 01 FF00"), 1, "{trace:#?}");
-    assert_eq!(redone("uds 34"), 1, "{trace:#?}");
-    assert_eq!(redone("uds 36 "), CONVERTED_BLOCKS as usize, "{trace:#?}");
-    assert_eq!(redone("uds 37"), 1, "{trace:#?}");
-    assert_eq!(redone("uds 31 01 FF01"), 1, "{trace:#?}");
+    let mut seen: Vec<&str> = Vec::new();
+    for line in trace.iter().map(String::as_str) {
+        if line.starts_with("uds 3E") || (line == "uds 22 F186" && seen.last() == Some(&line)) {
+            continue;
+        }
+        seen.push(line);
+    }
+    assert_eq!(seen, expected, "the restart's requests: {trace:#?}");
 
     // The ECU verified the whole image: a closed download, reset once.
     let probe = env.probe();

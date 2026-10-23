@@ -14,7 +14,9 @@
 //!    journal, which is committed and synced before the next instruction runs, so it needs no
 //!    cooperation from the child beyond the job itself. The test program parks the child with a
 //!    `Wait` instruction right after that block, which leaves the child alive at a known
-//!    instruction until the kill arrives.
+//!    instruction until the kill arrives. A procedure converted from Starlark has no such park
+//!    (its transfer is one expansion), so its scenario reads back from the journal the block
+//!    the kill came at.
 //! 3. [`AgentChild::kill`] ends the agent and its worker at once: SIGKILL to the child's
 //!    process group on unix, `TerminateJobObject` on the job object the child was put in on
 //!    Windows (it starts suspended and resumes once it is in the job, so its worker is created

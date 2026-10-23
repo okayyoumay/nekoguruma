@@ -240,7 +240,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted (items 1 to 3 amended by ADR-336: the transfer's block bytes come from `FlashBlock`, and the host checks the ECU's maxNumberOfBlockLength) | `agent` host, policy; `diag-ir` plan validation |
-| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted (applies to Codex and Copilot alike, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating) | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
+| [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted (applies to Codex and Copilot alike, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating; on a specification pull request a re-request it allows can be withheld for the maintainer's choice, ADR-349) | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
 | [ADR-252](ADR-252-job-runner-journals-at-plan-boundaries.md) | The Job Runner Journals at the Flash Recovery Plan's Boundaries | Accepted (item 2's open point decided by ADR-253; the step reaching a plan's end records the VM state since ADR-271, a step from inside the plan only since ADR-274; item 6 superseded by ADR-272; item 2 extended by ADR-291: a `RecoveryRequired` section outside the plans gets an intent ahead of its first primitive; item 7 amended by ADR-293: a program with a `RecoveryRequired` section keeps a journal without a plan too; item 3's cancel stop limited to interruptible points by ADR-330; item 7 amended again by ADR-335: every journaled job keeps a journal, a plain procedure included) | `agent` runner, journaling, inputs |
 | [ADR-253](ADR-253-restart-classification-and-the-recovery-point-intent.md) | Restart Classification and a Write-Ahead Intent at the Recovery-Required Point | Accepted (item 4's wiring into the runner decided by ADR-255; item 3's newest state includes the run start since ADR-272; item 3's entry-state read-back follows ADR-274 since the end state exists; item 3's step limit applies per run since ADR-287; item 1's intent is also written ahead of a `RecoveryRequired` section outside the plans since ADR-291; item 3's no-journal case amended by ADR-335: a program that writes outside its plans is `MissingJournal` too) | `agent` restart, journaling, journal |
 | [ADR-254](ADR-254-starlark-for-proprietary-procedures.md) | Starlark Replaces JavaScript as the Proprietary Procedure Language | Accepted (`diag.fail` has an instruction since ADR-280, and `diag.precondition` since ADR-338; `diag.ecu_info` lowers to reads of the identity rows since ADR-339; Decision item 4's bans on `lambda`, nested `def`, functions as values and default and keyword arguments narrowed by ADR-300; item 4's `diag` API extended with `diag.ecu(role)` target handles by ADR-325 item 2; item 4's `diag` API extended by ADR-336 with the plan annotations and the value of `diag.flash_transfer`; `diag.hmi` and `diag.record` lower since ADR-340) | `diag-frontend` subset spec, design 8.4, `ir.fbs` `source_format` |
@@ -338,6 +338,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
 | [ADR-347](ADR-347-the-communication-log-s-file-and-writer.md) | The Communication Log's File and Writer | Accepted (Decision item 2 extended by ADR-348) | design 8.11; `agent` `comm_log`, job runner entry points (`JobRun`), journal writer lock; ADR-255, ADR-346 item 10 |
 | [ADR-348](ADR-348-operational-logs.md) | Operational Logs | Accepted | design 12.2, 8.7, 8.11 (`procedure_log`) and 16.2; `agent` logging setup and worker output capture, `vci-service-launcher` and `vci-service-config` file output and rotation, `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346 |
+| [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`; ADR-251 |
 
 ## Status Legend
 
@@ -676,7 +677,7 @@ the predecessor repository these ADRs came from.
 - ADR-246
 - ADR-248
 - ADR-249
-- ADR-251 (applies to Codex and Copilot alike, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating)
+- ADR-251 (applies to Codex and Copilot alike, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating; on a specification pull request a re-request it allows can be withheld for the maintainer's choice, ADR-349)
 - ADR-260
 - ADR-275
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
@@ -687,6 +688,7 @@ the predecessor repository these ADRs came from.
 - ADR-333 (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342)
 - ADR-334
 - ADR-343
+- ADR-349
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

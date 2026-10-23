@@ -355,6 +355,31 @@ conditions fixed only Low-rated findings, in Markdown files only: its fix still 
 Step 3 check, and the loop then ends without a re-request. Step 5 reports those findings as
 fixed after the last review.
 
+**Specification pull requests: pause after eight rounds (ADR-349).** A specification pull request
+is one whose changed files, `work/` aside, are all Markdown and include an ADR
+(`docs/adr/ADR-*.md`) or `docs/system-architecture.md`. On one, count the review rounds that
+reported findings, from either reviewer. After the eighth such round, and after every later one
+until the maintainer answers, push the round's fix as usual. Then, before any re-request the
+rule above allows, check where the last four rounds' findings landed. For each finding, run
+`git blame -L <line>,<line> <reviewed commit> -- <path>`, using the line and commit the finding
+reviewed (`original_line` and `original_commit_id` in `get_review_comments`). Count the line as
+fix-written when the commit that wrote it is not an ancestor of the commit of the first review
+request (`git merge-base --is-ancestor`). If more than half are fix-written:
+
+- Do not re-request. Leave the PR a draft.
+- Ask the maintainer in the project thread, as a decision with these three options:
+  - **Cut the scope**: move the part the late findings keep landing on out of the PR into a
+    backlog item (`backlog` skill), then request one review on the cut head.
+  - **Rewrite**: rewrite that section in one piece, from rules that settle the neighbouring
+    cases together, then request one review. The count starts again.
+  - **Continue**: re-request as usual. The count starts again.
+- Give the share, the rounds so far and the section the findings land on with the question, and
+  recommend one option.
+- Wait for the answer, also when no maintainer is present (`unattended-clarification`).
+
+If half or fewer are fix-written, re-request as usual and check again after the next round with
+findings.
+
 ## CI facts
 
 - Read CI with `pull_request_read(method="get_check_runs")`; the Actions jobs report through the

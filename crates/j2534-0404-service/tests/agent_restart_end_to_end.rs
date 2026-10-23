@@ -1704,36 +1704,63 @@ fn a_next_run_with_the_vci_still_unplugged_keeps_the_job_for_a_later_run() {
 /// A procedure converted from Starlark, not built by hand (ADR-336, design 8.2.5): the agent
 /// running [`converted_spec`]'s plan is killed mid-transfer while the ECU is in its programming
 /// session, and the restart resets the ECU, redoes the transfer from the erase and completes.
-/// The converted plan takes its blocks from the job's artifact (`FlashBlock`), so the kill comes
-/// at whatever block the transfer has reached once block [`KILL_AFTER_BLOCK`] is journaled.
+/// The converted plan's transfer is one expansion with no `Wait` to park in, so the ECU holds
+/// the agent instead: a response-pending sequence armed, before the agent starts, for the
+/// TransferData of the block after [`KILL_AFTER_BLOCK`], and the kill comes while it runs.
 #[test]
 #[serial]
 fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
     let spec = converted_spec();
     let env = Env::with_variant("converted", ENTRY, CONVERTED, &ecu_config(60_000));
+    let held = KILL_AFTER_BLOCK + 1;
+    let held_request = format!("uds 36 {held:02X}");
+    // The first run's worker applies the command before its first request, and the fault then
+    // waits for the held block's TransferData (SID 0x36, its block counter).
+    env.inject(&format!(
+        concat!(
+            r#"{{"command": "inject_fault", "request": [54, {}], "#,
+            r#""fault": {{"response_pending": {{"count": {}, "interval_ms": {}}}}}}}"#
+        ),
+        held, PENDING_COUNT, PENDING_INTERVAL_MS
+    ));
     let agent = env.spawn_agent();
-    env.wait_for_block(&spec, KILL_AFTER_BLOCK, WAIT_FOR_BLOCK);
+    env.wait_for(&spec, &held_request, WAIT_FOR_BLOCK, |state| {
+        let sent = env.trace().contains(&held_request);
+        state
+            .facts
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.last_block == Some(KILL_AFTER_BLOCK))
+            && sent
+            && env.commands_applied()
+    });
+    let sent_at = std::time::Instant::now();
+    // The kill waits until the ECU has the request, well within the response-pending sequence.
+    std::thread::sleep(KILL_DELAY);
     let status = agent.kill();
     assert!(
         restart::died_of_kill(status),
-        "the agent should be killed mid-transfer, not end by itself: {status}"
+        "the agent should be killed while the ECU holds the block, not end by itself: {status}"
     );
-    // The journal as the kill left it: the transfer ran on after block 4, so the block it
-    // reached is read back, not known in advance.
     let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
     assert!(journal.facts.resume_counts.is_empty());
     let first_attempt = journal.facts.transfer.expect("a transfer attempt");
     let killed_at = first_attempt.last_block.expect("a journaled block");
-    assert!(
-        (KILL_AFTER_BLOCK..CONVERTED_BLOCKS).contains(&killed_at),
-        "killed at block {killed_at}"
+    assert_eq!(
+        killed_at, KILL_AFTER_BLOCK,
+        "the held block was not journaled"
     );
     assert!(first_attempt.exit.is_none(), "no RequestTransferExit yet");
+    // The restart comes after the ECU's sequence is over, as on a restart that takes longer.
+    std::thread::sleep(
+        Duration::from_millis(u64::from(PENDING_COUNT * PENDING_INTERVAL_MS))
+            .saturating_sub(sent_at.elapsed()),
+    );
     let plan = &spec.program.flash[0];
     assert!(plan.allows_restart(), "the plan allows a restart");
     assert_eq!(first_attempt.started_at.pc, plan.boundaries.erase_pc);
-    // The ECU waits for the block after the last journaled one, or for the one after that when
-    // it took a block whose response the kill kept from the journal.
+    // The ECU took the held block, whose response the kill kept from the journal, or is still
+    // waiting for it.
     let before = env.probe();
     assert_eq!(
         (before.session, before.flash_phase),

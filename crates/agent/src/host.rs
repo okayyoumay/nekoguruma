@@ -146,6 +146,8 @@ pub enum HostError {
     InputNotEstablished(diag_ir::RuntimeInput),
 }
 
+/// The name of an error event, or its code when it is not one the interface lists (a
+/// vendor's), as an error message and the communication log's `detail` give it.
 fn error_event_name(code: i32) -> String {
     PduErrorEvent::try_from(code)
         .map(|event| event.as_str_name().to_owned())
@@ -740,22 +742,15 @@ fn also_seen(result: &Result<Vec<u8>, HostError>, error_event: Option<i32>) -> O
 /// named but is no link error.
 fn events_seen(sent: &Sent, detail: &mut Detail) -> Option<LinkErrorKind> {
     let link_error = also_seen(&sent.result, sent.error_event).map(|code| {
-        detail.error_event = detail.error_event.or(error_event_str(code));
+        detail.error_event = detail.error_event.take().or(Some(error_event_name(code)));
         link_error_kind(code)
     });
     if sent.rx_timeout {
-        detail.error_event = detail
-            .error_event
-            .or(error_event_str(PduErrorEvent::PduErrEvtRxTimeout as i32));
+        detail.error_event = detail.error_event.take().or(Some(error_event_name(
+            PduErrorEvent::PduErrEvtRxTimeout as i32,
+        )));
     }
     link_error
-}
-
-/// The name of an error event, as `detail` carries it.
-fn error_event_str(code: i32) -> Option<&'static str> {
-    PduErrorEvent::try_from(code)
-        .ok()
-        .map(|event| event.as_str_name())
 }
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
@@ -825,13 +820,15 @@ fn sent_end(
         HostError::Setup(_) => End::Unknown(UnknownCause::PrimitiveFailedToStart),
         HostError::VciLost => {
             // Both cases of `VciLost` come from this event.
-            detail.error_event = error_event_str(PduErrorEvent::PduErrEvtLostCommToVci as i32);
+            detail.error_event = Some(error_event_name(
+                PduErrorEvent::PduErrEvtLostCommToVci as i32,
+            ));
             End::VciLost {
                 refused_after_loss: !started,
             }
         }
         HostError::PrimitiveFailed(code) => {
-            detail.error_event = error_event_str(*code);
+            detail.error_event = Some(error_event_name(*code));
             End::LinkError(link_error_kind(*code))
         }
         // `send_recv_async` gives no other error.
@@ -1380,7 +1377,10 @@ mod tests {
                 matches!(end, End::VciLost { refused_after_loss: r } if r == refused_after_loss),
                 "{end:?}"
             );
-            assert_eq!(detail.error_event, Some("PDU_ERR_EVT_LOST_COMM_TO_VCI"));
+            assert_eq!(
+                detail.error_event.as_deref(),
+                Some("PDU_ERR_EVT_LOST_COMM_TO_VCI")
+            );
         }
         let (end, detail) = end_of(&read, Err(rpc(tonic::Code::Unavailable)), false);
         assert!(
@@ -1404,7 +1404,7 @@ mod tests {
             matches!(end, End::LinkError(LinkErrorKind::Transmit)),
             "{end:?}"
         );
-        assert_eq!(detail.error_event, Some("PDU_ERR_EVT_TX_ERROR"));
+        assert_eq!(detail.error_event.as_deref(), Some("PDU_ERR_EVT_TX_ERROR"));
         assert!(matches!(
             end_of(&read, Err(HostError::EventsLost), true).0,
             End::Unknown(UnknownCause::EventsLost)
@@ -1546,20 +1546,35 @@ mod tests {
         assert_eq!(
             detail_of(&sent(Err(HostError::VciLost), Some(tx), false)),
             (
-                Some("PDU_ERR_EVT_LOST_COMM_TO_VCI"),
+                Some("PDU_ERR_EVT_LOST_COMM_TO_VCI".to_owned()),
                 Some(LinkErrorKind::Transmit)
             )
         );
         // A receive timeout is named, and is no link error.
         assert_eq!(
             detail_of(&sent(Err(HostError::NoResponse), None, true)),
-            (Some("PDU_ERR_EVT_RX_TIMEOUT"), None)
+            (Some("PDU_ERR_EVT_RX_TIMEOUT".to_owned()), None)
         );
         // An error event before the timeout is the one named.
         assert_eq!(
             detail_of(&sent(Err(HostError::NoResponse), Some(tx), true)),
-            (Some("PDU_ERR_EVT_TX_ERROR"), Some(LinkErrorKind::Transmit))
+            (
+                Some("PDU_ERR_EVT_TX_ERROR".to_owned()),
+                Some(LinkErrorKind::Transmit)
+            )
         );
+        // A code the interface does not list (a vendor's) is named by its number; the
+        // primitive's end is that link error, so it is not counted again beside it.
+        let vendor = 0x7FFF_0001;
+        assert_eq!(
+            detail_of(&sent(
+                Err(HostError::PrimitiveFailed(vendor)),
+                Some(vendor),
+                false
+            )),
+            (Some("error event 0x7fff0001".to_owned()), None)
+        );
+        assert_eq!(link_error_kind(vendor), LinkErrorKind::Other);
     }
 
     #[test]

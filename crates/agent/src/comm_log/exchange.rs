@@ -324,9 +324,9 @@ pub(crate) struct Detail {
     /// The host error's variant name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_error: Option<&'static str>,
-    /// The D-PDU error event's name.
+    /// The D-PDU error event's name, or its code when the interface lists no name for it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_event: Option<&'static str>,
+    pub error_event: Option<String>,
     /// The D-PDU error event's extra error information (ISO 22900-2:2022 D.4.2), by name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_error_info: Option<&'static str>,
@@ -2768,7 +2768,7 @@ mod tests {
         assert_eq!(pending["clock"], "worker");
         let detail = serde_json::to_value(Detail {
             host_error: Some("a"),
-            error_event: Some("b"),
+            error_event: Some("b".to_owned()),
             extra_error_info: Some("c"),
             grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
@@ -3114,7 +3114,7 @@ mod tests {
         let mut with_detail = evidence(&READ_F186, End::NoResponse);
         with_detail.detail = Detail {
             host_error: Some("NoResponse"),
-            error_event: Some("PDU_ERR_EVT_RX_TIMEOUT"),
+            error_event: Some("PDU_ERR_EVT_RX_TIMEOUT".to_owned()),
             extra_error_info: Some("RX_TIMEOUT_NO_RSP"),
             ..Detail::default()
         };

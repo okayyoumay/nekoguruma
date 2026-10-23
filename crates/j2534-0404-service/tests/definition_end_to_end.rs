@@ -22,7 +22,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{Job, JobDocument, JobLimits, run_program};
+use agent::{Job, JobDocument, JobLimits, JobRun, run_program};
 use diag_ir::VmState;
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -128,7 +128,11 @@ async fn run(worker: &WorkerProcess, dir: &Path, document: Vec<u8>) -> VmState {
         .connect(&ConnectOptions::default())
         .await
         .expect("client should connect");
-    let (state, _guards) = run_program(
+    let JobRun {
+        result: state,
+        guards: _guards,
+        ..
+    } = run_program(
         client,
         &link,
         job,

@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
+use agent::{HostError, JobError, JobLimits, JobRun, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -126,7 +126,11 @@ fn job_guards(writes: bool) -> JobGuards {
 }
 
 async fn run(client: &WorkerClient, config: &LinkConfig) -> Result<VmState, JobError> {
-    let (result, _guards) = run_program(
+    let JobRun {
+        result,
+        guards: _guards,
+        ..
+    } = run_program(
         client.clone(),
         config,
         read_vin(),

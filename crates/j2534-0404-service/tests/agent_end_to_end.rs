@@ -18,7 +18,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{Job, JobDocument, JobLimits, run_program};
+use agent::{Job, JobDocument, JobLimits, JobRun, run_program};
 use diag_ir::declaration::{
     DataKind, EcuDocumentT, EcuVariantT, FieldT, NegativeShapeT, Placement, PositiveResponseT,
     ProtocolT, ServiceT, encode_ecu_document,
@@ -317,7 +317,11 @@ async fn run_the_job() {
         .expect("client should connect");
 
     let job = document_job(&program());
-    let (state, _guards) = run_program(
+    let JobRun {
+        result: state,
+        guards: _guards,
+        ..
+    } = run_program(
         client,
         &job.declared_link().expect("the document declares its link"),
         job,
@@ -339,7 +343,11 @@ async fn run_the_job() {
     // The link of the first job is closed, so the worker can serve the next one. The agent
     // identified `sim-vci` from the module's version, which lets this job write.
     let job = document_job(&write_program());
-    let (state, _guards) = run_program(
+    let JobRun {
+        result: state,
+        guards: _guards,
+        ..
+    } = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await
@@ -363,7 +371,11 @@ async fn run_the_job() {
 
     // The VIN as the procedure reads it: decoded through the job's document.
     let job = decoding_job();
-    let (state, _guards) = run_program(
+    let JobRun {
+        result: state,
+        guards: _guards,
+        ..
+    } = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await
@@ -389,7 +401,11 @@ async fn run_the_job() {
         link.params,
         [("CP_BlockSize".to_owned(), 0), ("CP_StMin".to_owned(), 0)]
     );
-    let (state, _guards) = run_program(
+    let JobRun {
+        result: state,
+        guards: _guards,
+        ..
+    } = run_program(
         worker
             .connect(&ConnectOptions::default())
             .await

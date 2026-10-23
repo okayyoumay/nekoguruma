@@ -35,7 +35,7 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal};
 use agent::{
-    Artifact, HostError, Job, JobDocument, JobError, JobLimits, JournalSetup, LinkConfig,
+    Artifact, HostError, Job, JobDocument, JobError, JobLimits, JobRun, JournalSetup, LinkConfig,
     run_program_journaled,
 };
 use diag_ir::declaration::{
@@ -484,7 +484,11 @@ async fn run_the_jobs(
 
     let worker_ref = &worker;
     let run = move |job, dir, key| async move {
-        let (state, _guards) = run_program_journaled(
+        let JobRun {
+            result: state,
+            guards: _guards,
+            ..
+        } = run_program_journaled(
             worker_ref
                 .connect(&ConnectOptions::default())
                 .await

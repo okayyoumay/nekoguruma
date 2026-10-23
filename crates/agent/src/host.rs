@@ -396,6 +396,8 @@ pub struct WorkerHost<C: WorkerApi> {
     document: Option<crate::document::JobDocument>,
     /// The job's flash artifact, which `Op::FlashBlock` reads its blocks from (ADR-336).
     artifact: Option<crate::artifact::Artifact>,
+    /// The job's communication log, which the exchange entries will go to (ADR-347).
+    comm_log: Option<crate::comm_log::CommLog>,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -410,12 +412,19 @@ impl<C: WorkerApi> WorkerHost<C> {
             transfer: TransferCounter::default(),
             document: None,
             artifact: None,
+            comm_log: None,
         }
     }
 
     /// Gives the host the job's document (`crate::document`).
     pub fn set_document(&mut self, document: Option<crate::document::JobDocument>) {
         self.document = document;
+    }
+
+    /// Gives the host the job's communication log, a clone of the one the runner writes the job's
+    /// events to (ADR-347).
+    pub fn set_comm_log(&mut self, comm_log: Option<crate::comm_log::CommLog>) {
+        self.comm_log = comm_log;
     }
 
     /// Gives the host the job's flash artifact, which `artifact_bytes` serves (ADR-336 item 12).

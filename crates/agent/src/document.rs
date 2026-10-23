@@ -11,6 +11,7 @@ use std::sync::Arc;
 
 use diag_ir::Program;
 use diag_ir::declaration::{EcuVariant, LoadError, load_ecu_document};
+use sha2::Digest;
 
 /// A variant's document, checked once by [`load_ecu_document`] and shared by the runs of a
 /// job.
@@ -52,6 +53,12 @@ impl JobDocument {
             return Err(DocumentError::TrailingBytes(rest.len()));
         }
         Ok(program)
+    }
+
+    /// The SHA-256 of the document's bytes, which the communication log's header names it by
+    /// (ADR-347).
+    pub fn sha256(&self) -> [u8; 32] {
+        sha2::Sha256::digest(&self.bytes).into()
     }
 
     /// The variant's declarations.

@@ -641,9 +641,9 @@ pub(crate) fn nrc_kind(code: u8) -> NrcKind {
     }
 }
 
-/// The standard's identifier for a code (ISO 14229-1:2026 Annex A.1), for the codes it gives
-/// one, spelled as the table spells it (punctuation included). The authentication codes 0x50 to
-/// 0x5D have a title and a short form there, no identifier, so they have no name here.
+/// The name a code goes by (ISO 14229-1:2026 Annex A.1 defines the codes), written as this
+/// repository writes it elsewhere (`sim-ecu`'s `Nrc`): one camelCase word, no punctuation. The
+/// authentication codes 0x50 to 0x5D have no name here.
 pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
     Some(match code {
         0x10 => "generalReject",
@@ -669,7 +669,7 @@ pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
         0x71 => "transferDataSuspended",
         0x72 => "generalProgrammingFailure",
         0x73 => "wrongBlockSequenceCounter",
-        0x78 => "requestCorrectlyReceived-ResponsePending",
+        0x78 => "requestCorrectlyReceivedResponsePending",
         0x7E => "SubFunctionNotSupportedInActiveSession",
         0x7F => "serviceNotSupportedInActiveSession",
         0x81 => "rpmTooHigh",
@@ -681,11 +681,11 @@ pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
         0x87 => "temperatureTooLow",
         0x88 => "vehicleSpeedTooHigh",
         0x89 => "vehicleSpeedTooLow",
-        0x8A => "throttle/PedalTooHigh",
-        0x8B => "throttle/PedalTooLow",
+        0x8A => "throttlePedalTooHigh",
+        0x8B => "throttlePedalTooLow",
         0x8C => "transmissionRangeNotInNeutral",
         0x8D => "transmissionRangeNotInGear",
-        0x8F => "brakeSwitch(es)NotClosed",
+        0x8F => "brakeSwitchesNotClosed",
         0x90 => "shifterLeverNotInPark",
         0x91 => "torqueConverterClutchLocked",
         0x92 => "voltageTooHigh",
@@ -697,8 +697,9 @@ pub(crate) fn nrc_name(code: u8) -> Option<&'static str> {
     })
 }
 
-/// The standard's name of a diagnostic service (ISO 14229-1:2026, the service clauses and the
-/// service identifier table, 7.4). 0x83 is reserved there, so it has no name.
+/// The name a diagnostic service goes by (ISO 14229-1:2026 7.4 defines the identifiers), written
+/// as this repository writes it elsewhere (design 8.11's example logs, `sim-ecu`). A reserved
+/// identifier, such as 0x83, has no name.
 pub(crate) fn service_name(sid: u8) -> Option<&'static str> {
     Some(match sid {
         0x10 => "DiagnosticSessionControl",
@@ -969,22 +970,17 @@ struct LinkEffect {
     /// The final response is one the agent cannot use.
     unusable: bool,
     suppressed: bool,
-    /// The request is a session change or an ECUReset of a type that restarts the ECU.
+    /// The request is a session change or an ECUReset.
     restarts_ecu: bool,
     /// A link error of this exchange's link or of another link of its channel.
     link_error: Option<LinkErrorKind>,
 }
 
-/// Whether `request` is one after which the ECU may restart and so forget earlier requests: a
-/// DiagnosticSessionControl, or an ECUReset of type hardReset, keyOffOnReset or softReset
-/// (ISO 14229-1:2026 9.3, Table 33; the suppress bit is not part of the type). The rapid power
-/// shutdown types and every other value restart nothing.
+/// Whether `request` is one whose acceptance ends the earlier requests' evidence: a
+/// DiagnosticSessionControl or an ECUReset of any type (design 8.11 "Owed request", ADR-346
+/// item 6).
 fn restarts_ecu(request: &[u8]) -> bool {
-    match request {
-        [SID_SESSION_CONTROL, ..] => true,
-        [SID_ECU_RESET, sub, ..] => matches!(sub & 0x7F, 0x01..=0x03),
-        _ => false,
-    }
+    matches!(request, [SID_SESSION_CONTROL, ..] | [SID_ECU_RESET, ..])
 }
 
 /// The evidence of one link that later exchanges on it use (design 8.11 "Matched answer",
@@ -1796,13 +1792,13 @@ mod tests {
     }
 
     #[test]
-    fn nrc_names_are_the_standards_identifiers_for_listed_codes_only() {
+    fn nrc_names_are_given_for_listed_codes_only() {
         assert_eq!(nrc_name(0x22), Some("conditionsNotCorrect"));
         assert_eq!(nrc_name(0x35), Some("invalidKey"));
         assert_eq!(nrc_name(0x10), Some("generalReject"));
         assert_eq!(
             nrc_name(0x78),
-            Some("requestCorrectlyReceived-ResponsePending")
+            Some("requestCorrectlyReceivedResponsePending")
         );
         assert_eq!(nrc_name(0x7F), Some("serviceNotSupportedInActiveSession"));
         assert_eq!(
@@ -3126,27 +3122,19 @@ mod tests {
     }
 
     #[test]
-    fn only_a_reset_that_restarts_the_ecu_ends_the_evidence() {
-        // hardReset, keyOffOnReset and softReset, with or without the suppress bit, end the
-        // matched answers and the owed requests.
-        for sub in [0x01, 0x02, 0x03] {
-            let state = link_after(&[0x11, sub], End::Positive(vec![0x51, sub]));
+    fn an_accepted_reset_of_any_type_or_session_change_ends_the_evidence() {
+        // Every accepted ECUReset ends the matched answers and the owed requests (ADR-346
+        // item 6), with or without the suppress bit.
+        for sub in [0x01, 0x02, 0x03, 0x04, 0x05, 0x40, 0x81] {
+            let state = link_after(&[0x11, sub], End::Positive(vec![0x51, sub & 0x7F]));
             assert_eq!(counts(&state), (0, 0), "{sub:#04x}");
             assert_eq!(state.last_reset(), Some(3), "{sub:#04x}");
         }
-        let state = link_after(&[0x11, 0x81], End::Positive(vec![0x51, 0x01]));
-        assert_eq!(counts(&state), (0, 0));
-        // The rapid power shutdown types and every other value end nothing.
-        for sub in [0x04, 0x05, 0x00, 0x06, 0x40, 0x60, 0x7F] {
-            let state = link_after(&[0x11, sub], End::Positive(vec![0x51, sub]));
-            assert_eq!(counts(&state), (1, 1), "{sub:#04x}");
-            assert_eq!(state.last_reset(), None, "{sub:#04x}");
-        }
-        let state = link_after(&[0x11], End::Positive(vec![0x51]));
-        assert_eq!(counts(&state), (1, 1));
-        // A session change always ends them.
         let state = link_after(&[0x10, 0x02], End::Positive(vec![0x50, 0x02]));
         assert_eq!(counts(&state), (0, 0));
+        // A refused reset ends nothing.
+        let state = link_after(&[0x11, 0x01], End::Negative(vec![0x7F, 0x11, 0x22]));
+        assert_eq!(counts(&state), (1, 1));
     }
 
     #[test]
@@ -3156,23 +3144,20 @@ mod tests {
         assert_eq!(state.last_reset(), None);
         let state = link_after(&[0x11, 0x01], End::PositiveUnusable(vec![0x51]));
         assert_eq!(counts(&state), (0, 1));
-        // An ECUReset type that restarts nothing ends nothing, unusable or not.
-        let state = link_after(&[0x11, 0x04], End::PositiveUnusable(vec![0x51]));
-        assert_eq!(counts(&state), (1, 1));
         // Another service's unusable answer ends nothing.
         let state = link_after(&[0x31, 0x01], End::PositiveUnusable(vec![0x71]));
         assert_eq!(counts(&state), (1, 1));
     }
 
     #[test]
-    fn the_standards_names_are_spelled_as_annex_a_1_and_the_service_table_spell_them() {
+    fn the_names_are_single_words_and_the_service_table_leaves_reserved_identifiers_unnamed() {
         assert_eq!(
             nrc_name(0x78),
-            Some("requestCorrectlyReceived-ResponsePending")
+            Some("requestCorrectlyReceivedResponsePending")
         );
-        assert_eq!(nrc_name(0x8A), Some("throttle/PedalTooHigh"));
-        assert_eq!(nrc_name(0x8B), Some("throttle/PedalTooLow"));
-        assert_eq!(nrc_name(0x8F), Some("brakeSwitch(es)NotClosed"));
+        assert_eq!(nrc_name(0x8A), Some("throttlePedalTooHigh"));
+        assert_eq!(nrc_name(0x8B), Some("throttlePedalTooLow"));
+        assert_eq!(nrc_name(0x8F), Some("brakeSwitchesNotClosed"));
         assert_eq!(nrc_name(0x94), Some("ResourceTemporarilyNotAvailable"));
         // 0x83 is reserved in the service identifier table; its neighbours are services.
         assert_eq!(service_name(0x83), None);

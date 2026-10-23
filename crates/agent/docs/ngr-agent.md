@@ -333,10 +333,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   whose VCI absorbs pendings every response is `undetermined` (a pending may have come first);
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
-  later). An accepted session change, or an ECUReset of type hardReset, keyOffOnReset or
-  softReset (ISO 14229-1:2026 9.3), ends the matched answers and the owed requests; the rapid
-  power shutdown types and every other reset type end nothing, and an unusable answer to a
-  session change or such a reset ends only the matched answers. A reopened link, a worker
+  later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched
+  answers and the owed requests, and an unusable answer to either ends only the matched
+  answers. A reopened link, a worker
   restart or a VCI reconnect (`LinkState::reopened`) ends the matched answers and keeps the owed
   requests. The other rows stand as comments where the table puts them, and evidence only they
   could classify falls to the last row, `undetermined`, at the place in the table where that row

@@ -212,6 +212,10 @@ pub enum StarCode {
     /// ADR-309 item 3, ADR-314).
     #[serde(rename = "STAR_NOT_IN_PROFILE")]
     NotInProfile,
+    /// A `diag.log` message or `diag.fail` detail built from a value read from a SecurityAccess
+    /// or Authentication response (3.1, ADR-348 item 6).
+    #[serde(rename = "STAR_SECRET_IN_TEXT")]
+    SecretInText,
     /// A warning: a `range` loop with a bound known only at run time has no `@maxIterations`, so
     /// the default limit applies (4.2).
     #[serde(rename = "STAR_LOOP_LIMIT_DEFAULTED")]
@@ -248,6 +252,7 @@ impl StarCode {
             Self::ApiNotAvailable => "STAR_API_NOT_AVAILABLE",
             Self::UnknownService => "STAR_UNKNOWN_SERVICE",
             Self::NotInProfile => "STAR_NOT_IN_PROFILE",
+            Self::SecretInText => "STAR_SECRET_IN_TEXT",
             Self::LoopLimitDefaulted => "STAR_LOOP_LIMIT_DEFAULTED",
         }
     }

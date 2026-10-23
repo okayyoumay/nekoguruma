@@ -1892,6 +1892,92 @@ fn a_field_read_is_checked_against_the_declarations() {
     }
 }
 
+/// The example with an Authentication service (0x29) whose positive response carries a text
+/// field, `token`, after its sub-function and return value.
+fn with_authentication() -> Vec<(String, Vec<u8>)> {
+    let file = |name: &str| {
+        let (_, bytes) = example()
+            .into_iter()
+            .find(|(n, _)| n == name)
+            .expect("the example has the file");
+        String::from_utf8(bytes).expect("UTF-8")
+    };
+    let services = format!("{}authentication,0x29\n", file("services.csv"));
+    let fields = format!(
+        "{}request:authentication,sub,0,,uint,8,,,,,,0x01,,,\n\
+         response:authentication,sub,0,,uint,8,,,,,,0x01,,,\n\
+         response:authentication,returnValue,1,,uint,8,,,,,,,,,\n\
+         response:authentication,token,2,,ascii,32,,,,,,,,,\n",
+        file("fields.csv")
+    );
+    with(
+        with(example(), "services.csv", &services),
+        "fields.csv",
+        &fields,
+    )
+}
+
+#[test]
+fn log_and_fail_text_built_from_a_secret_response_is_rejected() {
+    use crate::star::StarCode::SecretInText;
+    let authenticate = "auth = diag.request(0x29, {\"sub\": 1})";
+    let cases = [
+        // An Authentication response's field, logged as it is.
+        format!("def main():\n    {authenticate}\n    diag.log(1, auth[\"fields\"][\"token\"])\n"),
+        // Through a variable, a helper's parameter and return value, and a concatenation.
+        format!(
+            "def describe(t):\n    return \"token \" + t\n\n\
+             def main():\n    {authenticate}\n    token = auth[\"fields\"][\"token\"]\n    \
+             diag.fail(\"AUTH\", describe(token))\n"
+        ),
+        // The response itself passed to a helper that reads the field.
+        format!(
+            "def token(r):\n    return r[\"fields\"][\"token\"]\n\n\
+             def main():\n    {authenticate}\n    diag.log(1, token(auth))\n"
+        ),
+        // One branch of a conditional is enough.
+        format!(
+            "def main():\n    {authenticate}\n    \
+             diag.log(1, \"no token\" if auth[\"ok\"] else auth[\"fields\"][\"token\"])\n"
+        ),
+        // A variable that holds the secret on one path only.
+        format!(
+            "def main():\n    {authenticate}\n    text = \"none\"\n    \
+             if auth[\"ok\"]:\n        text = auth[\"fields\"][\"token\"]\n    \
+             diag.log(1, text)\n"
+        ),
+    ];
+    for source in cases {
+        let errors: Vec<_> = procedures(with(with_authentication(), "main.star", &source))
+            .expect_err("rejected")
+            .errors
+            .into_iter()
+            .map(|e| e.code)
+            .collect();
+        assert_eq!(errors, [SecretInText], "{source}");
+    }
+}
+
+#[test]
+fn log_text_built_from_another_response_or_a_secret_response_s_status_is_accepted() {
+    let source = "\
+def main():
+    auth = diag.request(0x29, {\"sub\": 1})
+    if auth[\"ok\"]:
+        diag.log(1, \"authenticated\")
+    if auth[\"nrc\"] == 0x33:
+        diag.fail(\"AUTH\", \"denied\")
+    res = diag.request(0x22, {\"did\": 0xF190})
+    diag.log(1, \"vin \" + res[\"fields\"][\"vin\"])
+";
+    let mut auth = vec![0x69, 0x01, 0x00];
+    auth.extend_from_slice(b"T0K3");
+    assert_eq!(
+        answered_in(with_authentication(), source, &[&auth, &vin_answer()]).unwrap(),
+        ["authenticated", "vin NGRSIMECU00000001"]
+    );
+}
+
 #[test]
 fn every_procedure_file_reports_its_errors() {
     // Two files fail, one to check and one because it is not UTF-8; both are reported, and a

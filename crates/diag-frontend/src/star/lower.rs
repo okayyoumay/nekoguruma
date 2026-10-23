@@ -97,6 +97,12 @@ const MAX_COPIES: usize = 1000;
 /// function reached from many sections cannot make the converter build an unbounded program.
 const MAX_COPIED_INSTRUCTIONS: usize = 1 << 22;
 
+/// The service identifiers of `diag.request` whose responses hold secrets: SecurityAccess
+/// (ISO 14229-1:2026 9.4) and Authentication (9.6), as the communication log redacts them
+/// (design 8.11, ADR-347 item 6). No `diag.log` message or `diag.fail` detail may be built from
+/// such a response (subset 3.1, ADR-348 item 6).
+const SECRET_SERVICES: [u8; 2] = [0x27, 0x29];
+
 /// The `Fail` code of a loop that runs past its limit (subset 4.2, ADR-280).
 const LOOP_LIMIT_EXCEEDED: &str = "LOOP_LIMIT_EXCEEDED";
 /// The `Fail` code of a `write_uint` whose value does not fit its width (2.4).
@@ -397,6 +403,9 @@ impl Ty {
 struct Tys {
     bits: u16,
     service: Service,
+    /// Whether the value may hold bytes of a SecurityAccess or Authentication response, which
+    /// no `diag.log` message or `diag.fail` detail may be built from (3.1, ADR-348 item 6).
+    secret: bool,
 }
 
 /// The declared service a response comes from, as far as it is known at ingestion.
@@ -438,6 +447,7 @@ impl Tys {
         Tys {
             bits: ty.bit(),
             service: Service::Unknown,
+            secret: false,
         }
     }
 
@@ -446,6 +456,7 @@ impl Tys {
         Tys {
             bits: ty.bit(),
             service: Service::One(service),
+            secret: false,
         }
     }
 
@@ -454,6 +465,7 @@ impl Tys {
         Tys {
             bits: Ty::Response.bit(),
             service: Service::Dtcs(service),
+            secret: false,
         }
     }
 
@@ -461,6 +473,7 @@ impl Tys {
         Tys {
             bits: self.bits | other.bits,
             service: self.service.union(other.service),
+            secret: self.secret || other.secret,
         }
     }
 
@@ -675,6 +688,26 @@ enum Val {
     Run(Tys, Code),
     /// Code that pushes nothing: a call to a function that returns no value.
     Void(Code),
+}
+
+impl Val {
+    /// Whether the value may hold bytes of a SecurityAccess or Authentication response
+    /// ([`Tys::secret`]). A constant never does.
+    fn secret(&self) -> bool {
+        matches!(self, Val::Run(tys, _) if tys.secret)
+    }
+
+    /// The value, marked as holding such bytes when `secret` is set: the result of an operation
+    /// on an operand that may hold them may hold them too.
+    fn tainted(self, secret: bool) -> Val {
+        match self {
+            Val::Run(mut tys, code) if secret => {
+                tys.secret = true;
+                Val::Run(tys, code)
+            }
+            other => other,
+        }
+    }
 }
 
 // ---------------------------------------------------------------- Functions
@@ -939,6 +972,20 @@ impl<'a> Lowerer<'a> {
     /// expensive hint.
     fn is_muted(&self, code: StarCode, span: Span) -> bool {
         self.quiet > 0 || self.reported.contains(&(code, span.begin(), span.end()))
+    }
+
+    /// Rejects `what`, a `diag.log` message or `diag.fail` detail, built from a value that may
+    /// hold bytes of a SecurityAccess or Authentication response (subset 3.1, ADR-348 item 6).
+    fn secret_text(&mut self, span: Span, what: &str) {
+        self.error(
+            StarCode::SecretInText,
+            span,
+            format!(
+                "{what} is built from a SecurityAccess or Authentication response, whose bytes \
+                 the communication log keeps as their length only; log its `ok` or `nrc` \
+                 instead (3.1)"
+            ),
+        );
     }
 
     fn not_lowerable(&mut self, span: Span, hint: impl Into<String>) {
@@ -2190,28 +2237,33 @@ impl<'a> Lowerer<'a> {
             ExprP::Identifier(ident) => self.name(id, &ident.node.ident, span),
             ExprP::Not(inner) => {
                 let value = self.expr(id, inner);
-                self.not(value, span)
+                let secret = value.secret();
+                self.not(value, span).tainted(secret)
             }
             // -2^63 is in range though its magnitude is not: negate the literal as a whole.
             ExprP::Minus(inner) if is_two_to_the_63(inner) => Val::Const(Const::Int(i64::MIN)),
             ExprP::Minus(inner) => {
                 let value = self.expr(id, inner);
-                self.unary(Unary::Minus, value, span)
+                let secret = value.secret();
+                self.unary(Unary::Minus, value, span).tainted(secret)
             }
             ExprP::Plus(inner) => {
                 let value = self.expr(id, inner);
-                self.unary(Unary::Plus, value, span)
+                let secret = value.secret();
+                self.unary(Unary::Plus, value, span).tainted(secret)
             }
             ExprP::BitNot(inner) => {
                 let value = self.expr(id, inner);
-                self.unary(Unary::BitNot, value, span)
+                let secret = value.secret();
+                self.unary(Unary::BitNot, value, span).tainted(secret)
             }
             ExprP::Op(lhs, BinOp::And, rhs) => self.and_or(id, true, lhs, rhs, span),
             ExprP::Op(lhs, BinOp::Or, rhs) => self.and_or(id, false, lhs, rhs, span),
             ExprP::Op(lhs, op, rhs) => {
                 let a = self.expr(id, lhs);
                 let b = self.expr(id, rhs);
-                self.binary(id, *op, a, b, span)
+                let secret = a.secret() || b.secret();
+                self.binary(id, *op, a, b, span).tainted(secret)
             }
             ExprP::If(parts) => {
                 let (cond, then, otherwise) = &**parts;
@@ -2314,9 +2366,10 @@ impl<'a> Lowerer<'a> {
                             Val::Run(Tys::default(), Vec::new())
                         };
                         if tys.one() == Some(Ty::Response) {
-                            self.response_key(id, code, key, tys.service, span)
+                            self.response_key(id, code, key, tys, span)
                         } else {
                             self.field_key(code, key, tys.service, span)
+                                .tainted(tys.secret)
                         }
                     }
                     Val::Run(tys, code) if tys.one() == Some(Ty::Dtc) => {
@@ -2340,7 +2393,10 @@ impl<'a> Lowerer<'a> {
                     Val::Run(tys, code) if tys.one() == Some(Ty::DtcList) => {
                         self.dtc_at(id, code, b, span)
                     }
-                    a => self.index(a, b, span),
+                    a => {
+                        let secret = a.secret() || b.secret();
+                        self.index(a, b, span).tainted(secret)
+                    }
                 }
             }
             ExprP::Slice(object, start, stop, step) => {
@@ -2356,11 +2412,14 @@ impl<'a> Lowerer<'a> {
                     self.not_lowerable(span, "a slice with a step is not lowered (2.5)");
                     return Val::Run(Tys::default(), Vec::new());
                 }
+                let secret = object.secret()
+                    || start.as_ref().is_some_and(Val::secret)
+                    || stop.as_ref().is_some_and(Val::secret);
                 match (object, known(&start), known(&stop)) {
                     (Val::Const(object), Some(from), Some(to)) => {
                         self.slice(object, from, to, span)
                     }
-                    (object, ..) => self.run_slice(object, start, stop, span),
+                    (object, ..) => self.run_slice(object, start, stop, span).tainted(secret),
                 }
             }
             ExprP::Call(function, args) => self.call(id, function, &args.args, span),
@@ -2606,6 +2665,7 @@ impl<'a> Lowerer<'a> {
             return self.expr(id, rhs);
         }
         let b = self.expr(id, rhs);
+        let secret = a.secret() || b.secret();
         let (Some((ta, ca)), Some((tb, cb))) = (
             self.single(a, lhs.span, "`and` or `or`"),
             self.force(b, rhs.span),
@@ -2627,7 +2687,7 @@ impl<'a> Lowerer<'a> {
         code.push((Ins::Op(Op::Pop), span));
         code.extend(cb);
         code.push((Ins::Mark(end), span));
-        Val::Run(Tys::of(ta).union(tb), code)
+        Val::Run(Tys::of(ta).union(tb), code).tainted(secret)
     }
 
     // ------------------------------------------------------------ Operators
@@ -3156,9 +3216,10 @@ impl<'a> Lowerer<'a> {
         id: Option<usize>,
         code: Code,
         key: Val,
-        service: Service,
+        tys: Tys,
         span: Span,
     ) -> Val {
+        let (service, secret) = (tys.service, tys.secret);
         let Val::Const(Const::Str(key)) = key else {
             self.error(
                 StarCode::DynamicKeyNotAllowed,
@@ -3169,7 +3230,7 @@ impl<'a> Lowerer<'a> {
         };
         let mut code = code;
         match &*key {
-            "raw" => Val::Run(Tys::of(Ty::Bytes), code),
+            "raw" => Val::Run(Tys::of(Ty::Bytes), code).tainted(secret),
             "ok" => {
                 code.extend(self.response_ok(span));
                 Val::Run(Tys::of(Ty::Bool), code)
@@ -3214,6 +3275,7 @@ impl<'a> Lowerer<'a> {
                 Tys {
                     bits: Ty::Fields.bit(),
                     service,
+                    secret,
                 },
                 code,
             ),
@@ -3425,6 +3487,7 @@ impl<'a> Lowerer<'a> {
             Tys {
                 bits: Ty::DtcList.bit(),
                 service: Service::Dtcs(service),
+                secret: false,
             },
             code,
         )
@@ -3999,7 +4062,11 @@ impl<'a> Lowerer<'a> {
                             self.not_lowerable(span, reason);
                             Val::Run(Tys::default(), Vec::new())
                         }
-                        None => self.run_builtin(id, name, values_copy, span),
+                        None => {
+                            let secret = values_copy.iter().any(Val::secret);
+                            self.run_builtin(id, name, values_copy, span)
+                                .tainted(secret)
+                        }
                     };
                 }
                 self.not_lowerable(span, format!("`{name}` cannot be called here"));
@@ -4040,6 +4107,8 @@ impl<'a> Lowerer<'a> {
                             }
                         }
                     }
+                    // A method lowered at run time must keep its operands' secret mark, as the
+                    // built-ins do ([`Val::tainted`]).
                     _ => {
                         self.not_lowerable(
                             span,
@@ -4385,6 +4454,7 @@ impl<'a> Lowerer<'a> {
                 Tys {
                     bits: Ty::Response.bit(),
                     service: Service::Exit,
+                    secret: false,
                 },
                 Vec::new(),
             )
@@ -4560,6 +4630,7 @@ impl<'a> Lowerer<'a> {
             Tys {
                 bits: Ty::Response.bit(),
                 service: Service::Exit,
+                secret: false,
             },
             code,
         )
@@ -4670,6 +4741,10 @@ impl<'a> Lowerer<'a> {
                     }
                 };
                 let detail_value = self.expr(id, detail);
+                if detail_value.secret() {
+                    self.secret_text(detail.span, "a `diag.fail` detail");
+                    return Val::Void(Vec::new());
+                }
                 let detail_code = match self.single(
                     detail_value,
                     detail.span,
@@ -4760,6 +4835,10 @@ impl<'a> Lowerer<'a> {
                 };
                 let level = self.constant_int(id, level, name, "level", 0..=255);
                 let message_val = self.expr(id, message);
+                if message_val.secret() {
+                    self.secret_text(message.span, "a `diag.log` message");
+                    return Val::Void(Vec::new());
+                }
                 // A message known only at run time is the stack operand of `LogFromStack`; a
                 // constant one is pooled for `Log` (3.1).
                 if !matches!(message_val, Val::Const(_)) {
@@ -5605,6 +5684,7 @@ impl<'a> Lowerer<'a> {
             span,
         ));
         Val::Run(Tys::from_service(Ty::Response, service), code)
+            .tainted(SECRET_SERVICES.contains(&sid))
     }
 
     /// The code that pushes the operand of `diag.{function}`'s `request`: the bytes after the
@@ -5901,6 +5981,7 @@ impl<'a> Lowerer<'a> {
         let key_result = Tys {
             bits: Ty::Response.bit(),
             service: Service::Key,
+            secret: true,
         };
         let failed = Val::Run(key_result, Vec::new());
         let [level_arg] = args else {

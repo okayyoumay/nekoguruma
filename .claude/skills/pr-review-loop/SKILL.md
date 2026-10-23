@@ -363,8 +363,9 @@ push the round's fix as usual. Then, before any re-request the
 rule above allows, check where the last four rounds' findings landed. For each finding, run
 `git blame -L <line>,<line> <reviewed commit> -- <path>`, using the line and commit the finding
 reviewed (`original_line` and `original_commit_id` in `get_review_comments`). Count the line as
-fix-written when the commit that wrote it is not an ancestor of the commit of the first review
-request (`git merge-base --is-ancestor`). A Copilot finding that exists only in the review
+fix-written when the commit that wrote it is not an ancestor of the baseline commit
+(`git merge-base --is-ancestor`). The baseline is the head of the PR's first review request,
+and after a Cut the scope or Rewrite answer, the head of the one review requested after it. A Copilot finding that exists only in the review
 summary (Step 1) has no thread: use the file and line the summary names, at the review's
 `commit_id`; one that names no line counts as not fix-written. If more than half are
 fix-written:
@@ -373,10 +374,11 @@ fix-written:
 - Ask the maintainer in the project thread, as a decision with these three options:
   - **Cut the scope**: move the part the late findings keep landing on out of the PR into a
     backlog item (`backlog` skill), then request one review on the cut head. The count starts
-    again.
+    again, and that head becomes the baseline.
   - **Rewrite**: rewrite that section in one piece, from rules that settle the neighbouring
-    cases together, then request one review. The count starts again.
-  - **Continue**: re-request as usual. The count starts again.
+    cases together, then request one review. The count starts again, and the rewritten head
+    becomes the baseline.
+  - **Continue**: re-request as usual. The count starts again; the baseline stays.
 - Give the share, the rounds so far and the section the findings land on with the question, and
   recommend one option.
 - Wait for the answer, also when no maintainer is present (`unattended-clarification`).

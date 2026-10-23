@@ -35,16 +35,20 @@ loop's.
    the eighth such round, and after each later one, the round's fix is still pushed as usual. Before the re-request, the loop then checks where the findings
    of the last four rounds landed: it runs `git blame` on each finding's line at the commit the
    finding reviewed and counts the line as fix-written when the commit that wrote it came after
-   the first review request. A finding with no thread (one only a Copilot review summary
+   the baseline: the head of the first review request, or after a cut or a rewrite, the head of
+   the one review requested after it. A finding with no thread (one only a Copilot review summary
    lists) is placed by the file and line the summary names; one that names no line counts as
    not fix-written. If more than half of those findings are on fix-written lines, the
    loop does not re-request. It asks the maintainer to choose between three options:
    - **Cut the scope.** The settled part stays in this pull request. The part the late findings
      keep landing on leaves it and becomes a backlog item for a decision of its own. Then
-     one review is requested on the cut head, and the count starts again.
+     one review is requested on the cut head, and the count starts again from that head as
+     the baseline.
    - **Rewrite.** The affected section is rewritten in one piece, from rules that settle the
-     neighbouring cases together. Then one review is requested, and the count starts again.
-   - **Continue.** The loop re-requests as usual, and the count starts again.
+     neighbouring cases together. Then one review is requested, and the count starts again
+     from the rewritten head as the baseline.
+   - **Continue.** The loop re-requests as usual, and the count starts again with the same
+     baseline, since the text was not rewritten.
    If half or fewer are on fix-written lines, the loop re-requests as usual and checks again
    after the next round with findings. After any of the three options, the next check comes
    after eight more rounds with findings.

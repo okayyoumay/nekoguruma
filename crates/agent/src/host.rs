@@ -543,10 +543,10 @@ impl<C: WorkerApi> WorkerHost<C> {
         let sent = handle.block_on(self.send_recv_async(request, progress));
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
-            let link_error = events_seen(&sent, &mut detail);
+            let link_errors = events_seen(&sent, &mut detail);
             self.log(&request, before, end, detail, |evidence| {
                 evidence.expected = expected;
-                evidence.link_errors.extend(link_error);
+                evidence.link_errors.extend(link_errors);
             });
         }
         sent.result
@@ -595,7 +595,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 return Sent {
                     result: Err(error),
                     started: false,
-                    error_event: None,
+                    error_events: Vec::new(),
                     rx_timeout: false,
                 };
             }
@@ -624,7 +624,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         Sent {
             result,
             started: true,
-            error_event: progress.error,
+            error_events: progress.errors,
             rx_timeout: progress.rx_timeout,
         }
     }
@@ -717,40 +717,40 @@ impl<C: WorkerApi> WorkerHost<C> {
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
 
 /// How a primitive ended: its outcome, whether it started (a failure to start it sent
-/// nothing), the error event it reported before it ended, if any, and whether the worker
+/// nothing), the error events it reported before it ended, in order, and whether the worker
 /// reported its receive timeout.
 struct Sent {
     result: Result<Vec<u8>, HostError>,
     started: bool,
-    error_event: Option<i32>,
+    error_events: Vec<i32>,
     rx_timeout: bool,
 }
 
-/// The error event the worker reported in an exchange that ended some other way than by it: a
-/// fault seen in the exchange (design 8.11 "Link error"), whether a response followed it or
-/// the exchange then timed out or lost its events. A primitive that failed with it already
-/// ends on it.
-fn also_seen(result: &Result<Vec<u8>, HostError>, error_event: Option<i32>) -> Option<i32> {
-    match result {
-        Err(HostError::PrimitiveFailed(_)) => None,
-        _ => error_event,
+/// The error events the worker reported in an exchange beside the one it ended on: faults seen
+/// in the exchange (design 8.11 "Link error"), whether a response followed them or the
+/// exchange then timed out or lost its events. A primitive that failed ends on the last.
+fn also_seen<'a>(result: &Result<Vec<u8>, HostError>, error_events: &'a [i32]) -> &'a [i32] {
+    match (result, error_events) {
+        (Err(HostError::PrimitiveFailed(_)), [earlier @ .., _]) => earlier,
+        _ => error_events,
     }
 }
 
-/// The link error of the events `sent` reported beside its end, which `detail` names unless
-/// it already names the event that ended the exchange (a lost VCI); a receive timeout is
-/// named but is no link error.
-fn events_seen(sent: &Sent, detail: &mut Detail) -> Option<LinkErrorKind> {
-    let link_error = also_seen(&sent.result, sent.error_event).map(|code| {
-        detail.error_event = detail.error_event.take().or(Some(error_event_name(code)));
-        link_error_kind(code)
-    });
+/// The link errors of the events `sent` reported beside its end, every one, so the
+/// classification takes the most severe; `detail` names the last unless it already names the
+/// event that ended the exchange (a lost VCI). A receive timeout is named but is no link error.
+fn events_seen(sent: &Sent, detail: &mut Detail) -> Vec<LinkErrorKind> {
+    let seen = also_seen(&sent.result, &sent.error_events);
+    if let Some(&last) = seen.last() {
+        detail.error_event = detail.error_event.take().or(Some(error_event_name(last)));
+    }
+    let link_errors = seen.iter().map(|&code| link_error_kind(code)).collect();
     if sent.rx_timeout {
         detail.error_event = detail.error_event.take().or(Some(error_event_name(
             PduErrorEvent::PduErrEvtRxTimeout as i32,
         )));
     }
-    link_error
+    link_errors
 }
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
@@ -1016,6 +1016,8 @@ struct Progress {
     negative: NegativeShape,
     response: Option<Vec<u8>>,
     error: Option<i32>,
+    /// Every error event but the receive timeout, in order, for the communication log.
+    errors: Vec<i32>,
     /// The worker reported the receive timeout, which ends the exchange without a response.
     rx_timeout: bool,
 }
@@ -1029,6 +1031,7 @@ impl Progress {
             negative: NegativeShape::uds(),
             response: None,
             error: None,
+            errors: Vec::new(),
             rx_timeout: false,
         })
     }
@@ -1041,6 +1044,7 @@ impl Progress {
             negative: expected.negative,
             response: None,
             error: None,
+            errors: Vec::new(),
             rx_timeout: false,
         }
     }
@@ -1109,7 +1113,10 @@ impl Progress {
             {
                 self.rx_timeout = true;
             }
-            Some(event_item::Data::ErrorData(code)) => self.error = Some(code),
+            Some(event_item::Data::ErrorData(code)) => {
+                self.error = Some(code);
+                self.errors.push(code);
+            }
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
                     || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
@@ -1510,69 +1517,89 @@ mod tests {
 
     #[test]
     fn an_error_event_counts_however_the_exchange_ended() {
-        let tx = Some(PduErrorEvent::PduErrEvtTxError as i32);
+        let tx = [PduErrorEvent::PduErrEvtTxError as i32];
         for result in [
             Ok(vec![0x62, 0xF1, 0x90]),
             Err(HostError::NoResponse),
             Err(HostError::EventsLost),
             Err(HostError::EventStreamEnded),
         ] {
-            assert_eq!(also_seen(&result, tx), tx, "{result:?}");
+            assert_eq!(also_seen(&result, &tx), tx, "{result:?}");
         }
-        let failed = Err(HostError::PrimitiveFailed(
-            PduErrorEvent::PduErrEvtTxError as i32,
-        ));
-        assert_eq!(also_seen(&failed, tx), None);
-        assert_eq!(also_seen(&Err(HostError::NoResponse), None), None);
+        let failed = Err(HostError::PrimitiveFailed(tx[0]));
+        assert!(also_seen(&failed, &tx).is_empty());
+        let fault = PduErrorEvent::PduErrEvtVciHardwareFault as i32;
+        assert_eq!(also_seen(&failed, &[fault, tx[0]]), [fault]);
+        assert!(also_seen(&Err(HostError::NoResponse), &[]).is_empty());
     }
 
     #[test]
     fn detail_names_the_event_that_ended_the_exchange_first() {
         let read = [0x22, 0xF1, 0x90];
         let tx = PduErrorEvent::PduErrEvtTxError as i32;
-        let sent = |result, error_event, rx_timeout| Sent {
+        let fault = PduErrorEvent::PduErrEvtVciHardwareFault as i32;
+        let frame = PduErrorEvent::PduErrEvtFrameStruct as i32;
+        let sent = |result, error_events: &[i32], rx_timeout| Sent {
             result,
             started: true,
-            error_event,
+            error_events: error_events.to_vec(),
             rx_timeout,
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
                 sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
-            let link_error = events_seen(sent, &mut detail);
-            (detail.error_event, link_error)
+            let link_errors = events_seen(sent, &mut detail);
+            (detail.error_event, link_errors)
         };
+        let name = |name: &str| Some(name.to_owned());
         // A lost VCI after another error event: the loss is named, the other is a link error.
         assert_eq!(
-            detail_of(&sent(Err(HostError::VciLost), Some(tx), false)),
+            detail_of(&sent(Err(HostError::VciLost), &[tx], false)),
             (
-                Some("PDU_ERR_EVT_LOST_COMM_TO_VCI".to_owned()),
-                Some(LinkErrorKind::Transmit)
+                name("PDU_ERR_EVT_LOST_COMM_TO_VCI"),
+                vec![LinkErrorKind::Transmit]
             )
         );
         // A receive timeout is named, and is no link error.
         assert_eq!(
-            detail_of(&sent(Err(HostError::NoResponse), None, true)),
-            (Some("PDU_ERR_EVT_RX_TIMEOUT".to_owned()), None)
+            detail_of(&sent(Err(HostError::NoResponse), &[], true)),
+            (name("PDU_ERR_EVT_RX_TIMEOUT"), vec![])
         );
         // An error event before the timeout is the one named.
         assert_eq!(
-            detail_of(&sent(Err(HostError::NoResponse), Some(tx), true)),
+            detail_of(&sent(Err(HostError::NoResponse), &[tx], true)),
+            (name("PDU_ERR_EVT_TX_ERROR"), vec![LinkErrorKind::Transmit])
+        );
+        // Every fault seen is kept, so the classification can take the most severe.
+        assert_eq!(
+            detail_of(&sent(Ok(vec![0x62, 0xF1, 0x90]), &[fault, frame], false)),
             (
-                Some("PDU_ERR_EVT_TX_ERROR".to_owned()),
-                Some(LinkErrorKind::Transmit)
+                name("PDU_ERR_EVT_FRAME_STRUCT"),
+                vec![LinkErrorKind::VciHardwareFault, LinkErrorKind::Frame]
             )
         );
-        // A code the interface does not list (a vendor's) is named by its number; the
-        // primitive's end is that link error, so it is not counted again beside it.
+        // A primitive that failed ends on its last event; the earlier one is a link error
+        // beside it.
+        assert_eq!(
+            detail_of(&sent(
+                Err(HostError::PrimitiveFailed(frame)),
+                &[fault, frame],
+                false
+            )),
+            (
+                name("PDU_ERR_EVT_FRAME_STRUCT"),
+                vec![LinkErrorKind::VciHardwareFault]
+            )
+        );
+        // A code the interface does not list (a vendor's) is named by its number.
         let vendor = 0x7FFF_0001;
         assert_eq!(
             detail_of(&sent(
                 Err(HostError::PrimitiveFailed(vendor)),
-                Some(vendor),
+                &[vendor],
                 false
             )),
-            (Some("error event 0x7fff0001".to_owned()), None)
+            (name("error event 0x7fff0001"), vec![])
         );
         assert_eq!(link_error_kind(vendor), LinkErrorKind::Other);
     }

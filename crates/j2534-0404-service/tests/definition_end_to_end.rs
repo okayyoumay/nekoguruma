@@ -152,7 +152,10 @@ fn assert_procedure_logged(dir: &Path, message: &str) {
     let logged = std::fs::read_dir(dir)
         .expect("the communication-log directory")
         .map(|entry| entry.expect("an entry").path())
-        .filter(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+        .filter(|path| {
+            path.extension()
+                .is_some_and(|extension| extension == "jsonl")
+        })
         .flat_map(|path| {
             std::fs::read_to_string(&path)
                 .expect("a log")

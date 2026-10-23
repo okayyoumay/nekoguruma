@@ -8,7 +8,7 @@ declarations to decode with and no declared link, so the command takes none.
 ## `ngr-agent run`
 
 ```sh
-ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <file> --artifact-sha256 <hex>] [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>]
+ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <file> --artifact-sha256 <hex>] [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--comm-log <dir>]
 ```
 
 | Option | Meaning |
@@ -20,6 +20,7 @@ ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <f
 | `--artifact`, `--artifact-sha256` | The flash artifact a procedure reads its blocks from (`Op::FlashBlock`, design 8.2.5, 11.3, ADR-336 items 1 and 12), and the SHA-256 the job names for it, 64 hexadecimal digits in either case. Both or neither, each at most once. The file is read once, before any worker starts, and its bytes stay in memory for the job (`agent::Artifact`), so a file changed on disk after the check cannot change a block. See step 1 for the check |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
+| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing; at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}`, generation 0), so two runs never share a log, and the log's path is printed on stderr. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log ("Communication log" below) |
 
 The job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
 
@@ -273,6 +274,44 @@ stop or VM refusal is terminal across resumes, as for a plan program (ADR-280, A
 the journal exists, instead of running the program again.
 
 The restart's use of the records is the classification of a plain procedure, below.
+
+## Communication log
+
+The communication log (design 8.11, ADR-346) records a job's exchanges for a reader who must
+tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` writes it
+(ADR-347):
+
+- **File.** `{job id}.g{generation}.commlog.jsonl`, one JSON object per line, beside the job's
+  journal, under a writer lock of its own (`{job id}.g{generation}.commlog.lock`). Every run of
+  the job and generation appends to the same file. The journaled entry points log under their
+  journal's directory and key; `run_program` logs only when the job carries a setup
+  (`Job::with_comm_log`), and a journaled job whose setup names another directory or key ends in
+  `JobError::CommLogMismatch` before anything opens.
+- **Lines.** Every line has the next `seq` and an `event`. A new log starts with the `header`
+  (seq 0: the job's ID, generation, kind and document SHA-256, the target VIN when the job names
+  one, the ECU variant, the agent and IR schema versions, and a reading of the agent's clocks).
+  Each run writes `job_start` (the agent's version, `run`: `first`, `resume`, or `plain_start`
+  for a resume that finds no journal, and whether the job writes) and, when it ends,
+  `job_end` with the outcome (`ok` or the `JobError` variant's name). A reopen writes
+  `agent_clock` first, a new reading that starts a new agent epoch.
+- **Clean close and reopen.** A log whose last line is a complete `job_end` was closed cleanly.
+  A reopen cuts a torn last line, goes on after the last complete line's `seq`, and when the
+  close was not clean (a torn line, or a last line that is not `job_end`) marks its
+  `agent_clock` incomplete (on a file that held only a torn line, the new header's clock).
+- **Writes.** One write per line from the job's thread, synced after the opening lines and
+  after `job_end`. A failed write or sync stops the log for the rest of the run, which writes no
+  `job_end`, so the next reopen sees an unclean close.
+- **Status.** Every entry point returns a `JobRun`: the job's `result`, its `guards` and
+  `comm_log`, a `CommLogStatus`. It is `None` without a log (none configured, a job refused
+  before its thread starts, or one that ends before the log opens: a cancel, a journal another
+  run holds), `Complete`, or `Incomplete` with the reason: `NotOpened` (a log another run holds
+  is `WouldBlock`), `WriteFailed`, `UncleanReopen` or `CloseFailed`. The result is the same
+  whatever the status.
+- **Redaction.** Message bytes reach the log only through `comm_log::redaction::redact`: a
+  SecurityAccess key and seed are their length (the seed also whether it is all zero), an
+  Authentication message its length, and TransferData data (a download's requests, an upload's
+  responses) its length and SHA-256; the service, sub-function and block counter stay in clear.
+  The exchange entries that use it come with the rest of design 8.11.
 
 ## Restart classification
 
@@ -785,7 +824,7 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   `JobGuards` is dropped.
 
 Every entry point (`run_program`, `run_program_journaled`, `resume_program_journaled`) takes
-the guards by value and returns them with the run's result, so two runs can never use one set
+the guards by value and returns them with the run's result (`JobRun`), so two runs can never use one set
 at once. A program that writes and that this build allows (a debug build, on the simulator),
 run on guards without the slot, ends in `JobError::NoReprogrammingSlot` before anything opens;
 a release build refuses every writing program first (`JobError::Refused`). A new run after an agent crash or a loss of the

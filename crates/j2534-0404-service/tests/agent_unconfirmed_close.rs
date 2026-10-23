@@ -16,7 +16,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{JobError, JobLimits, LinkConfig, run_program};
+use agent::{JobError, JobLimits, JobRun, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -240,7 +240,9 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {
     // The VCI is unplugged during the wait, with the link open and the first request done.
     wait_for_first_request(ecu_state).await;
     send(control_dir, "001", r#"{"command": "disconnect_vci"}"#);
-    let (result, mut guards) = job.await.expect("the job task should not panic");
+    let JobRun {
+        result, mut guards, ..
+    } = job.await.expect("the job task should not panic");
 
     // A loss during the open would be a `JobError::Link`; this one is the second request's.
     assert!(
@@ -277,7 +279,7 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup) {
     // guards.
     send(control_dir, "002", r#"{"command": "connect_vci"}"#);
     let (worker, client) = launch_worker().await;
-    let (result, guards) = run_program(
+    let JobRun { result, guards, .. } = run_program(
         client,
         &link_config(),
         read_vin(),

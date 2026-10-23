@@ -43,15 +43,18 @@ resume opens its journal before the link.
    no log, as it has no journal.
 3. **The result carries the log's status.** The three entry points return a `JobRun`: the job's
    result, its guards and a `CommLogStatus` (no log, complete, or incomplete with the reason: the
-   log could not be opened, a write or the closing sync failed, or the log was reopened without a
-   clean close). The result itself is the same whatever the log's status. The status cannot be
+   log could not be opened, another run holding it included, a write or a sync failed, or the log
+   was reopened without a clean close). The result itself is the same whatever the log's status. The status cannot be
    only in the file, since the file is what fails, and the guards are about locks.
 4. **A log that ends in `job_end` was closed cleanly.** The first line is the header (`seq` 0).
    Each run writes `job_start`, and its last line is `job_end` with the job's outcome. A reopen
    drops a torn last line (everything after the last line break), goes on with the `seq` after
    the last complete line, and writes `agent_clock`, a new reading of the agent's clocks that
-   starts a new agent epoch (design 8.11). When the last complete line is not `job_end`, the
-   reopen marks `agent_clock` incomplete and the run's status is incomplete, even if the rest of
+   starts a new agent epoch (design 8.11). `job_start` names the run as the runner knows it
+   when it opens the log: a first run, a resume, or a resume that found no journal; a plain start
+   on an existing journal, which the restart classification decides later, is logged as a resume. When the file ended in a torn line or its last complete
+   line is not `job_end`, the reopen marks `agent_clock` incomplete (on a file that held only a
+   torn line, the new header's clock) and the run's status is incomplete, even if the rest of
    the run writes cleanly. No sidecar marks the close, since one could disagree with the file.
 5. **One write per line, synced at the edges, poisoned after a failure.** Each line is
    serialized and written with one write call from the job's thread, without a buffer the

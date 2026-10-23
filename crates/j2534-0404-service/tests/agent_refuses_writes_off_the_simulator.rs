@@ -17,7 +17,7 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
 use agent::policy::UDS_READ_ONLY_SERVICES;
-use agent::{HostError, JobError, JobLimits, LinkConfig, run_program};
+use agent::{HostError, JobError, JobLimits, JobRun, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 use j2534_0404_mock::mock_library_path;
 use worker_host::client::ConnectOptions;
@@ -141,7 +141,11 @@ async fn run_the_job() {
     assert!(!UDS_READ_ONLY_SERVICES.contains(&0x10));
     // The program writes, so its guards hold the slot: the refusal below is the policy's, not
     // the missing slot's.
-    let (result, _guards) = run_program(
+    let JobRun {
+        result,
+        guards: _guards,
+        ..
+    } = run_program(
         client,
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         program(),

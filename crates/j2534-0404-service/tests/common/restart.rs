@@ -61,7 +61,8 @@ use agent::guards::{GuardError, GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal, JournalState, Vin};
 use agent::{
-    JobError, JobLimits, JournalSetup, LinkConfig, resume_program_journaled, run_program_journaled,
+    JobError, JobLimits, JobRun, JournalSetup, LinkConfig, resume_program_journaled,
+    run_program_journaled,
 };
 use diag_ir::{Program, VmState};
 use j2534_0404::{FLOW_CONTROL_FILTER, ISO15765, J2534Api0404, PassThruMessage};
@@ -481,7 +482,7 @@ impl Env {
             .await
             .expect("client should connect");
         let guards = guards.unwrap_or_else(|| self.take_guards());
-        let (result, guards) = resume_program_journaled(
+        let JobRun { result, guards, .. } = resume_program_journaled(
             client,
             &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
             spec.program.clone(),
@@ -564,7 +565,9 @@ impl Env {
                 Interruption::Inject(command) => self.inject(command),
             }
             let mut run = run;
-            let (result, mut guards) = match tokio::time::timeout(RESTART_TIMEOUT, &mut run).await {
+            let JobRun {
+                result, mut guards, ..
+            } = match tokio::time::timeout(RESTART_TIMEOUT, &mut run).await {
                 Ok(joined) => joined.expect("the first run should not panic"),
                 Err(_) => {
                     // Dropping the run cancels the job, so the runtime's drop does not wait for
@@ -982,7 +985,11 @@ fn agent_main(spec: JobSpec) {
             &AtomicBool::new(false),
         )
         .expect("guards should be free");
-        let (result, _guards) = run_program_journaled(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_program_journaled(
             client,
             &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
             spec.program.clone(),

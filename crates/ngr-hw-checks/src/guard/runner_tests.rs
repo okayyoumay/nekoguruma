@@ -9,7 +9,7 @@ use std::time::Duration;
 use agent::guards::{GuardSetup, JobGuards};
 #[cfg(debug_assertions)]
 use agent::{HostError, JobError};
-use agent::{JobLimits, LinkConfig, run_program};
+use agent::{JobLimits, JobRun, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
 use tokio::sync::mpsc;
 use tonic::codegen::tokio_stream::wrappers::ReceiverStream;
@@ -446,7 +446,11 @@ async fn a_read_only_job_passes_the_guard_on_every_call() {
         mut run,
         ..
     } = setup().await;
-    let (result, _guards) = run_program(
+    let JobRun {
+        result,
+        guards: _guards,
+        ..
+    } = run_program(
         client.clone(),
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         program(0x22),
@@ -520,7 +524,11 @@ async fn a_job_with_many_primitives_costs_one_cancel_at_the_disconnect() {
             .collect(),
         ..program(0x22)
     };
-    let (result, _guards) = run_program(
+    let JobRun {
+        result,
+        guards: _guards,
+        ..
+    } = run_program(
         client.clone(),
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         many,
@@ -584,7 +592,11 @@ async fn a_state_changing_request_is_refused_before_it_reaches_the_worker() {
         ..
     } = setup().await;
     // A write needs the reprogramming slot of the job's guards.
-    let (result, _guards) = run_program(
+    let JobRun {
+        result,
+        guards: _guards,
+        ..
+    } = run_program(
         client.clone(),
         &LinkConfig::iso15765(0x7E0, 0x7E8),
         program(0x2E),

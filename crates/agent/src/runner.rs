@@ -9,7 +9,8 @@
 //! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252), and
 //! [`resume_program_journaled`] goes on with a job whose journal exists (`restart`, ADR-255).
 //! A [`Job`] is a program and, when its program decodes response fields, the variant's
-//! document the VM is stepped with (ADR-316).
+//! document the VM is stepped with (ADR-316). A run returns a [`JobRun`]: the result, the guards
+//! and how the job's communication log ended (design 8.11, ADR-347).
 
 use std::panic::AssertUnwindSafe;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -18,6 +19,7 @@ use std::time::Duration;
 
 use crate::artifact::{Artifact, SHA256_LEN, to_hex};
 use crate::client::WorkerApi;
+use crate::comm_log::{CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind};
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
@@ -80,6 +82,9 @@ pub struct Job {
     /// The hash the job names for its artifact (ADR-336 item 1) and the artifact the agent read.
     /// [`check_job`] compares them.
     artifact: Option<([u8; SHA256_LEN], Artifact)>,
+    /// Where the job writes its communication log when it has no journal to put it beside
+    /// (ADR-347). A journaled entry point derives its own from the journal's setup.
+    comm_log: Option<CommLogSetup>,
 }
 
 impl Job {
@@ -89,7 +94,17 @@ impl Job {
             program: document.program()?,
             document: Some(document),
             artifact: None,
+            comm_log: None,
         })
+    }
+
+    /// Gives the job a communication log at `setup` (design 8.11, ADR-347). A run without a
+    /// journal ([`run_program`]) writes no log otherwise. On a journaled entry point the log
+    /// goes beside the journal, and a `setup` with another directory or key is refused with
+    /// [`JobError::CommLogMismatch`].
+    pub fn with_comm_log(mut self, setup: CommLogSetup) -> Self {
+        self.comm_log = Some(setup);
+        self
     }
 
     /// Gives the job its flash artifact and the SHA-256 the job names for it (design 8.2.5,
@@ -136,8 +151,18 @@ impl From<Program> for Job {
             program,
             document: None,
             artifact: None,
+            comm_log: None,
         }
     }
+}
+
+/// What a run returns: the job's result, its guards, and how its communication log ended. The
+/// result's `Ok` or `Err` never depends on the log (ADR-347).
+#[derive(Debug)]
+pub struct JobRun {
+    pub result: Result<VmState, JobError>,
+    pub guards: JobGuards,
+    pub comm_log: CommLogStatus,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -267,6 +292,10 @@ pub enum JobError {
     /// only a bug in this crate causes.
     #[error("the job's guards were missing when the per-vehicle lock was to be taken")]
     GuardsMissing,
+    /// The job names a communication log in another directory or under another key than the
+    /// journal of the entry point it runs on; nothing is opened (ADR-347).
+    #[error("the job's communication log is not the one beside its journal")]
+    CommLogMismatch,
 }
 
 /// The job's error for the declared failure its journal records.
@@ -563,13 +592,17 @@ fn refuse_beyond(
 /// with the policy before anything opens. The run takes the guards by value, so two runs can
 /// never use one set at once, holds them until the link is closed, and returns them with its
 /// result. A dropped future releases them only once the job thread has ended.
+///
+/// A [`Job`] given [`Job::with_comm_log`] writes its communication log (design 8.11, ADR-347);
+/// without one the run writes none. How the log ended comes back in [`JobRun::comm_log`], and
+/// the log never changes the result.
 pub async fn run_program<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
     guards: JobGuards,
-) -> (Result<VmState, JobError>, JobGuards) {
+) -> JobRun {
     run_guarded(
         client,
         config,
@@ -589,7 +622,8 @@ pub async fn run_program<C: WorkerApi>(
 /// ADR-293) and, outside the plans, ahead of each primitive that is not safe to repeat and after
 /// each primitive (`journaling`). A commit that fails ends the job before the request it guards
 /// is sent. `guards` are taken and returned as for [`run_program`]; a program that writes needs
-/// the reprogramming slot (`JobGuards::take`).
+/// the reprogramming slot (`JobGuards::take`). The job's communication log goes beside the
+/// journal, under the same key (ADR-347).
 pub async fn run_program_journaled<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
@@ -597,7 +631,7 @@ pub async fn run_program_journaled<C: WorkerApi>(
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
-) -> (Result<VmState, JobError>, JobGuards) {
+) -> JobRun {
     run_guarded(
         client,
         config,
@@ -723,7 +757,8 @@ pub async fn run_program_journaled<C: WorkerApi>(
 /// vehicle's supply alone passes the guards it got back to its next run. The journal's writer
 /// lock is held while the job runs as well, so a second writer of the same journal ends in
 /// `JobError::Journal(JournalError::InUse)` with nothing sent (ADR-255). The start deadline and
-/// a server reservation are not taken here.
+/// a server reservation are not taken here. The log of the job's earlier runs is appended to
+/// (ADR-347).
 pub async fn resume_program_journaled<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
@@ -731,7 +766,7 @@ pub async fn resume_program_journaled<C: WorkerApi>(
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
-) -> (Result<VmState, JobError>, JobGuards) {
+) -> JobRun {
     run_guarded(
         client,
         config,
@@ -745,7 +780,7 @@ pub async fn resume_program_journaled<C: WorkerApi>(
 }
 
 /// Puts `guards` in a slot, runs the job with it and takes the guards back, so every entry
-/// point returns them with its result.
+/// point returns them with its result and its log's status.
 async fn run_guarded<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
@@ -754,9 +789,9 @@ async fn run_guarded<C: WorkerApi>(
     ceiling: Permission,
     journal: Option<JournalMode>,
     guards: JobGuards,
-) -> (Result<VmState, JobError>, JobGuards) {
+) -> JobRun {
     let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
-    let result = run_program_within(
+    let (result, comm_log) = run_program_within(
         client,
         config,
         job.into(),
@@ -771,10 +806,15 @@ async fn run_guarded<C: WorkerApi>(
         .unwrap_or_else(|e| e.into_inner())
         .take()
         .expect("nothing but this call takes the guards out of the slot");
-    (result, guards)
+    JobRun {
+        result,
+        guards,
+        comm_log,
+    }
 }
 
-/// [`run_program`] with the build's ceiling given, so tests can run under a lower one.
+/// [`run_program`] with the build's ceiling given, so tests can run under a lower one. A job
+/// refused before its thread starts has no communication log.
 async fn run_program_within<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
@@ -783,7 +823,70 @@ async fn run_program_within<C: WorkerApi>(
     ceiling: Permission,
     journal: Option<JournalMode>,
     guards: GuardSlot,
-) -> Result<VmState, JobError> {
+) -> (Result<VmState, JobError>, CommLogStatus) {
+    match run_checked(client, config, job, limits, ceiling, journal, guards).await {
+        Ok(run) => run,
+        Err(refused) => (Err(refused), CommLogStatus::None),
+    }
+}
+
+/// The communication log a job writes: the journal's own place on a journaled entry point, the
+/// job's own otherwise, and none without either. A job that names another place than its
+/// journal's is refused (ADR-347).
+fn comm_log_setup(
+    job: &Job,
+    journal: Option<&JournalMode>,
+) -> Result<Option<CommLogSetup>, JobError> {
+    let beside = journal.map(|mode| {
+        let (JournalMode::Create(setup) | JournalMode::Resume(setup)) = mode;
+        CommLogSetup {
+            dir: setup.dir.clone(),
+            key: setup.key.clone(),
+        }
+    });
+    match (&job.comm_log, beside) {
+        (Some(named), Some(beside)) if *named != beside => Err(JobError::CommLogMismatch),
+        (named, beside) => Ok(beside.or_else(|| named.clone())),
+    }
+}
+
+/// What the communication log's header and `job_start` say of `job` (ADR-347).
+fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
+    let setup = journal.map(|mode| {
+        let (JournalMode::Create(setup) | JournalMode::Resume(setup)) = mode;
+        setup
+    });
+    let key = setup
+        .map(|setup| setup.key.clone())
+        .or_else(|| job.comm_log.as_ref().map(|log| log.key.clone()));
+    RunFacts {
+        job_id: key
+            .as_ref()
+            .map(|key| key.job_id.0.clone())
+            .unwrap_or_default(),
+        generation: key.as_ref().map_or(0, |key| key.generation),
+        document_sha256: job.document.as_ref().map(JobDocument::sha256),
+        variant_name: job
+            .document
+            .as_ref()
+            .and_then(|document| document.variant().short_name().map(str::to_owned)),
+        target_vin: setup
+            .and_then(|setup| setup.vin.as_ref())
+            .map(|vin| vin.as_str().to_owned()),
+        writes: job.writes(),
+    }
+}
+
+/// [`run_program_within`] up to the checks that refuse a job: those are its `Err`.
+async fn run_checked<C: WorkerApi>(
+    client: C,
+    config: &LinkConfig,
+    job: Job,
+    limits: JobLimits,
+    ceiling: Permission,
+    journal: Option<JournalMode>,
+    guards: GuardSlot,
+) -> Result<(Result<VmState, JobError>, CommLogStatus), JobError> {
     let handle = Handle::current();
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return Err(JobError::CurrentThreadRuntime);
@@ -802,6 +905,7 @@ async fn run_program_within<C: WorkerApi>(
     // A job with a document reads its sources through the document, whatever table the caller
     // put in the journal's setup.
     let journal = use_document_sources(&job, journal)?;
+    let comm_log = comm_log_setup(&job, journal.as_ref())?;
     // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
     let holds_slot = guards
         .lock()
@@ -817,34 +921,53 @@ async fn run_program_within<C: WorkerApi>(
             "the link given is not the one the document declares".to_owned(),
         )));
     }
+    let comm_log = JobLog::new(comm_log, run_facts(&job, journal.as_ref()));
     let Job {
         program,
         document,
         artifact,
+        comm_log: _,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = Arc::clone(&cancel.0);
-    tokio::task::spawn_blocking(move || {
-        std::panic::catch_unwind(AssertUnwindSafe(|| {
+    let run = tokio::task::spawn_blocking(move || {
+        // Declared outside the unwind guard, so a panic still ends the log.
+        let mut comm_log = comm_log;
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
             run_job(
-                handle, client, &config, &program, document, artifact, limits, &cancelled, journal,
+                handle,
+                client,
+                &config,
+                &program,
+                document,
+                artifact,
+                limits,
+                &cancelled,
+                journal,
                 guards,
+                &mut comm_log,
             )
         }))
-        .unwrap_or(Err(JobError::Panicked))
+        .unwrap_or(Err(JobError::Panicked));
+        let status = comm_log.finish(&result);
+        (result, status)
     })
     .await
     .unwrap_or_else(|error| {
-        Err(if error.is_cancelled() {
-            // The runtime is shutting down.
-            JobError::Cancelled
-        } else {
-            JobError::Panicked
-        })
-    })
+        (
+            Err(if error.is_cancelled() {
+                // The runtime is shutting down.
+                JobError::Cancelled
+            } else {
+                JobError::Panicked
+            }),
+            CommLogStatus::None,
+        )
+    });
+    Ok(run)
 }
 
 /// The whole job, on the blocking thread: open, run, close.
@@ -863,6 +986,7 @@ fn run_job<C: WorkerApi>(
     cancelled: &AtomicBool,
     journal: Option<JournalMode>,
     guards: GuardSlot,
+    comm_log: &mut JobLog,
 ) -> Result<VmState, JobError> {
     // The job's guards stay held until the end of this function, after the link is closed
     // (`OpenLink`, declared below, closes it on every way out, a panic included): declared
@@ -903,6 +1027,14 @@ fn run_job<C: WorkerApi>(
         }
         _ => None,
     };
+    // The communication log opens after the journal, so a job a journal turns away has none, and
+    // before the link: a log that cannot be opened never steers the job (ADR-347).
+    let run_kind = match (&journal, &resume_journal) {
+        (Some(JournalMode::Resume(_)), Some(Err(JournalError::NotFound))) => RunKind::PlainStart,
+        (Some(JournalMode::Resume(_)), _) => RunKind::Resume,
+        _ => RunKind::First,
+    };
+    let comm_log = comm_log.open(run_kind);
     let timings = Timings::for_link(config);
     // An open that fails partway closes what it opened; when even that fails, or the open
     // panics, the worker may still hold the module or the link (ADR-258).
@@ -946,6 +1078,7 @@ fn run_job<C: WorkerApi>(
     // The journal records the hash of the artifact the job runs with (ADR-344).
     let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
     host.set_artifact(artifact);
+    host.set_comm_log(comm_log);
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -1813,6 +1946,7 @@ mod tests {
     use worker_host::client::WorkerClient;
 
     use super::*;
+    use crate::comm_log::CommLogIncomplete;
 
     /// [`resume_on`] that stops a redone transfer before its erase (step 4c), ending in
     /// `StoppedBeforeErase` with the restart's outcomes so far; any other job ends as in
@@ -4362,6 +4496,7 @@ def main():
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
                         slot,
+                        &mut JobLog::none(),
                     )
                 })
                 .await
@@ -4494,6 +4629,7 @@ def main():
                         &cancelled,
                         Some(JournalMode::Resume(setup)),
                         job_slot,
+                        &mut JobLog::none(),
                     )
                 })
                 .await
@@ -4565,7 +4701,7 @@ def main():
     #[tokio::test(flavor = "current_thread")]
     async fn a_resume_that_cannot_start_gives_the_guards_back() {
         let dir = journal_dir("resume-early");
-        let (result, guards) = resume_program_journaled(
+        let JobRun { result, guards, .. } = resume_program_journaled(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             flash_program(),
@@ -4916,7 +5052,7 @@ def main():
                 vci_only_guards("plain-creates-journal"),
             )
             .await
-            .0
+            .result
         };
         run().await.expect("a plain program runs");
         let state = Journal::read(&dir, &job_key()).expect("the job left a journal");
@@ -4946,12 +5082,16 @@ def main():
             vci_only_guards("entry-points-artifact-run"),
         )
         .await
-        .0
+        .result
         .expect("the job runs");
         let facts = Journal::read(&dir, &job_key()).unwrap().facts;
         assert_eq!(facts.artifact_sha256, Some(artifact_hash(1)));
         let (client, calls) = fake_worker(false).await;
-        let (result, _guards) = resume_program_journaled(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = resume_program_journaled(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             job(2),
@@ -5005,6 +5145,7 @@ def main():
                         &AtomicBool::new(false),
                         Some(JournalMode::Create(setup)),
                         slot,
+                        &mut JobLog::none(),
                     )
                 })
                 .await
@@ -9968,6 +10109,7 @@ def main():
             program: send(service),
             document: Some(document),
             artifact: None,
+            comm_log: None,
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -10054,6 +10196,7 @@ def main():
                 program,
                 document: Some(document()),
                 artifact: None,
+                comm_log: None,
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -10101,6 +10244,7 @@ def main():
             program: program.clone(),
             document: Some(vin_job_document()),
             artifact: None,
+            comm_log: None,
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
         // A field the document does not declare is refused before anything is sent, also
@@ -10114,6 +10258,7 @@ def main():
             program: undeclared,
             document: Some(vin_job_document()),
             artifact: None,
+            comm_log: None,
         };
         assert!(
             matches!(
@@ -10170,6 +10315,7 @@ def main():
             program,
             document: Some(vin_job_document()),
             artifact: None,
+            comm_log: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -10186,7 +10332,11 @@ def main():
 
     #[tokio::test(flavor = "multi_thread")]
     async fn a_job_that_decodes_without_a_document_is_refused_before_the_link() {
-        let (result, _guards) = run_guarded(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             decoding_program(),
@@ -10442,7 +10592,11 @@ def main():
             let mut setup = file_setup(&dir);
             setup.sources = crate::inputs::ServiceSources::default();
             let (client, calls) = fake_worker(false).await;
-            let (result, _guards) = resume_program_journaled(
+            let JobRun {
+                result,
+                guards: _guards,
+                ..
+            } = resume_program_journaled(
                 client,
                 &LinkConfig::iso15765(0x7E0, 0x7E8),
                 job,
@@ -10504,7 +10658,11 @@ def main():
                 matches!(refused, Err(JobError::Sources(_))),
                 "{name}: {refused:?}"
             );
-            let (result, _guards) = run_guarded(
+            let JobRun {
+                result,
+                guards: _guards,
+                ..
+            } = run_guarded(
                 unreachable_client(),
                 &LinkConfig::iso15765(0x7E0, 0x7E8),
                 job,
@@ -13616,7 +13774,11 @@ def main():
             // Refused before the journal is touched, so the directory is never created.
             let journal =
                 || file_setup(&std::env::temp_dir().join("ngr-runner-declared-link-never-created"));
-            let (result, _guards) = match entry {
+            let JobRun {
+                result,
+                guards: _guards,
+                ..
+            } = match entry {
                 "run" => {
                     run_program(
                         unreachable_client(),
@@ -13656,7 +13818,11 @@ def main():
             );
         }
         // On the declared link the same job reaches the worker.
-        let (result, _guards) = run_program(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_program(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             job(),
@@ -13677,7 +13843,11 @@ def main():
             Op::ServiceRequest { service: 0x22 },
             Op::ServiceRequest { service: 0x2E },
         ];
-        let (result, _guards) = run_guarded(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code.clone()),
@@ -13698,7 +13868,11 @@ def main():
             "{result:?}"
         );
         // Without the check, the same job reaches the worker.
-        let (result, _guards) = run_guarded(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(two_requests()[..2].to_vec()),
@@ -13722,7 +13896,11 @@ def main():
                 sub: 1,
             },
         ];
-        let (result, _guards) = run_guarded(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_guarded(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code.clone()),
@@ -13734,7 +13912,11 @@ def main():
         .await;
         assert!(matches!(result, Err(JobError::Link(_))), "{result:?}");
         // The public entry point uses the build's ceiling, which a debug build sets to it.
-        let (result, _guards) = run_program(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_program(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code),
@@ -13750,7 +13932,7 @@ def main():
     #[cfg(debug_assertions)]
     #[tokio::test(flavor = "multi_thread")]
     async fn a_writing_program_on_vci_only_guards_is_refused() {
-        let (result, guards) = run_program(
+        let JobRun { result, guards, .. } = run_program(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             flash_program(),
@@ -13764,7 +13946,7 @@ def main():
         );
         assert!(!guards.holds_slot());
         // With the slot, the same program gets past the check and reaches the link.
-        let (result, guards) = run_program(
+        let JobRun { result, guards, .. } = run_program(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             flash_program(),
@@ -13779,7 +13961,7 @@ def main():
     /// A program that only reads runs on VCI-only guards.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_read_only_program_runs_on_vci_only_guards() {
-        let (result, guards) = run_program(
+        let JobRun { result, guards, .. } = run_program(
             unreachable_client(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(two_requests()[..2].to_vec()),
@@ -13836,6 +14018,7 @@ def main():
                 &AtomicBool::new(true),
                 None,
                 slot,
+                &mut JobLog::none(),
             )
         })
         .await
@@ -13856,7 +14039,11 @@ def main():
     async fn a_current_thread_runtime_is_refused() {
         // Refused before the client is used.
         let client = unreachable_client();
-        let (result, _guards) = run_program(
+        let JobRun {
+            result,
+            guards: _guards,
+            ..
+        } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(Vec::new()),
@@ -14292,7 +14479,9 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_close_marks_the_guards_and_keeps_the_result() {
         let (client, calls) = fake_worker(true).await;
-        let (result, mut guards) = run_program(
+        let JobRun {
+            result, mut guards, ..
+        } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(Vec::new()),
@@ -14314,7 +14503,9 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn the_worker_host_cannot_establish_an_input_the_vci_does_not_offer() {
         let (client, calls) = fake_worker(false).await;
-        let (result, mut guards) = run_program(
+        let JobRun {
+            result, mut guards, ..
+        } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(vec![Op::ReadInput {
@@ -14404,7 +14595,9 @@ def main():
             ("held-open-fails", false, true),
         ] {
             let (client, calls) = fake_worker_with(fail_disconnect, fail_open).await;
-            let (result, mut guards) = run_program(
+            let JobRun {
+                result, mut guards, ..
+            } = run_program(
                 Held(client, None),
                 &LinkConfig::iso15765(0x7E0, 0x7E8),
                 program(Vec::new()),
@@ -14454,7 +14647,9 @@ def main():
             ),
         ] {
             let (client, calls) = fake_worker(false).await;
-            let (result, mut guards) = run_program(
+            let JobRun {
+                result, mut guards, ..
+            } = run_program(
                 Held(client, Some(status)),
                 &LinkConfig::iso15765(0x7E0, 0x7E8),
                 program(Vec::new()),
@@ -14476,7 +14671,7 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_confirmed_close_leaves_the_guards_unmarked() {
         let (client, calls) = fake_worker(false).await;
-        let (result, guards) = run_program(
+        let JobRun { result, guards, .. } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(Vec::new()),
@@ -14495,7 +14690,9 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_close_after_a_failed_job_keeps_the_jobs_error() {
         let (client, _calls) = fake_worker(true).await;
-        let (result, mut guards) = run_program(
+        let JobRun {
+            result, mut guards, ..
+        } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(two_requests()[..2].to_vec()),
@@ -14516,7 +14713,9 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_failed_open_that_cannot_clean_up_marks_the_guards() {
         let (client, calls) = fake_worker_with(false, true).await;
-        let (result, mut guards) = run_program(
+        let JobRun {
+            result, mut guards, ..
+        } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(Vec::new()),
@@ -14539,7 +14738,9 @@ def main():
         let (client, calls) = fake_worker(false).await;
         let mut guards = vci_only_guards("refused-unconfirmed");
         guards.mark_link_unconfirmed();
-        let (result, mut guards) = run_program(
+        let JobRun {
+            result, mut guards, ..
+        } = run_program(
             client.clone(),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(Vec::new()),
@@ -14554,7 +14755,7 @@ def main():
         assert!(guards.link_unconfirmed());
         assert!(calls.lock().unwrap().is_empty(), "nothing was sent");
         guards.worker_gone();
-        let (result, guards) = run_program(
+        let JobRun { result, guards, .. } = run_program(
             client,
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(Vec::new()),
@@ -14845,5 +15046,352 @@ def main():
                 bytes[13..17].to_vec(),
             ])
         );
+    }
+
+    // ---- the communication log (design 8.11, ADR-347) ----
+
+    fn comm_log_setup_in(dir: &std::path::Path) -> CommLogSetup {
+        CommLogSetup {
+            dir: dir.to_owned(),
+            key: job_key(),
+        }
+    }
+
+    /// The lines of the job's communication log in `dir`, each a JSON object.
+    fn comm_log_lines(dir: &std::path::Path) -> Vec<serde_json::Value> {
+        let text = std::fs::read_to_string(comm_log_setup_in(dir).path().unwrap()).unwrap();
+        assert!(text.ends_with('\n'), "{text:?}");
+        text.lines()
+            .map(|line| serde_json::from_str(line).expect(line))
+            .collect()
+    }
+
+    fn comm_log_events(lines: &[serde_json::Value]) -> Vec<&str> {
+        lines
+            .iter()
+            .map(|line| line["event"].as_str().unwrap())
+            .collect()
+    }
+
+    fn assert_seq_consecutive(lines: &[serde_json::Value]) {
+        for (at, line) in lines.iter().enumerate() {
+            assert_eq!(line["seq"], at as u64, "{lines:?}");
+        }
+    }
+
+    /// A bare run of `job` on the fake worker with the given guards tag.
+    async fn bare_run(job: Job, tag: &str) -> JobRun {
+        let (client, _calls) = fake_worker(false).await;
+        run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            job,
+            JobLimits::default(),
+            vci_only_guards(tag),
+        )
+        .await
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_with_a_comm_log_writes_the_header_job_start_and_job_end() {
+        let dir = journal_dir("comm-log-bare");
+        let job = Job::from(program(Vec::new())).with_comm_log(comm_log_setup_in(&dir));
+        let run = bare_run(job, "comm-log-bare").await;
+        run.result.expect("the program runs");
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        let lines = comm_log_lines(&dir);
+        assert_eq!(comm_log_events(&lines), ["header", "job_start", "job_end"]);
+        assert_seq_consecutive(&lines);
+        assert_eq!(lines[0]["job"]["id"], job_key().job_id.0);
+        assert_eq!(lines[0]["job"]["generation"], 1);
+        assert!(lines[0].get("vehicle").is_none(), "a bare run has no VIN");
+        assert_eq!(lines[1]["run"], "first");
+        assert_eq!(lines[2]["outcome"], "ok");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_log_write_that_fails_in_a_run_leaves_the_result_and_marks_the_log_incomplete() {
+        let dir = journal_dir("comm-log-write-fails");
+        let setup = comm_log_setup_in(&dir);
+        // The header and `job_start` are written; `job_end`, seq 2, fails.
+        crate::comm_log::fault::fail_after(setup.path().unwrap(), 2);
+        let job = Job::from(program(Vec::new())).with_comm_log(setup);
+        let run = bare_run(job, "comm-log-write-fails").await;
+        run.result.expect("the program runs whatever the log does");
+        assert_eq!(
+            run.comm_log,
+            CommLogStatus::Incomplete(CommLogIncomplete::WriteFailed {
+                seq: 2,
+                kind: std::io::ErrorKind::StorageFull,
+            })
+        );
+        let lines = comm_log_lines(&dir);
+        assert_eq!(comm_log_events(&lines), ["header", "job_start"]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_without_a_comm_log_writes_none() {
+        let dir = journal_dir("comm-log-none");
+        let run = bare_run(Job::from(program(Vec::new())), "comm-log-none").await;
+        run.result.expect("the program runs");
+        assert_eq!(run.comm_log, CommLogStatus::None);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A job that fails still ends its log, naming the error's variant and nothing else.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_that_fails_ends_its_log_with_the_error_variant() {
+        let dir = journal_dir("comm-log-failed");
+        let run = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(program(Vec::new())).with_comm_log(comm_log_setup_in(&dir)),
+            JobLimits::default(),
+            vci_only_guards("comm-log-failed"),
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::Link(_))),
+            "{:?}",
+            run.result
+        );
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        let lines = comm_log_lines(&dir);
+        assert_eq!(comm_log_events(&lines), ["header", "job_start", "job_end"]);
+        assert_eq!(lines[2]["outcome"], "Link");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every run of a job and generation appends to the one log: a second run reopens it after
+    /// the first one's clean close, in a new agent epoch and with the numbering going on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_run_appends_to_the_same_log() {
+        let dir = journal_dir("comm-log-second");
+        for round in 0..2 {
+            let job = Job::from(program(Vec::new())).with_comm_log(comm_log_setup_in(&dir));
+            let run = bare_run(job, &format!("comm-log-second-{round}")).await;
+            run.result.expect("the program runs");
+            assert_eq!(run.comm_log, CommLogStatus::Complete);
+        }
+        let lines = comm_log_lines(&dir);
+        assert_eq!(
+            comm_log_events(&lines),
+            [
+                "header",
+                "job_start",
+                "job_end",
+                "agent_clock",
+                "job_start",
+                "job_end"
+            ]
+        );
+        assert_seq_consecutive(&lines);
+        assert_eq!(lines[3]["epoch"], 1);
+        assert!(lines[3].get("incomplete").is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A journaled entry point puts the log beside the journal, under the journal's key, and the
+    /// header names the job's target VIN.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_journaled_run_writes_its_log_beside_the_journal() {
+        let dir = journal_dir("comm-log-journaled");
+        let (client, _calls) = fake_worker(false).await;
+        let run = run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            vci_only_guards("comm-log-journaled"),
+        )
+        .await;
+        run.result.expect("the program runs");
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        assert!(
+            Journal::read(&dir, &job_key()).is_ok(),
+            "the journal is beside it"
+        );
+        let lines = comm_log_lines(&dir);
+        assert_eq!(comm_log_events(&lines), ["header", "job_start", "job_end"]);
+        assert_eq!(lines[0]["vehicle"]["target_vin"], TARGET_VIN);
+        assert_eq!(lines[1]["run"], "first");
+
+        // The same setup naming the journal's own place is no mismatch.
+        let (client, _calls) = fake_worker(false).await;
+        let run = resume_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(program(Vec::new())).with_comm_log(comm_log_setup_in(&dir)),
+            JobLimits::default(),
+            file_setup_for(&dir, Some(TARGET_VIN)),
+            vci_only_guards("comm-log-journaled-resume"),
+        )
+        .await;
+        assert!(
+            !matches!(run.result, Err(JobError::CommLogMismatch)),
+            "{:?}",
+            run.result
+        );
+        let lines = comm_log_lines(&dir);
+        assert_seq_consecutive(&lines);
+        assert_eq!(lines[3]["event"], "agent_clock");
+        assert_eq!(lines[3]["epoch"], 1);
+        assert_eq!(lines[4]["run"], "resume");
+        assert_eq!(lines.last().unwrap()["event"], "job_end");
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A log named in another directory or under another key than the journal's is refused in
+    /// the preflight: nothing reaches the worker, and neither the journal nor the log is created.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_comm_log_beside_another_journal_is_refused_before_anything_opens() {
+        let dir = journal_dir("comm-log-mismatch");
+        let elsewhere = journal_dir("comm-log-mismatch-elsewhere");
+        let mut other_key = comm_log_setup_in(&dir);
+        other_key.key.generation += 1;
+        for setup in [comm_log_setup_in(&elsewhere), other_key] {
+            for resume in [false, true] {
+                let (client, calls) = fake_worker(false).await;
+                let job = Job::from(program(Vec::new())).with_comm_log(setup.clone());
+                let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+                let guards = vci_only_guards("comm-log-mismatch");
+                let journal = file_setup_for(&dir, None);
+                let run = if resume {
+                    resume_program_journaled(
+                        client,
+                        &config,
+                        job,
+                        JobLimits::default(),
+                        journal,
+                        guards,
+                    )
+                    .await
+                } else {
+                    run_program_journaled(
+                        client,
+                        &config,
+                        job,
+                        JobLimits::default(),
+                        journal,
+                        guards,
+                    )
+                    .await
+                };
+                assert!(
+                    matches!(run.result, Err(JobError::CommLogMismatch)),
+                    "{:?}",
+                    run.result
+                );
+                assert_eq!(run.comm_log, CommLogStatus::None);
+                assert!(
+                    calls.lock().unwrap().is_empty(),
+                    "{:?}",
+                    calls.lock().unwrap()
+                );
+            }
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        assert_eq!(std::fs::read_dir(&elsewhere).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&elsewhere).unwrap();
+    }
+
+    /// A log another run holds is not opened, and the job runs on without it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_log_that_is_in_use_is_not_opened_and_the_job_still_runs() {
+        let dir = journal_dir("comm-log-in-use");
+        let setup = comm_log_setup_in(&dir);
+        let held = crate::comm_log::CommLog::open(&setup).expect("the first writer opens it");
+        let run = bare_run(
+            Job::from(program(Vec::new())).with_comm_log(setup),
+            "comm-log-in-use",
+        )
+        .await;
+        run.result.expect("the log does not steer the job");
+        assert_eq!(
+            run.comm_log,
+            CommLogStatus::Incomplete(CommLogIncomplete::NotOpened(std::io::ErrorKind::WouldBlock))
+        );
+        drop(held);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A log that cannot be created (here its directory is missing) leaves the job as it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_log_that_cannot_be_created_does_not_change_the_result() {
+        let dir = journal_dir("comm-log-missing-dir");
+        let missing = dir.join("missing");
+        let run = bare_run(
+            Job::from(program(Vec::new())).with_comm_log(comm_log_setup_in(&missing)),
+            "comm-log-missing-dir",
+        )
+        .await;
+        run.result.expect("the program runs");
+        assert_eq!(
+            run.comm_log,
+            CommLogStatus::Incomplete(CommLogIncomplete::NotOpened(std::io::ErrorKind::NotFound))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A resume a journal another run holds ends before the log would open: no log, no new line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resume_the_journal_turns_away_has_no_log() {
+        let dir = journal_dir("comm-log-journal-in-use");
+        let (client, _calls) = fake_worker(false).await;
+        run_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("comm-log-journal-in-use"),
+        )
+        .await
+        .result
+        .expect("the first run");
+        let before = comm_log_lines(&dir).len();
+        let _holder = Journal::open(&dir, &job_key()).expect("another writer holds the journal");
+        let (client, _calls) = fake_worker(false).await;
+        let run = resume_program_journaled(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            program(Vec::new()),
+            JobLimits::default(),
+            file_setup_for(&dir, None),
+            vci_only_guards("comm-log-journal-in-use-resume"),
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::Journal(JournalError::InUse))),
+            "{:?}",
+            run.result
+        );
+        assert_eq!(run.comm_log, CommLogStatus::None);
+        assert_eq!(comm_log_lines(&dir).len(), before);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A job refused in the preflight has no log, even with one configured.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_refused_before_its_thread_starts_has_no_log() {
+        let dir = journal_dir("comm-log-refused");
+        let run = run_program(
+            unreachable_client(),
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(decoding_program()).with_comm_log(comm_log_setup_in(&dir)),
+            JobLimits::default(),
+            vci_only_guards("comm-log-refused"),
+        )
+        .await;
+        assert!(matches!(run.result, Err(JobError::NoDeclarations)));
+        assert_eq!(run.comm_log, CommLogStatus::None);
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 }

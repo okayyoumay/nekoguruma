@@ -627,7 +627,7 @@ pub struct FileStore {
 /// never deleted: a process that locked a recreated file would not exclude one still holding
 /// the old one. It is a separate file so that [`Journal::read`] works while a job writes, also
 /// where file locks are mandatory (Windows).
-struct WriterLock(File);
+pub(crate) struct WriterLock(File);
 
 impl Drop for WriterLock {
     /// Unlocks before the handle closes. The lock belongs to the open file description, which a
@@ -642,11 +642,17 @@ impl Drop for WriterLock {
 
 impl WriterLock {
     fn take(journal: &Path) -> Result<Self, JournalError> {
+        Self::at(&journal.with_extension("journal.lock"))
+    }
+
+    /// Takes the exclusive lock on the file at `lock`, which it creates when missing. The
+    /// communication log keeps its own lock this way (ADR-347).
+    pub(crate) fn at(lock: &Path) -> Result<Self, JournalError> {
         let file = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(false)
-            .open(journal.with_extension("journal.lock"))?;
+            .open(lock)?;
         match file.try_lock() {
             Ok(()) => Ok(Self(file)),
             Err(fs::TryLockError::WouldBlock) => Err(JournalError::InUse),
@@ -1105,8 +1111,9 @@ fn creation_prefix_allowed(
     }
 }
 
-/// `{job_id}.g{generation}.journal` in `dir`. The job ID must be a plain name (a UUID is).
-fn journal_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+/// `{job_id}.g{generation}`, the name the job's files share (the journal, the communication
+/// log). The job ID must be a plain name (a UUID is).
+pub(crate) fn job_file_stem(key: &JobKey) -> Result<String, JournalError> {
     let id = &key.job_id.0;
     if id.is_empty()
         || id.len() > 64
@@ -1116,7 +1123,12 @@ fn journal_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
     {
         return Err(JournalError::InvalidJobId(id.clone()));
     }
-    Ok(dir.join(format!("{id}.g{}.journal", key.generation)))
+    Ok(format!("{id}.g{}", key.generation))
+}
+
+/// `{job_id}.g{generation}.journal` in `dir`.
+fn journal_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
+    Ok(dir.join(format!("{}.journal", job_file_stem(key)?)))
 }
 
 /// Makes a new directory entry durable. NTFS logs the entry with the file's metadata, which

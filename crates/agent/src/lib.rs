@@ -3,6 +3,8 @@
 //! - [`launch`]: launching the worker that matches a VCI library's ABI (7.3)
 //! - [`artifact`]: the flash artifact a job's `FlashBlock` reads its blocks from (ADR-336)
 //! - [`client`]: the worker client as a trait, so the hardware harness can guard a job's calls (ADR-334)
+//! - [`comm_log`]: the log of a job's communication, kept beside its journal (design 8.11, ADR-346,
+//!   ADR-347)
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
@@ -21,6 +23,7 @@
 
 pub mod artifact;
 pub mod client;
+pub mod comm_log;
 pub mod document;
 pub mod guards;
 pub mod host;
@@ -36,12 +39,13 @@ pub mod send_receive;
 
 pub use artifact::Artifact;
 pub use client::WorkerApi;
+pub use comm_log::{CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus};
 pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};
 pub use journal::Vin;
 pub use journaling::JournalSetup;
 pub use link::{Link, LinkConfig};
 pub use runner::{
-    Job, JobError, JobLimits, check_job, check_program, resume_program_journaled, run_program,
-    run_program_journaled,
+    Job, JobError, JobLimits, JobRun, check_job, check_program, resume_program_journaled,
+    run_program, run_program_journaled,
 };

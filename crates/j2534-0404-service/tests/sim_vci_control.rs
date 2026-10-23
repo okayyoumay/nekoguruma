@@ -15,7 +15,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{JobError, JobLimits, Link, LinkConfig, link, run_program};
+use agent::{JobError, JobLimits, JobRun, Link, LinkConfig, link, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use vci_service_interface::{
     GetObjectIdRequest, GetVersionRequest, IoCtlRequest, ObjectType, PduError, data_item,
@@ -124,7 +124,11 @@ fn job_guards(writes: bool) -> JobGuards {
 }
 
 async fn run(client: &WorkerClient) -> Result<VmState, JobError> {
-    let (result, _guards) = run_program(
+    let JobRun {
+        result,
+        guards: _guards,
+        ..
+    } = run_program(
         client.clone(),
         &link_config(),
         read_vin(),

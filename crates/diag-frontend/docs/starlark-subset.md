@@ -291,9 +291,9 @@ field that stores them.
 | `form_id`, `template_id` | `str` constant of 1 to 128 bytes naming the form or record template (ADR-340 item 4): a value known only at run time is `STAR_NON_CONSTANT_ARGUMENT`, a constant of another type `STAR_UNSUPPORTED_SYNTAX`, another length `STAR_ARGUMENT_OUT_OF_RANGE`. Both calls take exactly their arguments (`STAR_UNSUPPORTED_SYNTAX` otherwise) |
 | `name` of `diag.precondition` | `str` constant, one of `voltage`, `externalSupply`, `ignition`, `engine`, `vehicleSpeed` (the names `# @preconditions` takes, 4.9); another `str` is `STAR_ARGUMENT_OUT_OF_RANGE`, a value known only at run time `STAR_NON_CONSTANT_ARGUMENT` and a constant of another type `STAR_UNSUPPORTED_SYNTAX`. The name need not be in `# @preconditions` |
 | `level` of `diag.log` | `int`, 0 to 255 |
-| `message` of `diag.log` | `str` expression, which may be built at run time |
+| `message` of `diag.log` | `str` expression, which may be built at run time, but not from a SecurityAccess or Authentication response (below; `STAR_SECRET_IN_TEXT`) |
 | `code` of `diag.fail` | non-empty `str` constant, 1 to 64 bytes of UTF-8 (the IR accepts 1 to 128; `Program::validate` checks the constant, ADR-280) |
-| `detail` of `diag.fail` | `str` expression, which may be built at run time |
+| `detail` of `diag.fail` | `str` expression, which may be built at run time, but not from a SecurityAccess or Authentication response (below; `STAR_SECRET_IN_TEXT`) |
 | `params` of `diag.hmi` | dict literal of at most 32 entries (ADR-340 item 4). A key is a string literal that is an identifier (`[A-Za-z_][A-Za-z0-9_]*`) of at most 64 bytes, unique in the dict; a computed key, or one that is not a string, is `STAR_DYNAMIC_KEY_NOT_ALLOWED` as for every dict literal (4.1), a string literal that is not an identifier `STAR_UNSUPPORTED_SYNTAX`, one past a bound, a repeated key or more than 32 entries `STAR_ARGUMENT_OUT_OF_RANGE`. A value is an `int`, `bool` or `str`, a constant or known only at run time (one inferred type, 4.8, else `STAR_NOT_LOWERABLE`); a value of another type, constant or not (`float`, `bytes`, a list, a dict, a response or an answer), is `STAR_UNSUPPORTED_SYNTAX`. The form, constants included, encodes to at most 16 KiB (`STAR_ARGUMENT_OUT_OF_RANGE`) (3.2) |
 | `params` of `diag.request` | dict literal whose keys and values select one declared service of the variant and give its other request fields (3.4); a call that selects none, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`). The keys, and the values of the service's constants, are known at ingestion (`STAR_NON_CONSTANT_ARGUMENT`); a field's value may be known only at run time (below) |
 | `params` of `diag.routine` | dict literal whose keys and values give the routine service's own constants and other request fields, as for `diag.request`; a call whose `routine_id`, `sub` and `params` select no generated routine service is rejected (`STAR_UNKNOWN_SERVICE`) |
@@ -317,6 +317,21 @@ A `diag.log` whose message is a constant `str` lowers to `Log`, which takes it f
 message is a `str` built at run time lowers to the code that pushes it, then `LogFromStack` (ADR-233); the VM
 decodes invalid UTF-8 in it lossily, so a log never stops a run. A message of another type, `bytes` included, is
 rejected whether it is a constant or computed at run time (`STAR_UNSUPPORTED_SYNTAX`); the level stays a constant.
+
+**No secret in a message or detail (ADR-348 item 6).** A `diag.log` message is written to the job's communication
+log, and a `diag.fail` detail to its journal and result, while the communication log keeps the bytes of a
+SecurityAccess or Authentication response as their length only (design 8.11). So a message or detail that may hold
+such bytes is rejected (`STAR_SECRET_IN_TEXT`). The lowering marks as secret the result of `diag.security_access`
+and of a `diag.request` of SID 0x27 or 0x29 (SecurityAccess and Authentication, ISO 14229-1 (2026) 9.4 and 9.6), and
+its `raw` and `fields`, with every field read from them. The mark follows the value through variables, function
+parameters and returned values (a variable or parameter is marked when any value assigned or passed to it is,
+4.8), and through every operator, index, slice and built-in that takes a marked operand; a conditional expression
+is marked when either branch is. A response's `ok` and `nrc` are not marked, so a procedure logs whether the ECU
+accepted the step and which code it refused it with. The mark follows data only, not the conditions around it: a
+constant message logged in a branch taken on a secret value is accepted. A message or detail that may hold such
+bytes is `STAR_SECRET_IN_TEXT` whatever its type, before its type is checked. Since a function's parameters and result
+have one type for all its calls (4.8), a helper that one caller passes a secret is marked for every call: a
+`diag.log` inside it is rejected there, and so is a message another caller builds from its result.
 
 ### 3.2 Lowering
 
@@ -953,6 +968,12 @@ The error codes of the restart declaration (ADR-336, 4.9); the converter reports
 | `STAR_PLAN_INVALID` | the lowered program is refused by `Program::validate` with an error that names a pc; located at the source of that pc (an error without a pc is `STAR_NOT_LOWERABLE`) |
 | `STAR_UNKNOWN_IDENTITY` | a key of `diag.ecu_info()` (`vin`, `part_number`, `software_version`) has no row in the variant's `identity.csv` (reported at the key; ADR-339) |
 | `STAR_UNKNOWN_PRECONDITION` | a name in `# @preconditions`, or the kind a `diag.precondition` call names, has no row in the variant's `preconditions.csv` (for the call, also a row with no default-session source, which the tables never produce) |
+
+The lowering also reports this code (3.1):
+
+| Code | Meaning |
+|---|---|
+| `STAR_SECRET_IN_TEXT` | a `diag.log` message or `diag.fail` detail is built from a value read from a SecurityAccess or Authentication response: a `diag.security_access` result, or a `diag.request` of SID 0x27 or 0x29 (reported at the message or detail; ADR-348 item 6) |
 
 ---
 

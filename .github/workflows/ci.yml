@@ -101,7 +101,8 @@ jobs:
       - run: cargo test --workspace --locked --exclude sim-vci --doc
 
   # Windows: some timing-sensitive worker-crate tests fail there when other tests run beside them,
-  # so the `ci-windows` profile runs those alone and the rest four at a time. The agent's tests
+  # so the `ci-windows` profile runs those alone, j2534-0404-service's restart end-to-end scenarios
+  # two at a time, and the rest four at a time. The agent's tests
   # spend their time on file I/O, so they run first, on their own and in parallel
   # (`ci-windows-parallel`), never beside the worker-crate tests. The second run does not rebuild.
   # On pull requests, j2534-0404-service (most of the remaining Windows time) is left out, but for

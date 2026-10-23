@@ -115,7 +115,10 @@ faults, and aims the logs at software experts away from the workshop.
    caller asking for one, so the message is never dropped: when such a `run_program` job carries no
    setup, the agent gives it one, in its communication-log directory, a setting that defaults to
    `commlog/` in the agent's local storage beside its journals (design 5.5), with a job id of its
-   own as `ngr-agent run --comm-log` does; this extends ADR-347 Decision item 2), and a `diag.fail`
+   own as `ngr-agent run --comm-log` does; this extends ADR-347 Decision item 2; the communication
+   log's rule that secret bytes are kept as their length only, design 8.11, holds for these messages
+   too: ingestion rejects a `diag.log` message or `diag.fail` detail built from a value read from a
+   SecurityAccess or Authentication response, so no such bytes reach either), and a `diag.fail`
    detail stays in the job's journal and result; the operational log records at most that a
    procedure logged or failed, with the level or the code. A value the agent reads from the vehicle,
    such as an identity that did not match, is likewise logged as the fact, not the value. Until

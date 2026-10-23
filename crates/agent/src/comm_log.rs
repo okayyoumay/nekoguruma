@@ -537,6 +537,11 @@ impl CommLog {
         inner.ended = inner.failed.is_none();
     }
 
+    /// Whether the log still takes lines: it has not failed.
+    pub(crate) fn is_open(&self) -> bool {
+        self.lock().failed.is_none()
+    }
+
     /// The agent's clocks now, for an exchange's times.
     pub(crate) fn now(&self) -> AgentNow {
         let clock = self.lock().clock();
@@ -1478,5 +1483,113 @@ mod tests {
             outcome_name(&Err(JobError::CommLogMismatch)),
             "CommLogMismatch"
         );
+    }
+
+    // ---- exchange entries (design 8.11 "Exchange entry") ----
+
+    fn evidence(
+        target: exchange::Target,
+        request: &[u8],
+        end: exchange::End,
+    ) -> exchange::Evidence {
+        exchange::Evidence::new(
+            exchange::Origin::Procedure,
+            target,
+            1,
+            0x7E8,
+            request.to_vec(),
+            end,
+        )
+    }
+
+    fn endpoint(tx_id: u32) -> exchange::Target {
+        exchange::Target::Endpoint {
+            link: 1,
+            tx_id,
+            rx_id: 0x7E8,
+        }
+    }
+
+    #[test]
+    fn exchanges_take_the_next_seq_and_their_target_s_link_state() {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        let answer = exchange::End::Positive(vec![0x62, 0xF1, 0x90]);
+        assert_eq!(
+            log.exchange(evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                answer.clone()
+            )),
+            Some(2)
+        );
+        assert_eq!(
+            log.exchange(evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                answer.clone()
+            )),
+            Some(3)
+        );
+        // Another target has a state of its own.
+        assert_eq!(
+            log.exchange(evidence(endpoint(0x7E1), &[0x22, 0xF1, 0x90], answer)),
+            Some(4)
+        );
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[2]["event"], "exchange");
+        assert_eq!(lines[2]["link_history"]["answered"], 0);
+        assert_eq!(lines[3]["link_history"]["answered"], 1);
+        assert_eq!(lines[3]["link_history"]["answered_same_match"], 1);
+        assert_eq!(lines[4]["link_history"]["answered"], 0);
+    }
+
+    #[test]
+    fn a_link_error_ends_the_matched_answers_of_every_target() {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        let answer = exchange::End::Positive(vec![0x62, 0xF1, 0x90]);
+        let read = [0x22, 0xF1, 0x90];
+        log.exchange(evidence(endpoint(0x7E1), &read, answer.clone()));
+        log.exchange(evidence(
+            endpoint(0x7E0),
+            &read,
+            exchange::End::LinkError(exchange::LinkErrorKind::Frame),
+        ));
+        log.exchange(evidence(endpoint(0x7E1), &read, answer));
+        let lines = sink.lines();
+        // The other target's matched answer ended with the error, its count since it too.
+        assert_eq!(lines[4]["link_history"]["answered"], 1);
+        assert_eq!(lines[4]["link_history"]["answered_since_error"], 0);
+        assert_eq!(lines[4]["link_history"]["answered_same_match"], 0);
+    }
+
+    #[test]
+    fn a_failed_log_takes_no_exchange() {
+        let sink = Recording {
+            fail_write: Some(2),
+            ..Recording::default()
+        };
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        assert!(log.is_open());
+        let answer = exchange::End::Positive(vec![0x62, 0xF1, 0x90]);
+        assert_eq!(
+            log.exchange(evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                answer.clone()
+            )),
+            None
+        );
+        assert!(!log.is_open());
+        assert_eq!(
+            log.exchange(evidence(endpoint(0x7E0), &[0x22, 0xF1, 0x90], answer)),
+            None
+        );
+        assert_eq!(taken_events(&sink), ["header", "job_start"]);
     }
 }

@@ -538,23 +538,28 @@ impl<C: WorkerApi> WorkerHost<C> {
             )
         });
         let handle = self.handle.clone();
-        let (result, started) = handle.block_on(self.send_recv_async(request, progress));
+        let sent = handle.block_on(self.send_recv_async(request, progress));
         if let Some((request, expected, negative, sid)) = logged {
-            let (end, detail) = sent_end(&result, &negative, sid, started);
+            let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
+            // An error event that came before the response is a fault seen in the exchange
+            // (design 8.11 "Link error").
+            let link_error = match (&sent.result, sent.error_event) {
+                (Ok(_), Some(code)) => {
+                    detail.error_event = error_event_str(code);
+                    Some(link_error_kind(code))
+                }
+                _ => None,
+            };
             self.log(&request, before, end, detail, |evidence| {
                 evidence.expected = expected;
+                evidence.link_errors.extend(link_error);
             });
         }
-        result
+        sent.result
     }
 
-    /// Sends `request` and waits for the primitive to end: the outcome, and whether the
-    /// primitive started (a failure to start it sent nothing).
-    async fn send_recv_async(
-        &mut self,
-        request: Vec<u8>,
-        mut progress: Progress,
-    ) -> (Result<Vec<u8>, HostError>, bool) {
+    /// Sends `request` and waits for the primitive to end.
+    async fn send_recv_async(&mut self, request: Vec<u8>, mut progress: Progress) -> Sent {
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -592,7 +597,13 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         let cop = match started {
             Ok(cop) => cop,
-            Err(error) => return (Err(error), false),
+            Err(error) => {
+                return Sent {
+                    result: Err(error),
+                    started: false,
+                    error_event: None,
+                };
+            }
         };
 
         let events = &mut self.link.events;
@@ -611,18 +622,23 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
             }
         };
-        let ended = tokio::time::timeout_at(deadline, wait)
+        let result = tokio::time::timeout_at(deadline, wait)
             .await
             .map_err(|_| HostError::NoResponse)
             .and_then(|outcome| outcome);
-        (ended, true)
+        Sent {
+            result,
+            started: true,
+            error_event: progress.error,
+        }
     }
 
     /// The agent's time now, when the host logs the request it is about to send: it has a log,
     /// its link's identifiers and a VM step running.
     fn log_clock(&self) -> Option<AgentNow> {
         match (&self.comm_log, &self.at, self.link_ids) {
-            (Some(log), Some(_), Some(_)) => Some(log.now()),
+            // A log that failed takes no more lines, so nothing is built for it.
+            (Some(log), Some(_), Some(_)) if log.is_open() => Some(log.now()),
             _ => None,
         }
     }
@@ -704,16 +720,42 @@ impl<C: WorkerApi> WorkerHost<C> {
 
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
 
+/// How a primitive ended: its outcome, whether it started (a failure to start it sent
+/// nothing), and the error event it reported before it ended, if any.
+struct Sent {
+    result: Result<Vec<u8>, HostError>,
+    started: bool,
+    error_event: Option<i32>,
+}
+
+/// The name of an error event, as `detail` carries it.
+fn error_event_str(code: i32) -> Option<&'static str> {
+    PduErrorEvent::try_from(code)
+        .ok()
+        .map(|event| event.as_str_name())
+}
+
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
-/// sub-function of a service that has one, which the host strips from the positive prefix
-/// (`positive_prefix`) and the ECU leaves unanswered when the request succeeds.
+/// sub-function of a service that has one (ISO 14229-1:2026: DiagnosticSessionControl,
+/// ECUReset, SecurityAccess, CommunicationControl, Authentication, TesterPresent,
+/// ControlDTCSetting, ResponseOnEvent, LinkControl, DynamicallyDefineDataIdentifier,
+/// RoutineControl), which the ECU leaves unanswered when the request succeeds.
 fn suppresses_positive_response(request: &[u8]) -> bool {
-    matches!(request, [0x10 | 0x11 | 0x19 | 0x27 | 0x28 | 0x31 | 0x3E | 0x85, sub, ..] if sub & 0x80 != 0)
+    matches!(
+        request,
+        [0x10 | 0x11 | 0x27 | 0x28 | 0x29 | 0x2C | 0x31 | 0x3E | 0x85 | 0x86 | 0x87, sub, ..]
+            if sub & 0x80 != 0
+    )
 }
 
 /// How a sent request ended, as its exchange entry gives it (design 8.11, `outcome`), and the
 /// internal names behind it. `started` tells a primitive that could not start from one that ran.
+///
+/// A positive response the agent cannot use is `positive_unusable`: a TransferData answer that
+/// does not echo the block's counter, and a RequestDownload answer with no readable
+/// maxNumberOfBlockLength (ISO 14229-1:2026 14.2.3, 14.4), which the transfer then refuses.
 fn sent_end(
+    request: &[u8],
     result: &Result<Vec<u8>, HostError>,
     negative: &NegativeShape,
     sid: u8,
@@ -723,7 +765,20 @@ fn sent_end(
         Ok(response) if negative.is_negative(sid, response) => {
             return (End::Negative(response.clone()), Detail::default());
         }
-        Ok(response) => return (End::Positive(response.clone()), Detail::default()),
+        Ok(response) => {
+            let unusable = match (request, response.as_slice()) {
+                ([0x36, counter, ..], [0x76, echoed, ..]) => echoed != counter,
+                ([0x36, ..], _) => true,
+                ([SID_REQUEST_DOWNLOAD, ..], [0x74, ..]) => max_block_length(response).is_none(),
+                _ => false,
+            };
+            let end = if unusable {
+                End::PositiveUnusable(response.clone())
+            } else {
+                End::Positive(response.clone())
+            };
+            return (end, Detail::default());
+        }
         Err(error) => error,
     };
     let mut detail = Detail {
@@ -748,9 +803,7 @@ fn sent_end(
             refused_after_loss: !started,
         },
         HostError::PrimitiveFailed(code) => {
-            detail.error_event = PduErrorEvent::try_from(*code)
-                .ok()
-                .map(|event| event.as_str_name());
+            detail.error_event = error_event_str(*code);
             End::LinkError(link_error_kind(*code))
         }
         // `send_recv_async` gives no other error.
@@ -778,7 +831,10 @@ fn link_error_kind(code: i32) -> LinkErrorKind {
 /// Why the agent refused `request` for `error` (design 8.11, `not_sent`).
 fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
     match error {
-        HostError::BadService(_) if !request.is_empty() => RefusalCause::UndeclaredService,
+        // A service number no request can carry: the entry has no bytes for it.
+        HostError::BadService(_) | HostError::UndeclaredService(_) => {
+            RefusalCause::UndeclaredService
+        }
         _ if request.is_empty() => RefusalCause::EmptyRequest,
         HostError::EmptyRequest => RefusalCause::EmptyRequest,
         HostError::NotAllowed(_)
@@ -786,9 +842,6 @@ fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
         | HostError::WrongService { .. }
         | HostError::DownloadBySendReceive(_)
         | HostError::TransferInterrupted(_) => RefusalCause::Policy,
-        HostError::BadService(_) | HostError::UndeclaredService(_) => {
-            RefusalCause::UndeclaredService
-        }
         HostError::NoTransferActive => RefusalCause::NoTransferActive,
         HostError::BlockTooLong { .. } => RefusalCause::BlockTooLong,
         HostError::NoBlockLength { .. } => RefusalCause::EarlierResponse,
@@ -875,7 +928,9 @@ impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
 }
 
 /// The `at` of the instruction at `pc`: its source position, from the source map entry that
-/// covers it (an entry covers its instruction and those after it up to the next, ADR-304), and
+/// covers it (an entry covers its instruction and those after it up to the next, ADR-304, so
+/// the map is in pc order; an unordered map from another producer gives a wrong position, not a
+/// failure), and
 /// the attributes of every section it is in, outermost first.
 fn at_of(program: &diag_ir::Program, pc: u32, steps: u64) -> At {
     let covering = program.source_map.partition_point(|span| span.pc <= pc);
@@ -1256,6 +1311,226 @@ fn wait_elapsed(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ---- exchange entries (design 8.11 "Exchange entry") ----
+
+    fn end_of(request: &[u8], result: Result<Vec<u8>, HostError>, started: bool) -> (End, Detail) {
+        sent_end(request, &result, &NegativeShape::uds(), request[0], started)
+    }
+
+    fn rpc(code: tonic::Code) -> HostError {
+        HostError::Rpc {
+            rpc: "StartComPrimitive",
+            status: Box::new(tonic::Status::new(code, "x")),
+        }
+    }
+
+    #[test]
+    fn a_sent_request_ends_as_the_host_saw_it() {
+        let read = [0x22, 0xF1, 0x90];
+        assert!(matches!(
+            end_of(&read, Ok(vec![0x62, 0xF1, 0x90]), true).0,
+            End::Positive(_)
+        ));
+        assert!(matches!(
+            end_of(&read, Ok(vec![0x7F, 0x22, 0x31]), true).0,
+            End::Negative(_)
+        ));
+        let (end, detail) = end_of(&read, Err(HostError::NoResponse), true);
+        assert!(matches!(end, End::NoResponse));
+        assert_eq!(detail.host_error, Some("NoResponse"));
+        for (started, refused_after_loss) in [(false, true), (true, false)] {
+            let end = end_of(&read, Err(HostError::VciLost), started).0;
+            assert!(
+                matches!(end, End::VciLost { refused_after_loss: r } if r == refused_after_loss),
+                "{end:?}"
+            );
+        }
+        let (end, detail) = end_of(&read, Err(rpc(tonic::Code::Unavailable)), false);
+        assert!(
+            matches!(end, End::Unknown(UnknownCause::PrimitiveFailedToStart)),
+            "{end:?}"
+        );
+        assert_eq!(detail.grpc_status, Some("Unavailable"));
+        let end = end_of(&read, Err(rpc(tonic::Code::Internal)), true).0;
+        assert!(
+            matches!(end, End::Unknown(UnknownCause::RpcFailure)),
+            "{end:?}"
+        );
+        let (end, detail) = end_of(
+            &read,
+            Err(HostError::PrimitiveFailed(
+                PduErrorEvent::PduErrEvtTxError as i32,
+            )),
+            true,
+        );
+        assert!(
+            matches!(end, End::LinkError(LinkErrorKind::Transmit)),
+            "{end:?}"
+        );
+        assert_eq!(detail.error_event, Some("PDU_ERR_EVT_TX_ERROR"));
+        assert!(matches!(
+            end_of(&read, Err(HostError::EventsLost), true).0,
+            End::Unknown(UnknownCause::EventsLost)
+        ));
+        assert!(matches!(
+            end_of(&read, Err(HostError::EventStreamEnded), true).0,
+            End::Unknown(UnknownCause::EventsEnded)
+        ));
+        assert!(matches!(
+            end_of(
+                &read,
+                Err(HostError::WorkerUnresponsive("StartComPrimitive")),
+                false
+            )
+            .0,
+            End::Unknown(UnknownCause::WorkerNotAnswering)
+        ));
+        assert!(matches!(
+            end_of(&read, Err(HostError::Setup("no handle")), false).0,
+            End::Unknown(UnknownCause::PrimitiveFailedToStart)
+        ));
+    }
+
+    #[test]
+    fn a_positive_response_the_agent_cannot_use_is_unusable() {
+        let block = [0x36, 0x01, 0xAA];
+        assert!(matches!(
+            end_of(&block, Ok(vec![0x76, 0x01]), true).0,
+            End::Positive(_)
+        ));
+        for wrong in [vec![0x76, 0x02], vec![0x76]] {
+            assert!(
+                matches!(
+                    end_of(&block, Ok(wrong.clone()), true).0,
+                    End::PositiveUnusable(_)
+                ),
+                "{wrong:02X?}"
+            );
+        }
+        let download = [0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 1, 0];
+        assert!(matches!(
+            end_of(&download, Ok(vec![0x74, 0x20, 0x01, 0x02]), true).0,
+            End::Positive(_)
+        ));
+        assert!(matches!(
+            end_of(&download, Ok(vec![0x74, 0x20, 0x01]), true).0,
+            End::PositiveUnusable(_)
+        ));
+    }
+
+    #[test]
+    fn a_refusal_names_its_cause() {
+        let cases: [(&[u8], HostError, RefusalCause); 9] = [
+            (
+                &[],
+                HostError::BadService(0x1FF),
+                RefusalCause::UndeclaredService,
+            ),
+            (
+                &[0x22],
+                HostError::UndeclaredService(7),
+                RefusalCause::UndeclaredService,
+            ),
+            (&[], HostError::NotAllowed(0), RefusalCause::EmptyRequest),
+            (&[0x2E], HostError::NotAllowed(0x2E), RefusalCause::Policy),
+            (
+                &[0x36, 0x01],
+                HostError::UseFlashTransfer,
+                RefusalCause::Policy,
+            ),
+            (
+                &[0x36],
+                HostError::NoTransferActive,
+                RefusalCause::NoTransferActive,
+            ),
+            (
+                &[0x36, 0x01],
+                HostError::BlockTooLong {
+                    block: 1,
+                    length: 9,
+                    max: 8,
+                },
+                RefusalCause::BlockTooLong,
+            ),
+            (
+                &[0x36, 0x01],
+                HostError::NoBlockLength {
+                    block: 1,
+                    response: vec![0x74],
+                },
+                RefusalCause::EarlierResponse,
+            ),
+            (
+                &[0x22],
+                HostError::BadNegativeShape("x"),
+                RefusalCause::PreparationError,
+            ),
+        ];
+        for (request, error, cause) in cases {
+            assert_eq!(refusal_cause(request, &error), cause, "{error:?}");
+        }
+    }
+
+    #[test]
+    fn the_suppress_bit_counts_on_a_service_with_a_sub_function() {
+        for suppressed in [
+            [0x3E, 0x80],
+            [0x10, 0x81],
+            [0x87, 0x83],
+            [0x29, 0x80],
+            [0x31, 0x81],
+        ] {
+            assert!(
+                suppresses_positive_response(&suppressed),
+                "{suppressed:02X?}"
+            );
+        }
+        for not in [&[0x3E, 0x00][..], &[0x22, 0x80, 0x01], &[0x3E], &[]] {
+            assert!(!suppresses_positive_response(not), "{not:02X?}");
+        }
+    }
+
+    #[test]
+    fn a_step_s_position_names_its_source_and_sections() {
+        let span = |pc, line| diag_ir::SourceSpan {
+            pc,
+            file: 0,
+            line,
+            column: 5,
+        };
+        let section = |start_pc, end_pc| diag_ir::Section {
+            start_pc,
+            end_pc,
+            interruptible: diag_ir::Interruptible::No,
+            idempotency: diag_ir::Idempotency::Safe,
+            expected_millis: 0,
+        };
+        let program = diag_ir::Program {
+            schema_version: diag_ir::IR_SCHEMA_VERSION,
+            code: Vec::new(),
+            constants: Vec::new(),
+            sections: vec![section(2, 4), section(6, 8)],
+            source_map: vec![span(0, 10), span(3, 11)],
+            identity: Default::default(),
+            preconditions: Default::default(),
+            flash: Vec::new(),
+        };
+        let at = at_of(&program, 2, 9);
+        assert_eq!((at.pc, at.steps), (2, 9));
+        assert_eq!(at.source.map(|source| source.line), Some(10));
+        assert_eq!(at.sections.len(), 1);
+        assert_eq!(
+            at_of(&program, 3, 0).source.map(|source| source.line),
+            Some(11)
+        );
+        assert!(at_of(&program, 4, 0).sections.is_empty());
+        let unmapped = diag_ir::Program {
+            source_map: Vec::new(),
+            ..program
+        };
+        assert!(at_of(&unmapped, 2, 0).source.is_none());
+    }
 
     /// Only an integer reading is a value for `ReadInput`; a reading the agent cannot establish
     /// or decode, or one that is text, is the repeatable host error (ADR-338).

@@ -1035,13 +1035,26 @@ impl LinkState {
         self.matched.clear();
     }
 
+    /// A link error came on the physical channel this link shares, logged as line `seq` (design
+    /// 8.11 "Link error", "Matched answer"): the matched answers and the count since the error
+    /// end, the owed requests stay. The log calls it on every target's state on that channel,
+    /// so a target that sent nothing during the error still loses its matched answers;
+    /// [`LinkState::record`] calls it for an error the exchange it takes in saw.
+    pub(crate) fn channel_link_error(&mut self, seq: u64, kind: LinkErrorKind) {
+        self.matched.clear();
+        self.answered_since_error = 0;
+        self.last_link_error = Some((seq, kind));
+    }
+
     /// Takes in an exchange that was logged.
     ///
     /// - An answer counts in `answered` and `answered_since_error`. It is a matched answer for
     ///   its key only when no owed request could own it and it did not accept an ECUReset or a
     ///   session change (that answer does not count for the exchanges after it).
     /// - A link error, on the exchange's own link or on another link of its physical channel,
-    ///   ends the matched answers and the count since the error, not the owed requests.
+    ///   ends the matched answers and the count since the error, not the owed requests
+    ///   ([`LinkState::channel_link_error`], which the log also calls on the states of the
+    ///   channel's other targets).
     /// - An accepted DiagnosticSessionControl (0x10) or ECUReset (0x11) of any type (ADR-346
     ///   item 6), or one sent with its positive response suppressed and classified `none`, ends
     ///   the matched answers and the owed requests: all of them when its answer could belong to
@@ -1064,9 +1077,7 @@ impl LinkState {
             }
         }
         if let Some(kind) = effect.link_error {
-            self.matched.clear();
-            self.answered_since_error = 0;
-            self.last_link_error = Some((entry.seq, kind));
+            self.channel_link_error(entry.seq, kind);
         }
         if accepting {
             match effect.owners.iter().min() {
@@ -2848,6 +2859,22 @@ mod tests {
         assert_eq!(late.link_history.owed_matching, 1);
         assert_eq!(late.classification, Classification::Undetermined);
         assert_eq!(late.sent, Sent::Unknown);
+    }
+
+    #[test]
+    fn a_channel_error_ends_the_matched_answers_of_an_idle_target_on_the_channel() {
+        // Two targets on one physical channel: B is idle while A's exchange sees the error.
+        let mut b = link_after(&[0x31, 0x01], End::Positive(vec![0x71, 0x01]));
+        assert_eq!(counts(&b), (1, 1));
+        b.channel_link_error(9, LinkErrorKind::Receive);
+        assert_eq!(
+            counts(&b),
+            (0, 1),
+            "matched answers end, the owed request stays"
+        );
+        assert_eq!(b.last_link_error(), Some((9, LinkErrorKind::Receive)));
+        let history = b.history_for(&read([0xF1, 0x86], End::NoResponse));
+        assert_eq!(history.answered_since_error, 0);
     }
 
     #[test]

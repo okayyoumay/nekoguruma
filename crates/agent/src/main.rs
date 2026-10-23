@@ -43,7 +43,8 @@ options:
                        slot (default: the 'locks' directory next to ngr-agent)
   --comm-log <dir>     writes the run's communication log (design 8.11) to this directory,
                        created if missing, and prints the log's path on stderr; without it
-                       the run writes none";
+                       the run writes none, unless its procedure logs messages (diag.log):
+                       then it writes one to the 'commlog' directory next to ngr-agent";
 
 /// How often a job waiting for its guards tries again.
 const GUARD_POLL: Duration = Duration::from_millis(10);
@@ -259,17 +260,18 @@ async fn run(args: RunArgs) -> Result<String, String> {
         .declared_link()
         .map_err(|error| format!("job failed: {error}"))?;
     // Only a job that passed its check gets a log, so a refused one creates no directory.
+    // A procedure that logs messages keeps them in a log even without `--comm-log` (ADR-348
+    // item 6): in `commlog/` beside the agent, as the locks are, and reported like any other.
+    let dir = match args.comm_log {
+        Some(dir) => Some(dir),
+        None if job.logs_messages() => Some(default_comm_logs()?),
+        None => None,
+    };
     let mut log_path = None;
-    if let Some(dir) = args.comm_log {
+    if let Some(dir) = dir {
         let setup = comm_log_setup(dir)?;
         log_path = setup.path().ok();
         job = job.with_comm_log(setup);
-    }
-    // A procedure that logs messages keeps them in a log of its own even without `--comm-log`
-    // (ADR-348 item 6): in `commlog/` beside the agent, as the locks are. Without that
-    // directory such a job is refused.
-    if let Ok(dir) = default_comm_logs() {
-        job = job.with_comm_log_dir(dir);
     }
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.

@@ -122,6 +122,12 @@ impl Job {
         self
     }
 
+    /// Whether the job's procedure logs messages with `diag.log`, so it always has a
+    /// communication log (ADR-348 item 6).
+    pub fn logs_messages(&self) -> bool {
+        logs_messages(&self.program)
+    }
+
     /// Gives the job its flash artifact and the SHA-256 the job names for it (design 8.2.5,
     /// ADR-336 item 1). [`check_job`] refuses the job when `artifact` hashes to something else.
     pub fn with_artifact(mut self, named_sha256: [u8; SHA256_LEN], artifact: Artifact) -> Self {

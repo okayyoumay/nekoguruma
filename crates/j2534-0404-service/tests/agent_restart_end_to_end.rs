@@ -82,6 +82,13 @@
 //! with the post-transfer steps journaled complete, which is the read-back verification (ADR-271):
 //! it redoes nothing of the plan and goes on after it from the VM state journaled at its end.
 //!
+//! The converted scenario runs a procedure converted from Starlark (`CONVERTED`) instead of a
+//! hand-built program: the example ECU definition with a flash plan, whose blocks come from the
+//! job's artifact, killed mid-transfer as above. The definition is copied with its external-supply
+//! and ignition preconditions read from the ECU (`sim-ecu`'s DIDs FD06 and FD07), since the agent
+//! reads no runtime input but the supply voltage, and a restart's gates need every precondition
+//! the plan declares. The restart resets the ECU, redoes the whole transfer and completes.
+//!
 //! The tests are serial, the entry test included: the restart sets process-wide environment
 //! variables for the worker it launches, and the entry test reads one.
 
@@ -359,10 +366,140 @@ fn read_back_program() -> Program {
     program
 }
 
+/// The job variant of the converted-procedure scenario ([`converted_spec`]).
+const CONVERTED: &str = "converted";
+
+/// The converted scenario's procedure: a flash plan (Starlark subset 4.9) that enters the
+/// programming session, erases, transfers the session's one segment and runs the integrity
+/// check, restartable from the erase on (`recovery=never`). A plan is an uninterruptible section
+/// (subset 4.5).
+const CONVERTED_PROCEDURE: &str = "\
+# @section uninterruptible expected=180000
+# @flashPlan session=1 recovery=never
+def write_application():
+    diag.request(0x10, {\"sub\": 0x02})
+    # @erase
+    diag.routine(0xFF00, 0x01, {})
+    exit = diag.flash_transfer(1)
+    if not exit[\"ok\"]:
+        diag.fail(\"TRANSFER_EXIT_REFUSED\", \"the transfer exit was refused\")
+    check = diag.routine(0xFF01, 0x01, {})
+    if not check[\"ok\"]:
+        diag.fail(\"CHECK_FAILED\", \"the integrity check failed\")
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write_application()
+";
+
+/// The converted session's one segment, of [`CONVERTED_BLOCKS`] blocks of the example's 0x100
+/// bytes: the test's copy of `flash_segments.csv` shortens the example's 0x10000 bytes, whose
+/// 256 blocks the restart redoes in about 16 s on a Linux debug build, too close to the
+/// harness's 120 s guard on a loaded Windows runner. 32 blocks still leave the first run's
+/// transfer running for a while after block [`KILL_AFTER_BLOCK`], where the kill comes.
+const CONVERTED_IMAGE_LEN: usize = 0x2000;
+const CONVERTED_BLOCKS: u32 = 0x20;
+
+/// `text` with `from` replaced by `to`; `from` must be in it, so a change to the example's
+/// tables fails here rather than leaving the copy as it was.
+fn replaced(text: &str, from: &str, to: &str) -> String {
+    assert!(text.contains(from), "the example's table holds {from:?}");
+    text.replace(from, to)
+}
+
+/// The example ECU definition (`crates/diag-frontend/examples/example-ecu`) with
+/// [`CONVERTED_PROCEDURE`], its external-supply and ignition preconditions read from the ECU
+/// (`sim-ecu`'s DIDs FD06 and FD07) instead of the runtime inputs the agent cannot read
+/// (`WorkerHost` reads the supply voltage alone), and its segment shortened to
+/// [`CONVERTED_IMAGE_LEN`] bytes, converted as the server would.
+fn converted_document() -> Vec<u8> {
+    let dir = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .join("../diag-frontend/examples/example-ecu");
+    let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(dir)
+        .expect("the example directory")
+        .map(|entry| {
+            let entry = entry.expect("entry");
+            let name = entry.file_name().into_string().expect("UTF-8 name");
+            // A Windows checkout may have CRLF line ends.
+            let text = std::fs::read_to_string(entry.path())
+                .expect("a table")
+                .replace("\r\n", "\n");
+            (name, text)
+        })
+        .map(|(name, text)| {
+            let text = match name.as_str() {
+                "dids.csv" => {
+                    text + ",externalSupply,0xFD06,yes,no,,,\n,ignition,0xFD07,yes,no,,,\n"
+                }
+                "fields.csv" => {
+                    text + "did:externalSupply,externalSupply,0,,uint,8,,,,,,,,,\n\
+                            did:ignition,ignition,0,,uint,8,,,,,,,,,\n"
+                }
+                "preconditions.csv" => replaced(
+                    &replaced(
+                        &text,
+                        ",external_supply,1,1,input:external_supply,,",
+                        ",external_supply,1,1,externalSupply.read.externalSupply,,",
+                    ),
+                    ",ignition,1,1,input:ignition_on,,",
+                    ",ignition,1,1,ignition.read.ignition,,",
+                ),
+                "flash_segments.csv" => replaced(
+                    &text,
+                    "application,app,0x00000000,0x00010000,0,0x0100,",
+                    &format!("application,app,0x00000000,{CONVERTED_IMAGE_LEN:#010X},0,0x0100,")
+                        .replace("0X", "0x"),
+                ),
+                _ => text,
+            };
+            (name, text.into_bytes())
+        })
+        .collect();
+    files.push((
+        "write.star".to_owned(),
+        CONVERTED_PROCEDURE.as_bytes().to_vec(),
+    ));
+    files.sort();
+    let tables =
+        diag_frontend::tables::read_files(files).unwrap_or_else(|e| panic!("does not read: {e:?}"));
+    let definition = diag_frontend::tables::resolve(tables)
+        .unwrap_or_else(|e| panic!("does not resolve: {e:?}"));
+    let procedures = diag_frontend::convert::lower_procedures(&definition)
+        .unwrap_or_else(|e| panic!("does not lower: {e:?}"));
+    // The first variant's, whose software version (1.0.0) is the simulated ECU's.
+    let mut documents = diag_frontend::convert::to_ir(&definition, &procedures).documents;
+    documents.remove(0).bytes
+}
+
+/// The converted scenario's job: [`converted_document`]'s procedure, its identity table from
+/// the document (ADR-345) and an image of [`CONVERTED_IMAGE_LEN`] bytes.
+fn converted_spec() -> JobSpec {
+    let document = converted_document();
+    let program = agent::Job::from_document(
+        agent::JobDocument::new(document.clone()).expect("the document loads"),
+    )
+    .expect("the document carries its procedure")
+    .program()
+    .clone();
+    let sources = ServiceSources::from_document(
+        &agent::JobDocument::new(document.clone()).expect("the document loads"),
+        &program,
+    )
+    .expect("the document's identity table");
+    JobSpec {
+        program,
+        document: Some(document),
+        artifact: Some((0..CONVERTED_IMAGE_LEN).map(|i| (i % 251) as u8).collect()),
+        sources,
+        ..spec()
+    }
+}
+
 /// The job the harness's agent child runs, by the scenario's variant ([`Env::with_variant`]).
 fn spec_for(variant: &str) -> JobSpec {
     match variant {
         "" => spec(),
+        CONVERTED => converted_spec(),
         COMPLETED_PATH => JobSpec {
             program: completed_path_program(),
             ..spec()
@@ -379,6 +516,8 @@ fn spec_for(variant: &str) -> JobSpec {
 fn spec() -> JobSpec {
     JobSpec {
         program: program(),
+        document: None,
+        artifact: None,
         sources: sources(),
         key: JobKey {
             job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e71".to_owned()),
@@ -1560,4 +1699,136 @@ fn a_next_run_with_the_vci_still_unplugged_keeps_the_job_for_a_later_run() {
         Teardown::RESET,
         result,
     );
+}
+
+/// A procedure converted from Starlark, not built by hand (ADR-336, design 8.2.5): the agent
+/// running [`converted_spec`]'s plan is killed mid-transfer while the ECU is in its programming
+/// session, and the restart resets the ECU, redoes the transfer from the erase and completes.
+/// The converted plan's transfer is one expansion with no `Wait` to park in, so the ECU holds
+/// the agent instead: a response-pending sequence armed, before the agent starts, for the
+/// TransferData of the block after [`KILL_AFTER_BLOCK`], and the kill comes while it runs.
+#[test]
+#[serial]
+fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
+    let spec = converted_spec();
+    let env = Env::with_variant("converted", ENTRY, CONVERTED, &ecu_config(60_000));
+    let held = KILL_AFTER_BLOCK + 1;
+    let held_request = format!("uds 36 {held:02X}");
+    // The first run's worker applies the command before its first request, and the fault then
+    // waits for the held block's TransferData (SID 0x36, its block counter).
+    env.inject(&format!(
+        concat!(
+            r#"{{"command": "inject_fault", "request": [54, {}], "#,
+            r#""fault": {{"response_pending": {{"count": {}, "interval_ms": {}}}}}}}"#
+        ),
+        held, PENDING_COUNT, PENDING_INTERVAL_MS
+    ));
+    let agent = env.spawn_agent();
+    env.wait_for(&spec, &held_request, WAIT_FOR_BLOCK, |state| {
+        let sent = env.trace().contains(&held_request);
+        state
+            .facts
+            .transfer
+            .as_ref()
+            .is_some_and(|transfer| transfer.last_block == Some(KILL_AFTER_BLOCK))
+            && sent
+            && env.commands_applied()
+    });
+    let sent_at = std::time::Instant::now();
+    // The kill waits until the ECU has the request, well within the response-pending sequence.
+    std::thread::sleep(KILL_DELAY);
+    let status = agent.kill();
+    assert!(
+        restart::died_of_kill(status),
+        "the agent should be killed while the ECU holds the block, not end by itself: {status}"
+    );
+    let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+    assert!(journal.facts.resume_counts.is_empty());
+    let first_attempt = journal.facts.transfer.expect("a transfer attempt");
+    let killed_at = first_attempt.last_block.expect("a journaled block");
+    assert_eq!(
+        killed_at, KILL_AFTER_BLOCK,
+        "the held block was not journaled"
+    );
+    assert!(first_attempt.exit.is_none(), "no RequestTransferExit yet");
+    // The restart comes after the ECU's sequence is over, as on a restart that takes longer.
+    std::thread::sleep(
+        Duration::from_millis(u64::from(PENDING_COUNT * PENDING_INTERVAL_MS))
+            .saturating_sub(sent_at.elapsed()),
+    );
+    let plan = &spec.program.flash[0];
+    assert!(plan.allows_restart(), "the plan allows a restart");
+    assert_eq!(first_attempt.started_at.pc, plan.boundaries.erase_pc);
+    // The ECU took the held block, whose response the kill kept from the journal, or is still
+    // waiting for it.
+    let before = env.probe();
+    assert_eq!(
+        (before.session, before.flash_phase),
+        (2, 2),
+        "the ECU should still be in its programming session, transferring: {before:?}"
+    );
+    assert!(
+        [killed_at + 1, killed_at + 2].contains(&before.flash_block),
+        "the ECU expects block {} after block {killed_at} was journaled",
+        before.flash_block
+    );
+
+    let state = env
+        .restart(&spec)
+        .expect("the restarted job should complete");
+    assert!(state.call_stack.is_empty(), "{state:?}");
+    let journal = agent::journal::Journal::read(&env.journal_dir(), &spec.key).expect("journal");
+    assert_eq!(journal.facts.resume_counts, [(StageId(plan.stage), 1)]);
+    let transfer = journal.facts.transfer.expect("a transfer attempt");
+    assert_eq!(transfer.started_at.pc, plan.boundaries.erase_pc);
+    assert!(
+        transfer.started_at.steps > first_attempt.started_at.steps,
+        "a new attempt"
+    );
+    assert_eq!(transfer.last_block, Some(CONVERTED_BLOCKS));
+    assert!(!transfer.interrupted);
+    assert!(transfer.exit.expect("an exit marker").complete);
+
+    // The restart's requests in order, as [`assert_restart_order`] reads them: the gates, each
+    // precondition check reading the external supply and the ignition from the ECU after the
+    // supply voltage, the ECUReset, the default-session confirmation, the identity and the
+    // software version, the replayed programming session, the erase, the whole transfer and
+    // the integrity check.
+    const PRECONDITIONS: [&str; 3] = ["vbatt", "uds 22 FD06", "uds 22 FD07"];
+    let mut expected = vec!["vbatt", "uds 22 F190", "uds 22 F187"];
+    expected.extend(PRECONDITIONS);
+    expected.extend([
+        "uds 11 01",
+        "uds 22 F186",
+        "uds 22 F190",
+        "uds 22 F187",
+        "uds 22 F189",
+    ]);
+    expected.extend(PRECONDITIONS);
+    expected.push("uds 10 02");
+    expected.extend(PRECONDITIONS);
+    expected.extend(["uds 31 01 FF00", "uds 34"]);
+    let blocks: Vec<String> = (1..=CONVERTED_BLOCKS)
+        .map(|block| format!("uds 36 {block:02X}"))
+        .collect();
+    expected.extend(blocks.iter().map(String::as_str));
+    expected.extend(["uds 37", "uds 31 01 FF01"]);
+    let trace = env.trace();
+    let mut seen: Vec<&str> = Vec::new();
+    for line in trace.iter().map(String::as_str) {
+        if line.starts_with("uds 3E") || (line == "uds 22 F186" && seen.last() == Some(&line)) {
+            continue;
+        }
+        seen.push(line);
+    }
+    assert_eq!(seen, expected, "the restart's requests: {trace:#?}");
+
+    // The ECU verified the whole image: a closed download, reset once.
+    let probe = env.probe();
+    assert_eq!(
+        (probe.flash_phase, probe.flash_block, probe.received),
+        (4, 0, 0),
+        "{probe:?}"
+    );
+    assert_eq!(probe.power_cycles, before.power_cycles + 1);
 }

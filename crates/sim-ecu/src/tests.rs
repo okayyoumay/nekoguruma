@@ -391,6 +391,11 @@ fn read_data_by_identifier_returns_each_supported_did() {
         ecu.request(&[0x22, 0xF1, 0x90, 0x12, 0x34, 0xF1, 0x86]),
         pos(&expected)
     );
+    // The external supply and the ignition, in the default and the programming session.
+    let flags = [0x62, 0xFD, 0x06, 0x01, 0xFD, 0x07, 0x01];
+    assert_eq!(ecu.request(&[0x22, 0xFD, 0x06, 0xFD, 0x07]), pos(&flags));
+    enter(&mut ecu, Session::Programming);
+    assert_eq!(ecu.request(&[0x22, 0xFD, 0x06, 0xFD, 0x07]), pos(&flags));
 }
 
 #[test]

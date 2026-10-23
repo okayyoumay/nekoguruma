@@ -14,7 +14,9 @@
 //!    journal, which is committed and synced before the next instruction runs, so it needs no
 //!    cooperation from the child beyond the job itself. The test program parks the child with a
 //!    `Wait` instruction right after that block, which leaves the child alive at a known
-//!    instruction until the kill arrives.
+//!    instruction until the kill arrives. A procedure converted from Starlark has no such park
+//!    (its transfer is one expansion), so its scenario has the ECU hold a block's response
+//!    with response-pending messages instead, and kills the agent while it waits.
 //! 3. [`AgentChild::kill`] ends the agent and its worker at once: SIGKILL to the child's
 //!    process group on unix, `TerminateJobObject` on the job object the child was put in on
 //!    Windows (it starts suspended and resumes once it is in the job, so its worker is created
@@ -61,8 +63,8 @@ use agent::guards::{GuardError, GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal, JournalState, Vin};
 use agent::{
-    JobError, JobLimits, JobRun, JournalSetup, LinkConfig, resume_program_journaled,
-    run_program_journaled,
+    Artifact, JobDocument, JobError, JobLimits, JobRun, JournalSetup, LinkConfig,
+    resume_program_journaled, run_program_journaled,
 };
 use diag_ir::{Program, VmState};
 use j2534_0404::{FLOW_CONTROL_FILTER, ISO15765, J2534Api0404, PassThruMessage};
@@ -85,7 +87,14 @@ const RESPONSE_ID: u32 = 0x7E8;
 /// The job a restart test runs. The test file builds it in a function the child processes call
 /// as well, so the first run, the restart and the probes all see the same program.
 pub struct JobSpec {
+    /// The job's program; the procedure of [`JobSpec::document`] when there is one.
     pub program: Program,
+    /// The ECU document the program comes from, for a procedure converted from a definition:
+    /// the job is built from it ([`agent::Job::from_document`]), so the VM decodes through its
+    /// declarations. `None` for a hand-built program.
+    pub document: Option<Vec<u8>>,
+    /// The job's flash artifact, which a converted plan's `FlashBlock` reads (ADR-336 item 1).
+    pub artifact: Option<Vec<u8>>,
     /// The ECU's identity fields, as the program's identity sources refer to them.
     pub sources: ServiceSources,
     pub key: JobKey,
@@ -97,6 +106,37 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
+    /// The job the agent runs: from the document when there is one, with the artifact. Named by
+    /// its path, since on Windows this file's `Job` is the job object the agent child runs in.
+    fn job(&self) -> agent::Job {
+        let job = match &self.document {
+            Some(document) => agent::Job::from_document(
+                JobDocument::new(document.clone()).expect("the document loads"),
+            )
+            .expect("the document carries its procedure"),
+            None => agent::Job::from(self.program.clone()),
+        };
+        match &self.artifact {
+            Some(bytes) => {
+                let artifact = Artifact::from_bytes(bytes.clone());
+                job.with_artifact(*artifact.sha256(), artifact)
+            }
+            None => job,
+        }
+    }
+
+    /// The link the job runs on: the one its document declares, or the harness's ISO 15765 link
+    /// for a hand-built program.
+    fn link(&self) -> LinkConfig {
+        match &self.document {
+            Some(_) => self
+                .job()
+                .declared_link()
+                .expect("the document declares its link"),
+            None => LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
+        }
+    }
+
     fn journal_setup(&self, dir: &Path) -> JournalSetup {
         JournalSetup {
             dir: dir.to_owned(),
@@ -484,8 +524,8 @@ impl Env {
         let guards = guards.unwrap_or_else(|| self.take_guards());
         let JobRun { result, guards, .. } = resume_program_journaled(
             client,
-            &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
-            spec.program.clone(),
+            &spec.link(),
+            spec.job(),
             JobLimits::default(),
             spec.journal_setup(&self.journal_dir()),
             guards,
@@ -546,12 +586,13 @@ impl Env {
                 .await
                 .expect("client should connect");
             let guards = self.take_guards();
-            let program = spec.program.clone();
+            let program = spec.job();
+            let link = spec.link();
             let journal = spec.journal_setup(&self.journal_dir());
             let run = tokio::spawn(async move {
                 run_program_journaled(
                     client,
-                    &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
+                    &link,
                     program,
                     JobLimits::default(),
                     journal,
@@ -991,8 +1032,8 @@ fn agent_main(spec: JobSpec) {
             ..
         } = run_program_journaled(
             client,
-            &LinkConfig::iso15765(REQUEST_ID, RESPONSE_ID),
-            spec.program.clone(),
+            &spec.link(),
+            spec.job(),
             JobLimits::default(),
             spec.journal_setup(&root.join("journal")),
             guards,

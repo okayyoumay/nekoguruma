@@ -32,7 +32,8 @@ loop's.
    `docs/system-architecture.md`.
 2. **When the loop pauses.** On a specification pull request, count the review rounds that
    reported findings, whichever reviewer gave them (Codex, or Copilot after a fallback). After
-   the eighth such round, and after each later one, the round's fix is still pushed as usual. Before the re-request, the loop then checks where the findings
+   the eighth such round, and after each later one, the round's fix is still pushed as usual. Before the re-request (also the one Step 3 of the
+   skill allows after a round that changed no file), the loop then checks where the findings
    of the last four rounds landed: it runs `git blame` on each finding's line at the commit the
    finding reviewed and counts the line as fix-written when the commit that wrote it came after
    the baseline: the head of the first review request, or after a cut or a rewrite, the head of
@@ -56,8 +57,9 @@ loop's.
    maintainer answers. A loop with no maintainer present (for example `backlog-loop`) waits the
    same way, as for any other decision only the maintainer can make.
 4. **Other pull requests.** Code pull requests and the rest of the loop are unchanged. ADR-251's
-   re-request conditions still decide whether a round re-requests at all; this pause only
-   withholds a re-request they would allow.
+   re-request conditions, and the skill's single re-request after a round that changed no file,
+   still decide whether a round re-requests at all; this pause only withholds a re-request they
+   would allow.
 5. **What the reviewer is told.** The review guidelines (`.github/copilot-instructions.md`, which
    Codex reads through `AGENTS.md`) say that a review requested after a cut or a rewrite counts
    as a first review, in which the reviewer reports everything it finds, and that after a cut

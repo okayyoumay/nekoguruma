@@ -274,7 +274,8 @@ finding. A round where every finding was declined (2d) or answered by pointing a
 reply changes no file: skip the sweep, checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
 newly declined finding *and* this head has not been re-requested after a no-change round
-before. Otherwise the loop ends: go to Step 5 after the replies. So the same head is
+before, and, on a specification pull request, the pause in Step 4 does not withhold it.
+Otherwise the loop ends: go to Step 5 after the replies. So the same head is
 re-requested at most once.
 
 First run the sweep ("Sweep: the kinds that recur") over the whole diff as it stands after the
@@ -359,8 +360,8 @@ fixed after the last review.
 is one whose changed files, `work/` aside, are all Markdown and include an ADR
 (`docs/adr/ADR-*.md`) or `docs/system-architecture.md`. On one, count the review rounds that
 reported findings, from either reviewer. After the eighth such round, and after each later one,
-push the round's fix as usual. Then, before any re-request the
-rule above allows, check where the last four rounds' findings landed. For each finding, run
+push the round's fix as usual, if it has one. Then, before any re-request, whether the rule above allows it
+or a round that changed no file does (Step 3), check where the last four rounds' findings landed. For each finding, run
 `git blame -L <line>,<line> <reviewed commit> -- <path>`, using the line and commit the finding
 reviewed (`original_line` and `original_commit_id` in `get_review_comments`). Count the line as
 fix-written when the commit that wrote it is not an ancestor of the baseline commit

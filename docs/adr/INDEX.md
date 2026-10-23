@@ -337,6 +337,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-345](ADR-345-the-agent-builds-its-source-table-from-the-job-s-document.md) | The Agent Builds Its Source Table From the Job's Document | Accepted | `agent` (`ServiceSources::from_document`, `check_job`, `JobError::Sources`, journal setup's table), design 8.9; ADR-245, ADR-336, ADR-338 |
 | [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
 | [ADR-347](ADR-347-the-communication-log-s-file-and-writer.md) | The Communication Log's File and Writer | Accepted | design 8.11; `agent` `comm_log`, job runner entry points (`JobRun`), journal writer lock; ADR-255, ADR-346 item 10 |
+| [ADR-348](ADR-348-operational-logs.md) | Operational Logs | Accepted | design 12.2 and 8.7; `agent` logging setup and worker output capture, `vci-service-launcher` and `vci-service-config` file output and rotation, `server`; ADR-024, ADR-033, ADR-089, ADR-285 |
 
 ## Status Legend
 
@@ -610,6 +611,7 @@ the predecessor repository these ADRs came from.
 - ADR-187
 - ADR-346
 - ADR-347
+- ADR-348
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)

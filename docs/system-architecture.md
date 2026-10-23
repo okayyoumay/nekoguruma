@@ -968,6 +968,7 @@ OTX HMI elements (confirmation, value input) are relayed via the server, because
 | updates | Firmware write jobs |
 | modes | Session control, power and ignition state |
 | bulk-data | Raw data chunks, freeze frames, captured sections (4.6) |
+| logs | Operational logs of the agent and its workers (12.2) |
 
 - SOVD operations / updates follow an asynchronous "start execution -> get status -> complete" model, so the existing job model maps onto them directly
 - SOVD presupposes OAuth2, which is consistent with adopting OIDC
@@ -1487,6 +1488,20 @@ Signature verification is needed on both server and agent, and is consolidated i
 - Do not declare dependencies on i386 / armhf packages
 - The `diag-ir` VM also runs on the server side, validating procedure definitions at ingestion with a dry run (execution with vehicle access mocked). `diag_ir::dry_run` resolves each request to the declared service it belongs to, answers it from a script or, without one, with a positive response built from the service's declaration, decodes every answer, and reports the requests, the decoded values, the other primitives reached and how the run ended; waits pass at once, and a key or operator answer must be scripted (ADR-328)
 - IR golden tests (known definition -> generated IR -> expected request bytes and decode results) are kept as regression tests: `crates/diag-frontend/tests/golden.rs` converts the example ECU with a golden procedure and compares the IR, the requests its programs send and the values its declarations decode from recorded responses with expected files, which `NGR_UPDATE_GOLDEN=1` rewrites when a change is intended. Fuzzing against malformed IR is also performed (the cargo-fuzz targets in `fuzz/`, run by CI)
+
+### 12.2 Operational Logs
+
+The operational log tells the developers and maintainers of NGR why NGR itself misbehaved (ADR-348). It is a third record beside the audit log (8.2.3), which is the evidence of what a job did, and the communication log (8.11), which places a failed exchange on the vehicle side or the system side. It is never evidence and nothing reads it to decide what to do, so an entry lost to rotation is acceptable; an event that belongs in one of the other two records is written there, and the operational log at most names it.
+
+- **Library and levels**: the agent, the workers and the server log through `tracing` with its five levels (`error`, `warn`, `info`, `debug`, `trace`), `info` by default. There is no fatal level: a process that cannot continue logs `error` before it exits
+- **Configuration**: workers take `level` and `output` from `config.toml` per API, library and architecture (ADR-024, ADR-033), checked before use (7.2, ADR-285). The agent reads the same fields from a table of its own in the same file, under the same check. Its default output is stderr when run from a terminal and a rotated file under `/var/log/nekoguruma/` (Linux) or `%ProgramData%\nekoguruma\logs\` (Windows) when run as an OS service (6.5)
+- **Workers' output**: the agent reads each worker's stderr line by line into its own log, with the worker's library name and ABI as fields and each line cut at 8 KiB. A worker with an output of its own keeps it
+- **Form**: a file output is JSON Lines, one entry per line with the UTC timestamp, level, `tracing` target, process, message and span fields; stderr stays text. Entries logged during a job carry the job id, ownership generation and VCI name, so they line up with the job's journal and communication log
+- **Size**: a file is rotated by size (10 MiB by default) and the oldest rotated file is deleted beyond a count (5 by default), so one process's log stays near 60 MiB
+- **Content**: never a VIN or other vehicle identity, a key, token, credential, seed or key value, OEM authorization or signing material, personal data, or the payload of a diagnostic exchange. Text from a vendor library or worker is escaped so that one entry stays one line. Detail kept from gRPC clients (ADR-089) goes here only
+- **Time**: entries carry the device clock, which is not trusted; the server records its receive time beside entries it fetches
+- **Collection**: nothing is streamed. The server fetches an agent's entries for a time range at or above a level through an enumerated instruction (16.3), up to 4 MiB per request over the data channel (5.2), and a failed job's result carries that job's entries at `info` and above, up to 1 MiB. Only administrators fetch logs; the server keeps them apart from the audit log, for a retention period set by the operator. Another enumerated instruction raises the agent's level filter for at most 24 hours, without touching outputs or paths
+- **Server**: JSON Lines to stdout for the platform to collect (14), or the rotated file in a local deployment (13), with the job id shared with the agent's entries. A component's SOVD `logs` resource (8.7) is served from these entries, `debug` and `trace` both reported as `debug`
 
 ---
 

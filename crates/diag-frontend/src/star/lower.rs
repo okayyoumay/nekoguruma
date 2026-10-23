@@ -701,7 +701,9 @@ impl Val {
     /// on an operand that may hold them may hold them too.
     fn tainted(self, secret: bool) -> Val {
         match self {
-            Val::Run(mut tys, code) if secret => {
+            // A value with no known type comes from an error already reported, which a second
+            // one about the secret would only repeat.
+            Val::Run(mut tys, code) if secret && tys.bits != 0 => {
                 tys.secret = true;
                 Val::Run(tys, code)
             }
@@ -2262,8 +2264,7 @@ impl<'a> Lowerer<'a> {
             ExprP::Op(lhs, op, rhs) => {
                 let a = self.expr(id, lhs);
                 let b = self.expr(id, rhs);
-                let secret = a.secret() || b.secret();
-                self.binary(id, *op, a, b, span).tainted(secret)
+                self.binary(id, *op, a, b, span)
             }
             ExprP::If(parts) => {
                 let (cond, then, otherwise) = &**parts;
@@ -2801,7 +2802,14 @@ impl<'a> Lowerer<'a> {
         Val::Const(Const::Int(0))
     }
 
+    /// `a op b`, marked secret when either operand is ([`Val::tainted`]), for an expression and
+    /// an augmented assignment alike.
     fn binary(&mut self, id: Option<usize>, op: BinOp, a: Val, b: Val, span: Span) -> Val {
+        let secret = a.secret() || b.secret();
+        self.binary_of(id, op, a, b, span).tainted(secret)
+    }
+
+    fn binary_of(&mut self, id: Option<usize>, op: BinOp, a: Val, b: Val, span: Span) -> Val {
         if let (Val::Const(x), Val::Const(y)) = (&a, &b) {
             // A list search compares the needle with every item, so it reads the needle once
             // per item.

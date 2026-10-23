@@ -2320,6 +2320,17 @@ fn security_access_arguments_and_results_are_checked() {
             "def main():\n    res = diag.security_access(1)\n    x = res[\"fields\"][\"key\"]\n",
             NotInProfile,
         ),
+        // Its `raw` holds the key response, which no message may be built from (ADR-348 item 6),
+        // also through a helper.
+        (
+            "def main():\n    res = diag.security_access(1)\n    diag.log(1, res[\"raw\"])\n",
+            SecretInText,
+        ),
+        (
+            "def key(r):\n    return r[\"raw\"][2:]\n\n\
+             def main():\n    diag.fail(\"KEY\", key(diag.security_access(1)))\n",
+            SecretInText,
+        ),
     ];
     for (source, code) in cases {
         let found = codes(source);

@@ -1940,6 +1940,15 @@ fn log_and_fail_text_built_from_a_secret_response_is_rejected() {
             "def main():\n    {authenticate}\n    \
              diag.log(1, \"no token\" if auth[\"ok\"] else auth[\"fields\"][\"token\"])\n"
         ),
+        // An augmented assignment, and `and`.
+        format!(
+            "def main():\n    {authenticate}\n    text = \"token \"\n    \
+             text += auth[\"fields\"][\"token\"]\n    diag.log(1, text)\n"
+        ),
+        format!(
+            "def main():\n    {authenticate}\n    \
+             diag.fail(\"AUTH\", auth[\"ok\"] and auth[\"fields\"][\"token\"])\n"
+        ),
         // A variable that holds the secret on one path only.
         format!(
             "def main():\n    {authenticate}\n    text = \"none\"\n    \

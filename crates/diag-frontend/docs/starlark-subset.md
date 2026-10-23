@@ -328,7 +328,10 @@ parameters and returned values (a variable or parameter is marked when any value
 4.8), and through every operator, index, slice and built-in that takes a marked operand; a conditional expression
 is marked when either branch is. A response's `ok` and `nrc` are not marked, so a procedure logs whether the ECU
 accepted the step and which code it refused it with. The mark follows data only, not the conditions around it: a
-constant message logged in a branch taken on a secret value is accepted.
+constant message logged in a branch taken on a secret value is accepted. A message or detail that may hold such
+bytes is `STAR_SECRET_IN_TEXT` whatever its type, before its type is checked. Since a function's parameters and result
+have one type for all its calls (4.8), a helper that one caller passes a secret is marked for every call: a
+`diag.log` inside it is rejected there, and so is a message another caller builds from its result.
 
 ### 3.2 Lowering
 

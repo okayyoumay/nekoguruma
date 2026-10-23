@@ -1169,6 +1169,12 @@ pub(crate) struct ExchangeEntry {
 }
 
 impl ExchangeEntry {
+    /// The link error the exchange saw, on its own link or another link of its channel, which
+    /// ends the matched answers of the channel's other targets too ([`LinkState::record`]).
+    pub(crate) fn link_error(&self) -> Option<LinkErrorKind> {
+        self.effect.link_error
+    }
+
     /// The entry for `evidence` as line `seq`, with `history` from
     /// [`LinkState::history_for`], classified by [`classify`].
     pub(crate) fn build(seq: u64, evidence: Evidence, history: LinkHistory) -> Self {

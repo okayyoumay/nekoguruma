@@ -16,8 +16,16 @@ use vci_service_interface::{
     PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest, event_item, event_notification,
 };
 
+use crate::comm_log::AgentNow;
+use crate::comm_log::exchange::{
+    AgentTimes, At, Detail, End, Evidence, Expected, LinkErrorKind, Origin, RefusalCause,
+    SectionAttrs, SourcePos, Target, UnknownCause,
+};
 use crate::link::{Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
+
+/// The `link` of the host's exchange entries: a job has one link (design 8.11).
+const LOG_LINK: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {
@@ -396,8 +404,17 @@ pub struct WorkerHost<C: WorkerApi> {
     document: Option<crate::document::JobDocument>,
     /// The job's flash artifact, which `Op::FlashBlock` reads its blocks from (ADR-336).
     artifact: Option<crate::artifact::Artifact>,
-    /// The job's communication log, which the exchange entries will go to (ADR-347).
+    /// The job's communication log, which the exchange entries go to (design 8.11, ADR-347).
     comm_log: Option<crate::comm_log::CommLog>,
+    /// The link's request and response identifiers, which the entries name.
+    link_ids: Option<(u32, u32)>,
+    /// The VM position of the step running ([`ProcedurePosition`]): only a request sent
+    /// during a step gets an entry here, with `origin` `procedure`. The runner's and the
+    /// restart's own reads have origins of their own, which do not reach the host yet.
+    at: Option<At>,
+    /// The `seq` of the entry of the last RequestDownload, which a block refused for its
+    /// response names (`caused_by`).
+    download_seq: Option<u64>,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -413,6 +430,9 @@ impl<C: WorkerApi> WorkerHost<C> {
             document: None,
             artifact: None,
             comm_log: None,
+            link_ids: None,
+            at: None,
+            download_seq: None,
         }
     }
 
@@ -425,6 +445,12 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// events to (ADR-347).
     pub fn set_comm_log(&mut self, comm_log: Option<crate::comm_log::CommLog>) {
         self.comm_log = comm_log;
+    }
+
+    /// Gives the host its link's request and response identifiers, which its exchange entries
+    /// name (design 8.11, `target`).
+    pub(crate) fn set_link_ids(&mut self, tx_id: u32, rx_id: u32) {
+        self.link_ids = Some((tx_id, rx_id));
     }
 
     /// Gives the host the job's flash artifact, which `artifact_bytes` serves (ADR-336 item 12).
@@ -456,10 +482,20 @@ impl<C: WorkerApi> WorkerHost<C> {
     ///
     /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
-        crate::policy::check_request(&request, self.link.application_layer, self.link.permission)?;
-        let progress = Progress::for_request(&request)?;
-        let handle = self.handle.clone();
-        handle.block_on(self.send_recv_async(request, progress))
+        let before = self.log_clock();
+        let checked = crate::policy::check_request(
+            &request,
+            self.link.application_layer,
+            self.link.permission,
+        )
+        .and_then(|()| Progress::for_request(&request));
+        match checked {
+            Ok(progress) => self.send(request, progress, before),
+            Err(error) => {
+                self.log_refused(&request, before, &error, None);
+                Err(error)
+            }
+        }
     }
 
     /// [`send_recv`](Self::send_recv) for a generic send-receive, whose answer is matched
@@ -469,17 +505,56 @@ impl<C: WorkerApi> WorkerHost<C> {
         request: Vec<u8>,
         expected: Expectation,
     ) -> Result<Vec<u8>, HostError> {
-        crate::policy::check_request(&request, self.link.application_layer, self.link.permission)?;
-        let progress = Progress::expecting(expected);
-        let handle = self.handle.clone();
-        handle.block_on(self.send_recv_async(request, progress))
+        let before = self.log_clock();
+        if let Err(error) = crate::policy::check_request(
+            &request,
+            self.link.application_layer,
+            self.link.permission,
+        ) {
+            self.log_refused(&request, before, &error, None);
+            return Err(error);
+        }
+        self.send(request, Progress::expecting(expected), before)
     }
 
+    /// Sends `request`, which `progress` waits for the answer to, and writes its exchange entry
+    /// when the host logs (`before` is the agent's time before it).
+    fn send(
+        &mut self,
+        request: Vec<u8>,
+        progress: Progress,
+        before: Option<AgentNow>,
+    ) -> Result<Vec<u8>, HostError> {
+        let logged = before.map(|_| {
+            let expected = Expected {
+                positive_prefix: progress.positive_prefix.clone(),
+                negative_pattern: progress.negative.pattern(progress.sid),
+            };
+            (
+                request.clone(),
+                expected,
+                progress.negative.clone(),
+                progress.sid,
+            )
+        });
+        let handle = self.handle.clone();
+        let (result, started) = handle.block_on(self.send_recv_async(request, progress));
+        if let Some((request, expected, negative, sid)) = logged {
+            let (end, detail) = sent_end(&result, &negative, sid, started);
+            self.log(&request, before, end, detail, |evidence| {
+                evidence.expected = expected;
+            });
+        }
+        result
+    }
+
+    /// Sends `request` and waits for the primitive to end: the outcome, and whether the
+    /// primitive started (a failure to start it sent nothing).
     async fn send_recv_async(
         &mut self,
         request: Vec<u8>,
         mut progress: Progress,
-    ) -> Result<Vec<u8>, HostError> {
+    ) -> (Result<Vec<u8>, HostError>, bool) {
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -500,18 +575,25 @@ impl<C: WorkerApi> WorkerHost<C> {
         let now = tokio::time::Instant::now();
         let deadline = now + self.timings.send_recv;
         // Starting the primitive counts against the same budget.
-        let cop = unary(
+        let started = unary(
             self.timings.unary.min(self.timings.send_recv),
             "StartComPrimitive",
             self.client.start_com_primitive(start),
         )
         .await
-        .map_err(lost_vci_between_primitives)?
-        .cop_handle
-        // Without a handle, events of no primitive would match.
-        .ok_or(HostError::Setup(
-            "StartComPrimitive returned no primitive handle",
-        ))?;
+        .map_err(lost_vci_between_primitives)
+        .and_then(|response| {
+            response
+                .cop_handle
+                // Without a handle, events of no primitive would match.
+                .ok_or(HostError::Setup(
+                    "StartComPrimitive returned no primitive handle",
+                ))
+        });
+        let cop = match started {
+            Ok(cop) => cop,
+            Err(error) => return (Err(error), false),
+        };
 
         let events = &mut self.link.events;
         let wait = async {
@@ -529,9 +611,288 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
             }
         };
-        tokio::time::timeout_at(deadline, wait)
+        let ended = tokio::time::timeout_at(deadline, wait)
             .await
-            .map_err(|_| HostError::NoResponse)?
+            .map_err(|_| HostError::NoResponse)
+            .and_then(|outcome| outcome);
+        (ended, true)
+    }
+
+    /// The agent's time now, when the host logs the request it is about to send: it has a log,
+    /// its link's identifiers and a VM step running.
+    fn log_clock(&self) -> Option<AgentNow> {
+        match (&self.comm_log, &self.at, self.link_ids) {
+            (Some(log), Some(_), Some(_)) => Some(log.now()),
+            _ => None,
+        }
+    }
+
+    /// Writes the exchange entry of `request`, which ended as `end`, when the host logs it
+    /// (`before` is `Some`): `origin` `procedure` at the step's position, with the agent's times
+    /// and `detail`, and what `complete` adds to the evidence. A failure of the log never
+    /// reaches the job, a panic included (ADR-347).
+    fn log(
+        &mut self,
+        request: &[u8],
+        before: Option<AgentNow>,
+        end: End,
+        detail: Detail,
+        complete: impl FnOnce(&mut Evidence),
+    ) {
+        let (Some(before), Some(log), Some(at), Some((tx_id, rx_id))) =
+            (before, &self.comm_log, &self.at, self.link_ids)
+        else {
+            return;
+        };
+        let target = Target::Endpoint {
+            link: LOG_LINK,
+            tx_id,
+            rx_id,
+        };
+        let mut evidence = Evidence::new(
+            Origin::Procedure,
+            target,
+            LOG_LINK,
+            rx_id,
+            request.to_vec(),
+            end,
+        );
+        evidence.at = Some(at.clone());
+        evidence.suppressed = suppresses_positive_response(request);
+        evidence.detail = detail;
+        complete(&mut evidence);
+        let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let now = log.now();
+            evidence.times.agent = AgentTimes {
+                epoch: before.epoch,
+                before_us: before.monotonic_us,
+                tx_confirmed_us: None,
+                end_us: now.monotonic_us,
+                before_wall_unix_ms: Some(before.wall_unix_ms),
+                end_wall_unix_ms: Some(now.wall_unix_ms),
+            };
+            log.exchange(evidence)
+        }));
+        let seq = logged.unwrap_or_else(|_| {
+            tracing::warn!("writing an exchange entry panicked");
+            None
+        });
+        if request.first() == Some(&SID_REQUEST_DOWNLOAD) {
+            self.download_seq = seq;
+        }
+    }
+
+    /// Writes the entry of a request the agent refused before sending it, for `error`
+    /// (`not_sent`, design 8.11). `caused_by` is the entry whose response caused the refusal.
+    fn log_refused(
+        &mut self,
+        request: &[u8],
+        before: Option<AgentNow>,
+        error: &HostError,
+        caused_by: Option<u64>,
+    ) {
+        let end = End::NotSent(refusal_cause(request, error));
+        let detail = Detail {
+            host_error: Some(host_error_name(error)),
+            ..Detail::default()
+        };
+        self.log(request, before, end, detail, |evidence| {
+            evidence.caused_by = caused_by;
+        });
+    }
+}
+
+const SID_REQUEST_DOWNLOAD: u8 = 0x34;
+
+/// Whether `request` asks for its positive response to be suppressed: bit 7 of the
+/// sub-function of a service that has one, which the host strips from the positive prefix
+/// (`positive_prefix`) and the ECU leaves unanswered when the request succeeds.
+fn suppresses_positive_response(request: &[u8]) -> bool {
+    matches!(request, [0x10 | 0x11 | 0x19 | 0x27 | 0x28 | 0x31 | 0x3E | 0x85, sub, ..] if sub & 0x80 != 0)
+}
+
+/// How a sent request ended, as its exchange entry gives it (design 8.11, `outcome`), and the
+/// internal names behind it. `started` tells a primitive that could not start from one that ran.
+fn sent_end(
+    result: &Result<Vec<u8>, HostError>,
+    negative: &NegativeShape,
+    sid: u8,
+    started: bool,
+) -> (End, Detail) {
+    let error = match result {
+        Ok(response) if negative.is_negative(sid, response) => {
+            return (End::Negative(response.clone()), Detail::default());
+        }
+        Ok(response) => return (End::Positive(response.clone()), Detail::default()),
+        Err(error) => error,
+    };
+    let mut detail = Detail {
+        host_error: Some(host_error_name(error)),
+        ..Detail::default()
+    };
+    let end = match error {
+        HostError::NoResponse => End::NoResponse,
+        HostError::EventsLost => End::Unknown(UnknownCause::EventsLost),
+        HostError::EventStreamEnded => End::Unknown(UnknownCause::EventsEnded),
+        HostError::WorkerUnresponsive(_) => End::Unknown(UnknownCause::WorkerNotAnswering),
+        HostError::Rpc { status, .. } => {
+            detail.grpc_status = Some(grpc_code_name(status.code()));
+            End::Unknown(if started {
+                UnknownCause::RpcFailure
+            } else {
+                UnknownCause::PrimitiveFailedToStart
+            })
+        }
+        HostError::Setup(_) => End::Unknown(UnknownCause::PrimitiveFailedToStart),
+        HostError::VciLost => End::VciLost {
+            refused_after_loss: !started,
+        },
+        HostError::PrimitiveFailed(code) => {
+            detail.error_event = PduErrorEvent::try_from(*code)
+                .ok()
+                .map(|event| event.as_str_name());
+            End::LinkError(link_error_kind(*code))
+        }
+        // `send_recv_async` gives no other error.
+        _ => End::Unknown(UnknownCause::RpcFailure),
+    };
+    (end, detail)
+}
+
+/// The kind of link error an error event names (design 8.11 "Link error"; ISO 22900-2:2022
+/// D.4.1 lists the events).
+fn link_error_kind(code: i32) -> LinkErrorKind {
+    match PduErrorEvent::try_from(code) {
+        Ok(PduErrorEvent::PduErrEvtFrameStruct) => LinkErrorKind::Frame,
+        Ok(PduErrorEvent::PduErrEvtTxError) => LinkErrorKind::Transmit,
+        Ok(PduErrorEvent::PduErrEvtTesterPresentError) => LinkErrorKind::TesterPresent,
+        Ok(PduErrorEvent::PduErrEvtRscLocked) => LinkErrorKind::ResourceLocked,
+        Ok(PduErrorEvent::PduErrEvtRxError) => LinkErrorKind::Receive,
+        Ok(PduErrorEvent::PduErrEvtProtErr) => LinkErrorKind::Protocol,
+        Ok(PduErrorEvent::PduErrEvtVciHardwareFault) => LinkErrorKind::VciHardwareFault,
+        Ok(PduErrorEvent::PduErrEvtInitError) => LinkErrorKind::Initialisation,
+        _ => LinkErrorKind::Other,
+    }
+}
+
+/// Why the agent refused `request` for `error` (design 8.11, `not_sent`).
+fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
+    match error {
+        HostError::BadService(_) if !request.is_empty() => RefusalCause::UndeclaredService,
+        _ if request.is_empty() => RefusalCause::EmptyRequest,
+        HostError::EmptyRequest => RefusalCause::EmptyRequest,
+        HostError::NotAllowed(_)
+        | HostError::UseFlashTransfer
+        | HostError::WrongService { .. }
+        | HostError::DownloadBySendReceive(_)
+        | HostError::TransferInterrupted(_) => RefusalCause::Policy,
+        HostError::BadService(_) | HostError::UndeclaredService(_) => {
+            RefusalCause::UndeclaredService
+        }
+        HostError::NoTransferActive => RefusalCause::NoTransferActive,
+        HostError::BlockTooLong { .. } => RefusalCause::BlockTooLong,
+        HostError::NoBlockLength { .. } => RefusalCause::EarlierResponse,
+        _ => RefusalCause::PreparationError,
+    }
+}
+
+/// The name of `error`'s variant, which an exchange entry's `detail` carries in place of its
+/// text (the text prints response bytes, which `redact` must see first).
+fn host_error_name(error: &HostError) -> &'static str {
+    match error {
+        HostError::Rpc { .. } => "Rpc",
+        HostError::WorkerUnresponsive(_) => "WorkerUnresponsive",
+        HostError::EventStreamEnded => "EventStreamEnded",
+        HostError::NoResponse => "NoResponse",
+        HostError::EventsLost => "EventsLost",
+        HostError::VciLost => "VciLost",
+        HostError::PrimitiveFailed(_) => "PrimitiveFailed",
+        HostError::BadService(_) => "BadService",
+        HostError::NotAllowed(_) => "NotAllowed",
+        HostError::NoTransferActive => "NoTransferActive",
+        HostError::TransferRefused { .. } => "TransferRefused",
+        HostError::TransferEchoMismatch { .. } => "TransferEchoMismatch",
+        HostError::BlockTooLong { .. } => "BlockTooLong",
+        HostError::NoBlockLength { .. } => "NoBlockLength",
+        HostError::UseFlashTransfer => "UseFlashTransfer",
+        HostError::NoArtifact => "NoArtifact",
+        HostError::ArtifactRange { .. } => "ArtifactRange",
+        HostError::Unsupported(_) => "Unsupported",
+        HostError::EmptyRequest => "EmptyRequest",
+        HostError::UndeclaredService(_) => "UndeclaredService",
+        HostError::WrongService { .. } => "WrongService",
+        HostError::DeclaredLink(_) => "DeclaredLink",
+        HostError::BadNegativeShape(_) => "BadNegativeShape",
+        HostError::DownloadBySendReceive(_) => "DownloadBySendReceive",
+        HostError::TransferInterrupted(_) => "TransferInterrupted",
+        HostError::Setup(_) => "Setup",
+        HostError::InputNotEstablished(_) => "InputNotEstablished",
+    }
+}
+
+/// The name of a gRPC status code, as `detail` carries it.
+fn grpc_code_name(code: tonic::Code) -> &'static str {
+    match code {
+        tonic::Code::Ok => "Ok",
+        tonic::Code::Cancelled => "Cancelled",
+        tonic::Code::Unknown => "Unknown",
+        tonic::Code::InvalidArgument => "InvalidArgument",
+        tonic::Code::DeadlineExceeded => "DeadlineExceeded",
+        tonic::Code::NotFound => "NotFound",
+        tonic::Code::AlreadyExists => "AlreadyExists",
+        tonic::Code::PermissionDenied => "PermissionDenied",
+        tonic::Code::ResourceExhausted => "ResourceExhausted",
+        tonic::Code::FailedPrecondition => "FailedPrecondition",
+        tonic::Code::Aborted => "Aborted",
+        tonic::Code::OutOfRange => "OutOfRange",
+        tonic::Code::Unimplemented => "Unimplemented",
+        tonic::Code::Internal => "Internal",
+        tonic::Code::Unavailable => "Unavailable",
+        tonic::Code::DataLoss => "DataLoss",
+        tonic::Code::Unauthenticated => "Unauthenticated",
+    }
+}
+
+/// The VM position of the request a step sends, which a host's exchange entries carry (design
+/// 8.11, `at`). The runner tells the host where each step begins and that it ended.
+pub trait ProcedurePosition {
+    /// The VM is about to run the instruction at `pc`, `steps` into the program.
+    fn step_begins(&mut self, _program: &diag_ir::Program, _pc: u32, _steps: u64) {}
+    /// The step ended: what the host sends now is not the procedure's.
+    fn step_ends(&mut self) {}
+}
+
+impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
+    fn step_begins(&mut self, program: &diag_ir::Program, pc: u32, steps: u64) {
+        if self.comm_log.is_some() {
+            self.at = Some(at_of(program, pc, steps));
+        }
+    }
+
+    fn step_ends(&mut self) {
+        self.at = None;
+    }
+}
+
+/// The `at` of the instruction at `pc`: its source position, from the source map entry that
+/// covers it (an entry covers its instruction and those after it up to the next, ADR-304), and
+/// the attributes of every section it is in, outermost first.
+fn at_of(program: &diag_ir::Program, pc: u32, steps: u64) -> At {
+    let covering = program.source_map.partition_point(|span| span.pc <= pc);
+    let source = covering
+        .checked_sub(1)
+        .map(|at| SourcePos::from(&program.source_map[at]));
+    let sections = program
+        .sections
+        .iter()
+        .filter(|section| section.start_pc <= pc && pc < section.end_pc)
+        .map(SectionAttrs::from)
+        .collect();
+    At {
+        pc,
+        steps,
+        source,
+        sections,
     }
 }
 
@@ -723,9 +1084,20 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     type Error = HostError;
 
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
-        let request = service_request_bytes(service, payload)?;
+        let before = self.log_clock();
+        let request = match service_request_bytes(service, payload) {
+            Ok(request) => request,
+            Err(error) => {
+                // No request can carry the service, so the entry has no bytes.
+                self.log_refused(&[], before, &error, None);
+                return Err(error);
+            }
+        };
         // Every TransferData goes through the block counter of `flash_transfer`.
-        refuse_transfer_data(&request)?;
+        if let Err(error) = refuse_transfer_data(&request) {
+            self.log_refused(&request, before, &error, None);
+            return Err(error);
+        }
         let response = self.send_recv(request.clone());
         self.transfer
             .after_request(&request, response.as_deref().map_err(|_| ()));
@@ -738,12 +1110,19 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     // against the service's positive response and the variant's negative-response shape
     // (ADR-309 item 4).
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, HostError> {
-        let expected = crate::send_receive::prepare(
+        let before = self.log_clock();
+        let expected = match crate::send_receive::prepare(
             self.document.as_ref(),
             service,
             request,
             self.transfer.accepted.is_some(),
-        )?;
+        ) {
+            Ok(expected) => expected,
+            Err(error) => {
+                self.log_refused(request, before, &error, None);
+                return Err(error);
+            }
+        };
         let response = self.send_expecting(request.to_vec(), expected);
         self.transfer
             .after_request(request, response.as_deref().map_err(|_| ()));
@@ -781,9 +1160,27 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     // The IR operand `block` is ignored: it is constant per instruction, while the wire counter
     // rises and wraps, so the counter comes from the host's own running count (ADR-250).
     fn flash_transfer(&mut self, _block: u32, data: &[u8]) -> Result<(), HostError> {
-        let (index, counter) = self.transfer.next()?;
-        self.transfer.check_length(index, data.len())?;
-        let outcome = self.send_recv(transfer_data_bytes(counter, data));
+        let before = self.log_clock();
+        let (index, counter) = match self.transfer.next() {
+            Ok(next) => next,
+            Err(error) => {
+                // No transfer gives the block a counter: the entry has the SID alone.
+                self.log_refused(&[0x36], before, &error, None);
+                return Err(error);
+            }
+        };
+        let request = transfer_data_bytes(counter, data);
+        if let Err(error) = self.transfer.check_length(index, data.len()) {
+            // A block refused for want of a block length was refused for the RequestDownload's
+            // response.
+            let caused_by = match error {
+                HostError::NoBlockLength { .. } => self.download_seq,
+                _ => None,
+            };
+            self.log_refused(&request, before, &error, caused_by);
+            return Err(error);
+        }
+        let outcome = self.send_recv(request);
         self.transfer.after_block(index, counter, outcome)
     }
 

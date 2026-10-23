@@ -339,16 +339,23 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   requests. The other rows stand as comments where the table puts them, and evidence only they
   could classify falls to the last row, `undetermined`, at the place in the table where that row
   stands.
-- **Exchange entries.** The worker host writes one entry for each request a VM step sends
-  through it (`send_recv`, the generic send-receive) and for each it refuses before sending
-  (`not_sent`: the request policy, an undeclared service, TransferData outside `FlashTransfer`, a
-  block with no transfer, one longer than the ECU's block length, or one refused for its
-  RequestDownload's response, which `caused_by` names). Each has `origin` `procedure`, the step's
-  `at` (pc, step count, the source position the program's source map gives, and the sections in
-  force), the link's identifiers as its `target`, the agent's times, and in `detail` the host
-  error's variant name, the error event's name and the gRPC status code, never their text. The
-  runner tells the host where each step begins and that it ended (`ProcedurePosition`); a request
-  sent outside a step (the runner's and the restart's own reads) gets no entry yet. The log keeps
+- **Exchange entries.** The worker host writes one entry for each request a VM step, the runner
+  or the restart sends through it (`send_recv`, the generic send-receive) and for each it refuses
+  before sending (`not_sent`: the request policy, an undeclared service, TransferData outside
+  `FlashTransfer`, a block with no transfer, one longer than the ECU's block length, or one
+  refused for its RequestDownload's response, which `caused_by` names). Each has its `origin`,
+  the link's identifiers as its `target`, the agent's times, and in `detail` the host error's
+  variant name, the error event's name and the gRPC status code, never their text. A step's
+  request has `origin` `procedure` and the step's `at` (pc, step count, the source position the
+  program's source map gives, and the sections in force); the runner tells the host where each
+  step begins and that it ended (`ProcedurePosition`). The runner's and the restart's own reads
+  have no `at`, and the origin the runner names around them (`ProcedurePosition::own_reads`):
+  `identification` for the identity read at a plan's entry and every identity read of a restart
+  (its gates included) or a checkpoint resume, `precondition` for every precondition read (the
+  gates', and the checks before the replay and before the erase), `teardown` for the ECUReset,
+  `restart_check` for the default-session confirmation and the restart's other checks, and
+  `guard` for the software version read. A supply voltage read is an IOCTL, not an exchange.
+  The log keeps
   one `LinkState` per target for the run, so it outlives the link within the run; a later run of
   the job starts it over, since the log is not read back. A link error an entry carries is handed
   to every other target's state too. Writing an entry never reaches the job, a panic included.

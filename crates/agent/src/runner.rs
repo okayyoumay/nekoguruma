@@ -29,7 +29,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
-use crate::host::{HostError, ProcedurePosition, Timings, TransferProgress, WorkerHost};
+use crate::host::{HostError, OwnRead, ProcedurePosition, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
 use crate::journaling::{JobJournal, JournalSetup};
@@ -1453,14 +1453,16 @@ where
             count_procedure_resume(&mut journal, limits, cancelled)?;
             let poll = limits.wait_poll.max(Duration::from_millis(1));
             let target_vin = journal.state().facts.target_vin.clone();
-            restart::check_procedure_identity(
-                program,
-                target_vin.as_ref(),
-                &sources,
-                host,
-                cancelled,
-                |vin| promote_to_vehicle(guards, vin, poll, cancelled),
-            )
+            own_reads(host, OwnRead::Identification, |host| {
+                restart::check_procedure_identity(
+                    program,
+                    target_vin.as_ref(),
+                    &sources,
+                    host,
+                    cancelled,
+                    |vin| promote_to_vehicle(guards, vin, poll, cancelled),
+                )
+            })
             .map_err(|error| journal_identity_abort(&mut journal, error))?;
             let point = *point;
             let run_start = point.state.steps;
@@ -1489,10 +1491,14 @@ where
         RestartDecision::Restart(point) => {
             // `classify` restarts only from a journal it read.
             let mut journal = opened?;
-            restart::check_before_ecu(program, &point, &mut journal, host, cancelled)?;
+            own_reads(host, OwnRead::RestartCheck, |host| {
+                restart::check_before_ecu(program, &point, &mut journal, host, cancelled)
+            })?;
             let poll = limits.wait_poll.max(Duration::from_millis(1));
-            let gate = restart::check_gates(program, &point, &sources, host, cancelled, |vin| {
-                promote_to_vehicle(guards, vin, poll, cancelled)
+            let gate = own_reads(host, OwnRead::Identification, |host| {
+                restart::check_gates(program, &point, &sources, host, cancelled, |vin| {
+                    promote_to_vehicle(guards, vin, poll, cancelled)
+                })
             })
             .map_err(|error| journal_identity_abort(&mut journal, error))?;
             // `classify` took the point from one of the program's plans.
@@ -1503,28 +1509,36 @@ where
                 .ok_or(JobError::Journal(JournalError::Invariant(
                     "the restart point names no plan of the program",
                 )))?;
-            let teardown = restart::teardown(gate, &point, &plan.timing, host, poll, cancelled)?;
-            let confirmed = restart::confirm_default_session(
-                point.flash_session,
-                teardown.clone(),
-                &plan.timing,
-                host,
-                poll,
-                cancelled,
-            )?;
-            restart::check_identity(
-                program,
-                &point,
-                &teardown,
-                &sources,
-                host,
-                cancelled,
-                |vin| promote_to_vehicle(guards, vin, poll, cancelled),
-            )
+            let teardown = own_reads(host, OwnRead::Teardown, |host| {
+                restart::teardown(gate, &point, &plan.timing, host, poll, cancelled)
+            })?;
+            let confirmed = own_reads(host, OwnRead::RestartCheck, |host| {
+                restart::confirm_default_session(
+                    point.flash_session,
+                    teardown.clone(),
+                    &plan.timing,
+                    host,
+                    poll,
+                    cancelled,
+                )
+            })?;
+            own_reads(host, OwnRead::Identification, |host| {
+                restart::check_identity(
+                    program,
+                    &point,
+                    &teardown,
+                    &sources,
+                    host,
+                    cancelled,
+                    |vin| promote_to_vehicle(guards, vin, poll, cancelled),
+                )
+            })
             .map_err(|error| journal_identity_abort(&mut journal, error))?;
-            let state = restart::check_state(
-                program, &point, plan, &teardown, &sources, host, poll, cancelled,
-            )?;
+            let state = own_reads(host, OwnRead::Guard, |host| {
+                restart::check_state(
+                    program, &point, plan, &teardown, &sources, host, poll, cancelled,
+                )
+            })?;
             if state == restart::StateCheck::ReadBackVerification {
                 // The match is the verification (ADR-271 item 1): the program goes on after the
                 // plan, with no erase and no reset for the verified plan.
@@ -1533,7 +1547,9 @@ where
                 )
                 .map(Restarted::Finished);
             }
-            restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)?;
+            own_reads(host, OwnRead::Precondition, |host| {
+                restart::check_reentry(program, &point, &teardown, &sources, host, cancelled)
+            })?;
             // Step 4b-2 (ADR-273): the plan's steps from the entry to the erase, without
             // the erase. A run start carrying the entry state is committed first (ADR-274),
             // so the entry state stays the one the journal finds behind a later end state.
@@ -1557,9 +1573,11 @@ where
                     // normally put the ECU in its programming session, so the mutable
                     // conditions are read through their programming-session sources, right
                     // before the erase.
-                    restart::check_before_erase(
-                        program, &point, &teardown, &sources, host, cancelled,
-                    )?;
+                    own_reads(host, OwnRead::Precondition, |host| {
+                        restart::check_before_erase(
+                            program, &point, &teardown, &sources, host, cancelled,
+                        )
+                    })?;
                     Ok(Restarted::AtErase(Box::new(AtErase {
                         journal: replay,
                         vm,
@@ -1831,6 +1849,19 @@ fn holds_cancel(program: &Program, holds: &[bool], pc: u32) -> bool {
         || matches!(program.code.get(pc as usize), Some(Op::Ret))
 }
 
+/// Runs `reads`, the runner's or the restart's own, with `origin` for the communication log
+/// (design 8.11).
+fn own_reads<H: ProcedurePosition, T>(
+    host: &mut H,
+    origin: OwnRead,
+    reads: impl FnOnce(&mut H) -> T,
+) -> T {
+    host.own_reads(Some(origin));
+    let result = reads(host);
+    host.own_reads(None);
+    result
+}
+
 /// The step loop from `vm`'s state, shared by a run from the program's start and the restart's
 /// replay (ADR-273). The caller commits the run start (ADR-272, ADR-274), not this loop. With `stop_before`, the loop ends in
 /// [`RunEnd::Stopped`] when execution arrives at that instruction, before the journal's
@@ -1913,7 +1944,9 @@ where
                 };
                 return Err(stop_run(Some(journal), at, RunStop::Vm(source), error));
             }
-            journal.arrive(program, &vm.state, host, cancelled)?;
+            own_reads(host, OwnRead::Identification, |host| {
+                journal.arrive(program, &vm.state, host, cancelled)
+            })?;
             // The identity reads at a boundary take time; a cancel during them stops the job
             // before the boundary's instruction runs.
             if cancelled.load(Ordering::Relaxed) {

@@ -1822,6 +1822,7 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
         seen.push(line);
     }
     assert_eq!(seen, expected, "the restart's requests: {trace:#?}");
+    assert_restart_origins(&env, &spec);
 
     // The ECU verified the whole image: a closed download, reset once.
     let probe = env.probe();
@@ -1831,4 +1832,99 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
         "{probe:?}"
     );
     assert_eq!(probe.power_cycles, before.power_cycles + 1);
+}
+
+/// The communication log the restart wrote beside the journal (design 8.11) gives each of its
+/// own reads the origin of the check that sent it, and the replayed and the redone steps the
+/// procedure's, in the order [`a_converted_starlark_procedure_killed_mid_transfer_is_restarted`]
+/// checks the requests in. A supply voltage read is no exchange, and tester presents and a
+/// repeated confirmation read are left out as there.
+fn assert_restart_origins(env: &Env, spec: &JobSpec) {
+    let setup = agent::CommLogSetup {
+        dir: env.journal_dir(),
+        key: spec.key.clone(),
+    };
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    // The restart's run is the last one in the log.
+    let run = lines
+        .iter()
+        .rposition(|line| line["event"] == "job_start")
+        .expect("a job start");
+    // The first run's own reads are the identity read at the plan's entry (8.9.1), before the
+    // erase; everything else it sent is the procedure's.
+    let first: Vec<(&str, &str)> = lines[..run]
+        .iter()
+        .filter(|line| line["event"] == "exchange" && line["origin"] != "procedure")
+        .map(|line| {
+            (
+                line["origin"].as_str().expect("an origin"),
+                line["request"]["bytes"]["clear"]
+                    .as_str()
+                    .expect("a request"),
+            )
+        })
+        .collect();
+    assert!(!first.is_empty(), "{text}");
+    assert!(
+        first.iter().all(|(origin, _)| *origin == "identification"),
+        "{first:?}"
+    );
+    let mut seen: Vec<(String, String)> = Vec::new();
+    for entry in lines[run..]
+        .iter()
+        .filter(|line| line["event"] == "exchange")
+    {
+        let origin = entry["origin"].as_str().expect("an origin").to_owned();
+        let request = entry["request"]["bytes"]["clear"]
+            .as_str()
+            .expect("the request in clear")
+            .to_owned();
+        assert_eq!(
+            entry["at"].is_object(),
+            origin == "procedure",
+            "only the procedure's requests have a VM position: {entry}"
+        );
+        let repeated = seen.last() == Some(&(origin.clone(), request.clone()));
+        if request.starts_with("3e") || (request == "22f186" && repeated) {
+            continue;
+        }
+        seen.push((origin, request));
+    }
+    fn preconditions(origin: &'static str) -> [(&'static str, &'static str); 2] {
+        [(origin, "22fd06"), (origin, "22fd07")]
+    }
+    // The gates: the identity, then the preconditions.
+    let mut expected = vec![("identification", "22f190"), ("identification", "22f187")];
+    expected.extend(preconditions("precondition"));
+    expected.extend([
+        ("teardown", "1101"),
+        ("restart_check", "22f186"),
+        ("identification", "22f190"),
+        ("identification", "22f187"),
+        ("guard", "22f189"),
+    ]);
+    expected.extend(preconditions("precondition"));
+    expected.push(("procedure", "1002"));
+    expected.extend(preconditions("precondition"));
+    expected.push(("procedure", "3101ff00"));
+    let own = expected.len();
+    let seen_own: Vec<(&str, &str)> = seen[..own.min(seen.len())]
+        .iter()
+        .map(|(origin, request)| (origin.as_str(), request.as_str()))
+        .collect();
+    assert_eq!(seen_own, expected, "{text}");
+    // The download, the whole transfer, its exit and the integrity check are the procedure's.
+    assert_eq!(
+        seen.len(),
+        own + 1 + CONVERTED_BLOCKS as usize + 2,
+        "{text}"
+    );
+    assert!(
+        seen[own..].iter().all(|(origin, _)| origin == "procedure"),
+        "{text}"
+    );
 }

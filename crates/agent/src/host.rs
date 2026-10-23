@@ -410,10 +410,12 @@ pub struct WorkerHost<C: WorkerApi> {
     comm_log: Option<crate::comm_log::CommLog>,
     /// The link's request and response identifiers, which the entries name.
     link_ids: Option<(u32, u32)>,
-    /// The VM position of the step running ([`ProcedurePosition`]): only a request sent
-    /// during a step gets an entry here, with `origin` `procedure`. The runner's and the
-    /// restart's own reads have origins of their own, which do not reach the host yet.
+    /// The VM position of the step running ([`ProcedurePosition`]): a request sent during a
+    /// step gets an entry with `origin` `procedure` at this position.
     at: Option<At>,
+    /// The runner's or the restart's own reads running ([`ProcedurePosition::own_reads`]): a
+    /// request sent outside a step gets an entry with their origin, and none without one.
+    own: Option<OwnRead>,
     /// The `seq` of the entry of the last RequestDownload, which a block refused for its
     /// response names (`caused_by`).
     download_seq: Option<u64>,
@@ -434,6 +436,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             comm_log: None,
             link_ids: None,
             at: None,
+            own: None,
             download_seq: None,
         }
     }
@@ -630,18 +633,29 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 
     /// The agent's time now, when the host logs the request it is about to send: it has a log,
-    /// its link's identifiers and a VM step running.
+    /// its link's identifiers, and a VM step or the agent's own reads running.
     fn log_clock(&self) -> Option<AgentNow> {
-        match (&self.comm_log, &self.at, self.link_ids) {
+        match (&self.comm_log, self.origin(), self.link_ids) {
             // A log that failed takes no more lines, so nothing is built for it.
             (Some(log), Some(_), Some(_)) if log.is_open() => Some(log.now()),
             _ => None,
         }
     }
 
+    /// The origin of a request sent now: the procedure's during a VM step, else that of the
+    /// agent's own reads running, if any.
+    fn origin(&self) -> Option<Origin> {
+        match (&self.at, self.own) {
+            (Some(_), _) => Some(Origin::Procedure),
+            (None, Some(own)) => Some(own.origin()),
+            (None, None) => None,
+        }
+    }
+
     /// Writes the exchange entry of `request`, which ended as `end`, when the host logs it
-    /// (`before` is `Some`): `origin` `procedure` at the step's position, with the agent's times
-    /// and `detail`, and what `complete` adds to the evidence. A failure of the log never
+    /// (`before` is `Some`): with its origin ([`WorkerHost::origin`]), at the step's position
+    /// for the procedure's, with the agent's times and `detail`, and what `complete` adds to the
+    /// evidence. A failure of the log never
     /// reaches the job, a panic included (ADR-347).
     fn log(
         &mut self,
@@ -651,8 +665,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         detail: Detail,
         complete: impl FnOnce(&mut Evidence),
     ) {
-        let (Some(before), Some(log), Some(at), Some((tx_id, rx_id))) =
-            (before, &self.comm_log, &self.at, self.link_ids)
+        let (Some(before), Some(log), Some(origin), Some((tx_id, rx_id))) =
+            (before, &self.comm_log, self.origin(), self.link_ids)
         else {
             return;
         };
@@ -661,15 +675,8 @@ impl<C: WorkerApi> WorkerHost<C> {
             tx_id,
             rx_id,
         };
-        let mut evidence = Evidence::new(
-            Origin::Procedure,
-            target,
-            LOG_LINK,
-            rx_id,
-            request.to_vec(),
-            end,
-        );
-        evidence.at = Some(at.clone());
+        let mut evidence = Evidence::new(origin, target, LOG_LINK, rx_id, request.to_vec(), end);
+        evidence.at = self.at.clone();
         evidence.suppressed = suppresses_positive_response(request);
         evidence.detail = detail;
         complete(&mut evidence);
@@ -938,6 +945,38 @@ pub trait ProcedurePosition {
     fn step_begins(&mut self, _program: &diag_ir::Program, _pc: u32, _steps: u64) {}
     /// The step ended: what the host sends now is not the procedure's.
     fn step_ends(&mut self) {}
+    /// The runner or the restart begins reads of its own, outside a step (`Some`), or ends
+    /// them (`None`): what the host sends meanwhile has that origin.
+    fn own_reads(&mut self, _reads: Option<OwnRead>) {}
+}
+
+/// Reads the runner and the restart send on their own, outside the VM's steps, by the origin
+/// the communication log gives them (design 8.11, `origin`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnRead {
+    /// The identity reads: at a plan's entry, and every identity read of a restart (its gates
+    /// included) or a checkpoint resume (8.2.5, 8.9.1).
+    Identification,
+    /// The write guard's reads of the ECU's state (8.9.1).
+    Guard,
+    /// The reads of the flash preconditions, wherever a restart checks them (8.9).
+    Precondition,
+    /// A restart's confirmation of the default session, and its other checks (8.2.5).
+    RestartCheck,
+    /// A restart's ECUReset (8.2.5).
+    Teardown,
+}
+
+impl OwnRead {
+    fn origin(self) -> Origin {
+        match self {
+            Self::Identification => Origin::Identification,
+            Self::Guard => Origin::Guard,
+            Self::Precondition => Origin::Precondition,
+            Self::RestartCheck => Origin::RestartCheck,
+            Self::Teardown => Origin::Teardown,
+        }
+    }
 }
 
 impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
@@ -949,6 +988,10 @@ impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
 
     fn step_ends(&mut self) {
         self.at = None;
+    }
+
+    fn own_reads(&mut self, reads: Option<OwnRead>) {
+        self.own = reads;
     }
 }
 

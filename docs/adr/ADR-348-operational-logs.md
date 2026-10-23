@@ -53,15 +53,16 @@ workshop.
    default is `info`. A process that cannot continue logs at `error` before it exits; there is no
    separate fatal level. Where SOVD severities are needed (item 10), `error`, `warn` and `info`
    map to the same names and `debug` and `trace` both map to `debug`.
-3. **The agent sets up logging the way a worker does.** At startup the agent installs a
-   subscriber configured from the same configuration file and the same `level` and `output`
-   fields as the workers, in a table of the agent's own, checked as ADR-285 checks the workers'
-   (in device mode a file that fails the check is not read and logging starts with its
-   defaults). The default output is stderr when the agent runs from a terminal and a rotated file
-   in a per-OS log directory when it runs as an OS service (design 6.5): `/var/log/nekoguruma/`
-   on Linux and `%ProgramData%\nekoguruma\logs\` on Windows. Every entry logged while a job runs
-   carries the job id and ownership generation (the journal's key) and the VCI name in a span,
-   so it can be lined up with the job's journal and communication log.
+3. **The agent sets up logging the way a worker does.** At startup the agent installs a subscriber
+   configured from the same configuration file and the same `level` and `output` fields as the
+   workers, in a table of the agent's own, checked as ADR-285 checks the workers' (in device mode a
+   file that fails the check is not read and logging starts with its defaults). The default output
+   is stderr when the agent runs from a terminal and a rotated file in a per-OS log directory when
+   it runs as an OS service (design 6.5): `/var/log/nekoguruma/` on Linux and
+   `%ProgramData%\nekoguruma\logs\` on Windows. Every entry logged while a job runs carries the job
+   id and ownership generation (the journal's key) and the VCI name in a span (the VCI name in the
+   span's `external` field, item 6), so it can be lined up with the job's journal and communication
+   log.
 4. **The agent captures its workers' output.** The agent reads each worker's stderr line by line and
    logs each line in its own operational log, the line in the entry's `external` field (item 6), at
    `info` unless the line carries a level the agent can read, with the worker's library name and ABI
@@ -87,13 +88,16 @@ workshop.
    directory; ADR-089 keeps full paths out of gRPC replies and in the log). Such text goes in an
    entry's `external` field, apart from the message, with control characters and line breaks escaped
    so that one entry stays one line and cannot imitate another; item 8 says when it may leave the
-   device. Text a procedure builds at run time can hold any of these, so it never reaches the
-   operational log: a `diag.log` message (Starlark subset 3.1) is written to the job's communication
-   log as a `procedure_log` event with its level, and a `diag.fail` detail stays in the job's
-   journal and result; the operational log records at most that a procedure logged or failed, with
-   the level or the code. A value the agent reads from the vehicle, such as an identity that did not
-   match, is likewise logged as the fact, not the value. Until every existing `tracing` call has
-   been checked against this item, the agent installs no subscriber (item 3).
+   device. Names that may identify a person or a device go there too, wherever they appear, span
+   fields included: the operator, a device or host name, an OS user name and an IP address (design
+   16.2), and a name a user or vendor gives a VCI (a VCI name, a J2534 `pname` or label). Text a
+   procedure builds at run time can hold any of these, so it never reaches the operational log: a
+   `diag.log` message (Starlark subset 3.1) is written to the job's communication log as a
+   `procedure_log` event with its level, and a `diag.fail` detail stays in the job's journal and
+   result; the operational log records at most that a procedure logged or failed, with the level or
+   the code. A value the agent reads from the vehicle, such as an identity that did not match, is
+   likewise logged as the fact, not the value. Until every existing `tracing` call has been checked
+   against this item, the agent installs no subscriber (item 3).
 7. **Device timestamps are not authoritative.** Entries carry the device's clock. Unlike the
    audit log (design 16.3), the operational log does not need a trusted time; when the server
    receives entries (item 8) it records its receive time beside them.
@@ -102,12 +106,12 @@ workshop.
    (design 16.3); the agent answers from its local files, at most 4 MiB per request, over the data
    channel's resumable transfer (design 5.2). When a job fails, the agent sends the entries logged
    in that job's span at `info` and above, at most 1 MiB, with the job's result. Fetching is limited
-   to administrators. Entries leave the device without their `external` fields, which are replaced
-   by their length, unless an administrator's fetch asks for them; such a fetch is held to design
-   16.2's rule for troubleshooting logs (sent only on an explicit action of the device's user, with
-   the scope shown), and nothing sent automatically carries them. The server keeps fetched entries
-   apart from the audit log, for a retention period that is an operator setting. An agent with no
-   server, or offline, keeps its entries only in its rotated files.
+   to administrators. Entries leave the device without their `external` fields, span fields
+   included, which are replaced by their length, unless an administrator's fetch asks for them; such
+   a fetch is held to design 16.2's rule for troubleshooting logs (sent only on an explicit action
+   of the device's user, with the scope shown), and nothing sent automatically carries them. The
+   server keeps fetched entries apart from the audit log, for a retention period that is an operator
+   setting. An agent with no server, or offline, keeps its entries only in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    It cannot change the output or any path, and only administrators can issue it, as for item 8.

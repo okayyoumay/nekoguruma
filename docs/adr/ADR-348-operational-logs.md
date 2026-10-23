@@ -60,12 +60,16 @@ faults, and aims the logs at software experts away from the workshop.
    alone when it runs as an OS service (design 6.5). Whatever `output` names, the agent also writes
    its entries to its rotated file of item 5, which is what item 8 collects, so a stderr, `journald`
    or `eventlog` output does not leave the server with nothing to fetch. The file's directory is a
-   setting, by default `/var/log/nekoguruma/` on Linux and `%ProgramData%\nekoguruma\logs\` on
-   Windows. Only `null` turns the file off; when it is off or cannot be opened, the agent says so on
-   its other output, and a fetch or a failed job's result reports that the agent keeps no log rather
-   than returning nothing. Every entry logged while a job runs carries the job id and ownership
-   generation (the journal's key) and the VCI name in a span (the VCI name in the span's `external`
-   field, item 6), so it can be lined up with the job's journal and communication log.
+   setting. Its default for an agent run as an OS service is `/var/log/nekoguruma/` on Linux and
+   `%ProgramData%\nekoguruma\logs\` on Windows, which the installation creates owned by the service
+   account; for an agent run from a terminal it is the user's own state directory,
+   `$XDG_STATE_HOME/nekoguruma/logs/` (by default `~/.local/state/nekoguruma/logs/`) on Linux and
+   `%LOCALAPPDATA%\nekoguruma\logs\` on Windows, which the agent creates. Only `null` turns the file
+   off; when it is off or cannot be opened, the agent says so on its other output, and a fetch or a
+   failed job's result reports that the agent keeps no log rather than returning nothing. Every
+   entry logged while a job runs carries the job id and ownership generation (the journal's key) and
+   the VCI name in a span (the VCI name in the span's `external` field, item 6), so it can be lined
+   up with the job's journal and communication log.
 4. **The agent captures its workers' output.** The agent reads each worker's stderr line by line and
    logs each line in its own operational log, the line in the entry's `external` field (item 6), at
    `info` unless the line carries a level the agent can read, with the worker's library name and ABI
@@ -123,13 +127,17 @@ faults, and aims the logs at software experts away from the workshop.
    is reached: the entry that recorded the job's failure, then `error` entries newest first, then
    `warn` entries newest first, then `info` entries newest first; the attachment says how many
    entries it left out at each level, and an entry larger than the space left is skipped rather than
-   cut. Fetching is limited to administrators. Entries leave the device without their `external`
-   fields, span fields included, which are replaced by their length, unless an administrator's fetch
-   asks for them; such a fetch is held to design 16.2's rule for troubleshooting logs (sent only on
-   an explicit action of the device's user, with the scope shown), and nothing sent automatically
-   carries them. The server keeps fetched entries apart from the audit log, for a retention period
-   that is an operator setting. An agent with no server, or offline, keeps its entries only in its
-   rotated files.
+   cut. The attachment goes only to the server that issued the job and is stored with that job; its
+   job id and ownership generation are that server's own keys, not identifiers of a person or
+   vehicle, and with `external` fields removed it adds nothing about the vehicle or any person to
+   what the server already holds for the job, so it needs no anonymization beyond that removal
+   (design 16.2). Fetching is limited to administrators. Entries leave the device without their
+   `external` fields, span fields included, which are replaced by their length, unless an
+   administrator's fetch asks for them; such a fetch is held to design 16.2's rule for
+   troubleshooting logs (sent only on an explicit action of the device's user, with the scope
+   shown), and nothing sent automatically carries them. The server keeps fetched entries apart from
+   the audit log, for a retention period that is an operator setting. An agent with no server, or
+   offline, keeps its entries only in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    It cannot change the output or any path, and only administrators can issue it, as for item 8.

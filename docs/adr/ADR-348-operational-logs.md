@@ -73,29 +73,35 @@ faults, and aims the logs at software experts away from the workshop.
    up with the job's journal and communication log.
 4. **The agent captures its workers' output.** The agent reads each worker's stderr line by line and
    logs each line in its own operational log, the line in the entry's `external` field (item 6), at
-   `info` unless the line carries a level the agent can read, with the worker's library name and ABI
-   as fields. A worker configured with an output of its own (a file, `journald`, `eventlog`) keeps
-   it, and its entries then stay at that destination: they are not in the agent's log, so neither a
-   fetch nor a failed job's result (item 8) carries them. The default stderr output is the one that
-   is collected; another output is a choice for local investigation on the device. A line longer
-   than 8 KiB is cut to 8 KiB and marked as cut: the reader keeps at most 8 KiB of a line and reads
-   and discards the rest up to the next line break or the end of the stream, so one misbehaving
-   library that never ends a line can neither fill an entry nor the agent's memory without bound.
+   `info` unless the line carries a level the agent can read, with the worker's API, ABI and worker
+   number (item 5) as fields and its library name, which a user or vendor configures and may name a
+   device, in `external` as well. A worker configured with an output of its own (a file, `journald`,
+   `eventlog`) keeps it, and its entries then stay at that destination: they are not in the agent's
+   log, so neither a fetch nor a failed job's result (item 8) carries them. The default stderr
+   output is the one that is collected; another output is a choice for local investigation on the
+   device. A line longer than 8 KiB is cut to 8 KiB and marked as cut: the reader keeps at most 8
+   KiB of a line and reads and discards the rest up to the next line break or the end of the stream,
+   so one misbehaving library that never ends a line can neither fill an entry nor the agent's
+   memory without bound.
 5. **Files are JSON Lines, one per process, private, rotated by size, with a cap.** A file output,
    in the agent and the workers alike, writes one JSON object per line with at least the timestamp
-   (UTC, RFC 3339 with microseconds), the level, the `tracing` target, the process (`agent`, the
-   worker's API and library, or `server`), the message and the span fields. stderr stays
-   human-readable text. Every process writes a file of its own: a worker adds a stem naming its API,
-   its library and, when the library has several devices, the device's position in the library's
-   `modules` list to the configured path, so workers that share a library-level or root setting
-   never write or rotate the same file. A log file and the directory NGR creates for it are readable
-   and writable only by the account the process runs as and by administrators (mode 0600 for files
-   and 0700 for directories on Unix, an access list granting only that account, SYSTEM and
+   (UTC, RFC 3339 with microseconds), the level, the `tracing` target, the process (`agent`,
+   `server`, or a worker's API and worker number, never its configured library or VCI name, which go
+   in `external`), the message and the span fields. stderr stays human-readable text. Every process
+   writes a file of its own: a worker adds a stem naming its API and its worker number to the
+   configured path. The agent gives each worker it launches a number unique among the workers it
+   runs at that time (the smallest one free) on its command line, so workers that share a
+   library-level or root setting, a J2534 library's several devices and the per-VCI D-PDU workers of
+   one library (design 8.8.1) alike, never write or rotate the same file; a worker started without
+   one uses its process id. A log file and the directory NGR creates for it are readable and
+   writable only by the account the process runs as and by administrators (mode 0600 for files and
+   0700 for directories on Unix, an access list granting only that account, SYSTEM and
    Administrators on Windows), since entries can carry `external` text (item 6); an existing file
    with wider access is narrowed when opened, or, where that fails, the output falls back to stderr
-   with a warning. A file is rotated when it reaches its size limit, and the oldest rotated file is
-   deleted once the count limit is reached. The limits are two new settings beside `output`: a
-   default of 10 MiB per file and 5 rotated files, so one process's log takes at most about 60 MiB.
+   with a warning (a stderr that item 6 treats as forwardable). A file is rotated when it reaches
+   its size limit, and the oldest rotated file is deleted once the count limit is reached. The
+   limits are two new settings beside `output`: a default of 10 MiB per file and 5 rotated files, so
+   one process's log takes at most about 60 MiB.
 6. **What an operational log never holds.** No VIN or other vehicle identity read from an ECU, no
    key, token, credential, seed or key value, OEM authorization material, signing material or bearer
    token, no personal data, and no request or response payload of a diagnostic exchange (the
@@ -105,27 +111,29 @@ faults, and aims the logs at software experts away from the workshop.
    directory; ADR-089 keeps full paths out of gRPC replies and in the log). Such text goes in an
    entry's `external` field, apart from the message, with control characters and line breaks escaped
    so that one entry stays one line and cannot imitate another; item 8 says when it may leave the
-   device. An output that the OS may forward off the device, `journald` and `eventlog`, writes an
-   `external` field as its length only, like the server's copy; the full text is kept only in the
-   local file and on stderr. Names that may identify a person or a device go there too, wherever
-   they appear, span fields included: the operator, a device or host name, an OS user name and an IP
-   address (design 16.2), and a name a user or vendor gives a VCI (a VCI name, a J2534 `pname` or
-   label). Text a procedure builds at run time can hold any of these, so it never reaches the
-   operational log: a `diag.log` message (Starlark subset 3.1) is written to the job's communication
-   log as a `procedure_log` event with its level (a job whose procedure uses `diag.log`, which its
-   IR shows when the job starts, always has a communication log, even without a journal and without
-   its caller asking for one, so the message is never dropped: when such a `run_program` job carries
-   no setup, the agent gives it one, in its communication-log directory, a setting that defaults to
-   `commlog/` in the agent's local storage beside its journals (design 5.5), with a job id of its
-   own as `ngr-agent run --comm-log` does; this extends ADR-347 Decision item 2; the communication
-   log's rule that secret bytes are kept as their length only, design 8.11, holds for these messages
-   too: ingestion rejects a `diag.log` message or `diag.fail` detail built from a value read from a
-   SecurityAccess or Authentication response, so no such bytes reach either), and a `diag.fail`
-   detail stays in the job's journal and result; the operational log records at most that a
-   procedure logged or failed, with the level or the code. A value the agent reads from the vehicle,
-   such as an identity that did not match, is likewise logged as the fact, not the value. Until
-   every existing `tracing` call has been checked against this item, the agent installs no
-   subscriber (item 3).
+   device. An output that the OS may forward off the device writes an `external` field as its length
+   only, like the server's copy: `journald`, `eventlog`, and stderr whenever it is not a terminal
+   (an OS service's stderr goes to the service manager, which may forward it), the fallback of item
+   5 included. The full text is kept only in the local file, on a terminal's stderr and on a
+   worker's stderr, which the agent reads through a private pipe (item 4). Names that may identify a
+   person or a device go there too, wherever they appear, span fields included: the operator, a
+   device or host name, an OS user name and an IP address (design 16.2), and a name a user or vendor
+   gives a VCI (a VCI name, a J2534 `pname` or label). Text a procedure builds at run time can hold
+   any of these, so it never reaches the operational log: a `diag.log` message (Starlark subset 3.1)
+   is written to the job's communication log as a `procedure_log` event with its level (a job whose
+   procedure uses `diag.log`, which its IR shows when the job starts, always has a communication
+   log, even without a journal and without its caller asking for one, so the message is never
+   dropped: when such a `run_program` job carries no setup, the agent gives it one, in its
+   communication-log directory, a setting that defaults to `commlog/` in the agent's local storage
+   beside its journals (design 5.5), with a job id of its own as `ngr-agent run --comm-log` does;
+   this extends ADR-347 Decision item 2; the communication log's rule that secret bytes are kept as
+   their length only, design 8.11, holds for these messages too: ingestion rejects a `diag.log`
+   message or `diag.fail` detail built from a value read from a SecurityAccess or Authentication
+   response, so no such bytes reach either), and a `diag.fail` detail stays in the job's journal and
+   result; the operational log records at most that a procedure logged or failed, with the level or
+   the code. A value the agent reads from the vehicle, such as an identity that did not match, is
+   likewise logged as the fact, not the value. Until every existing `tracing` call has been checked
+   against this item, the agent installs no subscriber (item 3).
 7. **Device timestamps are not authoritative.** Entries carry the device's clock. Unlike the
    audit log (design 16.3), the operational log does not need a trusted time; when the server
    receives entries (item 8) it records its receive time beside them.

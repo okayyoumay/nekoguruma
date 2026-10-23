@@ -61,7 +61,7 @@ use agent::guards::{GuardError, GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal, JournalState, Vin};
 use agent::{
-    Artifact, Job, JobDocument, JobError, JobLimits, JobRun, JournalSetup, LinkConfig,
+    Artifact, JobDocument, JobError, JobLimits, JobRun, JournalSetup, LinkConfig,
     resume_program_journaled, run_program_journaled,
 };
 use diag_ir::{Program, VmState};
@@ -88,7 +88,7 @@ pub struct JobSpec {
     /// The job's program; the procedure of [`JobSpec::document`] when there is one.
     pub program: Program,
     /// The ECU document the program comes from, for a procedure converted from a definition:
-    /// the job is built from it ([`Job::from_document`]), so the VM decodes through its
+    /// the job is built from it ([`agent::Job::from_document`]), so the VM decodes through its
     /// declarations. `None` for a hand-built program.
     pub document: Option<Vec<u8>>,
     /// The job's flash artifact, which a converted plan's `FlashBlock` reads (ADR-336 item 1).
@@ -104,14 +104,15 @@ pub struct JobSpec {
 }
 
 impl JobSpec {
-    /// The job the agent runs: from the document when there is one, with the artifact.
-    fn job(&self) -> Job {
+    /// The job the agent runs: from the document when there is one, with the artifact. Named by
+    /// its path, since on Windows this file's `Job` is the job object the agent child runs in.
+    fn job(&self) -> agent::Job {
         let job = match &self.document {
-            Some(document) => {
-                Job::from_document(JobDocument::new(document.clone()).expect("the document loads"))
-                    .expect("the document carries its procedure")
-            }
-            None => Job::from(self.program.clone()),
+            Some(document) => agent::Job::from_document(
+                JobDocument::new(document.clone()).expect("the document loads"),
+            )
+            .expect("the document carries its procedure"),
+            None => agent::Job::from(self.program.clone()),
         };
         match &self.artifact {
             Some(bytes) => {

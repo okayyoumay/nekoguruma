@@ -15,7 +15,10 @@ reviewing.
   passage that reads as copied from one of them, quoted or not, at any length, anywhere:
   comments, strings, fixtures, data files, docs, ADRs, commit messages, the PR description.
   Citations give the clause number and paraphrase. Never quote standard text in your own
-  comments.
+  comments. A standard's identifiers (service, negative response code or parameter names) are
+  terms, not text: do not flag one written as this repository already writes them (one word
+  in camel case, as `sim-ecu`'s `Nrc` variants are). A table, or a column of one, reproduced with the
+  standard's punctuation and spelling is still copied text.
 - **Secrets or private infrastructure**: credentials, keys, tokens, internal hostnames.
 - **Vehicle safety**: a write, flash or routine-control job that can run without the
   preconditions and guards of design 5.5, 5.6 and 8.9, or that bypasses the authorization and

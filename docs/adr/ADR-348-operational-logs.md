@@ -62,11 +62,14 @@ workshop.
    on Linux and `%ProgramData%\nekoguruma\logs\` on Windows. Every entry logged while a job runs
    carries the job id and ownership generation (the journal's key) and the VCI name in a span,
    so it can be lined up with the job's journal and communication log.
-4. **The agent captures its workers' output.** The agent reads each worker's stderr line by line
-   and logs each line in its own operational log, at `info` unless the line carries a level the
-   agent can read, with the worker's library name and ABI as fields. A worker configured with an
-   output of its own (a file, `journald`, `eventlog`) keeps it. A line longer than 8 KiB is cut
-   to 8 KiB and marked as cut, so one misbehaving library cannot fill an entry without bound.
+4. **The agent captures its workers' output.** The agent reads each worker's stderr line by line and
+   logs each line in its own operational log, the line in the entry's `external` field (item 6), at
+   `info` unless the line carries a level the agent can read, with the worker's library name and ABI as fields. A worker configured with an output of
+   its own (a file, `journald`, `eventlog`) keeps it, and its entries then stay at that destination:
+   they are not in the agent's log, so neither a fetch nor a failed job's result (item 8) carries
+   them. The default stderr output is the one that is collected; another output is a choice for
+   local investigation on the device. A line longer than 8 KiB is cut to 8 KiB and marked as cut, so
+   one misbehaving library cannot fill an entry without bound.
 5. **Files are JSON Lines, rotated by size, with a cap.** A file output, in the agent and the
    workers alike, writes one JSON object per line with at least the timestamp (UTC, RFC 3339 with
    microseconds), the level, the `tracing` target, the process (`agent`, the worker's API and

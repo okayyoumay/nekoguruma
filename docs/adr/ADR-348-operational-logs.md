@@ -2,9 +2,9 @@
 
 **Date:** 2026-10-23
 **Status:** Accepted
-**Affects:** design 12.2 (new), 8.7; `agent` (logging setup, worker output), `vci-service-launcher`
-and `vci-service-config` (logging output, rotation), `worker-host` (worker stderr), `server`;
-ADR-024, ADR-033, ADR-089, ADR-285
+**Affects:** design 12.2 (new), 8.7, 8.11 (the `procedure_log` event), 16.2; `agent` (logging setup,
+worker output), `vci-service-launcher` and `vci-service-config` (logging output, rotation),
+`worker-host` (worker stderr), `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346
 
 ## Context
 
@@ -74,13 +74,20 @@ workshop.
    file is rotated when it reaches its size limit, and the oldest rotated file is deleted once
    the count limit is reached. The limits are two new settings beside `output`: a default of
    10 MiB per file and 5 rotated files, so one log takes at most about 60 MiB.
-6. **What an operational log never holds.** No VIN or other vehicle identity read from an ECU,
-   no key, token, credential, seed or key value, OEM authorization material, signing material or
-   bearer token, no personal data, and no request or response payload of a diagnostic exchange
-   (the communication log holds those, under its own protection). Error text from a vendor
-   library or a worker is logged with control characters and line breaks escaped, so that one
-   entry stays one line and cannot imitate another. ADR-089's rule stays: detail that must not
-   reach a gRPC client, such as a library path, goes to the operational log only.
+6. **What an operational log never holds.** No VIN or other vehicle identity read from an ECU, no
+   key, token, credential, seed or key value, OEM authorization material, signing material or bearer
+   token, no personal data, and no request or response payload of a diagnostic exchange (the
+   communication log holds those, under its own protection). Error text from a vendor library or a
+   worker is logged with control characters and line breaks escaped, so that one entry stays one
+   line and cannot imitate another. ADR-089's rule stays: detail that must not reach a gRPC client,
+   such as a library path, goes to the operational log only. Text a procedure builds at run time can
+   hold any of these, so it never reaches the operational log: a `diag.log` message (Starlark subset
+   3.1) is written to the job's communication log as a `procedure_log` event with its level, and a
+   `diag.fail` detail stays in the job's journal and result; the operational log records at most
+   that a procedure logged or failed, with the level or the code. A value the agent reads from the
+   vehicle, such as an identity that did not match, is likewise logged as the fact, not the value.
+   Until every existing `tracing` call has been checked against this item, the agent installs no
+   subscriber (item 3).
 7. **Device timestamps are not authoritative.** Entries carry the device's clock. Unlike the
    audit log (design 16.3), the operational log does not need a trusted time; when the server
    receives entries (item 8) it records its receive time beside them.
@@ -105,6 +112,9 @@ workshop.
 
 ## Consequences
 
+- The communication log gains a `procedure_log` event, so a procedure's own messages stay
+  under that log's protection and sending rules (design 8.11, 16.2) beside the exchanges they
+  explain.
 - The agent's `tracing` events stop being discarded, and a worker's stderr in a service
   deployment lands in a file someone can read.
 - A device holds at most about 60 MiB of operational log per process with the default limits;

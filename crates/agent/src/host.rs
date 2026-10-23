@@ -1360,8 +1360,14 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         integer_reading(input, self.read(input)?)
     }
 
+    // The message goes to the communication log only, since it may hold vehicle data; the
+    // operational log records that one came, with its level (ADR-348 item 6). A job whose
+    // procedure logs always has a log (`Job::with_comm_log_dir`).
     fn log(&mut self, level: u8, message: &str) {
-        tracing::info!(level, "{message}");
+        tracing::info!(level, "the procedure logged a message");
+        if let Some(log) = &self.comm_log {
+            log.procedure_log(level, message);
+        }
     }
 }
 

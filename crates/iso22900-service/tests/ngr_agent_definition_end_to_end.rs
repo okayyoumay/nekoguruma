@@ -106,6 +106,9 @@ impl Setup {
             .arg(&self.workers)
             .arg("--locks")
             .arg(self.root.join("locks"))
+            // The procedures log with `diag.log`, whose messages go to a communication log.
+            .arg("--comm-log")
+            .arg(self.root.join("commlog"))
             .env("VCI_CONFIG_PATH", &self.config)
             .env("NGR_PDU_API_ROOT_FILE", &self.root_file)
             .env("NGR_SIM_ECU_CONFIG", ecu_config)

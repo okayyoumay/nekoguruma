@@ -49,7 +49,8 @@ pub(crate) mod exchange;
 
 /// Where a job keeps its communication log and under which key. The journaled entry points
 /// derive it from the journal's setup (same directory and key); a job without a journal gets one
-/// only through `Job::with_comm_log`.
+/// through `Job::with_comm_log`, or, when its procedure logs with `diag.log`, one of its own in
+/// the directory `Job::with_comm_log_dir` gives ([`CommLogSetup::for_run`]).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CommLogSetup {
     pub dir: PathBuf,
@@ -57,6 +58,31 @@ pub struct CommLogSetup {
 }
 
 impl CommLogSetup {
+    /// A log of its own for one run in `dir`: a job ID minted from the clock, the process ID
+    /// and a count within the process, so two runs never share a log, in generation 0
+    /// (ADR-347, ADR-348 item 6). On Unix a missing directory is created writable and readable
+    /// by its owner only, since the log holds the vehicle's data; an existing one keeps its
+    /// permissions, and the log file itself is its owner's alone ([`CommLog`]).
+    pub fn for_run(dir: PathBuf) -> io::Result<Self> {
+        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let mut builder = std::fs::DirBuilder::new();
+        builder.recursive(true);
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.create(&dir)?;
+        let unix_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map_or(0, |elapsed| elapsed.as_millis());
+        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        Ok(Self {
+            dir,
+            key: JobKey {
+                job_id: shared_proto::JobId(format!("run-{unix_ms}-{}-{run}", std::process::id())),
+                generation: 0,
+            },
+        })
+    }
+
     /// The log file of the setup's job and generation.
     pub fn path(&self) -> Result<PathBuf, JournalError> {
         Ok(self
@@ -142,6 +168,15 @@ enum Event<'a> {
     AgentClock(AgentClock),
     JobStart(JobStart),
     JobEnd(JobEnd<'a>),
+    ProcedureLog(ProcedureLog<'a>),
+}
+
+/// A message the procedure logged with `diag.log`, with its level (design 8.11, ADR-348 item
+/// 6). It may hold vehicle data, so it is kept here and never in the operational log.
+#[derive(Serialize)]
+struct ProcedureLog<'a> {
+    level: u8,
+    message: &'a str,
 }
 
 /// The first line of a log. Groups the job does not have are left out: the vehicle without a
@@ -246,6 +281,7 @@ pub(crate) fn outcome_name(result: &Result<VmState, JobError>) -> &'static str {
             JobError::VehicleLock(_) => "VehicleLock",
             JobError::GuardsMissing => "GuardsMissing",
             JobError::CommLogMismatch => "CommLogMismatch",
+            JobError::NoCommLogDir => "NoCommLogDir",
         },
     }
 }
@@ -587,6 +623,14 @@ impl CommLog {
             }
         }
         Some(seq)
+    }
+
+    /// Writes a `diag.log` message as a `procedure_log` event (design 8.11, ADR-348 item 6).
+    /// The event's `seq`; `None` once the log has failed.
+    pub(crate) fn procedure_log(&self, level: u8, message: &str) -> Option<u64> {
+        let mut inner = self.lock();
+        let event = Event::ProcedureLog(ProcedureLog { level, message });
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
     /// How the log stands now. After [`CommLog::end`] it is the run's final status; before it,

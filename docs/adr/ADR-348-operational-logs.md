@@ -105,15 +105,17 @@ faults, and aims the logs at software experts away from the workshop.
    directory; ADR-089 keeps full paths out of gRPC replies and in the log). Such text goes in an
    entry's `external` field, apart from the message, with control characters and line breaks escaped
    so that one entry stays one line and cannot imitate another; item 8 says when it may leave the
-   device. Names that may identify a person or a device go there too, wherever they appear, span
-   fields included: the operator, a device or host name, an OS user name and an IP address (design
-   16.2), and a name a user or vendor gives a VCI (a VCI name, a J2534 `pname` or label). Text a
-   procedure builds at run time can hold any of these, so it never reaches the operational log: a
-   `diag.log` message (Starlark subset 3.1) is written to the job's communication log as a
-   `procedure_log` event with its level (a job whose procedure uses `diag.log`, which its IR shows
-   when the job starts, always has a communication log, even without a journal and without its
-   caller asking for one, so the message is never dropped: when such a `run_program` job carries no
-   setup, the agent gives it one, in its communication-log directory, a setting that defaults to
+   device. An output that the OS may forward off the device, `journald` and `eventlog`, writes an
+   `external` field as its length only, like the server's copy; the full text is kept only in the
+   local file and on stderr. Names that may identify a person or a device go there too, wherever
+   they appear, span fields included: the operator, a device or host name, an OS user name and an IP
+   address (design 16.2), and a name a user or vendor gives a VCI (a VCI name, a J2534 `pname` or
+   label). Text a procedure builds at run time can hold any of these, so it never reaches the
+   operational log: a `diag.log` message (Starlark subset 3.1) is written to the job's communication
+   log as a `procedure_log` event with its level (a job whose procedure uses `diag.log`, which its
+   IR shows when the job starts, always has a communication log, even without a journal and without
+   its caller asking for one, so the message is never dropped: when such a `run_program` job carries
+   no setup, the agent gives it one, in its communication-log directory, a setting that defaults to
    `commlog/` in the agent's local storage beside its journals (design 5.5), with a job id of its
    own as `ngr-agent run --comm-log` does; this extends ADR-347 Decision item 2; the communication
    log's rule that secret bytes are kept as their length only, design 8.11, holds for these messages
@@ -162,8 +164,12 @@ faults, and aims the logs at software experts away from the workshop.
    or offline, keeps its entries only in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
-   It cannot change the output or any path, and only administrators can issue it, as for item 8.
-   A worker's level changes only through its configuration file and a restart.
+   The raise is one level applied to every target and laid over the configured filter: each
+   configured directive keeps its own level when that is more verbose, so a raise never makes any
+   target quieter (a configured `info,j2534_0404=trace` raised to `debug` logs `debug` everywhere
+   and still `trace` for that target). It cannot change the output or any path, and only
+   administrators can issue it, as for item 8. A worker's level changes only through its
+   configuration file and a restart.
 10. **The server logs JSON to stdout.** The server writes JSON Lines entries to stdout for the
     platform to collect (design 14); a local deployment (design 13), which runs as an OS service,
     writes the rotated file of item 5 instead. Its entries for a job carry the same job id as the

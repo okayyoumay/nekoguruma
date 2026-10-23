@@ -76,6 +76,8 @@ impl From<&SourceSpan> for SourcePos {
 pub(crate) struct SectionAttrs {
     pub interruptible: Interruptible,
     pub idempotency: Idempotency,
+    /// How long the section is expected to take, 0 when it declares none.
+    pub expected_millis: u32,
 }
 
 impl From<&Section> for SectionAttrs {
@@ -83,6 +85,7 @@ impl From<&Section> for SectionAttrs {
         Self {
             interruptible: section.interruptible,
             idempotency: section.idempotency,
+            expected_millis: section.expected_millis,
         }
     }
 }
@@ -2602,6 +2605,7 @@ mod tests {
             sections: vec![SectionAttrs {
                 interruptible: Interruptible::No,
                 idempotency: Idempotency::Safe,
+                expected_millis: 180_000,
             }],
         });
         full.supply_voltage = Some(SupplyVoltage {
@@ -2791,13 +2795,14 @@ mod tests {
             end_pc: 1,
             interruptible: Interruptible::RecoveryRequired,
             idempotency: Idempotency::CheckState,
-            expected_millis: 0,
+            expected_millis: 180_000,
         };
         let attrs = SectionAttrs::from(&section);
         assert!(matches!(
             attrs.interruptible,
             Interruptible::RecoveryRequired
         ));
+        assert_eq!(attrs.expected_millis, 180_000);
         assert_eq!(Expected::uds(&[]).positive_prefix, Vec::<u8>::new());
     }
 

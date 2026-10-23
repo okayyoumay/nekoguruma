@@ -1535,7 +1535,7 @@ mod tests {
             end_pc,
             interruptible: diag_ir::Interruptible::No,
             idempotency: diag_ir::Idempotency::Safe,
-            expected_millis: 0,
+            expected_millis: 180_000,
         };
         let program = diag_ir::Program {
             schema_version: diag_ir::IR_SCHEMA_VERSION,
@@ -1551,6 +1551,7 @@ mod tests {
         assert_eq!((at.pc, at.steps), (2, 9));
         assert_eq!(at.source.map(|source| source.line), Some(10));
         assert_eq!(at.sections.len(), 1);
+        assert_eq!(at.sections[0].expected_millis, 180_000);
         assert_eq!(
             at_of(&program, 3, 0).source.map(|source| source.line),
             Some(11)

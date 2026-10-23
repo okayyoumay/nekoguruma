@@ -117,6 +117,11 @@ These standards, and any other standard, are copyrighted. **Never copy their tex
 any length, into anything this repository stores: code comments, `docs/`, ADRs, commit messages, PR or issue bodies. Cite
 the clause or section number and paraphrase in your own words.
 
+A standard's identifiers (the names it gives services, negative response codes, parameters and
+the like) are terms, not text: code and docs use them as this repository already writes them,
+one word in camel case per name, as `sim-ecu`'s `Nrc` variants are. Reproducing a standard's
+table, or a column of one, with its punctuation and spelling is still copying.
+
 ### Generated code
 
 Proto bindings (`crates/vci-service-interface`), FFI bindings (`crates/*-sys/src/bindings/`) and

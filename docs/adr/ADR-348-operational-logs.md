@@ -89,11 +89,13 @@ faults, and aims the logs at software experts away from the workshop.
    process (`agent`, `server`, or a worker's API and worker number, never its configured library or
    VCI name, which go in `external`), the message and the span fields. stderr stays human-readable
    text. Every process writes a file of its own: a worker adds a stem naming its API and its worker
-   number to the configured path. The agent gives each worker it launches a number unique among the
-   workers it runs at that time (the smallest one free) on its command line, so workers that share a
-   library-level or root setting, a J2534 library's several devices and the per-VCI D-PDU workers of
-   one library (design 8.8.1) alike, never write or rotate the same file; a worker started without
-   one uses its process id. A log file and the directory NGR creates for it are readable and
+   number to the configured path. The worker number is a slot the worker claims at startup: the
+   smallest number whose lock file beside the log (`{stem}.{number}.lock`) it can lock exclusively
+   with an OS file lock, which the OS releases when the process ends. So no two running workers on
+   the device share a number, whichever agent launched them and whatever setting they share (a J2534
+   library's several devices, the per-VCI D-PDU workers of one library, design 8.8.1, or workers of
+   two agents), no two write or rotate the same file, and the files stay bounded by the number of
+   workers that run at once. A log file and the directory NGR creates for it are readable and
    writable only by the account the process runs as and by administrators (mode 0600 for files and
    0700 for directories on Unix, an access list granting only that account, SYSTEM and
    Administrators on Windows), since entries can carry `external` text (item 6); an existing file
@@ -176,10 +178,12 @@ faults, and aims the logs at software experts away from the workshop.
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    The raise is one level applied to every target and laid over the configured filter: each
    configured directive keeps its own level when that is more verbose, so a raise never makes any
-   target quieter (a configured `info,j2534_0404=trace` raised to `debug` logs `debug` everywhere
-   and still `trace` for that target). It cannot change the output or any path, and only
-   administrators can issue it, as for item 8. A worker's level changes only through its
-   configuration file and a restart.
+   target quieter. A raise never reaches a target the agent excludes for safety, such as a crate
+   whose `tracing` calls have not been checked against item 6: that exclusion is a separate filter
+   applied after the level filter, which neither the configuration nor a raise can change (a
+   configured `info,j2534_0404=trace` raised to `debug` logs `debug` everywhere and still `trace`
+   for that target). It cannot change the output or any path, and only administrators can issue it,
+   as for item 8. A worker's level changes only through its configuration file and a restart.
 10. **The server logs JSON to stdout.** The server writes JSON Lines entries to stdout for the
     platform to collect (design 14); a local deployment (design 13), which runs as an OS service,
     writes the rotated file of item 5 instead. Its entries for a job carry the same job id as the

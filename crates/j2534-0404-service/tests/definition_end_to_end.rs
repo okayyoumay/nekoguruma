@@ -120,8 +120,11 @@ fn job_guards(dir: &Path, writes: bool) -> JobGuards {
 
 /// Runs `document`'s procedure on the link it declares and returns the final state.
 async fn run(worker: &WorkerProcess, dir: &Path, document: Vec<u8>) -> VmState {
+    // The procedures log with `diag.log`; with neither a journal nor a log of the caller's, a
+    // job gets a log of its own in the agent's communication-log directory (ADR-348 item 6).
     let job = Job::from_document(JobDocument::new(document).expect("the document loads"))
-        .expect("the document carries its procedure");
+        .expect("the document carries its procedure")
+        .with_comm_log_dir(dir.join("commlog"));
     let link = job.declared_link().expect("the document declares its link");
     let writes = job.writes();
     let client: WorkerClient = worker
@@ -141,6 +144,24 @@ async fn run(worker: &WorkerProcess, dir: &Path, document: Vec<u8>) -> VmState {
     )
     .await;
     state.expect("the job should finish")
+}
+
+/// One of the logs in `dir` holds `message` as a `procedure_log` event, which the read
+/// procedure's `diag.log` writes there rather than to `tracing` (design 8.11, ADR-348 item 6).
+fn assert_procedure_logged(dir: &Path, message: &str) {
+    let logged = std::fs::read_dir(dir)
+        .expect("the communication-log directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.extension().is_some_and(|extension| extension == "jsonl"))
+        .flat_map(|path| {
+            std::fs::read_to_string(&path)
+                .expect("a log")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+                .collect::<Vec<_>>()
+        })
+        .any(|line| line["event"] == "procedure_log" && line["message"] == message);
+    assert!(logged, "no log in {} holds {message:?}", dir.display());
 }
 
 async fn run_the_definition(dir: &Path) {
@@ -174,6 +195,7 @@ async fn run_the_definition(dir: &Path) {
     // The read procedure checks every value it decodes.
     let state = run(&worker, dir, reads[variant].1.clone()).await;
     assert!(state.call_stack.is_empty(), "{state:?}");
+    assert_procedure_logged(&dir.join("commlog"), "read");
 
     // The routine changes the session, so it runs last.
     let routines = definition::documents("routine.star");

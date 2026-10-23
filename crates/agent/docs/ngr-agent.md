@@ -20,7 +20,7 @@ ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <f
 | `--artifact`, `--artifact-sha256` | The flash artifact a procedure reads its blocks from (`Op::FlashBlock`, design 8.2.5, 11.3, ADR-336 items 1 and 12), and the SHA-256 the job names for it, 64 hexadecimal digits in either case. Both or neither, each at most once. The file is read once, before any worker starts, and its bytes stay in memory for the job (`agent::Artifact`), so a file changed on disk after the check cannot change a block. See step 1 for the check |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
-| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing (on Unix writable and readable by its owner only; an existing directory keeps its permissions, which are not checked); at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}`, generation 0), so two runs never share a log, and the log's path is printed on stderr after the run, when the log was opened. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log ("Communication log" below) |
+| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing (on Unix writable and readable by its owner only; an existing directory keeps its permissions, which are not checked); at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}-{count}`, generation 0), so two runs never share a log, and the log's path is printed on stderr after the run, when the log was opened. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log, unless its procedure logs with `diag.log`: then it gets a log of its own in `commlog/` beside `ngr-agent`, as `--locks` defaults to `locks/` ("Communication log" below) |
 
 The job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
 
@@ -284,16 +284,22 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
 - **File.** `{job id}.g{generation}.commlog.jsonl`, one JSON object per line, beside the job's
   journal, under a writer lock of its own (`{job id}.g{generation}.commlog.lock`). Every run of
   the job and generation appends to the same file. The journaled entry points log under their
-  journal's directory and key; `run_program` logs only when the job carries a setup
+  journal's directory and key; `run_program` logs when the job carries a setup
   (`Job::with_comm_log`), and a journaled job whose setup names another directory or key ends in
-  `JobError::CommLogMismatch` before anything opens.
+  `JobError::CommLogMismatch` before anything opens. A procedure that logs with `diag.log` always
+  has a log, since its messages go nowhere else (ADR-348 item 6): a `run_program` job without a
+  setup gets one of its own (`CommLogSetup::for_run`) in the agent's communication-log directory
+  (`Job::with_comm_log_dir`), and without that directory it ends in `JobError::NoCommLogDir`
+  before anything opens.
 - **Lines.** Every line has the next `seq` and an `event`. A new log starts with the `header`
   (seq 0: the job's ID, generation, kind and document SHA-256, the target VIN when the job names
   one, the ECU variant, the agent and IR schema versions, and a reading of the agent's clocks).
   Each run writes `job_start` (the agent's version, `run`: `first`, `resume`, or `plain_start`
   for a resume that finds no journal, and whether the job writes) and, when it ends,
   `job_end` with the outcome (`ok` or the `JobError` variant's name). A reopen writes
-  `agent_clock` first, a new reading that starts a new agent epoch.
+  `agent_clock` first, a new reading that starts a new agent epoch. A `diag.log` message is a
+  `procedure_log` event with its `level` and `message`; the operational log (`tracing`) records
+  only that the procedure logged one, with its level.
 - **Clean close and reopen.** A log was closed cleanly when it holds its header and its last
   run's lines (from that run's header or `agent_clock`) number on from the largest `seq` before
   them, with nothing blank or damaged between them, to a complete `job_end`. Each run judges only

@@ -13,6 +13,7 @@
 //! and how the job's communication log ended (design 8.11, ADR-347).
 
 use std::panic::AssertUnwindSafe;
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -85,6 +86,9 @@ pub struct Job {
     /// Where the job writes its communication log when it has no journal to put it beside
     /// (ADR-347). A journaled entry point derives its own from the journal's setup.
     comm_log: Option<CommLogSetup>,
+    /// The agent's communication-log directory, where a job that needs a log and has no other
+    /// gets one of its own (ADR-348 item 6).
+    comm_log_dir: Option<PathBuf>,
 }
 
 impl Job {
@@ -95,6 +99,7 @@ impl Job {
             document: Some(document),
             artifact: None,
             comm_log: None,
+            comm_log_dir: None,
         })
     }
 
@@ -104,6 +109,16 @@ impl Job {
     /// [`JobError::CommLogMismatch`].
     pub fn with_comm_log(mut self, setup: CommLogSetup) -> Self {
         self.comm_log = Some(setup);
+        self
+    }
+
+    /// Gives the job the agent's communication-log directory (ADR-348 item 6). A procedure that
+    /// logs with `diag.log` always has a log, since its messages go nowhere else: a run with
+    /// neither a journal nor [`Job::with_comm_log`] gets a log of its own there
+    /// ([`CommLogSetup::for_run`]), and without this directory it is refused with
+    /// [`JobError::NoCommLogDir`] before anything is sent.
+    pub fn with_comm_log_dir(mut self, dir: PathBuf) -> Self {
+        self.comm_log_dir = Some(dir);
         self
     }
 
@@ -152,6 +167,7 @@ impl From<Program> for Job {
             document: None,
             artifact: None,
             comm_log: None,
+            comm_log_dir: None,
         }
     }
 }
@@ -296,6 +312,11 @@ pub enum JobError {
     /// journal of the entry point it runs on; nothing is opened (ADR-347).
     #[error("the job's communication log is not the one beside its journal")]
     CommLogMismatch,
+    /// The procedure logs with `diag.log`, and the job has neither a journal, a communication
+    /// log nor the agent's communication-log directory to put one in, so its messages would
+    /// go nowhere; nothing is opened (ADR-348 item 6).
+    #[error("the procedure logs messages, and the job has no communication log to keep them")]
+    NoCommLogDir,
 }
 
 /// The job's error for the declared failure its journal records.
@@ -850,6 +871,14 @@ fn comm_log_setup(
     }
 }
 
+/// Whether `program` logs messages with `diag.log` (its IR shows it when the job starts).
+fn logs_messages(program: &Program) -> bool {
+    program
+        .code
+        .iter()
+        .any(|op| matches!(op, Op::Log { .. } | Op::LogFromStack { .. }))
+}
+
 /// Whether two setups name the same log: the same key, and the same directory however it is
 /// spelled (a `..`, a link, a drive letter's case), when both directories exist to compare.
 fn same_log(a: &CommLogSetup, b: &CommLogSetup) -> bool {
@@ -890,7 +919,7 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
 async fn run_checked<C: WorkerApi>(
     client: C,
     config: &LinkConfig,
-    job: Job,
+    mut job: Job,
     limits: JobLimits,
     ceiling: Permission,
     journal: Option<JournalMode>,
@@ -914,7 +943,7 @@ async fn run_checked<C: WorkerApi>(
     // A job with a document reads its sources through the document, whatever table the caller
     // put in the journal's setup.
     let journal = use_document_sources(&job, journal)?;
-    let comm_log = comm_log_setup(&job, journal.as_ref())?;
+    let mut comm_log = comm_log_setup(&job, journal.as_ref())?;
     // A program that writes needs the device's reprogramming slot (design 8.8.1, ADR-257).
     let holds_slot = guards
         .lock()
@@ -930,12 +959,22 @@ async fn run_checked<C: WorkerApi>(
             "the link given is not the one the document declares".to_owned(),
         )));
     }
+    // A procedure that logs messages always has a log, its own when it has no other
+    // (ADR-348 item 6). Made only now, so a refused job creates no directory.
+    if comm_log.is_none() && logs_messages(&job.program) {
+        let dir = job.comm_log_dir.clone().ok_or(JobError::NoCommLogDir)?;
+        let setup = CommLogSetup::for_run(dir)
+            .map_err(|error| JobError::Journal(JournalError::Io(error)))?;
+        job.comm_log = Some(setup.clone());
+        comm_log = Some(setup);
+    }
     let comm_log = JobLog::new(comm_log, run_facts(&job, journal.as_ref()));
     let Job {
         program,
         document,
         artifact,
         comm_log: _,
+        comm_log_dir: _,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
@@ -10196,6 +10235,7 @@ def main():
             document: Some(document),
             artifact: None,
             comm_log: None,
+            comm_log_dir: None,
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -10283,6 +10323,7 @@ def main():
                 document: Some(document()),
                 artifact: None,
                 comm_log: None,
+                comm_log_dir: None,
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -10331,6 +10372,7 @@ def main():
             document: Some(vin_job_document()),
             artifact: None,
             comm_log: None,
+            comm_log_dir: None,
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
         // A field the document does not declare is refused before anything is sent, also
@@ -10345,6 +10387,7 @@ def main():
             document: Some(vin_job_document()),
             artifact: None,
             comm_log: None,
+            comm_log_dir: None,
         };
         assert!(
             matches!(
@@ -10402,6 +10445,7 @@ def main():
             document: Some(vin_job_document()),
             artifact: None,
             comm_log: None,
+            comm_log_dir: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -15215,6 +15259,123 @@ def main():
         let lines = comm_log_lines(&dir);
         assert_eq!(comm_log_events(&lines), ["header", "job_start"]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Every event any test of this process emits through `tracing`, as text: the global
+    /// subscriber, since the VM runs on a blocking thread of its own.
+    fn traced() -> &'static Mutex<Vec<String>> {
+        struct Capture(&'static Mutex<Vec<String>>);
+        struct Text(String);
+        impl tracing::field::Visit for Text {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                self.0.push_str(&format!(" {}={value:?}", field.name()));
+            }
+        }
+        impl tracing::Subscriber for Capture {
+            fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
+                true
+            }
+            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                tracing::span::Id::from_u64(1)
+            }
+            fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
+            fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
+            fn event(&self, event: &tracing::Event<'_>) {
+                let mut text = Text(String::new());
+                event.record(&mut text);
+                self.0
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(text.0);
+            }
+            fn enter(&self, _: &tracing::span::Id) {}
+            fn exit(&self, _: &tracing::span::Id) {}
+        }
+        static TRACED: std::sync::OnceLock<&'static Mutex<Vec<String>>> =
+            std::sync::OnceLock::new();
+        TRACED.get_or_init(|| {
+            let traced: &'static Mutex<Vec<String>> = Box::leak(Box::new(Mutex::new(Vec::new())));
+            tracing::subscriber::set_global_default(Capture(traced))
+                .expect("no other test sets a global subscriber");
+            traced
+        })
+    }
+
+    /// A `diag.log` message goes to the communication log as a `procedure_log` event with its
+    /// level, and the operational log gets only the fact (ADR-348 item 6). A job with neither a
+    /// journal nor a log of its caller's gets a log of its own in the agent's directory.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_logged_message_goes_to_a_log_of_its_own_and_not_to_tracing() {
+        let traced = traced();
+        let dir = journal_dir("comm-log-procedure-log");
+        let message = "odometer 123456 km, unique-6e0f";
+        let mut logging = program(vec![Op::Log {
+            level: 2,
+            message: 0,
+        }]);
+        logging.constants = vec![message.as_bytes().to_vec()];
+        let job = Job::from(logging).with_comm_log_dir(dir.clone());
+        let run = bare_run(job, "comm-log-procedure-log").await;
+        run.result.expect("the program runs");
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        // The log beside its writer lock.
+        let files: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|extension| extension == "jsonl")
+            })
+            .collect();
+        assert_eq!(files.len(), 1, "{files:?}");
+        let name = files[0].file_name().unwrap().to_str().unwrap();
+        assert!(
+            name.starts_with("run-") && name.ends_with(".g0.commlog.jsonl"),
+            "{name}"
+        );
+        let lines: Vec<serde_json::Value> = std::fs::read_to_string(&files[0])
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).expect(line))
+            .collect();
+        assert_eq!(
+            comm_log_events(&lines),
+            ["header", "job_start", "procedure_log", "job_end"]
+        );
+        assert_seq_consecutive(&lines);
+        assert_eq!(lines[2]["level"], 2);
+        assert_eq!(lines[2]["message"], message);
+        let traced = traced.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            traced.iter().all(|event| !event.contains("unique-6e0f")),
+            "{traced:?}"
+        );
+        assert!(
+            traced
+                .iter()
+                .any(|event| event.contains("the procedure logged a message")),
+            "{traced:?}"
+        );
+        drop(traced);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A procedure that logs, with no journal, no log and no directory to put one in, is refused
+    /// before anything opens: its messages would go nowhere (ADR-348 item 6).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_logging_procedure_with_nowhere_to_log_is_refused() {
+        let mut logging = program(vec![Op::Log {
+            level: 1,
+            message: 0,
+        }]);
+        logging.constants = vec![b"read".to_vec()];
+        let run = bare_run(Job::from(logging), "comm-log-nowhere").await;
+        assert!(
+            matches!(run.result, Err(JobError::NoCommLogDir)),
+            "{:?}",
+            run.result
+        );
+        assert_eq!(run.comm_log, CommLogStatus::None);
     }
 
     #[tokio::test(flavor = "multi_thread")]

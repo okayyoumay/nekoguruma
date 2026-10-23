@@ -6,11 +6,10 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::AtomicBool;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use agent::artifact::{Artifact, SHA256_LEN, parse_sha256};
 use agent::guards::{GuardSetup, JobGuards};
-use agent::journal::JobKey;
 use agent::launch::{Api, launch_worker};
 use agent::policy::build_ceiling;
 use agent::{CommLogSetup, Job, JobDocument, JobLimits, JobRun, check_job, run_program};
@@ -206,6 +205,10 @@ fn default_locks() -> Result<PathBuf, String> {
     next_to_exe("locks", "--locks")
 }
 
+fn default_comm_logs() -> Result<PathBuf, String> {
+    next_to_exe("commlog", "--comm-log")
+}
+
 fn next_to_exe(name: &str, flag: &str) -> Result<PathBuf, String> {
     let exe = std::env::current_exe()
         .map_err(|error| format!("cannot locate ngr-agent: {error}; pass {flag}"))?;
@@ -235,28 +238,11 @@ fn with_artifact(job: Job, artifact: Option<(PathBuf, [u8; SHA256_LEN])>) -> Res
     Ok(job.with_artifact(sha256, artifact))
 }
 
-/// The communication log of this run: a job ID minted from the clock and the process ID, so
-/// two runs never share a log, in generation 0 (ADR-347). On Unix a missing directory is created
-/// writable and readable by its owner only, since the log holds the vehicle's data; an existing
-/// one keeps its permissions, and the log file itself is its owner's alone (`agent::CommLog`).
+/// The communication log of this run, of its own in `dir` (`CommLogSetup::for_run`, ADR-347).
 fn comm_log_setup(dir: PathBuf) -> Result<CommLogSetup, String> {
-    let mut builder = std::fs::DirBuilder::new();
-    builder.recursive(true);
-    #[cfg(unix)]
-    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
-    builder
-        .create(&dir)
-        .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
-    let unix_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |elapsed| elapsed.as_millis());
-    let setup = CommLogSetup {
-        dir,
-        key: JobKey {
-            job_id: shared_proto::JobId(format!("run-{unix_ms}-{}", std::process::id())),
-            generation: 0,
-        },
-    };
+    let shown = dir.display().to_string();
+    let setup =
+        CommLogSetup::for_run(dir).map_err(|error| format!("cannot create {shown}: {error}"))?;
     setup
         .path()
         .map_err(|error| format!("--comm-log: {error}"))?;
@@ -278,6 +264,12 @@ async fn run(args: RunArgs) -> Result<String, String> {
         let setup = comm_log_setup(dir)?;
         log_path = setup.path().ok();
         job = job.with_comm_log(setup);
+    }
+    // A procedure that logs messages keeps them in a log of its own even without `--comm-log`
+    // (ADR-348 item 6): in `commlog/` beside the agent, as the locks are. Without that
+    // directory such a job is refused.
+    if let Ok(dir) = default_comm_logs() {
+        job = job.with_comm_log_dir(dir);
     }
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
@@ -474,7 +466,7 @@ mod tests {
         assert_eq!(setup.key.generation, 0);
         let id = &setup.key.job_id.0;
         assert!(
-            id.starts_with("run-") && id.ends_with(&format!("-{}", std::process::id())),
+            id.starts_with("run-") && id.contains(&format!("-{}-", std::process::id())),
             "{id}"
         );
         let path = setup.path().expect("the ID names a file");

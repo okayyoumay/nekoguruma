@@ -236,9 +236,9 @@ fn with_artifact(job: Job, artifact: Option<(PathBuf, [u8; SHA256_LEN])>) -> Res
 }
 
 /// The communication log of this run: a job ID minted from the clock and the process ID, so
-/// two runs never share a log, in generation 0 (ADR-347). Prints the log's path on stderr.
-/// A missing directory is created writable and readable by its owner only, since the log holds
-/// the vehicle's data.
+/// two runs never share a log, in generation 0 (ADR-347). On Unix a missing directory is created
+/// writable and readable by its owner only, since the log holds the vehicle's data; an existing
+/// one keeps its permissions, and the log file itself is its owner's alone (`agent::CommLog`).
 fn comm_log_setup(dir: PathBuf) -> Result<CommLogSetup, String> {
     let mut builder = std::fs::DirBuilder::new();
     builder.recursive(true);
@@ -257,10 +257,9 @@ fn comm_log_setup(dir: PathBuf) -> Result<CommLogSetup, String> {
             generation: 0,
         },
     };
-    let path = setup
+    setup
         .path()
         .map_err(|error| format!("--comm-log: {error}"))?;
-    eprintln!("ngr-agent: communication log: {}", path.display());
     Ok(setup)
 }
 
@@ -273,9 +272,12 @@ async fn run(args: RunArgs) -> Result<String, String> {
     let link = job
         .declared_link()
         .map_err(|error| format!("job failed: {error}"))?;
-    // Only a job that will run gets a log, so a refused one names no log that never exists.
+    // Only a job that passed its check gets a log, so a refused one creates no directory.
+    let mut log_path = None;
     if let Some(dir) = args.comm_log {
-        job = job.with_comm_log(comm_log_setup(dir)?);
+        let setup = comm_log_setup(dir)?;
+        log_path = setup.path().ok();
+        job = job.with_comm_log(setup);
     }
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
@@ -319,8 +321,20 @@ async fn run(args: RunArgs) -> Result<String, String> {
         mut guards,
         comm_log,
     } = run_program(worker.client, &link, job, JobLimits::default(), guards).await;
-    if let agent::CommLogStatus::Incomplete(incomplete) = &comm_log {
-        eprintln!("ngr-agent: communication log incomplete: {incomplete:?}");
+    // The path is printed only once the log exists: a job that never ran, or a log that could
+    // not be opened, names none.
+    match (&comm_log, &log_path) {
+        (agent::CommLogStatus::None, _) => {}
+        (agent::CommLogStatus::Incomplete(agent::CommLogIncomplete::NotOpened(kind)), _) => {
+            eprintln!("ngr-agent: communication log not opened: {kind:?}");
+        }
+        (status, Some(path)) => {
+            eprintln!("ngr-agent: communication log: {}", path.display());
+            if let agent::CommLogStatus::Incomplete(incomplete) = status {
+                eprintln!("ngr-agent: communication log incomplete: {incomplete:?}");
+            }
+        }
+        (_, None) => {}
     }
     // The job has closed its link whatever the result, unless its guards say otherwise
     // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
@@ -465,6 +479,16 @@ mod tests {
         );
         let path = setup.path().expect("the ID names a file");
         assert_eq!(path.parent(), Some(dir.as_path()));
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+            assert_eq!(
+                mode & 0o777,
+                0o700,
+                "a new log directory is its owner's alone"
+            );
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

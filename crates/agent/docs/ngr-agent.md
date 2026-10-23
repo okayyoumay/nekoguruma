@@ -20,7 +20,7 @@ ngr-agent run --vci <name> --mode <device|user> --document <file> [--artifact <f
 | `--artifact`, `--artifact-sha256` | The flash artifact a procedure reads its blocks from (`Op::FlashBlock`, design 8.2.5, 11.3, ADR-336 items 1 and 12), and the SHA-256 the job names for it, 64 hexadecimal digits in either case. Both or neither, each at most once. The file is read once, before any worker starts, and its bytes stay in memory for the job (`agent::Artifact`), so a file changed on disk after the check cannot change a block. See step 1 for the check |
 | `--workers` | Directory of worker builds, laid out as `<dir>/<ABI name>/j2534-0404-service[.exe]` and `<dir>/<ABI name>/iso22900-service[.exe]` (design 7.3). Default: `workers` next to the `ngr-agent` executable |
 | `--locks` | The device's lock directory for the job's guards ("Job guards" below), as an absolute path. Default: `locks` next to the `ngr-agent` executable. Lock files are opened read-only, so a file another user created still locks. The agent creates a missing directory writable by its owner only, so a device whose agents run as several users needs it prepared beforehand: writable by all of them, and with the sticky bit (or an equivalent ACL) so that no user can delete another's lock files (ADR-257). It must also be readable by every agent user, since the per-vehicle lock lists it, and on Unix support hard links, with which it creates its files (ADR-262). On Unix a directory that group or others may write without the sticky bit, or without being readable by them, is refused |
-| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing; at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}`, generation 0), so two runs never share a log, and the log's path is printed on stderr. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log ("Communication log" below) |
+| `--comm-log` | The directory of the run's communication log (design 8.11, ADR-347), created if missing (on Unix writable and readable by its owner only; an existing directory keeps its permissions, which are not checked); at most once. The run gets a job ID of its own (`run-{unix ms}-{process ID}`, generation 0), so two runs never share a log, and the log's path is printed on stderr after the run, when the log was opened. A log that ends incomplete is reported on stderr and does not change the exit status. Without it the run writes no log ("Communication log" below) |
 
 The job opens the link its variant declares (`agent::Job::declared_link`, ADR-324):
 
@@ -294,14 +294,17 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   for a resume that finds no journal, and whether the job writes) and, when it ends,
   `job_end` with the outcome (`ok` or the `JobError` variant's name). A reopen writes
   `agent_clock` first, a new reading that starts a new agent epoch.
-- **Clean close and reopen.** A log was closed cleanly when it starts with its header, its
-  lines number 0, 1, ... with nothing blank or damaged between them, and its last line is a
-  complete `job_end`. A reopen cuts a torn last line and goes on after the largest `seq` the
-  file holds, so numbering never goes back; when the close was not clean, its `agent_clock` is
-  marked incomplete. A file that does not start with a header gets one, marked incomplete, after
-  whatever it holds, and so does a resume that finds no log, since the job ran before. A file
-  whose `seq` or epoch has no successor is not opened (`NotOpened` with `InvalidData`). A new
-  file's directory is synced, as the journal's is, so its name survives a power loss.
+- **Clean close and reopen.** A log was closed cleanly when it holds its header and its last
+  run's lines (from that run's header or `agent_clock`) number on from the largest `seq` before
+  them, with nothing blank or damaged between them, to a complete `job_end`. Each run judges only
+  the run before it: damage further back was reported by the run that found it. A reopen cuts a
+  torn last line, goes on after the largest `seq` the file holds, so numbering never goes back,
+  and starts the epoch after the largest the file holds; when the close was not clean, its
+  `agent_clock` is marked incomplete. A file that holds no header gets one, marked incomplete,
+  after whatever it holds, and so does a resume that finds no log, since the job ran before. A
+  file whose `seq` or epoch has no successor is not opened (`NotOpened` with `InvalidData`). A
+  new or empty file's directory is synced, as the journal's is, so its name survives a power
+  loss, and on Unix a new log file is its owner's alone (mode 0600).
 - **Writes.** One write per line from the job's thread, synced after the opening lines and
   after `job_end`. A failed write or sync stops the log for the rest of the run, which writes no
   `job_end`, so the next reopen sees an unclean close.

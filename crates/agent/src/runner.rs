@@ -15259,8 +15259,6 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// A log named in another directory or under another key than the journal's is refused in
-    /// the preflight: nothing reaches the worker, and neither the journal nor the log is created.
     #[test]
     fn the_same_log_directory_spelled_another_way_is_no_mismatch() {
         let dir = journal_dir("comm-log-same-dir");
@@ -15278,6 +15276,8 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// A log named in another directory or under another key than the journal's is refused in
+    /// the preflight: nothing reaches the worker, and neither the journal nor the log is created.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_comm_log_beside_another_journal_is_refused_before_anything_opens() {
         let dir = journal_dir("comm-log-mismatch");

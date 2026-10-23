@@ -11,8 +11,9 @@
 //! the next `seq` and an `event` naming its kind. [`redaction::redact`] is how an exchange entry
 //! will carry a message's bytes.
 //!
-//! A log is closed cleanly when it starts with its header, its lines number 0, 1, ... with
-//! nothing blank or damaged between them, and its last line is a complete `job_end`. A log that
+//! A log is closed cleanly when it holds its header and its last run's lines number on from the
+//! largest `seq` before them, with nothing blank or damaged between them, to a complete
+//! `job_end`; each run judges only the run before it. A log that
 //! is opened again otherwise (a crash, a power loss, a write that failed) is cut after its last
 //! complete line, which drops a torn tail, goes on after the largest `seq` it holds, and its
 //! status ends as [`CommLogIncomplete::UncleanReopen`] at best; so does a resume that finds no
@@ -368,20 +369,20 @@ impl CommLog {
             job_file_stem(&setup.key).map_err(kind)?
         ));
         let lock = WriterLock::at(&lock_path).map_err(kind)?;
-        let existed = path.try_exists().map_err(|error| error.kind())?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&path)
-            .map_err(|error| error.kind())?;
-        if !existed {
-            // A new file's name is durable only once its directory is (as the journal's).
-            sync_dir(&setup.dir).map_err(|error| error.kind())?;
-        }
+        let mut options = OpenOptions::new();
+        options.read(true).write(true).create(true).truncate(false);
+        // The log holds the vehicle's data: on Unix a new one is its owner's alone. A file that
+        // exists keeps its mode.
+        #[cfg(unix)]
+        std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
+        let mut file = options.open(&path).map_err(|error| error.kind())?;
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|error| error.kind())?;
+        if bytes.is_empty() {
+            // A new file's name is durable only once its directory is (as the journal's). An
+            // empty file may be one whose earlier sync failed, so it is synced again.
+            sync_dir(&setup.dir).map_err(|error| error.kind())?;
+        }
         let scan = scan(&bytes).ok_or(io::ErrorKind::InvalidData)?;
         let io_kind = |error: io::Error| error.kind();
         if scan.complete_len < bytes.len() {
@@ -402,8 +403,8 @@ impl CommLog {
     }
 
     fn new(sink: Box<dyn LineSink>, scan: Scan, lock: Option<WriterLock>) -> Self {
-        // A log goes on after an earlier run only when its first line is its header; otherwise
-        // a header is written after whatever the file holds, marked incomplete.
+        // A log goes on after an earlier run once it holds a header; otherwise a header is
+        // written after whatever the file holds, marked incomplete.
         let reopened = scan.header;
         Self(Arc::new(Mutex::new(Inner {
             sink,
@@ -411,7 +412,8 @@ impl CommLog {
             failed: None,
             unclean: scan.torn
                 || (scan.complete_len > 0 && !(scan.header && scan.consistent && scan.clean_close)),
-            epoch: if reopened { scan.next_epoch } else { 0 },
+            // One more than any epoch the file holds, so two agents never share one.
+            epoch: scan.next_epoch,
             origin: Instant::now(),
             opening: Some(if reopened {
                 Opening::Reopened
@@ -581,10 +583,11 @@ struct Scan {
     torn: bool,
     /// Complete lines that are not blank.
     lines: usize,
-    /// The first of them is a header with `seq` 0.
+    /// One of them is a header.
     header: bool,
-    /// Every one of them is a JSON object whose `seq` is one more than the line's before (the
-    /// first 0), and the first is the header: nothing between them is missing or damaged.
+    /// The lines from the last opening line (a header or an `agent_clock`) on are each a JSON
+    /// object whose `seq` is one more than the largest before it (the first line's 0), with no
+    /// blank line between: nothing the last run wrote is missing or damaged.
     consistent: bool,
     /// The `seq` the next line takes: one more than the largest `seq` read, so numbering never
     /// goes back.
@@ -605,18 +608,20 @@ fn scan(bytes: &[u8]) -> Option<Scan> {
     let mut scan = Scan {
         complete_len,
         torn: complete_len < bytes.len(),
-        consistent: true,
         ..Scan::default()
     };
     let mut largest_seq: Option<u64> = None;
     let mut largest_epoch: Option<u64> = None;
+    // Whether the lines since the last opening line (a header or an `agent_clock`, which starts
+    // a run) are whole; `None` before the first. A run reports what it finds since the run
+    // before it began: damage further back was reported by the run that found it.
+    let mut since_opening: Option<bool> = None;
     for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             // A blank line is no line of this writer's.
-            scan.consistent = false;
+            since_opening = since_opening.map(|_| false);
             continue;
         }
-        let first = scan.lines == 0;
         scan.lines += 1;
         scan.clean_close = false;
         let parsed = serde_json::from_slice::<serde_json::Value>(line).ok();
@@ -624,29 +629,42 @@ fn scan(bytes: &[u8]) -> Option<Scan> {
         let seq = object.and_then(|object| object.get("seq")?.as_u64());
         let event = object.and_then(|object| object.get("event")?.as_str());
         let expected = largest_seq.map_or(Some(0), |seq| seq.checked_add(1));
-        if seq.is_none() || seq != expected {
-            scan.consistent = false;
-        }
+        let whole = seq.is_some() && seq == expected;
+        // A gap just before an `agent_clock` is the run before it losing its tail, which the run
+        // that wrote the `agent_clock` reported: the check starts again there.
+        let opens = seq.is_some();
         if let Some(seq) = seq {
             largest_seq = Some(largest_seq.map_or(seq, |largest| largest.max(seq)));
         }
-        match event {
-            Some("header") if first && seq == Some(0) => {
+        let epoch = match event {
+            Some("header") => {
                 scan.header = true;
-                largest_epoch = Some(largest_epoch.unwrap_or(0));
+                // A header starts the log: lines before it with a `seq` were lost from it.
+                since_opening = Some(whole);
+                // A header without a readable epoch began epoch 0.
+                Some(
+                    object
+                        .and_then(|object| object.get("clock")?.get("epoch")?.as_u64())
+                        .unwrap_or(0),
+                )
             }
             Some("agent_clock") => {
-                if let Some(epoch) = object.and_then(|object| object.get("epoch")?.as_u64()) {
-                    largest_epoch = Some(largest_epoch.map_or(epoch, |largest| largest.max(epoch)));
-                }
+                since_opening = Some(opens);
+                object.and_then(|object| object.get("epoch")?.as_u64())
             }
-            Some("job_end") => scan.clean_close = true,
-            _ => {}
-        }
-        if first && !scan.header {
-            scan.consistent = false;
+            _ => {
+                since_opening = since_opening.map(|before| before && whole);
+                if event == Some("job_end") {
+                    scan.clean_close = true;
+                }
+                None
+            }
+        };
+        if let Some(epoch) = epoch {
+            largest_epoch = Some(largest_epoch.map_or(epoch, |largest| largest.max(epoch)));
         }
     }
+    scan.consistent = since_opening == Some(true);
     scan.next_seq = match largest_seq {
         Some(seq) => seq.checked_add(1)?,
         None => 0,
@@ -693,9 +711,13 @@ impl JobLog {
     /// host.
     pub(crate) fn open(&mut self, run: RunKind) -> Option<CommLog> {
         let (setup, facts) = (self.setup.as_ref()?, self.facts.as_ref()?);
-        match CommLog::open(setup) {
+        // The log never changes the job's result, a panic while opening it included.
+        let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            CommLog::open(setup).inspect(|log| log.begin(facts, run))
+        }))
+        .unwrap_or(Err(CommLogIncomplete::NotOpened(io::ErrorKind::Other)));
+        match opened {
             Ok(log) => {
-                log.begin(facts, run);
                 self.log = Some(log.clone());
                 Some(log)
             }
@@ -1126,6 +1148,93 @@ mod tests {
         log.begin(&facts(), RunKind::Resume);
         log.end("ok");
         assert_eq!(log.status(), CommLogStatus::Complete);
+    }
+
+    #[test]
+    fn the_epoch_goes_on_after_the_largest_and_every_header_counts() {
+        let bytes = b"{\"seq\":0,\"event\":\"header\",\"clock\":{\"epoch\":0}}\n{\"seq\":1,\"event\":\"agent_clock\",\"epoch\":5}\n{\"seq\":2,\"event\":\"agent_clock\",\"epoch\":2}\n{\"seq\":3,\"event\":\"job_end\"}\n";
+        assert_eq!(
+            scan(bytes).unwrap().next_epoch,
+            6,
+            "the largest, not the last"
+        );
+        // A header that is not first, with an epoch of its own, counts as well.
+        let later = b"junk\n{\"seq\":0,\"event\":\"header\",\"clock\":{\"epoch\":4}}\n";
+        let scan = scan(later).unwrap();
+        assert!(scan.header);
+        assert_eq!(scan.next_epoch, 5);
+    }
+
+    #[test]
+    fn two_runs_over_a_file_without_a_header_get_their_own_epochs_and_one_header() {
+        let first = Recording::default();
+        let log = CommLog::over(Box::new(first.clone()), b"junk\n");
+        log.begin(&facts(), RunKind::First);
+        log.end("ok");
+        let mut bytes = b"junk\n".to_vec();
+        bytes.extend_from_slice(&first.taken.lock().unwrap());
+        let second = Recording::default();
+        let log = CommLog::over(Box::new(second.clone()), &bytes);
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        let lines = second.lines();
+        assert_eq!(
+            lines[0]["event"], "agent_clock",
+            "the header is written once"
+        );
+        assert_eq!(lines[0]["epoch"], 1);
+        assert_eq!(first.lines()[0]["clock"]["epoch"], 0);
+    }
+
+    #[test]
+    fn damage_an_earlier_run_reported_does_not_mark_later_runs() {
+        // Run 1 lost seq 2; run 2 reopened it as unclean and closed cleanly.
+        let bytes = b"{\"seq\":0,\"event\":\"header\"}\n{\"seq\":1,\"event\":\"job_start\"}\n{\"seq\":3,\"event\":\"agent_clock\",\"epoch\":1,\"incomplete\":true}\n{\"seq\":4,\"event\":\"job_start\"}\n{\"seq\":5,\"event\":\"job_end\"}\n";
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), bytes);
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        assert_eq!(log.status(), CommLogStatus::Complete);
+        assert!(sink.lines()[0].get("incomplete").is_none());
+        // A gap in the last run is still found.
+        let gap = b"{\"seq\":0,\"event\":\"header\"}\n{\"seq\":1,\"event\":\"agent_clock\",\"epoch\":1}\n{\"seq\":3,\"event\":\"job_end\"}\n";
+        let log = CommLog::over(Box::new(Recording::default()), gap);
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        assert_eq!(
+            log.status(),
+            CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen)
+        );
+    }
+
+    #[test]
+    fn a_first_header_whose_seq_is_not_zero_is_not_a_clean_start() {
+        let bytes = b"{\"seq\":5,\"event\":\"header\"}\n{\"seq\":6,\"event\":\"job_end\"}\n";
+        let log = CommLog::over(Box::new(Recording::default()), bytes);
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        assert_eq!(
+            log.status(),
+            CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_log_file_is_its_owners_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.end("ok");
+        let mode = std::fs::metadata(setup.path().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o600);
+        drop(log);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

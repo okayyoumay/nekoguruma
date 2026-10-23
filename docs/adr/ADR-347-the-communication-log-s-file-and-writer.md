@@ -48,18 +48,22 @@ resume opens its journal before the link.
    only in the file, since the file is what fails, and the guards are about locks.
 4. **A log that runs whole from its header to a `job_end` was closed cleanly.** The first line
    is the header (`seq` 0). Each run writes `job_start`, and its last line is `job_end` with the
-   job's outcome. A log was closed cleanly when it starts with its header, its lines number 0,
-   1, ... with nothing blank or damaged between them, and its last line is a complete `job_end`:
-   a power loss can keep a synced `job_end` and lose a line before it, so the last line alone
-   does not show a clean close. A reopen drops a torn last line (everything after the last line
+   job's outcome. A log was closed cleanly when it holds its header and the lines of its last
+   run (from that run's header or `agent_clock`) number on from the largest `seq` before them,
+   with nothing blank or damaged between them, to a complete `job_end`: a power loss can keep a
+   synced `job_end` and lose a line before it, so the last line alone does not show a clean
+   close. Each run judges only the run before it, so damage further back, which the run that
+   found it reported, does not mark every later run; a gap just before an `agent_clock` is the
+   tail of the run before it, reported by the run that wrote that `agent_clock`. A reopen drops a torn last line (everything after the last line
    break), goes on with the `seq` after the largest the file holds, so numbering never goes
    back, and writes `agent_clock`, a new reading of the agent's clocks that starts a new agent
-   epoch (design 8.11). When the close was not clean, the reopen marks `agent_clock` incomplete
+   epoch, one more than any epoch the file holds (design 8.11). When the close was not clean, the reopen marks `agent_clock` incomplete
    and the run's status is incomplete, even if the rest of the run writes cleanly. A file that
-   does not start with a header gets one after whatever it holds, marked incomplete, and so does
-   a resume that finds no log, since the job ran before. A file whose `seq` or epoch has no
+   holds no header gets one after whatever it holds, marked incomplete, and so does a resume
+   that finds no log, since the job ran before; a later run of it writes `agent_clock`. A file whose `seq` or epoch has no
    successor is not opened, and a log that reaches the last `seq` stops rather than wrap. A new
-   file's directory is synced, as the journal's is, so its name survives a power loss.
+   (or still empty) file's directory is synced, as the journal's is, so its name survives a
+   power loss. On Unix a new log file is its owner's alone (mode 0600).
    `job_start` names the run as the runner knows it when it opens the log: a first run, a resume,
    or a resume that found no journal; a plain start on an existing journal, which the restart
    classification decides later, is logged as a resume. No sidecar marks the close, since one

@@ -541,15 +541,10 @@ impl<C: WorkerApi> WorkerHost<C> {
         let sent = handle.block_on(self.send_recv_async(request, progress));
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
-            // An error event that came before the response is a fault seen in the exchange
-            // (design 8.11 "Link error").
-            let link_error = match (&sent.result, sent.error_event) {
-                (Ok(_), Some(code)) => {
-                    detail.error_event = error_event_str(code);
-                    Some(link_error_kind(code))
-                }
-                _ => None,
-            };
+            let link_error = also_seen(&sent.result, sent.error_event).map(|code| {
+                detail.error_event = error_event_str(code);
+                link_error_kind(code)
+            });
             self.log(&request, before, end, detail, |evidence| {
                 evidence.expected = expected;
                 evidence.link_errors.extend(link_error);
@@ -729,6 +724,17 @@ struct Sent {
 }
 
 /// The name of an error event, as `detail` carries it.
+/// The error event the worker reported in an exchange that ended some other way than by it: a
+/// fault seen in the exchange (design 8.11 "Link error"), whether a response followed it or
+/// the exchange then timed out or lost its events. A primitive that failed with it already
+/// ends on it.
+fn also_seen(result: &Result<Vec<u8>, HostError>, error_event: Option<i32>) -> Option<i32> {
+    match result {
+        Err(HostError::PrimitiveFailed(_)) => None,
+        _ => error_event,
+    }
+}
+
 fn error_event_str(code: i32) -> Option<&'static str> {
     PduErrorEvent::try_from(code)
         .ok()
@@ -736,7 +742,7 @@ fn error_event_str(code: i32) -> Option<&'static str> {
 }
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
-/// sub-function of a service that has one (ISO 14229-1:2026: DiagnosticSessionControl,
+/// sub-function of a service that has one (ISO 14229-1:2026 8.2.2: DiagnosticSessionControl,
 /// ECUReset, SecurityAccess, CommunicationControl, Authentication, ReadDTCInformation,
 /// TesterPresent,
 /// ControlDTCSetting, ResponseOnEvent, LinkControl, DynamicallyDefineDataIdentifier,
@@ -1476,6 +1482,24 @@ mod tests {
         for (request, error, cause) in cases {
             assert_eq!(refusal_cause(request, &error), cause, "{error:?}");
         }
+    }
+
+    #[test]
+    fn an_error_event_counts_however_the_exchange_ended() {
+        let tx = Some(PduErrorEvent::PduErrEvtTxError as i32);
+        for result in [
+            Ok(vec![0x62, 0xF1, 0x90]),
+            Err(HostError::NoResponse),
+            Err(HostError::EventsLost),
+            Err(HostError::EventStreamEnded),
+        ] {
+            assert_eq!(also_seen(&result, tx), tx, "{result:?}");
+        }
+        let failed = Err(HostError::PrimitiveFailed(
+            PduErrorEvent::PduErrEvtTxError as i32,
+        ));
+        assert_eq!(also_seen(&failed, tx), None);
+        assert_eq!(also_seen(&Err(HostError::NoResponse), None), None);
     }
 
     #[test]

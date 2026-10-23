@@ -115,15 +115,17 @@ faults, and aims the logs at software experts away from the workshop.
    cursor whose entry has been rotated away since is answered from the oldest entry left, and the
    reply says entries were lost), over the data channel's resumable transfer (design 5.2). When a
    job fails, the agent sends the entries logged in that job's span at `info` and above, at most 1
-   MiB, with the job's result; when they do not fit, every `error` and `warn` entry is kept first,
-   newest first, the rest is filled with the newest `info` entries, and the attachment says how many
-   entries it left out. Fetching is limited to administrators. Entries leave the device without
-   their `external` fields, span fields included, which are replaced by their length, unless an
-   administrator's fetch asks for them; such a fetch is held to design 16.2's rule for
-   troubleshooting logs (sent only on an explicit action of the device's user, with the scope
-   shown), and nothing sent automatically carries them. The server keeps fetched entries apart from
-   the audit log, for a retention period that is an operator setting. An agent with no server, or
-   offline, keeps its entries only in its rotated files.
+   MiB, with the job's result; when they do not fit, entries are taken in this order until the cap
+   is reached: the entry that recorded the job's failure, then `error` entries newest first, then
+   `warn` entries newest first, then `info` entries newest first; the attachment says how many
+   entries it left out at each level, and an entry larger than the space left is skipped rather than
+   cut. Fetching is limited to administrators. Entries leave the device without their `external`
+   fields, span fields included, which are replaced by their length, unless an administrator's fetch
+   asks for them; such a fetch is held to design 16.2's rule for troubleshooting logs (sent only on
+   an explicit action of the device's user, with the scope shown), and nothing sent automatically
+   carries them. The server keeps fetched entries apart from the audit log, for a retention period
+   that is an operator setting. An agent with no server, or offline, keeps its entries only in its
+   rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    It cannot change the output or any path, and only administrators can issue it, as for item 8.

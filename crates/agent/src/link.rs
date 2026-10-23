@@ -216,24 +216,31 @@ pub const PROTOCOL_UDS_ON_CAN: &str = "ISO_14229_3_on_ISO_15765_2";
 /// (Annex B.1, ADR-319).
 const UDS_ON_CAN_NAMES: [&str; 2] = ["ISO15765", PROTOCOL_UDS_ON_CAN];
 /// The ComParams the link sets itself ([`set_up_link`]).
-const SET_BY_LINK: [&str; 8] = [
+const SET_BY_LINK: [&str; 12] = [
     "CP_Baudrate",
     "CP_P2Max",
     "CP_P2Star",
     "CP_RC78Handling",
     "CP_RCByteOffset",
     "CP_RC78CompletionTimeout",
+    "CP_RC21Handling",
+    "CP_RC23Handling",
+    "CP_TransmitIndEnable",
+    "CP_StartMsgIndEnable",
     "CP_CanPhysReqId",
     "CP_CanRespUSDTId",
 ];
+/// The indications the link turns on for the communication log (design 8.11 "Link settings
+/// for the log"): transmit indications and start-of-message indications, which the J2534 worker
+/// passes on only under them (ADR-151). A library that refuses one opens the link without it.
+pub(crate) const INDICATION_COMPARAMS: [&str; 2] = ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"];
 /// ComParams that let a primitive run longer than [`LinkConfig::send_recv_ceiling`] allows:
-/// repeating the request on a busy (0x21) or not-yet-complete (0x23) answer, repeating it at
-/// the application or transport layer, and taking P2 and P2* from the ECU's session response.
-const OUTLAST_THE_HOST: [&str; 9] = [
-    "CP_RC21Handling",
+/// the limits and request times of repeating the request on a busy (0x21) or not-yet-complete
+/// (0x23) answer, which the link turns off (`CP_RC21Handling`, `CP_RC23Handling`), repeating it
+/// at the application or transport layer, and taking P2 and P2* from the ECU's session response.
+const OUTLAST_THE_HOST: [&str; 7] = [
     "CP_RC21CompletionTimeout",
     "CP_RC21RequestTime",
-    "CP_RC23Handling",
     "CP_RC23CompletionTimeout",
     "CP_RC23RequestTime",
     "CP_RepeatReqCountApp",
@@ -270,6 +277,29 @@ pub struct Link {
     /// The application layer whose read-only list the policy applies to the link's requests
     /// (ADR-342), from [`LinkConfig::application_layer`].
     pub(crate) application_layer: Option<ApplicationLayer>,
+    /// Which of [`INDICATION_COMPARAMS`] the library accepted.
+    pub(crate) indications: Indications,
+}
+
+/// Which indications the link has on: those of [`INDICATION_COMPARAMS`] the library accepted
+/// (design 8.11 "Link settings for the log").
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Indications {
+    /// `CP_TransmitIndEnable`.
+    pub(crate) transmit: bool,
+    /// `CP_StartMsgIndEnable`.
+    pub(crate) start_of_message: bool,
+}
+
+impl Indications {
+    /// Whether the library accepted the ComParam `name` of [`INDICATION_COMPARAMS`].
+    pub(crate) fn accepted(&self, name: &str) -> bool {
+        if name == INDICATION_COMPARAMS[0] {
+            self.transmit
+        } else {
+            self.start_of_message
+        }
+    }
 }
 
 impl Link {
@@ -310,9 +340,10 @@ pub(crate) fn valued_by_document(variant: &EcuVariant<'_>) -> Vec<&'static str> 
 }
 
 /// The ComParams the link sets itself, by name, before those the document declares; the
-/// identifiers go into the response ID table instead. The communication log's `link_opened`
+/// identifiers go into the response ID table instead, and the indications are set apart, since
+/// a library may refuse them ([`INDICATION_COMPARAMS`]). The communication log's `link_opened`
 /// names the same (design 8.11).
-pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 6] {
+pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 8] {
     [
         ("CP_Baudrate", config.baud_rate),
         ("CP_P2Max", micros(config.p2_max_ms)),
@@ -324,6 +355,11 @@ pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 6] {
             "CP_RC78CompletionTimeout",
             micros(config.rc78_completion_ms),
         ),
+        // The API repeats no request on a busy (0x21) or not-yet-complete (0x23) answer, which
+        // the log could not see (design 8.11 "Link settings for the log"): the one profile, UDS,
+        // declares neither a pending code (ADR-309 item 5).
+        ("CP_RC21Handling", 0),
+        ("CP_RC23Handling", 0),
     ]
 }
 
@@ -418,12 +454,13 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
         }
     };
     match set_up_link(client, config, deadline, cll_handle).await {
-        Ok(events) => Ok(Link {
+        Ok((events, indications)) => Ok(Link {
             module_handle,
             cll_handle,
             events,
             permission,
             application_layer: config.application_layer(),
+            indications,
         }),
         Err(error) => {
             let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
@@ -624,7 +661,7 @@ async fn set_up_link<C: WorkerApi>(
     config: &LinkConfig,
     deadline: Duration,
     cll_handle: ComLogicalLinkHandle,
-) -> Result<Streaming<EventNotification>, HostError> {
+) -> Result<(Streaming<EventNotification>, Indications), HostError> {
     let own = own_comparams(config);
     let declared = config
         .params
@@ -666,6 +703,15 @@ async fn set_up_link<C: WorkerApi>(
         )
         .await?;
     }
+    let mut indications = Indications::default();
+    for name in INDICATION_COMPARAMS {
+        let accepted = set_indication(client, deadline, cll_handle, name, &mut set).await?;
+        if name == INDICATION_COMPARAMS[0] {
+            indications.transmit = accepted;
+        } else {
+            indications.start_of_message = accepted;
+        }
+    }
 
     // The table makes the worker install the flow-control filter for the ECU's IDs.
     unary(
@@ -694,14 +740,66 @@ async fn set_up_link<C: WorkerApi>(
     )
     .await?;
 
-    unary(
+    let events = unary(
         deadline,
         "SubscribeEvent",
         client.subscribe_event(SubscribeEventRequest {
             handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
         }),
     )
+    .await?;
+    Ok((events, indications))
+}
+
+/// Turns the indication `name` of [`INDICATION_COMPARAMS`] on, and returns whether the library
+/// accepted it. A library that does not know the ComParam, or refuses it, leaves the link
+/// without the indication (design 8.11 "Link settings for the log"); a worker that does not
+/// answer, or whose connection is gone, fails the link as for any other ComParam. `set` holds
+/// the ids already set, so a ComParam the worker resolves to one of them is not set again.
+async fn set_indication<C: WorkerApi>(
+    client: &mut C,
+    deadline: Duration,
+    cll_handle: ComLogicalLinkHandle,
+    name: &'static str,
+    set: &mut Vec<u32>,
+) -> Result<bool, HostError> {
+    let id = match comparam_id(client, deadline, name).await {
+        Ok(id) => id,
+        Err(HostError::DeclaredLink(_)) => return Ok(false),
+        Err(error) => return Err(error),
+    };
+    if set.contains(&id) {
+        return Ok(false);
+    }
+    set.push(id);
+    match unary(
+        deadline,
+        "SetComParam",
+        client.set_com_param(SetComParamRequest {
+            cll_handle: Some(cll_handle),
+            param_item: Some(param(id, PduParamClass::PduPcCom, 1)),
+        }),
+    )
     .await
+    {
+        Ok(_) => Ok(true),
+        Err(HostError::Rpc { status, .. }) if refused(&status) => {
+            tracing::info!(
+                comparam = name,
+                "the library refused an indication ComParam"
+            );
+            Ok(false)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Whether `status` is the worker refusing a request, rather than the connection to it failing.
+fn refused(status: &tonic::Status) -> bool {
+    !matches!(
+        status.code(),
+        tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown
+    )
 }
 
 /// Disconnects and destroys the logical link and disconnects the module.
@@ -716,6 +814,7 @@ pub async fn close<C: WorkerApi>(
         events,
         permission: _,
         application_layer: _,
+        indications: _,
     } = link;
     drop(events);
     teardown(client, module_handle, cll_handle, deadline).await
@@ -975,6 +1074,8 @@ mod tests {
             vec![protocol(&[("CP_StMin", 0), ("cp_stmin", 1)])],
             vec![protocol(&[("cp_baudrate", 250_000)])],
             vec![protocol(&[("CP_RC78HANDLING", 0)])],
+            vec![protocol(&[("CP_TransmitIndEnable", 0)])],
+            vec![protocol(&[("CP_RC23Handling", 1)])],
             // A name that is not the standard's, which the J2534 worker may alias.
             vec![protocol(&[("DATA_RATE", 250_000)])],
             // ComParams that let a primitive outlast the host's deadline.

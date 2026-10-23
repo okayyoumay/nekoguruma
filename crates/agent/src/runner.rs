@@ -1137,7 +1137,12 @@ fn run_job<C: WorkerApi>(
             .as_ref()
             .map(|document| link::valued_by_document(&document.variant()))
             .unwrap_or_default();
-        log.link_opened(crate::host::LOG_LINK, config, &valued_by_document);
+        log.link_opened(
+            crate::host::LOG_LINK,
+            config,
+            &valued_by_document,
+            link.indications,
+        );
     }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     host.set_document(document);
@@ -14214,6 +14219,8 @@ def main():
         comparams: Mutex<Vec<String>>,
         /// Each SetComParam: the ComParam's name, its value and its class.
         set: Arc<Mutex<Vec<(String, u32, i32)>>>,
+        /// A ComParam whose SetComParam the worker refuses, by its lower-case name.
+        refuse_set: Option<&'static str>,
     }
 
     impl FakeWorker {
@@ -14395,6 +14402,11 @@ def main():
             ) = (item.id, item.param_data)
             {
                 let name = self.comparams.lock().unwrap()[usize::try_from(id - 1).unwrap()].clone();
+                if self.refuse_set == Some(name.as_str()) {
+                    return Err(tonic::Status::invalid_argument(
+                        "PDU_ERR_INVALID_PARAMETERS",
+                    ));
+                }
                 self.set
                     .lock()
                     .unwrap()
@@ -14491,6 +14503,16 @@ def main():
         fail_disconnect: bool,
         fail_open: bool,
     ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>, SetComParams) {
+        fake_worker_refusing(fail_disconnect, fail_open, None).await
+    }
+
+    /// [`fake_worker_recording`], whose worker refuses the SetComParam of `refuse_set` (a
+    /// lower-case name).
+    async fn fake_worker_refusing(
+        fail_disconnect: bool,
+        fail_open: bool,
+        refuse_set: Option<&'static str>,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>, SetComParams) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let service = FakeWorker {
@@ -14499,6 +14521,7 @@ def main():
             calls: Arc::clone(&calls),
             comparams: Mutex::new(Vec::new()),
             set: Arc::clone(&set),
+            refuse_set,
         };
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
@@ -14561,7 +14584,8 @@ def main():
     }
 
     /// The link sets its own ComParams, then the declared ones as declared, each with the class
-    /// the worker takes from the ComParam (ADR-324 item 3).
+    /// the worker takes from the ComParam (ADR-324 item 3), then its indications (design 8.11
+    /// "Link settings for the log").
     #[tokio::test(flavor = "multi_thread")]
     async fn declared_comparams_are_set_after_the_links_own() {
         let (mut client, _calls, set) = fake_worker_recording(false, false).await;
@@ -14587,10 +14611,58 @@ def main():
                 ("cp_rc78handling".to_owned(), 1, com),
                 ("cp_rcbyteoffset".to_owned(), 2, com),
                 ("cp_rc78completiontimeout".to_owned(), 25_000_000, com),
+                ("cp_rc21handling".to_owned(), 0, com),
+                ("cp_rc23handling".to_owned(), 0, com),
                 ("cp_blocksize".to_owned(), 8, specified),
                 ("cp_stmin".to_owned(), 20, specified),
+                ("cp_transmitindenable".to_owned(), 1, com),
+                ("cp_startmsgindenable".to_owned(), 1, com),
             ]
         );
+    }
+
+    /// A library that refuses an indication ComParam, or does not know it, leaves the link open
+    /// without that indication (design 8.11 "Link settings for the log"); the link records which
+    /// it has.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_refused_indication_leaves_the_link_open_without_it() {
+        for (refused, expected) in [
+            (
+                None,
+                link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+            ),
+            (
+                Some("cp_transmitindenable"),
+                link::Indications {
+                    transmit: false,
+                    start_of_message: true,
+                },
+            ),
+            (
+                Some("cp_startmsgindenable"),
+                link::Indications {
+                    transmit: true,
+                    start_of_message: false,
+                },
+            ),
+        ] {
+            let (mut client, calls, _set) = fake_worker_refusing(false, false, refused).await;
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            assert_eq!(link.indications, expected, "{refused:?}");
+            link::close(&mut client, link, Duration::from_secs(5))
+                .await
+                .expect("the link closes");
+            assert!(
+                calls.lock().unwrap().contains(&"ConnectComLogicalLink"),
+                "{refused:?}"
+            );
+        }
     }
 
     /// A declared ComParam the worker does not know, or resolves to one already set, stops the
@@ -15276,9 +15348,19 @@ def main():
         assert_eq!(comparam("CP_P2Max")["value"], 1_000_000);
         assert_eq!(comparam("CP_P2Max")["set_by"], "link");
         assert_eq!(comparam("CP_RC78Handling")["value"], 1);
-        assert!(comparam("CP_TransmitIndEnable").get("value").is_none());
+        assert!(comparam("CP_RC78Handling").get("accepted").is_none());
+        for name in ["CP_RC21Handling", "CP_RC23Handling"] {
+            assert_eq!(comparam(name)["value"], 0, "{name}");
+            assert_eq!(comparam(name)["set_by"], "link", "{name}");
+        }
+        for name in ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"] {
+            assert_eq!(comparam(name)["value"], 1, "{name}");
+            assert_eq!(comparam(name)["set_by"], "link", "{name}");
+            assert_eq!(comparam(name)["accepted"], true, "{name}");
+        }
+        assert!(comparam("CP_TesterPresentHandling").get("value").is_none());
         assert_eq!(
-            comparam("CP_TransmitIndEnable")["set_by"],
+            comparam("CP_TesterPresentHandling")["set_by"],
             "library_default"
         );
         assert_eq!(opened["transmit_confirmation"], serde_json::json!([]));

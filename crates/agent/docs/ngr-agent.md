@@ -303,10 +303,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those
   whose value the document gives, declared or the baud rate and a declared timing,
   `library_default` without a value for the timing ComParams design 8.11 lists that neither
-  sets), with no transmit-confirmation source, response times not judged and no timing margin
-  (`source` `none`), since the link turns none of those on yet, and `forwards_pendings` `null`,
-  since whether pendings are forwarded depends on the worker and the agent does not know it
-  yet.
+  sets). The link sets `CP_RC21Handling` and `CP_RC23Handling` to 0, so the API repeats no
+  request on a busy answer, and turns `CP_TransmitIndEnable` and `CP_StartMsgIndEnable` on;
+  their entries carry `accepted`, and a library that refuses one opens the link without it.
+  The event gives no transmit-confirmation source, response times not judged and no timing
+  margin (`source` `none`), since the agent does not read the indications yet, and
+  `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
+  the agent does not know it yet.
   A `diag.log` message is a
   `procedure_log` event with its `level` and `message`; the operational log (`tracing`) records
   only that the procedure logged one, with its level.

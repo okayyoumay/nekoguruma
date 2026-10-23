@@ -323,7 +323,6 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   - TransferData (14.4): the data of a download's requests and an upload's responses is its
     length and SHA-256, the block counter in clear.
 
-  The exchange entries that use it come with the rest of design 8.11.
 - **Exchange classification.** `comm_log::exchange` builds an exchange entry from what the
   agent saw of it (`Evidence`) and the link's history (`LinkState`: answers, matched answers,
   owed requests, the last link error, an accepted ECUReset or session change), and classifies it
@@ -339,7 +338,20 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   restart or a VCI reconnect (`LinkState::reopened`) ends the matched answers and keeps the owed
   requests. The other rows stand as comments where the table puts them, and evidence only they
   could classify falls to the last row, `undetermined`, at the place in the table where that row
-  stands. The host does not write entries yet.
+  stands.
+- **Exchange entries.** The worker host writes one entry for each request a VM step sends
+  through it (`send_recv`, the generic send-receive) and for each it refuses before sending
+  (`not_sent`: the request policy, an undeclared service, TransferData outside `FlashTransfer`, a
+  block with no transfer, one longer than the ECU's block length, or one refused for its
+  RequestDownload's response, which `caused_by` names). Each has `origin` `procedure`, the step's
+  `at` (pc, step count, the source position the program's source map gives, and the sections in
+  force), the link's identifiers as its `target`, the agent's times, and in `detail` the host
+  error's variant name, the error event's name and the gRPC status code, never their text. The
+  runner tells the host where each step begins and that it ended (`ProcedurePosition`); a request
+  sent outside a step (the runner's and the restart's own reads) gets no entry yet. The log keeps
+  one `LinkState` per target for the run, so it outlives the link within the run; a later run of
+  the job starts it over, since the log is not read back. A link error an entry carries is handed
+  to every other target's state too. Writing an entry never reaches the job, a panic included.
 
 ## Restart classification
 

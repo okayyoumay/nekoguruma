@@ -76,6 +76,8 @@ impl From<&SourceSpan> for SourcePos {
 pub(crate) struct SectionAttrs {
     pub interruptible: Interruptible,
     pub idempotency: Idempotency,
+    /// How long the section is expected to take, 0 when it declares none.
+    pub expected_millis: u32,
 }
 
 impl From<&Section> for SectionAttrs {
@@ -83,6 +85,7 @@ impl From<&Section> for SectionAttrs {
         Self {
             interruptible: section.interruptible,
             idempotency: section.idempotency,
+            expected_millis: section.expected_millis,
         }
     }
 }
@@ -321,9 +324,9 @@ pub(crate) struct Detail {
     /// The host error's variant name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_error: Option<&'static str>,
-    /// The D-PDU error event's name.
+    /// The D-PDU error event's name, or its code when the interface lists no name for it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_event: Option<&'static str>,
+    pub error_event: Option<String>,
     /// The D-PDU error event's extra error information (ISO 22900-2:2022 D.4.2), by name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub extra_error_info: Option<&'static str>,
@@ -1169,6 +1172,12 @@ pub(crate) struct ExchangeEntry {
 }
 
 impl ExchangeEntry {
+    /// The link error the exchange saw, on its own link or another link of its channel, which
+    /// ends the matched answers of the channel's other targets too ([`LinkState::record`]).
+    pub(crate) fn link_error(&self) -> Option<LinkErrorKind> {
+        self.effect.link_error
+    }
+
     /// The entry for `evidence` as line `seq`, with `history` from
     /// [`LinkState::history_for`], classified by [`classify`].
     pub(crate) fn build(seq: u64, evidence: Evidence, history: LinkHistory) -> Self {
@@ -2596,6 +2605,7 @@ mod tests {
             sections: vec![SectionAttrs {
                 interruptible: Interruptible::No,
                 idempotency: Idempotency::Safe,
+                expected_millis: 180_000,
             }],
         });
         full.supply_voltage = Some(SupplyVoltage {
@@ -2758,7 +2768,7 @@ mod tests {
         assert_eq!(pending["clock"], "worker");
         let detail = serde_json::to_value(Detail {
             host_error: Some("a"),
-            error_event: Some("b"),
+            error_event: Some("b".to_owned()),
             extra_error_info: Some("c"),
             grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
@@ -2785,13 +2795,14 @@ mod tests {
             end_pc: 1,
             interruptible: Interruptible::RecoveryRequired,
             idempotency: Idempotency::CheckState,
-            expected_millis: 0,
+            expected_millis: 180_000,
         };
         let attrs = SectionAttrs::from(&section);
         assert!(matches!(
             attrs.interruptible,
             Interruptible::RecoveryRequired
         ));
+        assert_eq!(attrs.expected_millis, 180_000);
         assert_eq!(Expected::uds(&[]).positive_prefix, Vec::<u8>::new());
     }
 
@@ -3103,7 +3114,7 @@ mod tests {
         let mut with_detail = evidence(&READ_F186, End::NoResponse);
         with_detail.detail = Detail {
             host_error: Some("NoResponse"),
-            error_event: Some("PDU_ERR_EVT_RX_TIMEOUT"),
+            error_event: Some("PDU_ERR_EVT_RX_TIMEOUT".to_owned()),
             extra_error_info: Some("RX_TIMEOUT_NO_RSP"),
             ..Detail::default()
         };

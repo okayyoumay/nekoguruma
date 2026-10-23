@@ -8,7 +8,10 @@
 //! debug build allows and only on the simulator (ADR-247). A third reads the VIN again and
 //! decodes it through the job's document (ADR-316). A fourth runs a procedure of the example
 //! ECU that reads DTCs with `diag.read_dtc`, which lowers to the generic send-receive (ADR-321).
-//! Every job comes from a document and opens the link its variant declares (ADR-324).
+//! A fifth keeps a communication log (design 8.11, ADR-347): it reads the VIN, a DID the ECU
+//! does not know, and a DID whose response `sim-vci` drops, and the log holds an exchange entry
+//! for each, classified by what the host saw. Every job comes from a document and opens the link
+//! its variant declares (ADR-324).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
@@ -18,7 +21,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{Job, JobDocument, JobLimits, JobRun, run_program};
+use agent::{CommLogSetup, CommLogStatus, Job, JobDocument, JobLimits, JobRun, run_program};
 use diag_ir::declaration::{
     DataKind, EcuDocumentT, EcuVariantT, FieldT, NegativeShapeT, Placement, PositiveResponseT,
     ProtocolT, ServiceT, encode_ecu_document,
@@ -83,6 +86,17 @@ fn program() -> Program {
         preconditions: Default::default(),
         flash: Vec::new(),
     }
+}
+
+/// [`program`], then a read of the spare part number, whose response the test has `sim-vci`
+/// drop.
+fn comm_log_program() -> Program {
+    let mut program = program();
+    program.constants.push(vec![0xF1, 0x87]);
+    program
+        .code
+        .extend([Op::PushBytes(2), Op::ServiceRequest { service: 0x22 }]);
+    program
 }
 
 /// Switches to the programming session (ISO 14229-1:2026 clause 9.2), then starts the check
@@ -242,6 +256,14 @@ fn agent_job_reads_the_vin_from_sim_vci() {
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
     let definition_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-definitions"));
+    // The control directory `sim-vci` takes faults from (`crates/sim-vci/docs/simulated-vci.md`),
+    // and the fifth job's communication log.
+    let control_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-control"));
+    let comm_log_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-commlog"));
+    for dir in [&control_dir, &comm_log_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+        std::fs::create_dir_all(dir).expect("test directory");
+    }
     let _ = std::fs::remove_dir_all(&definition_dir);
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &sim_vci_path())
@@ -251,6 +273,7 @@ fn agent_job_reads_the_vin_from_sim_vci() {
     unsafe {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
         std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
+        std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", &control_dir);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
         // The simulated ECU uses its built-in configuration.
         std::env::remove_var("NGR_SIM_ECU_CONFIG");
@@ -264,9 +287,18 @@ fn agent_job_reads_the_vin_from_sim_vci() {
         .expect("runtime");
     // A wedged service must fail the test, not hang the CI job.
     runtime
-        .block_on(async { tokio::time::timeout(Duration::from_secs(120), run_the_job()).await })
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                run_the_job(&control_dir, &comm_log_dir),
+            )
+            .await
+        })
         .expect("the end-to-end flow should finish in time");
     drop(config);
+    for dir in [&control_dir, &comm_log_dir] {
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
 
 /// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so
@@ -295,7 +327,7 @@ fn job_guards(writes: bool) -> JobGuards {
     .expect("guards should be free")
 }
 
-async fn run_the_job() {
+async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Path) {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
@@ -418,8 +450,134 @@ async fn run_the_job() {
     .await;
     state.expect("the DTC job should finish");
 
+    // A job with a communication log. `sim-vci` drops the response to the F187 read, which it
+    // takes from the control directory before the job's first request.
+    std::fs::write(
+        control_dir.join("001.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 241, 135], "fault": "drop_response"}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("001.tmp"), control_dir.join("001.json"))
+        .expect("the control file should be renamed");
+    let setup = CommLogSetup {
+        dir: comm_log_dir.to_owned(),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e72".to_owned()),
+            generation: 1,
+        },
+    };
+    let job = document_job(&comm_log_program()).with_comm_log(setup.clone());
+    let JobRun {
+        result: state,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    assert!(
+        matches!(state, Err(agent::JobError::Host { .. })),
+        "the dropped response ends the job: {state:?}"
+    );
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    assert_comm_log(&setup);
+
     worker
         .stop(Duration::from_secs(5))
         .await
         .expect("worker should stop");
+}
+
+/// The fifth job's exchange entries (design 8.11 "Exchange entry"): one per request, at the
+/// instruction that sent it, classified as today's evidence allows. The J2534 worker's link
+/// absorbs pendings and no time is judged yet, so a pending may have come first (H4) behind
+/// every answer and every silence: none of them is `none` or `vehicle` yet.
+fn assert_comm_log(setup: &CommLogSetup) {
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let entries: Vec<&serde_json::Value> = lines
+        .iter()
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    assert_eq!(entries.len(), 3, "{text}");
+    for (entry, (pc, request)) in entries
+        .iter()
+        .zip([(1, "22f190"), (3, "221234"), (5, "22f187")])
+    {
+        assert_eq!(entry["origin"], "procedure", "{entry}");
+        assert_eq!(entry["link"], 1, "{entry}");
+        assert_eq!(entry["target"]["link"], 1, "{entry}");
+        assert_eq!(entry["at"]["pc"], pc, "{entry}");
+        assert_eq!(entry["at"]["steps"], pc, "{entry}");
+        assert_eq!(entry["request"]["sid"], "0x22", "{entry}");
+        assert_eq!(
+            entry["request"]["service"], "ReadDataByIdentifier",
+            "{entry}"
+        );
+        assert_eq!(entry["request"]["bytes"]["clear"], request, "{entry}");
+        assert_eq!(entry["pending_visibility"], "absorbed_by_vci", "{entry}");
+        assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
+        assert!(
+            entry["times"]["agent"]["end_us"].as_u64()
+                >= entry["times"]["agent"]["before_us"].as_u64()
+        );
+        assert!(
+            entry["text"].as_str().is_some_and(|text| !text.is_empty()),
+            "{entry}"
+        );
+    }
+    // Sequence numbers rise from line to line.
+    let seqs: Vec<u64> = lines
+        .iter()
+        .map(|line| line["seq"].as_u64().expect("a seq"))
+        .collect();
+    assert!(
+        seqs.windows(2).all(|pair| pair[1] == pair[0] + 1),
+        "{seqs:?}"
+    );
+
+    let (vin, unknown, dropped) = (entries[0], entries[1], entries[2]);
+    assert_eq!(vin["outcome"]["result"], "positive", "{vin}");
+    assert_eq!(vin["sent"], "confirmed", "{vin}");
+    assert_eq!(vin["sent_evidence"], "answer", "{vin}");
+    assert_eq!(vin["classification"], "undetermined", "{vin}");
+    assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
+
+    // The ECU's negative response, with its code named.
+    assert_eq!(unknown["outcome"]["result"], "negative", "{unknown}");
+    assert_eq!(unknown["outcome"]["nrc"], "0x31", "{unknown}");
+    assert_eq!(
+        unknown["outcome"]["nrc_name"], "requestOutOfRange",
+        "{unknown}"
+    );
+    assert_eq!(
+        unknown["outcome"]["response"]["clear"], "7f2231",
+        "{unknown}"
+    );
+    assert_eq!(unknown["classification"], "undetermined", "{unknown}");
+    assert_eq!(unknown["link_history"]["answered"], 1, "{unknown}");
+
+    // The dropped response: no evidence the request reached the bus, and H4 open.
+    assert_eq!(dropped["outcome"]["result"], "no_response", "{dropped}");
+    assert_eq!(dropped["sent"], "unknown", "{dropped}");
+    assert_eq!(dropped["classification"], "undetermined", "{dropped}");
+    assert_eq!(dropped["detail"]["host_error"], "NoResponse", "{dropped}");
+    let reason = dropped["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("(H4)") && reason.contains("(H1)"),
+        "{reason}"
+    );
+    assert_eq!(dropped["link_history"]["answered"], 2, "{dropped}");
+
+    assert_eq!(lines.last().expect("a line")["event"], "job_end", "{text}");
 }

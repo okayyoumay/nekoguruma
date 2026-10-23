@@ -6,10 +6,11 @@
 //! log held runs without it. The log never steers a job: a failure to open it or to write it
 //! changes the job's [`CommLogStatus`] and nothing else.
 //!
-//! This part writes the lines that exist without an exchange: the `header` (once per log), the
-//! `agent_clock` reading a reopen writes, and a run's `job_start` and `job_end`. Every line has
-//! the next `seq` and an `event` naming its kind. [`redaction::redact`] is how an exchange entry
-//! will carry a message's bytes.
+//! The log holds the `header` (once per log), the `agent_clock` reading a reopen writes, a run's
+//! `job_start` and `job_end`, and the exchange entries the host gives it ([`CommLog::exchange`]), classified against each target's
+//! [`exchange::LinkState`], which the log keeps for the run. Every line has the next `seq` and an
+//! `event` naming its kind. [`redaction::redact`] is how an exchange entry carries a message's
+//! bytes.
 //!
 //! A log is closed cleanly when it holds its header and its last run's lines number on from the
 //! largest `seq` before them, with nothing blank or damaged between them, to a complete
@@ -33,14 +34,16 @@ use crate::journal::{JobKey, JournalError, Vin, WriterLock, job_file_stem, sync_
 use crate::runner::JobError;
 
 /// What an exchange entry carries of a message's bytes (design 8.11, ADR-347).
-#[cfg_attr(not(test), expect(dead_code, reason = "the exchange entries use it"))]
 pub(crate) mod redaction;
 
 /// The exchange entry, its evidence, the per-link history and the classification (design 8.11,
 /// ADR-346 items 2, 3 and 6).
 #[cfg_attr(
     not(test),
-    expect(dead_code, reason = "the host's exchange entries use it")
+    expect(
+        dead_code,
+        reason = "evidence and origins the host does not give yet (transmit indications, VCI times, the runner's own reads)"
+    )
 )]
 pub(crate) mod exchange;
 
@@ -345,6 +348,19 @@ struct Inner {
     ended: bool,
     /// Held while the log is open; absent for a sink a test gives.
     _lock: Option<WriterLock>,
+    /// The link state of each target the run's exchanges went to, in the order of their first
+    /// exchange. It lives as long as the log, so it outlives a link, a worker or a VCI connection
+    /// within the run; a later run of the job starts it over, since the log is not read back.
+    links: Vec<(exchange::Target, exchange::LinkState)>,
+}
+
+/// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
+/// monotonic microseconds since the log began, and the wall clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct AgentNow {
+    pub epoch: u32,
+    pub monotonic_us: u64,
+    pub wall_unix_ms: u64,
 }
 
 /// A job's open communication log. Clones share one writer, so the host and the runner write to
@@ -439,6 +455,7 @@ impl CommLog {
             }),
             ended: false,
             _lock: lock,
+            links: Vec::new(),
         })))
     }
 
@@ -520,6 +537,58 @@ impl CommLog {
         inner.ended = inner.failed.is_none();
     }
 
+    /// Whether the log still takes lines: it has not failed.
+    pub(crate) fn is_open(&self) -> bool {
+        self.lock().failed.is_none()
+    }
+
+    /// The agent's clocks now, for an exchange's times.
+    pub(crate) fn now(&self) -> AgentNow {
+        let clock = self.lock().clock();
+        AgentNow {
+            epoch: u32::try_from(clock.epoch).unwrap_or(u32::MAX),
+            monotonic_us: clock.monotonic_us,
+            wall_unix_ms: clock.wall_unix_ms,
+        }
+    }
+
+    /// Writes the exchange entry of `evidence` as the next line (design 8.11 "Exchange entry"),
+    /// classified against its target's link state, and takes the entry into that state. A link
+    /// error the entry carries ends the matched answers of every other target too: the run's
+    /// targets share its one link, and so its physical channel. The entry's `seq` when it was
+    /// written; `None` once the log has failed, and then the link state is left as it was.
+    pub(crate) fn exchange(&self, evidence: exchange::Evidence) -> Option<u64> {
+        let mut inner = self.lock();
+        if inner.failed.is_some() {
+            return None;
+        }
+        let at = match inner
+            .links
+            .iter()
+            .position(|(target, _)| *target == evidence.target)
+        {
+            Some(at) => at,
+            None => {
+                inner
+                    .links
+                    .push((evidence.target.clone(), exchange::LinkState::default()));
+                inner.links.len() - 1
+            }
+        };
+        let history = inner.links[at].1.history_for(&evidence);
+        let entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
+        let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
+        inner.links[at].1.record(&entry);
+        if let Some(kind) = entry.link_error() {
+            for (other, (_, state)) in inner.links.iter_mut().enumerate() {
+                if other != at {
+                    state.channel_link_error(seq, kind);
+                }
+            }
+        }
+        Some(seq)
+    }
+
     /// How the log stands now. After [`CommLog::end`] it is the run's final status; before it,
     /// a log that has not failed reads as not closed.
     pub(crate) fn status(&self) -> CommLogStatus {
@@ -552,8 +621,18 @@ impl Inner {
     /// Writes `event` as the next line unless the log has failed. A failure is recorded and
     /// stops the log.
     fn append(&mut self, event: &Event<'_>) {
+        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event }));
+    }
+
+    /// Writes the next line, which `serialize` puts into its buffer for the line's `seq`,
+    /// unless the log has failed. The `seq` when the line was written; a failure is recorded
+    /// and stops the log.
+    fn append_with(
+        &mut self,
+        serialize: impl FnOnce(u64, &mut Vec<u8>) -> serde_json::Result<()>,
+    ) -> Option<u64> {
         if self.failed.is_some() {
-            return;
+            return None;
         }
         let seq = self.next_seq;
         let Some(next) = seq.checked_add(1) else {
@@ -561,22 +640,26 @@ impl Inner {
                 seq,
                 kind: io::ErrorKind::InvalidData,
             });
-            return;
+            return None;
         };
         let mut line = Vec::with_capacity(256);
-        let written = serde_json::to_writer(&mut line, &Line { seq, event })
+        let written = serialize(seq, &mut line)
             .map_err(io::Error::from)
             .and_then(|()| {
                 line.push(b'\n');
                 self.sink.write_line(&line)
             });
         match written {
-            Ok(()) => self.next_seq = next,
+            Ok(()) => {
+                self.next_seq = next;
+                Some(seq)
+            }
             Err(error) => {
                 self.failed = Some(CommLogIncomplete::WriteFailed {
                     seq,
                     kind: error.kind(),
                 });
+                None
             }
         }
     }
@@ -1400,5 +1483,113 @@ mod tests {
             outcome_name(&Err(JobError::CommLogMismatch)),
             "CommLogMismatch"
         );
+    }
+
+    // ---- exchange entries (design 8.11 "Exchange entry") ----
+
+    fn evidence(
+        target: exchange::Target,
+        request: &[u8],
+        end: exchange::End,
+    ) -> exchange::Evidence {
+        exchange::Evidence::new(
+            exchange::Origin::Procedure,
+            target,
+            1,
+            0x7E8,
+            request.to_vec(),
+            end,
+        )
+    }
+
+    fn endpoint(tx_id: u32) -> exchange::Target {
+        exchange::Target::Endpoint {
+            link: 1,
+            tx_id,
+            rx_id: 0x7E8,
+        }
+    }
+
+    #[test]
+    fn exchanges_take_the_next_seq_and_their_target_s_link_state() {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        let answer = exchange::End::Positive(vec![0x62, 0xF1, 0x90]);
+        assert_eq!(
+            log.exchange(evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                answer.clone()
+            )),
+            Some(2)
+        );
+        assert_eq!(
+            log.exchange(evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                answer.clone()
+            )),
+            Some(3)
+        );
+        // Another target has a state of its own.
+        assert_eq!(
+            log.exchange(evidence(endpoint(0x7E1), &[0x22, 0xF1, 0x90], answer)),
+            Some(4)
+        );
+        let lines = sink.lines();
+        assert_eq!(lines.len(), 5);
+        assert_eq!(lines[2]["event"], "exchange");
+        assert_eq!(lines[2]["link_history"]["answered"], 0);
+        assert_eq!(lines[3]["link_history"]["answered"], 1);
+        assert_eq!(lines[3]["link_history"]["answered_same_match"], 1);
+        assert_eq!(lines[4]["link_history"]["answered"], 0);
+    }
+
+    #[test]
+    fn a_link_error_ends_the_matched_answers_of_every_target() {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        let answer = exchange::End::Positive(vec![0x62, 0xF1, 0x90]);
+        let read = [0x22, 0xF1, 0x90];
+        log.exchange(evidence(endpoint(0x7E1), &read, answer.clone()));
+        log.exchange(evidence(
+            endpoint(0x7E0),
+            &read,
+            exchange::End::LinkError(exchange::LinkErrorKind::Frame),
+        ));
+        log.exchange(evidence(endpoint(0x7E1), &read, answer));
+        let lines = sink.lines();
+        // The other target's matched answer ended with the error, its count since it too.
+        assert_eq!(lines[4]["link_history"]["answered"], 1);
+        assert_eq!(lines[4]["link_history"]["answered_since_error"], 0);
+        assert_eq!(lines[4]["link_history"]["answered_same_match"], 0);
+    }
+
+    #[test]
+    fn a_failed_log_takes_no_exchange() {
+        let sink = Recording {
+            fail_write: Some(2),
+            ..Recording::default()
+        };
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        assert!(log.is_open());
+        let answer = exchange::End::Positive(vec![0x62, 0xF1, 0x90]);
+        assert_eq!(
+            log.exchange(evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                answer.clone()
+            )),
+            None
+        );
+        assert!(!log.is_open());
+        assert_eq!(
+            log.exchange(evidence(endpoint(0x7E0), &[0x22, 0xF1, 0x90], answer)),
+            None
+        );
+        assert_eq!(taken_events(&sink), ["header", "job_start"]);
     }
 }

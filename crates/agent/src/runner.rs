@@ -29,7 +29,7 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
-use crate::host::{HostError, Timings, TransferProgress, WorkerHost};
+use crate::host::{HostError, ProcedurePosition, Timings, TransferProgress, WorkerHost};
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
 use crate::journaling::{JobJournal, JournalSetup};
@@ -1092,6 +1092,7 @@ fn run_job<C: WorkerApi>(
     let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
     host.set_artifact(artifact);
     host.set_comm_log(comm_log);
+    host.set_link_ids(config.tx_id, config.rx_id);
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -1236,7 +1237,11 @@ fn resume_on<H, S>(
     guards: &GuardSlot,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
     S: Store,
 {
     match restart_order(
@@ -1332,7 +1337,11 @@ fn restart_order<H, S>(
     guards: &GuardSlot,
 ) -> Result<Restarted<S>, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
     S: Store,
 {
     // Another run of this job holds the journal: it, not this one, goes on with the job.
@@ -1596,7 +1605,11 @@ fn continue_after_plan<H, S>(
     confirmed: restart::Confirmation,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
     S: Store,
 {
     // As at the start of every restart step: a cancel ends the job before the next verdict.
@@ -1731,7 +1744,11 @@ fn run_on<H, S>(
     journal: Option<&mut JobJournal<S>>,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
     S: Store,
 {
     run_on_from(program, host, limits, cancelled, journal, 0)
@@ -1748,7 +1765,11 @@ fn run_on_from<H, S>(
     first_step: u64,
 ) -> Result<VmState, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
     S: Store,
 {
     let mut vm = Vm::new(program);
@@ -1832,7 +1853,11 @@ fn run_vm<H, S>(
     cancel_at_entry: bool,
 ) -> Result<RunEnd, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
     S: Store,
 {
     let wait_poll = limits.wait_poll.max(Duration::from_millis(1));
@@ -1900,7 +1925,10 @@ where
             pc,
             steps: vm.state.steps,
         };
+        // The requests the step sends are the procedure's, at this position (design 8.11).
+        host.step_begins(program, pc, at.steps);
         let outcome = vm.step_with_declarations(program, variant.as_ref(), host);
+        host.step_ends();
         if vm.state.steps > at.steps {
             // The instruction completed.
             if let Some(journal) = journal.as_deref_mut() {
@@ -1980,7 +2008,11 @@ mod tests {
         guards: &GuardSlot,
     ) -> Result<VmState, JobError>
     where
-        H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+        H: DiagHost<Error = HostError>
+            + RuntimeInputs
+            + TransferProgress
+            + Declarations
+            + ProcedurePosition,
         S: Store,
     {
         resume_to_erase_with(
@@ -2015,7 +2047,11 @@ mod tests {
         guards: &GuardSlot,
     ) -> Result<VmState, JobError>
     where
-        H: DiagHost<Error = HostError> + RuntimeInputs + TransferProgress + Declarations,
+        H: DiagHost<Error = HostError>
+            + RuntimeInputs
+            + TransferProgress
+            + Declarations
+            + ProcedurePosition,
         S: Store,
     {
         match restart_order(
@@ -2143,6 +2179,8 @@ mod tests {
             None
         }
     }
+
+    impl ProcedurePosition for FakeHost {}
 
     impl Declarations for FakeHost {
         fn declarations(&self) -> Option<JobDocument> {
@@ -2992,6 +3030,8 @@ def main():
             self.transfer
         }
     }
+
+    impl ProcedurePosition for FlashHost {}
 
     impl DiagHost for FlashHost {
         type Error = HostError;

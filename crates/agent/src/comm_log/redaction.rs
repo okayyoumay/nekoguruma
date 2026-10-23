@@ -262,7 +262,8 @@ mod tests {
                 );
             }
         }
-        // The ISO 26021-2 pair keeps the seed and key rule.
+        // The end-of-life activation pair (0x5F, 0x60; ISO 14229-1:2026 9.4.2.2, Table 41) keeps
+        // the seed and key rule.
         let (_, data) = clear_of(Direction::Response, &[0x67, 0x5F, 0, 0]);
         assert!(matches!(
             data,

@@ -82,8 +82,9 @@ resume opens its journal before the link.
    returns, never raw bytes. It keeps the service and the sub-function in clear and replaces the
    rest:
    - SecurityAccess (ISO 14229-1:2026 9.4): a key request (a key level: even from 0x02 to 0x42,
-     or the ISO 26021-2 key 0x60) and a seed response (odd from 0x01 to 0x41, or 0x5F) by their
-     length, the seed with whether it is all zero. A request or response with any other
+     or 0x60) and a seed response (a seed level: odd from 0x01 to 0x41, or 0x5F) by their
+     length, the seed with whether it is all zero; 0x5F and 0x60 are the end-of-life activation
+     pair that 9.4.2.2 (Table 41) defines beside the numbered levels. A request or response with any other
      sub-function (the supplier-specific range 0x61 to 0x7E and the reserved values, 9.4.2.2)
      has no pairing the standard defines, so its data is its length in both directions;
    - Authentication (9.6): the data by its length; a response keeps its return value (9.6.6),

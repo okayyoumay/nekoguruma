@@ -45,6 +45,22 @@ fn the_definition_converts_to_a_document_per_variant_with_the_read_procedure() {
     }
 }
 
+/// Only the procedure the profile names is converted, whatever case another procedure's
+/// extension has, and the named one may have its extension in any case.
+#[test]
+fn only_the_named_procedure_is_converted_whatever_the_extensions_case() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut read = definition_dir(temp.path());
+    std::fs::write(temp.path().join("OTHER.STAR"), "def main():\n    pass\n").unwrap();
+    let documents = convert(&read).expect("the example converts");
+    assert_eq!(documents.len(), 2, "one document per variant");
+    std::fs::rename(temp.path().join("read.star"), temp.path().join("READ.Star")).unwrap();
+    read.procedure = "READ.Star".to_owned();
+    assert_eq!(convert(&read).expect("the example converts").len(), 2);
+    read.procedure = "dids.csv".to_owned();
+    assert!(matches!(convert(&read), Err(CheckError::Refused(_))));
+}
+
 /// A definition the check cannot convert is refused before anything is sent.
 #[test]
 fn a_definition_that_does_not_convert_is_refused() {

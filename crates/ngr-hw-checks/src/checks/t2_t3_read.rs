@@ -50,23 +50,31 @@ pub struct ReadOutcome {
 }
 
 /// Converts the profile's definition: every file of `read.definition` but the Starlark ones,
-/// and the read procedure `read.procedure`, into one document per variant (design 8.4).
+/// and the read procedure `read.procedure`, into one document per variant (design 8.4). A file
+/// is a Starlark one by its `.star` extension in any case, as the frontend reads it, so no other
+/// procedure in the directory is converted beside the one the profile names.
 pub fn convert(read: &ReadDefinition) -> Result<Documents, CheckError> {
     let refused = |what: String| CheckError::Refused(format!("the read definition: {what}"));
+    if !is_starlark(&read.procedure) {
+        return Err(refused(format!(
+            "the procedure {:?} is not a Starlark (`.star`) file",
+            read.procedure
+        )));
+    }
     let entries = std::fs::read_dir(&read.definition)
         .map_err(|e| refused(format!("{}: {e}", read.definition.display())))?;
     let mut files = Vec::new();
     for entry in entries {
         let entry = entry.map_err(|e| refused(e.to_string()))?;
         let path = entry.path();
-        if !path.is_file()
-            || path
-                .extension()
-                .is_some_and(|extension| extension == "star")
-        {
+        if !path.is_file() {
             continue;
         }
-        files.push((file_name(&path)?, read_text(&path)?));
+        let name = file_name(&path)?;
+        if is_starlark(&name) {
+            continue;
+        }
+        files.push((name, read_text(&path)?));
     }
     let procedure = read.definition.join(&read.procedure);
     files.push((read.procedure.clone(), read_text(&procedure)?));
@@ -90,6 +98,11 @@ pub fn convert(read: &ReadDefinition) -> Result<Documents, CheckError> {
         return Err(refused("no variant".to_owned()));
     }
     Ok(documents)
+}
+
+/// Whether the frontend reads `name` as a procedure file (`diag_frontend::tables::read_files`).
+fn is_starlark(name: &str) -> bool {
+    name.to_ascii_lowercase().ends_with(".star")
 }
 
 fn file_name(path: &Path) -> Result<String, CheckError> {

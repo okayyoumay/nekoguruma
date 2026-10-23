@@ -490,7 +490,8 @@ for a J2534 VCI; its body is `checks::t2_t3_read::run`, over the guarded client
 `j2534-0404-service` (`tests/t2_t3_read_check.rs`, on the example ECU's definition).
 
 - **The definition.** The profile's `[read]` names it. `checks::t2_t3_read::convert` converts
-  every file of `definition` but the Starlark ones, with the `procedure` file, into one document
+  every file of `definition` but the Starlark ones (`.star` in any case, as the frontend reads
+  them), with the `procedure` file, which must be one, into one document
   per variant (design 8.4), before any device opens, so a definition that does not convert sends
   nothing. The definition must declare the profile's link: the guard compares the job's link with
   the profile's, so the profile's `protocol` is the name the agent's link gives its resource,

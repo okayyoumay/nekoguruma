@@ -41,7 +41,7 @@ use diag_ir::{
     Source, Vm, VmError, VmState,
 };
 
-use crate::host::HostError;
+use crate::host::{HostError, OwnRead, ProcedurePosition};
 use crate::inputs::{FieldBytes, Reading, RuntimeInputs, ServiceSources};
 use crate::inputs::{read_field_bytes, resolve_source};
 use crate::journal::Vin;
@@ -743,9 +743,12 @@ pub(crate) fn check_gates<H>(
     promote: impl FnOnce(&Vin) -> Result<(), JobError>,
 ) -> Result<TeardownGate, JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs,
+    H: DiagHost<Error = HostError> + RuntimeInputs + ProcedurePosition,
 {
     let passive = |reason| Ok(TeardownGate::PassiveOnly(reason));
+    // The identity reads first, then the preconditions', each logged as such (design 8.11);
+    // the caller ends the own reads.
+    host.own_reads(Some(OwnRead::Identification));
     if cancelled.load(Ordering::Relaxed) {
         return Err(JobError::Cancelled);
     }
@@ -798,6 +801,7 @@ where
     }
 
     // The safety preconditions.
+    host.own_reads(Some(OwnRead::Precondition));
     let declared = &program.preconditions;
     for (kind, precondition) in [
         (PreconditionKind::Voltage, &declared.voltage_mv),

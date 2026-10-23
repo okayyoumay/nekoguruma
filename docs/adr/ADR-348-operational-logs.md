@@ -77,17 +77,19 @@ workshop.
 6. **What an operational log never holds.** No VIN or other vehicle identity read from an ECU, no
    key, token, credential, seed or key value, OEM authorization material, signing material or bearer
    token, no personal data, and no request or response payload of a diagnostic exchange (the
-   communication log holds those, under its own protection). Error text from a vendor library or a
-   worker is logged with control characters and line breaks escaped, so that one entry stays one
-   line and cannot imitate another. ADR-089's rule stays: detail that must not reach a gRPC client,
-   such as a library path, goes to the operational log only. Text a procedure builds at run time can
-   hold any of these, so it never reaches the operational log: a `diag.log` message (Starlark subset
-   3.1) is written to the job's communication log as a `procedure_log` event with its level, and a
-   `diag.fail` detail stays in the job's journal and result; the operational log records at most
-   that a procedure logged or failed, with the level or the code. A value the agent reads from the
-   vehicle, such as an identity that did not match, is likewise logged as the fact, not the value.
-   Until every existing `tracing` call has been checked against this item, the agent installs no
-   subscriber (item 3).
+   communication log holds those, under its own protection). Text NGR does not write itself cannot
+   be checked against this list: an error description a vendor library returns (which may echo a
+   diagnostic payload), a line of a worker's stderr, and a file path (which may name a user's home
+   directory; ADR-089 keeps full paths out of gRPC replies and in the log). Such text goes in an
+   entry's `external` field, apart from the message, with control characters and line breaks escaped
+   so that one entry stays one line and cannot imitate another; item 8 says when it may leave the
+   device. Text a procedure builds at run time can hold any of these, so it never reaches the
+   operational log: a `diag.log` message (Starlark subset 3.1) is written to the job's communication
+   log as a `procedure_log` event with its level, and a `diag.fail` detail stays in the job's
+   journal and result; the operational log records at most that a procedure logged or failed, with
+   the level or the code. A value the agent reads from the vehicle, such as an identity that did not
+   match, is likewise logged as the fact, not the value. Until every existing `tracing` call has
+   been checked against this item, the agent installs no subscriber (item 3).
 7. **Device timestamps are not authoritative.** Entries carry the device's clock. Unlike the
    audit log (design 16.3), the operational log does not need a trusted time; when the server
    receives entries (item 8) it records its receive time beside them.
@@ -96,9 +98,12 @@ workshop.
    (design 16.3); the agent answers from its local files, at most 4 MiB per request, over the data
    channel's resumable transfer (design 5.2). When a job fails, the agent sends the entries logged
    in that job's span at `info` and above, at most 1 MiB, with the job's result. Fetching is limited
-   to administrators. The server keeps fetched entries apart from the audit log, for a retention
-   period that is an operator setting. An agent with no server, or offline, keeps its entries only
-   in its rotated files.
+   to administrators. Entries leave the device without their `external` fields, which are replaced
+   by their length, unless an administrator's fetch asks for them; such a fetch is held to design
+   16.2's rule for troubleshooting logs (sent only on an explicit action of the device's user, with
+   the scope shown), and nothing sent automatically carries them. The server keeps fetched entries
+   apart from the audit log, for a retention period that is an operator setting. An agent with no
+   server, or offline, keeps its entries only in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    It cannot change the output or any path, and only administrators can issue it, as for item 8.
@@ -115,6 +120,9 @@ workshop.
 - The communication log gains a `procedure_log` event, so a procedure's own messages stay
   under that log's protection and sending rules (design 8.11, 16.2) beside the exchanges they
   explain.
+- Opaque text from vendor libraries, workers and file paths stays on the device unless the
+  device's user releases it, so a failed job's attached entries may lack the vendor's own words;
+  an administrator asks for them through the explicit path.
 - The agent's `tracing` events stop being discarded, and a worker's stderr in a service
   deployment lands in a file someone can read.
 - A device holds at most about 60 MiB of operational log per process with the default limits;

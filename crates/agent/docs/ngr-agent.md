@@ -324,6 +324,16 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
     length and SHA-256, the block counter in clear.
 
   The exchange entries that use it come with the rest of design 8.11.
+- **Exchange classification.** `comm_log::exchange` builds an exchange entry from what the
+  agent saw of it (`Evidence`) and the link's history (`LinkState`: answers, matched answers,
+  owed requests, the last link error, an accepted ECUReset or session change), and classifies it
+  by design 8.11's table, first matching row. It decides only the rows the agent's evidence
+  reaches today: without transmit indications a request is `sent` `confirmed` only by an answer
+  no owed request could own; without a transmit time the timing is `not_judged`, so on a link
+  whose VCI absorbs pendings every response is `undetermined` (a pending may have come first);
+  an answer an owed request could own leaves both `undetermined`. The other rows stand as
+  comments where the table puts them, and evidence only they could classify falls to the last
+  row, `undetermined`. The host does not write entries yet.
 
 ## Restart classification
 

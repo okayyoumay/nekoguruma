@@ -737,13 +737,14 @@ fn error_event_str(code: i32) -> Option<&'static str> {
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
 /// sub-function of a service that has one (ISO 14229-1:2026: DiagnosticSessionControl,
-/// ECUReset, SecurityAccess, CommunicationControl, Authentication, TesterPresent,
+/// ECUReset, SecurityAccess, CommunicationControl, Authentication, ReadDTCInformation,
+/// TesterPresent,
 /// ControlDTCSetting, ResponseOnEvent, LinkControl, DynamicallyDefineDataIdentifier,
 /// RoutineControl), which the ECU leaves unanswered when the request succeeds.
 fn suppresses_positive_response(request: &[u8]) -> bool {
     matches!(
         request,
-        [0x10 | 0x11 | 0x27 | 0x28 | 0x29 | 0x2C | 0x31 | 0x3E | 0x85 | 0x86 | 0x87, sub, ..]
+        [0x10 | 0x11 | 0x19 | 0x27 | 0x28 | 0x29 | 0x2C | 0x31 | 0x3E | 0x85 | 0x86 | 0x87, sub, ..]
             if sub & 0x80 != 0
     )
 }
@@ -799,9 +800,13 @@ fn sent_end(
             })
         }
         HostError::Setup(_) => End::Unknown(UnknownCause::PrimitiveFailedToStart),
-        HostError::VciLost => End::VciLost {
-            refused_after_loss: !started,
-        },
+        HostError::VciLost => {
+            // Both cases of `VciLost` come from this event.
+            detail.error_event = error_event_str(PduErrorEvent::PduErrEvtLostCommToVci as i32);
+            End::VciLost {
+                refused_after_loss: !started,
+            }
+        }
         HostError::PrimitiveFailed(code) => {
             detail.error_event = error_event_str(*code);
             End::LinkError(link_error_kind(*code))
@@ -1340,11 +1345,12 @@ mod tests {
         assert!(matches!(end, End::NoResponse));
         assert_eq!(detail.host_error, Some("NoResponse"));
         for (started, refused_after_loss) in [(false, true), (true, false)] {
-            let end = end_of(&read, Err(HostError::VciLost), started).0;
+            let (end, detail) = end_of(&read, Err(HostError::VciLost), started);
             assert!(
                 matches!(end, End::VciLost { refused_after_loss: r } if r == refused_after_loss),
                 "{end:?}"
             );
+            assert_eq!(detail.error_event, Some("PDU_ERR_EVT_LOST_COMM_TO_VCI"));
         }
         let (end, detail) = end_of(&read, Err(rpc(tonic::Code::Unavailable)), false);
         assert!(
@@ -1480,6 +1486,7 @@ mod tests {
             [0x87, 0x83],
             [0x29, 0x80],
             [0x31, 0x81],
+            [0x19, 0x82],
         ] {
             assert!(
                 suppresses_positive_response(&suppressed),

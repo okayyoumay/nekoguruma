@@ -194,9 +194,10 @@ struct LinkOpened<'a> {
     transmit_confirmation: [&'static str; 0],
     /// Whether response times can be judged on the link: not without a transmit time.
     response_times_judged: bool,
-    /// Whether the worker passes each response pending on: the VCI absorbs them
-    /// (`CP_RC78Handling` 1), so the log sees none.
-    forwards_pendings: bool,
+    /// Whether the worker passes each response pending on: not known to the agent yet, since
+    /// it depends on the worker (the J2534 worker forwards them, a D-PDU library may absorb
+    /// them), so `null` rather than a guess.
+    forwards_pendings: Option<bool>,
     timing_margin: TimingMargin,
 }
 
@@ -212,9 +213,11 @@ struct ComParamInForce<'a> {
 #[derive(Serialize)]
 #[serde(rename_all = "snake_case")]
 enum SetBy {
-    /// The agent's link sets it (`crate::link`).
+    /// The agent's link sets it, to the agent's own value (`crate::link`).
     Link,
-    /// The document declares it (ADR-324 item 3).
+    /// Its value comes from the document (ADR-324): one the document declares and the link
+    /// passes on (item 3), or one the link sets to the document's value (the baud rate, a
+    /// declared timing ComParam, rounded up to whole milliseconds).
     Document,
     /// Neither sets it: the library's default is in force, and the log does not know it.
     LibraryDefault,
@@ -694,14 +697,24 @@ impl CommLog {
     }
 
     /// Writes the `link_opened` event of the link `config` opened, as link `link` (design 8.11
-    /// "Header"). The event's `seq`; `None` once the log has failed.
-    pub(crate) fn link_opened(&self, link: u32, config: &crate::link::LinkConfig) -> Option<u64> {
+    /// "Header"); `valued_by_document` names the link's own ComParams whose value the document
+    /// gave (`link::valued_by_document`). The event's `seq`; `None` once the log has failed.
+    pub(crate) fn link_opened(
+        &self,
+        link: u32,
+        config: &crate::link::LinkConfig,
+        valued_by_document: &[&str],
+    ) -> Option<u64> {
         let mut comparams: Vec<ComParamInForce<'_>> = crate::link::own_comparams(config)
             .into_iter()
             .map(|(name, value)| ComParamInForce {
                 name,
                 value: Some(value),
-                set_by: SetBy::Link,
+                set_by: if valued_by_document.contains(&name) {
+                    SetBy::Document
+                } else {
+                    SetBy::Link
+                },
             })
             .collect();
         comparams.extend(config.params.iter().map(|(name, value)| ComParamInForce {
@@ -736,7 +749,7 @@ impl CommLog {
             comparams,
             transmit_confirmation: [],
             response_times_judged: false,
-            forwards_pendings: false,
+            forwards_pendings: None,
             timing_margin: TimingMargin {
                 ms: None,
                 source: "none",

@@ -1131,15 +1131,19 @@ fn run_job<C: WorkerApi>(
         document.as_ref().map(JobDocument::variant).as_ref(),
         permission,
     );
+    // What the link has in force, before anything is sent on it (design 8.11).
+    if let Some(log) = &comm_log {
+        let valued_by_document = document
+            .as_ref()
+            .map(|document| link::valued_by_document(&document.variant()))
+            .unwrap_or_default();
+        log.link_opened(crate::host::LOG_LINK, config, &valued_by_document);
+    }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     host.set_document(document);
     // The journal records the hash of the artifact the job runs with (ADR-344).
     let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
     host.set_artifact(artifact);
-    // What the link has in force, before anything is sent on it (design 8.11).
-    if let Some(log) = &comm_log {
-        log.link_opened(crate::host::LOG_LINK, config);
-    }
     host.set_comm_log(comm_log);
     host.set_link_ids(config.tx_id, config.rx_id);
     if let Err(error) = refused {
@@ -15279,7 +15283,7 @@ def main():
         );
         assert_eq!(opened["transmit_confirmation"], serde_json::json!([]));
         assert_eq!(opened["response_times_judged"], false);
-        assert_eq!(opened["forwards_pendings"], false);
+        assert!(opened["forwards_pendings"].is_null());
         assert_eq!(opened["timing_margin"]["source"], "none");
         assert_eq!(lines[3]["outcome"], "ok");
         std::fs::remove_dir_all(&dir).unwrap();

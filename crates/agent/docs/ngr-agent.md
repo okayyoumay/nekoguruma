@@ -300,10 +300,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `agent_clock` first, a new reading that starts a new agent epoch. Right after the link opens,
   before anything is sent on it, the run writes `link_opened`: the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
-  and `set_by` (`link` for those `agent::link` sets, `document` for those the document declares,
+  and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those
+  whose value the document gives, declared or the baud rate and a declared timing,
   `library_default` without a value for the timing ComParams design 8.11 lists that neither
-  sets), with no transmit-confirmation source, response times not judged, pendings not
-  forwarded and no timing margin (`source` `none`), since the link turns none of those on yet.
+  sets), with no transmit-confirmation source, response times not judged and no timing margin
+  (`source` `none`), since the link turns none of those on yet, and `forwards_pendings` `null`,
+  since whether pendings are forwarded depends on the worker and the agent does not know it
+  yet.
   A `diag.log` message is a
   `procedure_log` event with its `level` and `message`; the operational log (`tracing`) records
   only that the procedure logged one, with its level.

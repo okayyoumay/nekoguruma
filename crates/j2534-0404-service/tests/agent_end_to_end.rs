@@ -538,7 +538,8 @@ fn assert_comm_log(setup: &CommLogSetup) {
             "{name} {set_by} in {opened}"
         );
     }
-    assert_eq!(opened["forwards_pendings"], false, "{opened}");
+    // Whether the worker forwards pendings is not known to the agent yet.
+    assert!(opened["forwards_pendings"].is_null(), "{opened}");
     let entries: Vec<&serde_json::Value> = lines
         .iter()
         .filter(|line| line["event"] == "exchange")

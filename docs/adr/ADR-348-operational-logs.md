@@ -52,16 +52,20 @@ faults, and aims the logs at software experts away from the workshop.
    default is `info`. A process that cannot continue logs at `error` before it exits; there is no
    separate fatal level. Where SOVD severities are needed (item 10), `error`, `warn` and `info`
    map to the same names and `debug` and `trace` both map to `debug`.
-3. **The agent sets up logging the way a worker does.** At startup the agent installs a subscriber
-   configured from the same configuration file and the same `level` and `output` fields as the
-   workers, in a table of the agent's own, checked as ADR-285 checks the workers' (in device mode a
-   file that fails the check is not read and logging starts with its defaults). The default output
-   is stderr when the agent runs from a terminal and a rotated file in a per-OS log directory when
-   it runs as an OS service (design 6.5): `/var/log/nekoguruma/` on Linux and
-   `%ProgramData%\nekoguruma\logs\` on Windows. Every entry logged while a job runs carries the job
-   id and ownership generation (the journal's key) and the VCI name in a span (the VCI name in the
-   span's `external` field, item 6), so it can be lined up with the job's journal and communication
-   log.
+3. **The agent sets up logging the way a worker does, and always keeps a file.** At startup the
+   agent installs a subscriber configured from the same configuration file and the same `level` and
+   `output` fields as the workers, in a table of the agent's own, checked as ADR-285 checks the
+   workers' (in device mode a file that fails the check is not read and logging starts with its
+   defaults). The default output is stderr when the agent runs from a terminal and the rotated file
+   alone when it runs as an OS service (design 6.5). Whatever `output` names, the agent also writes
+   its entries to its rotated file of item 5, which is what item 8 collects, so a stderr, `journald`
+   or `eventlog` output does not leave the server with nothing to fetch. The file's directory is a
+   setting, by default `/var/log/nekoguruma/` on Linux and `%ProgramData%\nekoguruma\logs\` on
+   Windows. Only `null` turns the file off; when it is off or cannot be opened, the agent says so on
+   its other output, and a fetch or a failed job's result reports that the agent keeps no log rather
+   than returning nothing. Every entry logged while a job runs carries the job id and ownership
+   generation (the journal's key) and the VCI name in a span (the VCI name in the span's `external`
+   field, item 6), so it can be lined up with the job's journal and communication log.
 4. **The agent captures its workers' output.** The agent reads each worker's stderr line by line and
    logs each line in its own operational log, the line in the entry's `external` field (item 6), at
    `info` unless the line carries a level the agent can read, with the worker's library name and ABI

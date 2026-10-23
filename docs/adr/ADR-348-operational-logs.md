@@ -30,15 +30,14 @@ The rest is open:
   anyone who could read it;
 - the server has no logging at all yet.
 
-Comparable systems were surveyed before this decision: edge-device agents (AWS IoT Greengrass,
-Azure IoT Edge), an over-the-air update client (Mender), in-vehicle logging (AUTOSAR DLT) and the
-SOVD standard (ISO 17978-2:2026 use case 12, ISO 17978-3:2026 7.21). They agree on the shape:
-operational logs are kept apart from audit and communication records; entries are structured
-with a timestamp, a severity, a source and a message; the device keeps them in size-bounded,
-rotated files; and a server fetches them on request or receives them when something failed,
-rather than having them streamed all the time. SOVD likewise keeps a component's logs separate
-from its communication logs and its faults, and aims the logs at software experts away from the
-workshop.
+Comparable systems were surveyed before this decision: edge-device agents (AWS IoT Greengrass, Azure
+IoT Edge), an over-the-air update client (Mender) and the SOVD standard (ISO 17978-2:2026 use case
+12, ISO 17978-3:2026 7.21, with communication logs in 7.22). They agree on the shape: operational
+logs are kept apart from audit and communication records; entries are structured with a timestamp, a
+severity, a source and a message; the device keeps them in size-bounded, rotated files; and a server
+fetches them on request or receives them when something failed, rather than having them streamed all
+the time. SOVD likewise keeps a component's logs separate from its communication logs and its
+faults, and aims the logs at software experts away from the workshop.
 
 ## Decision
 
@@ -103,15 +102,20 @@ workshop.
    receives entries (item 8) it records its receive time beside them.
 8. **The server fetches logs; it does not receive a stream.** The server can ask an agent for its
    operational log entries in a time range at or above a level, through an enumerated instruction
-   (design 16.3); the agent answers from its local files, at most 4 MiB per request, over the data
-   channel's resumable transfer (design 5.2). When a job fails, the agent sends the entries logged
-   in that job's span at `info` and above, at most 1 MiB, with the job's result. Fetching is limited
-   to administrators. Entries leave the device without their `external` fields, span fields
-   included, which are replaced by their length, unless an administrator's fetch asks for them; such
-   a fetch is held to design 16.2's rule for troubleshooting logs (sent only on an explicit action
-   of the device's user, with the scope shown), and nothing sent automatically carries them. The
-   server keeps fetched entries apart from the audit log, for a retention period that is an operator
-   setting. An agent with no server, or offline, keeps its entries only in its rotated files.
+   (design 16.3); the agent answers from its local files in time order, at most 4 MiB per request,
+   with a cursor naming the next entry when more match, which the next request passes to continue (a
+   cursor whose entry has been rotated away since is answered from the oldest entry left, and the
+   reply says entries were lost), over the data channel's resumable transfer (design 5.2). When a
+   job fails, the agent sends the entries logged in that job's span at `info` and above, at most 1
+   MiB, with the job's result; when they do not fit, every `error` and `warn` entry is kept first,
+   newest first, the rest is filled with the newest `info` entries, and the attachment says how many
+   entries it left out. Fetching is limited to administrators. Entries leave the device without
+   their `external` fields, span fields included, which are replaced by their length, unless an
+   administrator's fetch asks for them; such a fetch is held to design 16.2's rule for
+   troubleshooting logs (sent only on an explicit action of the device's user, with the scope
+   shown), and nothing sent automatically carries them. The server keeps fetched entries apart from
+   the audit log, for a retention period that is an operator setting. An agent with no server, or
+   offline, keeps its entries only in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    It cannot change the output or any path, and only administrators can issue it, as for item 8.

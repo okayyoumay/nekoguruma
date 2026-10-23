@@ -413,7 +413,6 @@ pub struct EcuSnapshot {
     #[serde(default)]
     armed_for_request: Vec<(Vec<u8>, Fault)>,
     power_cycles: u64,
-    #[serde(default)]
     session_held: bool,
 }
 

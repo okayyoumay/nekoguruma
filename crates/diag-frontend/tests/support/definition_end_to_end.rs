@@ -11,15 +11,13 @@
 //! variant's identification services are sent to the ECU, and `diag_ir::decode::select_variant`
 //! picks the variant whose patterns the answers match (ADR-306, ADR-315).
 
-use std::collections::HashMap;
 use std::path::PathBuf;
 
 use diag_frontend::convert::{lower_procedures, to_ir};
 use diag_frontend::tables::{read_files, resolve};
-use diag_ir::declaration::{encode_ecu_document, load_ecu_document};
-use diag_ir::decode::{DecodedField, decode_positive_response, select_variant};
-use diag_ir::encode::encode_request;
-use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
+use diag_ir::VmState;
+use diag_ir::declaration::load_ecu_document;
+use diag_ir::identify::identification_document;
 
 fn examples() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../diag-frontend/examples")
@@ -89,89 +87,21 @@ pub fn documents(procedure: &str) -> Vec<(String, Vec<u8>)> {
         .collect()
 }
 
-/// The identification run of a variant's `document`: the document with its procedure replaced
-/// by a program that sends the request of each service its variant patterns name, through the
-/// generic send-receive, and leaves the answers on the stack. Returns the document and the
-/// services in the order their answers are stacked.
+/// The identification run of a variant's `document` (`diag_ir::identify`): the document with its
+/// procedure replaced by a program that sends the request of each service its variant patterns
+/// name and leaves the answers on the stack, and the services in the order their answers are
+/// stacked.
 pub fn identification(document: &[u8]) -> (Vec<u8>, Vec<u32>) {
-    let loaded = load_ecu_document(document).expect("the document loads");
-    let variant = loaded.variant().expect("a loaded document has its variant");
-    let mut services: Vec<u32> = variant
-        .patterns()
-        .into_iter()
-        .flatten()
-        .map(|pattern| pattern.service_id())
-        .collect();
-    services.sort_unstable();
-    services.dedup();
-    let mut program = Program {
-        schema_version: IR_SCHEMA_VERSION,
-        code: Vec::new(),
-        constants: Vec::new(),
-        sections: Vec::new(),
-        source_map: Vec::new(),
-        identity: Default::default(),
-        preconditions: Default::default(),
-        flash: Vec::new(),
-    };
-    for &id in &services {
-        let request = variant
-            .services()
-            .into_iter()
-            .flatten()
-            .find(|service| service.id() == id)
-            .and_then(|service| service.request())
-            .expect("an identification service has a request");
-        let mut message = vec![request.sid()];
-        message.extend(encode_request(&request, &HashMap::new()).expect("a constant request"));
-        let constant = u32::try_from(program.constants.len()).expect("a few constants");
-        program.constants.push(message);
-        program.code.push(Op::PushBytes(constant));
-        program.code.push(Op::SendReceive { service: id });
-    }
-    let mut unpacked = loaded.unpack();
-    unpacked.procedure = Some(postcard::to_allocvec(&program).expect("the program serializes"));
-    (encode_ecu_document(&unpacked), services)
+    identification_document(document).expect("the identification run builds")
 }
 
 /// The index in `documents` of the variant the identification runs select, or `None`. `runs`
 /// gives, for each document in order, the services of its [`identification`] and the final
 /// state of its run.
 pub fn identified(documents: &[(String, Vec<u8>)], runs: &[(Vec<u32>, VmState)]) -> Option<usize> {
-    let loaded: Vec<_> = documents
+    let documents: Vec<&[u8]> = documents
         .iter()
-        .map(|(_, bytes)| load_ecu_document(bytes).expect("the document loads"))
+        .map(|(_, bytes)| bytes.as_slice())
         .collect();
-    // Each answer decoded through its variant's own service; one that does not decode, such as
-    // a negative response, matches no pattern.
-    let mut decoded: HashMap<(usize, u32), Vec<DecodedField>> = HashMap::new();
-    for (index, ((services, state), document)) in runs.iter().zip(&loaded).enumerate() {
-        let variant = document
-            .variant()
-            .expect("a loaded document has its variant");
-        assert_eq!(services.len(), state.stack.len(), "one answer per service");
-        for (service, answer) in services.iter().zip(&state.stack) {
-            let Value::Bytes(answer) = answer else {
-                panic!("an answer is bytes: {answer:?}");
-            };
-            let positive = variant
-                .services()
-                .into_iter()
-                .flatten()
-                .find(|s| s.id() == *service)
-                .and_then(|s| s.positive())
-                .expect("an identification service has a positive response");
-            if let Ok(fields) = decode_positive_response(&positive, variant.layouts(), answer) {
-                decoded.insert((index, *service), fields);
-            }
-        }
-    }
-    select_variant(
-        loaded.iter().map(|document| {
-            document
-                .variant()
-                .expect("a loaded document has its variant")
-        }),
-        |index, service| decoded.get(&(index, service)).map(Vec::as_slice),
-    )
+    diag_ir::identify::identified(&documents, runs).expect("the identification runs are read")
 }

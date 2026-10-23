@@ -116,8 +116,9 @@ pub const ECU_STATE_ENV: &str = "NGR_SIM_ECU_STATE";
 /// so any change to the encoded `EcuSnapshot` (version 2: `EcuConfig::startup_ms` and the time
 /// left of the ECU's startup, ADR-265; version 3: the faults waiting for a request,
 /// `SimEcu::inject_for_request`; version 4: `EcuConfig::p2_server_max_ms` and
-/// `p2_star_server_max_ms`) needs a new version.
-const STATE_FILE_VERSION: u32 = 4;
+/// `p2_star_server_max_ms`; version 5: a held session, `SimEcu::hold_session`) needs a new
+/// version.
+const STATE_FILE_VERSION: u32 = 5;
 
 /// The contents of the [`ECU_STATE_ENV`] file (postcard).
 #[derive(Serialize, Deserialize)]
@@ -548,6 +549,7 @@ impl Bus {
                 (None, None) => self.change_ecu(|ecu| ecu.inject(fault)),
             },
             Command::ReconnectEcu {} => self.change_ecu(SimEcu::reconnect),
+            Command::HoldSession {} => self.change_ecu(SimEcu::hold_session),
             Command::DisconnectVci {} => {
                 self.vci_present = false;
                 self.device_lost |= self.device_open;
@@ -825,7 +827,7 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
 /// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
 /// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "crash_vci"}`,
-/// `{"command": "restart_vci"}`.
+/// `{"command": "restart_vci"}`, `{"command": "hold_session"}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
 enum Command {
@@ -863,6 +865,9 @@ enum Command {
     },
     /// Ends `FailWrites`.
     ClearWriteFailures {},
+    /// `SimEcu::hold_session`: a non-default session does not time out until the next request
+    /// reaches the ECU.
+    HoldSession {},
 }
 
 /// Applies one control command, given as the JSON a control file holds. For a test that loads

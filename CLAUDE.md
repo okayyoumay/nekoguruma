@@ -155,7 +155,8 @@ cdylib, and cargo runs no doc tests for one. nextest runs each test in its own p
 `cargo test` gives the same results, only more slowly; keep `#[serial]` on tests that share
 process-global state, since `cargo test` still needs it. Some of those tests are too
 timing-sensitive to run beside other tests on the Windows runner, so the `core-windows` job uses
-the `ci-windows` profile, which runs them alone and the rest four at a time, for every test
+the `ci-windows` profile, which runs them alone, the restart end-to-end scenarios two at a
+time and the rest four at a time, for every test
 except the agent's, which run first in a separate nextest run with the `ci-windows-parallel`
 profile. On pull requests `core-windows` leaves out
 `j2534-0404-service`, which has no Windows-specific code, except for its restart end to end

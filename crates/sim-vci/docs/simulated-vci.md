@@ -86,7 +86,7 @@ a vehicle outlives a crashed worker (ADR-241):
   not created, and every call that needs it fails until it can be. Only a file that does not
   exist starts a fresh ECU: a path that cannot be read for any other reason, a file of another
   format version (the version is checked before the rest is decoded; any change to the encoded
-  ECU state, such as `startup_ms`, the faults waiting for a request or the reported P2 and P2*, gets a new version, so a file written by an older build is
+  ECU state, such as `startup_ms`, the faults waiting for a request, the reported P2 and P2* or a held session, gets a new version, so a file written by an older build is
   refused rather than misread), or one whose state contradicts itself (`SimEcu::restore` refuses it) makes the
   call that first needs the ECU (`PassThruOpen` or a control command) fail with `ERR_FAILED`.
 - Replacing the file is retried briefly when Windows reports it in use.
@@ -184,6 +184,7 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "clear_write_failures"}` | ends `fail_writes` |
 | `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError` fails with `ERR_FAILED` (ADR-292) |
 | `{"command": "restart_vci"}` | restarts a crashed VCI |
+| `{"command": "hold_session"}` | holds a non-default session that has not timed out (`SimEcu::hold_session`): tS3_Server stops until the next request reaches the ECU. A test harness sends it from a process between two runs, so that the next run's start-up does not count against the session |
 
 Unknown commands and unknown fields, in the command or in the fault, are rejected. A command that needs the ECU creates it first,
 as the first `PassThruOpen` does. There are two ways to send one:

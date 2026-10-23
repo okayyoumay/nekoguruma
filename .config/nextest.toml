@@ -20,7 +20,8 @@ retries = 0
 # other tests run beside them, because they measure timer windows; the override gives each of
 # their tests every thread, so it runs alone. They are the modules whose timing dependence is still
 # to be removed. `agent_restart_end_to_end` is `#[serial]` only because it sets environment
-# variables, which nextest's process per test makes harmless, so it runs in parallel here.
+# variables, which nextest's process per test makes harmless, so it runs in parallel here, two at
+# a time (its override below).
 [profile.ci-windows]
 test-threads = 4
 fail-fast = false
@@ -48,8 +49,17 @@ threads-required = "num-test-threads"
 filter = 'package(ngr-library-resolver) & test(/^signer::tests::windows::/)'
 test-group = "windows-cert-store"
 
+# Each scenario of `j2534-0404-service`'s `agent_restart_end_to_end` starts an agent, a worker and
+# `sim-vci`. Four at a time on the runner's four cores, they ran three to four times slower than
+# alone, and scenarios that must finish within the simulated ECU's 10 s session timer missed it,
+# so at most two run at once.
+[[profile.ci-windows.overrides]]
+filter = 'binary(agent_restart_end_to_end)'
+test-group = "windows-restart-scenarios"
+
 [test-groups]
 windows-cert-store = { max-threads = 1 }
+windows-restart-scenarios = { max-threads = 2 }
 
 # Windows CI, for the tests that do not depend on timing and so need not run alone: the agent's
 # tests, which spend their time creating and syncing lock and journal files rather than on the CPU.

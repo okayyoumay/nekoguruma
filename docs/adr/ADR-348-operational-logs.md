@@ -136,14 +136,19 @@ faults, and aims the logs at software experts away from the workshop.
    administrator's fetch asks for them; such a fetch is held to design 16.2's rule for
    troubleshooting logs (sent only on an explicit action of the device's user, with the scope
    shown), and nothing sent automatically carries them. The agent itself obtains that action: it
-   holds the fetch and asks on the device, through its own terminal or a web app connected to it
-   locally (design 5.7.1), never through the server, showing the time range, the level and that
-   vendor and worker text and names are included. The approval names that one request and covers it
-   and its continuations only; when the device's user declines, or does not answer within 10
-   minutes, the agent answers without `external` fields and the reply says that approval was not
-   given. The server's or the administrator's request is never taken as the approval. The server
-   keeps fetched entries apart from the audit log, for a retention period that is an operator
-   setting. An agent with no server, or offline, keeps its entries only in its rotated files.
+   holds the fetch and waits for a user of the device to approve it there, never through the server.
+   The approval is given with a command of the agent's own run on the device (for example `ngr-agent
+   logs approve`), which reaches the running agent over a local-only channel (a Unix-domain socket
+   or a named pipe that accepts only the device's local users, never a network listener) whether or
+   not the server is connected, lists the pending requests with their time range, level and the fact
+   that vendor and worker text and names are included, and approves or declines one of them; an
+   agent run from a terminal may also ask on that terminal. The offline listener of design 5.7.1 is
+   not used for this. The approval names that one request and covers it and its continuations only;
+   when the device's user declines, or does not answer within 10 minutes, the agent answers without
+   `external` fields and the reply says that approval was not given. The server's or the
+   administrator's request is never taken as the approval. The server keeps fetched entries apart
+   from the audit log, for a retention period that is an operator setting. An agent with no server,
+   or offline, keeps its entries only in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
    It cannot change the output or any path, and only administrators can issue it, as for item 8.

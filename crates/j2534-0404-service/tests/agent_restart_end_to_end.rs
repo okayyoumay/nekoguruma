@@ -1498,7 +1498,13 @@ fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault
         // The last request came before the 1 s wait the agent was killed in.
         std::thread::sleep(Duration::from_millis(u64::from(S3_MS) + 500));
     }
-    let before = env.probe();
+    // A session still running is held until the restart's first request, however long the
+    // restart takes to start.
+    let before = if ecu_in_default_session {
+        env.probe()
+    } else {
+        env.probe_holding_session()
+    };
     assert_eq!(
         (before.session, before.flash_phase),
         (if ecu_in_default_session { 1 } else { 2 }, 4),
@@ -1533,10 +1539,10 @@ fn complete_on_the_completed_path(tag: &str, ecu_in_default_session: bool, fault
 
 /// The ECU is still in its programming session when the restart reads F186: the first read
 /// reports another session. The read restarts the ECU's session timer, which the passive wait
-/// then outlasts. The restart's gate reads must come within the timer ([`S3_MS`]) of the probe's
-/// last read; a runner that missed it would fail the test with one F186 read, never pass it
-/// wrongly. The timer cannot be longer than the plan's declared timeout, which the passive wait
-/// waits out, so both are [`S3_MS`].
+/// then outlasts. The probe holds the session until the restart's first request
+/// ([`restart::Env::probe_holding_session`]), so the time the restart takes to start does not
+/// count against the timer. The timer cannot be longer than the plan's declared timeout, which
+/// the passive wait waits out, so both are [`S3_MS`].
 #[test]
 #[serial]
 fn a_non_default_session_on_the_completed_path_is_confirmed_after_the_passive_retry() {

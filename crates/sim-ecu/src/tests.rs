@@ -1687,6 +1687,41 @@ fn reported_session(ecu: &mut SimEcu) -> u8 {
     r[3]
 }
 
+/// A held session outlasts tS3_Server, through a snapshot taken long before its restore, until
+/// the next request: that one is handled in the session, and the timer runs again from it.
+#[test]
+fn a_held_session_waits_for_the_next_request() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    enter(&mut ecu, Session::Extended);
+    ecu.hold_session();
+    clock.advance(ms(u64::from(DEFAULT_S3_SERVER_MS) * 3));
+    ecu.check_timers();
+    assert_eq!(ecu.session, Session::Extended);
+    let mut ecu = SimEcu::restore(
+        ecu.snapshot(),
+        ManualClock::default(),
+        ms(u64::from(DEFAULT_S3_SERVER_MS) * 3),
+    )
+    .expect("valid snapshot");
+    assert_eq!(reported_session(&mut ecu), Session::Extended.code());
+    // The read ended the hold: the timer runs from it as usual.
+    assert!(!ecu.session_held);
+    assert!(ecu.s3_deadline.is_some());
+}
+
+/// A hold does not bring back a session that timed out, and means nothing in the default one.
+#[test]
+fn a_hold_keeps_only_a_session_still_running() {
+    let (mut ecu, clock) = ecu_with_clock(config());
+    ecu.hold_session();
+    assert!(!ecu.session_held);
+    enter(&mut ecu, Session::Extended);
+    clock.advance(ms(u64::from(DEFAULT_S3_SERVER_MS)));
+    ecu.hold_session();
+    assert!(!ecu.session_held);
+    assert_eq!(ecu.session, Session::Default);
+}
+
 #[test]
 fn a_non_default_session_falls_back_after_s3_without_requests() {
     let (mut ecu, clock) = ecu_with_clock(config());

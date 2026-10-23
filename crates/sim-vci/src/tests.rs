@@ -996,6 +996,17 @@ fn the_control_export_arms_faults_and_reconnects_the_ecu() {
     );
 }
 
+/// `hold_session` reaches the ECU (`SimEcu::hold_session`, tested in `sim-ecu`).
+#[test]
+fn the_control_export_holds_the_session() {
+    let _f = fixture();
+    assert_eq!(control(r#"{"command": "hold_session"}"#), STATUS_NOERROR);
+    assert_eq!(
+        control(r#"{"command": "hold_session", "extra": 1}"#),
+        ERR_FAILED
+    );
+}
+
 #[test]
 fn the_control_export_arms_a_fault_for_a_service_or_a_request() {
     let _f = fixture();

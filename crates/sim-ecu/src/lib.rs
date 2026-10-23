@@ -379,6 +379,9 @@ pub struct SimEcu {
     armed_for_request: Vec<(Vec<u8>, Fault)>,
     /// Power cycles so far (power loss, ECU reset, reconnection).
     power_cycles: u64,
+    /// Set by [`SimEcu::hold_session`]: the non-default session does not time out until the
+    /// next request reaches the ECU.
+    session_held: bool,
 }
 
 /// The whole state of a [`SimEcu`], from [`SimEcu::snapshot`]. Timers are kept as the time left
@@ -410,6 +413,8 @@ pub struct EcuSnapshot {
     #[serde(default)]
     armed_for_request: Vec<(Vec<u8>, Fault)>,
     power_cycles: u64,
+    #[serde(default)]
+    session_held: bool,
 }
 
 /// Why [`SimEcu::restore`] refused a snapshot.
@@ -597,7 +602,18 @@ impl SimEcu {
             armed: Vec::new(),
             armed_for_request: Vec::new(),
             power_cycles: 0,
+            session_held: false,
         }
+    }
+
+    /// Holds a non-default session that has not timed out: tS3_Server stops until the next
+    /// request reaches the ECU, which handles it in that session and restarts the timer as
+    /// usual. A test harness uses it so that the time another process takes to start does not
+    /// count against the session. A session that has timed out, or the default session, is
+    /// left as it is.
+    pub fn hold_session(&mut self) {
+        self.check_timers();
+        self.session_held = self.session != Session::Default;
     }
 
     /// Simulates reconnection after a power loss or communication loss.
@@ -633,7 +649,7 @@ impl SimEcu {
     /// directly after advancing its clock calls it first.
     pub fn check_timers(&mut self) {
         let now = self.clock.now();
-        if self.s3_deadline.is_some_and(|deadline| now >= deadline) {
+        if !self.session_held && self.s3_deadline.is_some_and(|deadline| now >= deadline) {
             self.s3_deadline = None;
             if self.session != Session::Default {
                 // The same as a change to the default session: security is relocked and a
@@ -707,6 +723,7 @@ impl SimEcu {
             armed: self.armed.clone(),
             armed_for_request: self.armed_for_request.clone(),
             power_cycles: self.power_cycles,
+            session_held: self.session_held,
         }
     }
 
@@ -746,6 +763,7 @@ impl SimEcu {
         ecu.armed = snapshot.armed;
         ecu.armed_for_request = snapshot.armed_for_request;
         ecu.power_cycles = snapshot.power_cycles;
+        ecu.session_held = snapshot.session_held;
         ecu.check_timers();
         Ok(ecu)
     }
@@ -819,7 +837,9 @@ impl SimEcu {
                 .startup_ms
                 .map(|ms| reset_at.saturating_add(Duration::from_millis(ms.into())));
         }
-        // Any request that reaches the ECU restarts tS3_Server, supported or not.
+        // Any request that reaches the ECU restarts tS3_Server, supported or not, and ends a
+        // hold.
+        self.session_held = false;
         self.restart_s3(sent_after_ms);
         exchange
     }
@@ -986,6 +1006,7 @@ impl SimEcu {
         self.power_cycles += 1;
         self.session = Session::Default;
         self.s3_deadline = None;
+        self.session_held = false;
         // Responses still being delayed are never sent (the VCI side discards them).
         self.last_response_at = self.clock.now();
         self.lock_security();

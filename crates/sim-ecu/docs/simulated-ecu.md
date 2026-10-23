@@ -70,7 +70,10 @@ or from the request when no response is sent; when responses overtake each other
 the last one to go out. A request lost on the bus does not restart it.
 Timers keep running while the ECU is powered off or silent. When it expires, the ECU falls back to the default session as
 for a change to it: security is relocked and a running download is interrupted. The default
-session has no timer. An ECU reset or `reconnect()` also ends a non-default session.
+session has no timer. An ECU reset or `reconnect()` also ends a non-default session. `hold_session()` stops the timer of a non-default session that has not timed out until the
+next request reaches the ECU, which is handled in that session and restarts the timer as usual;
+the hold is kept in the state file, so a test harness can hold the session between the runs of
+two processes. A power cycle ends a hold.
 
 Every DiagnosticSessionControl request relocks security, including a restart of the active
 session. A running download is interrupted (see below) by any session other than programming,

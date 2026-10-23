@@ -67,7 +67,7 @@ use agent::{
     resume_program_journaled, run_program_journaled,
 };
 use diag_ir::{Program, VmState};
-use j2534_0404::{FLOW_CONTROL_FILTER, ISO15765, J2534Api0404, PassThruMessage};
+use j2534_0404::{ChannelId, FLOW_CONTROL_FILTER, ISO15765, J2534Api0404, PassThruMessage};
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
@@ -76,6 +76,9 @@ const LIBRARY_NAME: &str = "sim-vci";
 const ROLE_ENV: &str = "NGR_TEST_RESTART_ROLE";
 /// Set in a child process to the scenario's job variant ([`Env::with_variant`]).
 const VARIANT_ENV: &str = "NGR_TEST_RESTART_VARIANT";
+/// Set in the probe's process to the control directory when the probe holds the ECU's session
+/// after its reads ([`Env::probe_holding_session`]).
+const HOLD_ENV: &str = "NGR_TEST_RESTART_HOLD_SESSION";
 /// What the probe prints before its findings.
 const PROBE_PREFIX: &str = "ecu-probe";
 /// A wedged service must fail the test, not hang the CI job.
@@ -418,8 +421,24 @@ impl Env {
 
     /// Reads the simulated ECU's session and flash state in a process of its own.
     pub fn probe(&self) -> EcuProbe {
-        let output = self
-            .child("probe")
+        self.probe_with(self.child("probe"))
+    }
+
+    /// [`Env::probe`], then holds a non-default session (`sim-vci`'s `hold_session`) in the same
+    /// process, right after the probe's last read: the session then waits for the next request,
+    /// so the time the next run takes to start cannot let it time out.
+    pub fn probe_holding_session(&self) -> EcuProbe {
+        let mut command = self.child("probe");
+        // `sim-vci` takes the command from the control directory; none is waiting there, since
+        // this runs between the scenario's runs.
+        command
+            .env(HOLD_ENV, self.control_dir())
+            .env("NGR_SIM_VCI_CONTROL_DIR", self.control_dir());
+        self.probe_with(command)
+    }
+
+    fn probe_with(&self, mut command: Command) -> EcuProbe {
+        let output = command
             .stderr(Stdio::inherit())
             .output()
             .expect("the probe process should start");
@@ -1045,6 +1064,21 @@ fn agent_main(spec: JobSpec) {
     eprintln!("the agent child's job ended before the kill: {result:?}");
 }
 
+/// Holds the ECU's session from the probe's process: the command file goes into `dir`, and a
+/// call to the library that sends nothing applies it, so no request ends the hold here.
+fn hold_session(api: &J2534Api0404, channel: ChannelId, dir: &Path) {
+    let temporary = dir.join("hold.tmp");
+    std::fs::write(&temporary, r#"{"command": "hold_session"}"#)
+        .expect("the control file should be writable");
+    std::fs::rename(&temporary, dir.join("hold.json")).expect("the control file should be renamed");
+    api.disconnect(channel)
+        .expect("the channel should disconnect");
+    assert!(
+        !dir.join("hold.json").exists() && !dir.join("hold.rejected").exists(),
+        "sim-vci should have applied the hold"
+    );
+}
+
 fn message(data: &[u8]) -> PassThruMessage {
     PassThruMessage::new(ISO15765, 0, 0, 0, 0, data).expect("message fits")
 }
@@ -1081,6 +1115,9 @@ fn probe_main() {
     let session = read_did(0xF186);
     let flash = read_did(0xFD00);
     let cycles = read_did(0xFD01);
+    if let Some(dir) = std::env::var_os(HOLD_ENV) {
+        hold_session(&api, channel, Path::new(&dir));
+    }
     assert_eq!(
         (session.len(), flash.len(), cycles.len()),
         (1, 9, 4),

@@ -85,12 +85,12 @@ faults, and aims the logs at software experts away from the workshop.
    memory without bound.
 5. **Files are JSON Lines, one per process, private, rotated by size, with a cap.** A file output,
    in the agent and the workers alike, writes one JSON object per line with at least the timestamp
-   (UTC, RFC 3339 with microseconds), the level, the `tracing` target, the process (`agent`,
-   `server`, or a worker's API and worker number, never its configured library or VCI name, which go
-   in `external`), the message and the span fields. stderr stays human-readable text. Every process
-   writes a file of its own: a worker adds a stem naming its API and its worker number to the
-   configured path. The agent gives each worker it launches a number unique among the workers it
-   runs at that time (the smallest one free) on its command line, so workers that share a
+   (UTC, in the RFC 3339 section 5.6 form with microseconds), the level, the `tracing` target, the
+   process (`agent`, `server`, or a worker's API and worker number, never its configured library or
+   VCI name, which go in `external`), the message and the span fields. stderr stays human-readable
+   text. Every process writes a file of its own: a worker adds a stem naming its API and its worker
+   number to the configured path. The agent gives each worker it launches a number unique among the
+   workers it runs at that time (the smallest one free) on its command line, so workers that share a
    library-level or root setting, a J2534 library's several devices and the per-VCI D-PDU workers of
    one library (design 8.8.1) alike, never write or rotate the same file; a worker started without
    one uses its process id. A log file and the directory NGR creates for it are readable and
@@ -160,7 +160,9 @@ faults, and aims the logs at software experts away from the workshop.
    holds the fetch and waits for a user of the device to approve it there, never through the server.
    The approval is given with a command of the agent's own run on the device (for example `ngr-agent
    logs approve`), which reaches the running agent over a local-only channel (a Unix-domain socket
-   or a named pipe that accepts only the device's local users, never a network listener) whether or
+   or a named pipe, never a network listener, that checks the connecting account from the OS's peer
+   credentials and accepts an approval only from the account the agent was registered by, design
+   6.7, or a local administrator; any other local account can neither list nor approve) whether or
    not the server is connected, lists the pending requests with their time range, level and the fact
    that vendor and worker text and names are included, and approves or declines one of them; an
    agent run from a terminal may also ask on that terminal. The offline listener of design 5.7.1 is

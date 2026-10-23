@@ -364,7 +364,10 @@ rule above allows, check where the last four rounds' findings landed. For each f
 `git blame -L <line>,<line> <reviewed commit> -- <path>`, using the line and commit the finding
 reviewed (`original_line` and `original_commit_id` in `get_review_comments`). Count the line as
 fix-written when the commit that wrote it is not an ancestor of the commit of the first review
-request (`git merge-base --is-ancestor`). If more than half are fix-written:
+request (`git merge-base --is-ancestor`). A Copilot finding that exists only in the review
+summary (Step 1) has no thread: use the file and line the summary names, at the review's
+`commit_id`; one that names no line counts as not fix-written. If more than half are
+fix-written:
 
 - Do not re-request. Leave the PR a draft.
 - Ask the maintainer in the project thread, as a decision with these three options:

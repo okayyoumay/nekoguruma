@@ -338,7 +338,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
 | [ADR-347](ADR-347-the-communication-log-s-file-and-writer.md) | The Communication Log's File and Writer | Accepted (Decision item 2 extended by ADR-348) | design 8.11; `agent` `comm_log`, job runner entry points (`JobRun`), journal writer lock; ADR-255, ADR-346 item 10 |
 | [ADR-348](ADR-348-operational-logs.md) | Operational Logs | Accepted | design 12.2, 8.7, 8.11 (`procedure_log`) and 16.2; `agent` logging setup and worker output capture, `vci-service-launcher` and `vci-service-config` file output and rotation, `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346 |
-| [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`; ADR-251 |
+| [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-251 |
 
 ## Status Legend
 

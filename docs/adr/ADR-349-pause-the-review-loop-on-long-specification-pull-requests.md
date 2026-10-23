@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-23
 **Status:** Accepted
-**Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Step 4), `CLAUDE.md` ("Pull requests"); ADR-251
+**Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Step 4), `CLAUDE.md` ("Pull requests"), `.github/copilot-instructions.md` ("Writing findings"); ADR-251
 
 ## Context
 
@@ -35,7 +35,9 @@ loop's.
    the eighth such round, and after each later one, the round's fix is still pushed as usual. Before the re-request, the loop then checks where the findings
    of the last four rounds landed: it runs `git blame` on each finding's line at the commit the
    finding reviewed and counts the line as fix-written when the commit that wrote it came after
-   the first review request. If more than half of those findings are on fix-written lines, the
+   the first review request. A finding with no thread (one only a Copilot review summary
+   lists) is placed by the file and line the summary names; one that names no line counts as
+   not fix-written. If more than half of those findings are on fix-written lines, the
    loop does not re-request. It asks the maintainer to choose between three options:
    - **Cut the scope.** The settled part stays in this pull request. The part the late findings
      keep landing on leaves it and becomes a backlog item for a decision of its own. Then
@@ -52,6 +54,10 @@ loop's.
 4. **Other pull requests.** Code pull requests and the rest of the loop are unchanged. ADR-251's
    re-request conditions still decide whether a round re-requests at all; this pause only
    withholds a re-request they would allow.
+5. **What the reviewer is told.** The review guidelines (`.github/copilot-instructions.md`, which
+   Codex reads through `AGENTS.md`) say that a review requested after a cut or a rewrite counts
+   as a first review, in which the reviewer reports everything it finds, and that after a cut
+   the part moved to a backlog item is out of scope.
 
 ## Consequences
 

@@ -32,20 +32,20 @@ loop's.
    `docs/system-architecture.md`.
 2. **When the loop pauses.** On a specification pull request, count the review rounds that
    reported findings, whichever reviewer gave them (Codex, or Copilot after a fallback). After
-   the eighth such round, and after every later one until the maintainer answers, the round's
-   fix is still pushed as usual. Before the re-request, the loop then checks where the findings
+   the eighth such round, and after each later one, the round's fix is still pushed as usual. Before the re-request, the loop then checks where the findings
    of the last four rounds landed: it runs `git blame` on each finding's line at the commit the
    finding reviewed and counts the line as fix-written when the commit that wrote it came after
    the first review request. If more than half of those findings are on fix-written lines, the
    loop does not re-request. It asks the maintainer to choose between three options:
    - **Cut the scope.** The settled part stays in this pull request. The part the late findings
      keep landing on leaves it and becomes a backlog item for a decision of its own. Then
-     one review is requested on the cut head.
+     one review is requested on the cut head, and the count starts again.
    - **Rewrite.** The affected section is rewritten in one piece, from rules that settle the
      neighbouring cases together. Then one review is requested, and the count starts again.
    - **Continue.** The loop re-requests as usual, and the count starts again.
    If half or fewer are on fix-written lines, the loop re-requests as usual and checks again
-   after the next round with findings.
+   after the next round with findings. After any of the three options, the next check comes
+   after eight more rounds with findings.
 3. **While it waits.** The pull request stays a draft and gets no review request until the
    maintainer answers. A loop with no maintainer present (for example `backlog-loop`) waits the
    same way, as for any other decision only the maintainer can make.

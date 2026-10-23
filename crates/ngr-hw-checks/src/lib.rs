@@ -41,7 +41,7 @@ pub struct CheckDecl {
 
 /// The declarations of every hardware check, which [`listing`] reads. A new `hw_` test adds its
 /// declaration here.
-pub const CHECKS: &[CheckDecl] = &[PROFILE_CHECK, T0_LOOPBACK_CHECK];
+pub const CHECKS: &[CheckDecl] = &[PROFILE_CHECK, T0_LOOPBACK_CHECK, T2_T3_READ_CHECK];
 
 /// `hw_the_profile_permits_a_check`: the profile reads and permits a check that needs nothing,
 /// on every class. It opens no device; it shows that the `hardware` run finds the profile.
@@ -58,6 +58,15 @@ pub const PROFILE_CHECK: CheckDecl = CheckDecl {
 pub const T0_LOOPBACK_CHECK: CheckDecl = CheckDecl {
     name: "hw_t0_two_endpoint_loopback",
     classes: &[Class::T0],
+    operations: &[],
+};
+
+/// `hw_t2_t3_read`: on a bench ECU or a vehicle, the profile's definition (`[read]`) identifies
+/// the ECU's variant and runs its read procedure through the agent's job runner on the guarded
+/// client (`checks::t2_t3_read`). It needs a T2 or T3 profile and no operation beyond reads.
+pub const T2_T3_READ_CHECK: CheckDecl = CheckDecl {
+    name: "hw_t2_t3_read",
+    classes: &[Class::T2, Class::T3],
     operations: &[],
 };
 

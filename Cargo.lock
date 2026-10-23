@@ -1536,6 +1536,7 @@ name = "ngr-hw-checks"
 version = "0.1.0"
 dependencies = [
  "agent",
+ "diag-frontend",
  "diag-ir",
  "libc",
  "serde",

@@ -40,6 +40,7 @@ A TOML file outside the repository. Unknown keys are refused.
 | `expendable_ecu` | T2 only: the ECU may be reprogrammed |
 | `[power]` | T1 and T2 only: the commands that switch the supply `off` and `on`, each a program and its arguments |
 | `[[hardware-control]]` | T1 and T2 only: a hardware control the wiring is safe for, with its complete parameters (below) |
+| `[read]` | T1 to T3, optional: the definition the read check runs (see "The T2/T3 read check"). `definition` is a directory of CSV tables and Starlark files, and `procedure` the file name of the read procedure's Starlark file in it |
 
 The operations a class allows by itself, beyond reads:
 
@@ -322,7 +323,10 @@ connection is served by the runtime.
   the module (`held_module`): the job's link set-up lists, connects and disconnects none, and the
   device's closing step disconnects it once. The runner's set-up gives the baud rate, timing, the
   two identifiers and nothing more, so the client completes it from the profile: on
-  `SetUniqueRespIdTable` it appends the profile's other table entries (formats, address bytes);
+  `SetUniqueRespIdTable` it appends the profile's other table entries (formats, address bytes;
+  each format is segmented transport with flow control on, at the profile's width and
+  addressing, since the J2534 worker installs no flow-control filter for a response format
+  without flow control, ADR-040);
   on `ConnectComLogicalLink` it first sets every other pinned ComParam (address modes, the
   functional identifier, the filler, the tester-present message, the profile's own) at the
   profile's value, each added request decided and recorded like any other. The job's own values
@@ -474,6 +478,36 @@ carrying its own address byte.
   clause 7) is made by the worker from a compound protocol name that `GetResourceIds` does not
   accept, and the handle creates links through `GetResourceIds`, so a loopback of two channels of
   one module is refused by the test with that reason.
+
+## The T2/T3 read check
+
+`hw_t2_t3_read` (`ngr_hw_checks::T2_T3_READ_CHECK`, declared for T2 and T3, no operation beyond
+reads) runs a CSV + Starlark definition's reads on a bench ECU or a vehicle through the agent's job
+runner. The harness lists it for a T2 or T3 profile and refuses it on T0 and T1, and the test
+fails without `NGR_HW_PROFILE`. Its test is `crates/j2534-0404-service/tests/hw_t2_t3_read.rs`,
+for a J2534 VCI; its body is `checks::t2_t3_read::run`, over the guarded client
+(`guard::GuardedClient`, ADR-334), so CI runs it against `sim-vci` behind
+`j2534-0404-service` (`tests/t2_t3_read_check.rs`, on the example ECU's definition).
+
+- **The definition.** The profile's `[read]` names it. `checks::t2_t3_read::convert` converts
+  every file of `definition` but the Starlark ones (`.star` in any case, as the frontend reads
+  them), with the `procedure` file, which must be one, into one document
+  per variant (design 8.4), before any device opens, so a definition that does not convert sends
+  nothing. The definition must declare the profile's link: the guard compares the job's link with
+  the profile's, so the profile's `protocol` is the name the agent's link gives its resource,
+  `ISO_14229_3_on_ISO_15765_2`, and its identifiers and baud rate are the definition's.
+- **What it does.** Each candidate variant's identification services are sent to the ECU as one
+  job (`diag_ir::identify`, as a server identifies before it sends a job, design 8.9.1), and the
+  variant whose patterns the answers match is selected; then that variant's read procedure runs as
+  a job, and it checks the values it decodes. A job whose program writes is refused before it
+  starts. The jobs take the VCI's slot in a lock directory of the run's own, and their
+  communication logs go to the run's temporary directory.
+- **What the guard does.** Every request goes through it, so on T2 and T3 a write, routine, reset
+  or security access is refused before it reaches the worker, and the job fails with the refusal.
+- **Result.** It passes with the variant identified when the read procedure finishes. A
+  definition that does not convert, a profile without `[read]`, and a profile whose VCI is a
+  D-PDU API one are recorded as refused; a job that fails, or answers that match no variant, as
+  failed.
 
 ## Teardown
 

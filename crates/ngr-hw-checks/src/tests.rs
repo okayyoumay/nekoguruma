@@ -711,6 +711,67 @@ fn the_t0_loopback_check_is_listed_for_t0_and_refused_elsewhere() {
     );
 }
 
+/// The read check: listed for T2 and T3 profiles, refused on T0 and T1, and it fails without a
+/// profile.
+#[test]
+fn the_t2_t3_read_check_is_listed_for_t2_and_t3_and_refused_elsewhere() {
+    assert!(CHECKS.contains(&T2_T3_READ_CHECK));
+    assert_eq!(T2_T3_READ_CHECK.name, "hw_t2_t3_read");
+    for class in ["T2", "T3"] {
+        let profile = parse(&profile(class, "")).unwrap();
+        assert_eq!(
+            listing(&profile, &[T2_T3_READ_CHECK]),
+            "hw_t2_t3_read: permitted\n"
+        );
+        assert_eq!(start(&T2_T3_READ_CHECK, Ok(profile.clone())), Ok(profile));
+    }
+    let t0 = parse(T0_PROFILE).unwrap();
+    let t1 = parse(&t1("")).unwrap();
+    for profile in [t0, t1] {
+        let class = profile.class;
+        assert_eq!(
+            listing(&profile, &[T2_T3_READ_CHECK]),
+            format!(
+                "hw_t2_t3_read: refused: the check runs on [T2, T3], not on the profile's \
+                 {class:?}\n"
+            )
+        );
+        assert!(matches!(
+            start(&T2_T3_READ_CHECK, Ok(profile)),
+            Err(StartError::Refused { .. })
+        ));
+    }
+    assert_eq!(
+        start(&T2_T3_READ_CHECK, Err(ProfileError::NotSet)),
+        Err(StartError::Profile(ProfileError::NotSet))
+    );
+}
+
+/// A profile's `[read]` names the definition and the read procedure's file in it; a T0 profile
+/// has no ECU to read, and the procedure is a file name, not a path.
+#[test]
+fn a_read_definition_names_a_directory_and_a_procedure_file_in_it() {
+    let read = "[read]\ndefinition = \"/defs/bench\"\nprocedure = \"read.star\"\n";
+    let parsed = parse(&profile("T3", read)).unwrap();
+    assert_eq!(
+        parsed.read,
+        Some(profile::ReadDefinition {
+            definition: "/defs/bench".into(),
+            procedure: "read.star".to_owned(),
+        })
+    );
+    assert_eq!(parse(&profile("T2", "")).unwrap().read, None);
+    for procedure in ["", "sub/read.star", "../read.star"] {
+        let read = format!("[read]\ndefinition = \"/defs\"\nprocedure = \"{procedure}\"\n");
+        assert!(
+            matches!(parse(&profile("T3", &read)), Err(ProfileError::Invalid(_))),
+            "{procedure:?}"
+        );
+    }
+    let t0 = format!("{T0_PROFILE}\n[read]\ndefinition = \"/defs\"\nprocedure = \"read.star\"\n");
+    assert!(matches!(parse(&t0), Err(ProfileError::Invalid(_))));
+}
+
 #[test]
 fn a_profile_is_read_from_its_file() {
     let dir = std::env::temp_dir().join(format!("ngr-hw-checks-{}", std::process::id()));

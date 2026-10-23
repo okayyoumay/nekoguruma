@@ -1123,10 +1123,12 @@ impl Value {
 }
 
 /// The CAN ID format value of the profile's link (ISO 22900-2 (2022) Tables B.13 and B.14): the
-/// segmented transport, the identifier width and the addressing scheme. The padding bits are
-/// left to the filler handling ComParam.
+/// segmented transport with flow control on, the identifier width and the addressing scheme. The
+/// padding bits are left to the filler handling ComParam. A response format without flow
+/// control makes the J2534 worker install no flow-control filter for the address, so no
+/// response would reach the link (ADR-040).
 fn format_value(link: &Link) -> u32 {
-    let mut format = 0x04;
+    let mut format = 0x05;
     if link.id_bits == 29 {
         format |= 0x02;
     }
@@ -3314,15 +3316,15 @@ mod tests {
             let p = profile("T3", link);
             format_value(link_of(&p))
         };
-        assert_eq!(format("id_bits = 11\naddressing = \"normal\"\n"), 0x04);
-        assert_eq!(format("id_bits = 29\naddressing = \"normal\"\n"), 0x06);
+        assert_eq!(format("id_bits = 11\naddressing = \"normal\"\n"), 0x05);
+        assert_eq!(format("id_bits = 29\naddressing = \"normal\"\n"), 0x07);
         assert_eq!(
             format("id_bits = 11\naddressing = \"extended\"\naddress = 1\n"),
-            0x0C
+            0x0D
         );
         assert_eq!(
             format("id_bits = 29\naddressing = \"mixed\"\naddress = 1\n"),
-            0x4E
+            0x4F
         );
     }
 

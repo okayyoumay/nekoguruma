@@ -6,7 +6,7 @@
 //! expendable ECU on T2, and power commands and hardware controls on T1 and T2).
 
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
 
@@ -154,6 +154,16 @@ pub struct Link {
     pub comparams: BTreeMap<String, i64>,
 }
 
+/// The definition a read check runs against the profile's ECU (`checks::t2_t3_read`): a directory
+/// of CSV tables and Starlark files the frontend converts (design 8.4), and the Starlark file of
+/// the read procedure, by its file name in that directory.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ReadDefinition {
+    pub definition: PathBuf,
+    pub procedure: String,
+}
+
 /// One end of a T0 loopback: a VCI channel or a SocketCAN interface.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -222,6 +232,7 @@ struct RawProfile {
     power: Option<Power>,
     #[serde(default, rename = "hardware-control")]
     hardware_controls: Vec<HardwareControl>,
+    read: Option<ReadDefinition>,
     #[serde(default)]
     report_full_identifiers: bool,
 }
@@ -250,6 +261,8 @@ pub struct Profile {
     /// The profile asks for VINs and serial numbers in full in the run's report (design 13.5
     /// "Reports"); without it they are masked. Off unless the profile says `true`.
     pub report_full_identifiers: bool,
+    /// The definition a read check runs, for a profile with an ECU (`[read]`).
+    pub read: Option<ReadDefinition>,
 }
 
 impl Profile {
@@ -390,6 +403,18 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
         }
     }
 
+    if let Some(read) = &raw.read {
+        if class == Class::T0 {
+            return Err(invalid("a T0 profile has no ECU, so no `read` definition"));
+        }
+        let file = Path::new(&read.procedure);
+        if read.procedure.is_empty() || file.file_name() != Some(file.as_os_str()) {
+            return Err(invalid(
+                "`read.procedure` is the file name of a Starlark file in `read.definition`",
+            ));
+        }
+    }
+
     Ok(Profile {
         class,
         setup,
@@ -397,6 +422,7 @@ pub fn parse(text: &str) -> Result<Profile, ProfileError> {
         power: raw.power,
         hardware_controls: raw.hardware_controls,
         report_full_identifiers: raw.report_full_identifiers,
+        read: raw.read,
     })
 }
 

@@ -3,3 +3,4 @@
 //! them against a device live next to the worker binaries they launch.
 
 pub mod t0_loopback;
+pub mod t2_t3_read;

@@ -368,7 +368,8 @@ fix-written when the commit that wrote it is not an ancestor of the baseline com
 (`git merge-base --is-ancestor`). The baseline is the head of the PR's first review request,
 and after a Cut the scope or Rewrite answer, the head of the one review requested after it. A Copilot finding that exists only in the review
 summary (Step 1) has no thread: use the file and line the summary names, at the review's
-`commit_id`; one that names no line counts as not fix-written. If more than half are
+`commit_id`; one that names no line counts as not fix-written. So does a finding on a deleted
+line (`side: LEFT` in the review comment), since it is not on text in the reviewed commit. If more than half are
 fix-written:
 
 - Do not re-request. Leave the PR a draft.

@@ -94,8 +94,8 @@ workshop.
    in its rotated files.
 9. **The agent's level can be raised for a while.** An enumerated instruction can set the agent's
    level filter for a bounded period, at most 24 hours, after which the configured level returns.
-   It cannot change the output or any path. A worker's level changes only through its
-   configuration file and a restart.
+   It cannot change the output or any path, and only administrators can issue it, as for item 8.
+   A worker's level changes only through its configuration file and a restart.
 10. **The server logs JSON to stdout.** The server writes JSON Lines entries to stdout for the
     platform to collect (design 14); a local deployment (design 13), which runs as an OS service,
     writes the rotated file of item 5 instead. Its entries for a job carry the same job id as the

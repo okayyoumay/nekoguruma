@@ -230,7 +230,10 @@ the attribute fails the build once the code is used and gets removed.
    reached, or a stalled review), the skill switches that PR to GitHub Copilot code review for
    the rest of the PR (ADR-312); if Copilot is not available either, or the owner's Copilot
    budget is used up, it falls back to an `edge-case-hunter` pass over the whole diff and tells
-   the maintainer.
+   the maintainer. On a specification pull request (every changed file outside `work/` is
+   Markdown, and one is an ADR or the design document), the loop pauses after the eighth round with findings when more than half of the
+   last four rounds' findings land on text earlier fixes wrote, and asks the maintainer to cut
+   the scope, rewrite or continue (ADR-349).
 4. Before marking the PR ready, check that nothing deferred during the work exists only in the
    conversation: every follow-up is either done in the PR or added to the backlog (`backlog`
    skill). Items the PR finishes are closed in the same PR.

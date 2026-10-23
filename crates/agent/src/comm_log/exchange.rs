@@ -1042,11 +1042,10 @@ impl LinkState {
     ///   session change (that answer does not count for the exchanges after it).
     /// - A link error, on the exchange's own link or on another link of its physical channel,
     ///   ends the matched answers and the count since the error, not the owed requests.
-    /// - An accepted DiagnosticSessionControl (0x10) or ECUReset (0x11) of a type that restarts
-    ///   the ECU (hardReset, keyOffOnReset, softReset), or one sent with its positive response
-    ///   suppressed and classified `none`, ends the matched answers and the owed requests: all
-    ///   of them when its answer could belong to none, otherwise those sent before the earliest
-    ///   request it could belong to. An ECUReset of another type ends nothing.
+    /// - An accepted DiagnosticSessionControl (0x10) or ECUReset (0x11) of any type (ADR-346
+    ///   item 6), or one sent with its positive response suppressed and classified `none`, ends
+    ///   the matched answers and the owed requests: all of them when its answer could belong to
+    ///   none, otherwise those sent before the earliest request it could belong to.
     /// - A response to such a request that was accepted but is unusable (a bad field) ends the
     ///   matched answers only, since the ECU may be restarting but the agent cannot tell.
     /// - The exchange is owed when its request may have reached the ECU whole (`sent`

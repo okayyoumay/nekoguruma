@@ -77,8 +77,9 @@ faults, and aims the logs at software experts away from the workshop.
    it, and its entries then stay at that destination: they are not in the agent's log, so neither a
    fetch nor a failed job's result (item 8) carries them. The default stderr output is the one that
    is collected; another output is a choice for local investigation on the device. A line longer
-   than 8 KiB is cut to 8 KiB and marked as cut, so one misbehaving library cannot fill an entry
-   without bound.
+   than 8 KiB is cut to 8 KiB and marked as cut: the reader keeps at most 8 KiB of a line and reads
+   and discards the rest up to the next line break or the end of the stream, so one misbehaving
+   library that never ends a line can neither fill an entry nor the agent's memory without bound.
 5. **Files are JSON Lines, one per process, private, rotated by size, with a cap.** A file output,
    in the agent and the workers alike, writes one JSON object per line with at least the timestamp
    (UTC, RFC 3339 with microseconds), the level, the `tracing` target, the process (`agent`, the
@@ -108,11 +109,13 @@ faults, and aims the logs at software experts away from the workshop.
    16.2), and a name a user or vendor gives a VCI (a VCI name, a J2534 `pname` or label). Text a
    procedure builds at run time can hold any of these, so it never reaches the operational log: a
    `diag.log` message (Starlark subset 3.1) is written to the job's communication log as a
-   `procedure_log` event with its level, and a `diag.fail` detail stays in the job's journal and
-   result; the operational log records at most that a procedure logged or failed, with the level or
-   the code. A value the agent reads from the vehicle, such as an identity that did not match, is
-   likewise logged as the fact, not the value. Until every existing `tracing` call has been checked
-   against this item, the agent installs no subscriber (item 3).
+   `procedure_log` event with its level (a job whose procedure uses `diag.log`, which its IR shows
+   when the job starts, always has a communication log, even without a journal and without its
+   caller asking for one, so the message is never dropped), and a `diag.fail` detail stays in the
+   job's journal and result; the operational log records at most that a procedure logged or failed,
+   with the level or the code. A value the agent reads from the vehicle, such as an identity that
+   did not match, is likewise logged as the fact, not the value. Until every existing `tracing` call
+   has been checked against this item, the agent installs no subscriber (item 3).
 7. **Device timestamps are not authoritative.** Entries carry the device's clock. Unlike the
    audit log (design 16.3), the operational log does not need a trusted time; when the server
    receives entries (item 8) it records its receive time beside them.

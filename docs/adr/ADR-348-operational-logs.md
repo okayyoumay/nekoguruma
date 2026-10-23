@@ -71,13 +71,21 @@ faults, and aims the logs at software experts away from the workshop.
    is collected; another output is a choice for local investigation on the device. A line longer
    than 8 KiB is cut to 8 KiB and marked as cut, so one misbehaving library cannot fill an entry
    without bound.
-5. **Files are JSON Lines, rotated by size, with a cap.** A file output, in the agent and the
-   workers alike, writes one JSON object per line with at least the timestamp (UTC, RFC 3339 with
-   microseconds), the level, the `tracing` target, the process (`agent`, the worker's API and
-   library, or `server`), the message and the span fields. stderr stays human-readable text. A
-   file is rotated when it reaches its size limit, and the oldest rotated file is deleted once
-   the count limit is reached. The limits are two new settings beside `output`: a default of
-   10 MiB per file and 5 rotated files, so one log takes at most about 60 MiB.
+5. **Files are JSON Lines, one per process, private, rotated by size, with a cap.** A file output,
+   in the agent and the workers alike, writes one JSON object per line with at least the timestamp
+   (UTC, RFC 3339 with microseconds), the level, the `tracing` target, the process (`agent`, the
+   worker's API and library, or `server`), the message and the span fields. stderr stays
+   human-readable text. Every process writes a file of its own: a worker adds a stem naming its API,
+   its library and, when the library has several devices, the device's position in the library's
+   `modules` list to the configured path, so workers that share a library-level or root setting
+   never write or rotate the same file. A log file and the directory NGR creates for it are readable
+   and writable only by the account the process runs as and by administrators (mode 0600 for files
+   and 0700 for directories on Unix, an access list granting only that account, SYSTEM and
+   Administrators on Windows), since entries can carry `external` text (item 6); an existing file
+   with wider access is narrowed when opened, or, where that fails, the output falls back to stderr
+   with a warning. A file is rotated when it reaches its size limit, and the oldest rotated file is
+   deleted once the count limit is reached. The limits are two new settings beside `output`: a
+   default of 10 MiB per file and 5 rotated files, so one process's log takes at most about 60 MiB.
 6. **What an operational log never holds.** No VIN or other vehicle identity read from an ECU, no
    key, token, credential, seed or key value, OEM authorization material, signing material or bearer
    token, no personal data, and no request or response payload of a diagnostic exchange (the

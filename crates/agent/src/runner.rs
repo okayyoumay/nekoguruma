@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use crate::artifact::{Artifact, SHA256_LEN, to_hex};
 use crate::client::WorkerApi;
-use crate::comm_log::{CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind};
+use crate::comm_log::{CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind};
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
@@ -845,9 +845,20 @@ fn comm_log_setup(
         }
     });
     match (&job.comm_log, beside) {
-        (Some(named), Some(beside)) if *named != beside => Err(JobError::CommLogMismatch),
+        (Some(named), Some(beside)) if !same_log(named, &beside) => Err(JobError::CommLogMismatch),
         (named, beside) => Ok(beside.or_else(|| named.clone())),
     }
+}
+
+/// Whether two setups name the same log: the same key, and the same directory however it is
+/// spelled (a `..`, a link, a drive letter's case), when both directories exist to compare.
+fn same_log(a: &CommLogSetup, b: &CommLogSetup) -> bool {
+    a.key == b.key
+        && (a.dir == b.dir
+            || matches!(
+                (std::fs::canonicalize(&a.dir), std::fs::canonicalize(&b.dir)),
+                (Ok(a), Ok(b)) if a == b
+            ))
 }
 
 /// What the communication log's header and `job_start` say of `job` (ADR-347).
@@ -870,9 +881,7 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
             .document
             .as_ref()
             .and_then(|document| document.variant().short_name().map(str::to_owned)),
-        target_vin: setup
-            .and_then(|setup| setup.vin.as_ref())
-            .map(|vin| vin.as_str().to_owned()),
+        target_vin: setup.and_then(|setup| setup.vin.as_ref()).cloned(),
         writes: job.writes(),
     }
 }
@@ -952,7 +961,11 @@ async fn run_checked<C: WorkerApi>(
             )
         }))
         .unwrap_or(Err(JobError::Panicked));
-        let status = comm_log.finish(&result);
+        // The log never changes the result, a panic while ending it included.
+        let status = std::panic::catch_unwind(AssertUnwindSafe(|| comm_log.finish(&result)))
+            .unwrap_or(CommLogStatus::Incomplete(CommLogIncomplete::CloseFailed(
+                std::io::ErrorKind::Other,
+            )));
         (result, status)
     })
     .await
@@ -15248,6 +15261,23 @@ def main():
 
     /// A log named in another directory or under another key than the journal's is refused in
     /// the preflight: nothing reaches the worker, and neither the journal nor the log is created.
+    #[test]
+    fn the_same_log_directory_spelled_another_way_is_no_mismatch() {
+        let dir = journal_dir("comm-log-same-dir");
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        let named = comm_log_setup_in(&dir);
+        let mut spelled = named.clone();
+        spelled.dir = dir.join("sub").join("..");
+        assert!(same_log(&named, &spelled));
+        let mut other_key = named.clone();
+        other_key.key.generation += 1;
+        assert!(!same_log(&other_key, &spelled));
+        let mut missing = named.clone();
+        missing.dir = dir.join("missing");
+        assert!(!same_log(&named, &missing));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_comm_log_beside_another_journal_is_refused_before_anything_opens() {
         let dir = journal_dir("comm-log-mismatch");

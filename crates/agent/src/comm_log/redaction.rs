@@ -44,14 +44,19 @@ const SID_TRANSFER_DATA: u8 = 0x36;
 const SID_TRANSFER_DATA_POSITIVE: u8 = 0x76;
 
 /// `message` as the log carries it (design 8.11, ADR-347). By service (ISO 14229-1:2026 9.4
-/// SecurityAccess, 14.4 TransferData):
-/// - a SecurityAccess request whose sub-function (without the suppress bit) is even carries a
-///   key: the service and sub-function stay, the key is its length only;
-/// - a SecurityAccess response whose sub-function (without the suppress bit) is odd carries a
-///   seed: its length and whether it is all zero (an ECU whose level is unlocked answers a
-///   zero seed); an empty seed is not a zero seed;
-/// - an Authentication request or response (ISO 14229-1:2026 29): the service and sub-function
-///   stay, the rest is its length only;
+/// SecurityAccess, 9.6 Authentication, 14.4 TransferData):
+/// - a SecurityAccess request for a key level (sub-function, without the suppress bit, even from
+///   0x02 to 0x42, or 0x60, 9.4.2.2) carries a key: the service and sub-function stay, the key is
+///   its length only;
+/// - a SecurityAccess response for a seed level (odd from 0x01 to 0x41, or 0x5F) carries a seed:
+///   its length and whether it is all zero (an ECU whose level is unlocked answers a zero seed);
+///   an empty seed is not a zero seed;
+/// - a SecurityAccess request or response with any other sub-function (the supplier-specific
+///   range 0x61 to 0x7E and the reserved values, for which the standard defines no seed and key
+///   pairing): its data is its length only, in both directions;
+/// - an Authentication request: the service and sub-function stay, the rest is its length only;
+///   its response keeps the return value as well (9.6.6), which says how the ECU judged the
+///   step;
 /// - a TransferData request, and a response with bytes after the block counter: the service and
 ///   block counter stay, the data is its length and SHA-256;
 /// - everything else, negative responses included, stays whole.
@@ -62,40 +67,65 @@ pub(crate) fn redact(direction: Direction, message: &[u8]) -> LoggedMessage {
         clear: to_hex(message),
         data: None,
     };
-    let (&sid, rest) = match message.split_first() {
-        Some(split) => split,
-        None => return whole(),
+    let Some((&sid, rest)) = message.split_first() else {
+        return whole();
     };
-    let with_sub = |data: fn(&[u8]) -> Redacted| match rest.split_first() {
-        Some((_, tail)) => LoggedMessage {
-            clear: to_hex(&message[..2]),
-            data: Some(data(tail)),
-        },
-        None => whole(),
+    // The first `clear` bytes stay, the rest (possibly empty) becomes `data`'s.
+    let keep = |clear: usize, data: &dyn Fn(&[u8]) -> Redacted| {
+        if message.len() < clear {
+            return whole();
+        }
+        LoggedMessage {
+            clear: to_hex(&message[..clear]),
+            data: Some(data(&message[clear..])),
+        }
     };
     let secret = |tail: &[u8]| Redacted::Secret {
         len: tail.len(),
         all_zero: None,
     };
+    let level = rest.first().map(|sub| SecurityLevel::of(sub & 0x7F));
     match (direction, sid) {
-        (Direction::Request, SID_SECURITY_ACCESS)
-            if rest.first().is_some_and(|s| s & 0x7F & 1 == 0) =>
-        {
-            with_sub(secret)
-        }
-        (Direction::Response, SID_SECURITY_ACCESS_POSITIVE)
-            if rest.first().is_some_and(|s| s & 0x7F & 1 == 1) =>
-        {
-            with_sub(|tail| Redacted::Secret {
+        (Direction::Request, SID_SECURITY_ACCESS) => match level {
+            Some(SecurityLevel::Seed) | None => whole(),
+            Some(SecurityLevel::Key | SecurityLevel::Other) => keep(2, &secret),
+        },
+        (Direction::Response, SID_SECURITY_ACCESS_POSITIVE) => match level {
+            Some(SecurityLevel::Key) | None => whole(),
+            Some(SecurityLevel::Seed) => keep(2, &|tail: &[u8]| Redacted::Secret {
                 len: tail.len(),
                 all_zero: Some(!tail.is_empty() && tail.iter().all(|byte| *byte == 0)),
-            })
-        }
-        (Direction::Request, SID_AUTHENTICATION)
-        | (Direction::Response, SID_AUTHENTICATION_POSITIVE) => with_sub(secret),
-        (Direction::Request, SID_TRANSFER_DATA) => with_sub(bulk),
-        (Direction::Response, SID_TRANSFER_DATA_POSITIVE) if rest.len() > 1 => with_sub(bulk),
+            }),
+            Some(SecurityLevel::Other) => keep(2, &secret),
+        },
+        (Direction::Request, SID_AUTHENTICATION) => keep(2, &secret),
+        (Direction::Response, SID_AUTHENTICATION_POSITIVE) => keep(3, &secret),
+        (Direction::Request, SID_TRANSFER_DATA) => keep(2, &bulk),
+        (Direction::Response, SID_TRANSFER_DATA_POSITIVE) if message.len() > 2 => keep(2, &bulk),
         _ => whole(),
+    }
+}
+
+/// What a SecurityAccess sub-function's level is (ISO 14229-1:2026 9.4.2.2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SecurityLevel {
+    /// A seed request: odd from 0x01 to 0x41, or 0x5F.
+    Seed,
+    /// A key: even from 0x02 to 0x42, or 0x60.
+    Key,
+    /// The supplier-specific range and the reserved values.
+    Other,
+}
+
+impl SecurityLevel {
+    fn of(level: u8) -> Self {
+        match level {
+            0x01..=0x41 if level & 1 == 1 => Self::Seed,
+            0x02..=0x42 if level & 1 == 0 => Self::Key,
+            0x5F => Self::Seed,
+            0x60 => Self::Key,
+            _ => Self::Other,
+        }
     }
 }
 
@@ -191,7 +221,7 @@ mod tests {
     }
 
     #[test]
-    fn authentication_keeps_the_service_and_sub_function_only() {
+    fn authentication_keeps_the_service_sub_function_and_return_value_only() {
         let (clear, data) = clear_of(Direction::Request, &[0x29, 0x03, 5, 6, 7]);
         assert_eq!(clear, "2903");
         assert_eq!(
@@ -201,15 +231,52 @@ mod tests {
                 all_zero: None
             })
         );
-        let (clear, data) = clear_of(Direction::Response, &[0x69, 0x83, 1]);
-        assert_eq!(clear, "6983");
+        // The return value says how the ECU judged the step, so it stays.
+        let (clear, data) = clear_of(Direction::Response, &[0x69, 0x83, 0x01, 8, 9]);
+        assert_eq!(clear, "698301");
         assert_eq!(
             data,
             Some(Redacted::Secret {
-                len: 1,
+                len: 2,
                 all_zero: None
             })
         );
+        let (clear, data) = clear_of(Direction::Response, &[0x69, 0x83]);
+        assert_eq!((clear.as_str(), data), ("6983", None));
+    }
+
+    #[test]
+    fn security_access_outside_the_seed_and_key_levels_is_its_length_in_both_directions() {
+        // The supplier-specific range and the reserved values define no seed and key pairing.
+        for level in [0x00, 0x43, 0x5E, 0x61, 0x62, 0x7E, 0x7F, 0xE1] {
+            for (direction, sid) in [(Direction::Request, 0x27), (Direction::Response, 0x67)] {
+                let (clear, data) = clear_of(direction, &[sid, level, 1, 2, 3]);
+                assert_eq!(clear, format!("{sid:02x}{level:02x}"), "level {level:#04x}");
+                assert_eq!(
+                    data,
+                    Some(Redacted::Secret {
+                        len: 3,
+                        all_zero: None
+                    }),
+                    "level {level:#04x}"
+                );
+            }
+        }
+        // The ISO 26021-2 pair keeps the seed and key rule.
+        let (_, data) = clear_of(Direction::Response, &[0x67, 0x5F, 0, 0]);
+        assert!(matches!(
+            data,
+            Some(Redacted::Secret {
+                all_zero: Some(true),
+                ..
+            })
+        ));
+        let (_, data) = clear_of(Direction::Request, &[0x27, 0x60, 1]);
+        assert!(matches!(data, Some(Redacted::Secret { len: 1, .. })));
+        let (clear, data) = clear_of(Direction::Request, &[0x27, 0x41, 0xAA]);
+        assert_eq!((clear.as_str(), data), ("2741aa", None));
+        let (clear, data) = clear_of(Direction::Response, &[0x67, 0x42]);
+        assert_eq!((clear.as_str(), data), ("6742", None));
     }
 
     #[test]

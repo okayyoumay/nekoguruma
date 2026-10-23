@@ -61,7 +61,8 @@ pub struct StepRef {
 pub struct StageId(pub u32);
 
 /// The VIN a job targets. It is personal data (design 16.2): `Debug` hides it, there is no
-/// `Display`, and callers use [`Vin::as_str`] only to compare. The journal keeps it as given;
+/// `Display`, and callers use [`Vin::as_str`] only to compare and to write the communication
+/// log's header, which has the journal's protection (design 8.11). The journal keeps it as given;
 /// [`Vin::is_well_formed`] is the rule for whether it is well-formed, used by the
 /// restart's gates and the job guards (ADR-261, ADR-262).
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1133,7 +1134,7 @@ fn journal_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
 
 /// Makes a new directory entry durable. NTFS logs the entry with the file's metadata, which
 /// the file's own sync covers.
-fn sync_dir(dir: &Path) -> io::Result<()> {
+pub(crate) fn sync_dir(dir: &Path) -> io::Result<()> {
     #[cfg(unix)]
     File::open(dir)?.sync_all()?;
     #[cfg(not(unix))]

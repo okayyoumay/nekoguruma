@@ -294,23 +294,32 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   for a resume that finds no journal, and whether the job writes) and, when it ends,
   `job_end` with the outcome (`ok` or the `JobError` variant's name). A reopen writes
   `agent_clock` first, a new reading that starts a new agent epoch.
-- **Clean close and reopen.** A log whose last line is a complete `job_end` was closed cleanly.
-  A reopen cuts a torn last line, goes on after the last complete line's `seq`, and when the
-  close was not clean (a torn line, or a last line that is not `job_end`) marks its
-  `agent_clock` incomplete (on a file that held only a torn line, the new header's clock).
+- **Clean close and reopen.** A log was closed cleanly when it starts with its header, its
+  lines number 0, 1, ... with nothing blank or damaged between them, and its last line is a
+  complete `job_end`. A reopen cuts a torn last line and goes on after the largest `seq` the
+  file holds, so numbering never goes back; when the close was not clean, its `agent_clock` is
+  marked incomplete. A file that does not start with a header gets one, marked incomplete, after
+  whatever it holds, and so does a resume that finds no log, since the job ran before. A file
+  whose `seq` or epoch has no successor is not opened (`NotOpened` with `InvalidData`). A new
+  file's directory is synced, as the journal's is, so its name survives a power loss.
 - **Writes.** One write per line from the job's thread, synced after the opening lines and
   after `job_end`. A failed write or sync stops the log for the rest of the run, which writes no
   `job_end`, so the next reopen sees an unclean close.
 - **Status.** Every entry point returns a `JobRun`: the job's `result`, its `guards` and
   `comm_log`, a `CommLogStatus`. It is `None` without a log (none configured, a job refused
   before its thread starts, or one that ends before the log opens: a cancel, a journal another
-  run holds), `Complete`, or `Incomplete` with the reason: `NotOpened` (a log another run holds
+  run holds, a resume its journal turns away), `Complete`, or `Incomplete` with the reason: `NotOpened` (a log another run holds
   is `WouldBlock`), `WriteFailed`, `UncleanReopen` or `CloseFailed`. The result is the same
   whatever the status.
-- **Redaction.** Message bytes reach the log only through `comm_log::redaction::redact`: a
-  SecurityAccess key and seed are their length (the seed also whether it is all zero), an
-  Authentication message its length, and TransferData data (a download's requests, an upload's
-  responses) its length and SHA-256; the service, sub-function and block counter stay in clear.
+- **Redaction.** Message bytes reach the log only through `comm_log::redaction::redact`. The
+  service and sub-function stay in clear, and:
+  - SecurityAccess (ISO 14229-1:2026 9.4): a key is its length, a seed its length and whether it
+    is all zero; a request or response outside the seed and key levels (the supplier-specific
+    range and the reserved values, which define no pairing) is its length in both directions;
+  - Authentication (9.6): the data is its length, and a response keeps its return value;
+  - TransferData (14.4): the data of a download's requests and an upload's responses is its
+    length and SHA-256, the block counter in clear.
+
   The exchange entries that use it come with the rest of design 8.11.
 
 ## Restart classification

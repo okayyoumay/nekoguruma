@@ -11,10 +11,12 @@
 //! the next `seq` and an `event` naming its kind. [`redaction::redact`] is how an exchange entry
 //! will carry a message's bytes.
 //!
-//! A log is closed cleanly when its last complete line is a `job_end`. A log that is opened
-//! again otherwise (a crash, a power loss, a write that failed) is cut after its last complete
-//! line, which drops a torn tail, and its status ends as [`CommLogIncomplete::UncleanReopen`]
-//! at best.
+//! A log is closed cleanly when it starts with its header, its lines number 0, 1, ... with
+//! nothing blank or damaged between them, and its last line is a complete `job_end`. A log that
+//! is opened again otherwise (a crash, a power loss, a write that failed) is cut after its last
+//! complete line, which drops a torn tail, goes on after the largest `seq` it holds, and its
+//! status ends as [`CommLogIncomplete::UncleanReopen`] at best; so does a resume that finds no
+//! log, since the job ran before.
 
 use std::fs::{File, OpenOptions};
 use std::io::{self, Read, Seek, SeekFrom, Write};
@@ -26,7 +28,7 @@ use diag_ir::VmState;
 use serde::Serialize;
 
 use crate::artifact::to_hex;
-use crate::journal::{JobKey, JournalError, WriterLock, job_file_stem};
+use crate::journal::{JobKey, JournalError, Vin, WriterLock, job_file_stem, sync_dir};
 use crate::runner::JobError;
 
 /// What an exchange entry carries of a message's bytes (design 8.11, ADR-347).
@@ -56,7 +58,8 @@ impl CommLogSetup {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum CommLogStatus {
     /// No log was kept: none was configured, or the job was refused before its thread started,
-    /// or it ended before the log would have been opened (a cancel, a journal another run holds).
+    /// or it ended before the log would have been opened (a cancel, a journal another run holds,
+    /// a resume its journal turns away: a declared failure, an identity abort, a run's stop).
     None,
     /// The log was opened (or reopened after a clean close), took every line and ended with a
     /// synced `job_end`.
@@ -106,7 +109,7 @@ pub(crate) struct RunFacts {
     pub variant_name: Option<String>,
     /// The job's target VIN. The log has the journal's protection (design 8.11); the VIN never
     /// goes into an error or a trace.
-    pub target_vin: Option<String>,
+    pub target_vin: Option<Vin>,
     /// Whether the job's program writes.
     pub writes: bool,
 }
@@ -365,6 +368,7 @@ impl CommLog {
             job_file_stem(&setup.key).map_err(kind)?
         ));
         let lock = WriterLock::at(&lock_path).map_err(kind)?;
+        let existed = path.try_exists().map_err(|error| error.kind())?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -372,9 +376,13 @@ impl CommLog {
             .truncate(false)
             .open(&path)
             .map_err(|error| error.kind())?;
+        if !existed {
+            // A new file's name is durable only once its directory is (as the journal's).
+            sync_dir(&setup.dir).map_err(|error| error.kind())?;
+        }
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|error| error.kind())?;
-        let scan = scan(&bytes);
+        let scan = scan(&bytes).ok_or(io::ErrorKind::InvalidData)?;
         let io_kind = |error: io::Error| error.kind();
         if scan.complete_len < bytes.len() {
             tracing::warn!(
@@ -394,17 +402,16 @@ impl CommLog {
     }
 
     fn new(sink: Box<dyn LineSink>, scan: Scan, lock: Option<WriterLock>) -> Self {
-        let reopened = scan.lines > 0;
+        // A log goes on after an earlier run only when its first line is its header; otherwise
+        // a header is written after whatever the file holds, marked incomplete.
+        let reopened = scan.header;
         Self(Arc::new(Mutex::new(Inner {
             sink,
-            next_seq: scan.last_seq.map_or(0, |seq| seq + 1),
+            next_seq: scan.next_seq,
             failed: None,
-            unclean: scan.torn || (reopened && !scan.clean_close),
-            epoch: if reopened {
-                scan.last_epoch.unwrap_or(0) + 1
-            } else {
-                0
-            },
+            unclean: scan.torn
+                || (scan.complete_len > 0 && !(scan.header && scan.consistent && scan.clean_close)),
+            epoch: if reopened { scan.next_epoch } else { 0 },
             origin: Instant::now(),
             opening: Some(if reopened {
                 Opening::Reopened
@@ -419,7 +426,7 @@ impl CommLog {
     /// A log over `sink` that continues a file `scan` describes, for tests.
     #[cfg(test)]
     fn over(sink: Box<dyn LineSink>, existing: &[u8]) -> Self {
-        Self::new(sink, scan(existing), None)
+        Self::new(sink, scan(existing).expect("a scannable log"), None)
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -433,6 +440,10 @@ impl CommLog {
         let Some(opening) = inner.opening.take() else {
             return;
         };
+        // A resume belongs to a job that ran before: a log it has to start was lost.
+        if opening == Opening::Fresh && run == RunKind::Resume {
+            inner.unclean = true;
+        }
         match opening {
             Opening::Fresh => {
                 // The log begins here: the header reads 0.
@@ -449,10 +460,9 @@ impl CommLog {
                         kind: "procedure",
                         document_sha256: facts.document_sha256.as_ref().map(|hash| to_hex(hash)),
                     },
-                    vehicle: facts
-                        .target_vin
-                        .as_deref()
-                        .map(|target_vin| HeaderVehicle { target_vin }),
+                    vehicle: facts.target_vin.as_ref().map(|target_vin| HeaderVehicle {
+                        target_vin: target_vin.as_str(),
+                    }),
                     targets: variant.map(|ecu_variant| vec![HeaderTarget { ecu_variant }]),
                     software: HeaderSoftware {
                         agent: env!("CARGO_PKG_VERSION"),
@@ -491,8 +501,9 @@ impl CommLog {
         inner.ended = inner.failed.is_none();
     }
 
-    /// How the log stands now. After [`CommLog::end`] it is the run's final status.
-    pub fn status(&self) -> CommLogStatus {
+    /// How the log stands now. After [`CommLog::end`] it is the run's final status; before it,
+    /// a log that has not failed reads as not closed.
+    pub(crate) fn status(&self) -> CommLogStatus {
         let inner = self.lock();
         if let Some(failure) = &inner.failed {
             CommLogStatus::Incomplete(failure.clone())
@@ -526,6 +537,13 @@ impl Inner {
             return;
         }
         let seq = self.next_seq;
+        let Some(next) = seq.checked_add(1) else {
+            self.failed = Some(CommLogIncomplete::WriteFailed {
+                seq,
+                kind: io::ErrorKind::InvalidData,
+            });
+            return;
+        };
         let mut line = Vec::with_capacity(256);
         let written = serde_json::to_writer(&mut line, &Line { seq, event })
             .map_err(io::Error::from)
@@ -534,7 +552,7 @@ impl Inner {
                 self.sink.write_line(&line)
             });
         match written {
-            Ok(()) => self.next_seq += 1,
+            Ok(()) => self.next_seq = next,
             Err(error) => {
                 self.failed = Some(CommLogIncomplete::WriteFailed {
                     seq,
@@ -561,17 +579,25 @@ struct Scan {
     complete_len: usize,
     /// Bytes follow the last `\n`.
     torn: bool,
-    /// Complete lines.
+    /// Complete lines that are not blank.
     lines: usize,
-    /// The `seq` of the last line that is a JSON object with a numeric one.
-    last_seq: Option<u64>,
-    /// The epoch of the last `agent_clock`; the header's is 0.
-    last_epoch: Option<u64>,
-    /// The last complete line is a `job_end`.
+    /// The first of them is a header with `seq` 0.
+    header: bool,
+    /// Every one of them is a JSON object whose `seq` is one more than the line's before (the
+    /// first 0), and the first is the header: nothing between them is missing or damaged.
+    consistent: bool,
+    /// The `seq` the next line takes: one more than the largest `seq` read, so numbering never
+    /// goes back.
+    next_seq: u64,
+    /// The agent epoch the next reopen starts: one more than the largest read.
+    next_epoch: u64,
+    /// The last of them is a `job_end`.
     clean_close: bool,
 }
 
-fn scan(bytes: &[u8]) -> Scan {
+/// Reads an existing log. `None` when it holds a `seq` or an epoch with no successor, which
+/// only a damaged or forged file can.
+fn scan(bytes: &[u8]) -> Option<Scan> {
     let complete_len = bytes
         .iter()
         .rposition(|byte| *byte == b'\n')
@@ -579,33 +605,57 @@ fn scan(bytes: &[u8]) -> Scan {
     let mut scan = Scan {
         complete_len,
         torn: complete_len < bytes.len(),
+        consistent: true,
         ..Scan::default()
     };
-    for line in bytes[..complete_len].split(|byte| *byte == b'\n') {
-        if line.is_empty() {
+    let mut largest_seq: Option<u64> = None;
+    let mut largest_epoch: Option<u64> = None;
+    for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
+        if line.iter().all(u8::is_ascii_whitespace) {
+            // A blank line is no line of this writer's.
+            scan.consistent = false;
             continue;
         }
+        let first = scan.lines == 0;
         scan.lines += 1;
         scan.clean_close = false;
         let parsed = serde_json::from_slice::<serde_json::Value>(line).ok();
-        let Some(object) = parsed.as_ref().and_then(|value| value.as_object()) else {
-            continue;
-        };
-        if let Some(seq) = object.get("seq").and_then(|seq| seq.as_u64()) {
-            scan.last_seq = Some(seq);
+        let object = parsed.as_ref().and_then(|value| value.as_object());
+        let seq = object.and_then(|object| object.get("seq")?.as_u64());
+        let event = object.and_then(|object| object.get("event")?.as_str());
+        let expected = largest_seq.map_or(Some(0), |seq| seq.checked_add(1));
+        if seq.is_none() || seq != expected {
+            scan.consistent = false;
         }
-        match object.get("event").and_then(|event| event.as_str()) {
-            Some("header") => scan.last_epoch = Some(0),
+        if let Some(seq) = seq {
+            largest_seq = Some(largest_seq.map_or(seq, |largest| largest.max(seq)));
+        }
+        match event {
+            Some("header") if first && seq == Some(0) => {
+                scan.header = true;
+                largest_epoch = Some(largest_epoch.unwrap_or(0));
+            }
             Some("agent_clock") => {
-                if let Some(epoch) = object.get("epoch").and_then(|epoch| epoch.as_u64()) {
-                    scan.last_epoch = Some(epoch);
+                if let Some(epoch) = object.and_then(|object| object.get("epoch")?.as_u64()) {
+                    largest_epoch = Some(largest_epoch.map_or(epoch, |largest| largest.max(epoch)));
                 }
             }
             Some("job_end") => scan.clean_close = true,
             _ => {}
         }
+        if first && !scan.header {
+            scan.consistent = false;
+        }
     }
-    scan
+    scan.next_seq = match largest_seq {
+        Some(seq) => seq.checked_add(1)?,
+        None => 0,
+    };
+    scan.next_epoch = match largest_epoch {
+        Some(epoch) => epoch.checked_add(1)?,
+        None => 0,
+    };
+    Some(scan)
 }
 
 /// A job's log as the job thread holds it: the setup, what the header needs, and the log once
@@ -704,7 +754,7 @@ mod tests {
             generation: 3,
             document_sha256: Some([0xAB; 32]),
             variant_name: Some("Engine_V1".to_owned()),
-            target_vin: Some("WVWZZZ1JZXW000001".to_owned()),
+            target_vin: Some(Vin::new("WVWZZZ1JZXW000001".to_owned())),
             writes: false,
         }
     }
@@ -942,6 +992,16 @@ mod tests {
         }
     }
 
+    impl Recording {
+        fn lines(&self) -> Vec<serde_json::Value> {
+            String::from_utf8(self.taken.lock().unwrap().clone())
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect()
+        }
+    }
+
     fn taken_events(sink: &Recording) -> Vec<String> {
         String::from_utf8(sink.taken.lock().unwrap().clone())
             .unwrap()
@@ -1014,16 +1074,150 @@ mod tests {
     }
 
     #[test]
-    fn the_scan_continues_after_the_last_line_with_a_numeric_seq() {
+    fn the_scan_goes_on_after_the_largest_seq_and_epoch() {
         let scan = scan(
-            b"{\"seq\":4,\"event\":\"agent_clock\",\"epoch\":6}\nnot json\n{\"seq\":\"x\"}\n[1]\n",
+            b"{\"seq\":0,\"event\":\"header\"}\n{\"seq\":1,\"event\":\"agent_clock\",\"epoch\":6}\nnot json\n{\"seq\":\"x\"}\n[1]\n",
+        )
+        .unwrap();
+        assert_eq!((scan.next_seq, scan.next_epoch, scan.lines), (2, 7, 5));
+        assert!(scan.header && !scan.consistent && !scan.clean_close && !scan.torn);
+        let empty = super::scan(b"").unwrap();
+        assert_eq!((empty.lines, empty.next_seq, empty.torn), (0, 0, false));
+        assert!(!empty.header);
+    }
+
+    /// A log whose lines run 0, 1, ... from its header to a `job_end`.
+    const CLEAN: &[u8] = b"{\"seq\":0,\"event\":\"header\"}\n{\"seq\":1,\"event\":\"job_start\"}\n{\"seq\":2,\"event\":\"job_end\"}\n";
+
+    #[test]
+    fn a_seq_that_goes_back_does_not_number_lines_twice() {
+        let mut bytes = CLEAN.to_vec();
+        bytes.extend_from_slice(b"{\"seq\":1,\"event\":\"job_end\"}\n");
+        let scan = scan(&bytes).unwrap();
+        assert_eq!(scan.next_seq, 3, "after the largest seq, not the last");
+        assert!(!scan.consistent, "a seq that goes back is damage");
+        assert!(super::scan(CLEAN).unwrap().consistent);
+    }
+
+    #[test]
+    fn a_damaged_line_before_a_job_end_is_not_a_clean_close() {
+        // A sync that kept `job_end` but lost the line before it.
+        let damaged =
+            b"{\"seq\":0,\"event\":\"header\"}\n\0\0\0\0\n{\"seq\":2,\"event\":\"job_end\"}\n";
+        let gap = b"{\"seq\":0,\"event\":\"header\"}\n{\"seq\":2,\"event\":\"job_end\"}\n";
+        for bytes in [
+            &damaged[..],
+            &gap[..],
+            b"{\"seq\":0,\"event\":\"header\"}\n \n{\"seq\":1,\"event\":\"job_end\"}\n",
+        ] {
+            let sink = Recording::default();
+            let log = CommLog::over(Box::new(sink.clone()), bytes);
+            log.begin(&facts(), RunKind::Resume);
+            log.end("ok");
+            assert_eq!(
+                log.status(),
+                CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen),
+                "{}",
+                String::from_utf8_lossy(bytes)
+            );
+        }
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), CLEAN);
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        assert_eq!(log.status(), CommLogStatus::Complete);
+    }
+
+    #[test]
+    fn a_file_without_a_header_first_gets_one_marked_incomplete() {
+        for bytes in [
+            &b"\n"[..],
+            b" \n",
+            b"junk\n",
+            b"{\"seq\":0,\"event\":\"job_end\"}\n",
+        ] {
+            let sink = Recording::default();
+            let log = CommLog::over(Box::new(sink.clone()), bytes);
+            log.begin(&facts(), RunKind::First);
+            log.end("ok");
+            let lines = sink.lines();
+            assert_eq!(
+                lines[0]["event"],
+                "header",
+                "{:?}",
+                String::from_utf8_lossy(bytes)
+            );
+            assert_eq!(lines[0]["clock"]["incomplete"], true);
+            assert_eq!(
+                log.status(),
+                CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen)
+            );
+        }
+    }
+
+    #[test]
+    fn a_resume_that_finds_no_log_marks_the_new_one_incomplete() {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        assert_eq!(sink.lines()[0]["clock"]["incomplete"], true);
+        assert_eq!(
+            log.status(),
+            CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen)
         );
-        assert_eq!(scan.last_seq, Some(4));
-        assert_eq!(scan.last_epoch, Some(6));
-        assert_eq!(scan.lines, 4);
-        assert!(!scan.clean_close && !scan.torn);
-        let empty = super::scan(b"");
-        assert_eq!((empty.lines, empty.last_seq, empty.torn), (0, None, false));
+        // A first run starts a log cleanly.
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), b"");
+        log.begin(&facts(), RunKind::First);
+        log.end("ok");
+        assert_eq!(log.status(), CommLogStatus::Complete);
+    }
+
+    #[test]
+    fn a_seq_or_epoch_without_a_successor_is_not_opened_and_never_overflows() {
+        let max = u64::MAX;
+        assert!(
+            super::scan(format!("{{\"seq\":{max},\"event\":\"header\"}}\n").as_bytes()).is_none()
+        );
+        assert!(
+            super::scan(
+                format!("{{\"seq\":0,\"event\":\"header\"}}\n{{\"seq\":1,\"event\":\"agent_clock\",\"epoch\":{max}}}\n")
+                    .as_bytes()
+            )
+            .is_none()
+        );
+        // A log that reaches the last seq stops instead of wrapping.
+        let near = format!(
+            "{{\"seq\":0,\"event\":\"header\"}}\n{{\"seq\":{},\"event\":\"job_end\"}}\n",
+            max - 2
+        );
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), near.as_bytes());
+        log.begin(&facts(), RunKind::Resume);
+        log.end("ok");
+        assert_eq!(
+            log.status(),
+            CommLogStatus::Incomplete(CommLogIncomplete::WriteFailed {
+                seq: max,
+                kind: io::ErrorKind::InvalidData,
+            })
+        );
+        let seqs: Vec<u64> = sink
+            .lines()
+            .iter()
+            .map(|line| line["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, [max - 1]);
+    }
+
+    #[test]
+    fn crlf_line_ends_read_as_lines() {
+        let scan =
+            scan(b"{\"seq\":0,\"event\":\"header\"}\r\n{\"seq\":1,\"event\":\"job_end\"}\r\n")
+                .unwrap();
+        assert!(scan.header && scan.consistent && scan.clean_close);
+        assert_eq!(scan.next_seq, 2);
     }
 
     #[test]

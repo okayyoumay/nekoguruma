@@ -237,8 +237,15 @@ fn with_artifact(job: Job, artifact: Option<(PathBuf, [u8; SHA256_LEN])>) -> Res
 
 /// The communication log of this run: a job ID minted from the clock and the process ID, so
 /// two runs never share a log, in generation 0 (ADR-347). Prints the log's path on stderr.
+/// A missing directory is created writable and readable by its owner only, since the log holds
+/// the vehicle's data.
 fn comm_log_setup(dir: PathBuf) -> Result<CommLogSetup, String> {
-    std::fs::create_dir_all(&dir)
+    let mut builder = std::fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+    builder
+        .create(&dir)
         .map_err(|error| format!("cannot create {}: {error}", dir.display()))?;
     let unix_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -260,15 +267,16 @@ fn comm_log_setup(dir: PathBuf) -> Result<CommLogSetup, String> {
 /// Runs the job and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
     let mut job = with_artifact(read_job(&args.document)?, args.artifact)?;
-    if let Some(dir) = args.comm_log {
-        job = job.with_comm_log(comm_log_setup(dir)?);
-    }
     // A program the job would refuse does not need a worker, nor does a link the document
     // declares that cannot be used.
     check_job(&job, build_ceiling()).map_err(|error| format!("job failed: {error}"))?;
     let link = job
         .declared_link()
         .map_err(|error| format!("job failed: {error}"))?;
+    // Only a job that will run gets a log, so a refused one names no log that never exists.
+    if let Some(dir) = args.comm_log {
+        job = job.with_comm_log(comm_log_setup(dir)?);
+    }
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
     let dir = match args.locks {

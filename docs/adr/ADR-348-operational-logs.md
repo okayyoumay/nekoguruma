@@ -4,7 +4,8 @@
 **Status:** Accepted
 **Affects:** design 12.2 (new), 8.7, 8.11 (the `procedure_log` event), 16.2; `agent` (logging setup,
 worker output), `vci-service-launcher` and `vci-service-config` (logging output, rotation),
-`worker-host` (worker stderr), `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346
+`worker-host` (worker stderr), `server`, design 6.8; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346,
+ADR-347
 
 ## Context
 
@@ -111,11 +112,15 @@ faults, and aims the logs at software experts away from the workshop.
    `diag.log` message (Starlark subset 3.1) is written to the job's communication log as a
    `procedure_log` event with its level (a job whose procedure uses `diag.log`, which its IR shows
    when the job starts, always has a communication log, even without a journal and without its
-   caller asking for one, so the message is never dropped), and a `diag.fail` detail stays in the
-   job's journal and result; the operational log records at most that a procedure logged or failed,
-   with the level or the code. A value the agent reads from the vehicle, such as an identity that
-   did not match, is likewise logged as the fact, not the value. Until every existing `tracing` call
-   has been checked against this item, the agent installs no subscriber (item 3).
+   caller asking for one, so the message is never dropped: when such a `run_program` job carries no
+   setup, the agent gives it one, in its communication-log directory, a setting that defaults to
+   `commlog/` in the agent's local storage beside its journals (design 5.5), with a job id of its
+   own as `ngr-agent run --comm-log` does; this extends ADR-347 Decision item 2), and a `diag.fail`
+   detail stays in the job's journal and result; the operational log records at most that a
+   procedure logged or failed, with the level or the code. A value the agent reads from the vehicle,
+   such as an identity that did not match, is likewise logged as the fact, not the value. Until
+   every existing `tracing` call has been checked against this item, the agent installs no
+   subscriber (item 3).
 7. **Device timestamps are not authoritative.** Entries carry the device's clock. Unlike the
    audit log (design 16.3), the operational log does not need a trusted time; when the server
    receives entries (item 8) it records its receive time beside them.

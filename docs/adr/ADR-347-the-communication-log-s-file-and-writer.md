@@ -1,7 +1,8 @@
 # ADR-347: The Communication Log's File and Writer
 
 **Date:** 2026-10-22
-**Status:** Accepted
+**Status:** Accepted (Decision item 2 extended by ADR-348: a `run_program` job whose procedure
+uses `diag.log` gets a setup when it carries none)
 **Affects:** design 8.11 ("Scope and form"); `agent` (`comm_log`, the job runner's entry points
 and their `JobRun` result, `Job::with_comm_log`, `JobError::CommLogMismatch`, the journal's
 writer lock and file stem, `ngr-agent run --comm-log`); ADR-346 item 10

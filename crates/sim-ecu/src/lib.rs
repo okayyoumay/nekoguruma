@@ -54,6 +54,13 @@ pub const DID_BATTERY_VOLTAGE: u16 = 0xFD04;
 /// Simulator-specific DID (system supplier range) reporting a fixed boot time,
 /// [`BOOT_TIME_RAW`], as 2 bytes big endian, for the same purpose.
 pub const DID_BOOT_TIME: u16 = 0xFD05;
+/// Simulator-specific DID (system supplier range) reporting that an external supply is
+/// connected, as 1 byte (1), so that a definition can read the external-supply precondition from
+/// the ECU (design 8.9) where the agent has no runtime input for it.
+pub const DID_EXTERNAL_SUPPLY: u16 = 0xFD06;
+/// Simulator-specific DID (system supplier range) reporting that the ignition is on, as 1 byte
+/// (1), for the ignition precondition in the same way.
+pub const DID_IGNITION: u16 = 0xFD07;
 /// The raw value [`DID_BATTERY_VOLTAGE`] reports. The example ECU definition reads it in 0.1 V
 /// units, as 12.5 V (`crates/diag-frontend/examples/example-ecu`).
 pub const BATTERY_VOLTAGE_RAW: u16 = 0x007D;

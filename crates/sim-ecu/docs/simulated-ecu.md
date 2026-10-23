@@ -99,6 +99,8 @@ or `reconnect()` of the simulated ECU leaves it as it is.
 | FD01 | `SimEcu::power_cycles` (ECU resets, power losses, reconnections) as 4 bytes, big endian, saturating |
 | FD04 | a fixed battery voltage, `BATTERY_VOLTAGE_RAW` (0x007D), as 2 bytes, big endian; the example ECU definition reads it in 0.1 V units as 12.5 V |
 | FD05 | a fixed boot time, `BOOT_TIME_RAW` (0x002D), as 2 bytes, big endian; the example ECU definition reads it in 10 ms units as 450 ms |
+| FD06 | an external supply connected, as 1 byte (1), in every session, for a definition that reads the external-supply precondition from the ECU |
+| FD07 | the ignition on, as 1 byte (1), in every session, for the ignition precondition in the same way |
 
 `EcuConfig::validate` refuses a part number, software version or `downloaded_sw_version` that is not ASCII or is longer than its width, and a VIN that is not exactly 17 ASCII bytes (F190 is a fixed 17-byte row); `sim-vci` and `iso22900-mock` call it when they load or attach a configuration. A `SimEcu` built directly from a longer value cuts it, so the answer keeps its length. A configured `sw_version` or `downloaded_sw_version` shorter than 5 bytes is read back space-padded, so a job's intended software version, which the agent compares as the field's raw bytes (ADR-268), must include the padding.
 

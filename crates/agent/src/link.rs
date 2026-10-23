@@ -288,6 +288,45 @@ fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
 }
 
 /// `ms` is at most [`MAX_TIMING_MS`] after [`LinkConfig::validate`].
+/// Which of [`own_comparams`] take their value from `variant`'s document rather than the
+/// agent's default, by the names `own_comparams` gives: the baud rate always, and the timing
+/// ComParams the document declares ([`LinkConfig::declared`]). Empty for a variant that
+/// declares no usable protocol, whose link [`LinkConfig::declared`] refuses anyway.
+pub(crate) fn valued_by_document(variant: &EcuVariant<'_>) -> Vec<&'static str> {
+    let protocols: Vec<Protocol<'_>> = variant.protocols().into_iter().flatten().collect();
+    let [protocol] = protocols.as_slice() else {
+        return Vec::new();
+    };
+    let mut named = vec!["CP_Baudrate"];
+    for param in protocol.params().into_iter().flatten() {
+        let name = param.short_name().unwrap_or_default();
+        for timing in ["CP_P2Max", "CP_P2Star", "CP_RC78CompletionTimeout"] {
+            if name.eq_ignore_ascii_case(timing) {
+                named.push(timing);
+            }
+        }
+    }
+    named
+}
+
+/// The ComParams the link sets itself, by name, before those the document declares; the
+/// identifiers go into the response ID table instead. The communication log's `link_opened`
+/// names the same (design 8.11).
+pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 6] {
+    [
+        ("CP_Baudrate", config.baud_rate),
+        ("CP_P2Max", micros(config.p2_max_ms)),
+        ("CP_P2Star", micros(config.p2_star_ms)),
+        ("CP_RC78Handling", 1),
+        // The worker finds a response pending only at this offset.
+        ("CP_RCByteOffset", RC_BYTE_OFFSET),
+        (
+            "CP_RC78CompletionTimeout",
+            micros(config.rc78_completion_ms),
+        ),
+    ]
+}
+
 fn micros(ms: u32) -> u32 {
     ms.saturating_mul(1_000)
 }
@@ -586,18 +625,7 @@ async fn set_up_link<C: WorkerApi>(
     deadline: Duration,
     cll_handle: ComLogicalLinkHandle,
 ) -> Result<Streaming<EventNotification>, HostError> {
-    let own = [
-        ("CP_Baudrate", config.baud_rate),
-        ("CP_P2Max", micros(config.p2_max_ms)),
-        ("CP_P2Star", micros(config.p2_star_ms)),
-        ("CP_RC78Handling", 1),
-        // The worker finds a response pending only at this offset.
-        ("CP_RCByteOffset", RC_BYTE_OFFSET),
-        (
-            "CP_RC78CompletionTimeout",
-            micros(config.rc78_completion_ms),
-        ),
-    ];
+    let own = own_comparams(config);
     let declared = config
         .params
         .iter()
@@ -819,6 +847,35 @@ mod tests {
             matches!(&error, HostError::DeclaredLink(why) if why.contains("unit")),
             "{error}"
         );
+    }
+
+    /// The link's own ComParams whose value the document gives: the baud rate, and a timing
+    /// ComParam only when it is declared, under the link's spelling of its name.
+    #[test]
+    fn the_document_values_the_baud_rate_and_the_timings_it_declares() {
+        assert_eq!(
+            valued_by(vec![protocol(&[("cp_p2max", 50_000), ("CP_StMin", 0)])]),
+            ["CP_Baudrate", "CP_P2Max"]
+        );
+        assert_eq!(valued_by(vec![protocol(&[])]), ["CP_Baudrate"]);
+        assert!(valued_by(Vec::new()).is_empty());
+    }
+
+    fn valued_by(protocols: Vec<ProtocolT>) -> Vec<&'static str> {
+        valued_by_document(&document_of(protocols).variant())
+    }
+
+    fn document_of(protocols: Vec<ProtocolT>) -> JobDocument {
+        let mut variant = EcuVariantT::default();
+        variant.id = 1;
+        variant.short_name = Some("v".into());
+        variant.protocols = Some(protocols);
+        let mut document = EcuDocumentT::default();
+        document.schema_version = IR_SCHEMA_VERSION;
+        document.source_format = Some("csv-starlark".into());
+        document.source_digest = Some("00".into());
+        document.variant = Some(Box::new(variant));
+        JobDocument::new(encode_ecu_document(&document)).expect("the document loads")
     }
 
     fn declared(protocols: Vec<ProtocolT>) -> Result<LinkConfig, HostError> {

@@ -505,6 +505,41 @@ fn assert_comm_log(setup: &CommLogSetup) {
         .lines()
         .map(|line| serde_json::from_str(line).expect("a JSON line"))
         .collect();
+    // The link's settings come before anything is sent on it (design 8.11 "Header").
+    let events: Vec<&str> = lines
+        .iter()
+        .map(|line| line["event"].as_str().expect("an event"))
+        .collect();
+    assert_eq!(
+        &events[..3],
+        ["header", "job_start", "link_opened"],
+        "{text}"
+    );
+    let opened = &lines[2];
+    assert_eq!(opened["link"], 1, "{opened}");
+    assert_eq!(opened["protocol"], "ISO_14229_3_on_ISO_15765_2", "{opened}");
+    assert!(opened["baud_rate"].as_u64().is_some(), "{opened}");
+    let comparams = opened["comparams"].as_array().expect("the ComParams");
+    for (name, set_by) in [
+        ("CP_P2Max", "link"),
+        ("CP_P2Star", "link"),
+        ("CP_RC78Handling", "link"),
+        ("CP_RC78CompletionTimeout", "link"),
+        ("CP_RC21Handling", "library_default"),
+        ("CP_RC23Handling", "library_default"),
+        ("CP_TransmitIndEnable", "library_default"),
+        ("CP_StartMsgIndEnable", "library_default"),
+        ("CP_TesterPresentHandling", "library_default"),
+    ] {
+        assert!(
+            comparams
+                .iter()
+                .any(|param| param["name"] == name && param["set_by"] == set_by),
+            "{name} {set_by} in {opened}"
+        );
+    }
+    // Whether the worker forwards pendings is not known to the agent yet.
+    assert!(opened["forwards_pendings"].is_null(), "{opened}");
     let entries: Vec<&serde_json::Value> = lines
         .iter()
         .filter(|line| line["event"] == "exchange")

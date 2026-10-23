@@ -1131,6 +1131,14 @@ fn run_job<C: WorkerApi>(
         document.as_ref().map(JobDocument::variant).as_ref(),
         permission,
     );
+    // What the link has in force, before anything is sent on it (design 8.11).
+    if let Some(log) = &comm_log {
+        let valued_by_document = document
+            .as_ref()
+            .map(|document| link::valued_by_document(&document.variant()))
+            .unwrap_or_default();
+        log.link_opened(crate::host::LOG_LINK, config, &valued_by_document);
+    }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
     host.set_document(document);
     // The journal records the hash of the artifact the job runs with (ADR-344).
@@ -15236,13 +15244,48 @@ def main():
         run.result.expect("the program runs");
         assert_eq!(run.comm_log, CommLogStatus::Complete);
         let lines = comm_log_lines(&dir);
-        assert_eq!(comm_log_events(&lines), ["header", "job_start", "job_end"]);
+        assert_eq!(
+            comm_log_events(&lines),
+            ["header", "job_start", "link_opened", "job_end"]
+        );
         assert_seq_consecutive(&lines);
         assert_eq!(lines[0]["job"]["id"], job_key().job_id.0);
         assert_eq!(lines[0]["job"]["generation"], 1);
         assert!(lines[0].get("vehicle").is_none(), "a bare run has no VIN");
         assert_eq!(lines[1]["run"], "first");
-        assert_eq!(lines[2]["outcome"], "ok");
+        // What the link has in force (design 8.11 "Header").
+        let opened = &lines[2];
+        assert_eq!(opened["link"], 1);
+        assert_eq!(opened["target"]["tx_id"], 0x7E0);
+        assert_eq!(opened["target"]["rx_id"], 0x7E8);
+        assert_eq!(opened["protocol"], crate::link::PROTOCOL_UDS_ON_CAN);
+        assert_eq!(opened["baud_rate"], 500_000);
+        assert_eq!(
+            (opened["request_id"].clone(), opened["response_id"].clone()),
+            (0x7E0.into(), 0x7E8.into())
+        );
+        let comparam = |name: &str| {
+            opened["comparams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|param| param["name"] == name)
+                .unwrap_or_else(|| panic!("{name} in {opened}"))
+                .clone()
+        };
+        assert_eq!(comparam("CP_P2Max")["value"], 1_000_000);
+        assert_eq!(comparam("CP_P2Max")["set_by"], "link");
+        assert_eq!(comparam("CP_RC78Handling")["value"], 1);
+        assert!(comparam("CP_TransmitIndEnable").get("value").is_none());
+        assert_eq!(
+            comparam("CP_TransmitIndEnable")["set_by"],
+            "library_default"
+        );
+        assert_eq!(opened["transmit_confirmation"], serde_json::json!([]));
+        assert_eq!(opened["response_times_judged"], false);
+        assert!(opened["forwards_pendings"].is_null());
+        assert_eq!(opened["timing_margin"]["source"], "none");
+        assert_eq!(lines[3]["outcome"], "ok");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -15346,11 +15389,17 @@ def main():
             .collect();
         assert_eq!(
             comm_log_events(&lines),
-            ["header", "job_start", "procedure_log", "job_end"]
+            [
+                "header",
+                "job_start",
+                "link_opened",
+                "procedure_log",
+                "job_end"
+            ]
         );
         assert_seq_consecutive(&lines);
-        assert_eq!(lines[2]["level"], 2);
-        assert_eq!(lines[2]["message"], message);
+        assert_eq!(lines[3]["level"], 2);
+        assert_eq!(lines[3]["message"], message);
         let traced = traced.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             traced.iter().all(|event| !event.contains("unique-6e0f")),
@@ -15435,15 +15484,17 @@ def main():
             [
                 "header",
                 "job_start",
+                "link_opened",
                 "job_end",
                 "agent_clock",
                 "job_start",
+                "link_opened",
                 "job_end"
             ]
         );
         assert_seq_consecutive(&lines);
-        assert_eq!(lines[3]["epoch"], 1);
-        assert!(lines[3].get("incomplete").is_none());
+        assert_eq!(lines[4]["epoch"], 1);
+        assert!(lines[4].get("incomplete").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -15469,7 +15520,10 @@ def main():
             "the journal is beside it"
         );
         let lines = comm_log_lines(&dir);
-        assert_eq!(comm_log_events(&lines), ["header", "job_start", "job_end"]);
+        assert_eq!(
+            comm_log_events(&lines),
+            ["header", "job_start", "link_opened", "job_end"]
+        );
         assert_eq!(lines[0]["vehicle"]["target_vin"], TARGET_VIN);
         assert_eq!(lines[1]["run"], "first");
 
@@ -15491,9 +15545,9 @@ def main():
         );
         let lines = comm_log_lines(&dir);
         assert_seq_consecutive(&lines);
-        assert_eq!(lines[3]["event"], "agent_clock");
-        assert_eq!(lines[3]["epoch"], 1);
-        assert_eq!(lines[4]["run"], "resume");
+        assert_eq!(lines[4]["event"], "agent_clock");
+        assert_eq!(lines[4]["epoch"], 1);
+        assert_eq!(lines[5]["run"], "resume");
         assert_eq!(lines.last().unwrap()["event"], "job_end");
         assert_eq!(run.comm_log, CommLogStatus::Complete);
         std::fs::remove_dir_all(&dir).unwrap();

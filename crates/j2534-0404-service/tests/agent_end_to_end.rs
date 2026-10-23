@@ -525,10 +525,10 @@ fn assert_comm_log(setup: &CommLogSetup) {
         ("CP_P2Star", "link"),
         ("CP_RC78Handling", "link"),
         ("CP_RC78CompletionTimeout", "link"),
-        ("CP_RC21Handling", "library_default"),
-        ("CP_RC23Handling", "library_default"),
-        ("CP_TransmitIndEnable", "library_default"),
-        ("CP_StartMsgIndEnable", "library_default"),
+        ("CP_RC21Handling", "link"),
+        ("CP_RC23Handling", "link"),
+        ("CP_TransmitIndEnable", "link"),
+        ("CP_StartMsgIndEnable", "link"),
         ("CP_TesterPresentHandling", "library_default"),
     ] {
         assert!(
@@ -537,6 +537,21 @@ fn assert_comm_log(setup: &CommLogSetup) {
                 .any(|param| param["name"] == name && param["set_by"] == set_by),
             "{name} {set_by} in {opened}"
         );
+    }
+    // The link turns off the API's repeat on a busy answer, and the J2534 worker takes both
+    // indications (design 8.11 "Link settings for the log").
+    let comparam = |name: &str| {
+        comparams
+            .iter()
+            .find(|param| param["name"] == name)
+            .unwrap_or_else(|| panic!("{name} in {opened}"))
+    };
+    for name in ["CP_RC21Handling", "CP_RC23Handling"] {
+        assert_eq!(comparam(name)["value"], 0, "{name} in {opened}");
+    }
+    for name in ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"] {
+        assert_eq!(comparam(name)["value"], 1, "{name} in {opened}");
+        assert_eq!(comparam(name)["accepted"], true, "{name} in {opened}");
     }
     // Whether the worker forwards pendings is not known to the agent yet.
     assert!(opened["forwards_pendings"].is_null(), "{opened}");

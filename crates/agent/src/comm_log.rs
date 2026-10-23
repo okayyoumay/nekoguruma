@@ -189,8 +189,9 @@ struct LinkOpened<'a> {
     /// Every ComParam by name: those the link sets, those the document declares, and the
     /// timing ones design 8.11 lists that neither sets, which keep the library's default.
     comparams: Vec<ComParamInForce<'a>>,
-    /// What can confirm a request's transmission on this link: nothing yet, since the link
-    /// turns no transmit indication on.
+    /// What can confirm a request's transmission on this link: nothing yet, since the agent
+    /// does not read the link's transmit indications yet, even where the library accepted
+    /// `CP_TransmitIndEnable`.
     transmit_confirmation: [&'static str; 0],
     /// Whether response times can be judged on the link: not without a transmit time.
     response_times_judged: bool,
@@ -208,6 +209,10 @@ struct ComParamInForce<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<u32>,
     set_by: SetBy,
+    /// For an indication the link turns on (`link::INDICATION_COMPARAMS`): whether the library
+    /// accepted it. A refused one leaves the link without the indication.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    accepted: Option<bool>,
 }
 
 #[derive(Serialize)]
@@ -233,14 +238,9 @@ struct TimingMargin {
 }
 
 /// The timing ComParams design 8.11 has `link_opened` name even when the link leaves them to
-/// the library. `CP_P1Max` is left out: CAN has no inter-byte time.
-const LOGGED_TIMING_COMPARAMS: [&str; 5] = [
-    "CP_RC21Handling",
-    "CP_RC23Handling",
-    "CP_TransmitIndEnable",
-    "CP_StartMsgIndEnable",
-    "CP_TesterPresentHandling",
-];
+/// the library; the link sets the others it lists. `CP_P1Max` is left out: CAN has no
+/// inter-byte time.
+const LOGGED_TIMING_COMPARAMS: [&str; 1] = ["CP_TesterPresentHandling"];
 
 /// A message the procedure logged with `diag.log`, with its level (design 8.11, ADR-348 item
 /// 6). It may hold vehicle data, so it is kept here and never in the operational log.
@@ -698,12 +698,14 @@ impl CommLog {
 
     /// Writes the `link_opened` event of the link `config` opened, as link `link` (design 8.11
     /// "Header"); `valued_by_document` names the link's own ComParams whose value the document
-    /// gave (`link::valued_by_document`). The event's `seq`; `None` once the log has failed.
+    /// gave (`link::valued_by_document`), and `indications` those of its indications the library
+    /// accepted. The event's `seq`; `None` once the log has failed.
     pub(crate) fn link_opened(
         &self,
         link: u32,
         config: &crate::link::LinkConfig,
         valued_by_document: &[&str],
+        indications: crate::link::Indications,
     ) -> Option<u64> {
         let mut comparams: Vec<ComParamInForce<'_>> = crate::link::own_comparams(config)
             .into_iter()
@@ -715,12 +717,22 @@ impl CommLog {
                 } else {
                     SetBy::Link
                 },
+                accepted: None,
             })
             .collect();
+        comparams.extend(crate::link::INDICATION_COMPARAMS.into_iter().map(|name| {
+            ComParamInForce {
+                name,
+                value: Some(1),
+                set_by: SetBy::Link,
+                accepted: Some(indications.accepted(name)),
+            }
+        }));
         comparams.extend(config.params.iter().map(|(name, value)| ComParamInForce {
             name,
             value: Some(*value),
             set_by: SetBy::Document,
+            accepted: None,
         }));
         for name in LOGGED_TIMING_COMPARAMS {
             if !comparams
@@ -731,6 +743,7 @@ impl CommLog {
                     name,
                     value: None,
                     set_by: SetBy::LibraryDefault,
+                    accepted: None,
                 });
             }
         }

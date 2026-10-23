@@ -798,6 +798,22 @@ fn a_comparam_the_profile_fixes_keeps_its_value() {
     assert!(set(&env, unum("cp_blocksize", 0)).is_err());
 }
 
+/// The agent's link turns the busy-answer repeats off and the indications on: the guard passes
+/// those values and refuses a repeat turned on, or an indication value out of range.
+#[test]
+fn the_links_busy_answer_and_indication_comparams_pass_at_the_agents_values() {
+    let env = Env::linked(profile("T3"), false);
+    for name in ["CP_RC21Handling", "CP_RC23Handling"] {
+        assert!(set(&env, unum(name, 0)).is_ok(), "{name}");
+        assert!(set(&env, unum(name, 1)).is_err(), "{name}");
+    }
+    for name in ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"] {
+        assert!(set(&env, unum(name, 0)).is_ok(), "{name}");
+        assert!(set(&env, unum(name, 1)).is_ok(), "{name}");
+        assert!(set(&env, unum(name, 2)).is_err(), "{name}");
+    }
+}
+
 #[test]
 fn timing_comparams_pass_and_ids_resolve_through_what_was_learned() {
     let mut env = Env::linked(profile("T3"), false);

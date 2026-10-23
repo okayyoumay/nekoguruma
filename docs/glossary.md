@@ -246,6 +246,9 @@ The ISO 15765-2 (ISO-TP) network-layer parameter bounding how many consecutive F
 **NumReceiveCycles** (`ComPrimitiveCtrlData.NumReceiveCycles`)  
 Governs a COP's receive phase: `0` = no response required at all — the cycle completes immediately after the write, regardless of `expected_response_array` (ADR-058); `n > 0` = exactly `n` matching responses — the `CP_P2Max` window restarting after each for a `NumSendCycles != 0` (SEND-AND-RECEIVE) COP, but for a created-receive-only (`NumSendCycles == 0`, ADR-059) COP, `CP_CyclicRespTimeout` governs it exclusively instead (ADR-182, see **Receive Only**); `-1` = **IS-CYCLIC**; `-2` = **IS-MULTIPLE**; values below `-2` are rejected (`INVALID_ARGUMENT`). See ADR-053 for `COPT_SENDRECV`'s original cycle semantics and ADR-087 for `COPT_STOPCOMM`'s optional final-message receive phase, which reuses the same field with `-1` additionally rejected.
 
+**Operational log** (agent, workers, server; design 12.2, ADR-348)  
+The `tracing` log each NGR process keeps for the developers and maintainers of NGR, to find out why NGR itself misbehaved. JSON Lines when written to a file, rotated by size with a cap, fetched by the server on request or with a failed job's result, never streamed. Its own text holds no VIN, secrets, personal data or diagnostic payloads; text taken from vendor libraries, workers or file paths, and names that may identify a person or a device, sit in a separate `external` field that leaves the device only on the device user's explicit action; and it is never evidence: not the audit log (design 8.2.3) and not the **Communication log** (design 8.11).
+
 ---
 
 ## P–R

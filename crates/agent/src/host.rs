@@ -24,8 +24,9 @@ use crate::comm_log::exchange::{
 use crate::link::{Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
 
-/// The `link` of the host's exchange entries: a job has one link (design 8.11).
-const LOG_LINK: u32 = 1;
+/// The `link` of the host's exchange entries and of the log's `link_opened`: a job has one
+/// link (design 8.11).
+pub(crate) const LOG_LINK: u32 = 1;
 
 #[derive(Debug, thiserror::Error)]
 pub enum HostError {

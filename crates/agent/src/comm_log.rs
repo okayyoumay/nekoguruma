@@ -169,7 +169,75 @@ enum Event<'a> {
     JobStart(JobStart),
     JobEnd(JobEnd<'a>),
     ProcedureLog(ProcedureLog<'a>),
+    LinkOpened(LinkOpened<'a>),
 }
+
+/// What a link the job opened has in force (design 8.11 "Header", ADR-346): written right
+/// after the link opens, before anything is sent on it.
+#[derive(Serialize)]
+struct LinkOpened<'a> {
+    link: u32,
+    /// The endpoint: roles are not bound on the agent's one link.
+    target: exchange::Target,
+    /// The physical channel the link shares with any other link of the job: the agent opens
+    /// one link per job, on the worker's one module.
+    channel: u32,
+    protocol: &'a str,
+    baud_rate: u32,
+    request_id: u32,
+    response_id: u32,
+    /// Every ComParam by name: those the link sets, those the document declares, and the
+    /// timing ones design 8.11 lists that neither sets, which keep the library's default.
+    comparams: Vec<ComParamInForce<'a>>,
+    /// What can confirm a request's transmission on this link: nothing yet, since the link
+    /// turns no transmit indication on.
+    transmit_confirmation: [&'static str; 0],
+    /// Whether response times can be judged on the link: not without a transmit time.
+    response_times_judged: bool,
+    /// Whether the worker passes each response pending on: the VCI absorbs them
+    /// (`CP_RC78Handling` 1), so the log sees none.
+    forwards_pendings: bool,
+    timing_margin: TimingMargin,
+}
+
+#[derive(Serialize)]
+struct ComParamInForce<'a> {
+    name: &'a str,
+    /// The value set, absent when it keeps the library's default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<u32>,
+    set_by: SetBy,
+}
+
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum SetBy {
+    /// The agent's link sets it (`crate::link`).
+    Link,
+    /// The document declares it (ADR-324 item 3).
+    Document,
+    /// Neither sets it: the library's default is in force, and the log does not know it.
+    LibraryDefault,
+}
+
+/// The timing margin in use and where it came from: none is configured yet, so no time is
+/// compared with a limit beyond one.
+#[derive(Serialize)]
+struct TimingMargin {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    ms: Option<u32>,
+    source: &'static str,
+}
+
+/// The timing ComParams design 8.11 has `link_opened` name even when the link leaves them to
+/// the library. `CP_P1Max` is left out: CAN has no inter-byte time.
+const LOGGED_TIMING_COMPARAMS: [&str; 5] = [
+    "CP_RC21Handling",
+    "CP_RC23Handling",
+    "CP_TransmitIndEnable",
+    "CP_StartMsgIndEnable",
+    "CP_TesterPresentHandling",
+];
 
 /// A message the procedure logged with `diag.log`, with its level (design 8.11, ADR-348 item
 /// 6). It may hold vehicle data, so it is kept here and never in the operational log.
@@ -623,6 +691,59 @@ impl CommLog {
             }
         }
         Some(seq)
+    }
+
+    /// Writes the `link_opened` event of the link `config` opened, as link `link` (design 8.11
+    /// "Header"). The event's `seq`; `None` once the log has failed.
+    pub(crate) fn link_opened(&self, link: u32, config: &crate::link::LinkConfig) -> Option<u64> {
+        let mut comparams: Vec<ComParamInForce<'_>> = crate::link::own_comparams(config)
+            .into_iter()
+            .map(|(name, value)| ComParamInForce {
+                name,
+                value: Some(value),
+                set_by: SetBy::Link,
+            })
+            .collect();
+        comparams.extend(config.params.iter().map(|(name, value)| ComParamInForce {
+            name,
+            value: Some(*value),
+            set_by: SetBy::Document,
+        }));
+        for name in LOGGED_TIMING_COMPARAMS {
+            if !comparams
+                .iter()
+                .any(|param| param.name.eq_ignore_ascii_case(name))
+            {
+                comparams.push(ComParamInForce {
+                    name,
+                    value: None,
+                    set_by: SetBy::LibraryDefault,
+                });
+            }
+        }
+        let event = Event::LinkOpened(LinkOpened {
+            link,
+            target: exchange::Target::Endpoint {
+                link,
+                tx_id: config.tx_id,
+                rx_id: config.rx_id,
+            },
+            channel: 1,
+            protocol: &config.protocol_short_name,
+            baud_rate: config.baud_rate,
+            request_id: config.tx_id,
+            response_id: config.rx_id,
+            comparams,
+            transmit_confirmation: [],
+            response_times_judged: false,
+            forwards_pendings: false,
+            timing_margin: TimingMargin {
+                ms: None,
+                source: "none",
+            },
+        });
+        let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
     /// Writes a `diag.log` message as a `procedure_log` event (design 8.11, ADR-348 item 6).

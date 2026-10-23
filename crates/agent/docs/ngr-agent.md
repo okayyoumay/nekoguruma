@@ -297,7 +297,14 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   Each run writes `job_start` (the agent's version, `run`: `first`, `resume`, or `plain_start`
   for a resume that finds no journal, and whether the job writes) and, when it ends,
   `job_end` with the outcome (`ok` or the `JobError` variant's name). A reopen writes
-  `agent_clock` first, a new reading that starts a new agent epoch. A `diag.log` message is a
+  `agent_clock` first, a new reading that starts a new agent epoch. Right after the link opens,
+  before anything is sent on it, the run writes `link_opened`: the link, its endpoint and
+  channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
+  and `set_by` (`link` for those `agent::link` sets, `document` for those the document declares,
+  `library_default` without a value for the timing ComParams design 8.11 lists that neither
+  sets), with no transmit-confirmation source, response times not judged, pendings not
+  forwarded and no timing margin (`source` `none`), since the link turns none of those on yet.
+  A `diag.log` message is a
   `procedure_log` event with its `level` and `message`; the operational log (`tracing`) records
   only that the procedure logged one, with its level.
 - **Clean close and reopen.** A log was closed cleanly when it holds its header and its last

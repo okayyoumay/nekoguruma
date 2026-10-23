@@ -288,6 +288,24 @@ fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
 }
 
 /// `ms` is at most [`MAX_TIMING_MS`] after [`LinkConfig::validate`].
+/// The ComParams the link sets itself, by name, before those the document declares; the
+/// identifiers go into the response ID table instead. The communication log's `link_opened`
+/// names the same (design 8.11).
+pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 6] {
+    [
+        ("CP_Baudrate", config.baud_rate),
+        ("CP_P2Max", micros(config.p2_max_ms)),
+        ("CP_P2Star", micros(config.p2_star_ms)),
+        ("CP_RC78Handling", 1),
+        // The worker finds a response pending only at this offset.
+        ("CP_RCByteOffset", RC_BYTE_OFFSET),
+        (
+            "CP_RC78CompletionTimeout",
+            micros(config.rc78_completion_ms),
+        ),
+    ]
+}
+
 fn micros(ms: u32) -> u32 {
     ms.saturating_mul(1_000)
 }
@@ -586,18 +604,7 @@ async fn set_up_link<C: WorkerApi>(
     deadline: Duration,
     cll_handle: ComLogicalLinkHandle,
 ) -> Result<Streaming<EventNotification>, HostError> {
-    let own = [
-        ("CP_Baudrate", config.baud_rate),
-        ("CP_P2Max", micros(config.p2_max_ms)),
-        ("CP_P2Star", micros(config.p2_star_ms)),
-        ("CP_RC78Handling", 1),
-        // The worker finds a response pending only at this offset.
-        ("CP_RCByteOffset", RC_BYTE_OFFSET),
-        (
-            "CP_RC78CompletionTimeout",
-            micros(config.rc78_completion_ms),
-        ),
-    ];
+    let own = own_comparams(config);
     let declared = config
         .params
         .iter()

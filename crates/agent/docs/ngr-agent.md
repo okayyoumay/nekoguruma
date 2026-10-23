@@ -300,8 +300,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   the run before it: damage further back was reported by the run that found it. A reopen cuts a
   torn last line, goes on after the largest `seq` the file holds, so numbering never goes back,
   and starts the epoch after the largest the file holds; when the close was not clean, its
-  `agent_clock` is marked incomplete. A file that holds no header gets one, marked incomplete,
-  after whatever it holds, and so does a resume that finds no log, since the job ran before. A
+  `agent_clock` is marked incomplete. A file that holds no header (an empty one an earlier run
+  created included) gets one, marked incomplete, after whatever it holds, and so does a resume that finds no log, since the job ran before. A
   file whose `seq` or epoch has no successor is not opened (`NotOpened` with `InvalidData`). A
   new or empty file's directory is synced, as the journal's is, so its name survives a power
   loss, and on Unix a new log file is its owner's alone (mode 0600).

@@ -370,12 +370,19 @@ impl CommLog {
         ));
         let lock = WriterLock::at(&lock_path).map_err(kind)?;
         let mut options = OpenOptions::new();
-        options.read(true).write(true).create(true).truncate(false);
+        options.read(true).write(true);
         // The log holds the vehicle's data: on Unix a new one is its owner's alone. A file that
         // exists keeps its mode.
         #[cfg(unix)]
         std::os::unix::fs::OpenOptionsExt::mode(&mut options, 0o600);
-        let mut file = options.open(&path).map_err(|error| error.kind())?;
+        // Created here, or found: an empty file found is a run that stopped before its header.
+        let (mut file, created) = match options.clone().create_new(true).open(&path) {
+            Ok(file) => (file, true),
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+                (options.open(&path).map_err(|error| error.kind())?, false)
+            }
+            Err(error) => return Err(error.kind()),
+        };
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).map_err(|error| error.kind())?;
         if bytes.is_empty() {
@@ -383,7 +390,8 @@ impl CommLog {
             // empty file may be one whose earlier sync failed, so it is synced again.
             sync_dir(&setup.dir).map_err(|error| error.kind())?;
         }
-        let scan = scan(&bytes).ok_or(io::ErrorKind::InvalidData)?;
+        let mut scan = scan(&bytes).ok_or(io::ErrorKind::InvalidData)?;
+        scan.found_empty = !created && bytes.is_empty();
         let io_kind = |error: io::Error| error.kind();
         if scan.complete_len < bytes.len() {
             tracing::warn!(
@@ -411,6 +419,7 @@ impl CommLog {
             next_seq: scan.next_seq,
             failed: None,
             unclean: scan.torn
+                || scan.found_empty
                 || (scan.complete_len > 0 && !(scan.header && scan.consistent && scan.clean_close)),
             // One more than any epoch the file holds, so two agents never share one.
             epoch: scan.next_epoch,
@@ -596,6 +605,8 @@ struct Scan {
     next_epoch: u64,
     /// The last of them is a `job_end`.
     clean_close: bool,
+    /// The file was there, empty: an earlier run created it and stopped before its header.
+    found_empty: bool,
 }
 
 /// Reads an existing log. `None` when it holds a `seq` or an epoch with no successor, which
@@ -1217,6 +1228,34 @@ mod tests {
             log.status(),
             CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen)
         );
+    }
+
+    #[test]
+    fn an_empty_log_an_earlier_run_left_is_an_unclean_reopen() {
+        let dir = dir();
+        let setup = setup(&dir);
+        // A run that created the file and stopped before its header.
+        std::fs::write(setup.path().unwrap(), b"").unwrap();
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.end("ok");
+        assert_eq!(
+            log.status(),
+            CommLogStatus::Incomplete(CommLogIncomplete::UncleanReopen)
+        );
+        drop(log);
+        let text = std::fs::read_to_string(setup.path().unwrap()).unwrap();
+        let header: serde_json::Value = serde_json::from_str(text.lines().next().unwrap()).unwrap();
+        assert_eq!(header["event"], "header");
+        assert_eq!(header["clock"]["incomplete"], true);
+        // A file this open creates is a clean start.
+        std::fs::remove_file(setup.path().unwrap()).unwrap();
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.end("ok");
+        assert_eq!(log.status(), CommLogStatus::Complete);
+        drop(log);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[cfg(unix)]

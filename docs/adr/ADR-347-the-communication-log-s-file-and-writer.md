@@ -59,7 +59,8 @@ resume opens its journal before the link.
    back, and writes `agent_clock`, a new reading of the agent's clocks that starts a new agent
    epoch, one more than any epoch the file holds (design 8.11). When the close was not clean, the reopen marks `agent_clock` incomplete
    and the run's status is incomplete, even if the rest of the run writes cleanly. A file that
-   holds no header gets one after whatever it holds, marked incomplete, and so does a resume
+   holds no header (an empty one an earlier run created included: the open tells a file it
+   creates from one it finds) gets one after whatever it holds, marked incomplete, and so does a resume
    that finds no log, since the job ran before; a later run of it writes `agent_clock`. A file whose `seq` or epoch has no
    successor is not opened, and a log that reaches the last `seq` stops rather than wrap. A new
    (or still empty) file's directory is synced, as the journal's is, so its name survives a

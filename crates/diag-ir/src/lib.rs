@@ -519,6 +519,10 @@ pub trait DiagHost {
     /// [`StepError::Host`] with the state untouched, so the step can be repeated (ADR-338).
     fn runtime_input(&mut self, input: RuntimeInput) -> Result<i64, Self::Error>;
     fn log(&mut self, level: u8, message: &str);
+    /// Records an ECU identity value the agent's job runner read from a source the program
+    /// declares (the communication log's `identity` event, design 8.11). The VM never calls it;
+    /// a host that keeps no such record ignores it.
+    fn note_identity(&mut self, _kind: IdentityKind, _read: IdentityRead<'_>) {}
 }
 
 // ---------------------------------------------------------------- VM

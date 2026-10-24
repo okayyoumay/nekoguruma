@@ -1407,6 +1407,14 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
             log.procedure_log(level, message);
         }
     }
+
+    // An identity value the runner read goes to the communication log as it is read (design
+    // 8.11 "Header"); it is vehicle data, so never to the operational log.
+    fn note_identity(&mut self, kind: diag_ir::IdentityKind, read: diag_ir::IdentityRead<'_>) {
+        if let Some(log) = &self.comm_log {
+            log.identity(kind, read);
+        }
+    }
 }
 
 /// The integer a runtime-input reading gives `ReadInput`: anything else (no source, an

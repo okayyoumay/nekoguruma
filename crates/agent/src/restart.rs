@@ -43,7 +43,7 @@ use diag_ir::{
 
 use crate::host::{HostError, OwnRead, ProcedurePosition};
 use crate::inputs::{FieldBytes, Reading, RuntimeInputs, ServiceSources};
-use crate::inputs::{read_field_bytes, resolve_source};
+use crate::inputs::{read_identity_bytes, resolve_identity, resolve_source};
 use crate::journal::Vin;
 use crate::journal::{
     Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, StoppedRun, Store,
@@ -770,7 +770,9 @@ where
         return passive(PassiveReason::VinNotEstablished);
     };
     let target = target_vin.as_str();
-    match cancellable(cancelled, || resolve_source(source, sources, host))? {
+    match cancellable(cancelled, || {
+        resolve_identity(IdentityKind::Vin, source, sources, host)
+    })? {
         Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) && text == target => {
             // The vehicle is identified: take its lock before any further ECU request
             // (design 8.2.5, 8.8; ADR-263).
@@ -799,7 +801,9 @@ where
     ) else {
         return passive(PassiveReason::HardwareIdentityNotEstablished);
     };
-    match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
+    match cancellable(cancelled, || {
+        read_identity_bytes(IdentityKind::HardwarePartNumber, source, sources, host)
+    })? {
         Ok(FieldBytes::Field(bytes)) if bytes == recorded => {}
         Ok(FieldBytes::Field(_)) => return passive(PassiveReason::HardwareIdentityDiffers),
         Ok(_) => return passive(PassiveReason::HardwareIdentityNotEstablished),
@@ -887,7 +891,9 @@ where
         return not_established(IdentityKind::Vin);
     };
     let target = target_vin.as_str();
-    match cancellable(cancelled, || resolve_source(source, sources, host))? {
+    match cancellable(cancelled, || {
+        resolve_identity(IdentityKind::Vin, source, sources, host)
+    })? {
         Ok(Reading::Text(text)) if Vin::is_well_formed_text(&text) && text == target => {
             promote(target_vin)?;
         }
@@ -914,7 +920,9 @@ where
     ) else {
         return not_established(IdentityKind::HardwarePartNumber);
     };
-    match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
+    match cancellable(cancelled, || {
+        read_identity_bytes(IdentityKind::HardwarePartNumber, source, sources, host)
+    })? {
         Ok(FieldBytes::Field(bytes)) if bytes == recorded => Ok(()),
         Ok(FieldBytes::Field(_)) => Err(JobError::IdentityMismatch {
             identity: IdentityKind::HardwarePartNumber,
@@ -971,7 +979,9 @@ where
     ) else {
         return not_established();
     };
-    match cancellable(cancelled, || resolve_source(source, sources, host))? {
+    match cancellable(cancelled, || {
+        resolve_identity(IdentityKind::Vin, source, sources, host)
+    })? {
         Ok(Reading::Text(text))
             if Vin::is_well_formed_text(&text) && text == target_vin.as_str() =>
         {
@@ -1058,7 +1068,9 @@ where
             // Not before the first read, and not after the last: only between reads.
             wait_quietly(poll, poll, cancelled)?;
         }
-        match cancellable(cancelled, || read_field_bytes(source, sources, host))? {
+        match cancellable(cancelled, || {
+            read_identity_bytes(IdentityKind::SoftwareVersion, source, sources, host)
+        })? {
             Ok(FieldBytes::Field(bytes)) => {
                 let version = Some(bytes.as_slice());
                 return if version == facts.intended_software_version.as_deref() {

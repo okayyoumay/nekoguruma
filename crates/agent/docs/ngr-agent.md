@@ -334,7 +334,17 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   for a resume that finds no journal, and whether the job writes) and, when it ends,
   `job_end` with the outcome (`ok` or the `JobError` variant's name). A reopen writes
   `agent_clock` first, a new reading that starts a new agent epoch. Right after the link opens,
-  before anything is sent on it, the run writes `link_opened`: the link, its endpoint and
+  before anything is sent on it, the run writes `vci_connected`, then `link_opened`.
+  `vci_connected` names the API (`dpdu` or `j2534_0404`) when the job was told it
+  (`Job::with_vci`, which `ngr-agent run` sets from the worker it launched), the `unsigned long`
+  width of a J2534 worker, and the module's version data, which the link reads with
+  `GetVersion` in every build (`null` when the worker gives none):
+  - a D-PDU module's vendor, hardware name, serial number and version, firmware name and
+    version, and API library name and version;
+  - a J2534 worker's firmware, library and API versions only, which is all v04.04 gives.
+
+  Its `drift_bound` and `clock_margin` have `source` `none`, since neither is configured yet.
+  `link_opened` then gives the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those
   whose value the document gives, declared or the baud rate and a declared timing,
@@ -346,7 +356,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   margin (`source` `none`), since the agent does not read the indications yet, and
   `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
   the agent does not know it yet.
-  A `diag.log` message is a
+  Each ECU identity value the runner reads from a source the program declares (the hardware
+  part number and software version a write job records at its plan's entry, and the VIN,
+  hardware identity and software version a restart checks) is an `identity` event as it is
+  read. It has the `kind`, an `outcome` (`value`, `negative_response` with its `nrc`, or
+  `unreadable`), and the value as `text` when it is printable ASCII, else as `hex`. A read
+  whose request failed writes none; its exchange entry says why. A `diag.log` message is a
   `procedure_log` event with its `level` and `message`; the operational log (`tracing`) records
   only that the procedure logged one, with its level.
 - **Clean close and reopen.** A log was closed cleanly when it holds its header and its last

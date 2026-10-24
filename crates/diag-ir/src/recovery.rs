@@ -76,6 +76,18 @@ pub enum IdentityKind {
     SoftwareVersion,
 }
 
+/// What the agent's job runner read for an [`IdentityKind`] from the source a program declares,
+/// as [`DiagHost::note_identity`](crate::DiagHost::note_identity) passes it on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IdentityRead<'a> {
+    /// The field's bytes.
+    Value(&'a [u8]),
+    /// A negative response, with its response code.
+    Negative(u8),
+    /// No value: an answer that carries no field that decodes.
+    Unreadable,
+}
+
 /// The diagnostic session a precondition source is valid in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

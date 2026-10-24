@@ -13,7 +13,9 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::journal::JobKey;
 use agent::launch::{Api, launch_worker};
 use agent::policy::build_ceiling;
-use agent::{CommLogSetup, Job, JobDocument, JobLimits, JobRun, check_job, run_key, run_program};
+use agent::{
+    CommLogSetup, Job, JobDocument, JobLimits, JobRun, VciFacts, check_job, run_key, run_program,
+};
 use diag_ir::{Value, VmState};
 use tracing::Instrument;
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
@@ -324,6 +326,11 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
     )
     .await
     .map_err(|error| error.to_string())?;
+    // The communication log's `vci_connected` names the API and the width (design 8.11).
+    let job = job.with_vci(VciFacts {
+        api: args.api,
+        long_size: worker.long_size,
+    });
     let JobRun {
         result,
         mut guards,

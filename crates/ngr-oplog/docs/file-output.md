@@ -25,7 +25,9 @@ When `RotatingFile::open` fails (`OpenError`), the caller logs to stderr with a 
 - the directory cannot be created;
 - the file cannot be opened;
 - the file cannot be made private;
-- the path is not a regular file (a symbolic link is refused).
+- the path is not a regular file. The open itself does not follow a symbolic link (Unix) or a
+  reparse point (Windows), so one put in place after the check is refused too, and a FIFO does
+  not block it.
 
 ## Entries
 
@@ -48,7 +50,8 @@ A field recorded as an integer, a float or a boolean is written as a JSON number
 A NaN or an infinite float is written as text. Every other field is written as a string: a
 `%` field as its `Display` text, a `?` field as its `Debug` text.
 
-A span's fields are those it was created with and any recorded on it later.
+A span's fields are those it was created with and any recorded on it later; a span field named
+`message` is one of its `fields`. A span object's keys are sorted.
 
 JSON escapes every control character in a string, so a value never breaks the line. The
 `external` field's text is escaped by its caller as well (`vci_service_config::External`,
@@ -60,7 +63,8 @@ JSON escapes every control character in a string, so a value never breaks the li
 
 - the path, for example `logs/agent.log`;
 - the size limit, `max_bytes`, 10 MiB by default;
-- the number of rotated files kept, `max_files`, 5 by default.
+- the number of rotated files kept, `max_files`, 5 by default and at most 100 (a larger value
+  counts as 100, since each rotation renames every rotated file while the log waits).
 
 Before an entry that would take a non-empty file past the limit, the file is rotated:
 
@@ -70,16 +74,27 @@ Before an entry that would take a non-empty file past the limit, the file is rot
 4. a new empty file is started.
 
 An entry is never split. An entry larger than the limit goes whole into an empty file. With
-`max_files` at 0 the file is deleted and started again. One process's log therefore takes at
+`max_files` at 0 the file is emptied and started again. One process's log therefore takes at
 most about `(max_files + 1) × max_bytes`, about 60 MiB by default.
 
-A reopened file is appended to, and its length counts toward the limit.
+A reopened file is appended to, and its length counts toward the limit. A file whose last line
+has no end (a crash in the middle of an entry) is ended with a line break first, and so is an
+entry whose write failed part of the way, so the next entry always starts a line of its own.
+
+A rotation never stops the log:
+- each step is tried even when an earlier one failed, for example a rotated file another process
+  holds open, or one that cannot be deleted;
+- a current file that cannot be renamed is emptied instead. Where the OS refuses that too (a
+  Windows handle that may only append), it keeps growing, by the limit each time it is reached;
+- when the new file cannot be opened, entries go on to the renamed one, which is rotated again at
+  the limit;
+- the entry that started the rotation is written in every case.
 
 ## Permissions
 
 | | Unix | Windows |
 |---|---|---|
-| A directory the writer creates (each missing one, its parents included) | `0700` | an access list, protected from inheritance, allowing only the owner and the Administrators group, inherited by what is created in it |
+| A directory the writer creates (each missing one, its parents included) | `0700` | an access list, protected from inheritance, allowing only the owner, SYSTEM and the Administrators group, inherited by what is created in it; a directory that cannot be given it is removed again |
 | The file | `0600`; an existing file with wider access is narrowed when it is opened | the same access list, set each time the file is opened |
 | An existing directory | left as it is: the installation may have prepared it, or a configured path may name a shared one | left as it is |
 

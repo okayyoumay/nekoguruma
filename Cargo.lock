@@ -1572,6 +1572,7 @@ dependencies = [
 name = "ngr-oplog"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde_json",
  "tempfile",
  "tracing",

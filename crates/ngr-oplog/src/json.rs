@@ -23,11 +23,12 @@ const EXTERNAL: &str = "external";
 /// ```json
 /// {"timestamp":"2026-10-24T06:40:07.123456Z","level":"WARN","target":"agent::runner",
 ///  "process":"agent","message":"could not close the link","fields":{"error":"..."},
-///  "external":"...","spans":[{"name":"job","fields":{"job_id":"..."},"external":"..."}]}
+///  "external":"...","spans":[{"external":"...","fields":{"job_id":"..."},"name":"job"}]}
 /// ```
 ///
-/// (one line in the file). `fields`, `external` and `spans` are left out when empty, and a
-/// span's `fields` and `external` likewise. A value recorded as a number or a boolean is written
+/// (one line in the file). The entry's keys come in this order; a span's are sorted. `fields`,
+/// `external` and `spans` are left out when empty, and a span's `fields` and `external`
+/// likewise. A value recorded as a number or a boolean is written
 /// as one; everything else as a string. A failed write is dropped: the log cannot report its own
 /// failure.
 #[derive(Debug)]
@@ -120,7 +121,9 @@ where
         if let Some(span) = ctx.span(id) {
             let mut fields = Fields::default();
             attrs.record(&mut fields);
-            span.extensions_mut().insert(fields);
+            // `replace`, not `insert`, which would panic on a span another `JsonLayer` in the same
+            // registry has already given its fields.
+            span.extensions_mut().replace(fields);
         }
     }
 
@@ -169,9 +172,12 @@ impl Fields {
         }
     }
 
-    /// Adds `fields` and `external` to `object` when they are not empty; a span's message, which
-    /// a span cannot have, is ignored.
-    fn into_entry(self, object: &mut Map<String, Value>) {
+    /// Adds `fields` and `external` to `object` when they are not empty. An event's message has
+    /// been taken out by then; a span's field named `message` goes into its `fields`.
+    fn into_entry(mut self, object: &mut Map<String, Value>) {
+        if let Some(message) = self.message.take() {
+            self.values.insert("message".to_owned(), message.into());
+        }
         if !self.values.is_empty() {
             object.insert("fields".into(), Value::Object(self.values));
         }
@@ -316,6 +322,30 @@ mod tests {
         let outside = entries[1].as_object().unwrap();
         for key in ["fields", "external", "spans"] {
             assert!(!outside.contains_key(key), "{outside:?}");
+        }
+    }
+
+    /// A span field named `message` is kept in its fields, and a second `JsonLayer` in the same
+    /// registry does not panic on a new span.
+    #[test]
+    fn a_span_s_message_field_is_kept_and_two_layers_can_share_a_registry() {
+        let temp = tempfile::tempdir().unwrap();
+        let open =
+            |name: &str| RotatingFile::open(FileSettings::new(temp.path().join(name))).unwrap();
+        let subscriber = tracing_subscriber::registry()
+            .with(JsonLayer::new("agent", open("a.log")))
+            .with(JsonLayer::new("agent", open("b.log")));
+        tracing::subscriber::with_default(subscriber, || {
+            tracing::info_span!("job", message = "span text").in_scope(|| tracing::info!("in"));
+        });
+        for name in ["a.log", "b.log"] {
+            let text = std::fs::read_to_string(temp.path().join(name)).unwrap();
+            let entry: Value = serde_json::from_str(text.trim_end()).unwrap();
+            assert_eq!(
+                entry["spans"],
+                serde_json::json!([{"name": "job", "fields": {"message": "span text"}}])
+            );
+            assert_eq!(entry["message"], "in");
         }
     }
 

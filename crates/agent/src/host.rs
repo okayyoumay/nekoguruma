@@ -917,6 +917,40 @@ fn host_error_name(error: &HostError) -> &'static str {
     }
 }
 
+impl crate::oplog::LogSafe for HostError {
+    /// The error's text without the response bytes some variants print (an NRC is kept), and
+    /// with a failed RPC's status as its code: the status message is the worker's text.
+    fn log_text(&self) -> String {
+        match self {
+            HostError::Rpc { rpc, status } => {
+                format!("{rpc} failed: {}", grpc_code_name(status.code()))
+            }
+            HostError::TransferRefused { block, response } => match response.as_slice() {
+                [0x7F, _, nrc] => {
+                    format!("the ECU refused TransferData block {block} with NRC {nrc:#04x}")
+                }
+                _ => format!("the ECU refused TransferData block {block}"),
+            },
+            HostError::TransferEchoMismatch { block, counter, .. } => format!(
+                "the ECU's TransferData response to block {block} (counter {counter:#04x}) is wrong"
+            ),
+            HostError::NoBlockLength { block, .. } => format!(
+                "the ECU's RequestDownload response has no readable maxNumberOfBlockLength, so TransferData block {block} is not sent (ADR-336)"
+            ),
+            other => other.to_string(),
+        }
+    }
+
+    fn log_external(&self) -> Option<crate::oplog::ExternalField> {
+        match self {
+            HostError::Rpc { status, .. } if !status.message().is_empty() => {
+                Some(crate::oplog::external(status.message()))
+            }
+            _ => None,
+        }
+    }
+}
+
 /// The name of a gRPC status code, as `detail` carries it.
 fn grpc_code_name(code: tonic::Code) -> &'static str {
     match code {

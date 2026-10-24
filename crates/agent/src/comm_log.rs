@@ -526,7 +526,7 @@ impl CommLog {
         let io_kind = |error: io::Error| error.kind();
         if scan.complete_len < bytes.len() {
             tracing::warn!(
-                path = %path.display(),
+                external = %crate::oplog::External(path.display()),
                 cut = bytes.len() - scan.complete_len,
                 "communication log ends in a line that was not finished; cutting it off"
             );

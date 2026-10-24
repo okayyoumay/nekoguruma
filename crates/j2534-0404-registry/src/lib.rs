@@ -222,16 +222,19 @@ pub fn find_j2534_device_on_registry(
     device_name: &str,
     mode: RegistryViewMode,
 ) -> Result<J2534DeviceInfo, RegistryError> {
-    debug!(device_name, ?mode, "looking up J2534 device in registry");
+    // A device's name is the vendor's and may name the device, and a library path may name a
+    // user's directory, so both go in `external`, escaped by `Debug` (ADR-348 item 6).
+    debug!(
+        ?mode,
+        external = ?device_name,
+        "looking up J2534 device in registry"
+    );
     let result = enumerate_j2534_devices(mode)?
         .into_iter()
         .find(|d| d.device_name == device_name)
         .ok_or_else(|| RegistryError::NotFound(device_name.to_owned()));
     if let Err(RegistryError::NotFound(ref name)) = result {
-        warn!(
-            device_name = name.as_str(),
-            "J2534 device not found in registry"
-        );
+        warn!(external = ?name, "J2534 device not found in registry");
     }
     result
 }
@@ -272,12 +275,15 @@ fn enumerate_devices_impl(mode: RegistryViewMode) -> Result<Vec<J2534DeviceInfo>
             let raw = raw.trim().to_owned();
             if raw.is_empty() {
                 debug!(
-                    device_name,
+                    external = ?device_name,
                     "skipping J2534 device: FunctionLibrary is empty"
                 );
                 return None;
             }
-            debug!(device_name, library_path = raw, "found J2534 device");
+            debug!(
+                external = ?format!("{device_name}: {raw}"),
+                "found J2534 device"
+            );
             Some(J2534DeviceInfo {
                 device_name,
                 library_path: PathBuf::from(raw),

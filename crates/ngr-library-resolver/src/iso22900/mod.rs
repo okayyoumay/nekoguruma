@@ -20,6 +20,7 @@ use std::{
 };
 
 use tracing::warn;
+use vci_service_config::External;
 
 use crate::RegistryView;
 
@@ -451,10 +452,15 @@ pub fn resolve_in_root_file(root_file: &Path, name: &str) -> Result<Resolved, Re
         .into_iter()
         .partition(|e| e.short_name.as_deref() == Some(name));
     for entry in &other {
+        // The file's path, the entry's name and the error (which quotes the entry's URIs)
+        // are text NGR does not write, so they go in `external` (ADR-348 item 6).
         warn!(
-            file = %root_file.display(),
-            short_name = entry.short_name.as_deref().unwrap_or(""),
-            error = %entry.error,
+            external = %External(format!(
+                "file {}, entry {:?}: {}",
+                root_file.display(),
+                entry.short_name.as_deref().unwrap_or(""),
+                entry.error
+            )),
             "skipping unusable D-PDU API entry"
         );
     }
@@ -487,9 +493,11 @@ pub fn resolve_in_root_file(root_file: &Path, name: &str) -> Result<Resolved, Re
             ] {
                 if file.is_none() {
                     warn!(
-                        file = %root_file.display(),
-                        short_name = name,
                         element,
+                        external = %External(format!(
+                            "file {}, entry {name:?}",
+                            root_file.display()
+                        )),
                         "D-PDU API entry lacks an element the root file schema requires"
                     );
                 }
@@ -534,7 +542,10 @@ fn root_file_path_or(
     override_file: Option<PathBuf>,
 ) -> Result<Option<PathBuf>, ResolveError> {
     if let Some(file) = override_file {
-        tracing::debug!(file = %file.display(), "using the debug root description file, not the registry");
+        tracing::debug!(
+            external = %External(file.display()),
+            "using the debug root description file, not the registry"
+        );
         return Ok(Some(file));
     }
     {

@@ -9,6 +9,13 @@
 //! Extracted from `vci-service-launcher` (see ADR-033) so it can be reused
 //! by consumers, such as `vci-service-manager`, that do not want the rest of
 //! `vci-service-launcher`'s gRPC/JSON-RPC bootstrap machinery.
+//!
+//! [`External`] escapes the text an operational log entry carries in its `external` field
+//! (design 12.2, ADR-348 item 6).
+
+mod external;
+
+pub use external::External;
 
 use std::{
     collections::HashMap,

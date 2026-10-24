@@ -93,7 +93,8 @@ with that `Name`.
 - Results of `read_definitions` and the file list of `Ambiguous` are sorted by file path.
 - An invalid file (non-regular file, over the size cap, other validation failures, relative `FunctionLibrary` or search path, empty `Name`, protocol value other
   than 0 or 1, `LongSize` other than 4 or 8, unknown or mistyped key, unreadable file) is skipped
-  and logged at warn level with its path and reason. `read_definitions` returns the invalid
+  and logged at warn level with its path and reason, both in the entry's `external` field (ADR-348
+  item 6). `read_definitions` returns the invalid
   files with their `DefinitionError` for callers that want to report them.
 - A missing directory counts as empty (`NotFound` on resolve); a directory that exists but cannot
   be listed is `ResolveError::Io`.
@@ -199,7 +200,8 @@ resolving an entry that lacks one logs a warning for that entry.
 
 - `NoRootFile`: no registry value, or the root file does not exist. Distinct from `NotFound`.
 - `NotFound`: no entry has the name; it carries the number of unusable entries skipped, so a
-  typo in an entry is visible. Each skipped entry is logged at warn level.
+  typo in an entry is visible. Each skipped entry is logged at warn level, with the root file's
+  path, the entry's name and the error in the entry's `external` field (ADR-348 item 6).
 - `Ambiguous`: more than one entry has the name (an unusable one counts); none is picked.
 - `InvalidEntry`: the one entry with the name is refused, with an `EntryError`: `MissingShortName`,
   `NestedShortName`, `MissingLibrary`, `Duplicate`, `InvalidUri`, `RemoteHost` or `RelativePath`

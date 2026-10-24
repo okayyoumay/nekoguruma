@@ -17,6 +17,7 @@ diag-ir.workspace = true
 worker-host.workspace = true
 j2534-0404-registry.workspace = true
 ngr-library-resolver.workspace = true
+vci-service-config.workspace = true
 vci-service-interface.workspace = true
 tokio.workspace = true
 tonic = "0.14.6"

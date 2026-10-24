@@ -97,6 +97,36 @@ pub enum GuardError {
     NotAVehicleFile,
 }
 
+impl crate::oplog::LogSafe for GuardError {
+    /// The error's text without the VCI name or the path some variants print, which go in the
+    /// `external` field (ADR-348 item 6).
+    fn log_text(&self) -> String {
+        match self {
+            GuardError::InvalidVci(_) => {
+                format!("the VCI name cannot name a lock: it must have 1 to {MAX_VCI_NAME} bytes")
+            }
+            GuardError::UnsafeDir(_) => "the lock directory lets other users delete or replace \
+                                         lock files"
+                .to_owned(),
+            GuardError::UnlistableDir(_) => {
+                "the lock directory may be written but not listed by other users".to_owned()
+            }
+            GuardError::NotAFile(_) => "a lock file is not a regular file".to_owned(),
+            other => other.to_string(),
+        }
+    }
+
+    fn log_external(&self) -> Option<crate::oplog::ExternalField> {
+        match self {
+            GuardError::InvalidVci(name) => Some(crate::oplog::external(name)),
+            GuardError::UnsafeDir(path)
+            | GuardError::UnlistableDir(path)
+            | GuardError::NotAFile(path) => Some(crate::oplog::external(path.display())),
+            _ => None,
+        }
+    }
+}
+
 /// How many vehicle lock files a lock directory has (ADR-262).
 const VEHICLE_BUCKETS: u32 = 0x1000;
 

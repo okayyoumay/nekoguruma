@@ -35,6 +35,7 @@ use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
 use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
+use crate::oplog::LogSafe;
 use crate::policy::{self, Permission};
 use crate::restart::{self, OnSiteReason, RestartDecision};
 
@@ -325,6 +326,59 @@ pub enum JobError {
     NoCommLogDir,
 }
 
+impl crate::oplog::LogSafe for JobError {
+    /// The error's text, with a nested error's as [`LogSafe`](crate::oplog::LogSafe) gives
+    /// it, and a procedure failure's code but not its detail (ADR-348 item 6).
+    fn log_text(&self) -> String {
+        use crate::oplog::vm_error_text;
+        match self {
+            JobError::Link(source) => format!("link: {}", source.log_text()),
+            JobError::Vm { pc, source } => {
+                format!("procedure failed at {pc}: {}", vm_error_text(source))
+            }
+            JobError::Host { pc, source } => {
+                format!("primitive failed at {pc}: {}", source.log_text())
+            }
+            JobError::Refused { pc, source } => {
+                format!("instruction {pc} is refused: {}", source.log_text())
+            }
+            JobError::IdentityRead {
+                pc,
+                identity,
+                source,
+            } => format!(
+                "reading the ECU's {identity:?} at {pc} failed: {}",
+                source.log_text()
+            ),
+            JobError::Undeclared { pc, source } => format!(
+                "instruction {pc} decodes a field the job's document does not declare: {}",
+                vm_error_text(source)
+            ),
+            JobError::ProcedureFailed { pc, code, .. } => {
+                format!("the procedure ended as failed at {pc}: {code:?}")
+            }
+            JobError::VehicleLock(source) => {
+                format!(
+                    "the per-vehicle lock could not be taken: {}",
+                    source.log_text()
+                )
+            }
+            other => other.to_string(),
+        }
+    }
+
+    fn log_external(&self) -> Option<crate::oplog::ExternalField> {
+        match self {
+            JobError::Link(source)
+            | JobError::Host { source, .. }
+            | JobError::Refused { source, .. }
+            | JobError::IdentityRead { source, .. } => source.log_external(),
+            JobError::VehicleLock(source) => source.log_external(),
+            _ => None,
+        }
+    }
+}
+
 /// The job's error for the declared failure its journal records.
 fn failure_error(failure: &crate::journal::ProcedureFailure) -> JobError {
     JobError::ProcedureFailed {
@@ -362,7 +416,12 @@ fn stop_run<S: Store>(
     match journal.run_stopped(at, reason) {
         Ok(()) => error,
         Err(journal_error) => {
-            tracing::warn!(%error, %journal_error, "could not journal the run's stop");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                %journal_error,
+                "could not journal the run's stop"
+            );
             journal_error
         }
     }
@@ -1227,7 +1286,11 @@ impl<C: WorkerApi> OpenLink<C> {
         }));
         match closed {
             Ok(Ok(())) => return,
-            Ok(Err(error)) => tracing::warn!(%error, "could not close the link"),
+            Ok(Err(error)) => tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "could not close the link"
+            ),
             Err(_) => tracing::warn!("closing the link panicked"),
         }
         mark_link_unconfirmed(&self.guards);
@@ -2044,8 +2107,14 @@ where
                     && let Err(error) = journal.procedure_failed(at, &code, &detail)
                 {
                     // The job ends in the journal error, so the procedure's own reason would
-                    // be lost.
-                    tracing::warn!(pc, ?code, ?detail, %error, "could not journal the procedure failure");
+                    // be lost: the log keeps its code, but not its detail, which is the
+                    // procedure's text (ADR-348 item 6).
+                    tracing::warn!(
+                        pc,
+                        ?code,
+                        error = %error.log_text(),
+                        "could not journal the procedure failure"
+                    );
                     return Err(error);
                 }
                 return Err(JobError::ProcedureFailed { pc, code, detail });

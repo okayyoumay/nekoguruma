@@ -32,6 +32,7 @@ pub mod journal;
 mod journaling;
 pub mod launch;
 pub mod link;
+mod oplog;
 pub mod policy;
 pub mod restart;
 pub mod runner;

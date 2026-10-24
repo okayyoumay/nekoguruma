@@ -820,6 +820,12 @@ fn sent_end(
         HostError::WorkerUnresponsive(_) => End::Unknown(UnknownCause::WorkerNotAnswering),
         HostError::Rpc { status, .. } => {
             detail.grpc_status = Some(grpc_code_name(status.code()));
+            // A start the worker refused and names a reason for was not sent (ADR-350 item 2):
+            // the worker's own reasons, `system`. Without a reason the send stays unknown.
+            if !started && let Some(reason) = refusal_reason(status) {
+                detail.worker_detail = Some(reason.as_str_name().to_owned());
+                return (End::NotSent(RefusalCause::SystemOwnReasons), detail);
+            }
             End::Unknown(if started {
                 UnknownCause::RpcFailure
             } else {
@@ -844,6 +850,15 @@ fn sent_end(
         _ => End::Unknown(UnknownCause::RpcFailure),
     };
     (end, detail)
+}
+
+/// The reason a worker gave for refusing to start a primitive (ADR-350 item 2), when it gave
+/// one.
+fn refusal_reason(status: &tonic::Status) -> Option<vci_service_interface::RefusalReason> {
+    vci_service_interface::error_detail_from_status(status)
+        .and_then(|detail| detail.refusal)
+        .and_then(|reason| vci_service_interface::RefusalReason::try_from(reason).ok())
+        .filter(|reason| *reason != vci_service_interface::RefusalReason::Unspecified)
 }
 
 /// The kind of link error an error event names (design 8.11 "Link error"; ISO 22900-2:2022
@@ -1457,6 +1472,55 @@ mod tests {
             rpc: "StartComPrimitive",
             status: Box::new(tonic::Status::new(code, "x")),
         }
+    }
+
+    /// A start the worker refused with a reason was not sent, refused by the worker for its own
+    /// reasons (ADR-350 item 2, design 8.11 `not_sent`), the reason in `detail`. A refusal
+    /// without a reason, and a reason on a primitive that started, keep the send unknown.
+    #[test]
+    fn a_refusal_that_names_its_reason_is_not_sent() {
+        use vci_service_interface::{ErrorDetail, PduError, RefusalReason};
+        let refused = |reason: Option<RefusalReason>| {
+            Err(HostError::Rpc {
+                rpc: "StartComPrimitive",
+                status: Box::new(vci_service_interface::status_with_error_detail(
+                    tonic::Code::InvalidArgument,
+                    "refused",
+                    ErrorDetail {
+                        pdu_error: PduError::PduErrInvalidParameters as i32,
+                        error_event_data: None,
+                        detail_text: None,
+                        refusal: reason.map(|reason| reason as i32),
+                    },
+                )),
+            })
+        };
+        let read = [0x22, 0xF1, 0x90];
+        for reason in [
+            RefusalReason::InvalidParameters,
+            RefusalReason::QueueFull,
+            RefusalReason::ProtocolCannotCarry,
+        ] {
+            let (end, detail) = end_of(&read, refused(Some(reason)), false);
+            assert!(
+                matches!(end, End::NotSent(RefusalCause::SystemOwnReasons)),
+                "{reason:?}: {end:?}"
+            );
+            assert_eq!(detail.worker_detail.as_deref(), Some(reason.as_str_name()));
+            assert_eq!(detail.grpc_status, Some("InvalidArgument"));
+        }
+        for result in [refused(None), refused(Some(RefusalReason::Unspecified))] {
+            let end = end_of(&read, result, false).0;
+            assert!(
+                matches!(end, End::Unknown(UnknownCause::PrimitiveFailedToStart)),
+                "{end:?}"
+            );
+        }
+        let end = end_of(&read, refused(Some(RefusalReason::QueueFull)), true).0;
+        assert!(
+            matches!(end, End::Unknown(UnknownCause::RpcFailure)),
+            "{end:?}"
+        );
     }
 
     #[test]

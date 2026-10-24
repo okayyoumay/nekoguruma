@@ -5,7 +5,9 @@
 `cop_handle` attribution; `SET_PROG_VOLTAGE`'s mapping corrected by
 conformance-audit fix A2-21 — `ERR_PIN_INVALID` now maps to
 `PduErrMuxRscNotSupported`, not folded into the blanket
-`PduErrVoltageNotSupported` override)
+`PduErrVoltageNotSupported` override; a refused `StartComPrimitive` with
+`INVALID_ARGUMENT` carries an `ErrorDetail` even for a request-shape
+failure, and its refusal reason, by ADR-350)
 **Affects:** `vci-service-interface` (proto, `rich_error.rs`), `iso22900-service`
              (`error.rs`, `service/rpc.rs`, `service/rpc_primitive.rs`,
              `service/rpc_link.rs`, `service/handles.rs`,

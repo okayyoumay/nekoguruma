@@ -55,6 +55,11 @@ const MOCK_TIMESTAMP: UNUM32 = 4242;
 const MOCK_VERSION_TAG: &[u8] = b"iso22900-mock\0";
 const MOCK_VEHICLE_NAME: &[u8] = b"mock-vehicle\0";
 
+/// The mock's additional error code (ISO 22900-2:2022 D.4.2, `ExtraErrorInfoId`) on the receive
+/// timeout of a ComPrimitive the attached ECU did not answer. D.4.2 leaves these codes to the
+/// vendor's MDF, so the value is the mock's own.
+pub const MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP: UNUM32 = 0x0000_0101;
+
 /// IOCTL command id for which `PDUIoCtl` reports success without filling in the output item,
 /// so tests can check how the wrapper handles a library that returns a null item.
 pub const MOCK_IOCTL_NULL_OUTPUT: UNUM32 = 0x7FFF_FF00;
@@ -80,8 +85,8 @@ enum EventKind {
     Result(Vec<u8>),
     /// A ComPrimitive status item.
     Status(T_PDU_STATUS),
-    /// An error item.
-    Error(T_PDU_ERR_EVT),
+    /// An error item, with its additional error code.
+    Error(T_PDU_ERR_EVT, UNUM32),
 }
 
 #[derive(Default, Clone, Copy)]
@@ -359,11 +364,11 @@ unsafe fn make_event_item(event: PendingEvent) -> *mut PDU_EVENT_ITEM {
             E_PDU_IT::PDU_IT_STATUS,
             Box::into_raw(Box::new(status)).cast::<c_void>(),
         ),
-        EventKind::Error(code) => (
+        EventKind::Error(code, extra) => (
             E_PDU_IT::PDU_IT_ERROR,
             Box::into_raw(Box::new(PDU_ERROR_DATA {
                 ErrorCodeId: code,
-                ExtraErrorInfoId: 0,
+                ExtraErrorInfoId: extra,
             }))
             .cast::<c_void>(),
         ),
@@ -603,7 +608,10 @@ fn ecu_events(
             let at = events.last().map_or(0, |(delay_ms, _)| *delay_ms);
             events.push((
                 at,
-                with(EventKind::Error(E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT)),
+                with(EventKind::Error(
+                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
+                )),
             ));
             at
         }

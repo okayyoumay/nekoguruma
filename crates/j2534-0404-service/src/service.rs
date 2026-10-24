@@ -6277,7 +6277,10 @@ impl VciService for J2534Service {
         &self,
         request: Request<vci_service_interface::StartComPrimitiveRequest>,
     ) -> Result<Response<vci_service_interface::ComPrimitiveResponse>, Status> {
-        self.rpc_start_com_primitive(request).await
+        // A refusal names its reason when it shows the request was not sent (ADR-350).
+        self.rpc_start_com_primitive(request)
+            .await
+            .map_err(vci_service_interface::start_refusal)
     }
 
     async fn cancel_com_primitive(

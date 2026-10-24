@@ -836,6 +836,45 @@ fn sae_tx_size_range(
     }
 }
 
+/// Why [`resolve_send_recv_tx`] refused a request: its parameters, or a request the link's
+/// protocol cannot carry (its length), which the refusal names as such (ADR-350).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TxRefusal {
+    message: String,
+    protocol_cannot_carry: bool,
+}
+
+impl TxRefusal {
+    fn invalid(message: String) -> Self {
+        Self {
+            message,
+            protocol_cannot_carry: false,
+        }
+    }
+
+    fn protocol_cannot_carry(message: String) -> Self {
+        Self {
+            message,
+            protocol_cannot_carry: true,
+        }
+    }
+
+    /// The refusal as the status `StartComPrimitive` returns.
+    pub(super) fn into_status(self) -> Status {
+        if self.protocol_cannot_carry {
+            vci_service_interface::protocol_cannot_carry(self.message)
+        } else {
+            Status::invalid_argument(self.message)
+        }
+    }
+}
+
+impl std::fmt::Display for TxRefusal {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
 /// Resolves addressing, the full header-prefixed message, TxFlags, and (for
 /// software ISO-TP) framing options for a `CoptSendrecv`, from `params` and
 /// `entries` — and validates the result (SAE J2534-1 TX size range ADR-049,
@@ -892,7 +931,7 @@ pub(super) fn resolve_send_recv_tx(
     // "Manual Checksum" widened message-size range applies (see the
     // `size_range` computation below). Ignored for every other protocol.
     checksum_mode: bool,
-) -> Result<ResolvedSendRecvTx, String> {
+) -> Result<ResolvedSendRecvTx, TxRefusal> {
     // The `ChannelProtocol` view of the link's actual connected hardware
     // (`hw_protocol_id` is always a native J2534 ID, so this is exactly
     // `ChannelProtocol::from_raw`) -- used below for checks that must follow
@@ -985,7 +1024,8 @@ pub(super) fn resolve_send_recv_tx(
         software_isotp,
         tp20_established_tx_id,
         raw_mode,
-    )?;
+    )
+    .map_err(TxRefusal::invalid)?;
 
     // SAE J2534-1 (PassThruMessage.Data length by protocol): reject the
     // constructed message outside the applicable Min/Max Tx range. In
@@ -1089,7 +1129,7 @@ pub(super) fn resolve_send_recv_tx(
         tp20_is_broadcast,
     );
     if !size_range.contains(&full_message.len()) {
-        return Err(format!(
+        return Err(TxRefusal::protocol_cannot_carry(format!(
             "cop_data length {} produces a {}-byte J2534 message, outside the valid \
              TX message size range ({}..={} bytes){}",
             cop_data.len(),
@@ -1105,7 +1145,7 @@ pub(super) fn resolve_send_recv_tx(
                 }
                 _ => " for this protocol".to_string(),
             },
-        ));
+        )));
     }
 
     // ISO 15765-2 requires a functionally addressed (broadcast) request to
@@ -1168,7 +1208,7 @@ pub(super) fn resolve_send_recv_tx(
         };
         let functional_payload_len = cop_data.len().saturating_sub(tx_prefix);
         if functional_payload_len > max_sf_payload {
-            return Err(format!(
+            return Err(TxRefusal::protocol_cannot_carry(format!(
                 "cop_data length {} ({}-byte payload after the {tx_prefix}-byte RawMode prefix) \
                  exceeds the {max_sf_payload}-byte Single Frame limit for functional \
                  (CP_RequestAddrMode=2) ISO15765 addressing -- ISO 15765-2 requires \
@@ -1180,7 +1220,7 @@ pub(super) fn resolve_send_recv_tx(
                 } else {
                     ""
                 },
-            ));
+            )));
         }
     }
 
@@ -1280,7 +1320,7 @@ pub(super) fn resolve_send_recv_tx(
     // for the deferred/Working call site this is still the last chance to
     // catch a malformed message before it would otherwise reach the adapter).
     j2534_0404::PassThruMessage::new(hw_protocol_id, 0, hw_tx_flags, 0, 0, &full_message)
-        .map_err(|err| format!("invalid cop_data: {err}"))?;
+        .map_err(|err| TxRefusal::invalid(format!("invalid cop_data: {err}")))?;
 
     // ADR-180 Decision 14 (widened by Decision 18, design-advisor consult,
     // PR #72 round 15): surface the SAME resolved J1939 source-address byte
@@ -1411,7 +1451,7 @@ mod resolve_send_recv_tx_tp20_extended_id_tests {
             Err(err) => err,
         };
         assert!(
-            err.contains("3..=8"),
+            err.to_string().contains("3..=8"),
             "the rejection must cite the broadcast-specific 3..=8 range, not the ordinary \
              connection-bound 4..=4096 range: {err}"
         );
@@ -3411,7 +3451,7 @@ impl J2534Service {
                     Ok(resolved) => resolved,
                     Err(err) => {
                         self.primitives.lock().await.remove(&cop_handle);
-                        return Err(Status::invalid_argument(err));
+                        return Err(err.into_status());
                     }
                 };
                 // ADR-196 Decision item 3b: the ONE shared helper computing
@@ -4684,7 +4724,7 @@ impl J2534Service {
                         }
                         Err(err) => {
                             self.primitives.lock().await.remove(&cop_handle);
-                            return Err(Status::invalid_argument(err));
+                            return Err(err.into_status());
                         }
                     }
                 };
@@ -4936,7 +4976,7 @@ impl J2534Service {
                         Err(err) => {
                             self.rollback_stop_comm_pending(handle, cop_handle, connect_generation)
                                 .await;
-                            return Err(Status::invalid_argument(err));
+                            return Err(err.into_status());
                         }
                     }
                 };

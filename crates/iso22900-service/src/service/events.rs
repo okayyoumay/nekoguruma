@@ -65,6 +65,9 @@ pub(super) fn to_proto_event_item(
 ) -> Result<EventItem, Status> {
     let map_err = |error: DPduApiError| rich_runtime_error(api, h_mod, h_cll, error);
 
+    // An error item's additional error code (ISO 22900-2:2022 D.4.2), passed on as the library
+    // gives it (ADR-350).
+    let mut extra_error_info = None;
     let data = match borrowed.result_data() {
         Ok(result) => {
             let extra_info = match result.extra_info() {
@@ -105,7 +108,10 @@ pub(super) fn to_proto_event_item(
         Err(DPduApiError::Unsupported(_)) => match borrowed.status_data() {
             Ok(status) => Some(EventItemData::CopStatus(status.status() as i32)),
             Err(DPduApiError::Unsupported(_)) => match borrowed.error_data() {
-                Ok(error) => Some(EventItemData::ErrorData(error.error_code_id().0 as i32)),
+                Ok(error) => {
+                    extra_error_info = Some(error.extra_error_info_id());
+                    Some(EventItemData::ErrorData(error.error_code_id().0 as i32))
+                }
                 Err(DPduApiError::Unsupported(_)) => match borrowed.info_data() {
                     Ok(info) => Some(EventItemData::InfoData(info.info_code().0 as i32)),
                     Err(DPduApiError::Unsupported(_)) => None,
@@ -166,6 +172,7 @@ pub(super) fn to_proto_event_item(
         timestamp: borrowed.timestamp(),
         data,
         cop_tag,
+        extra_error_info,
     })
 }
 

@@ -14,7 +14,7 @@
 use prost::Message;
 use tonic::{Code, Status};
 
-use crate::ErrorDetail;
+use crate::{ErrorDetail, PduError, RefusalReason};
 
 const ERROR_DETAIL_TYPE_URL: &str = "type.googleapis.com/vci.service.ErrorDetail";
 
@@ -70,6 +70,53 @@ pub fn error_detail_from_status(status: &Status) -> Option<ErrorDetail> {
         .and_then(|any| ErrorDetail::decode(any.value.as_slice()).ok())
 }
 
+/// The status of a refused `StartComPrimitive`, with the reason the worker
+/// refused it set as [`ErrorDetail::refusal`] when the refusal shows the
+/// request was not sent (ADR-350): an invalid argument the worker found
+/// itself (a status without an `ErrorDetail`, which gains one with
+/// `PDU_ERR_INVALID_PARAMETERS`), or a library's
+/// `PDU_ERR_INVALID_PARAMETERS` or `PDU_ERR_TX_QUEUE_FULL`. A refusal
+/// already named is kept, and any other status is returned as it is.
+pub fn start_refusal(status: Status) -> Status {
+    let detail = match error_detail_from_status(&status) {
+        Some(detail) if detail.refusal.is_some() => return status,
+        Some(detail) => detail,
+        None if status.code() == Code::InvalidArgument => ErrorDetail {
+            pdu_error: PduError::PduErrInvalidParameters as i32,
+            ..Default::default()
+        },
+        None => return status,
+    };
+    let reason = match PduError::try_from(detail.pdu_error) {
+        Ok(PduError::PduErrInvalidParameters) => RefusalReason::InvalidParameters,
+        Ok(PduError::PduErrTxQueueFull) => RefusalReason::QueueFull,
+        _ => return status,
+    };
+    status_with_error_detail(
+        status.code(),
+        status.message(),
+        ErrorDetail {
+            refusal: Some(reason as i32),
+            ..detail
+        },
+    )
+}
+
+/// The status of a `StartComPrimitive` the worker refuses because the link's
+/// protocol cannot carry the request (ADR-350), such as one longer than its
+/// transport allows.
+pub fn protocol_cannot_carry(message: impl Into<String>) -> Status {
+    status_with_error_detail(
+        Code::InvalidArgument,
+        message,
+        ErrorDetail {
+            pdu_error: PduError::PduErrInvalidParameters as i32,
+            refusal: Some(RefusalReason::ProtocolCannotCarry as i32),
+            ..Default::default()
+        },
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +133,7 @@ mod tests {
                 extra_error_info: 7,
             }),
             detail_text: Some("resource locked by another CLL".to_string()),
+            refusal: None,
         };
 
         let status =
@@ -103,6 +151,7 @@ mod tests {
             pdu_error: 0x1234,
             error_event_data: None,
             detail_text: None,
+            refusal: None,
         };
 
         let status = status_with_error_detail(Code::Internal, "unmapped", detail.clone());
@@ -110,6 +159,54 @@ mod tests {
             error_detail_from_status(&status).expect("error detail should round-trip");
 
         assert_eq!(round_tripped, detail);
+    }
+
+    /// A refused start names its reason only when the refusal shows the
+    /// request was not sent (ADR-350).
+    #[test]
+    fn a_refused_start_names_its_reason() {
+        let refusal = |status: Status| {
+            error_detail_from_status(&start_refusal(status)).and_then(|detail| detail.refusal)
+        };
+        let native = |error: PduError| {
+            status_with_error_detail(
+                Code::Internal,
+                "native",
+                ErrorDetail {
+                    pdu_error: error as i32,
+                    ..Default::default()
+                },
+            )
+        };
+        assert_eq!(
+            refusal(Status::invalid_argument("cop_type is not a COPT")),
+            Some(RefusalReason::InvalidParameters as i32)
+        );
+        assert_eq!(
+            refusal(native(PduError::PduErrInvalidParameters)),
+            Some(RefusalReason::InvalidParameters as i32)
+        );
+        assert_eq!(
+            refusal(native(PduError::PduErrTxQueueFull)),
+            Some(RefusalReason::QueueFull as i32)
+        );
+        assert_eq!(
+            refusal(protocol_cannot_carry("4096 bytes")),
+            Some(RefusalReason::ProtocolCannotCarry as i32)
+        );
+        // Nothing shows the request was not sent.
+        assert_eq!(refusal(native(PduError::PduErrFctFailed)), None);
+        assert_eq!(refusal(Status::internal("tx queue closed")), None);
+        // The message, code and the rest of the detail stay.
+        let status = start_refusal(native(PduError::PduErrTxQueueFull));
+        assert_eq!(
+            (status.code(), status.message()),
+            (Code::Internal, "native")
+        );
+        assert_eq!(
+            error_detail_from_status(&status).unwrap().pdu_error,
+            PduError::PduErrTxQueueFull as i32
+        );
     }
 
     #[test]

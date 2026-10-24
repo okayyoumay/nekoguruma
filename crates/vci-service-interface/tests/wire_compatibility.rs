@@ -102,6 +102,7 @@ fn an_event_item_keeps_an_absent_and_an_empty_cop_tag_apart() {
         }),
         timestamp: 4242,
         cop_tag: None,
+        extra_error_info: None,
         data: Some(event_item::Data::CopStatus(
             PduComPrimitiveStatus::PduCopstFinished as i32,
         )),
@@ -163,6 +164,7 @@ fn an_error_detail_keeps_an_absent_and_an_empty_detail_text_apart() {
         pdu_error: PduError::PduErrFctFailed as i32,
         error_event_data: None,
         detail_text: None,
+        refusal: None,
     };
     assert_eq!(decode::<ErrorDetail>(&without_text), expected);
     assert_round_trip(&expected);
@@ -173,5 +175,34 @@ fn an_error_detail_keeps_an_absent_and_an_empty_detail_text_apart() {
         ..expected
     };
     assert_eq!(decode::<ErrorDetail>(&with_empty_text), expected);
+    assert_round_trip(&expected);
+}
+
+/// ADR-350: an error event's extra error information is `optional`, so a
+/// worker with none (J2534) and a library's 0 stay apart, and a refusal's
+/// reason is a field of its own beside the PDU error.
+#[test]
+fn an_error_event_s_extra_information_and_a_refusal_s_reason_are_on_the_wire() {
+    let error = [0x38, 0x01, 0x50, 0x00]; // 7: error_data = 1, 10: extra_error_info = 0
+    let expected = EventItem {
+        data: Some(event_item::Data::ErrorData(1)),
+        extra_error_info: Some(0),
+        ..Default::default()
+    };
+    assert_eq!(decode::<EventItem>(&error), expected);
+    assert_round_trip(&expected);
+    assert_eq!(
+        decode::<EventItem>(&error[..2]).extra_error_info,
+        None,
+        "absent, not 0"
+    );
+
+    let refused = [0x08, 0x50, 0x20, 0x03]; // 1: INVALID_PARAMETERS, 4: refusal = 3
+    let expected = ErrorDetail {
+        pdu_error: PduError::PduErrInvalidParameters as i32,
+        refusal: Some(vci_service_interface::RefusalReason::ProtocolCannotCarry as i32),
+        ..Default::default()
+    };
+    assert_eq!(decode::<ErrorDetail>(&refused), expected);
     assert_round_trip(&expected);
 }

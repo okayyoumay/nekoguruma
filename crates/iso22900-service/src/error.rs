@@ -38,6 +38,7 @@ pub(crate) fn api_not_initialized_status(message: impl Into<String>) -> Status {
         pdu_error: PduError::PduErrPduapiNotConstructed as i32,
         error_event_data: None,
         detail_text: None,
+        refusal: None,
     };
     status_with_error_detail(Code::FailedPrecondition, message, detail)
 }
@@ -74,6 +75,7 @@ fn runtime_error_parts(error: &DPduApiError) -> (Code, String, ErrorDetail) {
                 pdu_error: *code as i32,
                 error_event_data: None,
                 detail_text: None,
+                refusal: None,
             },
         ),
         other => (
@@ -83,6 +85,7 @@ fn runtime_error_parts(error: &DPduApiError) -> (Code, String, ErrorDetail) {
                 pdu_error: PduError::PduErrFctFailed as i32,
                 error_event_data: None,
                 detail_text: None,
+                refusal: None,
             },
         ),
     }

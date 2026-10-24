@@ -186,6 +186,7 @@ pub(crate) fn map_native_error_as(
         pdu_error: pdu_error as i32,
         error_event_data: error_event_data_for(last_error),
         detail_text: Some(format!("{context}: {error}")),
+        refusal: None,
     };
     let code = if pdu_error == PduError::PduErrInvalidHandle {
         Code::NotFound
@@ -205,6 +206,7 @@ pub(crate) fn unknown_handle_status(message: impl Into<String>) -> Status {
         pdu_error: PduError::PduErrInvalidHandle as i32,
         error_event_data: None,
         detail_text: None,
+        refusal: None,
     };
     status_with_error_detail(Code::NotFound, message, detail)
 }
@@ -231,6 +233,7 @@ pub(crate) fn state_guard_status(
         pdu_error: pdu_error as i32,
         error_event_data: error_event_data_for(last_error),
         detail_text: None,
+        refusal: None,
     };
     status_with_error_detail(code, message, detail)
 }

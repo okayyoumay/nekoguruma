@@ -2331,6 +2331,7 @@ mod tests {
                         extra_error_info: 0,
                     }),
                     detail_text: None,
+                    refusal: None,
                 },
             )),
         };

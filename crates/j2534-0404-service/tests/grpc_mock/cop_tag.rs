@@ -223,6 +223,11 @@ async fn oversized_cop_tag_is_rejected_before_the_cop_is_created() {
         .expect_err("an oversized cop_tag should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(status.message().contains("cop_tag"), "{}", status.message());
+    // The refusal says the request was not sent, and why (ADR-350).
+    assert_eq!(
+        vci_service_interface::error_detail_from_status(&status).and_then(|d| d.refusal),
+        Some(vci_service_interface::RefusalReason::InvalidParameters as i32)
+    );
 
     // A tag right at the documented limit is accepted (boundary check).
     let max_tag = vec![0u8; 64];
@@ -438,6 +443,8 @@ async fn cop_tag_round_trips_to_a_cop_scoped_error_event() {
                 .is_some_and(|h| h.cop_handle == cop_handle.cop_handle)
             {
                 observed_tag = Some(item.cop_tag.clone());
+                // A J2534 error event has no extra error information (ADR-350).
+                assert_eq!(item.extra_error_info, None);
                 true
             } else {
                 false

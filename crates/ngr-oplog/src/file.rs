@@ -87,6 +87,16 @@ pub struct RotatingFile {
     settings: FileSettings,
     file: File,
     len: u64,
+    /// The file was renamed to `rotated_path(1)` but no new file could be opened at the path,
+    /// so `file` is that rotated file: the next rotation must neither move nor delete it.
+    detached: bool,
+    /// How many of the next reopens fail, so a test can make one fail.
+    #[cfg(test)]
+    fail_reopens: u32,
+    /// A directory a test has the next rotation create at the path right after its rename, so
+    /// the file cannot be moved back.
+    #[cfg(test)]
+    block_path_after_rename: bool,
 }
 
 impl RotatingFile {
@@ -112,6 +122,11 @@ impl RotatingFile {
             settings,
             file,
             len,
+            detached: false,
+            #[cfg(test)]
+            fail_reopens: 0,
+            #[cfg(test)]
+            block_path_after_rename: false,
         })
     }
 
@@ -152,13 +167,26 @@ impl RotatingFile {
     /// process holds open, a file that cannot be deleted), and the current file is emptied in
     /// any case where the OS allows it, so the log keeps its size bound and keeps logging:
     /// - the current file cannot be renamed: it is truncated;
-    /// - the new file cannot be opened: entries go on to the renamed one, which is rotated
-    ///   again at the limit.
+    /// - the new file cannot be opened: the renamed file is moved back and truncated, or, where
+    ///   that fails too, entries go on to the renamed file, which no later rotation moves or
+    ///   deletes; each rotation tries again to open a new file and otherwise truncates it.
     fn rotate(&mut self) {
+        self.len = 0;
+        if self.detached {
+            match self.reopen() {
+                Ok(file) => {
+                    self.file = file;
+                    self.detached = false;
+                }
+                Err(_) => {
+                    let _ = self.file.set_len(0);
+                }
+            }
+            return;
+        }
         let settings = &self.settings;
         let max_files = settings.max_files.min(FileSettings::MAX_FILES_LIMIT);
         if max_files == 0 && self.file.set_len(0).is_ok() {
-            self.len = 0;
             return;
         }
         let renamed = if max_files > 0 {
@@ -170,17 +198,41 @@ impl RotatingFile {
         } else {
             remove_if_present(&settings.path).is_ok()
         };
+        #[cfg(test)]
+        if renamed && std::mem::take(&mut self.block_path_after_rename) {
+            std::fs::create_dir(&self.settings.path).unwrap();
+        }
         if !renamed {
             // The file stays where it is; empty it instead. Where even that fails (a handle
             // that may only append), it keeps growing, by the limit each time it is reached.
             let _ = self.file.set_len(0);
-            self.len = 0;
             return;
         }
-        if let Ok(file) = private::open_append(&settings.path) {
-            self.file = file;
+        match self.reopen() {
+            Ok(file) => self.file = file,
+            Err(_) => {
+                // `file` is now the rotated file. Put it back where the log is, emptied, so
+                // the files stay as the next rotation expects them.
+                let settings = &self.settings;
+                if max_files > 0
+                    && std::fs::rename(settings.rotated_path(1), &settings.path).is_ok()
+                {
+                    let _ = self.file.set_len(0);
+                } else {
+                    self.detached = true;
+                }
+            }
         }
-        self.len = 0;
+    }
+
+    /// Opens a new file at the path.
+    fn reopen(&mut self) -> io::Result<File> {
+        #[cfg(test)]
+        if self.fail_reopens > 0 {
+            self.fail_reopens -= 1;
+            return Err(io::Error::other("a reopen made to fail"));
+        }
+        private::open_append(&self.settings.path)
     }
 }
 
@@ -323,6 +375,49 @@ mod tests {
         assert_eq!(read(&settings.path), "four\n");
         assert_eq!(read(&settings.rotated_path(1)), "three\n");
         assert!(settings.rotated_path(2).is_dir() && settings.rotated_path(3).is_dir());
+    }
+
+    /// A new file that cannot be opened after the rename does not lose the log: the renamed
+    /// file is moved back, and the next rotation works as usual.
+    #[test]
+    fn a_failed_reopen_moves_the_file_back() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = settings(temp.path(), 4, 1);
+        let mut file = RotatingFile::open(settings.clone()).unwrap();
+        file.write_entry(b"one\n").unwrap();
+        file.fail_reopens = 1;
+        file.write_entry(b"two\n").unwrap();
+        assert_eq!(read(&settings.path), "two\n");
+        assert!(!settings.rotated_path(1).exists());
+        file.write_entry(b"three\n").unwrap();
+        assert_eq!(read(&settings.path), "three\n");
+        assert_eq!(read(&settings.rotated_path(1)), "two\n");
+    }
+
+    /// When the file cannot be moved back either, entries go on to the renamed file, which no
+    /// later rotation deletes, and a new file is opened as soon as that works again.
+    #[test]
+    fn a_detached_file_is_never_deleted_and_is_left_once_a_reopen_works() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = settings(temp.path(), 4, 1);
+        let mut file = RotatingFile::open(settings.clone()).unwrap();
+        file.write_entry(b"one\n").unwrap();
+        // The reopen fails, and something takes the path, so the file cannot be moved back.
+        file.fail_reopens = 1;
+        file.block_path_after_rename = true;
+        file.write_entry(b"two\n").unwrap();
+        assert!(file.detached);
+        assert_eq!(read(&settings.rotated_path(1)), "one\ntwo\n");
+        // Still unable to open a file at the path: the detached file is emptied, not deleted.
+        file.fail_reopens = 1;
+        file.write_entry(b"three\n").unwrap();
+        assert_eq!(read(&settings.rotated_path(1)), "three\n");
+        // The path is free again: the next rotation opens a new file there.
+        std::fs::remove_dir(&settings.path).unwrap();
+        file.write_entry(b"four\n").unwrap();
+        assert!(!file.detached);
+        assert_eq!(read(&settings.path), "four\n");
+        assert_eq!(read(&settings.rotated_path(1)), "three\n");
     }
 
     /// A file that ends in the middle of a line, as a crash leaves it, is ended before the

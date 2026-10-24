@@ -86,10 +86,26 @@ pub(crate) fn open_append(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// The error for an existing file that another account owns: narrowing its mode or its access
+/// list would still leave that account access, so the file is refused and the caller falls back.
+fn foreign_owner() -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        "the log file belongs to another account",
+    )
+}
+
 #[cfg(unix)]
 fn restrict_file(_path: &Path, file: &File) -> io::Result<()> {
-    use std::os::unix::fs::PermissionsExt;
-    let mode = file.metadata()?.permissions().mode();
+    use std::os::unix::fs::{MetadataExt, PermissionsExt};
+    let meta = file.metadata()?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let me = unsafe { libc::geteuid() };
+    // Root owns what an administrator prepared; any other owner keeps access to the file.
+    if meta.uid() != me && meta.uid() != 0 {
+        return Err(foreign_owner());
+    }
+    let mode = meta.permissions().mode();
     if mode & 0o077 != 0 {
         file.set_permissions(std::fs::Permissions::from_mode(mode & 0o700))?;
     }
@@ -98,6 +114,9 @@ fn restrict_file(_path: &Path, file: &File) -> io::Result<()> {
 
 #[cfg(windows)]
 fn restrict_file(path: &Path, _file: &File) -> io::Result<()> {
+    if !windows::owned_by_us_or_administrators(path)? {
+        return Err(foreign_owner());
+    }
     windows::restrict(path, false)
 }
 
@@ -107,14 +126,18 @@ mod windows {
     use std::os::windows::ffi::OsStrExt;
     use std::path::Path;
 
-    use windows_sys::Win32::Foundation::{ERROR_SUCCESS, LocalFree};
+    use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
+        SE_FILE_OBJECT, SetNamedSecurityInfoW,
     };
     use windows_sys::Win32::Security::{
-        ACL, DACL_SECURITY_INFORMATION, GetSecurityDescriptorDacl,
-        PROTECTED_DACL_SECURITY_INFORMATION, PSECURITY_DESCRIPTOR,
+        ACL, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation,
+        IsWellKnownSid, OWNER_SECURITY_INFORMATION, PROTECTED_DACL_SECURITY_INFORMATION,
+        PSECURITY_DESCRIPTOR, TOKEN_QUERY, TOKEN_USER, TokenUser, WinBuiltinAdministratorsSid,
+        WinLocalSystemSid,
     };
+    use windows_sys::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
     /// Full access for the owner (`OW`), SYSTEM (`SY`) and the Administrators group (`BA`),
     /// nothing inherited (`P`); a directory's entries are inherited by what is created in it
@@ -124,6 +147,72 @@ mod windows {
 
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
         text.encode_wide().chain(Some(0)).collect()
+    }
+
+    /// Whether `path`'s owner is the process's account, SYSTEM or the Administrators group (an
+    /// elevated process's files are owned by the group), the accounts the access list grants.
+    pub(super) fn owned_by_us_or_administrators(path: &Path) -> io::Result<bool> {
+        let name = wide(path.as_os_str());
+        let mut owner = std::ptr::null_mut();
+        let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
+        // SAFETY: `name` is a NUL-terminated UTF-16 path; `owner` points into `descriptor`, an
+        // allocation the call makes and which is freed below.
+        let status = unsafe {
+            GetNamedSecurityInfoW(
+                name.as_ptr(),
+                SE_FILE_OBJECT,
+                OWNER_SECURITY_INFORMATION,
+                &mut owner,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                &mut descriptor,
+            )
+        };
+        if status != ERROR_SUCCESS {
+            return Err(io::Error::from_raw_os_error(status as i32));
+        }
+        let result = (|| {
+            // SAFETY: `owner` is a valid SID inside `descriptor`.
+            if unsafe {
+                IsWellKnownSid(owner, WinBuiltinAdministratorsSid) != 0
+                    || IsWellKnownSid(owner, WinLocalSystemSid) != 0
+            } {
+                return Ok(true);
+            }
+            let mut token: HANDLE = std::ptr::null_mut();
+            // SAFETY: the current process's pseudo handle needs no closing; `token` receives a
+            // handle closed below.
+            if unsafe { OpenProcessToken(GetCurrentProcess(), TOKEN_QUERY, &mut token) } == 0 {
+                return Err(io::Error::last_os_error());
+            }
+            // A buffer of `u64`s keeps the `TOKEN_USER` it receives aligned.
+            let mut buffer = vec![0u64; 16];
+            let mut len = 0u32;
+            // SAFETY: `token` is open with TOKEN_QUERY, and `buffer` holds `len` bytes.
+            let ok = unsafe {
+                GetTokenInformation(
+                    token,
+                    TokenUser,
+                    buffer.as_mut_ptr().cast(),
+                    (buffer.len() * 8) as u32,
+                    &mut len,
+                )
+            };
+            let error = io::Error::last_os_error();
+            // SAFETY: `token` was opened above and is closed once.
+            unsafe { CloseHandle(token) };
+            if ok == 0 {
+                return Err(error);
+            }
+            // SAFETY: the call filled `buffer` with a `TOKEN_USER` whose SID lies inside it;
+            // `owner` is valid as above.
+            let user = unsafe { &*buffer.as_ptr().cast::<TOKEN_USER>() };
+            Ok(unsafe { EqualSid(owner, user.User.Sid) } != 0)
+        })();
+        // SAFETY: `descriptor` was allocated by the call above and is freed once.
+        unsafe { LocalFree(descriptor as _) };
+        result
     }
 
     /// Replaces `path`'s access list with the private one. The file was opened without following
@@ -215,6 +304,26 @@ mod tests {
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
         drop(open_append(&path).unwrap());
         assert_eq!(mode(&path), 0o600);
+    }
+
+    /// An existing file another account owns is refused: narrowing its mode would still leave
+    /// that account access. Only root can give a file away, so the test runs only as root.
+    #[test]
+    fn a_file_another_account_owns_is_refused() {
+        // SAFETY: `geteuid` has no preconditions.
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("agent.log");
+        std::fs::write(&path, b"").unwrap();
+        std::os::unix::fs::chown(&path, Some(65534), None).unwrap();
+        assert_eq!(
+            open_append(&path).unwrap_err().kind(),
+            io::ErrorKind::PermissionDenied
+        );
+        std::os::unix::fs::chown(&path, Some(0), None).unwrap();
+        drop(open_append(&path).unwrap());
     }
 
     #[test]

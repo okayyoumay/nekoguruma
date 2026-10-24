@@ -24,7 +24,7 @@ When `RotatingFile::open` fails (`OpenError`), the caller logs to stderr with a 
 
 - the directory cannot be created;
 - the file cannot be opened;
-- the file cannot be made private;
+- the file cannot be made private, or another account owns it;
 - the path is not a regular file. The open itself does not follow a symbolic link (Unix) or a
   reparse point (Windows), so one put in place after the check is refused too, and a FIFO does
   not block it.
@@ -86,8 +86,9 @@ A rotation never stops the log:
   holds open, or one that cannot be deleted;
 - a current file that cannot be renamed is emptied instead. Where the OS refuses that too (a
   Windows handle that may only append), it keeps growing, by the limit each time it is reached;
-- when the new file cannot be opened, entries go on to the renamed one, which is rotated again at
-  the limit;
+- when the new file cannot be opened, the renamed one is moved back and emptied. Where that fails
+  too, entries go on to the renamed file: no later rotation moves or deletes it, each rotation
+  tries again to open a new file and otherwise empties it, so the log stays bounded;
 - the entry that started the rotation is written in every case.
 
 ## Permissions
@@ -96,6 +97,7 @@ A rotation never stops the log:
 |---|---|---|
 | A directory the writer creates (each missing one, its parents included) | `0700` | an access list, protected from inheritance, allowing only the owner, SYSTEM and the Administrators group, inherited by what is created in it; a directory that cannot be given it is removed again |
 | The file | `0600`; an existing file with wider access is narrowed when it is opened | the same access list, set each time the file is opened |
+| An existing file another account owns | refused (narrowing it would leave its owner access); root may own it | refused, unless the process's account, SYSTEM or the Administrators group owns it |
 | An existing directory | left as it is: the installation may have prepared it, or a configured path may name a shared one | left as it is |
 
 A rotated file keeps its permissions, since it is the same file renamed.

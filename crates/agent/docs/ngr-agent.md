@@ -167,7 +167,9 @@ relative directory) keeps its default, with a warning, and so do all of them whe
 not parse. The paths and the file's own text in those warnings are in their `external` field.
 
 A run's entries are in a `job` span with its job id (the communication log's, when there is
-one), generation 0 and the VCI name in the span's `external` field. What an entry may hold is
+one), generation 0 and the VCI name in the span's `external` field. The span is kept at any
+configured level, so an entry logged during a job carries those fields even when the level is
+above `info`. What an entry may hold is
 `operational-log.md`.
 
 ## Configuration file

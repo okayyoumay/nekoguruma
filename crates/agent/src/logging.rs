@@ -20,7 +20,8 @@
 //! read and the agent logs with its defaults; in user mode it is read and the findings are
 //! logged as a warning.
 //!
-//! Each job runs in a [`job_span`] with its job id, ownership generation and VCI name.
+//! Each job runs in a [`job_span`] with its job id, ownership generation and VCI name, which
+//! the level filter lets through at any level.
 
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
@@ -28,11 +29,12 @@ use std::path::{Path, PathBuf};
 use ngr_library_resolver::Policy;
 use ngr_oplog::{ExternalText, FileSettings, JsonLayer, RotatingFile, Slot, TextLayer};
 use tracing::Subscriber;
-use tracing_subscriber::EnvFilter;
-use tracing_subscriber::filter::FilterFn;
+use tracing_subscriber::filter::{FilterExt, FilterFn};
 use tracing_subscriber::fmt::MakeWriter;
+use tracing_subscriber::layer::Filter;
 use tracing_subscriber::layer::SubscriberExt;
 use tracing_subscriber::registry::LookupSpan;
+use tracing_subscriber::{EnvFilter, Layer};
 
 use vci_service_config::{AgentLoggingConfig, LogOutput, LogOutputKind};
 use worker_host::service::OperatingMode;
@@ -78,7 +80,7 @@ pub fn install(mode: OperatingMode) -> Logging {
     if settings.off {
         // Nothing is written, so nothing about the settings can be said either.
         let _ = tracing::subscriber::set_global_default(subscriber(
-            settings.filter,
+            &settings.level,
             None::<fn() -> std::io::Stderr>,
             ExternalText::LengthOnly,
             None,
@@ -94,7 +96,7 @@ pub fn install(mode: OperatingMode) -> Logging {
     let dir = settings.dir.clone().map_or_else(default_dir, Ok);
     let (logging, json, external) = setup(dir, std::io::stderr().is_terminal());
     let installed = tracing::subscriber::set_global_default(subscriber(
-        settings.filter,
+        &settings.level,
         Some(std::io::stderr),
         external,
         json,
@@ -114,7 +116,8 @@ pub fn install(mode: OperatingMode) -> Logging {
 /// The settings the agent logs with.
 #[derive(Debug)]
 struct Settings {
-    filter: EnvFilter,
+    /// The level's filter directive, checked to parse.
+    level: String,
     /// Whether `output` is `"null"`: no stderr and no file.
     off: bool,
     /// The configured directory of the file; `None` for [`default_dir`].
@@ -124,7 +127,7 @@ struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            filter: EnvFilter::new(DEFAULT_LEVEL),
+            level: DEFAULT_LEVEL.to_owned(),
             off: false,
             dir: None,
         }
@@ -187,7 +190,7 @@ fn apply(table: AgentLoggingConfig, notices: &mut Vec<Notice>) -> Settings {
     let mut settings = Settings::default();
     if let Some(level) = table.level {
         match EnvFilter::try_new(&level) {
-            Ok(filter) => settings.filter = filter,
+            Ok(_) => settings.level = level,
             Err(error) => notices.push(Notice::Level {
                 level,
                 error: error.to_string(),
@@ -282,10 +285,12 @@ fn warn_no_file(no_file: &NoFile) {
     );
 }
 
-/// The subscriber: `filter`, then the safety filter, then the text output on `stderr` when
-/// given and, when given, the file's JSON output.
+/// The subscriber: the safety filter, then the text output on `stderr` when given and, when
+/// given, the file's JSON output, each behind the filter of the level directive `level`. That
+/// filter always lets the [`job_span`] through, whatever the level, so an entry logged during a
+/// job keeps the job's fields at any level (ADR-348 item 3).
 pub fn subscriber<W>(
-    filter: EnvFilter,
+    level: &str,
     stderr: Option<W>,
     external: ExternalText,
     file: Option<JsonLayer>,
@@ -294,10 +299,26 @@ where
     W: for<'w> MakeWriter<'w> + Send + Sync + 'static,
 {
     tracing_subscriber::registry()
-        .with(filter)
         .with(FilterFn::new(|metadata| !is_unchecked(metadata.target())))
-        .with(stderr.map(|stderr| TextLayer::new(stderr, external)))
-        .with(file)
+        .with(
+            stderr.map(|stderr| TextLayer::new(stderr, external).with_filter(level_filter(level))),
+        )
+        .with(file.map(|file| file.with_filter(level_filter(level))))
+}
+
+/// The filter of the level directive `level`, which also lets the [`job_span`] through.
+fn level_filter<S>(level: &str) -> impl Filter<S> + use<S>
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    EnvFilter::new(level).or(FilterFn::new(
+        is_job_span as fn(&tracing::Metadata<'_>) -> bool,
+    ))
+}
+
+/// Whether `metadata` is the [`job_span`]'s.
+fn is_job_span(metadata: &tracing::Metadata<'_>) -> bool {
+    metadata.is_span() && metadata.name() == "job" && metadata.target() == module_path!()
 }
 
 /// Whether `target` belongs to a crate the safety filter drops.
@@ -420,7 +441,7 @@ mod tests {
         let (slot, file) = open_file(&temp.path().join("logs")).unwrap();
         let stderr = Captured::default();
         let subscriber = subscriber(
-            EnvFilter::new(DEFAULT_LEVEL),
+            DEFAULT_LEVEL,
             Some(stderr.clone()),
             ExternalText::Full,
             Some(JsonLayer::new(PROCESS, file)),
@@ -475,12 +496,7 @@ mod tests {
         assert_eq!(no_file.path.as_deref(), Some(dir.as_path()));
         let stderr = Captured::default();
         tracing::subscriber::with_default(
-            subscriber(
-                EnvFilter::new(DEFAULT_LEVEL),
-                Some(stderr.clone()),
-                external,
-                None,
-            ),
+            subscriber(DEFAULT_LEVEL, Some(stderr.clone()), external, None),
             || warn_no_file(&no_file),
         );
         let text = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
@@ -513,7 +529,7 @@ mod tests {
     fn a_forwarded_stderr_writes_external_as_its_length() {
         let stderr = Captured::default();
         let subscriber = subscriber(
-            EnvFilter::new(DEFAULT_LEVEL),
+            DEFAULT_LEVEL,
             Some(stderr.clone()),
             ExternalText::LengthOnly,
             None,
@@ -609,18 +625,27 @@ mod tests {
         assert!(logging.file.as_ref().unwrap().starts_with(logs.path()));
         let stderr = Captured::default();
         tracing::subscriber::with_default(
-            subscriber(settings.filter, Some(stderr.clone()), external, json),
+            subscriber(&settings.level, Some(stderr.clone()), external, json),
             || {
+                // The job span is an `info` one, and stays on at a `warn` level, so the warning
+                // keeps the job's fields (ADR-348 item 3).
+                let _job = job_span(&key(), "bench VCI").entered();
                 tracing::info!("below the configured level");
                 tracing::warn!("at the configured level");
             },
         );
         let text = text(&stderr);
         assert_eq!(text.lines().count(), 1, "{text}");
-        assert!(text.contains("at the configured level"), "{text}");
+        assert!(
+            text.contains(r#"job{generation=4 job_id="run-1-2-3" external="bench VCI"}: at the configured level"#),
+            "{text}"
+        );
         let file = std::fs::read_to_string(logging.file.as_ref().unwrap()).unwrap();
         assert_eq!(file.lines().count(), 1, "{file}");
-        assert!(file.contains("at the configured level"), "{file}");
+        let entry: serde_json::Value = serde_json::from_str(file.trim_end()).unwrap();
+        assert_eq!(entry["message"], "at the configured level");
+        assert_eq!(entry["spans"][0]["name"], "job");
+        assert_eq!(entry["spans"][0]["fields"]["job_id"], "run-1-2-3");
 
         let (_temp, path) = config(CONFIGURED);
         let (settings, notices) = read_settings(&path, &policy(), OperatingMode::Device);
@@ -636,14 +661,14 @@ mod tests {
         make_writable_by_regular_users(&path);
         let (settings, notices) = read_settings(&path, &Policy::system(), OperatingMode::Device);
         assert!(!settings.off && settings.dir.is_none());
-        assert_eq!(settings.filter.to_string(), DEFAULT_LEVEL);
+        assert_eq!(settings.level, DEFAULT_LEVEL);
         let [Notice::Refused { findings }] = notices.as_slice() else {
             panic!("one refusal, not {notices:?}");
         };
         let stderr = Captured::default();
         tracing::subscriber::with_default(
             subscriber(
-                EnvFilter::new(DEFAULT_LEVEL),
+                DEFAULT_LEVEL,
                 Some(stderr.clone()),
                 ExternalText::LengthOnly,
                 None,
@@ -698,7 +723,7 @@ mod tests {
         );
         let (settings, notices) = read_settings(&path, &policy(), OperatingMode::Device);
         assert!(!settings.off && settings.dir.is_none());
-        assert_eq!(settings.filter.to_string(), DEFAULT_LEVEL);
+        assert_eq!(settings.level, DEFAULT_LEVEL);
         assert!(
             matches!(
                 notices.as_slice(),

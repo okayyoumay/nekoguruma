@@ -84,8 +84,9 @@ entry whose write failed part of the way, so the next entry always starts a line
 A rotation never stops the log:
 - each step is tried even when an earlier one failed, for example a rotated file another process
   holds open, or one that cannot be deleted;
-- a current file that cannot be renamed is emptied instead. Where the OS refuses that too (a
-  Windows handle that may only append), it keeps growing, by the limit each time it is reached;
+- a current file that cannot be renamed is emptied instead (on Windows, whose append-only handle
+  cannot truncate, through a second handle). Where the OS refuses that too, it keeps growing, by
+  the limit each time it is reached;
 - when the new file cannot be opened, the renamed one is moved back and emptied. Where that fails
   too, entries go on to the renamed file: no later rotation moves or deletes it, each rotation
   tries again to open a new file and otherwise empties it, so the log stays bounded;

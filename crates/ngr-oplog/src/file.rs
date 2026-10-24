@@ -179,14 +179,14 @@ impl RotatingFile {
                     self.detached = false;
                 }
                 Err(_) => {
-                    let _ = self.file.set_len(0);
+                    let _ = self.empty();
                 }
             }
             return;
         }
         let settings = &self.settings;
         let max_files = settings.max_files.min(FileSettings::MAX_FILES_LIMIT);
-        if max_files == 0 && self.file.set_len(0).is_ok() {
+        if max_files == 0 && self.empty().is_ok() {
             return;
         }
         let renamed = if max_files > 0 {
@@ -203,9 +203,9 @@ impl RotatingFile {
             std::fs::create_dir(&self.settings.path).unwrap();
         }
         if !renamed {
-            // The file stays where it is; empty it instead. Where even that fails (a handle
-            // that may only append), it keeps growing, by the limit each time it is reached.
-            let _ = self.file.set_len(0);
+            // The file stays where it is; empty it instead. Where even that fails, it keeps
+            // growing, by the limit each time it is reached.
+            let _ = self.empty();
             return;
         }
         match self.reopen() {
@@ -217,12 +217,31 @@ impl RotatingFile {
                 if max_files > 0
                     && std::fs::rename(settings.rotated_path(1), &settings.path).is_ok()
                 {
-                    let _ = self.file.set_len(0);
+                    let _ = self.empty();
                 } else {
                     self.detached = true;
                 }
             }
         }
+    }
+
+    /// Empties the file entries go to: the one at the path, or the rotated one while detached.
+    /// A handle that may only append (Windows) cannot truncate, so the file is then truncated
+    /// through a second handle; entries go on at its new end either way.
+    fn empty(&self) -> io::Result<()> {
+        if self.file.set_len(0).is_ok() {
+            return Ok(());
+        }
+        let current = if self.detached {
+            self.settings.rotated_path(1)
+        } else {
+            self.settings.path.clone()
+        };
+        std::fs::OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(current)
+            .map(drop)
     }
 
     /// Opens a new file at the path.

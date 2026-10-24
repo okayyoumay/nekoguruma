@@ -514,6 +514,34 @@ whose VCI belongs to the other worker, and a set debug-only override of the libr
   the other worker's are recorded as refused; a job that fails, or answers that match no variant, as
   failed.
 
+## The T2 timing check
+
+`hw_t2_timing` (`ngr_hw_checks::T2_TIMING_CHECK`, declared for T2 only, no operation beyond
+reads) records a bench ECU's session timing beside the values `sim-ecu` uses (ISO 14229-2 (2021)
+9.2), so the simulator can be checked against a real ECU. The harness lists it for a T2 profile
+and refuses it on T0, T1 and T3, and the test fails without `NGR_HW_PROFILE`. It has a test
+beside each worker, `crates/j2534-0404-service/tests/hw_t2_timing.rs` for a J2534 VCI and
+`crates/iso22900-service/tests/hw_t2_timing.rs` for a D-PDU API VCI; each refuses a profile
+whose VCI belongs to the other worker and a set debug-only override of the library lookup, as the
+read check's tests do. The body is `checks::t2_timing::run`, over the guarded handle and the
+profile's link, and CI runs it against `sim-vci` behind `j2534-0404-service`
+(`tests/t2_timing_check.rs`), with the simulated ECU configured to a P2 and P2* other than
+`sim-ecu`'s defaults.
+
+- **What it sends.** DiagnosticSessionControl for the default session, whose positive response
+  carries the server's P2 in 1 ms units and P2* in 10 ms units (ISO 14229-1 (2026) 9.2), then
+  TesterPresent with its response not suppressed (9.7), `checks::t2_timing::SAMPLES` requests in
+  all. Both are on the T2 and T3 read-only list, so the guard passes them.
+- **What it records.** The reported P2 and P2* beside `sim-ecu`'s defaults
+  (`DEFAULT_P2_SERVER_MAX_MS`, `DEFAULT_P2_STAR_SERVER_MAX_MS`), each marked when it differs, and
+  the agent's round trip of each request. The round trips start before the RPC and include the
+  worker and the event path, so they are reported and never judged against P2 (design 8.11
+  "Timing judged").
+- **Result.** It passes when the ECU answers every request with its positive response; the
+  report's message holds the comparison. A reported value that differs from `sim-ecu`'s is not a
+  failure. A negative or malformed response, a request the ECU does not answer, and a link that
+  does not open fail it.
+
 ## Teardown
 
 `ngr_hw_checks::teardown::Teardown` holds the steps a check registers as it acquires a resource

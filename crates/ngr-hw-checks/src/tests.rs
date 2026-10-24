@@ -747,6 +747,40 @@ fn the_t2_t3_read_check_is_listed_for_t2_and_t3_and_refused_elsewhere() {
     );
 }
 
+/// The timing check: listed for a T2 profile only, refused on T0, T1 and T3, and it fails
+/// without a profile.
+#[test]
+fn the_t2_timing_check_is_listed_for_t2_and_refused_elsewhere() {
+    assert!(CHECKS.contains(&T2_TIMING_CHECK));
+    assert_eq!(T2_TIMING_CHECK.name, "hw_t2_timing");
+    let t2 = parse(&profile("T2", "")).unwrap();
+    assert_eq!(
+        listing(&t2, &[T2_TIMING_CHECK]),
+        "hw_t2_timing: permitted\n"
+    );
+    assert_eq!(start(&T2_TIMING_CHECK, Ok(t2.clone())), Ok(t2));
+    let t0 = parse(T0_PROFILE).unwrap();
+    let t1 = parse(&t1("")).unwrap();
+    let t3 = parse(&profile("T3", "")).unwrap();
+    for profile in [t0, t1, t3] {
+        let class = profile.class;
+        assert_eq!(
+            listing(&profile, &[T2_TIMING_CHECK]),
+            format!(
+                "hw_t2_timing: refused: the check runs on [T2], not on the profile's {class:?}\n"
+            )
+        );
+        assert!(matches!(
+            start(&T2_TIMING_CHECK, Ok(profile)),
+            Err(StartError::Refused { .. })
+        ));
+    }
+    assert_eq!(
+        start(&T2_TIMING_CHECK, Err(ProfileError::NotSet)),
+        Err(StartError::Profile(ProfileError::NotSet))
+    );
+}
+
 /// A profile's `[read]` names the definition and the read procedure's file in it; a T0 profile
 /// has no ECU to read, and the procedure is a file name, not a path.
 #[test]

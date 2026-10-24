@@ -1545,6 +1545,7 @@ dependencies = [
  "diag-ir",
  "libc",
  "serde",
+ "sim-ecu",
  "tempfile",
  "thiserror",
  "tokio",

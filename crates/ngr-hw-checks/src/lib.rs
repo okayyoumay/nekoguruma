@@ -41,7 +41,12 @@ pub struct CheckDecl {
 
 /// The declarations of every hardware check, which [`listing`] reads. A new `hw_` test adds its
 /// declaration here.
-pub const CHECKS: &[CheckDecl] = &[PROFILE_CHECK, T0_LOOPBACK_CHECK, T2_T3_READ_CHECK];
+pub const CHECKS: &[CheckDecl] = &[
+    PROFILE_CHECK,
+    T0_LOOPBACK_CHECK,
+    T2_T3_READ_CHECK,
+    T2_TIMING_CHECK,
+];
 
 /// `hw_the_profile_permits_a_check`: the profile reads and permits a check that needs nothing,
 /// on every class. It opens no device; it shows that the `hardware` run finds the profile.
@@ -67,6 +72,15 @@ pub const T0_LOOPBACK_CHECK: CheckDecl = CheckDecl {
 pub const T2_T3_READ_CHECK: CheckDecl = CheckDecl {
     name: "hw_t2_t3_read",
     classes: &[Class::T2, Class::T3],
+    operations: &[],
+};
+
+/// `hw_t2_timing`: on a bench ECU, the P2 and P2* the ECU reports and the agent's round trips of
+/// a few requests, compared with the values `sim-ecu` uses (`checks::t2_timing`). It needs a T2
+/// profile and no operation beyond reads.
+pub const T2_TIMING_CHECK: CheckDecl = CheckDecl {
+    name: "hw_t2_timing",
+    classes: &[Class::T2],
     operations: &[],
 };
 

@@ -10,6 +10,8 @@ agent = { path = "../agent" }
 diag-frontend = { path = "../diag-frontend" }
 diag-ir = { workspace = true }
 serde = { workspace = true }
+# `checks::t2_timing` compares the ECU's session timing with the simulator's defaults.
+sim-ecu = { workspace = true }
 thiserror = { workspace = true }
 tokio = { workspace = true }
 toml = { workspace = true }

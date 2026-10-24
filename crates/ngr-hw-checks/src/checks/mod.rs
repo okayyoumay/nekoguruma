@@ -4,3 +4,4 @@
 
 pub mod t0_loopback;
 pub mod t2_t3_read;
+pub mod t2_timing;

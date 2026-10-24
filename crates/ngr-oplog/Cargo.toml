@@ -1,0 +1,28 @@
+[package]
+name = "ngr-oplog"
+version.workspace = true
+license.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+# The operational log's file output (design 12.2, ADR-348 item 5): a `tracing` layer that writes
+# JSON Lines to a file rotated by size. The agent and the workers both link it, and the workers
+# are cross-built for 32-bit and ARM targets, so it keeps its dependencies few.
+[dependencies]
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_System_Threading",
+] }
+
+[dev-dependencies]
+tempfile = "3"

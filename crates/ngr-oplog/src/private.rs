@@ -67,7 +67,8 @@ pub(crate) fn open_append(path: &Path) -> io::Result<File> {
     // On Unix the file is opened to append. On Windows a handle opened to append may not
     // truncate, which a rotation needs when the file cannot be renamed, so it is opened to write
     // and its one writer moves to the end before each write ([`seek_end`]).
-    options.create(true);
+    // It is opened to read as well, so its last byte is read through this handle.
+    options.create(true).read(true);
     #[cfg(unix)]
     options.append(true);
     #[cfg(windows)]
@@ -97,6 +98,26 @@ pub(crate) fn open_append(path: &Path) -> io::Result<File> {
     restrict_file(&file)?;
     seek_end(&file)?;
     Ok(file)
+}
+
+/// The byte at `offset` in `file`, read without moving where the next write goes.
+pub(crate) fn byte_at(file: &File, offset: u64) -> io::Result<u8> {
+    let mut byte = [0u8; 1];
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(&mut byte, offset)?;
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::FileExt;
+        if file.seek_read(&mut byte, offset)? != 1 {
+            return Err(io::ErrorKind::UnexpectedEof.into());
+        }
+        // `seek_read` moves the position; the next write goes to the end again.
+        seek_end(file)?;
+    }
+    Ok(byte[0])
 }
 
 /// Moves `file`'s position to its end, where the next write goes: a no-op on Unix, where the file
@@ -181,10 +202,11 @@ mod windows {
     const READ_CONTROL: u32 = 0x0002_0000;
     const WRITE_DAC: u32 = 0x0004_0000;
     const FILE_READ_ATTRIBUTES: u32 = 0x0080;
-    /// A log file's handle: writing, its attributes (for its metadata), and reading and
-    /// changing its security.
+    const GENERIC_READ: u32 = 0x8000_0000;
+    /// A log file's handle: reading (its last byte) and writing, its attributes (for its
+    /// metadata), and reading and changing its security.
     pub(super) const FILE_ACCESS: u32 =
-        GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC;
+        GENERIC_READ | GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC;
 
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
         use std::os::windows::ffi::OsStrExt;

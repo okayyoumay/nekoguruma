@@ -114,7 +114,7 @@ impl RotatingFile {
         let mut len = file.metadata().map_err(OpenError::File)?.len();
         // A run that ended in the middle of an entry (a crash, a power loss) left a line with
         // no end; it is ended, so the first new entry starts a line of its own.
-        if len > 0 && !ends_with_line_break(&settings.path) {
+        if len > 0 && private::byte_at(&file, len - 1).is_ok_and(|byte| byte != b'\n') {
             (&file).write_all(b"\n").map_err(OpenError::File)?;
             len += 1;
         }
@@ -242,19 +242,6 @@ impl RotatingFile {
         }
         private::open_append(&self.settings.path)
     }
-}
-
-/// Whether the file at `path` ends with a line break; a file that cannot be read counts as
-/// ending with one, so nothing is added to it.
-fn ends_with_line_break(path: &Path) -> bool {
-    use std::io::{Read, Seek, SeekFrom};
-    let mut last = [0u8; 1];
-    File::open(path)
-        .and_then(|mut file| {
-            file.seek(SeekFrom::End(-1))?;
-            file.read_exact(&mut last)
-        })
-        .map_or(true, |()| last[0] == b'\n')
 }
 
 fn remove_if_present(path: &Path) -> io::Result<()> {

@@ -151,7 +151,9 @@ reads logging settings of its own. It logs at level `info` to two places.
 
   Each running agent writes a file of its own, `agent.{n}.log`, where `n` is the smallest
   number whose `agent.{n}.lock` it can lock. The file is rotated at 10 MiB, and 5 rotated
-  files are kept. When the file cannot be opened, the agent warns on stderr and logs there alone.
+  files are kept. When the file cannot be opened, the agent warns on stderr and logs there alone;
+  that stderr is the fallback ADR-348 item 5 treats as forwardable, so it writes `external`
+  fields as their length only even on a terminal.
 
 A run's entries are in a `job` span with its job id (the communication log's, when there is
 one), generation 0 and the VCI name in the span's `external` field. What an entry may hold is

@@ -38,3 +38,4 @@ libc = "0.2"
 diag-frontend = { path = "../diag-frontend" }
 sim-ecu.workspace = true
 tempfile = "3"
+tracing-core = "0.1"

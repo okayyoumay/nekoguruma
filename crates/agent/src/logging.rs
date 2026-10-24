@@ -8,7 +8,8 @@
 //!   terminal, since the OS may forward it (ADR-348 item 6);
 //! - and the rotated JSON Lines file (`ngr_oplog`) in the user's state directory, one per
 //!   running agent ([`ngr_oplog::Slot`]); when it cannot be opened the agent logs to stderr alone,
-//!   with a warning.
+//!   with a warning, and that stderr, the fallback of ADR-348 item 5, writes `external` fields as
+//!   their length only even on a terminal.
 //!
 //! Each job runs in a [`job_span`] with its job id, ownership generation and VCI name.
 
@@ -38,36 +39,69 @@ const PROCESS: &str = "agent";
 #[derive(Debug)]
 pub struct Logging {
     /// The file the log is written to, or why there is none.
-    pub file: Result<PathBuf, String>,
+    pub file: Result<PathBuf, NoFile>,
     _slot: Option<Slot>,
+}
+
+/// Why the agent has no log file: NGR's own words, and the path concerned, which may name a
+/// user's directory and so goes in the warning's `external` field (ADR-348 item 6).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NoFile {
+    pub why: String,
+    pub path: Option<PathBuf>,
 }
 
 /// Installs the agent's subscriber as the process's global default. Entries go to stderr and,
 /// unless it cannot be opened, to the rotated file in [`default_dir`]. Call once, at startup.
 pub fn install() -> Logging {
-    let external = if std::io::stderr().is_terminal() {
-        ExternalText::Full
-    } else {
-        ExternalText::LengthOnly
-    };
-    let (file, slot, json) = match default_dir().and_then(|dir| open_file(&dir)) {
-        Ok((slot, file)) => (
-            Ok(slot.path().to_owned()),
-            Some(slot),
-            Some(JsonLayer::new(PROCESS, file)),
-        ),
-        Err(why) => (Err(why), None, None),
-    };
+    let (logging, json, external) = setup(default_dir(), std::io::stderr().is_terminal());
     let installed =
         tracing::subscriber::set_global_default(subscriber(std::io::stderr, external, json))
             .is_ok();
-    if installed && let Err(why) = &file {
-        tracing::warn!(
-            external = %External(why),
-            "the operational log file could not be opened; logging to stderr only"
-        );
+    if installed && let Err(no_file) = &logging.file {
+        warn_no_file(no_file);
     }
-    Logging { file, _slot: slot }
+    logging
+}
+
+/// The file's output and how stderr writes `external` fields, for the state directory `dir`.
+/// Without the file, stderr is the fallback ADR-348 item 5 names, which item 6 treats as one
+/// the OS may forward, so it writes `external` as its length only even on a terminal.
+fn setup(
+    dir: Result<PathBuf, NoFile>,
+    stderr_is_terminal: bool,
+) -> (Logging, Option<JsonLayer>, ExternalText) {
+    match dir.and_then(|dir| open_file(&dir)) {
+        Ok((slot, file)) => (
+            Logging {
+                file: Ok(slot.path().to_owned()),
+                _slot: Some(slot),
+            },
+            Some(JsonLayer::new(PROCESS, file)),
+            if stderr_is_terminal {
+                ExternalText::Full
+            } else {
+                ExternalText::LengthOnly
+            },
+        ),
+        Err(no_file) => (
+            Logging {
+                file: Err(no_file),
+                _slot: None,
+            },
+            None,
+            ExternalText::LengthOnly,
+        ),
+    }
+}
+
+/// Logs that the file could not be opened.
+fn warn_no_file(no_file: &NoFile) {
+    tracing::warn!(
+        error = %no_file.why,
+        external = no_file.path.as_ref().map(|path| tracing::field::display(External(path.display()))),
+        "the operational log file could not be opened; logging to stderr only"
+    );
 }
 
 /// The subscriber: the level filter, then the safety filter, then the text output on `stderr`
@@ -115,18 +149,36 @@ pub fn job_span(key: &JobKey, vci: &str) -> tracing::Span {
 }
 
 /// Claims the agent's slot in `dir` and opens its file.
-fn open_file(dir: &Path) -> Result<(Slot, RotatingFile), String> {
-    let slot = Slot::claim(dir, PROCESS).map_err(|error| format!("{}: {error}", dir.display()))?;
-    let file = RotatingFile::open(FileSettings::new(slot.path()))
-        .map_err(|error| format!("{}: {error}", slot.path().display()))?;
+fn open_file(dir: &Path) -> Result<(Slot, RotatingFile), NoFile> {
+    let slot = Slot::claim(dir, PROCESS).map_err(|error| NoFile {
+        why: format!("no slot in the log directory: {}", io_kind(&error)),
+        path: Some(dir.to_owned()),
+    })?;
+    let file = RotatingFile::open(FileSettings::new(slot.path())).map_err(|error| NoFile {
+        why: match &error {
+            ngr_oplog::OpenError::Dir(io) => format!("the log directory: {}", io_kind(io)),
+            ngr_oplog::OpenError::File(io) => format!("the log file: {}", io_kind(io)),
+        },
+        path: Some(slot.path().to_owned()),
+    })?;
     Ok((slot, file))
+}
+
+/// An I/O error as its kind and OS code, which hold no path or other outside text.
+fn io_kind(error: &std::io::Error) -> String {
+    match error.raw_os_error() {
+        Some(code) => format!("{:?} (OS error {code})", error.kind()),
+        None => format!("{:?}", error.kind()),
+    }
 }
 
 /// The directory of the agent's log when run by a user (design 12.2): the user's state
 /// directory, `$XDG_STATE_HOME/nekoguruma/logs` (an absolute `XDG_STATE_HOME`, else
 /// `~/.local/state`) on Unix, `%LOCALAPPDATA%\nekoguruma\logs` on Windows.
-pub fn default_dir() -> Result<PathBuf, String> {
-    state_dir(|name| std::env::var_os(name)).map(|dir| dir.join("nekoguruma").join("logs"))
+pub fn default_dir() -> Result<PathBuf, NoFile> {
+    state_dir(|name| std::env::var_os(name))
+        .map(|dir| dir.join("nekoguruma").join("logs"))
+        .map_err(|why| NoFile { why, path: None })
 }
 
 /// The user's state directory from the environment `var` reads.
@@ -226,6 +278,47 @@ mod tests {
             }])
         );
         assert_eq!(slot.path(), temp.path().join("logs").join("agent.0.log"));
+    }
+
+    /// Without the file, stderr is the fallback, which writes `external` as its length even on a
+    /// terminal; the warning says why in NGR's words and puts the path in `external`.
+    #[test]
+    fn without_the_file_stderr_warns_and_writes_external_as_its_length() {
+        let temp = tempfile::tempdir().unwrap();
+        // A file where the log directory should be.
+        let dir = temp.path().join("logs");
+        std::fs::write(&dir, b"").unwrap();
+        let (logging, json, external) = setup(Ok(dir.clone()), true);
+        assert!(json.is_none());
+        assert_eq!(external, ExternalText::LengthOnly);
+        let no_file = logging.file.unwrap_err();
+        assert_eq!(no_file.path.as_deref(), Some(dir.as_path()));
+        let stderr = Captured::default();
+        tracing::subscriber::with_default(subscriber(stderr.clone(), external, None), || {
+            warn_no_file(&no_file)
+        });
+        let text = String::from_utf8(stderr.0.lock().unwrap().clone()).unwrap();
+        assert!(
+            text.contains("logging to stderr only error=\"no slot in the log directory: "),
+            "{text}"
+        );
+        assert!(!text.contains(temp.path().to_str().unwrap()), "{text}");
+        let length = dir.display().to_string().len();
+        assert!(
+            text.ends_with(&format!("external=<{length} bytes>\n")),
+            "{text}"
+        );
+        // With no state directory at all there is no path to name.
+        let no_dir = NoFile {
+            why: "neither XDG_STATE_HOME nor HOME is set".to_owned(),
+            path: None,
+        };
+        let (logging, _, _) = setup(Err(no_dir), true);
+        assert_eq!(logging.file.unwrap_err().path, None);
+        // With the file, a terminal's stderr writes `external` in full.
+        let (logging, json, external) = setup(Ok(temp.path().join("ok")), true);
+        assert!(logging.file.is_ok() && json.is_some());
+        assert_eq!(external, ExternalText::Full);
     }
 
     /// A stderr that is not a terminal writes `external` fields as their length only.

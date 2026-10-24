@@ -28,10 +28,11 @@ pub enum ExternalText {
 /// Writes each event as one line:
 ///
 /// ```text
-/// 2026-10-24T06:40:07.123456Z  WARN agent::runner: job{job_id="run-1" generation=0 external=<7 bytes>}: could not close the link error="..." external=<12 bytes>
+/// 2026-10-24T06:40:07.123456Z  WARN agent::runner: job{generation=0 job_id="run-1" external=<7 bytes>}: could not close the link error="..." external=<12 bytes>
 /// ```
 ///
-/// The spans come root first, then the message, then the event's fields. A string field is
+/// The spans come root first, then the message, then the event's fields, each in name order. A
+/// string field is
 /// written quoted and escaped, the message with its line breaks and control characters escaped,
 /// so an entry stays one line. A failed write is dropped: the log cannot report its own failure.
 #[derive(Debug)]
@@ -108,18 +109,12 @@ impl<W> TextLayer<W> {
     }
 }
 
-/// `text` with its backslashes, line breaks and other control characters escaped.
+/// `text` escaped as `Debug` escapes a string, without the quotes: backslashes, line breaks,
+/// control characters and other characters that are not printed as themselves (the Unicode line
+/// and paragraph separators, bidirectional overrides) become escapes.
 fn escape(text: &str) -> String {
-    text.chars()
-        .flat_map(|c| {
-            let escaped: String = if c == '\\' || c.is_control() {
-                c.escape_default().collect()
-            } else {
-                c.to_string()
-            };
-            escaped.chars().collect::<Vec<_>>()
-        })
-        .collect()
+    let quoted = format!("{text:?}");
+    quoted[1..quoted.len() - 1].to_owned()
 }
 
 impl<S, W> Layer<S> for TextLayer<W>
@@ -205,6 +200,19 @@ mod tests {
                  pc=7 external=\"vendor\\nsaid\"\n",
                 module_path!()
             )
+        );
+    }
+
+    /// The Unicode line and paragraph separators and a bidirectional override in a message are
+    /// escaped, as in a quoted field.
+    #[test]
+    fn a_message_s_unicode_line_breaks_are_escaped() {
+        let text = lines(ExternalText::Full, || {
+            tracing::warn!("a\u{2028}b\u{2029}c\u{202e}d\\e\r")
+        });
+        assert!(
+            text.ends_with("a\\u{2028}b\\u{2029}c\\u{202e}d\\\\e\\r\n"),
+            "{text:?}"
         );
     }
 

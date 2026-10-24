@@ -15465,8 +15465,13 @@ def main():
     }
 
     /// Every event any test of this process emits through `tracing`, as text: the global
-    /// subscriber, since the VM runs on a blocking thread of its own.
+    /// subscriber, since the VM runs on a blocking thread of its own. An event's text starts with
+    /// the fields of the spans the emitting thread is in, so a test sees which job it belongs to.
     fn traced() -> &'static Mutex<Vec<String>> {
+        use std::cell::RefCell;
+        use std::collections::HashMap;
+        use std::sync::atomic::AtomicU64;
+
         struct Capture(&'static Mutex<Vec<String>>);
         struct Text(String);
         impl tracing::field::Visit for Text {
@@ -15474,25 +15479,76 @@ def main():
                 self.0.push_str(&format!(" {}={value:?}", field.name()));
             }
         }
+        /// Each span's fields as text and its metadata, by id.
+        static SPANS: std::sync::OnceLock<
+            Mutex<HashMap<u64, (String, &'static tracing::Metadata<'static>)>>,
+        > = std::sync::OnceLock::new();
+        static NEXT_SPAN: AtomicU64 = AtomicU64::new(1);
+        thread_local! {
+            /// The spans this thread is in, innermost last.
+            static ENTERED: RefCell<Vec<u64>> = const { RefCell::new(Vec::new()) };
+        }
+        fn spans() -> &'static Mutex<HashMap<u64, (String, &'static tracing::Metadata<'static>)>> {
+            SPANS.get_or_init(Default::default)
+        }
         impl tracing::Subscriber for Capture {
             fn enabled(&self, _: &tracing::Metadata<'_>) -> bool {
                 true
             }
-            fn new_span(&self, _: &tracing::span::Attributes<'_>) -> tracing::span::Id {
-                tracing::span::Id::from_u64(1)
+            fn new_span(&self, attrs: &tracing::span::Attributes<'_>) -> tracing::span::Id {
+                let id = NEXT_SPAN.fetch_add(1, Ordering::Relaxed);
+                let mut text = Text(format!("{}{{", attrs.metadata().name()));
+                attrs.record(&mut text);
+                text.0.push('}');
+                spans()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .insert(id, (text.0, attrs.metadata()));
+                tracing::span::Id::from_u64(id)
             }
             fn record(&self, _: &tracing::span::Id, _: &tracing::span::Record<'_>) {}
             fn record_follows_from(&self, _: &tracing::span::Id, _: &tracing::span::Id) {}
             fn event(&self, event: &tracing::Event<'_>) {
                 let mut text = Text(String::new());
+                ENTERED.with(|entered| {
+                    let spans = spans().lock().unwrap_or_else(|e| e.into_inner());
+                    for id in entered.borrow().iter() {
+                        if let Some((span, _)) = spans.get(id) {
+                            text.0.push_str(span);
+                            text.0.push(':');
+                        }
+                    }
+                });
                 event.record(&mut text);
                 self.0
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .push(text.0);
             }
-            fn enter(&self, _: &tracing::span::Id) {}
-            fn exit(&self, _: &tracing::span::Id) {}
+            fn enter(&self, id: &tracing::span::Id) {
+                ENTERED.with(|entered| entered.borrow_mut().push(id.into_u64()));
+            }
+            fn exit(&self, id: &tracing::span::Id) {
+                ENTERED.with(|entered| {
+                    let mut entered = entered.borrow_mut();
+                    if let Some(at) = entered
+                        .iter()
+                        .rposition(|entered| *entered == id.into_u64())
+                    {
+                        entered.remove(at);
+                    }
+                });
+            }
+            fn current_span(&self) -> tracing_core::span::Current {
+                let current = ENTERED.with(|entered| entered.borrow().last().copied());
+                let spans = spans().lock().unwrap_or_else(|e| e.into_inner());
+                match current.and_then(|id| spans.get(&id).map(|(_, metadata)| (id, *metadata))) {
+                    Some((id, metadata)) => {
+                        tracing_core::span::Current::new(tracing::span::Id::from_u64(id), metadata)
+                    }
+                    None => tracing_core::span::Current::none(),
+                }
+            }
         }
         static TRACED: std::sync::OnceLock<&'static Mutex<Vec<String>>> =
             std::sync::OnceLock::new();
@@ -15502,6 +15558,39 @@ def main():
                 .expect("no other test sets a global subscriber");
             traced
         })
+    }
+
+    /// The job's span reaches the VM's thread: what the procedure's run logs there carries the
+    /// job's id (ADR-348 item 3).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_the_vm_thread_logs_is_in_the_job_s_span() {
+        use tracing::Instrument;
+        let traced = traced();
+        let dir = journal_dir("comm-log-job-span");
+        let mut logging = program(vec![Op::Log {
+            level: 2,
+            message: 0,
+        }]);
+        logging.constants = vec![b"hello".to_vec()];
+        let job = Job::from(logging).with_comm_log_dir(dir.clone());
+        let key = crate::journal::JobKey {
+            job_id: shared_proto::JobId("span-test-7f3a".to_owned()),
+            generation: 2,
+        };
+        let span = crate::logging::job_span(&key, "bench VCI");
+        let run = bare_run(job, "comm-log-job-span").instrument(span).await;
+        run.result.expect("the program runs");
+        let traced = traced.lock().unwrap_or_else(|e| e.into_inner());
+        let logged: Vec<_> = traced
+            .iter()
+            .filter(|event| event.contains("the procedure logged a message"))
+            .filter(|event| event.contains("span-test-7f3a"))
+            .collect();
+        assert_eq!(logged.len(), 1, "{traced:?}");
+        assert!(logged[0].starts_with("job{"), "{logged:?}");
+        assert!(logged[0].contains("generation=2"), "{logged:?}");
+        drop(traced);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A `diag.log` message goes to the communication log as a `procedure_log` event with its

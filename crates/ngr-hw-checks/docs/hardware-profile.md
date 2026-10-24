@@ -484,10 +484,15 @@ carrying its own address byte.
 `hw_t2_t3_read` (`ngr_hw_checks::T2_T3_READ_CHECK`, declared for T2 and T3, no operation beyond
 reads) runs a CSV + Starlark definition's reads on a bench ECU or a vehicle through the agent's job
 runner. The harness lists it for a T2 or T3 profile and refuses it on T0 and T1, and the test
-fails without `NGR_HW_PROFILE`. Its test is `crates/j2534-0404-service/tests/hw_t2_t3_read.rs`,
-for a J2534 VCI; its body is `checks::t2_t3_read::run`, over the guarded client
-(`guard::GuardedClient`, ADR-334), so CI runs it against `sim-vci` behind
-`j2534-0404-service` (`tests/t2_t3_read_check.rs`, on the example ECU's definition).
+fails without `NGR_HW_PROFILE`. It has a test beside each worker, under the same name:
+`crates/j2534-0404-service/tests/hw_t2_t3_read.rs` for a J2534 VCI and
+`crates/iso22900-service/tests/hw_t2_t3_read.rs` for a D-PDU API VCI. Both run the body
+`checks::t2_t3_read::run` over the guarded client (`guard::GuardedClient`, ADR-334), so CI runs
+it on the example ECU's definition through each worker (`tests/t2_t3_read_check.rs` in both
+crates): against `sim-vci` behind `j2534-0404-service`, and against the simulated ECU
+`iso22900-mock` answers from (ADR-299) behind `iso22900-service`. Each test refuses a profile
+whose VCI belongs to the other worker, and a set debug-only override of the library lookup
+(`NGR_J2534_DEFINITION_DIR` or `NGR_PDU_API_ROOT_FILE`, ADR-282).
 
 - **The definition.** The profile's `[read]` names it. `checks::t2_t3_read::convert` converts
   every file of `definition` but the Starlark ones (`.star` in any case, as the frontend reads
@@ -505,8 +510,8 @@ for a J2534 VCI; its body is `checks::t2_t3_read::run`, over the guarded client
 - **What the guard does.** Every request goes through it, so on T2 and T3 a write, routine, reset
   or security access is refused before it reaches the worker, and the job fails with the refusal.
 - **Result.** It passes with the variant identified when the read procedure finishes. A
-  definition that does not convert, a profile without `[read]`, and a profile whose VCI is a
-  D-PDU API one are recorded as refused; a job that fails, or answers that match no variant, as
+  definition that does not convert, a profile without `[read]`, and a profile whose VCI is
+  the other worker's are recorded as refused; a job that fails, or answers that match no variant, as
   failed.
 
 ## Teardown

@@ -138,13 +138,16 @@ The worker's own log goes to stderr.
 
 ## Operational log
 
-The agent logs its own `tracing` events (design 12.2, ADR-348), with fixed settings until it
-reads logging settings of its own. It logs at level `info` to two places.
+The agent logs its own `tracing` events (design 12.2, ADR-348), with the settings of its own
+table in the configuration file, `[config.agent.logging]` (`level`, `output`, `dir`;
+`crates/vci-service-config/docs/logging-config.md`). Without them it logs at level `info` to two
+places; `output = "null"` turns both off, the only setting that turns the file off (ADR-348
+item 3).
 
-- **stderr**, as one line of text per entry. When stderr is not a terminal, for example when a
-  service manager collects it, each `external` field is written as its length only, since the
-  OS may forward that output off the device (ADR-348 item 6).
-- **A JSON Lines file** in the user's state directory (`ngr_oplog`):
+- **stderr**, as one line of text per entry. When stderr is not a
+  terminal, for example when a service manager collects it, each `external` field is written as
+  its length only, since the OS may forward that output off the device (ADR-348 item 6).
+- **A JSON Lines file** (`ngr_oplog`) in the configured `dir`, else the user's state directory:
   - `$XDG_STATE_HOME/nekoguruma/logs/` (an absolute `XDG_STATE_HOME`), else
     `~/.local/state/nekoguruma/logs/`, on Unix;
   - `%LOCALAPPDATA%\nekoguruma\logs\` on Windows.
@@ -154,6 +157,14 @@ reads logging settings of its own. It logs at level `info` to two places.
   files are kept. When the file cannot be opened, the agent warns on stderr and logs there alone;
   that stderr is the fallback ADR-348 item 5 treats as forwardable, so it writes `external`
   fields as their length only even on a terminal.
+
+The agent checks the configuration file with the design 7.2 writability rules before it reads
+the settings, as a worker does (ADR-285), with the device's `--mode`: in device mode a file
+regular users can change is not read, and the agent logs with the defaults above and warns; in
+user mode the file is read and the findings are logged as a warning. A setting that cannot be
+used (a level that is not a filter directive, an output other than `"stderr"` or `"null"`, a
+relative directory) keeps its default, with a warning, and so do all of them when the file does
+not parse. The paths and the file's own text in those warnings are in their `external` field.
 
 A run's entries are in a `job` span with its job id (the communication log's, when there is
 one), generation 0 and the VCI name in the span's `external` field. What an entry may hold is

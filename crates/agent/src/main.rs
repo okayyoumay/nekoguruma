@@ -80,8 +80,9 @@ fn main() -> ExitCode {
         }
     };
     // The operational log (design 12.2), kept for the process's lifetime: stderr and the
-    // rotated file in the user's state directory (`crates/agent/docs/ngr-agent.md`).
-    let _logging = agent::logging::install();
+    // rotated file, with the settings of the configuration file checked for the device's mode
+    // (`crates/agent/docs/ngr-agent.md`).
+    let _logging = agent::logging::install(args.mode);
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
     let runtime = match tokio::runtime::Builder::new_multi_thread()

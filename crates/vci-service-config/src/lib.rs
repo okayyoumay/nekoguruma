@@ -174,6 +174,27 @@ pub struct FileOutput {
     pub file: String,
 }
 
+/// The agent's own logging settings, `[config.agent.logging]` (design 12.2, ADR-348 item 3).
+/// The agent checks the file as a worker does before it reads them (ADR-285).
+///
+/// ```toml
+/// [config.agent.logging]
+/// level = "info"
+/// output = "stderr"
+/// dir = "/var/log/nekoguruma"
+/// ```
+#[derive(Debug, Clone, Deserialize, Default)]
+pub struct AgentLoggingConfig {
+    /// `tracing-subscriber` EnvFilter directive string, as a worker's `level`.
+    pub level: Option<String>,
+    /// The agent's output besides its rotated file, as a worker's `output`. Of the values a
+    /// worker takes the agent writes `"stderr"`; `"null"` turns its whole log off, the file
+    /// included (ADR-348 item 3).
+    pub output: Option<LogOutput>,
+    /// The directory of the agent's rotated JSON Lines file. Must be absolute.
+    pub dir: Option<PathBuf>,
+}
+
 /// One pre-declared J2534 v04.04 device-selection entry, from a
 /// `[[config.apis.j2534-0404.libs."<lib>".modules]]` array-of-tables entry
 /// (see ADR-106).
@@ -321,10 +342,16 @@ struct ApiConfig {
 }
 
 #[derive(Debug, Deserialize, Default)]
+struct AgentConfig {
+    logging: Option<AgentLoggingConfig>,
+}
+
+#[derive(Debug, Deserialize, Default)]
 struct RootConfig {
     logging: Option<LoggingConfig>,
     apis: Option<HashMap<String, ApiConfig>>,
     manager: Option<ManagerConfig>,
+    agent: Option<AgentConfig>,
 }
 
 /// Top-level TOML document: `[config]` table.
@@ -635,7 +662,11 @@ fn known_folder(rfid: &windows_sys::core::GUID) -> PathBuf {
 /// legitimate "nothing configured" state, distinct from "file exists but is
 /// broken" — and resolves to `Ok(TomlConfig::default())`.
 fn try_load_toml_config() -> Result<TomlConfig, ConfigFileError> {
-    let path = config_file_path();
+    try_load_toml_config_at(config_file_path())
+}
+
+/// [`try_load_toml_config`] for the file at `path`.
+fn try_load_toml_config_at(path: PathBuf) -> Result<TomlConfig, ConfigFileError> {
     let content = match fs::read_to_string(&path) {
         Ok(s) => s,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(TomlConfig::default()),
@@ -715,6 +746,18 @@ pub fn find_logging_config(
 
     // Priority 5: root config
     root.logging.unwrap_or_default()
+}
+
+/// The agent's logging settings (`[config.agent.logging]`) in the configuration file at
+/// `path`, the agent's [`config_file`]. A missing file or table configures nothing; a file that
+/// cannot be read or parsed is an error, which the agent reports in its own log once it has
+/// started with its defaults.
+pub fn find_agent_logging_config(path: &Path) -> Result<AgentLoggingConfig, ConfigFileError> {
+    Ok(try_load_toml_config_at(path.to_owned())?
+        .config
+        .and_then(|root| root.agent)
+        .and_then(|agent| agent.logging)
+        .unwrap_or_default())
 }
 
 /// Return a configured vendor STRUCTFIELD entry size (bytes) for the given
@@ -1220,6 +1263,39 @@ mod tests {
         fs::create_dir_all(full_path.parent().unwrap()).expect("create config dir");
         fs::write(&full_path, contents).expect("write test config.toml");
         guard
+    }
+
+    #[test]
+    fn the_agent_s_logging_table_is_read_from_the_named_file() {
+        let temp = tempfile::tempdir().expect("create temp dir");
+        let path = temp.path().join("config.toml");
+        // No file and no table both configure nothing.
+        let none = find_agent_logging_config(&path).expect("a missing file is no error");
+        assert!(none.level.is_none() && none.output.is_none() && none.dir.is_none());
+        fs::write(&path, "[config.logging]\nlevel = \"debug\"\n").unwrap();
+        let none = find_agent_logging_config(&path).expect("no agent table");
+        assert!(none.level.is_none(), "a worker's table is not the agent's");
+
+        fs::write(
+            &path,
+            "[config.agent.logging]\nlevel = \"agent=debug,warn\"\noutput = \"null\"\n\
+             dir = \"/var/log/nekoguruma\"\n",
+        )
+        .unwrap();
+        let config = find_agent_logging_config(&path).expect("the agent's table");
+        assert_eq!(config.level.as_deref(), Some("agent=debug,warn"));
+        assert!(matches!(
+            config.output,
+            Some(LogOutput::Named(LogOutputKind::Null))
+        ));
+        assert_eq!(config.dir, Some(PathBuf::from("/var/log/nekoguruma")));
+
+        // A file that does not parse is an error, not a silent default.
+        fs::write(&path, "[config.agent.logging]\nlevel = 3\n").unwrap();
+        assert!(matches!(
+            find_agent_logging_config(&path),
+            Err(ConfigFileError::Parse { .. })
+        ));
     }
 
     #[test]

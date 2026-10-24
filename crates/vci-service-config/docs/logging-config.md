@@ -1,7 +1,7 @@
 # vci-service-config Configuration
 
 This document covers the full `config.toml` schema loaded by
-`vci-service-config`: logging settings, the per-library worker settings,
+`vci-service-config`: logging settings (the workers' and the agent's), the per-library worker settings,
 the J2534 module selection and the vendor settings. `vci-service-launcher` re-exports this crate as
 `vci_service_launcher::config` (see ADR-033), so every service built on the
 launcher template picks this schema up automatically.
@@ -113,6 +113,36 @@ Specifies where log records are written. Defaults to `"stderr"` when omitted.
 | `"eventlog"` | Windows Event Log. Requires the `eventlog` Cargo feature; falls back to `stderr` on non-Windows. |
 | `"journald"` | systemd journal. Requires the `journald` Cargo feature; falls back to `stderr` on non-Linux. |
 | `{ file = "<path>" }` | Append to a file. The file is created if it does not exist. Falls back to `stderr` if the file cannot be opened. |
+
+### The agent's table: `[config.agent.logging]`
+
+`ngr-agent` reads a table of its own, not the workers' hierarchy below (design 12.2, ADR-348
+item 3; `find_agent_logging_config`). It has no per-API or per-library levels.
+
+```toml
+[config.agent.logging]
+level = "info"                   # EnvFilter directive, as a worker's `level`; default "info"
+output = "stderr"                # "stderr" (default), or "null" for no log at all
+dir = "/var/log/nekoguruma"      # absolute directory of the agent's JSON Lines file
+```
+
+- `level` is a filter directive as for a worker. The agent applies its safety filter after it,
+  which no level raises (ADR-348 item 9).
+- `output` is the agent's output besides its rotated JSON Lines file, which it writes whatever
+  `output` names (ADR-348 item 3). Of a worker's values the agent writes `"stderr"`; `"null"`
+  turns the whole log off, the file included, and is the only setting that does. The agent's
+  file is the one in `dir`, so `{ file = ... }`, like `"eventlog"` and `"journald"`, keeps
+  stderr with a warning.
+- `dir` must be absolute; without it the file is in the user's state directory
+  (`crates/agent/docs/ngr-agent.md`, "Operational log"). A relative directory keeps the default
+  with a warning.
+
+The agent checks the file with the design 7.2 writability rules before it reads the table, as a
+worker does (ADR-285), in the mode it runs with. In device mode a file regular users can change
+is not read: the agent logs with its defaults and warns, and still runs (the worker it launches
+refuses such a file itself). In user mode the table is read and the findings are logged as a
+warning. Unlike a worker, the agent does not fall back silently on a file it cannot parse: it
+logs with its defaults and warns.
 
 ---
 

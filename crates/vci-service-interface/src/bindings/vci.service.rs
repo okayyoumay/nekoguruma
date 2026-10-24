@@ -493,7 +493,7 @@ pub struct EventItem {
     /// for that COP. Absent otherwise -- never a zero-length sentinel.
     #[prost(bytes = "vec", optional, tag = "9")]
     pub cop_tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 10, 8")]
     pub data: ::core::option::Option<event_item::Data>,
 }
 /// Nested message and enum types in `EventItem`.
@@ -508,11 +508,24 @@ pub mod event_item {
         CllStatus(i32),
         #[prost(enumeration = "super::PduComPrimitiveStatus", tag = "6")]
         CopStatus(i32),
-        #[prost(enumeration = "super::PduErrorEvent", tag = "7")]
-        ErrorData(i32),
+        /// ADR-350: the error event with its additional error code; it was
+        /// a bare PDUErrorEvent under tag 7, which stays reserved.
+        #[prost(message, tag = "10")]
+        ErrorData(super::ErrorData),
         #[prost(enumeration = "super::PduInfo", tag = "8")]
         InfoData(i32),
     }
+}
+/// ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ErrorData {
+    #[prost(enumeration = "PduErrorEvent", tag = "1")]
+    pub error_event: i32,
+    /// The item's additional error code (D.4.2, ExtraErrorInfoId), whose
+    /// meaning the library's MDF gives. Absent when the worker has none, as
+    /// for every J2534 error event.
+    #[prost(uint32, optional, tag = "2")]
+    pub extra_error_info: ::core::option::Option<u32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LostEventItemNotification {}
@@ -627,6 +640,10 @@ pub struct ErrorDetail {
     /// Absent when unavailable.
     #[prost(string, optional, tag = "3")]
     pub detail_text: ::core::option::Option<::prost::alloc::string::String>,
+    /// ADR-350: set on a refused StartComPrimitive only, and only when the
+    /// worker knows the request was not sent: why it was refused.
+    #[prost(enumeration = "RefusalReason", optional, tag = "4")]
+    pub refusal: ::core::option::Option<i32>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ResourceStatusResponse {
@@ -1639,6 +1656,43 @@ impl CllCreateFlagBit {
             "CLL_CREATE_FLAG_BIT_UNSPECIFIED" => Some(Self::Unspecified),
             "CLL_CREATE_FLAG_CHECKSUM_MODE" => Some(Self::CllCreateFlagChecksumMode),
             "CLL_CREATE_FLAG_RAW_MODE" => Some(Self::CllCreateFlagRawMode),
+            _ => None,
+        }
+    }
+}
+/// ADR-350: why a worker refused a StartComPrimitive before sending it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum RefusalReason {
+    Unspecified = 0,
+    /// The request's parameters are invalid (PDU_ERR_INVALID_PARAMETERS).
+    InvalidParameters = 1,
+    /// The link's transmit queue is full (PDU_ERR_TX_QUEUE_FULL).
+    QueueFull = 2,
+    /// The link's protocol cannot carry the request, such as a request longer
+    /// than its transport allows.
+    ProtocolCannotCarry = 3,
+}
+impl RefusalReason {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "REFUSAL_REASON_UNSPECIFIED",
+            Self::InvalidParameters => "REFUSAL_REASON_INVALID_PARAMETERS",
+            Self::QueueFull => "REFUSAL_REASON_QUEUE_FULL",
+            Self::ProtocolCannotCarry => "REFUSAL_REASON_PROTOCOL_CANNOT_CARRY",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "REFUSAL_REASON_UNSPECIFIED" => Some(Self::Unspecified),
+            "REFUSAL_REASON_INVALID_PARAMETERS" => Some(Self::InvalidParameters),
+            "REFUSAL_REASON_QUEUE_FULL" => Some(Self::QueueFull),
+            "REFUSAL_REASON_PROTOCOL_CANNOT_CARRY" => Some(Self::ProtocolCannotCarry),
             _ => None,
         }
     }

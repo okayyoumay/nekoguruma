@@ -55,7 +55,7 @@ use vci_service_interface::{
     ComLogicalLinkResponse, ComOperationType, ComParamResponse, ComPrimitiveCtrlData,
     ComPrimitiveHandle, ComPrimitiveResponse, ConflictingResourcesResponse,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, EcuUniqueRespData, EventItem, EventNotification,
+    DisconnectComLogicalLinkRequest, EcuUniqueRespData, ErrorData, EventItem, EventNotification,
     ExpectedResponseData, GetComParamRequest, GetConflictingResourcesRequest, GetModuleIdsRequest,
     GetObjectIdRequest, GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest,
     GetTimestampRequest, GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest,
@@ -713,7 +713,7 @@ impl Progress {
         if item.cop_handle.is_none_or(|handle| handle == cop)
             && matches!(
                 item.data,
-                Some(event_item::Data::ErrorData(code))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: code, .. }))
                     if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
             )
         {
@@ -730,9 +730,12 @@ impl Progress {
                 self.response = Some(result.data_bytes);
             }
             // The ECU did not answer: reported as no response when the primitive ends.
-            Some(event_item::Data::ErrorData(code))
-                if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {}
-            Some(event_item::Data::ErrorData(code)) => self.error = Some(code),
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: code, ..
+            })) if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {}
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: code, ..
+            })) => self.error = Some(code),
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
                     || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
@@ -2131,9 +2134,10 @@ impl GuardedHandle {
                 handle.is_some() && (handle == monitor || handle == send)
             };
             match item.data {
-                Some(event_item::Data::ErrorData(code))
-                    if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
-                        && (item.cop_handle.is_none() || ours(item.cop_handle)) =>
+                Some(event_item::Data::ErrorData(ErrorData {
+                    error_event: code, ..
+                })) if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
+                    && (item.cop_handle.is_none() || ours(item.cop_handle)) =>
                 {
                     return Err(HandleError::VciLost);
                 }
@@ -2156,10 +2160,11 @@ impl GuardedHandle {
                     }
                     frames.push_back(result.data_bytes);
                 }
-                Some(event_item::Data::ErrorData(code))
-                    if send.is_some()
-                        && item.cop_handle == send
-                        && code != PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                Some(event_item::Data::ErrorData(ErrorData {
+                    error_event: code, ..
+                })) if send.is_some()
+                    && item.cop_handle == send
+                    && code != PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                 {
                     return Err(HandleError::SendFailed(format!(
                         "transmit error event {code:#x}"
@@ -3009,7 +3014,17 @@ mod tests {
             ..COP
         };
         let ended = |cop: Option<ComPrimitiveHandle>| {
-            Progress::default().on_item(event(cop, event_item::Data::ErrorData(lost)), COP, None)
+            Progress::default().on_item(
+                event(
+                    cop,
+                    event_item::Data::ErrorData(ErrorData {
+                        error_event: lost,
+                        extra_error_info: None,
+                    }),
+                ),
+                COP,
+                None,
+            )
         };
         // For the whole link, with no primitive handle, or for this primitive.
         for cop in [None, Some(COP)] {
@@ -3024,7 +3039,17 @@ mod tests {
         let tx = PduErrorEvent::PduErrEvtTxError as i32;
         assert!(
             Progress::default()
-                .on_item(event(None, event_item::Data::ErrorData(tx)), COP, None)
+                .on_item(
+                    event(
+                        None,
+                        event_item::Data::ErrorData(ErrorData {
+                            error_event: tx,
+                            extra_error_info: None
+                        })
+                    ),
+                    COP,
+                    None
+                )
                 .is_none()
         );
     }
@@ -3051,7 +3076,16 @@ mod tests {
         assert!(matches!(done, Some(Outcome::Ended(Ok(r))) if r == [0x62, 0xF1, 0x90, 1]));
         let mut failed = Progress::default();
         let tx = PduErrorEvent::PduErrEvtTxError as i32;
-        assert!(on(&mut failed, event_item::Data::ErrorData(tx)).is_none());
+        assert!(
+            on(
+                &mut failed,
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: tx,
+                    extra_error_info: None
+                })
+            )
+            .is_none()
+        );
         let done = on(
             &mut failed,
             event_item::Data::CopStatus(PduComPrimitiveStatus::PduCopstCancelled as i32),

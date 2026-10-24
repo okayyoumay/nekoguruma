@@ -26,8 +26,8 @@ use serial_test::serial;
 use tonic::Code;
 use vci_service_interface::{
     ComOperationType, ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, IoCtlRequest, ModuleHandle, PduError, PinData, ResourceData,
-    StartComPrimitiveRequest, SubscribeEventRequest, create_com_logical_link_request,
+    DisconnectComLogicalLinkRequest, ErrorData, IoCtlRequest, ModuleHandle, PduError, PinData,
+    ResourceData, StartComPrimitiveRequest, SubscribeEventRequest, create_com_logical_link_request,
     error_detail_from_status, event_item, io_ctl_request, resource_data, subscribe_event_request,
 };
 
@@ -40,7 +40,7 @@ use crate::harness::*;
 fn is_prot_err_error(item: &vci_service_interface::EventItem) -> bool {
     matches!(
         item.data,
-        Some(event_item::Data::ErrorData(error))
+        Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
             if error == vci_service_interface::PduErrorEvent::PduErrEvtProtErr as i32
     )
 }

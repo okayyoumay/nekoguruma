@@ -9,7 +9,7 @@ use iso22900::{
 };
 use vci_service_interface::{
     ComLogicalLinkHandle as VciServiceComLogicalLinkHandle,
-    ComPrimitiveHandle as VciServiceComPrimitiveHandle, EventItem,
+    ComPrimitiveHandle as VciServiceComPrimitiveHandle, ErrorData, EventItem,
     EventNotification as VciServiceEventNotification, ExtraInfo, LostEventItemNotification,
     ModuleHandle as VciServiceModuleHandle, ResultData, SystemHandle,
     event_item::Data as EventItemData,
@@ -105,7 +105,12 @@ pub(super) fn to_proto_event_item(
         Err(DPduApiError::Unsupported(_)) => match borrowed.status_data() {
             Ok(status) => Some(EventItemData::CopStatus(status.status() as i32)),
             Err(DPduApiError::Unsupported(_)) => match borrowed.error_data() {
-                Ok(error) => Some(EventItemData::ErrorData(error.error_code_id().0 as i32)),
+                // The item's additional error code (ISO 22900-2:2022 D.4.2) is passed on as the
+                // library gives it (ADR-350).
+                Ok(error) => Some(EventItemData::ErrorData(ErrorData {
+                    error_event: error.error_code_id().0 as i32,
+                    extra_error_info: Some(error.extra_error_info_id()),
+                })),
                 Err(DPduApiError::Unsupported(_)) => match borrowed.info_data() {
                     Ok(info) => Some(EventItemData::InfoData(info.info_code().0 as i32)),
                     Err(DPduApiError::Unsupported(_)) => None,

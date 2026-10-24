@@ -405,6 +405,10 @@ async fn iso15765_protocol_rejects_cop_data_outside_size_range() {
         "{}",
         status.message()
     );
+    assert_eq!(
+        refusal(&status),
+        Some(vci_service_interface::RefusalReason::InvalidParameters)
+    );
     assert_eq!(server.backdoor.written_count(MOCK_CHANNEL_ID), 0);
 
     set_can_phys_req_id_and_promote(&mut client, cll_handle, 0x7E0).await;
@@ -418,6 +422,11 @@ async fn iso15765_protocol_rejects_cop_data_outside_size_range() {
         status.message().contains("4..=4099"),
         "{}",
         status.message()
+    );
+    // The protocol cannot carry it, which the refusal names (ADR-350).
+    assert_eq!(
+        refusal(&status),
+        Some(vci_service_interface::RefusalReason::ProtocolCannotCarry)
     );
     assert_eq!(server.backdoor.written_count(MOCK_CHANNEL_ID), 0);
 
@@ -2480,4 +2489,11 @@ async fn sci_timing_params_convert_from_microseconds_to_native_units() {
     );
 
     server.shutdown().await;
+}
+
+/// The refusal reason a refused `StartComPrimitive` names (ADR-350).
+fn refusal(status: &tonic::Status) -> Option<vci_service_interface::RefusalReason> {
+    vci_service_interface::error_detail_from_status(status)
+        .and_then(|detail| detail.refusal)
+        .and_then(|reason| vci_service_interface::RefusalReason::try_from(reason).ok())
 }

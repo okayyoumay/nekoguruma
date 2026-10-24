@@ -63,7 +63,7 @@ mod common;
 
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, ExpectedResponseData, GetResourceIdsRequest, ParamItem,
+    CreateComLogicalLinkRequest, ErrorData, ExpectedResponseData, GetResourceIdsRequest, ParamItem,
     PduComPrimitiveStatus, PduParamClass, PinData, ResourceData, SetComParamRequest,
     StartComPrimitiveRequest, create_com_logical_link_request, event_item, param_item, pin_data,
     resource_data,
@@ -232,7 +232,9 @@ async fn run(bin: &str, mut args: std::env::Args) -> common::Result<()> {
                 key_bytes = Some(result.data_bytes.clone());
                 false
             }
-            Some(event_item::Data::ErrorData(err)) => {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: err, ..
+            })) => {
                 saw_error = Some(*err);
                 false
             }

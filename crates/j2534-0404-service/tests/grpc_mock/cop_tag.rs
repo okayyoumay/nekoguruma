@@ -14,7 +14,7 @@
 
 use serial_test::serial;
 use vci_service_interface::{
-    ComLogicalLinkHandle, ComPrimitiveCtrlData, EventNotification, ExpectedResponseData,
+    ComLogicalLinkHandle, ComPrimitiveCtrlData, ErrorData, EventNotification, ExpectedResponseData,
     PduComPrimitiveStatus, StartComPrimitiveRequest, SubscribeEventRequest, event_item,
     event_notification, subscribe_event_request, vci_service_client::VciServiceClient,
 };
@@ -223,6 +223,11 @@ async fn oversized_cop_tag_is_rejected_before_the_cop_is_created() {
         .expect_err("an oversized cop_tag should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
     assert!(status.message().contains("cop_tag"), "{}", status.message());
+    // The refusal says the request was not sent, and why (ADR-350).
+    assert_eq!(
+        vci_service_interface::error_detail_from_status(&status).and_then(|d| d.refusal),
+        Some(vci_service_interface::RefusalReason::InvalidParameters as i32)
+    );
 
     // A tag right at the documented limit is accepted (boundary check).
     let max_tag = vec![0u8; 64];
@@ -430,8 +435,12 @@ async fn cop_tag_round_trips_to_a_cop_scoped_error_event() {
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
-                    if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
+                Some(event_item::Data::ErrorData(ErrorData {
+                    error_event,
+                    // A J2534 error event has no extra error information (ADR-350).
+                    extra_error_info: None,
+                }))
+                    if *error_event == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) && item
                 .cop_handle
                 .as_ref()
@@ -567,7 +576,9 @@ async fn cop_tag_is_attributed_correctly_when_multiple_cyclic_cops_are_reaped_co
     let mut observed_b = None;
     assert!(
         wait_for_event(&mut events, 2000, |item| {
-            if let Some(event_item::Data::ErrorData(error)) = &item.data
+            if let Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) = &item.data
                 && *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             {
                 if item

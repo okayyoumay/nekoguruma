@@ -10,8 +10,9 @@ use serial_test::serial;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveCtrlData,
     ConnectComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    ExpectedResponseData, GetObjectIdRequest, IoCtlRequest, ObjectType, StartComPrimitiveRequest,
-    event_item, io_ctl_request, subscribe_event_request, vci_service_client::VciServiceClient,
+    ErrorData, ExpectedResponseData, GetObjectIdRequest, IoCtlRequest, ObjectType,
+    StartComPrimitiveRequest, event_item, io_ctl_request, subscribe_event_request,
+    vci_service_client::VciServiceClient,
 };
 
 use crate::harness::*;
@@ -1361,7 +1362,7 @@ async fn mode_0_arm_time_send_respects_pending_p3_phys_gap_from_prior_sendrecv()
 fn is_tester_present_error(item: &vci_service_interface::EventItem) -> bool {
     matches!(
         item.data,
-        Some(event_item::Data::ErrorData(error))
+        Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
             if error == vci_service_interface::PduErrorEvent::PduErrEvtTesterPresentError as i32
     )
 }
@@ -3913,7 +3914,7 @@ async fn isotp_fc_wait_catches_fc_landing_during_a_dispatched_tester_present_wri
         wait_for_event(&mut events_b, 4000, |item| {
             if matches!(
                 item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;

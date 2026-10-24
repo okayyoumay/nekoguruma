@@ -337,7 +337,10 @@ impl VciService for Iso22900Service {
         &self,
         request: Request<StartComPrimitiveRequest>,
     ) -> Result<Response<ComPrimitiveResponse>, Status> {
-        self.rpc_start_com_primitive(request).await
+        // A refusal names its reason when it shows the request was not sent (ADR-350).
+        self.rpc_start_com_primitive(request)
+            .await
+            .map_err(vci_service_interface::start_refusal)
     }
 
     async fn cancel_com_primitive(

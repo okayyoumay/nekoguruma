@@ -1264,7 +1264,7 @@ the same override reason as their named-bit counterparts above, and
 | `module_status` | Module availability changed |
 | `cll_status` | CLL connected/disconnected/comm-started — queued in `rx_buf` for `GetEventItem` pollers, not just live `SubscribeEvent` subscribers (ADR-105 P2 follow-up, `CllQueueItem::Status`) |
 | `cop_status` | COP state transition — queued in `rx_buf` for `GetEventItem` pollers, not just live `SubscribeEvent` subscribers (ADR-140, `CllQueueItem::Status(StatusEvent::Cop)`); resolved from `logical_links` before `send_cop_status`'s callers acquire `primitives`, so ADR-128's `primitives`/`terminal_cops` atomicity guarantee is unaffected |
-| `error_data` | Hardware or protocol error — `EventItem.cop_handle` (ADR-112) is set when the error originated from a specific ComPrimitive's own execution (e.g. an ECU timeout), `None` when module- or CLL-scoped |
+| `error_data` | Hardware or protocol error — `EventItem.cop_handle` (ADR-112) is set when the error originated from a specific ComPrimitive's own execution (e.g. an ECU timeout), `None` when module- or CLL-scoped. The variant is an `ErrorData` message (ADR-350): `error_event` is the `PDUErrorEvent`, and `optional extra_error_info` is the error item's additional error code (ISO 22900-2:2022 D.4.2), whose meaning the library's MDF gives: `iso22900-service` passes on the library's value, a 0 included, and `j2534-0404-service` leaves it absent, since J2534 has none. The variant moved from tag 7 (a bare `PDUErrorEvent`, now reserved) to tag 10 |
 | `info_data` | Module list, resource lock, or ComParam change notification |
 
 **`LostEventItemNotification`** is sent when the service detected that event items were dropped (queue overflow) — `SubscribeEvent` subscribers only; there is no `GetEventItem` equivalent (ISO 22900-2's `PDU_EVT_DATA_LOST` is defined as a callback-only signal never stored in the event queue). In `j2534-0404-service` (ADR-115): the queue's `event_queue_cap`/`event_queue_mode` policy is enforced on every item regardless of subscriber state (see "Single-consumer queue semantics" above) — a `Limited`-mode CLL sends `Lost` *instead of* the dropped item's own notification once the queue is full; a `Circular`-mode CLL sends `Lost` *in addition to* the newly-arrived item's own notification, marking the loss of the evicted older item. In practice this means a healthy, actively-draining subscriber almost never sees `Lost` (the queue empties every cycle, so it rarely reaches capacity) — but it is not structurally impossible: a stale backlog from before the subscriber attached can still cross the cap on the very next push, firing one honest `Lost` even to a subscriber whose own live sends are all succeeding. A client that only calls `GetEventItem` (no live subscription) receives no loss signal at all, by design.
@@ -1652,12 +1652,28 @@ message ErrorDetail {
   has no text field.
 
 Rust clients can decode this with `vci_service_interface::error_detail_from_status(&status)`.
+
+**A refused `StartComPrimitive` names its reason (ADR-350).** `ErrorDetail` also has
+`optional RefusalReason refusal = 4`, which a worker sets on a refused `StartComPrimitive` only,
+and only when the refusal shows the request was not sent:
+
+| `refusal` | When |
+|---|---|
+| `REFUSAL_REASON_INVALID_PARAMETERS` | The worker's own checks found the request invalid (its status is `INVALID_ARGUMENT`, and the detail's `pdu_error` is `PDU_ERR_INVALID_PARAMETERS`), or the library returned `PDU_ERR_INVALID_PARAMETERS` |
+| `REFUSAL_REASON_QUEUE_FULL` | The library returned `PDU_ERR_TX_QUEUE_FULL` (`j2534-0404-service` maps `ERR_BUFFER_FULL` to it; its own queue is unbounded) |
+| `REFUSAL_REASON_PROTOCOL_CANNOT_CARRY` | `j2534-0404-service`'s transmit-size checks: the message is outside the SAE J2534-1 size range of the link's protocol, or a functionally addressed ISO 15765-2 request does not fit a single frame |
+
+An absent `refusal` says nothing about whether the request was sent (a failed start, a lost VCI, a
+library code that does not show it). Both workers set it through
+`vci_service_interface::start_refusal`.
 Not every failure carries an `ErrorDetail`: it is attached only where ISO
 22900-2 defines a return code for that failure (native call failures,
 emulated handle/state-machine rejections). Pure request-shape/transport
 validation failures (a missing required field, an unresolvable oneof) get a
 plain `Status` with no `ErrorDetail` — there was never a `GetLastError`-queryable
-analog for those either.
+analog for those either. The exception is `StartComPrimitive`: its
+`INVALID_ARGUMENT` refusals carry an `ErrorDetail` with
+`PDU_ERR_INVALID_PARAMETERS` and their refusal reason (above).
 
 ---
 

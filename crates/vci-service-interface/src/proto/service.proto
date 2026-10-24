@@ -512,13 +512,25 @@ message EventItem {
         PDUModuleStatus module_status = 4;
         PDUComLogicalLinkStatus cll_status = 5;
         PDUComPrimitiveStatus cop_status = 6;
-        PDUErrorEvent error_data = 7;
+        // ADR-350: the error event with its additional error code; it was
+        // a bare PDUErrorEvent under tag 7, which stays reserved.
+        ErrorData error_data = 10;
         PDUInfo info_data = 8;
     }
+    reserved 7;
     // ADR-204: echoes StartComPrimitiveRequest.cop_tag verbatim, iff
     // cop_handle is set above and a tag was supplied at StartComPrimitive
     // for that COP. Absent otherwise -- never a zero-length sentinel.
     optional bytes cop_tag = 9;
+}
+
+// ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).
+message ErrorData {
+    PDUErrorEvent error_event = 1;
+    // The item's additional error code (D.4.2, ExtraErrorInfoId), whose
+    // meaning the library's MDF gives. Absent when the worker has none, as
+    // for every J2534 error event.
+    optional uint32 extra_error_info = 2;
 }
 
 message LostEventItemNotification {
@@ -613,6 +625,21 @@ message ErrorDetail {
     // or adapter-layer diagnostic context not present at the driver layer).
     // Absent when unavailable.
     optional string detail_text = 3;
+    // ADR-350: set on a refused StartComPrimitive only, and only when the
+    // worker knows the request was not sent: why it was refused.
+    optional RefusalReason refusal = 4;
+}
+
+// ADR-350: why a worker refused a StartComPrimitive before sending it.
+enum RefusalReason {
+    REFUSAL_REASON_UNSPECIFIED = 0;
+    // The request's parameters are invalid (PDU_ERR_INVALID_PARAMETERS).
+    REFUSAL_REASON_INVALID_PARAMETERS = 1;
+    // The link's transmit queue is full (PDU_ERR_TX_QUEUE_FULL).
+    REFUSAL_REASON_QUEUE_FULL = 2;
+    // The link's protocol cannot carry the request, such as a request longer
+    // than its transport allows.
+    REFUSAL_REASON_PROTOCOL_CANNOT_CARRY = 3;
 }
 
 message ResourceStatusResponse {

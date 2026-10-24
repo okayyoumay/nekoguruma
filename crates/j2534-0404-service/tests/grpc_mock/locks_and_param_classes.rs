@@ -15,9 +15,9 @@ use serial_test::serial;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveCtrlData, ComPrimitiveHandle,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, EcuUniqueRespData, ExpectedResponseData, GetStatusRequest,
-    LockResourceRequest, ModuleHandle, ParamItem, PduComPrimitiveStatus, PduError,
-    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest,
+    DisconnectComLogicalLinkRequest, EcuUniqueRespData, ErrorData, ExpectedResponseData,
+    GetStatusRequest, LockResourceRequest, ModuleHandle, ParamItem, PduComPrimitiveStatus,
+    PduError, SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest,
     UniqueRespIdTableItem, UnlockResourceRequest, create_com_logical_link_request,
     error_detail_from_status, event_item, get_status_request, param_item, status_response,
 };
@@ -149,7 +149,7 @@ async fn wait_for_cop_executing(
 fn is_rsc_locked_error(item: &vci_service_interface::EventItem) -> bool {
     matches!(
         item.data,
-        Some(event_item::Data::ErrorData(error))
+        Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
             if error == vci_service_interface::PduErrorEvent::PduErrEvtRscLocked as i32
     )
 }

@@ -10,8 +10,8 @@
 use serial_test::serial;
 use vci_service_interface::{
     ComLogicalLinkHandle, ComPrimitiveCtrlData, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, ExpectedResponseData, LockResourceRequest, ModuleHandle,
-    ParamItem, PinData, ResourceData, SetComParamRequest, StartComPrimitiveRequest,
+    CreateComLogicalLinkRequest, ErrorData, ExpectedResponseData, LockResourceRequest,
+    ModuleHandle, ParamItem, PinData, ResourceData, SetComParamRequest, StartComPrimitiveRequest,
     create_com_logical_link_request, event_item, param_item, pin_data, resource_data,
     subscribe_event_request,
 };
@@ -1653,7 +1653,7 @@ async fn iso14230_wakeup_only_fast_init_failure_emits_error_and_reverts_temp_par
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;

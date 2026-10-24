@@ -133,6 +133,7 @@ fn status_of(error: HandleError) -> tonic::Status {
                     extra_error_info: 0,
                 }),
                 detail_text: None,
+                refusal: None,
             },
         ),
         HandleError::Rpc { code, message, .. }

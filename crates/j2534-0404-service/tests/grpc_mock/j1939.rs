@@ -45,12 +45,13 @@ use tonic::Code;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveCtrlData, ComPrimitiveHandle,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DataItem,
-    DisconnectComLogicalLinkRequest, ExpectedResponseData, GetObjectIdRequest, GetStatusRequest,
-    IoBytearray, ModuleHandle, ObjectType, ParamItem, PduComPrimitiveStatus, PduError,
-    PduErrorEvent, PinData, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
-    StartComPrimitiveRequest, UniqueRespIdTableItem, create_com_logical_link_request, data_item,
-    error_detail_from_status, event_item, get_status_request, io_ctl_request, param_item,
-    resource_data, status_response, subscribe_event_request,
+    DisconnectComLogicalLinkRequest, ErrorData, ExpectedResponseData, GetObjectIdRequest,
+    GetStatusRequest, IoBytearray, ModuleHandle, ObjectType, ParamItem, PduComPrimitiveStatus,
+    PduError, PduErrorEvent, PinData, ResourceData, SetComParamRequest,
+    SetUniqueRespIdTableRequest, StartComPrimitiveRequest, UniqueRespIdTableItem,
+    create_com_logical_link_request, data_item, error_detail_from_status, event_item,
+    get_status_request, io_ctl_request, param_item, resource_data, status_response,
+    subscribe_event_request,
 };
 
 use crate::harness::*;
@@ -679,9 +680,9 @@ async fn claim_retries_the_next_candidate_after_the_first_is_lost() {
     let mut saw_init_error = false;
     wait_for_event(&mut events, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtInitError as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtInitError as i32 => {
                 saw_init_error = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -763,7 +764,7 @@ async fn claim_exhaustion_fails_startcomm_with_init_error() {
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;
@@ -835,7 +836,7 @@ async fn unconfigured_name_fails_the_claim_immediately_not_via_timeout() {
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;
@@ -971,7 +972,7 @@ async fn unclaimed_source_address_over_8_bytes_fails_the_send() {
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtTxError as i32
             ) {
                 saw_tx_error = true;
@@ -1607,7 +1608,7 @@ async fn sibling_cll_skips_an_address_a_live_sibling_already_claimed() {
         wait_for_event(&mut events_b, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_b = true;
@@ -1888,7 +1889,7 @@ async fn restarting_after_stopcomm_frees_the_previously_claimed_address_for_a_si
         wait_for_event(&mut events_a, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_a = true;
@@ -1933,7 +1934,7 @@ async fn restarting_after_stopcomm_frees_the_previously_claimed_address_for_a_si
         wait_for_event(&mut events_b, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_b = true;
@@ -2061,7 +2062,7 @@ async fn spontaneous_loss_frees_the_lost_address_for_a_sibling_after_an_earlier_
         wait_for_event(&mut events_a, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_a = true;
@@ -2169,7 +2170,7 @@ async fn spontaneous_loss_frees_the_lost_address_for_a_sibling_after_an_earlier_
         wait_for_event(&mut events_c, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_c = true;
@@ -4612,7 +4613,7 @@ async fn coptupdateparam_execution_time_check_catches_a_claim_that_lands_after_e
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtProtErr as i32
             ) {
                 saw_prot_err = true;
@@ -4763,7 +4764,7 @@ async fn coptupdateparam_execution_time_check_catches_j1939_target_address_ffff_
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtProtErr as i32
             ) {
                 saw_prot_err = true;
@@ -4898,7 +4899,7 @@ async fn coptupdateparam_execution_time_rejection_pushes_no_hardware_write_for_t
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtProtErr as i32
             ) {
                 saw_prot_err = true;
@@ -5478,7 +5479,7 @@ async fn opting_out_of_negotiation_after_a_claim_frees_the_address_for_a_sibling
         wait_for_event(&mut events_b, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_b = true;
@@ -5584,7 +5585,7 @@ async fn temp_bound_negotiation_opt_out_does_not_wrongly_block_later_ordinary_se
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;
@@ -5715,7 +5716,7 @@ async fn stopcomm_final_message_after_a_spontaneous_loss_is_suppressed_not_sent(
     assert!(
         wait_for_event(&mut events, 2000, |item| matches!(
             &item.data,
-            Some(event_item::Data::ErrorData(error))
+            Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                 if *error == PduErrorEvent::PduErrEvtInitError as i32
         ) && item.cop_handle.is_none())
         .await,
@@ -5745,7 +5746,7 @@ async fn stopcomm_final_message_after_a_spontaneous_loss_is_suppressed_not_sent(
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtProtErr as i32
             ) && item.cop_handle.as_ref().map(|c| c.cop_handle) == Some(stopcomm_cop.cop_handle)
             {
@@ -6205,7 +6206,7 @@ async fn leaked_claim_cancel_blocks_a_fresh_attempt_until_the_native_cancel_fina
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;
@@ -6240,7 +6241,7 @@ async fn leaked_claim_cancel_blocks_a_fresh_attempt_until_the_native_cancel_fina
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_third = true;
@@ -6401,7 +6402,7 @@ async fn leaked_claim_on_a_disjoint_candidate_list_still_blocks_the_whole_attemp
             if this_cop
                 && matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == PduErrorEvent::PduErrEvtInitError as i32
                 )
             {
@@ -6455,7 +6456,7 @@ async fn leaked_claim_on_a_disjoint_candidate_list_still_blocks_the_whole_attemp
             if this_cop
                 && matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == PduErrorEvent::PduErrEvtInitError as i32
                 )
             {
@@ -6600,7 +6601,7 @@ async fn opt_out_startcomm_fails_closed_while_a_relinquished_claim_remains_leake
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;
@@ -6676,7 +6677,7 @@ async fn opt_out_startcomm_fails_closed_while_a_relinquished_claim_remains_leake
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_2 = true;
@@ -6828,7 +6829,7 @@ async fn name_collision_blocks_a_sibling_claiming_a_disjoint_address() {
             if this_cop
                 && matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == PduErrorEvent::PduErrEvtInitError as i32
                 )
             {
@@ -6899,7 +6900,7 @@ async fn name_collision_blocks_a_sibling_claiming_a_disjoint_address() {
             if this_cop
                 && matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == PduErrorEvent::PduErrEvtInitError as i32
                 )
             {
@@ -7185,7 +7186,7 @@ async fn coptupdateparam_execution_time_check_catches_a_name_change_that_lands_a
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtProtErr as i32
             ) {
                 saw_prot_err = true;
@@ -7345,7 +7346,7 @@ async fn spontaneous_reclaim_after_a_temp_bound_claim_uses_the_temp_bound_name_n
         wait_for_event(&mut events_a, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_a = true;
@@ -7681,7 +7682,7 @@ async fn leaked_claim_blocks_repeat_message_start_on_an_opted_out_sibling_cll() 
         wait_for_event(&mut events_a, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_a = true;
@@ -7951,7 +7952,7 @@ async fn spontaneous_reclaim_aborts_on_a_pending_stopcomm_without_issuing_a_clai
         wait_for_event(&mut events_c, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error_c = true;
@@ -8209,7 +8210,7 @@ async fn spontaneous_reclaim_resumes_after_a_cancelled_stopcomm_reverts_stop_com
             if this_cop
                 && matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == PduErrorEvent::PduErrEvtInitError as i32
                 )
             {

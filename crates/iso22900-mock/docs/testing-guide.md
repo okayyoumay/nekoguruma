@@ -85,7 +85,7 @@ With a `sim-ecu` attached (ADR-299), a `PDU_COPT_SENDRECV` ComPrimitive with req
 
 1. a `PDU_COPST_EXECUTING` status item;
 2. a result item for each response-pending message (`7F <SID> 78`): the mock does no negative-response handling of its own;
-3. a result item with the response, or, when the ECU sends none, an error item `PDU_ERR_EVT_RX_TIMEOUT`;
+3. a result item with the response, or, when the ECU sends none, an error item `PDU_ERR_EVT_RX_TIMEOUT` with the additional error code `MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP`;
 4. a `PDU_COPST_FINISHED` status item.
 
 The control data's cycles decide what is sent and received: with no send cycles nothing reaches the ECU and only the two status items follow; with no receive cycles the request reaches the ECU and only the two status items follow. Any other combination runs as one send and one response, and so does a ComPrimitive without control data.
@@ -172,6 +172,7 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
 | `MOCK_TIMESTAMP` | 4242 | Timestamp returned by `PDUGetTimestamp` |
+| `MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP` | `0x0000_0101` | The additional error code (ISO 22900-2:2022 D.4.2, `ExtraErrorInfoId`) of the `PDU_ERR_EVT_RX_TIMEOUT` error item for a ComPrimitive the attached ECU does not answer; D.4.2 leaves these codes to the vendor's MDF, so the value is the mock's own (ADR-350) |
 | `MOCK_IOCTL_NULL_OUTPUT` | `0x7FFF_FF00` | IOCTL command id that succeeds without an output item (public, for null-item tests) |
 
 ---

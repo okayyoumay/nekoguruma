@@ -1,4 +1,5 @@
 use super::*;
+use vci_service_interface::ErrorData;
 
 fn make_cll_notification(
     cll_handle: u32,
@@ -134,7 +135,10 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                 cop_handle: c.cop_handle,
             }),
             timestamp: tracked.timestamp,
-            data: Some(EventItemData::ErrorData(tracked.event as i32)),
+            data: Some(EventItemData::ErrorData(ErrorData {
+                error_event: tracked.event as i32,
+                extra_error_info: None,
+            })),
             // ADR-204: echoed verbatim whenever `cop_handle` (i.e.
             // `tracked.cop`) is present -- `send_error_event` resolved this
             // from `primitives` at record time (see `TrackedError::cop_tag`'s
@@ -655,7 +659,10 @@ pub(in crate::service) async fn send_error_event(
                 cll_handle,
                 cop_handle,
                 timestamp,
-                EventItemData::ErrorData(error as i32),
+                EventItemData::ErrorData(ErrorData {
+                    error_event: error as i32,
+                    extra_error_info: None,
+                }),
                 cop_tag,
             );
             let _ = sub.send(Ok(n));

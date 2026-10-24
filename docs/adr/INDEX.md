@@ -103,7 +103,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-102](ADR-102-p2star-reload-per-occurrence-rc78-ceiling-reinstated.md) | CP_P2Star Reloads Per 0x78; CP_RC78CompletionTimeout Reinstated as Total Ceiling | Accepted (amends ADR-056, ADR-057) | `j2534-0404-service` service, events, comparam_defaults, service_params |
 | [ADR-103](ADR-103-paramitem-name-based-addressing.md) | ParamItem Name-Based Addressing for Set-Family RPCs | Accepted | `vci-service-interface`, `iso22900-service`, `j2534-0404-service` |
 | [ADR-104](ADR-104-p3phys-p3func-p3min-name-resolution-fix.md) | Fix CP_P3Phys/CP_P3Func/CP_P3Min Name Resolution — Not Aliases | Accepted | `j2534-0404-service` names, rpc_link |
-| [ADR-105](ADR-105-rich-error-model-replaces-get-last-error.md) | Rich Error Model via grpc-status-details-bin Replaces GetLastError | Accepted (amended by ADR-112; SET_PROG_VOLTAGE mapping corrected by conformance-audit fix A2-21) | `vci-service-interface`, `iso22900-service`, `j2534-0404-service`, `j2534-0500-service` |
+| [ADR-105](ADR-105-rich-error-model-replaces-get-last-error.md) | Rich Error Model via grpc-status-details-bin Replaces GetLastError | Accepted (amended by ADR-112; SET_PROG_VOLTAGE mapping corrected by conformance-audit fix A2-21; a refused `StartComPrimitive` carries an `ErrorDetail` with its refusal reason, by ADR-350) | `vci-service-interface`, `iso22900-service`, `j2534-0404-service`, `j2534-0500-service` |
 | [ADR-106](ADR-106-static-conflicting-resources-table-scan.md) | Static Table Scan Replaces Live-Connection Scan for GetConflictingResources | Accepted | `j2534-0404-service` rpc_link, resources, names |
 | [ADR-107](ADR-107-j2534-0404-multi-module-config-selection.md) | Config-Declared Multi-Module Device Selection for J2534 v04.04 | Accepted (Decision (b) kept; simultaneous devices come from one worker per device, `label` must be non-empty and unique as the device selector, a worker started with a label keeps its entry's Decision (c) handle, Decision (d)'s `ModuleConnect` on such a worker accepts only that handle, `PDU_HANDLE_UNDEF` and module-level event and subscription attribution resolve to it (Accepted Residual 4 closed for such workers), and `pname` must be unique per library too, ADR-281) | `vci-service-config`, `j2534-0404`, `j2534-0404-service` service, config, rpc_module, rpc_link, error |
 | [ADR-108](ADR-108-enum-newtype-underlying-type-is-target-abi-dependent.md) | Bindgen Enum-Newtype Underlying Type Is Target-ABI-Dependent — Always Cast, Never Assume `u32` | Accepted | `iso22900-sys` bindings (all targets), `iso22900` safety.rs, lib.rs, item/data/event.rs, item/data/io.rs |
@@ -339,6 +339,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-347](ADR-347-the-communication-log-s-file-and-writer.md) | The Communication Log's File and Writer | Accepted (Decision item 2 extended by ADR-348) | design 8.11; `agent` `comm_log`, job runner entry points (`JobRun`), journal writer lock; ADR-255, ADR-346 item 10 |
 | [ADR-348](ADR-348-operational-logs.md) | Operational Logs | Accepted | design 12.2, 8.7, 8.11 (`procedure_log`) and 16.2; `agent` logging setup and worker output capture, `vci-service-launcher` and `vci-service-config` file output and rotation, `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346 |
 | [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-251 |
+| [ADR-350](ADR-350-worker-error-events-carry-extra-information-and-refusals-name-their-reason.md) | Worker Error Events Carry Their Extra Information, and Refusals Name Their Reason | Accepted | `vci-service-interface` (`EventItem`, `ErrorDetail`), `iso22900-service`, `j2534-0404-service`, `iso22900-mock`, `docs/rpc-api-guide.md`; design 8.11, ADR-105, ADR-346 |
 
 ## Status Legend
 
@@ -600,7 +601,7 @@ the predecessor repository these ADRs came from.
 - ADR-079 (items 12-13 superseded by ADR-114; item 15 superseded by ADR-135, then ADR-187)
 - ADR-089
 - ADR-102
-- ADR-105 (amended by ADR-112; SET_PROG_VOLTAGE mapping corrected by A2-21)
+- ADR-105 (amended by ADR-112; SET_PROG_VOLTAGE mapping corrected by A2-21; `StartComPrimitive` refusals amended by ADR-350)
 - ADR-112 (the module handle in events is the selected one on a worker started with a label, ADR-281)
 - ADR-114
 - ADR-115
@@ -613,6 +614,7 @@ the predecessor repository these ADRs came from.
 - ADR-346
 - ADR-347
 - ADR-348
+- ADR-350
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)

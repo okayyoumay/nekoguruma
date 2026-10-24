@@ -16,7 +16,7 @@ use tonic::transport::{Channel, Server};
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveHandle,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, EventItem, EventNotification, GetComParamRequest,
+    DisconnectComLogicalLinkRequest, ErrorData, EventItem, EventNotification, GetComParamRequest,
     GetConflictingResourcesRequest, GetEventItemRequest, GetModuleIdsRequest, GetObjectIdRequest,
     GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest, GetTimestampRequest,
     GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest, LockResourceRequest,
@@ -952,6 +952,16 @@ async fn start_com_primitive_rejects_oversized_cop_tag() {
         .await
         .expect_err("oversized cop_tag should be rejected");
     assert_eq!(status.code(), tonic::Code::InvalidArgument);
+    // The refusal says the request was not sent, and why (ADR-350).
+    let detail = vci_service_interface::error_detail_from_status(&status)
+        .expect("a refused start carries an ErrorDetail");
+    assert_eq!(
+        (detail.pdu_error, detail.refusal),
+        (
+            vci_service_interface::PduError::PduErrInvalidParameters as i32,
+            Some(vci_service_interface::RefusalReason::InvalidParameters as i32)
+        )
+    );
 
     server.shutdown().await;
 }
@@ -1275,8 +1285,12 @@ impl Drop for AttachedEcu<'_> {
 enum Seen {
     Result(Vec<u8>),
     Status(i32),
-    Error(i32),
+    /// The error event and its extra error information (ADR-350).
+    Error(i32, Option<u32>),
 }
+
+/// The mock's additional error code on the receive timeout of an unanswered ComPrimitive.
+const XTRA_RX_TIMEOUT_NO_RSP: Option<u32> = Some(iso22900_mock::MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP);
 
 const IDLE: i32 = 0x8010;
 const EXECUTING: i32 = 0x8011;
@@ -1349,7 +1363,10 @@ async fn events_until_finished(
         let event = match item.data.expect("event data") {
             event_item::Data::ResultData(result) => Seen::Result(result.data_bytes),
             event_item::Data::CopStatus(status) => Seen::Status(status),
-            event_item::Data::ErrorData(error) => Seen::Error(error),
+            event_item::Data::ErrorData(ErrorData {
+                error_event,
+                extra_error_info,
+            }) => Seen::Error(error_event, extra_error_info),
             other => panic!("unexpected event {other:?}"),
         };
         if event == Seen::Status(FINISHED) {
@@ -1424,7 +1441,7 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
         send_and_receive(&mut client, &mut stream, cll_handle, &read_vin).await,
         [
             Seen::Status(EXECUTING),
-            Seen::Error(0x103),
+            Seen::Error(0x103, XTRA_RX_TIMEOUT_NO_RSP),
             Seen::Status(FINISHED)
         ]
     );
@@ -1532,7 +1549,7 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
         send_and_receive(&mut client, &mut stream, cll_handle, &read_vin).await,
         [
             Seen::Status(EXECUTING),
-            Seen::Error(0x103),
+            Seen::Error(0x103, XTRA_RX_TIMEOUT_NO_RSP),
             Seen::Status(FINISHED)
         ]
     );

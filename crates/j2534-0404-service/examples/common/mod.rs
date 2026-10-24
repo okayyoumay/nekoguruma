@@ -94,8 +94,8 @@ use std::time::Duration;
 use tonic::Streaming;
 use tonic::transport::Channel;
 use vci_service_interface::{
-    ComLogicalLinkHandle, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest, EventItem,
-    EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetVersionRequest,
+    ComLogicalLinkHandle, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest, ErrorData,
+    EventItem, EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetVersionRequest,
     ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ObjectType, SubscribeEventRequest,
     event_item, event_notification, subscribe_event_request, vci_service_client::VciServiceClient,
 };
@@ -279,7 +279,9 @@ pub fn print_event_item(item: &EventItem) {
         ),
         Some(event_item::Data::CllStatus(status)) => println!("  event: CllStatus({status})"),
         Some(event_item::Data::CopStatus(status)) => println!("  event: CopStatus({status})"),
-        Some(event_item::Data::ErrorData(err)) => println!("  event: ErrorData({err})"),
+        Some(event_item::Data::ErrorData(ErrorData {
+            error_event: err, ..
+        })) => println!("  event: ErrorData({err})"),
         Some(event_item::Data::ModuleStatus(status)) => println!("  event: ModuleStatus({status})"),
         Some(event_item::Data::InfoData(info)) => println!("  event: InfoData({info})"),
         None => println!("  event: (empty)"),
@@ -363,7 +365,9 @@ pub async fn wait_for_send_recv_response(
                 response = Some(result.data_bytes.clone());
                 false
             }
-            Some(event_item::Data::ErrorData(err)) => {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: err, ..
+            })) => {
                 saw_error = Some(*err);
                 false
             }
@@ -451,7 +455,9 @@ pub async fn wait_for_cop_finished(
             return false;
         }
         match &item.data {
-            Some(event_item::Data::ErrorData(err)) => {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: err, ..
+            })) => {
                 saw_error = Some(*err);
                 false
             }

@@ -90,6 +90,13 @@ pub struct RotatingFile {
     /// The file was renamed to `rotated_path(1)` but no new file could be opened at the path,
     /// so `file` is that rotated file: the next rotation must neither move nor delete it.
     detached: bool,
+    /// The last write failed part of the way and its line could not be ended, so a line break
+    /// is owed before the next entry.
+    line_open: bool,
+    /// How many of the next writes fail after writing half their bytes, so a test can tear a
+    /// line.
+    #[cfg(test)]
+    fail_writes: u32,
     /// How many of the next reopens fail, so a test can make one fail.
     #[cfg(test)]
     fail_reopens: u32,
@@ -123,6 +130,9 @@ impl RotatingFile {
             file,
             len,
             detached: false,
+            line_open: false,
+            #[cfg(test)]
+            fail_writes: 0,
             #[cfg(test)]
             fail_reopens: 0,
             #[cfg(test)]
@@ -139,15 +149,19 @@ impl RotatingFile {
     /// non-empty file past the limit, the file is rotated first; a rotation that fails does not
     /// keep the entry from being written.
     ///
-    /// A write that fails part of the way is ended with a line break where possible, so the
-    /// next entry still starts a line of its own.
+    /// A write that fails part of the way is ended with a line break, so the next entry still
+    /// starts a line of its own; when even that fails, the line break is written before the
+    /// next entry, which is refused while it cannot be.
     pub fn write_entry(&mut self, entry: &[u8]) -> io::Result<()> {
         if self.len > 0 && self.len.saturating_add(entry.len() as u64) > self.settings.max_bytes {
             self.rotate();
         }
-        // The position is at the end already on Unix; on Windows it is moved there.
-        let written = private::seek_end(&self.file).and_then(|()| self.file.write_all(entry));
-        match written {
+        if self.line_open {
+            self.write_raw(b"\n")?;
+            self.len += 1;
+            self.line_open = false;
+        }
+        match self.write_raw(entry) {
             Ok(()) => {
                 self.len += entry.len() as u64;
                 Ok(())
@@ -156,12 +170,28 @@ impl RotatingFile {
                 // The length of what was written is unknown; counting the whole entry keeps
                 // the rotation on the safe side.
                 self.len += entry.len() as u64;
-                if self.file.write_all(b"\n").is_ok() {
+                if self.write_raw(b"\n").is_ok() {
                     self.len += 1;
+                } else {
+                    self.line_open = true;
                 }
                 Err(error)
             }
         }
+    }
+
+    /// Writes `bytes` at the file's end (the position is there already on Unix; on Windows it
+    /// is moved there).
+    fn write_raw(&mut self, bytes: &[u8]) -> io::Result<()> {
+        #[cfg(test)]
+        if self.fail_writes > 0 {
+            self.fail_writes -= 1;
+            private::seek_end(&self.file)?;
+            self.file.write_all(&bytes[..bytes.len() / 2])?;
+            return Err(io::Error::other("a write made to fail"));
+        }
+        private::seek_end(&self.file)?;
+        self.file.write_all(bytes)
     }
 
     /// Moves each rotated file one number up, deleting the one beyond the count, and starts an
@@ -179,6 +209,7 @@ impl RotatingFile {
                 Ok(file) => {
                     self.file = file;
                     self.detached = false;
+                    self.line_open = false;
                 }
                 Err(_) => {
                     let _ = self.empty();
@@ -186,11 +217,11 @@ impl RotatingFile {
             }
             return;
         }
-        let settings = &self.settings;
-        let max_files = settings.max_files.min(FileSettings::MAX_FILES_LIMIT);
+        let max_files = self.settings.max_files.min(FileSettings::MAX_FILES_LIMIT);
         if max_files == 0 && self.empty().is_ok() {
             return;
         }
+        let settings = &self.settings;
         let renamed = if max_files > 0 {
             let _ = remove_if_present(&settings.rotated_path(max_files));
             for n in (1..max_files).rev() {
@@ -211,14 +242,17 @@ impl RotatingFile {
             return;
         }
         match self.reopen() {
-            Ok(file) => self.file = file,
+            Ok(file) => {
+                self.file = file;
+                self.line_open = false;
+            }
             Err(_) => {
                 // `file` is now the rotated file. Put it back where the log is, emptied, so
                 // the files stay as the next rotation expects them.
                 let settings = &self.settings;
-                if max_files > 0
-                    && std::fs::rename(settings.rotated_path(1), &settings.path).is_ok()
-                {
+                let moved_back = max_files > 0
+                    && std::fs::rename(settings.rotated_path(1), &settings.path).is_ok();
+                if moved_back {
                     let _ = self.empty();
                 } else {
                     self.detached = true;
@@ -228,8 +262,9 @@ impl RotatingFile {
     }
 
     /// Empties the file entries go to, through the handle itself, so no path is opened again.
-    fn empty(&self) -> io::Result<()> {
+    fn empty(&mut self) -> io::Result<()> {
         self.file.set_len(0)?;
+        self.line_open = false;
         private::seek_end(&self.file)
     }
 
@@ -413,6 +448,30 @@ mod tests {
         assert!(!file.detached);
         assert_eq!(read(&settings.path), "four\n");
         assert_eq!(read(&settings.rotated_path(1)), "three\n");
+    }
+
+    /// A write that fails part of the way is ended with a line break; when even that fails,
+    /// the line break is written before the next entry, so no entry is joined to a torn one.
+    #[test]
+    fn a_torn_write_is_ended_before_the_next_entry() {
+        let temp = tempfile::tempdir().unwrap();
+        let settings = settings(temp.path(), 1024, 1);
+        let mut file = RotatingFile::open(settings.clone()).unwrap();
+        file.fail_writes = 1;
+        assert!(file.write_entry(b"{\"a\":1}\n").is_err());
+        file.write_entry(b"{\"b\":2}\n").unwrap();
+        // The entry and the line break that would end it both fail.
+        file.fail_writes = 2;
+        assert!(file.write_entry(b"{\"c\":3}\n").is_err());
+        assert!(file.line_open);
+        // While the owed line break still fails, the next entry is refused, not joined.
+        file.fail_writes = 1;
+        assert!(file.write_entry(b"{\"d\":4}\n").is_err());
+        file.write_entry(b"{\"e\":5}\n").unwrap();
+        assert_eq!(
+            read(&settings.path),
+            "{\"a\"\n{\"b\":2}\n{\"c\"\n{\"e\":5}\n"
+        );
     }
 
     /// A file that ends in the middle of a line, as a crash leaves it, is ended before the

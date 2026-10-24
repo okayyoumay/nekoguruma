@@ -80,6 +80,8 @@ most about `(max_files + 1) × max_bytes`, about 60 MiB by default.
 A reopened file is appended to, and its length counts toward the limit. A file whose last line
 has no end (a crash in the middle of an entry) is ended with a line break first, and so is an
 entry whose write failed part of the way, so the next entry always starts a line of its own.
+When even that line break cannot be written, it is written before the next entry, which is
+refused while it still cannot be.
 
 A rotation never stops the log:
 - each step is tried even when an earlier one failed, for example a rotated file another process

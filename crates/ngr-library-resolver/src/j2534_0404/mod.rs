@@ -20,6 +20,7 @@ use std::{
 };
 
 use tracing::{debug, warn};
+use vci_service_config::External;
 
 mod definition;
 
@@ -130,7 +131,7 @@ pub fn read_definitions(dir: &Path) -> Result<Definitions, ResolveError> {
         }
         Ok(_) => {}
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            debug!(dir = %dir.display(), "definition directory does not exist");
+            debug!(external = %External(dir.display()), "definition directory does not exist");
             return Ok(Definitions::default());
         }
         Err(source) => {
@@ -143,7 +144,7 @@ pub fn read_definitions(dir: &Path) -> Result<Definitions, ResolveError> {
     let entries = match fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            debug!(dir = %dir.display(), "definition directory does not exist");
+            debug!(external = %External(dir.display()), "definition directory does not exist");
             return Ok(Definitions::default());
         }
         Err(source) => {
@@ -178,7 +179,12 @@ pub fn read_definitions(dir: &Path) -> Result<Definitions, ResolveError> {
         match parsed {
             Ok(def) => out.valid.push((path, def)),
             Err(error) => {
-                warn!(file = %path.display(), %error, "skipping invalid J2534 definition");
+                // The path and the parse error, which may quote the file, go in `external` (ADR-348
+                // item 6).
+                warn!(
+                    external = %External(format!("file {}: {error}", path.display())),
+                    "skipping invalid J2534 definition"
+                );
                 out.invalid.push((path, error));
             }
         }
@@ -288,7 +294,10 @@ fn resolve_on_registry_or_in(
 ) -> Result<Resolved, ResolveError> {
     use j2534_0404_registry::RegistryError;
     if let Some(dir) = override_dir {
-        debug!(dir = %dir.display(), "resolving in the debug definition directory, not the registry");
+        debug!(
+            external = %External(dir.display()),
+            "resolving in the debug definition directory, not the registry"
+        );
         return resolve_in_dir(dir, name);
     }
     match j2534_0404_registry::find_j2534_device_on_registry(name, mode) {

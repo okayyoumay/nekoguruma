@@ -16,6 +16,7 @@ use vci_service_interface::{
 };
 
 use crate::host::{HostError, unary};
+use crate::oplog::LogSafe;
 use crate::policy::{ApplicationLayer, Permission};
 
 /// What a job's link needs: from the protocol a job's document declares
@@ -584,7 +585,11 @@ async fn vci_permission<C: WorkerApi>(
             .as_ref()
             .map_or(Permission::ReadOnly, crate::policy::identify),
         Err(error) => {
-            tracing::warn!(%error, "could not read the VCI's version; the job stays read-only");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "could not read the VCI's version; the job stays read-only"
+            );
             Permission::ReadOnly
         }
     }
@@ -872,7 +877,11 @@ async fn disconnect_module<C: WorkerApi>(
     .await
     .map(drop);
     if let Err(error) = &result {
-        tracing::warn!(%error, "could not disconnect the module");
+        tracing::warn!(
+            error = %error.log_text(),
+            external = error.log_external(),
+            "could not disconnect the module"
+        );
     }
     result
 }

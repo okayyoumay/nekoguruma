@@ -48,6 +48,7 @@ use crate::journal::Vin;
 use crate::journal::{
     Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, StoppedRun, Store,
 };
+use crate::oplog::LogSafe;
 use crate::runner::JobError;
 
 /// How a job whose journal exists goes on.
@@ -671,7 +672,11 @@ where
             Ok(Reading::Value(millivolts)) => Some(millivolts),
             Ok(_) => None,
             Err(error) => {
-                tracing::warn!(%error, "the supply voltage could not be read");
+                tracing::warn!(
+                    error = %error.log_text(),
+                    external = error.log_external(),
+                    "the supply voltage could not be read"
+                );
                 None
             }
         };
@@ -778,7 +783,11 @@ where
         }
         Ok(_) => return passive(PassiveReason::VinNotEstablished),
         Err(error) => {
-            tracing::warn!(%error, "the ECU's VIN could not be read");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "the ECU's VIN could not be read"
+            );
             return passive(PassiveReason::VinNotEstablished);
         }
     }
@@ -795,7 +804,11 @@ where
         Ok(FieldBytes::Field(_)) => return passive(PassiveReason::HardwareIdentityDiffers),
         Ok(_) => return passive(PassiveReason::HardwareIdentityNotEstablished),
         Err(error) => {
-            tracing::warn!(%error, "the ECU's hardware identity could not be read");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "the ECU's hardware identity could not be read"
+            );
             return passive(PassiveReason::HardwareIdentityNotEstablished);
         }
     }
@@ -885,7 +898,11 @@ where
         }
         Ok(_) => return not_established(IdentityKind::Vin),
         Err(error) => {
-            tracing::warn!(%error, "the ECU's VIN could not be read after the restart");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "the ECU's VIN could not be read after the restart"
+            );
             return not_established(IdentityKind::Vin);
         }
     }
@@ -904,7 +921,11 @@ where
         }),
         Ok(_) => not_established(IdentityKind::HardwarePartNumber),
         Err(error) => {
-            tracing::warn!(%error, "the ECU's hardware identity could not be read after the restart");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "the ECU's hardware identity could not be read after the restart"
+            );
             not_established(IdentityKind::HardwarePartNumber)
         }
     }
@@ -963,7 +984,11 @@ where
         }
         Ok(_) => not_established(),
         Err(error) => {
-            tracing::warn!(%error, "the ECU's VIN could not be read for a checkpoint resume");
+            tracing::warn!(
+                error = %error.log_text(),
+                external = error.log_external(),
+                "the ECU's VIN could not be read for a checkpoint resume"
+            );
             not_established()
         }
     }
@@ -1057,10 +1082,17 @@ where
                 return Ok(StateCheck::RedoTransfer);
             }
             Ok(other) => {
-                tracing::warn!(?other, "the ECU's software version was not established");
+                tracing::warn!(
+                    answer = field_bytes_text(&other),
+                    "the ECU's software version was not established"
+                );
             }
             Err(error) => {
-                tracing::warn!(%error, "the ECU's software version could not be read");
+                tracing::warn!(
+                    error = %error.log_text(),
+                    external = error.log_external(),
+                    "the ECU's software version could not be read"
+                );
             }
         }
     }
@@ -1202,7 +1234,12 @@ where
                     Ok(Reading::Value(value)) => range.contains(&value),
                     Ok(_) => false,
                     Err(error) => {
-                        tracing::warn!(%error, ?kind, "a precondition could not be read {log_context}");
+                        tracing::warn!(
+                            error = %error.log_text(),
+                            external = error.log_external(),
+                            ?kind,
+                            "a precondition could not be read {log_context}"
+                        );
                         false
                     }
                 }
@@ -1295,12 +1332,19 @@ where
                 [0x51, 0x01] => return Ok(Teardown::Reset),
                 [0x7F, 0x11, nrc] if *nrc != 0x78 => PassiveCause::ResetRefused { nrc: *nrc },
                 other => {
-                    tracing::warn!(answer = ?other, "the ECUReset got no usable answer");
+                    tracing::warn!(
+                        answer_len = other.len(),
+                        "the ECUReset got no usable answer"
+                    );
                     PassiveCause::ResetOutcomeUnknown
                 }
             },
             Err(error) => {
-                tracing::warn!(%error, "the ECUReset got no usable answer");
+                tracing::warn!(
+                    error = %error.log_text(),
+                    external = error.log_external(),
+                    "the ECUReset got no usable answer"
+                );
                 PassiveCause::ResetOutcomeUnknown
             }
         }
@@ -1414,8 +1458,8 @@ where
         // after it.
         match cancellable(cancelled, || host.service_request(0x22, &[0xF1, 0x86]))? {
             Ok(response) if response == [0x62, 0xF1, 0x86, 0x01] => return Ok(true),
-            Ok(other) => log_failed_read(failed_reads, format_args!("answer {other:02X?}")),
-            Err(error) => log_failed_read(failed_reads, format_args!("{error}")),
+            Ok(other) => log_failed_read(failed_reads, Ok(&other)),
+            Err(error) => log_failed_read(failed_reads, Err(&error)),
         }
         failed_reads += 1;
         let remaining = deadline.saturating_duration_since(Instant::now());
@@ -1431,12 +1475,45 @@ where
 }
 
 /// Logs a failed F186 read: the first of an attempt at warn, later ones at debug, so a long
-/// window does not flood the log. `failed_before` counts the attempt's earlier failed reads.
-fn log_failed_read(failed_before: u32, what: std::fmt::Arguments<'_>) {
+/// window does not flood the log. `failed_before` counts the attempt's earlier failed reads. An
+/// answer is logged as its length, or its NRC when negative, not its bytes (ADR-348 item 6).
+fn log_failed_read(failed_before: u32, read: Result<&[u8], &HostError>) {
+    let (answer_len, nrc, error, external) = match read {
+        Ok(answer) => {
+            let nrc = match answer {
+                [0x7F, _, nrc] => Some(*nrc),
+                _ => None,
+            };
+            (Some(answer.len()), nrc, None, None)
+        }
+        Err(error) => (None, None, Some(error.log_text()), error.log_external()),
+    };
     if failed_before == 0 {
-        tracing::warn!("the session read did not confirm the default session: {what}");
+        tracing::warn!(
+            answer_len,
+            nrc,
+            error,
+            external,
+            "the session read did not confirm the default session"
+        );
     } else {
-        tracing::debug!("the session read did not confirm the default session: {what}");
+        tracing::debug!(
+            answer_len,
+            nrc,
+            error,
+            external,
+            "the session read did not confirm the default session"
+        );
+    }
+}
+
+/// A [`FieldBytes`] as the log carries it: the kind and the field's length, or the NRC, never
+/// the field's bytes, which are the vehicle's (ADR-348 item 6).
+fn field_bytes_text(read: &FieldBytes) -> String {
+    match read {
+        FieldBytes::Field(bytes) => format!("a field of {} bytes", bytes.len()),
+        FieldBytes::Negative(nrc) => format!("a negative response with NRC {nrc:#04x}"),
+        FieldBytes::Unreadable => "nothing readable".to_owned(),
     }
 }
 
@@ -1471,7 +1548,12 @@ where
             Ok(Reading::Value(value)) => return Ok(range.contains(&value)),
             Ok(_) => {}
             Err(error) => {
-                tracing::warn!(%error, ?kind, "a safety precondition could not be read");
+                tracing::warn!(
+                    error = %error.log_text(),
+                    external = error.log_external(),
+                    ?kind,
+                    "a safety precondition could not be read"
+                );
                 return Ok(false);
             }
         }

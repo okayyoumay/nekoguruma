@@ -48,6 +48,12 @@ exists but cannot be read or parsed is an `Err`.
 See `docs/logging-config.md` for the full TOML schema and lookup-priority
 tables.
 
+`External` (`src/external.rs`) is not configuration: it escapes the text an
+operational log entry carries in its `external` field (design 12.2, ADR-348
+item 6), so one entry stays one line. It lives here because every crate whose
+`tracing` events reach the agent's subscriber and that logs such text already
+links this crate, or can without new dependencies.
+
 Extracted from `vci-service-launcher` (ADR-033) so the config-loading logic
 has no dependency on `tonic`/`tokio` or any other part of the gRPC/JSON-RPC
 service bootstrap, and can be reused by consumers that only need
@@ -61,6 +67,8 @@ configuration, not a running service.
   using `vci_service_launcher::config::*` unchanged for logging.
   `j2534-0404-service` also reads `find_can_channel_mode()` through this
   re-export at startup (ADR-046), and `find_modules()` the same way (ADR-107).
+- `agent` and `ngr-library-resolver` use `External` in their `tracing` calls
+  (the rule is `crates/agent/docs/operational-log.md`).
 - No registry crate depends on this crate any more: `iso22900-registry` and
   `j2534-0404-registry` read no `config.toml` setting, and libraries resolve
   only through `ngr-library-resolver` (ADR-228 Decision item 4, ADR-281

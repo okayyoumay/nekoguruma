@@ -791,7 +791,7 @@ impl Journal<FileStore> {
         let loaded = load(&bytes, key)?;
         if loaded.len < bytes.len() {
             tracing::warn!(
-                path = %path.display(),
+                external = %crate::oplog::External(path.display()),
                 cut = bytes.len() - loaded.len,
                 "journal ends in a frame its commit did not finish; cutting it off"
             );

@@ -103,3 +103,6 @@ A rotation never stops the log:
 | An existing directory | left as it is: the installation may have prepared it, or a configured path may name a shared one | left as it is |
 
 A rotated file keeps its permissions, since it is the same file renamed.
+
+On Windows the owner is read and the access list set through the handle the writer opened, never
+by the path, so a path another account changes in between cannot redirect either.

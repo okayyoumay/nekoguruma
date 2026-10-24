@@ -1,7 +1,8 @@
 //! Files and directories readable and writable only by the process's account and administrators
 //! (ADR-348 item 5): mode 0700 and 0600 on Unix (root needs no grant), and on Windows an access
 //! list, protected from inheritance, that allows only the object's owner, SYSTEM and the
-//! Administrators group.
+//! Administrators group. Ownership and the access list are checked and set through the handle
+//! to the object opened, never by its path.
 
 use std::fs::{File, OpenOptions};
 use std::io;
@@ -35,7 +36,7 @@ pub(crate) fn create_dir(dir: &Path) -> io::Result<()> {
                 Ok(()) => {
                     // A directory that could not be made private is not left behind, or the
                     // next start would take it as one prepared for the log.
-                    if let Err(error) = windows::restrict(path, true) {
+                    if let Err(error) = windows::restrict_dir(path) {
                         let _ = std::fs::remove_dir(path);
                         return Err(error);
                     }
@@ -81,15 +82,19 @@ pub(crate) fn open_append(path: &Path) -> io::Result<File> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        options.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+        // Writing, and reading and changing the file's own security, so its owner is checked and
+        // its access list set through this handle rather than by its path, which another
+        // account could have changed by then.
+        options
+            .access_mode(windows::FILE_ACCESS)
+            .custom_flags(windows::FILE_FLAG_OPEN_REPARSE_POINT);
     }
     let file = options.open(path)?;
     let meta = file.metadata()?;
     if !meta.is_file() || meta.file_type().is_symlink() {
         return Err(not_a_file());
     }
-    restrict_file(path, &file)?;
+    restrict_file(&file)?;
     seek_end(&file)?;
     Ok(file)
 }
@@ -117,7 +122,7 @@ fn foreign_owner() -> io::Error {
 }
 
 #[cfg(unix)]
-fn restrict_file(_path: &Path, file: &File) -> io::Result<()> {
+fn restrict_file(file: &File) -> io::Result<()> {
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     let meta = file.metadata()?;
     // SAFETY: `geteuid` has no preconditions and cannot fail.
@@ -134,23 +139,25 @@ fn restrict_file(_path: &Path, file: &File) -> io::Result<()> {
 }
 
 #[cfg(windows)]
-fn restrict_file(path: &Path, _file: &File) -> io::Result<()> {
-    if !windows::owned_by_us_or_administrators(path)? {
+fn restrict_file(file: &File) -> io::Result<()> {
+    use std::os::windows::io::AsRawHandle;
+    let handle = file.as_raw_handle();
+    if !windows::owned_by_us_or_administrators(handle)? {
         return Err(foreign_owner());
     }
-    windows::restrict(path, false)
+    windows::restrict(handle, false)
 }
 
 #[cfg(windows)]
 mod windows {
     use std::io;
-    use std::os::windows::ffi::OsStrExt;
+    use std::os::windows::io::{AsRawHandle, RawHandle};
     use std::path::Path;
 
     use windows_sys::Win32::Foundation::{CloseHandle, ERROR_SUCCESS, HANDLE, LocalFree};
     use windows_sys::Win32::Security::Authorization::{
-        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetNamedSecurityInfoW,
-        SE_FILE_OBJECT, SetNamedSecurityInfoW,
+        ConvertStringSecurityDescriptorToSecurityDescriptorW, GetSecurityInfo, SE_FILE_OBJECT,
+        SetSecurityInfo,
     };
     use windows_sys::Win32::Security::{
         ACL, DACL_SECURITY_INFORMATION, EqualSid, GetSecurityDescriptorDacl, GetTokenInformation,
@@ -166,21 +173,35 @@ mod windows {
     pub(super) const FILE_SDDL: &str = "D:P(A;;FA;;;OW)(A;;FA;;;SY)(A;;FA;;;BA)";
     pub(super) const DIR_SDDL: &str = "D:P(A;OICI;FA;;;OW)(A;OICI;FA;;;SY)(A;OICI;FA;;;BA)";
 
+    /// Opens the reparse point itself rather than what it points to.
+    pub(super) const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+    /// Opens a directory.
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    const READ_CONTROL: u32 = 0x0002_0000;
+    const WRITE_DAC: u32 = 0x0004_0000;
+    const FILE_READ_ATTRIBUTES: u32 = 0x0080;
+    /// A log file's handle: writing, its attributes (for its metadata), and reading and
+    /// changing its security.
+    pub(super) const FILE_ACCESS: u32 =
+        GENERIC_WRITE | FILE_READ_ATTRIBUTES | READ_CONTROL | WRITE_DAC;
+
     fn wide(text: &std::ffi::OsStr) -> Vec<u16> {
+        use std::os::windows::ffi::OsStrExt;
         text.encode_wide().chain(Some(0)).collect()
     }
 
-    /// Whether `path`'s owner is the process's account, SYSTEM or the Administrators group (an
-    /// elevated process's files are owned by the group), the accounts the access list grants.
-    pub(super) fn owned_by_us_or_administrators(path: &Path) -> io::Result<bool> {
-        let name = wide(path.as_os_str());
+    /// Whether the owner of the object `handle` is open on is the process's account, SYSTEM or
+    /// the Administrators group (an elevated process's files are owned by the group), the
+    /// accounts the access list grants.
+    pub(super) fn owned_by_us_or_administrators(handle: RawHandle) -> io::Result<bool> {
         let mut owner = std::ptr::null_mut();
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
-        // SAFETY: `name` is a NUL-terminated UTF-16 path; `owner` points into `descriptor`, an
+        // SAFETY: `handle` is open with READ_CONTROL; `owner` points into `descriptor`, an
         // allocation the call makes and which is freed below.
         let status = unsafe {
-            GetNamedSecurityInfoW(
-                name.as_ptr(),
+            GetSecurityInfo(
+                handle as HANDLE,
                 SE_FILE_OBJECT,
                 OWNER_SECURITY_INFORMATION,
                 &mut owner,
@@ -236,10 +257,28 @@ mod windows {
         result
     }
 
-    /// Replaces `path`'s access list with the private one. The file was opened without following
-    /// a reparse point and checked to be a regular file, in a directory the log owns, so the path
-    /// names the object opened.
-    pub(super) fn restrict(path: &Path, dir: bool) -> io::Result<()> {
+    /// Gives the directory at `path`, which this process has just created, the private access
+    /// list, through a handle to that directory itself (a reparse point put there instead is
+    /// refused).
+    pub(super) fn restrict_dir(path: &Path) -> io::Result<()> {
+        use std::os::windows::fs::OpenOptionsExt;
+        let dir = std::fs::OpenOptions::new()
+            .access_mode(READ_CONTROL | WRITE_DAC | FILE_READ_ATTRIBUTES)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT)
+            .open(path)?;
+        let meta = dir.metadata()?;
+        if !meta.is_dir() || meta.file_type().is_symlink() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "the log directory is not a directory",
+            ));
+        }
+        restrict(dir.as_raw_handle(), true)
+    }
+
+    /// Replaces the access list of the object `handle` is open on (with WRITE_DAC) with the
+    /// private one.
+    pub(super) fn restrict(handle: RawHandle, dir: bool) -> io::Result<()> {
         let sddl = wide(if dir { DIR_SDDL } else { FILE_SDDL }.as_ref());
         let mut descriptor: PSECURITY_DESCRIPTOR = std::ptr::null_mut();
         // SAFETY: `sddl` is a NUL-terminated UTF-16 string, and `descriptor` receives a
@@ -267,12 +306,11 @@ mod windows {
             {
                 return Err(io::Error::last_os_error());
             }
-            let name = wide(path.as_os_str());
-            // SAFETY: `name` is a NUL-terminated UTF-16 path and `dacl` a valid access list;
-            // no owner, group or system list is changed.
+            // SAFETY: `handle` is open with WRITE_DAC and `dacl` is a valid access list; no
+            // owner, group or system list is changed.
             let status = unsafe {
-                SetNamedSecurityInfoW(
-                    name.as_ptr(),
+                SetSecurityInfo(
+                    handle as HANDLE,
                     SE_FILE_OBJECT,
                     DACL_SECURITY_INFORMATION | PROTECTED_DACL_SECURITY_INFORMATION,
                     std::ptr::null_mut(),

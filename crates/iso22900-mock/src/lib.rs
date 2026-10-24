@@ -1524,21 +1524,79 @@ pub fn write_root_file(
     short_name: &str,
     library: &Path,
 ) -> Result<PathBuf, std::io::Error> {
+    write_root_file_entry(dir, short_name, library, None)
+}
+
+/// [`write_root_file`] with an entry that also names `module_description_file` as its MDF
+/// (`MODULE_DESCRIPTION_FILE`, ISO 22900-2:2022 Annex F).
+pub fn write_root_file_with_mdf(
+    dir: &Path,
+    short_name: &str,
+    library: &Path,
+    module_description_file: &Path,
+) -> Result<PathBuf, std::io::Error> {
+    write_root_file_entry(dir, short_name, library, Some(module_description_file))
+}
+
+fn write_root_file_entry(
+    dir: &Path,
+    short_name: &str,
+    library: &Path,
+    module_description_file: Option<&Path>,
+) -> Result<PathBuf, std::io::Error> {
     let root_file = dir.join("pdu_api_root.xml");
     // The name is element text: escape the characters XML gives a meaning there. The URI needs
     // none, since `file_uri` percent-encodes `&`, `<` and `"`.
-    let short_name = short_name
-        .replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;");
+    let short_name = xml_text(short_name);
+    let mdf = module_description_file
+        .map(|mdf| format!("    <MODULE_DESCRIPTION_FILE URI=\"{}\"/>\n", file_uri(mdf)))
+        .unwrap_or_default();
     let xml = format!(
         "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
          <MVCI_PDU_API_ROOT>\n  <MVCI_PDU_API>\n    <SHORT_NAME>{short_name}</SHORT_NAME>\n    \
-         <LIBRARY_FILE URI=\"{}\"/>\n  </MVCI_PDU_API>\n</MVCI_PDU_API_ROOT>\n",
+         <LIBRARY_FILE URI=\"{}\"/>\n{mdf}  </MVCI_PDU_API>\n</MVCI_PDU_API_ROOT>\n",
         file_uri(library)
     );
     std::fs::write(&root_file, xml)?;
     Ok(root_file)
+}
+
+/// The name the mock's MDF gives [`MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP`].
+pub const MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP_NAME: &str = "MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP";
+
+/// Writes a module description file `mock_mdf.xml` into `dir` whose `ERROR_CODE` elements name
+/// `error_codes` (ISO 22900-2:2022 Annex F, F.4), and returns its path. The mock reads no MDF
+/// itself: the file is for `iso22900-service`, which names the extra error information of the mock's
+/// error events by it.
+pub fn write_module_description_file(
+    dir: &Path,
+    error_codes: &[(UNUM32, &str)],
+) -> Result<PathBuf, std::io::Error> {
+    let path = dir.join("mock_mdf.xml");
+    let codes: String = error_codes
+        .iter()
+        .map(|(id, name)| {
+            format!(
+                "  <ERROR_CODE>\n    <ID>{id}</ID>\n    <SHORT_NAME>{}</SHORT_NAME>\n    \
+                 <DESCRIPTION>iso22900-mock error code</DESCRIPTION>\n  </ERROR_CODE>\n",
+                xml_text(name)
+            )
+        })
+        .collect();
+    let xml = format!(
+        "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+         <MVCI_MODULE_DESCRIPTION MVCI_PART2_STANDARD_VERSION=\"2.2.2\" FILE_VERSION=\"1\">\n\
+         {codes}</MVCI_MODULE_DESCRIPTION>\n"
+    );
+    std::fs::write(&path, xml)?;
+    Ok(path)
+}
+
+/// `text` escaped for XML element text.
+fn xml_text(text: &str) -> String {
+    text.replace('&', "&amp;")
+        .replace('<', "&lt;")
+        .replace('>', "&gt;")
 }
 
 pub fn mock_library_path() -> Result<PathBuf, std::io::Error> {

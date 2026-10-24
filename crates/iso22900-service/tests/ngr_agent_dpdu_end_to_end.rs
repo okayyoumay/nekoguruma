@@ -90,70 +90,108 @@ fn program() -> Program {
     }
 }
 
+/// The mock's simulated ECU, its library and workers, and the configuration every run uses.
+struct Setup {
+    root: PathBuf,
+    library: PathBuf,
+    workers: PathBuf,
+    config: PathBuf,
+    ecu_config: PathBuf,
+}
+
+impl Setup {
+    fn new(root: &Path) -> Self {
+        let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
+        let abi =
+            worker_host::abi::detect_file(&library).expect("the mock should have a known ABI");
+        let workers = root.join("workers");
+        install_worker(&workers, abi.name());
+        let config = root.join("config.toml");
+        std::fs::write(&config, "").expect("test config file should be writable");
+        // The mock attaches a simulated ECU with this configuration at PDUConstruct (ADR-299):
+        // `sim-vci`'s default one.
+        let ecu_config = root.join("ecu.json");
+        std::fs::write(
+            &ecu_config,
+            r#"{"vin":"NGRSIMECU00000001","part_number":"NGR-SIM-ECU","sw_version":"1.0.0",
+                "response_delay_ms":0,"drop_at_block":null,"require_security_access":false,
+                "require_gateway_auth":false,"fail_checksum":false}"#,
+        )
+        .expect("ECU configuration should be writable");
+        Self {
+            root: root.to_owned(),
+            library,
+            workers,
+            config,
+            ecu_config,
+        }
+    }
+
+    /// Runs `ngr-agent` on `procedure`'s document with the root file `root_file`, keeping a
+    /// communication log in `comm_log` when given; returns its exit status and stdout.
+    fn run(
+        &self,
+        root_file: &Path,
+        procedure: &Program,
+        comm_log: Option<&Path>,
+    ) -> (std::process::ExitStatus, String) {
+        let document_path = self.root.join("variant.dir");
+        std::fs::write(&document_path, document(procedure)).expect("document should be writable");
+        let mut command = Command::new(ngr_agent_path());
+        command
+            .args([
+                "run",
+                "--api",
+                "dpdu",
+                "--vci",
+                LIBRARY_NAME,
+                "--mode",
+                "user",
+                "--document",
+            ])
+            .arg(&document_path)
+            .arg("--workers")
+            .arg(&self.workers)
+            .arg("--locks")
+            .arg(self.root.join("locks"));
+        if let Some(dir) = comm_log {
+            command.arg("--comm-log").arg(dir);
+        }
+        let mut child = command
+            .env("VCI_CONFIG_PATH", &self.config)
+            .env("NGR_PDU_API_ROOT_FILE", root_file)
+            .env("NGR_SIM_ECU_CONFIG", &self.ecu_config)
+            .env_remove("NGR_SIM_ECU_STATE")
+            .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
+            .stdout(Stdio::piped())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .expect("ngr-agent should start");
+
+        // A wedged agent or worker must fail the test, not hang the CI job.
+        let deadline = Instant::now() + Duration::from_secs(120);
+        let status = loop {
+            if let Some(status) = child.try_wait().expect("ngr-agent should be waitable") {
+                break status;
+            }
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("ngr-agent did not finish in time");
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        };
+        let output = child.wait_with_output().expect("ngr-agent output");
+        (status, String::from_utf8_lossy(&output.stdout).into_owned())
+    }
+}
+
 #[test]
 fn ngr_agent_runs_a_document_on_a_d_pdu_api_vci() {
     let temp = tempfile::tempdir().expect("temporary directory");
-    let root = temp.path();
-    let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
-    let abi = worker_host::abi::detect_file(&library).expect("the mock should have a known ABI");
-    let workers = root.join("workers");
-    install_worker(&workers, abi.name());
-    let config_path = root.join("config.toml");
-    std::fs::write(&config_path, "").expect("test config file should be writable");
-    let root_file = iso22900_mock::write_root_file(root, LIBRARY_NAME, &library)
+    let setup = Setup::new(temp.path());
+    let root_file = iso22900_mock::write_root_file(temp.path(), LIBRARY_NAME, &setup.library)
         .expect("root description file should be writable");
-    // The mock attaches a simulated ECU with this configuration at PDUConstruct (ADR-299):
-    // `sim-vci`'s default one.
-    let ecu_config = root.join("ecu.json");
-    std::fs::write(
-        &ecu_config,
-        r#"{"vin":"NGRSIMECU00000001","part_number":"NGR-SIM-ECU","sw_version":"1.0.0",
-            "response_delay_ms":0,"drop_at_block":null,"require_security_access":false,
-            "require_gateway_auth":false,"fail_checksum":false}"#,
-    )
-    .expect("ECU configuration should be writable");
-    let document_path = root.join("variant.dir");
-    std::fs::write(&document_path, document(&program())).expect("document should be writable");
-
-    let mut child = Command::new(ngr_agent_path())
-        .args([
-            "run",
-            "--api",
-            "dpdu",
-            "--vci",
-            LIBRARY_NAME,
-            "--mode",
-            "user",
-            "--document",
-        ])
-        .arg(&document_path)
-        .arg("--workers")
-        .arg(&workers)
-        .arg("--locks")
-        .arg(root.join("locks"))
-        .env("VCI_CONFIG_PATH", &config_path)
-        .env("NGR_PDU_API_ROOT_FILE", &root_file)
-        .env("NGR_SIM_ECU_CONFIG", &ecu_config)
-        .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .expect("ngr-agent should start");
-
-    // A wedged agent or worker must fail the test, not hang the CI job.
-    let deadline = Instant::now() + Duration::from_secs(120);
-    let status = loop {
-        if let Some(status) = child.try_wait().expect("ngr-agent should be waitable") {
-            break status;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            panic!("ngr-agent did not finish in time");
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    let output = child.wait_with_output().expect("ngr-agent output");
-    let stdout = String::from_utf8_lossy(&output.stdout);
+    let (status, stdout) = setup.run(&root_file, &program(), None);
     assert!(
         status.success(),
         "ngr-agent failed: {status}, stdout {stdout}"
@@ -168,4 +206,81 @@ fn ngr_agent_runs_a_document_on_a_d_pdu_api_vci() {
         [Value::Bytes(vin), Value::Bytes(vec![0x7F, 0x22, 0x31])],
         "{state:?}"
     );
+}
+
+/// TesterPresent with its suppress bit set, which the simulated ECU leaves unanswered, so the
+/// mock ends the primitive with its receive timeout and its own extra error code.
+fn unanswered_program() -> Program {
+    Program {
+        schema_version: IR_SCHEMA_VERSION,
+        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x3E }],
+        constants: vec![vec![0x80]],
+        sections: Vec::new(),
+        source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
+    }
+}
+
+/// The `detail` of the one exchange entry in the communication log under `dir`.
+fn exchange_detail(dir: &Path) -> serde_json::Value {
+    let mut entries: Vec<serde_json::Value> = std::fs::read_dir(dir)
+        .expect("the communication log directory")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(".commlog.jsonl"))
+        .flat_map(|path| {
+            std::fs::read_to_string(path)
+                .expect("a log")
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+                .collect::<Vec<_>>()
+        })
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    assert_eq!(entries.len(), 1, "{entries:?}");
+    entries.remove(0)["detail"].clone()
+}
+
+#[test]
+fn the_worker_names_the_mock_s_extra_error_code_by_its_mdf_in_the_log() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let setup = Setup::new(temp.path());
+    let code = iso22900_mock::MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP;
+    let name = iso22900_mock::MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP_NAME;
+    // An entry whose MDF names `codes`.
+    let with_mdf = |codes: &[(u32, &str)]| {
+        let mdf = iso22900_mock::write_module_description_file(temp.path(), codes)
+            .expect("the MDF should be writable");
+        iso22900_mock::write_root_file_with_mdf(temp.path(), LIBRARY_NAME, &setup.library, &mdf)
+            .expect("root description file should be writable")
+    };
+    // The worker names the code by its MDF; an MDF that names only another code, and an entry
+    // with no MDF, leave the code alone (ADR-351). Each case writes its root file over the last
+    // one's.
+    for (case, expected) in [("named", Some(name)), ("unnamed", None), ("no-mdf", None)] {
+        let root_file = match case {
+            "named" => with_mdf(&[(code, name)]),
+            "unnamed" => with_mdf(&[(code + 1, "ANOTHER_CODE")]),
+            _ => iso22900_mock::write_root_file(temp.path(), LIBRARY_NAME, &setup.library)
+                .expect("root description file should be writable"),
+        };
+        let comm_log = temp.path().join(format!("commlog-{case}"));
+        let (status, stdout) = setup.run(&root_file, &unanswered_program(), Some(&comm_log));
+        // The unanswered request ends the job; its log still holds the exchange.
+        assert!(!status.success(), "{case}: {stdout}");
+        let detail = exchange_detail(&comm_log);
+        assert_eq!(
+            detail["error_event"], "PDU_ERR_EVT_RX_TIMEOUT",
+            "{case}: {detail}"
+        );
+        assert_eq!(detail["extra_error_info"], code, "{case}: {detail}");
+        assert_eq!(
+            detail
+                .get("extra_error_info_name")
+                .and_then(|name| name.as_str()),
+            expected,
+            "{case}: {detail}"
+        );
+    }
 }

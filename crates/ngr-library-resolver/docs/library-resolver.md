@@ -120,9 +120,17 @@ Annex F, cited by clause only).
 **Chain.** The root description file lists one `MVCI_PDU_API` entry per installed implementation.
 The entry itself names the API library (`LIBRARY_FILE`), the module description file
 (`MODULE_DESCRIPTION_FILE`) and the cable description file (`CABLE_DESCRIPTION_FILE`), each as a
-`URI` attribute holding a `file:` URI. The MDF and CDF are not parsed and not followed to find the
-library; their paths are reported in `Implementation` for the 7.2 check. ADR-277 is the decision
-record for the rules below.
+`URI` attribute holding a `file:` URI. The MDF and CDF are not followed to find the library;
+their paths are reported in `Implementation` for the 7.2 check. ADR-277 is the decision record
+for the rules below.
+
+**MDF error codes** (`iso22900::mdf::read_error_codes(path)`). For a caller that has resolved an
+entry (`iso22900-service` at startup, ADR-351), the MDF's `ERROR_CODE` elements (Annex F, F.4) give the vendor's names for the extra error
+information of its error events (D.4.2): each element's decimal `ID` and trimmed `SHORT_NAME`;
+the `DESCRIPTION` is not kept. The file has the root file's encoding rules and a 16 MiB limit,
+and its document element must be `MVCI_MODULE_DESCRIPTION`. An element without exactly one
+usable `ID` (an unsigned 32-bit decimal) and one non-empty `SHORT_NAME` is skipped, and an `ID`
+two elements name differently has no name.
 
 **Root file location** (`root_file_path(view)`). On Windows the registry view `view` of
 `HKLM\SOFTWARE\D-PDU API`, value `Root File` (a missing key, value or blank content is `None`).

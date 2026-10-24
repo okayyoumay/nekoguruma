@@ -420,7 +420,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `worker_detail`; a failed start without a reason stays `unknown`
   (`primitive_failed_to_start`), since it does not show the request was not sent. Each has its
   `origin`, the link's identifiers as its `target`, the agent's times, and in `detail` the host
-  error's variant name, the error event's name and the gRPC status code, never their text. A step's
+  error's variant name, the error event's name and the gRPC status code, never their text. The
+  named error event's extra error information (ISO 22900-2:2022 D.4.2) goes in too, as the
+  worker gave it (ADR-351): its code in `extra_error_info` and its name in
+  `extra_error_info_name` (the D-PDU worker's from the library's MDF, the J2534 worker's own).
+  The host does not interpret either, so neither changes the outcome or the classification. A
+  lost VCI the worker reports before a request starts carries neither. A step's
   request has `origin` `procedure` and the step's `at` (pc, step count, the source position the
   program's source map gives, and the sections in force); the runner tells the host where each
   step begins and that it ended (`ProcedurePosition`). The runner's and the restart's own reads

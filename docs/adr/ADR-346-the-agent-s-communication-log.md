@@ -1,7 +1,7 @@
 # ADR-346: The Agent's Communication Log
 
 **Date:** 2026-10-22
-**Status:** Accepted
+**Status:** Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351)
 **Affects:** design 8.11 (new); `agent` (`WorkerHost::send_recv` / `send_recv_async` and the
 link's event handling in `host.rs`, the ComParams `link.rs` sets, the job runner); the worker
 interface's error events (`vci-service-interface`, `docs/rpc-api-guide.md`); `sim-vci`

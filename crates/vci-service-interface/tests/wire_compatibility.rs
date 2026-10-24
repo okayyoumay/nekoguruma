@@ -180,6 +180,7 @@ fn an_error_detail_keeps_an_absent_and_an_empty_detail_text_apart() {
 /// ADR-350: an error event's extra error information is `optional` inside
 /// `ErrorData`, so a worker with none (J2534) and a library's 0 stay apart;
 /// the bare enum's old tag 7 is reserved and no longer reads as an error.
+/// ADR-351 adds the information's name beside it.
 /// A refusal's reason is a field of its own beside the PDU error.
 #[test]
 fn an_error_event_s_extra_information_and_a_refusal_s_reason_are_on_the_wire() {
@@ -189,6 +190,7 @@ fn an_error_event_s_extra_information_and_a_refusal_s_reason_are_on_the_wire() {
         data: Some(event_item::Data::ErrorData(ErrorData {
             error_event: 1,
             extra_error_info: Some(0),
+            extra_error_info_name: None,
         })),
         ..Default::default()
     };
@@ -200,8 +202,35 @@ fn an_error_event_s_extra_information_and_a_refusal_s_reason_are_on_the_wire() {
         Some(event_item::Data::ErrorData(ErrorData {
             error_event: 1,
             extra_error_info: None,
+            extra_error_info_name: None,
         })),
         "absent, not 0"
+    );
+    // ADR-351: the information's name is a field of its own beside the code, and comes alone
+    // when the worker has no code.
+    // 10: error_data { 1: error_event = 1, 2: extra_error_info = 0x101, 3: name = "AB" }
+    let named = [
+        0x52, 0x09, 0x08, 0x01, 0x10, 0x81, 0x02, 0x1A, 0x02, b'A', b'B',
+    ];
+    let expected = EventItem {
+        data: Some(event_item::Data::ErrorData(ErrorData {
+            error_event: 1,
+            extra_error_info: Some(0x101),
+            extra_error_info_name: Some("AB".to_owned()),
+        })),
+        ..Default::default()
+    };
+    assert_eq!(decode::<EventItem>(&named), expected);
+    assert_round_trip(&expected);
+    // 10: error_data { 1: error_event = 1, 3: name = "AB" }
+    assert_eq!(
+        decode::<EventItem>(&[0x52, 0x06, 0x08, 0x01, 0x1A, 0x02, b'A', b'B']).data,
+        Some(event_item::Data::ErrorData(ErrorData {
+            error_event: 1,
+            extra_error_info: None,
+            extra_error_info_name: Some("AB".to_owned()),
+        })),
+        "a name without a code"
     );
     assert_eq!(
         decode::<EventItem>(&[0x38, 0x01]).data,

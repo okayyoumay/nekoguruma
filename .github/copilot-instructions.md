@@ -53,6 +53,12 @@ reviewing.
 - **Spec citations**, anywhere (code, docs, scripts, commit messages, the PR description): a
   standard cited without its clause or section number, or an ISO 22900-2 citation that does not
   say whether it targets the 2009 or the 2022 edition.
+- **Worker-specific branching in the agent**: agent code (`crates/agent`), or a section of
+  `docs/system-architecture.md` or an ADR, that makes the agent behave differently by which
+  worker (J2534 or D-PDU API) or which library it drives, where the worker could absorb the
+  difference behind the common worker interface (design principle 6, ADR-351). A value one API
+  cannot give at all travels through the interface as an explicit absence that the agent treats
+  alike for every worker; flag code that tells the workers apart instead.
 - **Naming**, in any file type: a new crate, binary or command without the `ngr` prefix; a new
   path or configuration directory named after the project that does not use the full lowercase
   name `nekoguruma` (for example `ngr/` or `Nekoguruma/`); documentation not in English; a new

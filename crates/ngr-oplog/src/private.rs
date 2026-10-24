@@ -48,7 +48,7 @@ pub(crate) fn create_dir(dir: &Path) -> io::Result<()> {
     }
 }
 
-/// Opens `path` for appending, creating it private, and narrows an existing file whose access is
+/// Opens `path` for writing at its end, creating it private, and narrows an existing file whose access is
 /// wider. A path that is not a regular file is refused: a symbolic link or reparse point is not
 /// followed (the open itself refuses it, so one put in place after the check is refused too), and
 /// a FIFO does not block the open.
@@ -63,7 +63,14 @@ pub(crate) fn open_append(path: &Path) -> io::Result<File> {
         return Err(not_a_file());
     }
     let mut options = OpenOptions::new();
-    options.create(true).append(true);
+    // On Unix the file is opened to append. On Windows a handle opened to append may not
+    // truncate, which a rotation needs when the file cannot be renamed, so it is opened to write
+    // and its one writer moves to the end before each write ([`seek_end`]).
+    options.create(true);
+    #[cfg(unix)]
+    options.append(true);
+    #[cfg(windows)]
+    options.write(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
@@ -83,7 +90,21 @@ pub(crate) fn open_append(path: &Path) -> io::Result<File> {
         return Err(not_a_file());
     }
     restrict_file(path, &file)?;
+    seek_end(&file)?;
     Ok(file)
+}
+
+/// Moves `file`'s position to its end, where the next write goes: a no-op on Unix, where the file
+/// is opened to append.
+pub(crate) fn seek_end(file: &File) -> io::Result<()> {
+    #[cfg(windows)]
+    {
+        use std::io::Seek;
+        (&*file).seek(io::SeekFrom::End(0))?;
+    }
+    #[cfg(unix)]
+    let _ = file;
+    Ok(())
 }
 
 /// The error for an existing file that another account owns: narrowing its mode or its access

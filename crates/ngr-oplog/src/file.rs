@@ -145,7 +145,9 @@ impl RotatingFile {
         if self.len > 0 && self.len.saturating_add(entry.len() as u64) > self.settings.max_bytes {
             self.rotate();
         }
-        match self.file.write_all(entry) {
+        // The position is at the end already on Unix; on Windows it is moved there.
+        let written = private::seek_end(&self.file).and_then(|()| self.file.write_all(entry));
+        match written {
             Ok(()) => {
                 self.len += entry.len() as u64;
                 Ok(())
@@ -225,23 +227,10 @@ impl RotatingFile {
         }
     }
 
-    /// Empties the file entries go to: the one at the path, or the rotated one while detached.
-    /// A handle that may only append (Windows) cannot truncate, so the file is then truncated
-    /// through a second handle; entries go on at its new end either way.
+    /// Empties the file entries go to, through the handle itself, so no path is opened again.
     fn empty(&self) -> io::Result<()> {
-        if self.file.set_len(0).is_ok() {
-            return Ok(());
-        }
-        let current = if self.detached {
-            self.settings.rotated_path(1)
-        } else {
-            self.settings.path.clone()
-        };
-        std::fs::OpenOptions::new()
-            .write(true)
-            .truncate(true)
-            .open(current)
-            .map(drop)
+        self.file.set_len(0)?;
+        private::seek_end(&self.file)
     }
 
     /// Opens a new file at the path.

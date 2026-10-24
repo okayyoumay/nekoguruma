@@ -16,7 +16,7 @@ use crate::time::utc_timestamp;
 
 /// The name of the field that holds text NGR does not write itself (ADR-348 item 6), which an
 /// entry keeps apart from its other fields.
-const EXTERNAL: &str = "external";
+pub(crate) const EXTERNAL: &str = "external";
 
 /// Writes each event to a [`RotatingFile`] as one line:
 ///
@@ -118,21 +118,11 @@ where
     S: Subscriber + for<'a> LookupSpan<'a>,
 {
     fn on_new_span(&self, attrs: &Attributes<'_>, id: &Id, ctx: Context<'_, S>) {
-        if let Some(span) = ctx.span(id) {
-            let mut fields = Fields::default();
-            attrs.record(&mut fields);
-            // `replace`, not `insert`, which would panic on a span another `JsonLayer` in the same
-            // registry has already given its fields.
-            span.extensions_mut().replace(fields);
-        }
+        record_new_span(attrs, id, &ctx);
     }
 
     fn on_record(&self, id: &Id, values: &Record<'_>, ctx: Context<'_, S>) {
-        if let Some(span) = ctx.span(id)
-            && let Some(fields) = span.extensions_mut().get_mut::<Fields>()
-        {
-            values.record(fields);
-        }
+        record_span(id, values, &ctx);
     }
 
     fn on_event(&self, event: &Event<'_>, ctx: Context<'_, S>) {
@@ -143,12 +133,39 @@ where
     }
 }
 
-/// An event's or a span's recorded fields.
+/// Keeps a new span's fields in its extensions, for the entries of the events in it.
+pub(crate) fn record_new_span<S>(attrs: &Attributes<'_>, id: &Id, ctx: &Context<'_, S>)
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    if let Some(span) = ctx.span(id) {
+        let mut fields = Fields::default();
+        attrs.record(&mut fields);
+        // `replace`, not `insert`, which would panic on a span another layer of this crate in the
+        // same registry has already given its fields.
+        span.extensions_mut().replace(fields);
+    }
+}
+
+/// Adds the fields recorded on a span after it was created.
+pub(crate) fn record_span<S>(id: &Id, values: &Record<'_>, ctx: &Context<'_, S>)
+where
+    S: Subscriber + for<'a> LookupSpan<'a>,
+{
+    if let Some(span) = ctx.span(id)
+        && let Some(fields) = span.extensions_mut().get_mut::<Fields>()
+    {
+        values.record(fields);
+    }
+}
+
+/// An event's or a span's recorded fields. Each layer of this crate keeps a span's in the span's
+/// extensions, replacing what another one put there (they record the same).
 #[derive(Debug, Clone, Default)]
-struct Fields {
-    message: Option<String>,
-    values: Map<String, Value>,
-    external: Option<String>,
+pub(crate) struct Fields {
+    pub(crate) message: Option<String>,
+    pub(crate) values: Map<String, Value>,
+    pub(crate) external: Option<String>,
 }
 
 impl Fields {

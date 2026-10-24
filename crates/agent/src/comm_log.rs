@@ -57,6 +57,20 @@ pub struct CommLogSetup {
     pub key: JobKey,
 }
 
+/// A job key of its own for one run of `ngr-agent run`: a job ID minted from the clock, the
+/// process ID and a count within the process, so two runs never share one, in generation 0.
+pub fn run_key() -> JobKey {
+    static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let unix_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |elapsed| elapsed.as_millis());
+    let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    JobKey {
+        job_id: shared_proto::JobId(format!("run-{unix_ms}-{}-{run}", std::process::id())),
+        generation: 0,
+    }
+}
+
 impl CommLogSetup {
     /// A log of its own for one run in `dir`: a job ID minted from the clock, the process ID
     /// and a count within the process, so two runs never share a log, in generation 0
@@ -64,23 +78,18 @@ impl CommLogSetup {
     /// by its owner only, since the log holds the vehicle's data; an existing one keeps its
     /// permissions, and the log file itself is its owner's alone ([`CommLog`]).
     pub fn for_run(dir: PathBuf) -> io::Result<Self> {
-        static RUNS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        Self::for_run_key(dir, run_key())
+    }
+
+    /// [`for_run`](Self::for_run) with the run's key minted already ([`run_key`]), so the
+    /// operational log's job span names the same job (ADR-348 item 3).
+    pub fn for_run_key(dir: PathBuf, key: JobKey) -> io::Result<Self> {
         let mut builder = std::fs::DirBuilder::new();
         builder.recursive(true);
         #[cfg(unix)]
         std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
         builder.create(&dir)?;
-        let unix_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map_or(0, |elapsed| elapsed.as_millis());
-        let run = RUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        Ok(Self {
-            dir,
-            key: JobKey {
-                job_id: shared_proto::JobId(format!("run-{unix_ms}-{}-{run}", std::process::id())),
-                generation: 0,
-            },
-        })
+        Ok(Self { dir, key })
     }
 
     /// The log file of the setup's job and generation.

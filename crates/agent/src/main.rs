@@ -10,10 +10,12 @@ use std::time::Duration;
 
 use agent::artifact::{Artifact, SHA256_LEN, parse_sha256};
 use agent::guards::{GuardSetup, JobGuards};
+use agent::journal::JobKey;
 use agent::launch::{Api, launch_worker};
 use agent::policy::build_ceiling;
-use agent::{CommLogSetup, Job, JobDocument, JobLimits, JobRun, check_job, run_program};
+use agent::{CommLogSetup, Job, JobDocument, JobLimits, JobRun, check_job, run_key, run_program};
 use diag_ir::{Value, VmState};
+use tracing::Instrument;
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const USAGE: &str = "\
@@ -77,6 +79,9 @@ fn main() -> ExitCode {
             return ExitCode::from(2);
         }
     };
+    // The operational log (design 12.2), kept for the process's lifetime: stderr and the
+    // rotated file in the user's state directory (`crates/agent/docs/ngr-agent.md`).
+    let _logging = agent::logging::install();
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -239,19 +244,27 @@ fn with_artifact(job: Job, artifact: Option<(PathBuf, [u8; SHA256_LEN])>) -> Res
     Ok(job.with_artifact(sha256, artifact))
 }
 
-/// The communication log of this run, of its own in `dir` (`CommLogSetup::for_run`, ADR-347).
-fn comm_log_setup(dir: PathBuf) -> Result<CommLogSetup, String> {
+/// The communication log of this run, of its own in `dir` under the run's `key`
+/// (`CommLogSetup::for_run_key`, ADR-347).
+fn comm_log_setup(dir: PathBuf, key: JobKey) -> Result<CommLogSetup, String> {
     let shown = dir.display().to_string();
-    let setup =
-        CommLogSetup::for_run(dir).map_err(|error| format!("cannot create {shown}: {error}"))?;
+    let setup = CommLogSetup::for_run_key(dir, key)
+        .map_err(|error| format!("cannot create {shown}: {error}"))?;
     setup
         .path()
         .map_err(|error| format!("--comm-log: {error}"))?;
     Ok(setup)
 }
 
-/// Runs the job and returns the final VM state as JSON.
+/// Runs the job, in its span of the operational log, and returns the final VM state as JSON.
 async fn run(args: RunArgs) -> Result<String, String> {
+    // The run's job key: its communication log's and its span's (ADR-348 item 3).
+    let key = run_key();
+    let span = agent::logging::job_span(&key, &args.vci);
+    run_job(args, key).instrument(span).await
+}
+
+async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
     let mut job = with_artifact(read_job(&args.document)?, args.artifact)?;
     // A program the job would refuse does not need a worker, nor does a link the document
     // declares that cannot be used.
@@ -269,7 +282,7 @@ async fn run(args: RunArgs) -> Result<String, String> {
     };
     let mut log_path = None;
     if let Some(dir) = dir {
-        let setup = comm_log_setup(dir)?;
+        let setup = comm_log_setup(dir, key)?;
         log_path = setup.path().ok();
         job = job.with_comm_log(setup);
     }
@@ -464,7 +477,7 @@ mod tests {
     #[test]
     fn a_run_mints_a_log_of_its_own_in_generation_zero() {
         let dir = std::env::temp_dir().join(format!("ngr-agent-comm-log-{}", std::process::id()));
-        let setup = comm_log_setup(dir.clone()).expect("a log setup");
+        let setup = comm_log_setup(dir.clone(), run_key()).expect("a log setup");
         assert_eq!(setup.key.generation, 0);
         let id = &setup.key.job_id.0;
         assert!(

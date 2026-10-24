@@ -81,4 +81,5 @@ throughout.
 A crate that starts to reach the agent's subscriber before its calls have been checked against
 these rules is excluded by the subscriber's safety filter (ADR-348 item 9). The filter runs after
 the level filter, and neither the configuration nor a level raise changes it. Its targets come out
-of the filter once the crate is checked.
+of the filter once the crate is checked. The list is `UNCHECKED_TARGETS` in `src/logging.rs`;
+it is empty, since every crate the agent links is checked.

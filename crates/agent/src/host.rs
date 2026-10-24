@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 
 use crate::client::WorkerApi;
 use diag_ir::DiagHost;
+use ngr_library_resolver::iso22900::mdf::ErrorCodes;
 use tokio::runtime::Handle;
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, ErrorData, EventItem,
@@ -410,6 +411,8 @@ pub struct WorkerHost<C: WorkerApi> {
     artifact: Option<crate::artifact::Artifact>,
     /// The job's communication log, which the exchange entries go to (design 8.11, ADR-347).
     comm_log: Option<crate::comm_log::CommLog>,
+    /// The names of the worker's extra error information, which the entries' `detail` gives.
+    error_codes: ErrorCodes,
     /// The link's request and response identifiers, which the entries name.
     link_ids: Option<(u32, u32)>,
     /// The VM position of the step running ([`ProcedurePosition`]): a request sent during a
@@ -436,6 +439,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             document: None,
             artifact: None,
             comm_log: None,
+            error_codes: ErrorCodes::default(),
             link_ids: None,
             at: None,
             own: None,
@@ -452,6 +456,12 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// events to (ADR-347).
     pub fn set_comm_log(&mut self, comm_log: Option<crate::comm_log::CommLog>) {
         self.comm_log = comm_log;
+    }
+
+    /// Gives the host the names the worker's library gives the extra error information of its
+    /// error events (the error codes of its MDF), which its exchange entries name them by.
+    pub fn set_error_codes(&mut self, error_codes: ErrorCodes) {
+        self.error_codes = error_codes;
     }
 
     /// Gives the host its link's request and response identifiers, which its exchange entries
@@ -548,7 +558,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let sent = handle.block_on(self.send_recv_async(request, progress));
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
-            let link_errors = events_seen(&sent, &mut detail);
+            let link_errors = events_seen(&sent, &self.error_codes, &mut detail);
             self.log(&request, before, end, detail, |evidence| {
                 evidence.expected = expected;
                 evidence.link_errors.extend(link_errors);
@@ -601,7 +611,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                     result: Err(error),
                     started: false,
                     error_events: Vec::new(),
-                    rx_timeout: false,
+                    rx_timeout: None,
+                    vci_lost: None,
                 };
             }
         };
@@ -631,6 +642,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             started: true,
             error_events: progress.errors,
             rx_timeout: progress.rx_timeout,
+            vci_lost: progress.vci_lost,
         }
     }
 
@@ -725,20 +737,41 @@ impl<C: WorkerApi> WorkerHost<C> {
 
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
 
+/// One error event the worker reported: its code and its extra error information
+/// (ISO 22900-2:2022 D.4.2), which a J2534 worker never has.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct ErrorSeen {
+    event: i32,
+    extra: Option<u32>,
+}
+
+impl ErrorSeen {
+    fn of(data: &ErrorData) -> Self {
+        Self {
+            event: data.error_event,
+            extra: data.extra_error_info,
+        }
+    }
+}
+
 /// How a primitive ended: its outcome, whether it started (a failure to start it sent
-/// nothing), the error events it reported before it ended, in order, and whether the worker
-/// reported its receive timeout.
+/// nothing), the error events it reported before it ended, in order, the receive timeout if the
+/// worker reported one, and the lost VCI if the event stream reported it.
 struct Sent {
     result: Result<Vec<u8>, HostError>,
     started: bool,
-    error_events: Vec<i32>,
-    rx_timeout: bool,
+    error_events: Vec<ErrorSeen>,
+    rx_timeout: Option<ErrorSeen>,
+    vci_lost: Option<ErrorSeen>,
 }
 
 /// The error events the worker reported in an exchange beside the one it ended on: faults seen
 /// in the exchange (design 8.11 "Link error"), whether a response followed them or the
 /// exchange then timed out or lost its events. A primitive that failed ends on the last.
-fn also_seen<'a>(result: &Result<Vec<u8>, HostError>, error_events: &'a [i32]) -> &'a [i32] {
+fn also_seen<'a>(
+    result: &Result<Vec<u8>, HostError>,
+    error_events: &'a [ErrorSeen],
+) -> &'a [ErrorSeen] {
     match (result, error_events) {
         (Err(HostError::PrimitiveFailed(_)), [earlier @ .., _]) => earlier,
         _ => error_events,
@@ -747,19 +780,37 @@ fn also_seen<'a>(result: &Result<Vec<u8>, HostError>, error_events: &'a [i32]) -
 
 /// The link errors of the events `sent` reported beside its end, every one, so the
 /// classification takes the most severe; `detail` names the last unless it already names the
-/// event that ended the exchange (a lost VCI). A receive timeout is named but is no link error.
-fn events_seen(sent: &Sent, detail: &mut Detail) -> Vec<LinkErrorKind> {
+/// event that ended the exchange (a lost VCI, a failed primitive). A receive timeout is named
+/// but is no link error. The named event's extra error information is named too, by
+/// `error_codes`, or by its code when they have no name for it.
+fn events_seen(sent: &Sent, error_codes: &ErrorCodes, detail: &mut Detail) -> Vec<LinkErrorKind> {
     let seen = also_seen(&sent.result, &sent.error_events);
-    if let Some(&last) = seen.last() {
-        detail.error_event = detail.error_event.take().or(Some(error_event_name(last)));
-    }
-    let link_errors = seen.iter().map(|&code| link_error_kind(code)).collect();
-    if sent.rx_timeout {
-        detail.error_event = detail.error_event.take().or(Some(error_event_name(
-            PduErrorEvent::PduErrEvtRxTimeout as i32,
-        )));
-    }
-    link_errors
+    // The event `sent_end` named, when it named one: the one that ended the exchange.
+    let named = match &sent.result {
+        Err(HostError::PrimitiveFailed(_)) => sent.error_events.last(),
+        Err(HostError::VciLost) => sent.vci_lost.as_ref(),
+        _ => None,
+    };
+    let named = if detail.error_event.is_some() {
+        named
+    } else {
+        let named = seen.last().or(sent.rx_timeout.as_ref());
+        detail.error_event = named.map(|seen| error_event_name(seen.event));
+        named
+    };
+    detail.extra_error_info = named
+        .and_then(|seen| seen.extra)
+        .map(|code| extra_error_name(error_codes, code));
+    seen.iter()
+        .map(|seen| link_error_kind(seen.event))
+        .collect()
+}
+
+/// The name `error_codes` gives an extra error information code, or the code in hexadecimal.
+fn extra_error_name(error_codes: &ErrorCodes, code: u32) -> String {
+    error_codes
+        .name(code)
+        .map_or_else(|| format!("{code:#x}"), str::to_owned)
 }
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
@@ -1110,10 +1161,13 @@ struct Progress {
     negative: NegativeShape,
     response: Option<Vec<u8>>,
     error: Option<i32>,
-    /// Every error event but the receive timeout, in order, for the communication log.
-    errors: Vec<i32>,
-    /// The worker reported the receive timeout, which ends the exchange without a response.
-    rx_timeout: bool,
+    /// Every error event but the receive timeout and a lost VCI, in order, for the
+    /// communication log.
+    errors: Vec<ErrorSeen>,
+    /// The receive timeout the worker reported, which ends the exchange without a response.
+    rx_timeout: Option<ErrorSeen>,
+    /// The lost VCI the worker reported, which ends the exchange at once.
+    vci_lost: Option<ErrorSeen>,
 }
 
 impl Progress {
@@ -1126,7 +1180,8 @@ impl Progress {
             response: None,
             error: None,
             errors: Vec::new(),
-            rx_timeout: false,
+            rx_timeout: None,
+            vci_lost: None,
         })
     }
 
@@ -1139,7 +1194,8 @@ impl Progress {
             response: None,
             error: None,
             errors: Vec::new(),
-            rx_timeout: false,
+            rx_timeout: None,
+            vci_lost: None,
         }
     }
 
@@ -1179,12 +1235,10 @@ impl Progress {
         // whole link, with no primitive handle, before it cancels the primitives; one bound to
         // this primitive counts the same.
         if item.cop_handle.is_none_or(|handle| handle == cop)
-            && matches!(
-                item.data,
-                Some(event_item::Data::ErrorData(ErrorData { error_event: code, .. }))
-                    if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
-            )
+            && let Some(event_item::Data::ErrorData(data)) = &item.data
+            && data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
         {
+            self.vci_lost = Some(ErrorSeen::of(data));
             return Some(Err(HostError::VciLost));
         }
         // Events of earlier primitives, and of none, are not this request's.
@@ -1202,16 +1256,14 @@ impl Progress {
             }
             // A receive timeout means the ECU did not answer (or did not accept the rest of a
             // segmented request), which is `NoResponse`, not a failed transmission.
-            Some(event_item::Data::ErrorData(ErrorData {
-                error_event: code, ..
-            })) if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {
-                self.rx_timeout = true;
+            Some(event_item::Data::ErrorData(data))
+                if data.error_event == PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+            {
+                self.rx_timeout = Some(ErrorSeen::of(&data));
             }
-            Some(event_item::Data::ErrorData(ErrorData {
-                error_event: code, ..
-            })) => {
-                self.error = Some(code);
-                self.errors.push(code);
+            Some(event_item::Data::ErrorData(data)) => {
+                self.error = Some(data.error_event);
+                self.errors.push(ErrorSeen::of(&data));
             }
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
@@ -1674,9 +1726,14 @@ mod tests {
         }
     }
 
+    /// An error event without extra error information.
+    fn seen(event: i32) -> ErrorSeen {
+        ErrorSeen { event, extra: None }
+    }
+
     #[test]
     fn an_error_event_counts_however_the_exchange_ended() {
-        let tx = [PduErrorEvent::PduErrEvtTxError as i32];
+        let tx = [seen(PduErrorEvent::PduErrEvtTxError as i32)];
         for result in [
             Ok(vec![0x62, 0xF1, 0x90]),
             Err(HostError::NoResponse),
@@ -1685,9 +1742,9 @@ mod tests {
         ] {
             assert_eq!(also_seen(&result, &tx), tx, "{result:?}");
         }
-        let failed = Err(HostError::PrimitiveFailed(tx[0]));
+        let failed = Err(HostError::PrimitiveFailed(tx[0].event));
         assert!(also_seen(&failed, &tx).is_empty());
-        let fault = PduErrorEvent::PduErrEvtVciHardwareFault as i32;
+        let fault = seen(PduErrorEvent::PduErrEvtVciHardwareFault as i32);
         assert_eq!(also_seen(&failed, &[fault, tx[0]]), [fault]);
         assert!(also_seen(&Err(HostError::NoResponse), &[]).is_empty());
     }
@@ -1698,16 +1755,18 @@ mod tests {
         let tx = PduErrorEvent::PduErrEvtTxError as i32;
         let fault = PduErrorEvent::PduErrEvtVciHardwareFault as i32;
         let frame = PduErrorEvent::PduErrEvtFrameStruct as i32;
-        let sent = |result, error_events: &[i32], rx_timeout| Sent {
+        let sent = |result, error_events: &[i32], rx_timeout: bool| Sent {
             result,
             started: true,
-            error_events: error_events.to_vec(),
-            rx_timeout,
+            error_events: error_events.iter().copied().map(seen).collect(),
+            rx_timeout: rx_timeout.then(|| seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
+            vci_lost: None,
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
                 sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
-            let link_errors = events_seen(sent, &mut detail);
+            let link_errors = events_seen(sent, &ErrorCodes::default(), &mut detail);
+            assert_eq!(detail.extra_error_info, None);
             (detail.error_event, link_errors)
         };
         let name = |name: &str| Some(name.to_owned());
@@ -1761,6 +1820,84 @@ mod tests {
             (name("error event 0x7fff0001"), vec![])
         );
         assert_eq!(link_error_kind(vendor), LinkErrorKind::Other);
+    }
+
+    #[test]
+    fn detail_names_the_extra_error_information_of_the_event_it_names() {
+        let read = [0x22, 0xF1, 0x90];
+        let codes = ngr_library_resolver::iso22900::mdf::parse_error_codes(
+            "<MVCI_MODULE_DESCRIPTION><ERROR_CODE><ID>257</ID>\
+             <SHORT_NAME>XTRA_RX_TIMEOUT</SHORT_NAME><DESCRIPTION>d</DESCRIPTION></ERROR_CODE>\
+             </MVCI_MODULE_DESCRIPTION>",
+        )
+        .unwrap();
+        let event = |event: PduErrorEvent, extra| ErrorSeen {
+            event: event as i32,
+            extra,
+        };
+        let tx = |extra| event(PduErrorEvent::PduErrEvtTxError, extra);
+        let timeout = |extra| event(PduErrorEvent::PduErrEvtRxTimeout, extra);
+        let lost = |extra| event(PduErrorEvent::PduErrEvtLostCommToVci, extra);
+        let base = |result| Sent {
+            result,
+            started: true,
+            error_events: Vec::new(),
+            rx_timeout: None,
+            vci_lost: None,
+        };
+        let names = |sent: Sent, codes: &ErrorCodes| {
+            let (_, mut detail) =
+                sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
+            events_seen(&sent, codes, &mut detail);
+            (detail.error_event, detail.extra_error_info)
+        };
+        let name = |name: &str| Some(name.to_owned());
+        // The MDF names the timeout's code; without it, or for a code it does not list, the code
+        // is given in hexadecimal.
+        let timed_out = || Sent {
+            rx_timeout: Some(timeout(Some(257))),
+            ..base(Err(HostError::NoResponse))
+        };
+        assert_eq!(
+            names(timed_out(), &codes),
+            (name("PDU_ERR_EVT_RX_TIMEOUT"), name("XTRA_RX_TIMEOUT"))
+        );
+        assert_eq!(
+            names(timed_out(), &ErrorCodes::default()),
+            (name("PDU_ERR_EVT_RX_TIMEOUT"), name("0x101"))
+        );
+        // The information is that of the event named: here the transmit error before the
+        // timeout, which has none.
+        let both = Sent {
+            error_events: vec![tx(None)],
+            rx_timeout: Some(timeout(Some(257))),
+            ..base(Err(HostError::NoResponse))
+        };
+        assert_eq!(names(both, &codes), (name("PDU_ERR_EVT_TX_ERROR"), None));
+        // A failed primitive names the event it ended on, not an earlier one.
+        let failed = Sent {
+            error_events: vec![tx(Some(257)), tx(Some(0x7F))],
+            ..base(Err(HostError::PrimitiveFailed(tx(None).event)))
+        };
+        assert_eq!(
+            names(failed, &codes),
+            (name("PDU_ERR_EVT_TX_ERROR"), name("0x7f"))
+        );
+        // A lost VCI names its own, also after another event.
+        let gone = Sent {
+            error_events: vec![tx(Some(257))],
+            vci_lost: Some(lost(Some(0xFFFF_FFFF))),
+            ..base(Err(HostError::VciLost))
+        };
+        assert_eq!(
+            names(gone, &codes),
+            (name("PDU_ERR_EVT_LOST_COMM_TO_VCI"), name("0xffffffff"))
+        );
+        // A lost VCI the start refused carries no event of the stream, so no information.
+        assert_eq!(
+            names(base(Err(HostError::VciLost)), &codes),
+            (name("PDU_ERR_EVT_LOST_COMM_TO_VCI"), None)
+        );
     }
 
     #[test]

@@ -491,8 +491,9 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     assert_eq!(comm_log, CommLogStatus::Complete);
     assert_comm_log(&setup);
 
-    // A request longer than ISO 15765 can carry (SAE J2534-1 v04.04 limits a message to 4095
-    // bytes of data): the worker refuses it before sending, naming the reason.
+    // A request longer than ISO 15765 can carry (SAE J2534-1 v04.04 clause 8.3 limits an
+    // ISO15765 message to 4095 bytes of data after its CAN ID): the worker refuses it before
+    // sending, naming the reason.
     let setup = CommLogSetup {
         dir: comm_log_dir.to_owned(),
         key: agent::journal::JobKey {

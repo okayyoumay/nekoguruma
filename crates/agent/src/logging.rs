@@ -303,7 +303,8 @@ mod tests {
             "{text}"
         );
         assert!(!text.contains(temp.path().to_str().unwrap()), "{text}");
-        let length = dir.display().to_string().len();
+        // The field holds the path as `External` escapes it (a Windows path's backslashes doubled).
+        let length = External(dir.display()).to_string().len();
         assert!(
             text.ends_with(&format!("external=<{length} bytes>\n")),
             "{text}"

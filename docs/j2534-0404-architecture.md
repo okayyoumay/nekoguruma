@@ -790,7 +790,11 @@ the shared bus across every CLL, not just this COP, and always reads the
 live Active set at the moment of each transmit. A resolution failure (bad
 addressing, size, or framing) is a synchronous `StartComPrimitive
 INVALID_ARGUMENT`, exactly like any other malformed request — there is no
-execution-time deferral. Since resolution binds at call time, a
+execution-time deferral. Its `ErrorDetail` names the refusal reason
+(ADR-350, `docs/rpc-api-guide.md`): `PROTOCOL_CANNOT_CARRY` for a message
+outside the protocol's transmit size range or a functional request that
+does not fit a single frame, `INVALID_PARAMETERS` for the rest, and a
+library's `ERR_BUFFER_FULL` is `QUEUE_FULL`. Since resolution binds at call time, a
 `SetComParam`/`CoptUpdateparam`/`CoptRestoreParam` issued *after* the
 `StartComPrimitive` call returns cannot retroactively affect an
 already-started COP, regardless of how the poll task's FIFO queue happens to

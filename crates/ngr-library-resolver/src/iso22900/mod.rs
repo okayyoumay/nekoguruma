@@ -7,8 +7,9 @@
 //! registry value `Root File` under `HKLM\SOFTWARE\D-PDU API` on Windows, read in an explicit
 //! [`RegistryView`] (or, in a debug build, at a set `NGR_PDU_API_ROOT_FILE`, ADR-282), and at
 //! `vci_service_config::pdu_api_root_file()` elsewhere. The MDF and CDF
-//! are not parsed here and are not followed to find the library; their paths are reported so the
-//! 7.2 check can cover them. Matching rules and error cases are in `docs/library-resolver.md`.
+//! are not followed to find the library; their paths are reported so the 7.2 check can cover
+//! them. [`mdf`] reads the error codes an MDF names, for a caller that has resolved one. Matching
+//! rules and error cases are in `docs/library-resolver.md`.
 //!
 //! The name a caller resolves is the entry's `SHORT_NAME` (trimmed), matched exactly and
 //! case-sensitively.
@@ -23,6 +24,8 @@ use tracing::warn;
 use vci_service_config::External;
 
 use crate::RegistryView;
+
+pub mod mdf;
 
 /// Largest root description file accepted, in bytes.
 pub const MAX_ROOT_FILE_SIZE: u64 = 1024 * 1024;

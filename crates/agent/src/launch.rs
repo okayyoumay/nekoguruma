@@ -17,7 +17,9 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use j2534_0404_registry::RegistryViewMode;
+use ngr_library_resolver::iso22900::mdf::ErrorCodes;
 use ngr_library_resolver::{RegistryView, iso22900, j2534_0404};
+use vci_service_config::External;
 use worker_host::abi::{self, Abi, AbiError};
 use worker_host::client::{ConnectError, ConnectOptions, WorkerClient};
 use worker_host::service::{
@@ -125,13 +127,14 @@ const RESOLUTIONS: &[Resolution] = &[Resolution {
     abi: None,
 }];
 
-/// What one worker build would load for a VCI: the library, and the `LongSize` its J2534
+/// What one worker build would load for a VCI: the library, the `LongSize` its J2534
 /// registration definition declares (7.1.1; a registry entry and a D-PDU API implementation
-/// declare none).
+/// declare none), and the module description file a D-PDU API implementation names.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Library {
     path: PathBuf,
     long_size: Option<u8>,
+    module_description_file: Option<PathBuf>,
 }
 
 /// A running worker and a client connected to it.
@@ -143,6 +146,11 @@ pub struct LaunchedWorker {
     /// override, else the registration definition's `LongSize`, else the ABI's default; for a
     /// D-PDU API worker, which takes none, the ABI's default.
     pub long_size: u8,
+    /// The names of the extra error information the worker's error events carry: the error
+    /// codes of the MDF the D-PDU API implementation names (ISO 22900-2:2022 Annex F, F.4).
+    /// Empty for a J2534 worker, whose events carry none, and when the entry names no MDF or
+    /// the MDF cannot be read, which is logged and does not fail the launch.
+    pub error_codes: ErrorCodes,
     pub process: WorkerProcess,
     pub client: WorkerClient,
 }
@@ -161,7 +169,7 @@ pub async fn launch_worker(
     workers: &WorkerLayout,
     options: &LaunchOptions,
 ) -> Result<LaunchedWorker, LaunchError> {
-    let (library, abi, long_size, options) = match api {
+    let (library, abi, long_size, options, error_codes) = match api {
         Api::J2534 => {
             let (library, abi) = resolve(vci, RESOLUTIONS, lookup_j2534, abi::detect_file)?;
             let long_size = worker_long_size(vci, abi, options.long_size, &library)?;
@@ -169,7 +177,7 @@ pub async fn launch_worker(
                 long_size: Some(long_size),
                 ..options.clone()
             };
-            (library.path, abi, long_size, options)
+            (library.path, abi, long_size, options, ErrorCodes::default())
         }
         Api::Dpdu => {
             let (library, abi) = resolve(vci, RESOLUTIONS, lookup_dpdu, abi::detect_file)?;
@@ -177,7 +185,18 @@ pub async fn launch_worker(
                 long_size: None,
                 ..options.clone()
             };
-            (library.path, abi, abi.default_long_size(), options)
+            let error_codes = library
+                .module_description_file
+                .as_deref()
+                .map(error_codes)
+                .unwrap_or_default();
+            (
+                library.path,
+                abi,
+                abi.default_long_size(),
+                options,
+                error_codes,
+            )
         }
     };
     let binary = workers.find(api.service(), abi)?;
@@ -187,8 +206,23 @@ pub async fn launch_worker(
         abi,
         library,
         long_size,
+        error_codes,
         process,
         client,
+    })
+}
+
+/// The error codes the MDF at `path` names, or none when it cannot be read: the names are for
+/// the log's readers, so a launch does not fail for them.
+fn error_codes(path: &Path) -> ErrorCodes {
+    iso22900::mdf::read_error_codes(path).unwrap_or_else(|error| {
+        // The error quotes the vendor's path, which NGR does not write (ADR-348 item 6).
+        tracing::warn!(
+            external = %External(error),
+            "the module description file's error codes cannot be read; extra error \
+             information is logged by its code"
+        );
+        ErrorCodes::default()
     })
 }
 
@@ -230,6 +264,7 @@ fn lookup_j2534(vci: &str, resolution: &Resolution) -> Result<Library, j2534_040
     Ok(Library {
         path: resolved.definition.library,
         long_size: resolved.definition.long_size,
+        module_description_file: None,
     })
 }
 
@@ -240,6 +275,7 @@ fn lookup_dpdu(vci: &str, resolution: &Resolution) -> Result<Library, iso22900::
     Ok(Library {
         path: resolved.implementation.library_file,
         long_size: None,
+        module_description_file: resolved.implementation.module_description_file,
     })
 }
 
@@ -318,6 +354,7 @@ mod tests {
         Library {
             path: PathBuf::from(path),
             long_size: None,
+            module_description_file: None,
         }
     }
 
@@ -408,6 +445,7 @@ mod tests {
         let library = |long_size| Library {
             path: PathBuf::from("lib"),
             long_size,
+            module_description_file: None,
         };
         let width = |abi, requested, declared| {
             worker_long_size("v", abi, requested, &library(declared)).unwrap()

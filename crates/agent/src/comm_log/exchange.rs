@@ -327,9 +327,11 @@ pub(crate) struct Detail {
     /// The D-PDU error event's name, or its code when the interface lists no name for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_event: Option<String>,
-    /// The D-PDU error event's extra error information (ISO 22900-2:2022 D.4.2), by name.
+    /// The D-PDU error event's extra error information (ISO 22900-2:2022 D.4.2): the
+    /// `SHORT_NAME` the library's MDF gives its code (Annex F, F.4), else the code in
+    /// hexadecimal.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_error_info: Option<&'static str>,
+    pub extra_error_info: Option<String>,
     /// The gRPC status code's name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_status: Option<&'static str>,
@@ -2769,7 +2771,7 @@ mod tests {
         let detail = serde_json::to_value(Detail {
             host_error: Some("a"),
             error_event: Some("b".to_owned()),
-            extra_error_info: Some("c"),
+            extra_error_info: Some("c".to_owned()),
             grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
             native_return_code: Some("f".to_owned()),
@@ -3115,7 +3117,7 @@ mod tests {
         with_detail.detail = Detail {
             host_error: Some("NoResponse"),
             error_event: Some("PDU_ERR_EVT_RX_TIMEOUT".to_owned()),
-            extra_error_info: Some("RX_TIMEOUT_NO_RSP"),
+            extra_error_info: Some("RX_TIMEOUT_NO_RSP".to_owned()),
             ..Detail::default()
         };
         let json = entry_json(with_detail);

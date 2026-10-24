@@ -327,11 +327,14 @@ pub(crate) struct Detail {
     /// The D-PDU error event's name, or its code when the interface lists no name for it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error_event: Option<String>,
-    /// The D-PDU error event's extra error information (ISO 22900-2:2022 D.4.2): the
-    /// `SHORT_NAME` the library's MDF gives its code (Annex F, F.4), else the code in
-    /// hexadecimal.
+    /// The D-PDU error event's extra error code (ISO 22900-2:2022 D.4.2), as the worker gives it.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub extra_error_info: Option<String>,
+    pub extra_error_info: Option<u32>,
+    /// The name the worker gives the extra error information (ADR-351): for a D-PDU worker the
+    /// `SHORT_NAME` the library's MDF gives the code (Annex F, F.4), for a J2534 worker its own
+    /// name for a case it tells apart.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub extra_error_info_name: Option<String>,
     /// The gRPC status code's name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub grpc_status: Option<&'static str>,
@@ -354,8 +357,8 @@ pub(crate) enum LinkErrorKind {
     Protocol,
     Frame,
     TesterPresent,
-    /// A transmit error. Without extra error information it is told apart from nothing else, so
-    /// it is logged as a link error with `sent` `unknown`.
+    /// A transmit error. Its extra error information is not interpreted (ADR-351), so it is
+    /// logged as a link error with `sent` `unknown`.
     Transmit,
     /// An unlisted code.
     Other,
@@ -480,8 +483,8 @@ impl UnknownCause {
 /// How the exchange ended, as the producer saw it: the input of `outcome`. The response bytes
 /// are raw here; [`Outcome`] carries them through [`redact`].
 ///
-/// Not given yet, with the rows that need them: `answers`, `no_flow_control`,
-/// `response_incomplete` and `response_malformed`.
+/// Not given yet, with the rows that need them: `answers` and `response_incomplete`. No
+/// outcome rests on a worker's extra error information (ADR-351).
 #[derive(Debug, Clone)]
 #[expect(
     clippy::enum_variant_names,
@@ -1621,9 +1624,8 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
             (Undetermined, reason)
         }
-        // Not implemented: `response_incomplete`, and `no_flow_control` (`vehicle` after a
-        // flow-control wait past its limit, otherwise `undetermined`). Need the transport's
-        // extra error information.
+        // Not implemented: `response_incomplete` (needs a start-of-message indication with no
+        // response).
         End::NoResponse if this_exchange && !any_link_error => {
             if history.owed_matching == 0 {
                 (
@@ -1664,8 +1666,6 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
             (Undetermined, reason)
         }
-        // Not implemented: `response_malformed`, and `not_sent` by a transmit error (they need
-        // the extra error information that names the case).
         _ => last_row(),
     }
 }
@@ -2771,13 +2771,14 @@ mod tests {
         let detail = serde_json::to_value(Detail {
             host_error: Some("a"),
             error_event: Some("b".to_owned()),
-            extra_error_info: Some("c".to_owned()),
+            extra_error_info: Some(3),
+            extra_error_info_name: Some("c".to_owned()),
             grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
             native_return_code: Some("f".to_owned()),
         })
         .unwrap();
-        assert_eq!(keys(&detail).len(), 6);
+        assert_eq!(keys(&detail).len(), 7);
         let span = SourceSpan {
             pc: 1,
             file: 2,
@@ -3117,7 +3118,8 @@ mod tests {
         with_detail.detail = Detail {
             host_error: Some("NoResponse"),
             error_event: Some("PDU_ERR_EVT_RX_TIMEOUT".to_owned()),
-            extra_error_info: Some("RX_TIMEOUT_NO_RSP".to_owned()),
+            extra_error_info: Some(0x101),
+            extra_error_info_name: Some("RX_TIMEOUT_NO_RSP".to_owned()),
             ..Detail::default()
         };
         let json = entry_json(with_detail);
@@ -3126,7 +3128,8 @@ mod tests {
             json!({
                 "host_error": "NoResponse",
                 "error_event": "PDU_ERR_EVT_RX_TIMEOUT",
-                "extra_error_info": "RX_TIMEOUT_NO_RSP",
+                "extra_error_info": 257,
+                "extra_error_info_name": "RX_TIMEOUT_NO_RSP",
             })
         );
     }

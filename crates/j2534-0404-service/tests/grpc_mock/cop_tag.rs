@@ -437,8 +437,10 @@ async fn cop_tag_round_trips_to_a_cop_scoped_error_event() {
                 &item.data,
                 Some(event_item::Data::ErrorData(ErrorData {
                     error_event,
-                    // A J2534 error event has no extra error information (ADR-350).
+                    // A J2534 error event has no extra error code (ADR-350), and this worker
+                    // names none of its cases yet (ADR-351).
                     extra_error_info: None,
+                    extra_error_info_name: None,
                 }))
                     if *error_event == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) && item

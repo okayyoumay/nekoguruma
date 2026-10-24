@@ -125,7 +125,7 @@ their paths are reported in `Implementation` for the 7.2 check. ADR-277 is the d
 for the rules below.
 
 **MDF error codes** (`iso22900::mdf::read_error_codes(path)`). For a caller that has resolved an
-entry, the MDF's `ERROR_CODE` elements (Annex F, F.4) give the vendor's names for the extra error
+entry (`iso22900-service` at startup, ADR-351), the MDF's `ERROR_CODE` elements (Annex F, F.4) give the vendor's names for the extra error
 information of its error events (D.4.2): each element's decimal `ID` and trimmed `SHORT_NAME`;
 the `DESCRIPTION` is not kept. The file has the root file's encoding rules and a 16 MiB limit,
 and its document element must be `MVCI_MODULE_DESCRIPTION`. An element without exactly one

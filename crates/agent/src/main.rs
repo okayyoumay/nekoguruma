@@ -327,13 +327,10 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
     .await
     .map_err(|error| error.to_string())?;
     // The communication log's `vci_connected` names the API and the width (design 8.11).
-    // Its exchange entries name extra error information by the library's MDF.
-    let job = job
-        .with_vci(VciFacts {
-            api: args.api,
-            long_size: worker.long_size,
-        })
-        .with_error_codes(worker.error_codes);
+    let job = job.with_vci(VciFacts {
+        api: args.api,
+        long_size: worker.long_size,
+    });
     let JobRun {
         result,
         mut guards,

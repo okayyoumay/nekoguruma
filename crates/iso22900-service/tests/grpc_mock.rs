@@ -1366,7 +1366,12 @@ async fn events_until_finished(
             event_item::Data::ErrorData(ErrorData {
                 error_event,
                 extra_error_info,
-            }) => Seen::Error(error_event, extra_error_info),
+                extra_error_info_name,
+            }) => {
+                // The test's root file names no MDF, so no code has a name (ADR-351).
+                assert_eq!(extra_error_info_name, None);
+                Seen::Error(error_event, extra_error_info)
+            }
             other => panic!("unexpected event {other:?}"),
         };
         if event == Seen::Status(FINISHED) {

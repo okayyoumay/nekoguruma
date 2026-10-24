@@ -138,6 +138,7 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
             data: Some(EventItemData::ErrorData(ErrorData {
                 error_event: tracked.event as i32,
                 extra_error_info: None,
+                extra_error_info_name: None,
             })),
             // ADR-204: echoed verbatim whenever `cop_handle` (i.e.
             // `tracked.cop`) is present -- `send_error_event` resolved this
@@ -662,6 +663,7 @@ pub(in crate::service) async fn send_error_event(
                 EventItemData::ErrorData(ErrorData {
                     error_event: error as i32,
                     extra_error_info: None,
+                    extra_error_info_name: None,
                 }),
                 cop_tag,
             );

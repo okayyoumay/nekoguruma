@@ -517,7 +517,7 @@ pub mod event_item {
     }
 }
 /// ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct ErrorData {
     #[prost(enumeration = "PduErrorEvent", tag = "1")]
     pub error_event: i32,
@@ -526,6 +526,12 @@ pub struct ErrorData {
     /// for every J2534 error event.
     #[prost(uint32, optional, tag = "2")]
     pub extra_error_info: ::core::option::Option<u32>,
+    /// The name of the item's additional error information (ADR-351): the
+    /// D-PDU worker gives the SHORT_NAME the library's MDF gives
+    /// extra_error_info; the J2534 worker names a case it tells apart itself,
+    /// with no code. Absent when the worker has no name for it.
+    #[prost(string, optional, tag = "3")]
+    pub extra_error_info_name: ::core::option::Option<::prost::alloc::string::String>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LostEventItemNotification {}

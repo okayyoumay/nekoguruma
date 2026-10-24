@@ -28,7 +28,6 @@ use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
     VmState, WaitingOn,
 };
-use ngr_library_resolver::iso22900::mdf::ErrorCodes;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::document::{Declarations, JobDocument};
@@ -95,9 +94,6 @@ pub struct Job {
     comm_log_dir: Option<PathBuf>,
     /// The VCI the worker was launched for, for the log's `vci_connected` (design 8.11).
     vci: Option<VciFacts>,
-    /// The names the worker's library gives its extra error information, for the log's
-    /// exchange entries (design 8.11 `detail`).
-    error_codes: ErrorCodes,
 }
 
 impl Job {
@@ -110,7 +106,6 @@ impl Job {
             comm_log: None,
             comm_log_dir: None,
             vci: None,
-            error_codes: ErrorCodes::default(),
         })
     }
 
@@ -137,14 +132,6 @@ impl Job {
     /// width, which the communication log's `vci_connected` records (design 8.11).
     pub fn with_vci(mut self, vci: VciFacts) -> Self {
         self.vci = Some(vci);
-        self
-    }
-
-    /// Gives the job the names the worker's library gives the extra error information of its
-    /// error events, the error codes of its MDF (`LaunchedWorker::error_codes`). An exchange
-    /// entry names a code by them, and by its number when they have no name for it.
-    pub fn with_error_codes(mut self, error_codes: ErrorCodes) -> Self {
-        self.error_codes = error_codes;
         self
     }
 
@@ -201,7 +188,6 @@ impl From<Program> for Job {
             comm_log: None,
             comm_log_dir: None,
             vci: None,
-            error_codes: ErrorCodes::default(),
         }
     }
 }
@@ -1069,7 +1055,6 @@ async fn run_checked<C: WorkerApi>(
         comm_log: _,
         comm_log_dir: _,
         vci: _,
-        error_codes,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
@@ -1095,7 +1080,6 @@ async fn run_checked<C: WorkerApi>(
                 journal,
                 guards,
                 &mut comm_log,
-                error_codes,
             )
         }))
         .unwrap_or(Err(JobError::Panicked));
@@ -1138,7 +1122,6 @@ fn run_job<C: WorkerApi>(
     journal: Option<JournalMode>,
     guards: GuardSlot,
     comm_log: &mut JobLog,
-    error_codes: ErrorCodes,
 ) -> Result<VmState, JobError> {
     // The job's guards stay held until the end of this function, after the link is closed
     // (`OpenLink`, declared below, closes it on every way out, a panic included): declared
@@ -1245,7 +1228,6 @@ fn run_job<C: WorkerApi>(
     let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
     host.set_artifact(artifact);
     host.set_comm_log(comm_log);
-    host.set_error_codes(error_codes);
     host.set_link_ids(config.tx_id, config.rx_id);
     if let Err(error) = refused {
         drop(host);
@@ -4747,7 +4729,6 @@ def main():
                         Some(JournalMode::Create(setup)),
                         slot,
                         &mut JobLog::none(),
-                        ErrorCodes::default(),
                     )
                 })
                 .await
@@ -4881,7 +4862,6 @@ def main():
                         Some(JournalMode::Resume(setup)),
                         job_slot,
                         &mut JobLog::none(),
-                        ErrorCodes::default(),
                     )
                 })
                 .await
@@ -5398,7 +5378,6 @@ def main():
                         Some(JournalMode::Create(setup)),
                         slot,
                         &mut JobLog::none(),
-                        ErrorCodes::default(),
                     )
                 })
                 .await
@@ -10365,7 +10344,6 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
-            error_codes: ErrorCodes::default(),
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -10455,7 +10433,6 @@ def main():
                 comm_log: None,
                 comm_log_dir: None,
                 vci: None,
-                error_codes: ErrorCodes::default(),
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -10506,7 +10483,6 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
-            error_codes: ErrorCodes::default(),
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
         // A field the document does not declare is refused before anything is sent, also
@@ -10523,7 +10499,6 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
-            error_codes: ErrorCodes::default(),
         };
         assert!(
             matches!(
@@ -10583,7 +10558,6 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
-            error_codes: ErrorCodes::default(),
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -14287,7 +14261,6 @@ def main():
                 None,
                 slot,
                 &mut JobLog::none(),
-                ErrorCodes::default(),
             )
         })
         .await

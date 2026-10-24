@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 
 use crate::client::WorkerApi;
 use diag_ir::DiagHost;
-use ngr_library_resolver::iso22900::mdf::ErrorCodes;
 use tokio::runtime::Handle;
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, ErrorData, EventItem,
@@ -411,8 +410,6 @@ pub struct WorkerHost<C: WorkerApi> {
     artifact: Option<crate::artifact::Artifact>,
     /// The job's communication log, which the exchange entries go to (design 8.11, ADR-347).
     comm_log: Option<crate::comm_log::CommLog>,
-    /// The names of the worker's extra error information, which the entries' `detail` gives.
-    error_codes: ErrorCodes,
     /// The link's request and response identifiers, which the entries name.
     link_ids: Option<(u32, u32)>,
     /// The VM position of the step running ([`ProcedurePosition`]): a request sent during a
@@ -439,7 +436,6 @@ impl<C: WorkerApi> WorkerHost<C> {
             document: None,
             artifact: None,
             comm_log: None,
-            error_codes: ErrorCodes::default(),
             link_ids: None,
             at: None,
             own: None,
@@ -456,12 +452,6 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// events to (ADR-347).
     pub fn set_comm_log(&mut self, comm_log: Option<crate::comm_log::CommLog>) {
         self.comm_log = comm_log;
-    }
-
-    /// Gives the host the names the worker's library gives the extra error information of its
-    /// error events (the error codes of its MDF), which its exchange entries name them by.
-    pub fn set_error_codes(&mut self, error_codes: ErrorCodes) {
-        self.error_codes = error_codes;
     }
 
     /// Gives the host its link's request and response identifiers, which its exchange entries
@@ -558,7 +548,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let sent = handle.block_on(self.send_recv_async(request, progress));
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
-            let link_errors = events_seen(&sent, &self.error_codes, &mut detail);
+            let link_errors = events_seen(&sent, &mut detail);
             self.log(&request, before, end, detail, |evidence| {
                 evidence.expected = expected;
                 evidence.link_errors.extend(link_errors);
@@ -738,11 +728,12 @@ impl<C: WorkerApi> WorkerHost<C> {
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
 
 /// One error event the worker reported: its code and its extra error information
-/// (ISO 22900-2:2022 D.4.2), which a J2534 worker never has.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// (ISO 22900-2:2022 D.4.2), the code and the name the worker gives it (ADR-351).
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct ErrorSeen {
     event: i32,
     extra: Option<u32>,
+    extra_name: Option<String>,
 }
 
 impl ErrorSeen {
@@ -750,6 +741,7 @@ impl ErrorSeen {
         Self {
             event: data.error_event,
             extra: data.extra_error_info,
+            extra_name: data.extra_error_info_name.clone(),
         }
     }
 }
@@ -781,9 +773,9 @@ fn also_seen<'a>(
 /// The link errors of the events `sent` reported beside its end, every one, so the
 /// classification takes the most severe; `detail` names the last unless it already names the
 /// event that ended the exchange (a lost VCI, a failed primitive). A receive timeout is named
-/// but is no link error. The named event's extra error information is named too, by
-/// `error_codes`, or by its code when they have no name for it.
-fn events_seen(sent: &Sent, error_codes: &ErrorCodes, detail: &mut Detail) -> Vec<LinkErrorKind> {
+/// but is no link error. The named event's extra error information goes in too, its code and its
+/// name as the worker gave them (ADR-351): the agent does not interpret either.
+fn events_seen(sent: &Sent, detail: &mut Detail) -> Vec<LinkErrorKind> {
     let seen = also_seen(&sent.result, &sent.error_events);
     // The event `sent_end` named, when it named one: the one that ended the exchange.
     let named = match &sent.result {
@@ -798,19 +790,11 @@ fn events_seen(sent: &Sent, error_codes: &ErrorCodes, detail: &mut Detail) -> Ve
         detail.error_event = named.map(|seen| error_event_name(seen.event));
         named
     };
-    detail.extra_error_info = named
-        .and_then(|seen| seen.extra)
-        .map(|code| extra_error_name(error_codes, code));
+    detail.extra_error_info = named.and_then(|seen| seen.extra);
+    detail.extra_error_info_name = named.and_then(|seen| seen.extra_name.clone());
     seen.iter()
         .map(|seen| link_error_kind(seen.event))
         .collect()
-}
-
-/// The name `error_codes` gives an extra error information code, or the code in hexadecimal.
-fn extra_error_name(error_codes: &ErrorCodes, code: u32) -> String {
-    error_codes
-        .name(code)
-        .map_or_else(|| format!("{code:#x}"), str::to_owned)
 }
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
@@ -1728,7 +1712,11 @@ mod tests {
 
     /// An error event without extra error information.
     fn seen(event: i32) -> ErrorSeen {
-        ErrorSeen { event, extra: None }
+        ErrorSeen {
+            event,
+            extra: None,
+            extra_name: None,
+        }
     }
 
     #[test]
@@ -1745,7 +1733,7 @@ mod tests {
         let failed = Err(HostError::PrimitiveFailed(tx[0].event));
         assert!(also_seen(&failed, &tx).is_empty());
         let fault = seen(PduErrorEvent::PduErrEvtVciHardwareFault as i32);
-        assert_eq!(also_seen(&failed, &[fault, tx[0]]), [fault]);
+        assert_eq!(also_seen(&failed, &[fault.clone(), tx[0].clone()]), [fault]);
         assert!(also_seen(&Err(HostError::NoResponse), &[]).is_empty());
     }
 
@@ -1765,8 +1753,9 @@ mod tests {
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
                 sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
-            let link_errors = events_seen(sent, &ErrorCodes::default(), &mut detail);
+            let link_errors = events_seen(sent, &mut detail);
             assert_eq!(detail.extra_error_info, None);
+            assert_eq!(detail.extra_error_info_name, None);
             (detail.error_event, link_errors)
         };
         let name = |name: &str| Some(name.to_owned());
@@ -1823,21 +1812,16 @@ mod tests {
     }
 
     #[test]
-    fn detail_names_the_extra_error_information_of_the_event_it_names() {
+    fn detail_gives_the_extra_error_information_of_the_event_it_names() {
         let read = [0x22, 0xF1, 0x90];
-        let codes = ngr_library_resolver::iso22900::mdf::parse_error_codes(
-            "<MVCI_MODULE_DESCRIPTION><ERROR_CODE><ID>257</ID>\
-             <SHORT_NAME>XTRA_RX_TIMEOUT</SHORT_NAME><DESCRIPTION>d</DESCRIPTION></ERROR_CODE>\
-             </MVCI_MODULE_DESCRIPTION>",
-        )
-        .unwrap();
-        let event = |event: PduErrorEvent, extra| ErrorSeen {
+        let event = |event: PduErrorEvent, extra, name: Option<&str>| ErrorSeen {
             event: event as i32,
             extra,
+            extra_name: name.map(str::to_owned),
         };
-        let tx = |extra| event(PduErrorEvent::PduErrEvtTxError, extra);
-        let timeout = |extra| event(PduErrorEvent::PduErrEvtRxTimeout, extra);
-        let lost = |extra| event(PduErrorEvent::PduErrEvtLostCommToVci, extra);
+        let tx = |extra, name| event(PduErrorEvent::PduErrEvtTxError, extra, name);
+        let timeout = |extra, name| event(PduErrorEvent::PduErrEvtRxTimeout, extra, name);
+        let lost = |extra| event(PduErrorEvent::PduErrEvtLostCommToVci, extra, None);
         let base = |result| Sent {
             result,
             started: true,
@@ -1845,58 +1829,74 @@ mod tests {
             rx_timeout: None,
             vci_lost: None,
         };
-        let names = |sent: Sent, codes: &ErrorCodes| {
+        let given = |sent: Sent| {
             let (_, mut detail) =
                 sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
-            events_seen(&sent, codes, &mut detail);
-            (detail.error_event, detail.extra_error_info)
+            events_seen(&sent, &mut detail);
+            (
+                detail.error_event,
+                detail.extra_error_info,
+                detail.extra_error_info_name,
+            )
         };
         let name = |name: &str| Some(name.to_owned());
-        // The MDF names the timeout's code; without it, or for a code it does not list, the code
-        // is given in hexadecimal.
-        let timed_out = || Sent {
-            rx_timeout: Some(timeout(Some(257))),
-            ..base(Err(HostError::NoResponse))
-        };
-        assert_eq!(
-            names(timed_out(), &codes),
-            (name("PDU_ERR_EVT_RX_TIMEOUT"), name("XTRA_RX_TIMEOUT"))
-        );
-        assert_eq!(
-            names(timed_out(), &ErrorCodes::default()),
-            (name("PDU_ERR_EVT_RX_TIMEOUT"), name("0x101"))
-        );
+        // The code and the name come as the worker gave them: both, the code alone (a D-PDU
+        // code its MDF does not name), or the name alone (a J2534 worker's case).
+        for (extra, extra_name) in [
+            (Some(0x101), Some("XTRA_RX_TIMEOUT")),
+            (Some(0x101), None),
+            (None, Some("ISO15765_CF_TIMEOUT")),
+        ] {
+            let timed_out = Sent {
+                rx_timeout: Some(timeout(extra, extra_name)),
+                ..base(Err(HostError::NoResponse))
+            };
+            assert_eq!(
+                given(timed_out),
+                (
+                    name("PDU_ERR_EVT_RX_TIMEOUT"),
+                    extra,
+                    extra_name.map(str::to_owned)
+                )
+            );
+        }
         // The information is that of the event named: here the transmit error before the
         // timeout, which has none.
         let both = Sent {
-            error_events: vec![tx(None)],
-            rx_timeout: Some(timeout(Some(257))),
+            error_events: vec![tx(None, None)],
+            rx_timeout: Some(timeout(Some(0x101), Some("XTRA_RX_TIMEOUT"))),
             ..base(Err(HostError::NoResponse))
         };
-        assert_eq!(names(both, &codes), (name("PDU_ERR_EVT_TX_ERROR"), None));
+        assert_eq!(given(both), (name("PDU_ERR_EVT_TX_ERROR"), None, None));
         // A failed primitive names the event it ended on, not an earlier one.
         let failed = Sent {
-            error_events: vec![tx(Some(257)), tx(Some(0x7F))],
-            ..base(Err(HostError::PrimitiveFailed(tx(None).event)))
+            error_events: vec![tx(Some(0x101), Some("EARLIER")), tx(Some(0x7F), None)],
+            ..base(Err(HostError::PrimitiveFailed(
+                PduErrorEvent::PduErrEvtTxError as i32,
+            )))
         };
         assert_eq!(
-            names(failed, &codes),
-            (name("PDU_ERR_EVT_TX_ERROR"), name("0x7f"))
+            given(failed),
+            (name("PDU_ERR_EVT_TX_ERROR"), Some(0x7F), None)
         );
-        // A lost VCI names its own, also after another event.
+        // A lost VCI gives its own, also after another event.
         let gone = Sent {
-            error_events: vec![tx(Some(257))],
+            error_events: vec![tx(Some(0x101), None)],
             vci_lost: Some(lost(Some(0xFFFF_FFFF))),
             ..base(Err(HostError::VciLost))
         };
         assert_eq!(
-            names(gone, &codes),
-            (name("PDU_ERR_EVT_LOST_COMM_TO_VCI"), name("0xffffffff"))
+            given(gone),
+            (
+                name("PDU_ERR_EVT_LOST_COMM_TO_VCI"),
+                Some(0xFFFF_FFFF),
+                None
+            )
         );
         // A lost VCI the start refused carries no event of the stream, so no information.
         assert_eq!(
-            names(base(Err(HostError::VciLost)), &codes),
-            (name("PDU_ERR_EVT_LOST_COMM_TO_VCI"), None)
+            given(base(Err(HostError::VciLost))),
+            (name("PDU_ERR_EVT_LOST_COMM_TO_VCI"), None, None)
         );
     }
 
@@ -2508,6 +2508,7 @@ mod tests {
                 event_item::Data::ErrorData(ErrorData {
                     error_event: tx_error,
                     extra_error_info: None,
+                    extra_error_info_name: None,
                 }),
             ),
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
@@ -2525,7 +2526,8 @@ mod tests {
                 None,
                 event_item::Data::ErrorData(ErrorData {
                     error_event: lost,
-                    extra_error_info: None
+                    extra_error_info: None,
+                    extra_error_info_name: None,
                 })
             )]),
             Some(Err(HostError::VciLost))
@@ -2536,7 +2538,8 @@ mod tests {
                     None,
                     event_item::Data::ErrorData(ErrorData {
                         error_event: lost,
-                        extra_error_info: None
+                        extra_error_info: None,
+                        extra_error_info_name: None,
                     })
                 ),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
@@ -2551,7 +2554,8 @@ mod tests {
                     Some(COP),
                     event_item::Data::ErrorData(ErrorData {
                         error_event: lost,
-                        extra_error_info: None
+                        extra_error_info: None,
+                        extra_error_info_name: None,
                     })
                 ),
             ]),
@@ -2566,7 +2570,8 @@ mod tests {
                 }),
                 event_item::Data::ErrorData(ErrorData {
                     error_event: lost,
-                    extra_error_info: None
+                    extra_error_info: None,
+                    extra_error_info_name: None,
                 })
             )])
             .is_none()
@@ -2579,7 +2584,8 @@ mod tests {
                     Some(COP),
                     event_item::Data::ErrorData(ErrorData {
                         error_event: timeout,
-                        extra_error_info: None
+                        extra_error_info: None,
+                        extra_error_info_name: None,
                     })
                 ),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),

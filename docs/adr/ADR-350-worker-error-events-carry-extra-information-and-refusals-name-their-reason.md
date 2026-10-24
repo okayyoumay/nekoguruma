@@ -1,7 +1,7 @@
 # ADR-350: Worker Error Events Carry Their Extra Information, and Refusals Name Their Reason
 
 **Date:** 2026-10-24
-**Status:** Accepted
+**Status:** Accepted (Decision item 1's agent use of a known code superseded by ADR-351)
 **Affects:** `vci-service-interface` (`service.proto`: `EventItem`, `ErrorData`, `ErrorDetail`, `RefusalReason`;
 `start_refusal`, `protocol_cannot_carry`), `iso22900-service` (event items, `StartComPrimitive`),
 `j2534-0404-service` (`StartComPrimitive`, `resolve_send_recv_tx`), `iso22900-mock`,

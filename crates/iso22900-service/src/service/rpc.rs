@@ -1,3 +1,4 @@
+use ngr_library_resolver::iso22900::mdf::ErrorCodes;
 use std::{collections::HashMap, pin::Pin, sync::Arc};
 
 use tokio::sync::{Mutex, mpsc, watch::Receiver};
@@ -58,6 +59,9 @@ pub struct Iso22900Service {
     pub(super) event_notifications: mpsc::UnboundedSender<iso22900::EventNotification>,
     pub(super) subscriptions: Arc<Mutex<SubscriptionMap>>,
     pub(super) cop_tags: Arc<Mutex<CopTagMap>>,
+    /// The names the library's MDF gives its additional error codes, which error event items
+    /// carry beside the code (ADR-351).
+    pub(super) error_codes: Arc<ErrorCodes>,
     pub(super) shutdown: tokio::sync::watch::Receiver<bool>,
     /// Whether the launcher's design 7.2 check on `config.toml` let its settings through
     /// ([`ConfigFile::settings_apply`], ADR-285). When the file was absent at startup, settings
@@ -440,6 +444,8 @@ impl VciServer for Iso22900Service {
         let library_path = resolved.implementation.library_file.clone();
         // Kept alive until `DPduApi::new` has mapped the library (design 7.2).
         let checked = check_library(&resolved, startup_config.mode())?;
+        // Read while the checked files are held, so the MDF read is the one checked (ADR-351).
+        let error_codes = Arc::new(module_error_codes(&resolved));
         // Fail fast on a noncanonical `vendor_struct_types` config key
         // (ADR-218): `resolve_vendor_struct_entry_size` only ever looks up
         // one canonical `"0x<8 lowercase hex digits>"` key per call, so an
@@ -474,6 +480,7 @@ impl VciServer for Iso22900Service {
             Arc::clone(&api),
             Arc::clone(&subscriptions),
             Arc::clone(&cop_tags),
+            Arc::clone(&error_codes),
         ));
 
         let subs_for_shutdown = Arc::clone(&subscriptions);
@@ -491,6 +498,7 @@ impl VciServer for Iso22900Service {
             event_notifications: event_notifications_tx,
             subscriptions,
             cop_tags,
+            error_codes,
             shutdown,
             config_checked,
         })
@@ -499,6 +507,23 @@ impl VciServer for Iso22900Service {
     fn get_requested_port(&self) -> Option<u16> {
         self.startup_config.requested_port
     }
+}
+
+/// The error codes of the MDF the root file entry names (ISO 22900-2:2022 Annex F, F.4), or none
+/// when it names none or the MDF cannot be read: the names only label the codes, so the worker
+/// starts without them (ADR-351).
+fn module_error_codes(resolved: &ngr_library_resolver::iso22900::Resolved) -> ErrorCodes {
+    let Some(path) = &resolved.implementation.module_description_file else {
+        return ErrorCodes::default();
+    };
+    ngr_library_resolver::iso22900::mdf::read_error_codes(path).unwrap_or_else(|error| {
+        tracing::warn!(
+            %error,
+            "the module description file's error codes cannot be read; error events carry \
+             their additional error code without a name"
+        );
+        ErrorCodes::default()
+    })
 }
 
 // All tests below rely on the debug-only runtime overrides of the root

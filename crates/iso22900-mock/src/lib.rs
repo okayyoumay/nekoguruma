@@ -1566,7 +1566,7 @@ pub const MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP_NAME: &str = "MOCK_XTRA_ERR_RX_TIMEOUT
 
 /// Writes a module description file `mock_mdf.xml` into `dir` whose `ERROR_CODE` elements name
 /// `error_codes` (ISO 22900-2:2022 Annex F, F.4), and returns its path. The mock reads no MDF
-/// itself: the file is for the agent, which names the extra error information of the mock's
+/// itself: the file is for `iso22900-service`, which names the extra error information of the mock's
 /// error events by it.
 pub fn write_module_description_file(
     dir: &Path,

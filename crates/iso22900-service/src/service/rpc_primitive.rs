@@ -205,7 +205,14 @@ impl Iso22900Service {
         let item = api
             .get_event_item(h_mod, h_cll)
             .map_err(map_runtime_error)?;
-        let event_item = to_proto_event_item(api, item.borrowed(), h_mod, h_cll, &mut cop_tags)?;
+        let event_item = to_proto_event_item(
+            api,
+            item.borrowed(),
+            h_mod,
+            h_cll,
+            &mut cop_tags,
+            &self.error_codes,
+        )?;
 
         Ok(Response::new(EventItemResponse {
             event_item: Some(event_item),

@@ -531,6 +531,11 @@ message ErrorData {
     // meaning the library's MDF gives. Absent when the worker has none, as
     // for every J2534 error event.
     optional uint32 extra_error_info = 2;
+    // The name of the item's additional error information (ADR-351): the
+    // D-PDU worker gives the SHORT_NAME the library's MDF gives
+    // extra_error_info; the J2534 worker names a case it tells apart itself,
+    // with no code. Absent when the worker has no name for it.
+    optional string extra_error_info_name = 3;
 }
 
 message LostEventItemNotification {

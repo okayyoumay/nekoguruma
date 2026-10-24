@@ -168,7 +168,12 @@ worker's own `INVALID_ARGUMENT` checks (the operation type, an oversized tag) ca
 is `INVALID_PARAMETERS` and its `PDU_ERR_TX_QUEUE_FULL` is `QUEUE_FULL`
 (`vci_service_interface::start_refusal`). An error event item passes on the library's additional
 error code, `PDU_ERROR_DATA.ExtraErrorInfoId` (ISO 22900-2:2022 D.4.2), as
-`ErrorData.extra_error_info` in the event item's `error_data`.
+`ErrorData.extra_error_info` in the event item's `error_data`, with the code's name in
+`ErrorData.extra_error_info_name` (ADR-351). The names come from the `ERROR_CODE` elements of the
+MDF the root file entry names (Annex F, F.4), read once at startup, after the design 7.2 checks
+and while the checked files are held (`ngr_library_resolver::iso22900::mdf`). An entry without an
+MDF, an MDF that cannot be read (logged at warn level; the worker starts), and a code the MDF
+does not name leave the name absent.
 
 Mapping logic is in `error.rs` and `preload.rs`. `map_construct_error` and `map_resolve_error`
 log the full underlying error (which may contain a local filesystem path or

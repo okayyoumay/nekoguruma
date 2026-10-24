@@ -1,5 +1,7 @@
 use std::sync::Arc;
 
+use ngr_library_resolver::iso22900::mdf::ErrorCodes;
+
 use tokio::sync::{Mutex, mpsc};
 use tonic::Status;
 
@@ -62,6 +64,7 @@ pub(super) fn to_proto_event_item(
     h_mod: ModuleHandle,
     h_cll: ComLogicalLinkHandle,
     cop_tags: &mut CopTagMap,
+    error_codes: &ErrorCodes,
 ) -> Result<EventItem, Status> {
     let map_err = |error: DPduApiError| rich_runtime_error(api, h_mod, h_cll, error);
 
@@ -106,10 +109,14 @@ pub(super) fn to_proto_event_item(
             Ok(status) => Some(EventItemData::CopStatus(status.status() as i32)),
             Err(DPduApiError::Unsupported(_)) => match borrowed.error_data() {
                 // The item's additional error code (ISO 22900-2:2022 D.4.2) is passed on as the
-                // library gives it (ADR-350).
+                // library gives it (ADR-350), with the name the library's MDF gives it, if any
+                // (ADR-351).
                 Ok(error) => Some(EventItemData::ErrorData(ErrorData {
                     error_event: error.error_code_id().0 as i32,
                     extra_error_info: Some(error.extra_error_info_id()),
+                    extra_error_info_name: error_codes
+                        .name(error.extra_error_info_id())
+                        .map(str::to_owned),
                 })),
                 Err(DPduApiError::Unsupported(_)) => match borrowed.info_data() {
                     Ok(info) => Some(EventItemData::InfoData(info.info_code().0 as i32)),
@@ -179,6 +186,7 @@ pub(super) async fn run_event_subscription_task(
     api: Arc<Mutex<Option<DPduApi>>>,
     subscriptions: Arc<Mutex<SubscriptionMap>>,
     cop_tags: Arc<Mutex<CopTagMap>>,
+    error_codes: Arc<ErrorCodes>,
 ) {
     while let Some(notification) = notification_rx.recv().await {
         let handle =
@@ -225,6 +233,7 @@ pub(super) async fn run_event_subscription_task(
                                 notification.module_handle,
                                 notification.logical_link_handle,
                                 &mut cop_tags_guard,
+                                &error_codes,
                             )
                             .map(|item| VciServiceEventNotification {
                                 handle: Some(handle),

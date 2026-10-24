@@ -243,12 +243,11 @@ fn exchange_detail(dir: &Path) -> serde_json::Value {
 }
 
 #[test]
-fn the_communication_log_names_the_mock_s_extra_error_code_by_its_mdf() {
+fn the_worker_names_the_mock_s_extra_error_code_by_its_mdf_in_the_log() {
     let temp = tempfile::tempdir().expect("temporary directory");
     let setup = Setup::new(temp.path());
     let code = iso22900_mock::MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP;
     let name = iso22900_mock::MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP_NAME;
-    let hex = format!("{code:#x}");
     // An entry whose MDF names `codes`.
     let with_mdf = |codes: &[(u32, &str)]| {
         let mdf = iso22900_mock::write_module_description_file(temp.path(), codes)
@@ -256,9 +255,10 @@ fn the_communication_log_names_the_mock_s_extra_error_code_by_its_mdf() {
         iso22900_mock::write_root_file_with_mdf(temp.path(), LIBRARY_NAME, &setup.library, &mdf)
             .expect("root description file should be writable")
     };
-    // The MDF's name for the code; an MDF that names only another code, and an entry with no
-    // MDF, leave the code's number. Each case writes its root file over the last one's.
-    for (case, expected) in [("named", name), ("unnamed", &hex), ("no-mdf", &hex)] {
+    // The worker names the code by its MDF; an MDF that names only another code, and an entry
+    // with no MDF, leave the code alone (ADR-351). Each case writes its root file over the last
+    // one's.
+    for (case, expected) in [("named", Some(name)), ("unnamed", None), ("no-mdf", None)] {
         let root_file = match case {
             "named" => with_mdf(&[(code, name)]),
             "unnamed" => with_mdf(&[(code + 1, "ANOTHER_CODE")]),
@@ -274,6 +274,13 @@ fn the_communication_log_names_the_mock_s_extra_error_code_by_its_mdf() {
             detail["error_event"], "PDU_ERR_EVT_RX_TIMEOUT",
             "{case}: {detail}"
         );
-        assert_eq!(detail["extra_error_info"], expected, "{case}: {detail}");
+        assert_eq!(detail["extra_error_info"], code, "{case}: {detail}");
+        assert_eq!(
+            detail
+                .get("extra_error_info_name")
+                .and_then(|name| name.as_str()),
+            expected,
+            "{case}: {detail}"
+        );
     }
 }

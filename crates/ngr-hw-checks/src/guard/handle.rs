@@ -3020,6 +3020,7 @@ mod tests {
                     event_item::Data::ErrorData(ErrorData {
                         error_event: lost,
                         extra_error_info: None,
+                        extra_error_info_name: None,
                     }),
                 ),
                 COP,
@@ -3044,7 +3045,8 @@ mod tests {
                         None,
                         event_item::Data::ErrorData(ErrorData {
                             error_event: tx,
-                            extra_error_info: None
+                            extra_error_info: None,
+                            extra_error_info_name: None,
                         })
                     ),
                     COP,
@@ -3081,7 +3083,8 @@ mod tests {
                 &mut failed,
                 event_item::Data::ErrorData(ErrorData {
                     error_event: tx,
-                    extra_error_info: None
+                    extra_error_info: None,
+                    extra_error_info_name: None,
                 })
             )
             .is_none()

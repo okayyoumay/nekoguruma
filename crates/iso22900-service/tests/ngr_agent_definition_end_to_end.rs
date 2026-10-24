@@ -179,4 +179,31 @@ fn a_definition_runs_end_to_end_through_the_d_pdu_worker() {
         &routines[variant].1,
     );
     assert!(state.call_stack.is_empty(), "{state:?}");
+
+    // Each run's communication log names the D-PDU API and the module's version data as the
+    // mock reports it (design 8.11 "Header").
+    let logs: Vec<_> = std::fs::read_dir(temp.path().join("commlog"))
+        .expect("the communication logs")
+        .map(|entry| entry.expect("an entry").path())
+        .filter(|path| path.to_string_lossy().ends_with(".commlog.jsonl"))
+        .collect();
+    assert!(!logs.is_empty());
+    for path in logs {
+        let text = std::fs::read_to_string(&path).expect("a log");
+        let connected: serde_json::Value = text
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+            .find(|line| line["event"] == "vci_connected")
+            .unwrap_or_else(|| panic!("vci_connected in {text}"));
+        assert_eq!(connected["api"], "dpdu", "{connected}");
+        assert!(
+            connected.get("unsigned_long_bytes").is_none(),
+            "{connected}"
+        );
+        let version = &connected["version"];
+        assert_eq!(version["vendor"], "Mock Vendor", "{connected}");
+        assert_eq!(version["hardware_name"], "Mock Hardware", "{connected}");
+        assert_eq!(version["hardware_serial_number"], 123456, "{connected}");
+        assert_eq!(version["api_library_name"], "iso22900-mock", "{connected}");
+    }
 }

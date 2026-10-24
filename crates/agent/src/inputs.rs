@@ -583,6 +583,79 @@ pub enum FieldBytes {
     Unreadable,
 }
 
+/// [`read_field_bytes`] for the identity `kind`, noting what was read with the host (the
+/// communication log's `identity`, design 8.11). A request that failed notes nothing: its
+/// exchange entry says why.
+pub fn read_identity_bytes<H>(
+    kind: diag_ir::IdentityKind,
+    source: Source,
+    table: &ServiceSources,
+    host: &mut H,
+) -> Result<FieldBytes, HostError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    let read = read_field_bytes(source, table, host)?;
+    host.note_identity(
+        kind,
+        match &read {
+            FieldBytes::Field(bytes) => diag_ir::IdentityRead::Value(bytes),
+            FieldBytes::Negative(nrc) => diag_ir::IdentityRead::Negative(*nrc),
+            FieldBytes::Unreadable => diag_ir::IdentityRead::Unreadable,
+        },
+    );
+    Ok(read)
+}
+
+/// [`resolve_source`] for the identity `kind`, noting what was read with the host as
+/// [`read_identity_bytes`] does, from the same one response: the decoded value, a negative
+/// response with its code, or unreadable for anything else.
+pub fn resolve_identity<H>(
+    kind: diag_ir::IdentityKind,
+    source: Source,
+    table: &ServiceSources,
+    host: &mut H,
+) -> Result<Reading, HostError>
+where
+    H: DiagHost<Error = HostError> + RuntimeInputs,
+{
+    let mut noted = None;
+    let reading = match source {
+        Source::RuntimeInput(input) => host.read(input)?,
+        Source::EcuService {
+            service_id,
+            field_id,
+        } => match table
+            .get(service_id, field_id)
+            .and_then(|field| Some((field, field.request.split_first()?)))
+        {
+            None => Reading::CannotBeDecoded,
+            Some((field, (&sid, payload))) => {
+                let response = host.service_request(u16::from(sid), payload)?;
+                if let [0x7F, echoed, nrc] = response[..]
+                    && echoed == sid
+                {
+                    noted = Some(diag_ir::IdentityRead::Negative(nrc));
+                }
+                decode_field(field, sid, &response)
+            }
+        },
+    };
+    let number;
+    let read = noted.unwrap_or(match &reading {
+        Reading::Text(text) => diag_ir::IdentityRead::Value(text.as_bytes()),
+        Reading::Value(value) => {
+            number = value.to_string();
+            diag_ir::IdentityRead::Value(number.as_bytes())
+        }
+        Reading::CannotBeEstablished | Reading::CannotBeDecoded => {
+            diag_ir::IdentityRead::Unreadable
+        }
+    });
+    host.note_identity(kind, read);
+    Ok(reading)
+}
+
 /// Reads the raw bytes of an `EcuService` field, for the write-job journal, which records the
 /// ECU's identity as the ECU answered it (ADR-244, ADR-252). The request and the checks are
 /// those of [`resolve_source`], and the field must also decode under its encoding. A negative
@@ -769,6 +842,8 @@ mod tests {
         responses: Vec<Result<Vec<u8>, HostError>>,
         sent: Vec<(u16, Vec<u8>)>,
         inputs: FixedInputs,
+        /// The identity values noted with the host, as `IdentityRead` gives them.
+        noted: Vec<(diag_ir::IdentityKind, String)>,
     }
 
     impl Fake {
@@ -777,6 +852,7 @@ mod tests {
                 responses: vec![Ok(response.to_vec())],
                 sent: Vec::new(),
                 inputs: FixedInputs::new(),
+                noted: Vec::new(),
             }
         }
     }
@@ -836,6 +912,9 @@ mod tests {
                 .ok_or(HostError::InputNotEstablished(input))
         }
         fn log(&mut self, _: u8, _: &str) {}
+        fn note_identity(&mut self, kind: diag_ir::IdentityKind, read: diag_ir::IdentityRead<'_>) {
+            self.noted.push((kind, format!("{read:?}")));
+        }
     }
 
     fn vin_field() -> ServiceField {
@@ -890,6 +969,53 @@ mod tests {
         source: Source,
     ) {
         let _ = resolve_source(source, &ServiceSources::default(), host);
+    }
+
+    /// An identity read notes what it read with the host: the field's bytes, a negative
+    /// response's code, or an answer that decodes to no value; a failed request notes nothing.
+    #[test]
+    fn identity_reads_note_what_they_read() {
+        use diag_ir::IdentityKind::{HardwarePartNumber, Vin};
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
+        let reading = resolve_identity(Vin, ecu(1, 1), &table(), &mut host).unwrap();
+        assert_eq!(reading, Reading::Text("WVWZZZ1JZXW000001".to_owned()));
+        let mut host2 = Fake::answering(&[0x7F, 0x22, 0x31]);
+        read_identity_bytes(HardwarePartNumber, ecu(1, 1), &table(), &mut host2).unwrap();
+        let mut host3 = Fake::answering(&[0x62, 0xF1, 0x90, 0x41]);
+        resolve_identity(Vin, ecu(1, 1), &table(), &mut host3).unwrap();
+        // A VIN the ECU refuses keeps its code, as the byte reads do; the restart still reads it
+        // as not decoded.
+        let mut host4 = Fake::answering(&[0x7F, 0x22, 0x22]);
+        let refused = resolve_identity(Vin, ecu(1, 1), &table(), &mut host4).unwrap();
+        assert_eq!(refused, Reading::CannotBeDecoded);
+        assert_eq!(host4.sent.len(), 1, "one request");
+        let mut failed = Fake {
+            responses: vec![Err(HostError::NoResponse)],
+            ..Fake::answering(&[])
+        };
+        assert!(read_identity_bytes(HardwarePartNumber, ecu(1, 1), &table(), &mut failed).is_err());
+        assert_eq!(
+            [
+                host.noted,
+                host2.noted,
+                host3.noted,
+                host4.noted,
+                failed.noted
+            ]
+            .concat(),
+            [
+                (
+                    Vin,
+                    format!("{:?}", diag_ir::IdentityRead::Value(b"WVWZZZ1JZXW000001"))
+                ),
+                (
+                    HardwarePartNumber,
+                    format!("{:?}", diag_ir::IdentityRead::Negative(0x31))
+                ),
+                (Vin, format!("{:?}", diag_ir::IdentityRead::Unreadable)),
+                (Vin, format!("{:?}", diag_ir::IdentityRead::Negative(0x22))),
+            ]
+        );
     }
 
     #[test]
@@ -1024,6 +1150,7 @@ mod tests {
             responses: vec![Err(HostError::NoResponse)],
             sent: Vec::new(),
             inputs: FixedInputs::new(),
+            noted: Vec::new(),
         };
         let got = resolve_source(ecu(1, 1), &table(), &mut host);
         assert!(matches!(got, Err(HostError::NoResponse)));

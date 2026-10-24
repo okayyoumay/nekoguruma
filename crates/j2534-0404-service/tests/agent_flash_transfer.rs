@@ -21,7 +21,9 @@
 //!
 //! The jobs run with the write-job journal (ADR-252): the ECU's part number and software
 //! version are read at the plan's entry, and the first job's journal reads back with every
-//! block, the RequestTransferExit marker and the post-transfer completion.
+//! block, the RequestTransferExit marker and the post-transfer completion. The first job's
+//! communication log, beside its journal, holds the VCI's connection with `sim-vci`'s J2534
+//! versions and each identity value as it was read (design 8.11 "Header").
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test; both jobs run in it, one after the other, on
@@ -34,9 +36,10 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent::guards::{GuardSetup, JobGuards};
 use agent::inputs::ServiceSources;
 use agent::journal::{JobKey, Journal};
+use agent::launch::Api;
 use agent::{
     Artifact, HostError, Job, JobDocument, JobError, JobLimits, JobRun, JournalSetup, LinkConfig,
-    run_program_journaled,
+    VciFacts, run_program_journaled,
 };
 use diag_ir::declaration::{
     DataKind, EcuDocumentT, EcuVariantT, FieldT, FlashSegmentT, FlashSessionT, Placement,
@@ -424,6 +427,8 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .expect("a RequestTransferExit marker");
     assert!(exit.complete);
 
+    assert_comm_log(&journal_dir);
+
     // The refused block was never sent, so the second job's journal records no block.
     let journal =
         Journal::read(&long_block_journal_dir, &long_block_job_key()).expect("the second journal");
@@ -434,6 +439,68 @@ fn agent_job_downloads_more_blocks_than_the_counter_holds() {
         .expect("a transfer-start marker");
     assert_eq!(transfer.last_block, None);
     assert!(transfer.exit.is_none());
+}
+
+/// The first job's communication log: `vci_connected` before `link_opened`, with the J2534
+/// versions `sim-vci` reports and the worker's width, then the part number and the software
+/// version as `identity` events, in the order they were read.
+fn assert_comm_log(journal_dir: &std::path::Path) {
+    let path = std::fs::read_dir(journal_dir)
+        .expect("the journal directory")
+        .map(|entry| entry.expect("an entry").path())
+        .find(|path| path.to_string_lossy().ends_with(".commlog.jsonl"))
+        .expect("a communication log beside the journal");
+    let text = std::fs::read_to_string(&path).expect("the log");
+    let lines: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("a JSON line"))
+        .collect();
+    let events: Vec<&str> = lines
+        .iter()
+        .map(|line| line["event"].as_str().expect("an event"))
+        .collect();
+    assert_eq!(
+        &events[..4],
+        ["header", "job_start", "vci_connected", "link_opened"],
+        "{text}"
+    );
+    let connected = &lines[2];
+    assert_eq!(connected["api"], "j2534_0404", "{connected}");
+    assert_eq!(connected["unsigned_long_bytes"], long_size(), "{connected}");
+    let version = &connected["version"];
+    // `sim-vci`'s `FIRMWARE_VERSION` and `DLL_VERSION` (`crates/sim-vci/src/lib.rs`).
+    assert_eq!(version["firmware_version"], "NGR-SIM 1.0", "{connected}");
+    assert!(
+        version["library_version"]
+            .as_str()
+            .is_some_and(|library| library.starts_with("sim-vci ")),
+        "{connected}"
+    );
+    assert!(version["api_version"].is_u64(), "{connected}");
+    assert!(version.get("vendor").is_none(), "{connected}");
+    assert_eq!(connected["drift_bound"]["source"], "none", "{connected}");
+    let identities: Vec<(&str, &str)> = lines
+        .iter()
+        .filter(|line| line["event"] == "identity")
+        .map(|line| {
+            assert_eq!(line["outcome"], "value", "{line}");
+            (
+                line["kind"].as_str().expect("a kind"),
+                line["text"].as_str().expect("a text value"),
+            )
+        })
+        .collect();
+    assert_eq!(
+        identities,
+        [
+            (
+                "hardware_part_number",
+                std::str::from_utf8(PART_NUMBER).unwrap()
+            ),
+            ("software_version", std::str::from_utf8(SW_VERSION).unwrap()),
+        ],
+        "{text}"
+    );
 }
 
 /// Guards for one job, in a lock directory of this call's own: the slot is device-wide, so
@@ -494,7 +561,13 @@ async fn run_the_jobs(
                 .await
                 .expect("client should connect"),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
-            job,
+            Job::with_vci(
+                job,
+                VciFacts {
+                    api: Api::J2534,
+                    long_size: long_size(),
+                },
+            ),
             JobLimits::default(),
             JournalSetup {
                 dir,

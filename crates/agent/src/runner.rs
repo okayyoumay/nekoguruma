@@ -20,7 +20,9 @@ use std::time::Duration;
 
 use crate::artifact::{Artifact, SHA256_LEN, to_hex};
 use crate::client::WorkerApi;
-use crate::comm_log::{CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind};
+use crate::comm_log::{
+    CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciFacts,
+};
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
@@ -90,6 +92,8 @@ pub struct Job {
     /// The agent's communication-log directory, where a job that needs a log and has no other
     /// gets one of its own (ADR-348 item 6).
     comm_log_dir: Option<PathBuf>,
+    /// The VCI the worker was launched for, for the log's `vci_connected` (design 8.11).
+    vci: Option<VciFacts>,
 }
 
 impl Job {
@@ -101,6 +105,7 @@ impl Job {
             artifact: None,
             comm_log: None,
             comm_log_dir: None,
+            vci: None,
         })
     }
 
@@ -120,6 +125,13 @@ impl Job {
     /// [`JobError::NoCommLogDir`] before anything is sent.
     pub fn with_comm_log_dir(mut self, dir: PathBuf) -> Self {
         self.comm_log_dir = Some(dir);
+        self
+    }
+
+    /// Tells the job which VCI its worker was launched for: the API and the `unsigned long`
+    /// width, which the communication log's `vci_connected` records (design 8.11).
+    pub fn with_vci(mut self, vci: VciFacts) -> Self {
+        self.vci = Some(vci);
         self
     }
 
@@ -175,6 +187,7 @@ impl From<Program> for Job {
             artifact: None,
             comm_log: None,
             comm_log_dir: None,
+            vci: None,
         }
     }
 }
@@ -977,6 +990,7 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
             .and_then(|document| document.variant().short_name().map(str::to_owned)),
         target_vin: setup.and_then(|setup| setup.vin.as_ref()).cloned(),
         writes: job.writes(),
+        vci: job.vci,
     }
 }
 
@@ -1040,6 +1054,7 @@ async fn run_checked<C: WorkerApi>(
         artifact,
         comm_log: _,
         comm_log_dir: _,
+        vci: _,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
@@ -1193,8 +1208,9 @@ fn run_job<C: WorkerApi>(
         document.as_ref().map(JobDocument::variant).as_ref(),
         permission,
     );
-    // What the link has in force, before anything is sent on it (design 8.11).
+    // The VCI, then what the link has in force, before anything is sent on it (design 8.11).
     if let Some(log) = &comm_log {
+        log.vci_connected(link.version.as_ref());
         let valued_by_document = document
             .as_ref()
             .map(|document| link::valued_by_document(&document.variant()))
@@ -10327,6 +10343,7 @@ def main():
             artifact: None,
             comm_log: None,
             comm_log_dir: None,
+            vci: None,
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -10415,6 +10432,7 @@ def main():
                 artifact: None,
                 comm_log: None,
                 comm_log_dir: None,
+                vci: None,
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -10464,6 +10482,7 @@ def main():
             artifact: None,
             comm_log: None,
             comm_log_dir: None,
+            vci: None,
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
         // A field the document does not declare is refused before anything is sent, also
@@ -10479,6 +10498,7 @@ def main():
             artifact: None,
             comm_log: None,
             comm_log_dir: None,
+            vci: None,
         };
         assert!(
             matches!(
@@ -10537,6 +10557,7 @@ def main():
             artifact: None,
             comm_log: None,
             comm_log_dir: None,
+            vci: None,
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -15390,15 +15411,27 @@ def main():
         let lines = comm_log_lines(&dir);
         assert_eq!(
             comm_log_events(&lines),
-            ["header", "job_start", "link_opened", "job_end"]
+            [
+                "header",
+                "job_start",
+                "vci_connected",
+                "link_opened",
+                "job_end"
+            ]
         );
         assert_seq_consecutive(&lines);
         assert_eq!(lines[0]["job"]["id"], job_key().job_id.0);
         assert_eq!(lines[0]["job"]["generation"], 1);
         assert!(lines[0].get("vehicle").is_none(), "a bare run has no VIN");
         assert_eq!(lines[1]["run"], "first");
+        // The VCI: this fake worker gives no version data, and the job was not told the API.
+        let connected = &lines[2];
+        assert!(connected["version"].is_null(), "{connected}");
+        assert!(connected.get("api").is_none(), "{connected}");
+        assert_eq!(connected["drift_bound"]["source"], "none");
+        assert_eq!(connected["clock_margin"]["source"], "none");
         // What the link has in force (design 8.11 "Header").
-        let opened = &lines[2];
+        let opened = &lines[3];
         assert_eq!(opened["link"], 1);
         assert_eq!(opened["target"]["tx_id"], 0x7E0);
         assert_eq!(opened["target"]["rx_id"], 0x7E8);
@@ -15439,7 +15472,7 @@ def main():
         assert_eq!(opened["response_times_judged"], false);
         assert!(opened["forwards_pendings"].is_null());
         assert_eq!(opened["timing_margin"]["source"], "none");
-        assert_eq!(lines[3]["outcome"], "ok");
+        assert_eq!(lines[4]["outcome"], "ok");
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
@@ -15635,14 +15668,15 @@ def main():
             [
                 "header",
                 "job_start",
+                "vci_connected",
                 "link_opened",
                 "procedure_log",
                 "job_end"
             ]
         );
         assert_seq_consecutive(&lines);
-        assert_eq!(lines[3]["level"], 2);
-        assert_eq!(lines[3]["message"], message);
+        assert_eq!(lines[4]["level"], 2);
+        assert_eq!(lines[4]["message"], message);
         let traced = traced.lock().unwrap_or_else(|e| e.into_inner());
         assert!(
             traced.iter().all(|event| !event.contains("unique-6e0f")),
@@ -15727,16 +15761,18 @@ def main():
             [
                 "header",
                 "job_start",
+                "vci_connected",
                 "link_opened",
                 "job_end",
                 "agent_clock",
                 "job_start",
+                "vci_connected",
                 "link_opened",
                 "job_end"
             ]
         );
         assert_seq_consecutive(&lines);
-        assert_eq!(lines[4]["epoch"], 1);
+        assert_eq!(lines[5]["epoch"], 1);
         assert!(lines[4].get("incomplete").is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -15765,7 +15801,13 @@ def main():
         let lines = comm_log_lines(&dir);
         assert_eq!(
             comm_log_events(&lines),
-            ["header", "job_start", "link_opened", "job_end"]
+            [
+                "header",
+                "job_start",
+                "vci_connected",
+                "link_opened",
+                "job_end"
+            ]
         );
         assert_eq!(lines[0]["vehicle"]["target_vin"], TARGET_VIN);
         assert_eq!(lines[1]["run"], "first");
@@ -15788,9 +15830,9 @@ def main():
         );
         let lines = comm_log_lines(&dir);
         assert_seq_consecutive(&lines);
-        assert_eq!(lines[4]["event"], "agent_clock");
-        assert_eq!(lines[4]["epoch"], 1);
-        assert_eq!(lines[5]["run"], "resume");
+        assert_eq!(lines[5]["event"], "agent_clock");
+        assert_eq!(lines[5]["epoch"], 1);
+        assert_eq!(lines[6]["run"], "resume");
         assert_eq!(lines.last().unwrap()["event"], "job_end");
         assert_eq!(run.comm_log, CommLogStatus::Complete);
         std::fs::remove_dir_all(&dir).unwrap();

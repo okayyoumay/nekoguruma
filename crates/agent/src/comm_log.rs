@@ -159,6 +159,8 @@ pub(crate) struct RunFacts {
     pub target_vin: Option<Vin>,
     /// Whether the job's program writes.
     pub writes: bool,
+    /// The VCI the worker was launched for, when the job was told (`Job::with_vci`).
+    pub vci: Option<VciFacts>,
 }
 
 /// A line of the log: its sequence number and its event.
@@ -178,7 +180,85 @@ enum Event<'a> {
     JobStart(JobStart),
     JobEnd(JobEnd<'a>),
     ProcedureLog(ProcedureLog<'a>),
+    VciConnected(VciConnected<'a>),
     LinkOpened(LinkOpened<'a>),
+    Identity(Identity),
+}
+
+/// What the agent knows of the VCI it launched the job's worker for: the API its library
+/// implements and the `unsigned long` width the worker runs with (design 7.1.2), for
+/// `vci_connected`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VciFacts {
+    pub api: crate::launch::Api,
+    pub long_size: u8,
+}
+
+/// The VCI's connection (design 8.11 "Header"): written when the job's link has opened the
+/// module, before `link_opened`.
+#[derive(Serialize)]
+struct VciConnected<'a> {
+    /// `dpdu` (ISO 22900-2:2022 clause 8) or `j2534_0404` (SAE J2534-1 v04.04 clause 7);
+    /// absent when the job was not told which.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    api: Option<&'static str>,
+    /// The `unsigned long` width a J2534 worker runs with (design 7.1.2).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unsigned_long_bytes: Option<u8>,
+    /// The worker's version data as far as the API gives it; `null` when the worker gave none.
+    version: Option<VciVersion<'a>>,
+    /// How far the VCI's clock may run from the agent's, and the tolerance of one clock reading:
+    /// neither is configured yet, so the log uses none.
+    drift_bound: Configured,
+    clock_margin: Configured,
+}
+
+/// A worker's version data. J2534 v04.04's `PassThruReadVersion` gives the firmware, library
+/// and API versions only, which the J2534 worker passes on as the hardware name, the firmware
+/// name and the API version number; a D-PDU API module gives the rest as well.
+#[derive(Serialize)]
+#[serde(untagged)]
+enum VciVersion<'a> {
+    J2534 {
+        firmware_version: &'a str,
+        library_version: &'a str,
+        api_version: u32,
+    },
+    Dpdu {
+        vendor: &'a str,
+        hardware_name: &'a str,
+        hardware_serial_number: u32,
+        hardware_version: u32,
+        firmware_name: &'a str,
+        firmware_version: u32,
+        api_library_name: &'a str,
+        api_library_version: u32,
+    },
+}
+
+/// A value the log uses and where it came from (design 8.11 "Drift bound").
+#[derive(Serialize)]
+struct Configured {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value: Option<u32>,
+    source: &'static str,
+}
+
+/// An ECU identity value the runner read, as it was read (design 8.11 "Header"). The log has
+/// the journal's protection, so it may hold the VIN.
+#[derive(Serialize)]
+struct Identity {
+    kind: &'static str,
+    /// `value`, `negative_response` or `unreadable`.
+    outcome: &'static str,
+    /// The value as text, when it is printable ASCII.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    text: Option<String>,
+    /// The value's bytes in hex, when it is not printable ASCII.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    hex: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    nrc: Option<u8>,
 }
 
 /// What a link the job opened has in force (design 8.11 "Header", ADR-346): written right
@@ -468,6 +548,8 @@ struct Inner {
     /// exchange. It lives as long as the log, so it outlives a link, a worker or a VCI connection
     /// within the run; a later run of the job starts it over, since the log is not read back.
     links: Vec<(exchange::Target, exchange::LinkState)>,
+    /// The run's VCI, from its facts, for `vci_connected`.
+    vci: Option<VciFacts>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -571,6 +653,7 @@ impl CommLog {
             }),
             ended: false,
             _lock: lock,
+            vci: None,
             links: Vec::new(),
         })))
     }
@@ -589,6 +672,7 @@ impl CommLog {
     /// `agent_clock` on a reopened one, then `job_start`. Written once per run.
     pub(crate) fn begin(&self, facts: &RunFacts, run: RunKind) {
         let mut inner = self.lock();
+        inner.vci = facts.vci;
         let Some(opening) = inner.opening.take() else {
             return;
         };
@@ -776,6 +860,89 @@ impl CommLog {
                 ms: None,
                 source: "none",
             },
+        });
+        let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
+    /// Writes the `vci_connected` event of the job's VCI (design 8.11 "Header"): the VCI as the
+    /// agent launched it, when the run's facts name it, and the module's `version` data, when
+    /// the worker gave it. The event's `seq`; `None` once the log has failed.
+    pub(crate) fn vci_connected(
+        &self,
+        version: Option<&vci_service_interface::VersionData>,
+    ) -> Option<u64> {
+        use crate::launch::Api;
+        let vci = self.lock().vci;
+        let api = vci.map(|vci| vci.api);
+        let event = Event::VciConnected(VciConnected {
+            api: api.map(|api| match api {
+                Api::Dpdu => "dpdu",
+                Api::J2534 => "j2534_0404",
+            }),
+            unsigned_long_bytes: vci
+                .filter(|vci| vci.api == Api::J2534)
+                .map(|vci| vci.long_size),
+            version: version.map(|v| match api {
+                Some(Api::J2534) => VciVersion::J2534 {
+                    firmware_version: &v.hw_name,
+                    library_version: &v.fw_name,
+                    api_version: v.pdu_api_sw_version,
+                },
+                _ => VciVersion::Dpdu {
+                    vendor: &v.vendor_name,
+                    hardware_name: &v.hw_name,
+                    hardware_serial_number: v.hw_serial_number,
+                    hardware_version: v.hw_version,
+                    firmware_name: &v.fw_name,
+                    firmware_version: v.fw_version,
+                    api_library_name: &v.pdu_api_sw_name,
+                    api_library_version: v.pdu_api_sw_version,
+                },
+            }),
+            drift_bound: Configured {
+                value: None,
+                source: "none",
+            },
+            clock_margin: Configured {
+                value: None,
+                source: "none",
+            },
+        });
+        let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
+    /// Writes an `identity` event for the value of `kind` the runner read (design 8.11
+    /// "Header"). The event's `seq`; `None` once the log has failed.
+    pub(crate) fn identity(
+        &self,
+        kind: diag_ir::IdentityKind,
+        read: diag_ir::IdentityRead<'_>,
+    ) -> Option<u64> {
+        use diag_ir::{IdentityKind, IdentityRead};
+        let printable = |bytes: &[u8]| bytes.iter().all(|b| (0x20..0x7F).contains(b));
+        let (outcome, text, hex, nrc) = match read {
+            IdentityRead::Value(bytes) if printable(bytes) => (
+                "value",
+                Some(String::from_utf8_lossy(bytes).into_owned()),
+                None,
+                None,
+            ),
+            IdentityRead::Value(bytes) => ("value", None, Some(to_hex(bytes)), None),
+            IdentityRead::Negative(nrc) => ("negative_response", None, None, Some(nrc)),
+            IdentityRead::Unreadable => ("unreadable", None, None, None),
+        };
+        let event = Event::Identity(Identity {
+            kind: match kind {
+                IdentityKind::Vin => "vin",
+                IdentityKind::HardwarePartNumber => "hardware_part_number",
+                IdentityKind::SoftwareVersion => "software_version",
+            },
+            outcome,
+            text,
+            hex,
+            nrc,
         });
         let mut inner = self.lock();
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
@@ -1080,6 +1247,7 @@ mod tests {
             variant_name: Some("Engine_V1".to_owned()),
             target_vin: Some(Vin::new("WVWZZZ1JZXW000001".to_owned())),
             writes: false,
+            vci: None,
         }
     }
 
@@ -1141,6 +1309,51 @@ mod tests {
         assert_eq!(lines[1]["run"], "first");
         assert_eq!(lines[1]["writes"], false);
         assert_eq!(lines[2]["outcome"], "ok");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Each identity value as it was read: printable text as text (the VIN included, which the
+    /// log may hold), other bytes in hex, a negative response with its code, and an answer
+    /// without a value as unreadable.
+    #[test]
+    fn identity_events_hold_each_value_as_it_was_read() {
+        use diag_ir::{IdentityKind, IdentityRead};
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.identity(IdentityKind::Vin, IdentityRead::Value(b"WVWZZZ1JZXW000001"));
+        log.identity(
+            IdentityKind::HardwarePartNumber,
+            IdentityRead::Value(&[0x01, 0xAB, 0x7F]),
+        );
+        log.identity(IdentityKind::SoftwareVersion, IdentityRead::Negative(0x31));
+        log.identity(IdentityKind::SoftwareVersion, IdentityRead::Unreadable);
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let identities: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "identity")
+            .map(|line| {
+                let mut line = line.clone();
+                line.as_object_mut().unwrap().remove("seq");
+                line
+            })
+            .collect();
+        assert_eq!(
+            identities,
+            [
+                serde_json::json!({"event": "identity", "kind": "vin", "outcome": "value",
+                    "text": "WVWZZZ1JZXW000001"}),
+                serde_json::json!({"event": "identity", "kind": "hardware_part_number",
+                    "outcome": "value", "hex": "01ab7f"}),
+                serde_json::json!({"event": "identity", "kind": "software_version",
+                    "outcome": "negative_response", "nrc": 0x31}),
+                serde_json::json!({"event": "identity", "kind": "software_version",
+                    "outcome": "unreadable"}),
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

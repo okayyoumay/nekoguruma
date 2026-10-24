@@ -51,7 +51,7 @@ use diag_ir::{
 };
 
 use crate::host::{HostError, TransferProgress};
-use crate::inputs::{FieldBytes, ServiceSources, read_field_bytes};
+use crate::inputs::{FieldBytes, ServiceSources, read_identity_bytes};
 use crate::journal::{
     FileStore, JobKey, Journal, JournalError, RunStop, StageId, StepRef, Store, Vin,
 };
@@ -385,13 +385,14 @@ impl<S: Store> JobJournal<S> {
             if cancelled.load(Ordering::Relaxed) {
                 return Err(JobError::Cancelled);
             }
-            let read = read_field_bytes(source, &self.sources, host).map_err(|source| {
-                JobError::IdentityRead {
-                    pc,
-                    identity,
-                    source,
-                }
-            })?;
+            let read =
+                read_identity_bytes(identity, source, &self.sources, host).map_err(|source| {
+                    JobError::IdentityRead {
+                        pc,
+                        identity,
+                        source,
+                    }
+                })?;
             match (identity, read) {
                 (IdentityKind::HardwarePartNumber, FieldBytes::Field(value)) => {
                     self.journal.commit_ecu_hardware_part_number(&value)?;

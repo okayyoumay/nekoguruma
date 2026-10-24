@@ -11,8 +11,8 @@ use vci_service_interface::{
     EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
     ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ObjectType, ParamItem,
     PduParamClass, PinData, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
-    SubscribeEventRequest, UniqueRespIdTableItem, create_com_logical_link_request, param_item,
-    pin_data, resource_data, subscribe_event_request,
+    SubscribeEventRequest, UniqueRespIdTableItem, VersionData, create_com_logical_link_request,
+    param_item, pin_data, resource_data, subscribe_event_request,
 };
 
 use crate::host::{HostError, unary};
@@ -280,6 +280,9 @@ pub struct Link {
     pub(crate) application_layer: Option<ApplicationLayer>,
     /// Which of [`INDICATION_COMPARAMS`] the library accepted.
     pub(crate) indications: Indications,
+    /// The module's version data, for the communication log's `vci_connected` (design 8.11);
+    /// `None` when the worker did not give it.
+    pub(crate) version: Option<VersionData>,
 }
 
 /// Which indications the link has on: those of [`INDICATION_COMPARAMS`] the library accepted
@@ -435,7 +438,8 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
         None => open_module(client, deadline).await?,
     };
 
-    let permission = vci_permission(client, deadline, module_handle).await;
+    let version = vci_version(client, deadline, module_handle).await;
+    let permission = vci_permission(version.as_ref());
 
     let cll_handle = match create_link(client, config, deadline, module_handle).await {
         Ok(cll_handle) => cll_handle,
@@ -462,6 +466,7 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
             permission,
             application_layer: config.application_layer(),
             indications,
+            version,
         }),
         Err(error) => {
             let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
@@ -562,15 +567,13 @@ fn nothing_created(error: &HostError) -> bool {
     }
 }
 
-/// What a job may send through this module (ADR-247). A debug build asks the worker which VCI
-/// it fronts, since only the simulator may be written to. A VCI whose version cannot be read
-/// is not the simulator: the job stays read-only, as it would in a release build.
-#[cfg(debug_assertions)]
-async fn vci_permission<C: WorkerApi>(
+/// The module's version data (`GetVersion`), read in every build for the communication log's
+/// `vci_connected` (design 8.11). A worker that does not give it leaves `None`, with a warning.
+async fn vci_version<C: WorkerApi>(
     client: &mut C,
     deadline: Duration,
     module_handle: ModuleHandle,
-) -> Permission {
+) -> Option<VersionData> {
     let version = unary(
         deadline,
         "GetVersion",
@@ -580,28 +583,29 @@ async fn vci_permission<C: WorkerApi>(
     )
     .await;
     match version {
-        Ok(response) => response
-            .version_data
-            .as_ref()
-            .map_or(Permission::ReadOnly, crate::policy::identify),
+        Ok(response) => response.version_data,
         Err(error) => {
             tracing::warn!(
                 error = %error.log_text(),
                 external = error.log_external(),
                 "could not read the VCI's version; the job stays read-only"
             );
-            Permission::ReadOnly
+            None
         }
     }
 }
 
-/// A release build never asks: its links are read-only whatever the VCI (ADR-247).
+/// What a job may send through this module (ADR-247). A debug build decides from the VCI the
+/// version data names, since only the simulator may be written to. A VCI whose version could
+/// not be read is not the simulator: the job stays read-only, as it would in a release build.
+#[cfg(debug_assertions)]
+fn vci_permission(version: Option<&VersionData>) -> Permission {
+    version.map_or(Permission::ReadOnly, crate::policy::identify)
+}
+
+/// A release build's links are read-only whatever the VCI (ADR-247).
 #[cfg(not(debug_assertions))]
-async fn vci_permission<C: WorkerApi>(
-    _client: &mut C,
-    _deadline: Duration,
-    _module_handle: ModuleHandle,
-) -> Permission {
+fn vci_permission(_version: Option<&VersionData>) -> Permission {
     Permission::ReadOnly
 }
 
@@ -822,6 +826,7 @@ pub async fn close<C: WorkerApi>(
         permission: _,
         application_layer: _,
         indications: _,
+        version: _,
     } = link;
     drop(events);
     teardown(client, module_handle, cll_handle, deadline).await

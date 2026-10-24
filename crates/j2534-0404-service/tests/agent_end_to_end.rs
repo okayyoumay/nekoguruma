@@ -511,11 +511,15 @@ fn assert_comm_log(setup: &CommLogSetup) {
         .map(|line| line["event"].as_str().expect("an event"))
         .collect();
     assert_eq!(
-        &events[..3],
-        ["header", "job_start", "link_opened"],
+        &events[..4],
+        ["header", "job_start", "vci_connected", "link_opened"],
         "{text}"
     );
-    let opened = &lines[2];
+    // The job was not told which API it runs on, so its version data has the D-PDU form.
+    let connected = &lines[2];
+    assert!(connected.get("api").is_none(), "{connected}");
+    assert_eq!(connected["version"]["vendor"], "j2534-0404", "{connected}");
+    let opened = &lines[3];
     assert_eq!(opened["link"], 1, "{opened}");
     assert_eq!(opened["protocol"], "ISO_14229_3_on_ISO_15765_2", "{opened}");
     assert!(opened["baud_rate"].as_u64().is_some(), "{opened}");

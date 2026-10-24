@@ -21,11 +21,12 @@ use serial_test::serial;
 use vci_service_interface::{
     ComLogicalLinkHandle, ComPrimitiveCtrlData, ComPrimitiveHandle, ConnectComLogicalLinkRequest,
     CreateComLogicalLinkRequest, DataItem, DestroyComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, ExpectedResponseData, GetObjectIdRequest, GetStatusRequest,
-    IoBytearray, LockResourceRequest, ModuleHandle, ObjectType, PduComLogicalLinkStatus,
-    PduComPrimitiveStatus, PduErrorEvent, PinData, ResourceData, StartComPrimitiveRequest,
-    UnlockResourceRequest, create_com_logical_link_request, data_item, event_item,
-    get_status_request, io_ctl_request, resource_data, status_response, subscribe_event_request,
+    DisconnectComLogicalLinkRequest, ErrorData, ExpectedResponseData, GetObjectIdRequest,
+    GetStatusRequest, IoBytearray, LockResourceRequest, ModuleHandle, ObjectType,
+    PduComLogicalLinkStatus, PduComPrimitiveStatus, PduErrorEvent, PinData, ResourceData,
+    StartComPrimitiveRequest, UnlockResourceRequest, create_com_logical_link_request, data_item,
+    event_item, get_status_request, io_ctl_request, resource_data, status_response,
+    subscribe_event_request,
 };
 
 use crate::harness::*;
@@ -662,9 +663,9 @@ async fn concurrent_startcomm_on_the_same_cll_rejects_the_loser_without_disturbi
                     finished.insert(h);
                 }
             }
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtInitError as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtInitError as i32 => {
                 if let Some(h) = item.cop_handle {
                     errored.insert(h);
                 }
@@ -770,9 +771,9 @@ async fn connection_rejected_when_all_four_slots_are_full() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -1199,9 +1200,9 @@ async fn second_cll_reusing_an_established_siblings_rx_id_is_rejected_and_does_n
     let mut saw_init_error = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtInitError as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtInitError as i32 => {
                 saw_init_error = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -1962,9 +1963,9 @@ async fn disconnect_mid_wait_after_native_issue_tears_down_the_leaked_slot() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_s4, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -2244,9 +2245,9 @@ async fn abandoned_connection_request_quarantines_its_rx_id_against_an_immediate
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -2452,9 +2453,9 @@ async fn abandoned_entrys_quarantine_releases_even_after_its_owner_cll_is_gone()
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -2593,9 +2594,9 @@ async fn stopcomm_quarantines_its_rx_id_against_an_immediate_retry() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -2742,9 +2743,9 @@ async fn abandoned_entrys_established_outcome_stays_quarantined_until_the_follow
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -2797,9 +2798,9 @@ async fn abandoned_entrys_established_outcome_stays_quarantined_until_the_follow
     let mut saw_rsc_locked_c = false;
     wait_for_event(&mut events_c, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked_c = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -2946,9 +2947,9 @@ async fn spontaneous_loss_after_establishment_reconciles_before_a_later_stopcomm
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -3084,7 +3085,7 @@ async fn stale_spontaneous_loss_never_misattributes_onto_an_unrelated_new_startc
     let mut saw_error_b = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(_)) => {
+            Some(event_item::Data::ErrorData(ErrorData { .. })) => {
                 saw_error_b = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -3295,14 +3296,14 @@ async fn stale_lost_swallow_is_one_shot_and_never_eats_the_new_occupants_own_gen
     let mut saw_init_error_b = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked_b = true;
             }
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtInitError as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtInitError as i32 => {
                 saw_init_error_b = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -3535,9 +3536,9 @@ async fn second_cll_passive_arm_is_rejected_while_one_is_already_armed() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -3615,9 +3616,9 @@ async fn active_established_connection_blocks_a_passive_arm_on_the_same_rx_id() 
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_passive, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -3691,9 +3692,9 @@ async fn passive_armed_slot_blocks_an_active_proposal_on_the_same_rx_id() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_active, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -4156,9 +4157,9 @@ async fn disarm_races_an_inbound_accept_and_leaves_the_entry_quarantined() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_retry, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -4299,9 +4300,9 @@ async fn disarm_of_a_never_established_passive_listener_bounded_releases_after_t
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_retry, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -4449,9 +4450,9 @@ async fn destroy_com_logical_link_disarms_the_passive_listener() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -4614,9 +4615,9 @@ async fn chx_destroy_com_logical_link_disarms_the_passive_listener() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -6046,7 +6047,7 @@ async fn broadcast_periodic_temp_bound_start_succeeds_despite_sibling_holding_co
         };
         if matches!(
             item.data,
-            Some(event_item::Data::ErrorData(error))
+            Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                 if error == PduErrorEvent::PduErrEvtRscLocked as i32
         ) {
             saw_rsc_locked = true;
@@ -7020,9 +7021,9 @@ async fn chx_destroy_com_logical_link_tears_down_the_native_connection_and_frees
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -7181,9 +7182,9 @@ async fn chx_disconnect_com_logical_link_tears_down_the_native_connection_and_fr
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))
@@ -7351,9 +7352,9 @@ async fn chx_disconnect_com_logical_link_disarms_the_passive_listener() {
     let mut saw_rsc_locked = false;
     wait_for_event(&mut events_b, 2000, |item| {
         match &item.data {
-            Some(event_item::Data::ErrorData(error))
-                if *error == PduErrorEvent::PduErrEvtRscLocked as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) if *error == PduErrorEvent::PduErrEvtRscLocked as i32 => {
                 saw_rsc_locked = true;
             }
             Some(event_item::Data::CopStatus(status))

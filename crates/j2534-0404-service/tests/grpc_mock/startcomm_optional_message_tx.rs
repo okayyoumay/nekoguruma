@@ -11,7 +11,7 @@
 
 use serial_test::serial;
 use vci_service_interface::{
-    CancelComPrimitiveRequest, ComPrimitiveCtrlData, ExpectedResponseData,
+    CancelComPrimitiveRequest, ComPrimitiveCtrlData, ErrorData, ExpectedResponseData,
     StartComPrimitiveRequest, event_item, subscribe_event_request,
 };
 
@@ -302,7 +302,7 @@ async fn can_optional_message_no_response_times_out_but_still_reaches_comm_start
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -434,7 +434,7 @@ async fn can_optional_message_is_multiple_collects_all_matches_and_reaches_comm_
                 Some(event_item::Data::ResultData(result)) if result.acceptance_id == 5 => {
                     accepted += 1;
                 }
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error
                         == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                 {
@@ -811,7 +811,7 @@ async fn can_optional_message_temp_param_update_transmit_failure_reverts_hardwar
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtInitError as i32
             ) {
                 saw_init_error = true;

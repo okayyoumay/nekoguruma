@@ -217,7 +217,6 @@ impl VciService for FakeWorker {
                         timestamp: 0,
                         data: Some(data),
                         cop_tag: None,
-                        extra_error_info: None,
                     })),
                 })
             };

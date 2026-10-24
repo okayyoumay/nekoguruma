@@ -16,7 +16,7 @@ use tonic::transport::{Channel, Server};
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveHandle,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
-    DisconnectComLogicalLinkRequest, EventItem, EventNotification, GetComParamRequest,
+    DisconnectComLogicalLinkRequest, ErrorData, EventItem, EventNotification, GetComParamRequest,
     GetConflictingResourcesRequest, GetEventItemRequest, GetModuleIdsRequest, GetObjectIdRequest,
     GetResourceIdsRequest, GetResourceStatusRequest, GetStatusRequest, GetTimestampRequest,
     GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest, LockResourceRequest,
@@ -1363,7 +1363,10 @@ async fn events_until_finished(
         let event = match item.data.expect("event data") {
             event_item::Data::ResultData(result) => Seen::Result(result.data_bytes),
             event_item::Data::CopStatus(status) => Seen::Status(status),
-            event_item::Data::ErrorData(error) => Seen::Error(error, item.extra_error_info),
+            event_item::Data::ErrorData(ErrorData {
+                error_event,
+                extra_error_info,
+            }) => Seen::Error(error_event, extra_error_info),
             other => panic!("unexpected event {other:?}"),
         };
         if event == Seen::Status(FINISHED) {

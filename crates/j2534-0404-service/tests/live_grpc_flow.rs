@@ -96,7 +96,7 @@ use tonic::transport::Server;
 use vci_service_interface::{
     ComLogicalLinkHandle, ComPrimitiveCtrlData, ConnectComLogicalLinkRequest,
     CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    EcuUniqueRespData, EventNotification, ExpectedResponseData, GetModuleIdsRequest,
+    EcuUniqueRespData, ErrorData, EventNotification, ExpectedResponseData, GetModuleIdsRequest,
     GetObjectIdRequest, GetResourceIdsRequest, GetVersionRequest, ModuleConnectRequest,
     ModuleDisconnectRequest, ModuleHandle, ObjectType, ParamItem, PduParamClass, ResourceData,
     SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest,
@@ -246,7 +246,9 @@ fn print_event_item(item: &vci_service_interface::EventItem) {
         ),
         Some(event_item::Data::CllStatus(status)) => println!("  event: CllStatus({status})"),
         Some(event_item::Data::CopStatus(status)) => println!("  event: CopStatus({status})"),
-        Some(event_item::Data::ErrorData(err)) => println!("  event: ErrorData({err})"),
+        Some(event_item::Data::ErrorData(ErrorData {
+            error_event: err, ..
+        })) => println!("  event: ErrorData({err})"),
         Some(event_item::Data::ModuleStatus(status)) => println!("  event: ModuleStatus({status})"),
         Some(event_item::Data::InfoData(info)) => println!("  event: InfoData({info})"),
         None => println!("  event: (empty)"),

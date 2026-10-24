@@ -6,7 +6,7 @@
 
 use serial_test::serial;
 use vci_service_interface::{
-    ComLogicalLinkHandle, ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
+    ComLogicalLinkHandle, ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest, ErrorData,
     EventNotification, StartComPrimitiveRequest, SubscribeEventRequest, TxFlagBit, event_item,
     subscribe_event_request, vci_service_client::VciServiceClient,
 };
@@ -1344,7 +1344,7 @@ async fn software_isotp_mode_fs_wait_exceeds_internal_bound_aborts_with_prot_err
     assert!(
         wait_for_event(&mut events, 5000, |item| matches!(
             &item.data,
-            Some(event_item::Data::ErrorData(error))
+            Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                 if *error == vci_service_interface::PduErrorEvent::PduErrEvtProtErr as i32
         ))
         .await,

@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-24
 **Status:** Accepted
-**Affects:** `vci-service-interface` (`service.proto`: `EventItem`, `ErrorDetail`, `RefusalReason`;
+**Affects:** `vci-service-interface` (`service.proto`: `EventItem`, `ErrorData`, `ErrorDetail`, `RefusalReason`;
 `start_refusal`, `protocol_cannot_carry`), `iso22900-service` (event items, `StartComPrimitive`),
 `j2534-0404-service` (`StartComPrimitive`, `resolve_send_recv_tx`), `iso22900-mock`,
 `docs/rpc-api-guide.md`; design 8.11, ADR-105, ADR-346
@@ -27,13 +27,17 @@ did not carry:
 
 ## Decision
 
-1. **Extra error information.** `EventItem` gains `optional uint32 extra_error_info`, set only
-   beside `error_data`: the error item's additional error code as the library gives it. It is a
-   field of its own, not part of the `oneof`, so `error_data` keeps its tag and its readers. It is
-   `optional`, so a worker with no such value leaves it absent and a library's 0 stays 0. The
-   D-PDU worker copies `ExtraErrorInfoId`; the J2534 worker leaves it absent, since SAE J2534-1
-   has no such value. The codes are vendor-defined, so the interface passes them on without
-   interpreting them; the agent uses one only when it knows the library's code.
+1. **Extra error information.** `EventItem.error_data` becomes a message, `ErrorData`, with
+   `error_event` (the `PDUErrorEvent`) and `optional uint32 extra_error_info`: the error item's
+   additional error code as the library gives it. The extra information belongs to the error, so
+   it is part of the error's own value rather than a field of `EventItem` that only one variant
+   uses. The variant moves to tag 10 and its old tag 7, the bare `PDUErrorEvent`, is reserved:
+   this breaks the wire format for error events, which is accepted because no release has
+   shipped. `PDUErrorEvent` itself stays an enum, since `ErrorDetail` and other messages use it.
+   The field is `optional`, so a worker with no such value leaves it absent and a library's 0
+   stays 0. The D-PDU worker copies `ExtraErrorInfoId`; the J2534 worker leaves it absent, since
+   SAE J2534-1 has no such value. The codes are vendor-defined, so the interface passes them on
+   without interpreting them; the agent uses one only when it knows the library's code.
 2. **Refusal reason.** `ErrorDetail` gains `optional RefusalReason refusal`, with the reasons
    `INVALID_PARAMETERS`, `QUEUE_FULL` and `PROTOCOL_CANNOT_CARRY`. A worker sets it on a refused
    `StartComPrimitive` only, and only when the refusal shows the request was not sent. Its
@@ -56,6 +60,9 @@ did not carry:
    other codes: a code that does not show the request was not sent leaves the reason absent.
 
 ## Consequences
+
+- Every reader of `EventItem.error_data` reads `ErrorData.error_event` instead of the bare enum,
+  and a peer built before this change does not read the new error events.
 
 - A refused `StartComPrimitive` now always carries an `ErrorDetail` when its status is
   `INVALID_ARGUMENT`; ADR-105's plain status for request-shape failures stays for every other

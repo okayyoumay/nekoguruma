@@ -512,18 +512,25 @@ message EventItem {
         PDUModuleStatus module_status = 4;
         PDUComLogicalLinkStatus cll_status = 5;
         PDUComPrimitiveStatus cop_status = 6;
-        PDUErrorEvent error_data = 7;
+        // ADR-350: the error event with its additional error code; it was
+        // a bare PDUErrorEvent under tag 7, which stays reserved.
+        ErrorData error_data = 10;
         PDUInfo info_data = 8;
     }
+    reserved 7;
     // ADR-204: echoes StartComPrimitiveRequest.cop_tag verbatim, iff
     // cop_handle is set above and a tag was supplied at StartComPrimitive
     // for that COP. Absent otherwise -- never a zero-length sentinel.
     optional bytes cop_tag = 9;
-    // ADR-350: with error_data only, the error item's additional error code
-    // (ISO 22900-2:2022 D.4.2, PDU_ERROR_DATA.ExtraErrorInfoId), whose
+}
+
+// ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).
+message ErrorData {
+    PDUErrorEvent error_event = 1;
+    // The item's additional error code (D.4.2, ExtraErrorInfoId), whose
     // meaning the library's MDF gives. Absent when the worker has none, as
     // for every J2534 error event.
-    optional uint32 extra_error_info = 10;
+    optional uint32 extra_error_info = 2;
 }
 
 message LostEventItemNotification {

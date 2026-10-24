@@ -10,7 +10,7 @@
 
 use serial_test::serial;
 use vci_service_interface::{
-    ComPrimitiveCtrlData, ComPrimitiveHandle, EventNotification, ExpectedResponseData,
+    ComPrimitiveCtrlData, ComPrimitiveHandle, ErrorData, EventNotification, ExpectedResponseData,
     PduErrorEvent, StartComPrimitiveRequest, SubscribeEventRequest, event_item,
     subscribe_event_request, vci_service_client::VciServiceClient,
 };
@@ -350,7 +350,7 @@ async fn rc21_retransmit_write_failure_still_finishes_the_cop_sendrecv() {
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtTxError as i32
             ) {
                 saw_tx_error = true;

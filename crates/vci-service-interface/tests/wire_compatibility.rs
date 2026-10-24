@@ -9,9 +9,9 @@
 
 use prost::Message;
 use vci_service_interface::{
-    ComPrimitiveCtrlData, ComPrimitiveHandle, DataItem, ErrorDetail, EventItem, ParamItem,
-    PduComPrimitiveStatus, PduError, PduParamClass, com_primitive_ctrl_data, data_item, event_item,
-    param_item,
+    ComPrimitiveCtrlData, ComPrimitiveHandle, DataItem, ErrorData, ErrorDetail, EventItem,
+    ParamItem, PduComPrimitiveStatus, PduError, PduParamClass, com_primitive_ctrl_data, data_item,
+    event_item, param_item,
 };
 
 fn decode<M: Message + Default>(bytes: &[u8]) -> M {
@@ -102,7 +102,6 @@ fn an_event_item_keeps_an_absent_and_an_empty_cop_tag_apart() {
         }),
         timestamp: 4242,
         cop_tag: None,
-        extra_error_info: None,
         data: Some(event_item::Data::CopStatus(
             PduComPrimitiveStatus::PduCopstFinished as i32,
         )),
@@ -178,23 +177,36 @@ fn an_error_detail_keeps_an_absent_and_an_empty_detail_text_apart() {
     assert_round_trip(&expected);
 }
 
-/// ADR-350: an error event's extra error information is `optional`, so a
-/// worker with none (J2534) and a library's 0 stay apart, and a refusal's
-/// reason is a field of its own beside the PDU error.
+/// ADR-350: an error event's extra error information is `optional` inside
+/// `ErrorData`, so a worker with none (J2534) and a library's 0 stay apart;
+/// the bare enum's old tag 7 is reserved and no longer reads as an error.
+/// A refusal's reason is a field of its own beside the PDU error.
 #[test]
 fn an_error_event_s_extra_information_and_a_refusal_s_reason_are_on_the_wire() {
-    let error = [0x38, 0x01, 0x50, 0x00]; // 7: error_data = 1, 10: extra_error_info = 0
+    // 10: error_data { 1: error_event = 1, 2: extra_error_info = 0 }
+    let error = [0x52, 0x04, 0x08, 0x01, 0x10, 0x00];
     let expected = EventItem {
-        data: Some(event_item::Data::ErrorData(1)),
-        extra_error_info: Some(0),
+        data: Some(event_item::Data::ErrorData(ErrorData {
+            error_event: 1,
+            extra_error_info: Some(0),
+        })),
         ..Default::default()
     };
     assert_eq!(decode::<EventItem>(&error), expected);
     assert_round_trip(&expected);
+    let without_extra = [0x52, 0x02, 0x08, 0x01];
     assert_eq!(
-        decode::<EventItem>(&error[..2]).extra_error_info,
-        None,
+        decode::<EventItem>(&without_extra).data,
+        Some(event_item::Data::ErrorData(ErrorData {
+            error_event: 1,
+            extra_error_info: None,
+        })),
         "absent, not 0"
+    );
+    assert_eq!(
+        decode::<EventItem>(&[0x38, 0x01]).data,
+        None,
+        "tag 7 is reserved"
     );
 
     let refused = [0x08, 0x50, 0x20, 0x03]; // 1: INVALID_PARAMETERS, 4: refusal = 3

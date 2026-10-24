@@ -8,10 +8,10 @@ use serial_test::serial;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveCtrlData, ComPrimitiveHandle,
     ConnectComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    EventNotification, ExpectedResponseData, GetObjectIdRequest, GetStatusRequest, IoCtlRequest,
-    ObjectType, PduComPrimitiveStatus, StartComPrimitiveRequest, SubscribeEventRequest, event_item,
-    event_notification, get_status_request, io_ctl_request, status_response,
-    subscribe_event_request, vci_service_client::VciServiceClient,
+    ErrorData, EventNotification, ExpectedResponseData, GetObjectIdRequest, GetStatusRequest,
+    IoCtlRequest, ObjectType, PduComPrimitiveStatus, StartComPrimitiveRequest,
+    SubscribeEventRequest, event_item, event_notification, get_status_request, io_ctl_request,
+    status_response, subscribe_event_request, vci_service_client::VciServiceClient,
 };
 
 use crate::harness::*;
@@ -598,9 +598,10 @@ async fn sendrecv_is_multiple_collects_all_matches_within_the_window() {
                 Some(event_item::Data::ResultData(result)) if result.acceptance_id == 5 => {
                     accepted += 1;
                 }
-                Some(event_item::Data::ErrorData(error))
-                    if *error
-                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                Some(event_item::Data::ErrorData(ErrorData {
+                    error_event: error, ..
+                })) if *error
+                    == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                 {
                     saw_rx_timeout = true;
                 }
@@ -1180,7 +1181,9 @@ async fn sendrecv_error_event_carries_the_failing_cops_own_handle_not_a_concurre
     let mut error_cop_handle = None;
     assert!(
         wait_for_event(&mut events, 2000, |item| {
-            if let Some(event_item::Data::ErrorData(error)) = &item.data
+            if let Some(event_item::Data::ErrorData(ErrorData {
+                error_event: error, ..
+            })) = &item.data
                 && *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             {
                 error_cop_handle = Some(item.cop_handle);
@@ -2195,7 +2198,7 @@ async fn sendrecv_empty_expected_response_with_nonzero_cycles_times_out() {
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -4270,9 +4273,10 @@ async fn tier1_wait_takes_a_grace_pass_for_a_companion_delivered_match_still_que
                 Some(event_item::Data::ResultData(result)) if result.acceptance_id == 9 => {
                     matched = true;
                 }
-                Some(event_item::Data::ErrorData(error))
-                    if *error
-                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                Some(event_item::Data::ErrorData(ErrorData {
+                    error_event: error, ..
+                })) if *error
+                    == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                 {
                     saw_rx_timeout = true;
                 }
@@ -4444,9 +4448,10 @@ async fn tier1_wait_recheck_survives_many_deadline_vs_companion_watermark_races_
                 Some(event_item::Data::ResultData(result)) if result.acceptance_id == 9 => {
                     match_count += 1;
                 }
-                Some(event_item::Data::ErrorData(error))
-                    if *error
-                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                Some(event_item::Data::ErrorData(ErrorData {
+                    error_event: error, ..
+                })) if *error
+                    == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                 {
                     saw_rx_timeout = true;
                 }
@@ -4706,7 +4711,7 @@ async fn receive_only_finite_n_created_cop_rc_cfg_none_pending_rc_does_not_exten
         wait_for_event(&mut events, 700, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -4811,7 +4816,7 @@ async fn receive_only_finite_n_cancel_after_detach_yields_single_cancelled_statu
             }
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -4830,7 +4835,7 @@ async fn receive_only_finite_n_cancel_after_detach_yields_single_cancelled_statu
             }
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -4918,7 +4923,7 @@ async fn receive_only_finite_n_default_timeout_stays_executing_past_old_p2max_wi
         !wait_for_event(&mut events, 400, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -5014,7 +5019,7 @@ async fn receive_only_finite_n_cyclic_timeout_errors_then_finishes_with_suspend_
         wait_for_event(&mut events, 2000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
             ) {
                 saw_rx_timeout = true;
@@ -5191,7 +5196,7 @@ async fn receive_only_finite_n_cancel_races_cyclic_timeout_expiry_stays_cancelle
                 }
                 if matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
                 ) {
                     saw_rx_timeout_for_this_cop = true;
@@ -5305,7 +5310,7 @@ async fn receive_only_finite_n_cyclic_deadline_restarts_on_match_then_count_comp
             wait_for_event(&mut events, 2000, |item| {
                 if matches!(
                     &item.data,
-                    Some(event_item::Data::ErrorData(error))
+                    Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                         if *error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
                 ) {
                     saw_rx_timeout = true;

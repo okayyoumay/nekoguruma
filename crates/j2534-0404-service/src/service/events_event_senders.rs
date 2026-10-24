@@ -1,4 +1,5 @@
 use super::*;
+use vci_service_interface::ErrorData;
 
 fn make_cll_notification(
     cll_handle: u32,
@@ -26,7 +27,6 @@ fn make_cll_notification(
             timestamp,
             data: Some(data),
             cop_tag,
-            extra_error_info: None,
         })),
     }
 }
@@ -123,7 +123,6 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                 // a `ResultData` frame is the primary `cop_tag` use case, the
                 // response to a `CoptSendrecv` COP.
                 cop_tag: frame.cop_tag.clone(),
-                extra_error_info: None,
             }
         }
         // Async error event queued by send_error_event (ADR-105 revision):
@@ -136,13 +135,15 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                 cop_handle: c.cop_handle,
             }),
             timestamp: tracked.timestamp,
-            data: Some(EventItemData::ErrorData(tracked.event as i32)),
+            data: Some(EventItemData::ErrorData(ErrorData {
+                error_event: tracked.event as i32,
+                extra_error_info: None,
+            })),
             // ADR-204: echoed verbatim whenever `cop_handle` (i.e.
             // `tracked.cop`) is present -- `send_error_event` resolved this
             // from `primitives` at record time (see `TrackedError::cop_tag`'s
             // own doc comment).
             cop_tag: tracked.cop_tag.clone(),
-            extra_error_info: None,
         },
         // CLL/COP status transition queued by send_cll_status/send_cop_status
         // (ADR-105 P2 follow-up): same shape SubscribeEvent already sends its
@@ -153,7 +154,6 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                 timestamp: tracked.timestamp,
                 data: Some(EventItemData::CllStatus(*status as i32)),
                 cop_tag: None,
-                extra_error_info: None,
             },
             StatusEvent::Cop {
                 cop_handle,
@@ -168,7 +168,6 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                 timestamp: tracked.timestamp,
                 data: Some(EventItemData::CopStatus(*status as i32)),
                 cop_tag: cop_tag.clone(),
-                extra_error_info: None,
             },
         },
         // Both consumers of this function (`drain_queue_live` and
@@ -369,7 +368,6 @@ pub(in crate::service) async fn send_cop_status(
                         timestamp: module_timestamp_us(),
                         data: Some(EventItemData::CopStatus(status as i32)),
                         cop_tag,
-                        extra_error_info: None,
                     })),
                 };
                 let _ = sub.send(Ok(n));
@@ -661,7 +659,10 @@ pub(in crate::service) async fn send_error_event(
                 cll_handle,
                 cop_handle,
                 timestamp,
-                EventItemData::ErrorData(error as i32),
+                EventItemData::ErrorData(ErrorData {
+                    error_event: error as i32,
+                    extra_error_info: None,
+                }),
                 cop_tag,
             );
             let _ = sub.send(Ok(n));
@@ -708,7 +709,6 @@ pub(in crate::service) async fn send_system_info(
         timestamp,
         data: Some(EventItemData::InfoData(info as i32)),
         cop_tag: None,
-        extra_error_info: None,
     };
     {
         let mut buf = system_event_buf.lock().await;
@@ -740,7 +740,6 @@ pub(super) async fn send_module_status(
         timestamp,
         data: Some(EventItemData::ModuleStatus(status as i32)),
         cop_tag: None,
-        extra_error_info: None,
     };
     {
         let mut buf = module_event_buf.lock().await;

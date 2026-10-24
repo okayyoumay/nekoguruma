@@ -168,7 +168,7 @@ worker's own `INVALID_ARGUMENT` checks (the operation type, an oversized tag) ca
 is `INVALID_PARAMETERS` and its `PDU_ERR_TX_QUEUE_FULL` is `QUEUE_FULL`
 (`vci_service_interface::start_refusal`). An error event item passes on the library's additional
 error code, `PDU_ERROR_DATA.ExtraErrorInfoId` (ISO 22900-2:2022 D.4.2), as
-`EventItem.extra_error_info`.
+`ErrorData.extra_error_info` in the event item's `error_data`.
 
 Mapping logic is in `error.rs` and `preload.rs`. `map_construct_error` and `map_resolve_error`
 log the full underlying error (which may contain a local filesystem path or

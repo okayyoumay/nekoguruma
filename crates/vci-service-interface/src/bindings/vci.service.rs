@@ -493,13 +493,7 @@ pub struct EventItem {
     /// for that COP. Absent otherwise -- never a zero-length sentinel.
     #[prost(bytes = "vec", optional, tag = "9")]
     pub cop_tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    /// ADR-350: with error_data only, the error item's additional error code
-    /// (ISO 22900-2:2022 D.4.2, PDU_ERROR_DATA.ExtraErrorInfoId), whose
-    /// meaning the library's MDF gives. Absent when the worker has none, as
-    /// for every J2534 error event.
-    #[prost(uint32, optional, tag = "10")]
-    pub extra_error_info: ::core::option::Option<u32>,
-    #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 7, 8")]
+    #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 10, 8")]
     pub data: ::core::option::Option<event_item::Data>,
 }
 /// Nested message and enum types in `EventItem`.
@@ -514,11 +508,24 @@ pub mod event_item {
         CllStatus(i32),
         #[prost(enumeration = "super::PduComPrimitiveStatus", tag = "6")]
         CopStatus(i32),
-        #[prost(enumeration = "super::PduErrorEvent", tag = "7")]
-        ErrorData(i32),
+        /// ADR-350: the error event with its additional error code; it was
+        /// a bare PDUErrorEvent under tag 7, which stays reserved.
+        #[prost(message, tag = "10")]
+        ErrorData(super::ErrorData),
         #[prost(enumeration = "super::PduInfo", tag = "8")]
         InfoData(i32),
     }
+}
+/// ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ErrorData {
+    #[prost(enumeration = "PduErrorEvent", tag = "1")]
+    pub error_event: i32,
+    /// The item's additional error code (D.4.2, ExtraErrorInfoId), whose
+    /// meaning the library's MDF gives. Absent when the worker has none, as
+    /// for every J2534 error event.
+    #[prost(uint32, optional, tag = "2")]
+    pub extra_error_info: ::core::option::Option<u32>,
 }
 #[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct LostEventItemNotification {}

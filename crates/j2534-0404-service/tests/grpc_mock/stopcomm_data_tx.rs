@@ -8,7 +8,7 @@
 use serial_test::serial;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveCtrlData,
-    ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest, ExpectedResponseData,
+    ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest, ErrorData, ExpectedResponseData,
     GetObjectIdRequest, IoCtlRequest, LockResourceRequest, ObjectType, PduComPrimitiveStatus,
     PduError, PduErrorEvent, StartComPrimitiveRequest, UnlockResourceRequest,
     error_detail_from_status, event_item, io_ctl_request, subscribe_event_request,
@@ -1386,7 +1386,7 @@ async fn stopcomm_multiframe_cancel_during_transmit_does_not_abort() {
     assert!(
         !wait_for_event(&mut events, 200, |item| matches!(
             item.data,
-            Some(event_item::Data::ErrorData(_))
+            Some(event_item::Data::ErrorData(ErrorData { .. }))
         ))
         .await,
         "no PduErrorEvent should be emitted for a non-cancellable StopComm transmit"
@@ -3120,9 +3120,10 @@ async fn stopcomm_is_multiple_chatty_ecu_bounded_by_match_reset_ceiling() {
                 };
                 match &item.data {
                     Some(event_item::Data::ResultData(_)) => match_count += 1,
-                    Some(event_item::Data::ErrorData(err))
-                        if *err
-                            == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                    Some(event_item::Data::ErrorData(ErrorData {
+                        error_event: err, ..
+                    })) if *err
+                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                     {
                         saw_rx_timeout = true;
                     }
@@ -3285,9 +3286,10 @@ async fn stopcomm_is_multiple_chatty_ecu_bounded_by_ceiling_factor_not_floor() {
                 };
                 match &item.data {
                     Some(event_item::Data::ResultData(_)) => match_count += 1,
-                    Some(event_item::Data::ErrorData(err))
-                        if *err
-                            == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                    Some(event_item::Data::ErrorData(ErrorData {
+                        error_event: err, ..
+                    })) if *err
+                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                     {
                         saw_rx_timeout = true;
                     }
@@ -3469,9 +3471,10 @@ async fn stopcomm_is_multiple_rc78_chatter_bounded_by_match_reset_ceiling() {
                     Some(event_item::Data::ResultData(rd)) if rd.acceptance_id == 7 => {
                         match_count += 1;
                     }
-                    Some(event_item::Data::ErrorData(err))
-                        if *err
-                            == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                    Some(event_item::Data::ErrorData(ErrorData {
+                        error_event: err, ..
+                    })) if *err
+                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                     {
                         saw_rx_timeout = true;
                     }
@@ -3632,9 +3635,10 @@ async fn stopcomm_is_multiple_rc21_request_time_bounded_by_match_reset_ceiling()
                     Some(event_item::Data::ResultData(rd)) if rd.acceptance_id == 7 => {
                         match_count += 1;
                     }
-                    Some(event_item::Data::ErrorData(err))
-                        if *err
-                            == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
+                    Some(event_item::Data::ErrorData(ErrorData {
+                        error_event: err, ..
+                    })) if *err
+                        == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32 =>
                     {
                         saw_rx_timeout = true;
                     }
@@ -3806,7 +3810,7 @@ async fn stopcomm_rc21_retransmit_write_failure_still_reaches_terminal() {
         wait_for_event(&mut events, 2_000, |item| {
             if matches!(
                 &item.data,
-                Some(event_item::Data::ErrorData(error))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
                     if *error == PduErrorEvent::PduErrEvtTxError as i32
             ) {
                 saw_tx_error = true;

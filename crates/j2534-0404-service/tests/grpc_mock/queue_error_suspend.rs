@@ -10,7 +10,7 @@
 use serial_test::serial;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkHandle, ComPrimitiveCtrlData, ComPrimitiveHandle,
-    ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest, EventNotification,
+    ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest, ErrorData, EventNotification,
     ExpectedResponseData, GetStatusRequest, PduComPrimitiveStatus, StartComPrimitiveRequest,
     SubscribeEventRequest, get_status_request, status_response,
     vci_service_client::VciServiceClient,
@@ -143,7 +143,7 @@ async fn subscribe(
 fn is_rx_timeout(item: &vci_service_interface::EventItem) -> bool {
     matches!(
         item.data,
-        Some(vci_service_interface::event_item::Data::ErrorData(error))
+        Some(vci_service_interface::event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
             if error == vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
     )
 }

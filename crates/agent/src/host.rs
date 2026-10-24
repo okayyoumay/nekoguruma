@@ -12,8 +12,9 @@ use crate::client::WorkerApi;
 use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
-    ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, EventItem, ExpectedResponseData,
-    PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest, event_item, event_notification,
+    ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, ErrorData, EventItem,
+    ExpectedResponseData, PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest,
+    event_item, event_notification,
 };
 
 use crate::comm_log::AgentNow;
@@ -1131,7 +1132,7 @@ impl Progress {
         if item.cop_handle.is_none_or(|handle| handle == cop)
             && matches!(
                 item.data,
-                Some(event_item::Data::ErrorData(code))
+                Some(event_item::Data::ErrorData(ErrorData { error_event: code, .. }))
                     if code == PduErrorEvent::PduErrEvtLostCommToVci as i32
             )
         {
@@ -1152,12 +1153,14 @@ impl Progress {
             }
             // A receive timeout means the ECU did not answer (or did not accept the rest of a
             // segmented request), which is `NoResponse`, not a failed transmission.
-            Some(event_item::Data::ErrorData(code))
-                if code == PduErrorEvent::PduErrEvtRxTimeout as i32 =>
-            {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: code, ..
+            })) if code == PduErrorEvent::PduErrEvtRxTimeout as i32 => {
                 self.rx_timeout = true;
             }
-            Some(event_item::Data::ErrorData(code)) => {
+            Some(event_item::Data::ErrorData(ErrorData {
+                error_event: code, ..
+            })) => {
                 self.error = Some(code);
                 self.errors.push(code);
             }
@@ -2257,7 +2260,13 @@ mod tests {
         // A transmit error bound to the primitive is a failed primitive.
         let tx_error = PduErrorEvent::PduErrEvtTxError as i32;
         let failed = outcome(vec![
-            event(Some(COP), event_item::Data::ErrorData(tx_error)),
+            event(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: tx_error,
+                    extra_error_info: None,
+                }),
+            ),
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
         ]);
         let Some(Err(error @ HostError::PrimitiveFailed(code))) = failed else {
@@ -2269,12 +2278,24 @@ mod tests {
         // the lost VCI ends the primitive at once, before the cancellation (ADR-289).
         let lost = PduErrorEvent::PduErrEvtLostCommToVci as i32;
         assert!(matches!(
-            outcome(vec![event(None, event_item::Data::ErrorData(lost))]),
+            outcome(vec![event(
+                None,
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: lost,
+                    extra_error_info: None
+                })
+            )]),
             Some(Err(HostError::VciLost))
         ));
         assert!(matches!(
             outcome(vec![
-                event(None, event_item::Data::ErrorData(lost)),
+                event(
+                    None,
+                    event_item::Data::ErrorData(ErrorData {
+                        error_event: lost,
+                        extra_error_info: None
+                    })
+                ),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
             ]),
             Some(Err(HostError::VciLost))
@@ -2283,7 +2304,13 @@ mod tests {
         assert!(matches!(
             outcome(vec![
                 event(Some(COP), result(&[0x7F, 0x22, 0x78])),
-                event(Some(COP), event_item::Data::ErrorData(lost)),
+                event(
+                    Some(COP),
+                    event_item::Data::ErrorData(ErrorData {
+                        error_event: lost,
+                        extra_error_info: None
+                    })
+                ),
             ]),
             Some(Err(HostError::VciLost))
         ));
@@ -2294,7 +2321,10 @@ mod tests {
                     cop_handle: COP.cop_handle + 1,
                     ..COP
                 }),
-                event_item::Data::ErrorData(lost)
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: lost,
+                    extra_error_info: None
+                })
             )])
             .is_none()
         );
@@ -2302,7 +2332,13 @@ mod tests {
         let timeout = PduErrorEvent::PduErrEvtRxTimeout as i32;
         assert!(matches!(
             outcome(vec![
-                event(Some(COP), event_item::Data::ErrorData(timeout)),
+                event(
+                    Some(COP),
+                    event_item::Data::ErrorData(ErrorData {
+                        error_event: timeout,
+                        extra_error_info: None
+                    })
+                ),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
             ]),
             Some(Err(HostError::NoResponse))

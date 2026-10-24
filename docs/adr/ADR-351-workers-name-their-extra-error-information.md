@@ -28,6 +28,8 @@ timer, and on a native ISO 15765 channel it sees the receive status bits and the
 indication.
 
 The agent therefore had no way to map a D-PDU code to a case, and no code to map on J2534.
+Mapping each library's or worker's codes in the agent would also make the agent branch on the
+worker, which design principle 6 avoids: the workers absorb their APIs' differences.
 
 ## Decision
 

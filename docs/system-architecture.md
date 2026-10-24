@@ -112,6 +112,7 @@ flowchart TB
 3. **Layer trust by what is signed (11.1).** ECU flash data is protected by the supplier signature verified by the ECU, extension packages by the operator's distribution key, and job instructions by the server's instruction key. The server is treated as "a path that only carries, and is not trusted."
 4. **Confine scale- and environment-dependent decisions to replaceable points.**
 5. **The core holds only standards and interruption countermeasures; individual facts are moved out as extensions.** Extensions are expressed as data, and code-based extensions are limited to the server side (Chapter 9).
+6. **The agent treats every worker alike; the workers absorb their APIs' differences.** When a specification is designed, the agent should, as far as possible, not branch on which worker (J2534 or D-PDU API) or which library it drives. A difference between the APIs, or between libraries, is absorbed in the worker, the compatibility layer that knows it, which presents the result through the common worker interface (3.4, ADR-351). Where a difference cannot be absorbed (a value one API cannot give at all), the interface carries its absence explicitly, and the agent treats the absence the same way whichever worker it comes from.
 
 ---
 
@@ -157,6 +158,7 @@ Each device's operating mode is fixed to exactly one of "user mode" or "device m
 
 - One process per library, a dedicated thread per VCI. A J2534 library with several configured devices runs one process per device, so each device is its own worker (ADR-281)
 - Absorbs differences in libraries' data-passing methods and always outputs externally as a "timestamped sample sequence"
+- Absorbs the differences between its API and the common worker interface, and between libraries, so that the agent need not tell the workers apart (Design Principle 6). For example, each worker names its error events' extra error information itself: the D-PDU worker from the library's MDF, the J2534 worker from the cases it tells apart (ADR-351)
 - Splits a single data source into a recording path that tolerates no loss and a monitoring path that drops old data when delayed
 - Implemented in coarse-grained operation units (acquire / write / read-back verification)
 - Many J2534 DLLs are not thread-safe, which matches the per-VCI thread design. L0 / L1 (transport and protocol) also reside in the worker

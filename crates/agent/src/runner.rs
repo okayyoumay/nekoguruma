@@ -1046,7 +1046,10 @@ async fn run_checked<C: WorkerApi>(
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = Arc::clone(&cancel.0);
+    // The job's span, so what the VM's thread logs is in it (ADR-348 item 3).
+    let span = tracing::Span::current();
     let run = tokio::task::spawn_blocking(move || {
+        let _span = span.entered();
         // Declared outside the unwind guard, so a panic still ends the log.
         let mut comm_log = comm_log;
         let result = std::panic::catch_unwind(AssertUnwindSafe(|| {

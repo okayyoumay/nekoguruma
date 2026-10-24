@@ -108,3 +108,30 @@ A rotated file keeps its permissions, since it is the same file renamed.
 
 On Windows the owner is read and the access list set through the handle the writer opened, never
 by the path, so a path another account changes in between cannot redirect either.
+
+## Text output
+
+`TextLayer` writes each entry as one line of text, for stderr (design 12.2: stderr stays
+human-readable):
+
+```text
+2026-10-24T06:40:07.123456Z  WARN agent::runner: job{generation=0 job_id="run-1" external="bench"}: could not close the link pc=7
+```
+
+A line holds, in this order:
+- the timestamp, the level and the target;
+- the spans, root first, each with its fields;
+- the message, with its line breaks and control characters escaped;
+- the event's fields, string values quoted and escaped.
+
+`ExternalText` chooses how an `external` field is written:
+- `Full` writes the text itself, for an output that stays on the device (a terminal);
+- `LengthOnly` writes `<n bytes>`, for an output the OS may forward (a stderr that is not a
+  terminal, `journald`, `eventlog`; ADR-348 item 6).
+
+## One file per process
+
+`Slot::claim(dir, stem)` gives a process a file of its own (ADR-348 item 5). It claims the
+smallest number `n` whose lock file `{stem}.{n}.lock` it can lock exclusively, and the file is
+`{stem}.{n}.log`. The OS releases the lock when the process ends, so no two running processes
+share a file, and the numbers stay bounded by how many run at once.

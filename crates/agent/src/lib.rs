@@ -5,6 +5,7 @@
 //! - [`client`]: the worker client as a trait, so the hardware harness can guard a job's calls (ADR-334)
 //! - [`comm_log`]: the log of a job's communication, kept beside its journal (design 8.11, ADR-346,
 //!   ADR-347)
+//! - [`logging`]: the agent's operational log, its `tracing` subscriber (design 12.2, ADR-348)
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
@@ -32,6 +33,7 @@ pub mod journal;
 mod journaling;
 pub mod launch;
 pub mod link;
+pub mod logging;
 mod oplog;
 pub mod policy;
 pub mod restart;
@@ -40,7 +42,7 @@ pub mod send_receive;
 
 pub use artifact::Artifact;
 pub use client::WorkerApi;
-pub use comm_log::{CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus};
+pub use comm_log::{CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus, run_key};
 pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};
 pub use journal::Vin;

@@ -18,6 +18,8 @@ worker-host.workspace = true
 j2534-0404-registry.workspace = true
 ngr-library-resolver.workspace = true
 vci-service-config.workspace = true
+ngr-oplog.workspace = true
+tracing-subscriber.workspace = true
 vci-service-interface.workspace = true
 tokio.workspace = true
 tonic = "0.14.6"
@@ -35,3 +37,4 @@ libc = "0.2"
 [dev-dependencies]
 diag-frontend = { path = "../diag-frontend" }
 sim-ecu.workspace = true
+tempfile = "3"

@@ -23,7 +23,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | `worker-host` | ABI detection from the library header, launching worker services, authenticated gRPC client | 7.3 / 7.4 |
 | `iso22900*`, `j2534-0404*`, `vci-service-*` | J2534 / D-PDU API FFI, wrappers, discovery, mocks and the gRPC worker services (`docs/worker-crates.md`) | 3.4 / 7.1.2 / 7.4 |
 | `ngr-library-resolver` | Resolves a VCI name to its vendor library, one module per standard and version (J2534 v04.04: Linux definition files, Windows registry; ISO 22900 D-PDU API: root description file, ISO 22900-2:2022 clause 8.7), and runs the 7.2 pre-load writability check (ADR-270) and signer check (ADR-278) | 7.1 / 7.1.1 / 7.2 |
-| `ngr-oplog` | The operational log's file output: a `tracing` layer writing JSON Lines to a private file rotated by size (ADR-348 item 5), for the agent and the workers | 12.2 |
+| `ngr-oplog` | The operational log's outputs: `tracing` layers writing JSON Lines to a private file rotated by size, one per process (ADR-348 item 5), and text for stderr, for the agent and the workers | 12.2 |
 | `sim-vci` | cdylib exposing J2534 (mock) | 13.4 |
 | `sim-ecu` | Simulation of UDS responses and flash state transitions | 13.4 |
 | `ngr-hw-checks` | Harness of the optional real-hardware checks: the hardware profile, check declarations and their listing, opening the profile's device through a worker with the module match (ADR-275), the guarded handle for checks and the agent's runner (ADR-333, ADR-334), and the check bodies (the T0 loopback) | 13.5 |

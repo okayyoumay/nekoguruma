@@ -136,6 +136,27 @@ commits 0 (ADR-252).
 
 The worker's own log goes to stderr.
 
+## Operational log
+
+The agent logs its own `tracing` events (design 12.2, ADR-348), with fixed settings until it
+reads logging settings of its own. It logs at level `info` to two places.
+
+- **stderr**, as one line of text per entry. When stderr is not a terminal, for example when a
+  service manager collects it, each `external` field is written as its length only, since the
+  OS may forward that output off the device (ADR-348 item 6).
+- **A JSON Lines file** in the user's state directory (`ngr_oplog`):
+  - `$XDG_STATE_HOME/nekoguruma/logs/` (an absolute `XDG_STATE_HOME`), else
+    `~/.local/state/nekoguruma/logs/`, on Unix;
+  - `%LOCALAPPDATA%\nekoguruma\logs\` on Windows.
+
+  Each running agent writes a file of its own, `agent.{n}.log`, where `n` is the smallest
+  number whose `agent.{n}.lock` it can lock. The file is rotated at 10 MiB, and 5 rotated
+  files are kept. When the file cannot be opened, the agent warns on stderr and logs there alone.
+
+A run's entries are in a `job` span with its job id (the communication log's, when there is
+one), generation 0 and the VCI name in the span's `external` field. What an entry may hold is
+`operational-log.md`.
+
 ## Configuration file
 
 The agent and the worker find the library without `config.toml`, from the registry on Windows

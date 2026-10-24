@@ -10,8 +10,10 @@
 //! ECU that reads DTCs with `diag.read_dtc`, which lowers to the generic send-receive (ADR-321).
 //! A fifth keeps a communication log (design 8.11, ADR-347): it reads the VIN, a DID the ECU
 //! does not know, and a DID whose response `sim-vci` drops, and the log holds an exchange entry
-//! for each, classified by what the host saw. Every job comes from a document and opens the link
-//! its variant declares (ADR-324).
+//! for each, classified by what the host saw. A sixth sends a request longer than ISO 15765 can
+//! carry, which the worker refuses with its reason (ADR-350), and its log shows the request not
+//! sent, refused by the worker. Every job comes from a document and opens the link its variant
+//! declares (ADR-324).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
 //! spawned service cannot race with another test.
@@ -488,6 +490,58 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     );
     assert_eq!(comm_log, CommLogStatus::Complete);
     assert_comm_log(&setup);
+
+    // A request longer than ISO 15765 can carry (SAE J2534-1 v04.04 clause 8.3 limits an
+    // ISO15765 message to 4095 bytes of data after its CAN ID): the worker refuses it before
+    // sending, naming the reason.
+    let setup = CommLogSetup {
+        dir: comm_log_dir.to_owned(),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e73".to_owned()),
+            generation: 1,
+        },
+    };
+    let too_long = Program {
+        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        constants: vec![vec![0xF1; 5000]],
+        ..program()
+    };
+    let job = document_job(&too_long).with_comm_log(setup.clone());
+    let JobRun {
+        result: state,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    assert!(
+        matches!(state, Err(agent::JobError::Host { .. })),
+        "the refusal ends the job: {state:?}"
+    );
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let entry: serde_json::Value = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+        .find(|line| line["event"] == "exchange")
+        .unwrap_or_else(|| panic!("an exchange entry in {text}"));
+    assert_eq!(entry["outcome"]["result"], "not_sent", "{entry}");
+    assert_eq!(entry["outcome"]["cause"], "system_own_reasons", "{entry}");
+    assert_eq!(entry["sent_evidence"], "refused", "{entry}");
+    assert_eq!(entry["sent"], "not_sent", "{entry}");
+    assert_eq!(entry["classification"], "system", "{entry}");
+    assert_eq!(
+        entry["detail"]["worker_detail"], "REFUSAL_REASON_PROTOCOL_CANNOT_CARRY",
+        "{entry}"
+    );
 
     worker
         .stop(Duration::from_secs(5))

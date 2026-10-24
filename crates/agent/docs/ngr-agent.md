@@ -413,9 +413,14 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   or the restart sends through it (`send_recv`, the generic send-receive) and for each it refuses
   before sending (`not_sent`: the request policy, an undeclared service, TransferData outside
   `FlashTransfer`, a block with no transfer, one longer than the ECU's block length, or one
-  refused for its RequestDownload's response, which `caused_by` names). Each has its `origin`,
-  the link's identifiers as its `target`, the agent's times, and in `detail` the host error's
-  variant name, the error event's name and the gRPC status code, never their text. A step's
+  refused for its RequestDownload's response, which `caused_by` names). A request the worker
+  refused to start and named a reason for (ADR-350 item 2: invalid parameters, a full queue, a
+  request the protocol cannot carry) is `not_sent` too, refused by the worker for its own
+  reasons (`system_own_reasons`, `system`), with the reason's name in `detail`'s
+  `worker_detail`; a failed start without a reason stays `unknown`
+  (`primitive_failed_to_start`), since it does not show the request was not sent. Each has its
+  `origin`, the link's identifiers as its `target`, the agent's times, and in `detail` the host
+  error's variant name, the error event's name and the gRPC status code, never their text. A step's
   request has `origin` `procedure` and the step's `at` (pc, step count, the source position the
   program's source map gives, and the sections in force); the runner tells the host where each
   step begins and that it ended (`ProcedurePosition`). The runner's and the restart's own reads

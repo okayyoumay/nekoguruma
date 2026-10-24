@@ -292,16 +292,35 @@ mod windows_tests {
         sddl
     }
 
+    /// Whether `sddl`, as read back, is the private list `expected`: protected (`P`) with the
+    /// same entries. Windows adds its own control flags on the way back, such as `AI` (the list
+    /// was set through the inheritance-aware API), which say nothing about who has access.
+    fn is_private(sddl: &str, expected: &str) -> bool {
+        let split = |text: &str| -> (String, String) {
+            let text = text.strip_prefix("D:").unwrap_or(text);
+            let at = text.find('(').unwrap_or(text.len());
+            (text[..at].to_owned(), text[at..].to_owned())
+        };
+        let (flags, entries) = split(sddl);
+        let (_, expected_entries) = split(expected);
+        flags.contains('P') && entries == expected_entries
+    }
+
     #[test]
     fn a_created_directory_and_file_get_the_private_access_list() {
         let temp = tempfile::tempdir().unwrap();
         let dir = temp.path().join("a").join("logs");
         create_dir(&dir).unwrap();
-        assert_eq!(dacl(&dir), windows::DIR_SDDL);
-        assert_eq!(dacl(&temp.path().join("a")), windows::DIR_SDDL);
+        assert!(is_private(&dacl(&dir), windows::DIR_SDDL), "{}", dacl(&dir));
+        let parent = dacl(&temp.path().join("a"));
+        assert!(is_private(&parent, windows::DIR_SDDL), "{parent}");
         let path = dir.join("agent.log");
         drop(open_append(&path).unwrap());
-        assert_eq!(dacl(&path), windows::FILE_SDDL);
+        assert!(
+            is_private(&dacl(&path), windows::FILE_SDDL),
+            "{}",
+            dacl(&path)
+        );
     }
 
     #[test]
@@ -312,8 +331,16 @@ mod windows_tests {
         assert_eq!(dacl(temp.path()), before);
         let path = temp.path().join("agent.log");
         std::fs::write(&path, b"").unwrap();
-        assert_ne!(dacl(&path), windows::FILE_SDDL);
+        assert!(
+            !is_private(&dacl(&path), windows::FILE_SDDL),
+            "{}",
+            dacl(&path)
+        );
         drop(open_append(&path).unwrap());
-        assert_eq!(dacl(&path), windows::FILE_SDDL);
+        assert!(
+            is_private(&dacl(&path), windows::FILE_SDDL),
+            "{}",
+            dacl(&path)
+        );
     }
 }

@@ -607,8 +607,9 @@ where
     Ok(read)
 }
 
-/// [`resolve_source`] for the identity `kind`, noting the value read with the host as
-/// [`read_identity_bytes`] does; an answer that decodes to no value is noted unreadable.
+/// [`resolve_source`] for the identity `kind`, noting what was read with the host as
+/// [`read_identity_bytes`] does, from the same one response: the decoded value, a negative
+/// response with its code, or unreadable for anything else.
 pub fn resolve_identity<H>(
     kind: diag_ir::IdentityKind,
     source: Source,
@@ -618,9 +619,30 @@ pub fn resolve_identity<H>(
 where
     H: DiagHost<Error = HostError> + RuntimeInputs,
 {
-    let reading = resolve_source(source, table, host)?;
+    let mut noted = None;
+    let reading = match source {
+        Source::RuntimeInput(input) => host.read(input)?,
+        Source::EcuService {
+            service_id,
+            field_id,
+        } => match table
+            .get(service_id, field_id)
+            .and_then(|field| Some((field, field.request.split_first()?)))
+        {
+            None => Reading::CannotBeDecoded,
+            Some((field, (&sid, payload))) => {
+                let response = host.service_request(u16::from(sid), payload)?;
+                if let [0x7F, echoed, nrc] = response[..]
+                    && echoed == sid
+                {
+                    noted = Some(diag_ir::IdentityRead::Negative(nrc));
+                }
+                decode_field(field, sid, &response)
+            }
+        },
+    };
     let number;
-    let read = match &reading {
+    let read = noted.unwrap_or(match &reading {
         Reading::Text(text) => diag_ir::IdentityRead::Value(text.as_bytes()),
         Reading::Value(value) => {
             number = value.to_string();
@@ -629,7 +651,7 @@ where
         Reading::CannotBeEstablished | Reading::CannotBeDecoded => {
             diag_ir::IdentityRead::Unreadable
         }
-    };
+    });
     host.note_identity(kind, read);
     Ok(reading)
 }
@@ -961,13 +983,26 @@ mod tests {
         read_identity_bytes(HardwarePartNumber, ecu(1, 1), &table(), &mut host2).unwrap();
         let mut host3 = Fake::answering(&[0x62, 0xF1, 0x90, 0x41]);
         resolve_identity(Vin, ecu(1, 1), &table(), &mut host3).unwrap();
+        // A VIN the ECU refuses keeps its code, as the byte reads do; the restart still reads it
+        // as not decoded.
+        let mut host4 = Fake::answering(&[0x7F, 0x22, 0x22]);
+        let refused = resolve_identity(Vin, ecu(1, 1), &table(), &mut host4).unwrap();
+        assert_eq!(refused, Reading::CannotBeDecoded);
+        assert_eq!(host4.sent.len(), 1, "one request");
         let mut failed = Fake {
             responses: vec![Err(HostError::NoResponse)],
             ..Fake::answering(&[])
         };
         assert!(read_identity_bytes(HardwarePartNumber, ecu(1, 1), &table(), &mut failed).is_err());
         assert_eq!(
-            [host.noted, host2.noted, host3.noted, failed.noted].concat(),
+            [
+                host.noted,
+                host2.noted,
+                host3.noted,
+                host4.noted,
+                failed.noted
+            ]
+            .concat(),
             [
                 (
                     Vin,
@@ -978,6 +1013,7 @@ mod tests {
                     format!("{:?}", diag_ir::IdentityRead::Negative(0x31))
                 ),
                 (Vin, format!("{:?}", diag_ir::IdentityRead::Unreadable)),
+                (Vin, format!("{:?}", diag_ir::IdentityRead::Negative(0x22))),
             ]
         );
     }

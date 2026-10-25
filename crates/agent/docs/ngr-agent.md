@@ -446,7 +446,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
   later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched
   answers and the owed requests, and an unusable answer to either ends only the matched
-  answers. A reopened link, a worker
+  answers. A link error ends the matched answers too, but a final response that came after
+  every link error of its exchange, in the order the host read the link's items, counts as an answer
+  since the error (VCI times are not compared); an error after it, or from another link of the
+  channel, ends it. A reopened link, a worker
   restart or a VCI reconnect (`LinkState::reopened`) ends the matched answers and keeps the owed
   requests. The other rows stand as comments where the table puts them, and evidence only they
   could classify falls to the last row, `undetermined`, at the place in the table where that row

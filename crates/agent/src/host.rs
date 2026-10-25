@@ -550,11 +550,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let link_errors = events_seen(&sent, &mut detail);
             let unbound = unattached_items(&sent.unbound);
+            let before_answer = errors_before_answer(&sent);
             let vci_ended = sent.rx_timeout.is_some();
             self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
                 evidence.link_errors.extend(link_errors);
+                evidence.link_errors_before_answer = before_answer;
             });
         }
         sent.result
@@ -604,6 +606,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     result: Err(error),
                     started: false,
                     error_events: Vec::new(),
+                    errors_before_response: None,
                     rx_timeout: None,
                     vci_lost: None,
                     unbound: Vec::new(),
@@ -645,6 +648,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             result,
             started: true,
             error_events: std::mem::take(&mut progress.errors),
+            errors_before_response: progress.errors_before_response.take(),
             rx_timeout: progress.rx_timeout.take(),
             vci_lost: progress.vci_lost.take(),
             unbound: std::mem::take(&mut progress.unbound),
@@ -820,6 +824,8 @@ struct Sent {
     result: Result<Vec<u8>, HostError>,
     started: bool,
     error_events: Vec<ErrorSeen>,
+    /// How many of `error_events` were read before the final response, when there was one.
+    errors_before_response: Option<usize>,
     rx_timeout: Option<ErrorSeen>,
     vci_lost: Option<ErrorSeen>,
     unbound: Vec<Unbound>,
@@ -845,6 +851,13 @@ fn also_seen<'a>(
         (Err(HostError::PrimitiveFailed(_)), [earlier @ .., _]) => earlier,
         _ => error_events,
     }
+}
+
+/// Whether `sent` ended with a final response that every link error it reported came before, in
+/// the order the items were read (design 8.11 "Matched answer"). The VCI's times are not used:
+/// its clocks are not aligned with the agent's.
+fn errors_before_answer(sent: &Sent) -> bool {
+    sent.result.is_ok() && sent.errors_before_response == Some(sent.error_events.len())
 }
 
 /// The link errors of the events `sent` reported beside its end, every one, so the
@@ -1225,6 +1238,9 @@ struct Progress {
     /// Every error event but the receive timeout and a lost VCI, in order, for the
     /// communication log.
     errors: Vec<ErrorSeen>,
+    /// How many of `errors` were read when the final response was taken: the ones before it, in
+    /// the order the link's items were read.
+    errors_before_response: Option<usize>,
     /// The receive timeout the worker reported, which ends the exchange without a response.
     rx_timeout: Option<ErrorSeen>,
     /// The lost VCI the worker reported, which ends the exchange at once.
@@ -1244,6 +1260,7 @@ impl Progress {
             response: None,
             error: None,
             errors: Vec::new(),
+            errors_before_response: None,
             rx_timeout: None,
             vci_lost: None,
             unbound: Vec::new(),
@@ -1259,6 +1276,7 @@ impl Progress {
             response: None,
             error: None,
             errors: Vec::new(),
+            errors_before_response: None,
             rx_timeout: None,
             vci_lost: None,
             unbound: Vec::new(),
@@ -1326,6 +1344,7 @@ impl Progress {
                     && !self.negative.is_pending(self.sid, &result.data_bytes) =>
             {
                 self.response = Some(result.data_bytes);
+                self.errors_before_response = Some(self.errors.len());
             }
             // A receive timeout means the ECU did not answer (or did not accept the rest of a
             // segmented request), which is `NoResponse`, not a failed transmission.
@@ -1836,6 +1855,7 @@ mod tests {
             result,
             started: true,
             error_events: error_events.iter().copied().map(seen).collect(),
+            errors_before_response: None,
             rx_timeout: rx_timeout.then(|| seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
             vci_lost: None,
             unbound: Vec::new(),
@@ -1916,6 +1936,7 @@ mod tests {
             result,
             started: true,
             error_events: Vec::new(),
+            errors_before_response: None,
             rx_timeout: None,
             vci_lost: None,
             unbound: Vec::new(),
@@ -2437,6 +2458,52 @@ mod tests {
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
         ]);
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+    }
+
+    /// Design 8.11 "Matched answer": the order the items were read in says which of the
+    /// exchange's link errors came before its final response.
+    #[test]
+    fn the_read_order_says_which_errors_came_before_the_final_response() {
+        let fault = || {
+            event(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtFrameStruct as i32,
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                }),
+            )
+        };
+        let answer = || event(Some(COP), result(&[0x62, 0xF1, 0x90]));
+        let finished = || event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        let sent_of = |events: Vec<EventItem>| {
+            let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+            let result = events
+                .into_iter()
+                .find_map(|item| progress.on_event(item, COP))
+                .unwrap();
+            Sent {
+                result,
+                started: true,
+                error_events: std::mem::take(&mut progress.errors),
+                errors_before_response: progress.errors_before_response.take(),
+                rx_timeout: None,
+                vci_lost: None,
+                unbound: Vec::new(),
+            }
+        };
+        let before = sent_of(vec![fault(), answer(), finished()]);
+        assert_eq!(before.error_events.len(), 1);
+        assert!(errors_before_answer(&before));
+        let after = sent_of(vec![answer(), fault(), finished()]);
+        assert_eq!(after.error_events.len(), 1);
+        assert!(!errors_before_answer(&after));
+        // One error on each side of the answer is not all before it.
+        let both = sent_of(vec![fault(), answer(), fault(), finished()]);
+        assert!(!errors_before_answer(&both));
+        // With no answer there is none to count.
+        let none = sent_of(vec![fault(), finished()]);
+        assert!(none.result.is_err() && !errors_before_answer(&none));
     }
 
     /// Design 8.11 "Link settings for the log": the result and error items of no primitive or

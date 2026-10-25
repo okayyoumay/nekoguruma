@@ -1356,6 +1356,7 @@ async fn process_frame_for_entry(
     frame: FrameRouteContext,
     data: &[u8],
     is_tx_side: bool,
+    notes: &mut Vec<IsoTpRxNote>,
 ) -> Vec<(Vec<u8>, u32, bool, bool)> {
     match &entry.kind {
         RxEntryKind::Hardware { native_mixed, .. }
@@ -1537,19 +1538,26 @@ async fn process_frame_for_entry(
                         );
                     }
                     let mut reassembly = ctx.reassembly.lock().await;
-                    // Purge reassemblies whose N_Cr expired without a final
-                    // CF, so abandoned transfers don't accumulate.
-                    reassembly.retain(|_, r| !r.is_expired(now));
+                    // Drop reassemblies whose N_Cr expired without a final
+                    // CF, raising each one's failure, so abandoned transfers
+                    // don't accumulate (`raise_expired_reassemblies` sweeps
+                    // the rest each poll pass).
+                    notes.extend(take_expired_reassemblies(&mut reassembly, now));
                     // ADR-222: keyed by (can_id, canonical width), not can_id
                     // alone -- see `IsoTpRxContext::reassembly`'s and
                     // `CanIdWidthGate::reassembly_key_width`'s own doc
                     // comments for why this uses `reassembly_key` (the
                     // matched entry's own gate), never the raw
                     // `frame.frame_is_29bit` bit.
-                    reassembly.insert(
-                        reassembly_key,
-                        isotp::Reassembly::start(total_len, payload, now, ctx.n_cr),
-                    );
+                    // The COP a failure of this message binds to (ADR-351):
+                    // the one waiting on this response ID now, if only one
+                    // does. A first frame that replaces an unfinished one
+                    // raises nothing for the replaced message.
+                    let mut started = isotp::Reassembly::start(total_len, payload, now, ctx.n_cr);
+                    started.waiting_cop =
+                        sole_waiting_cop(&entry.registrants, entry.connect_generation, uid);
+                    reassembly.insert(reassembly_key, started);
+                    notes.push(IsoTpRxNote::Started(uid));
                     Vec::new()
                 }
                 Some(isotp::Frame::Consecutive {
@@ -1577,12 +1585,20 @@ async fn process_frame_for_entry(
                                 sequence_number,
                                 "software ISO-TP: wrong ConsecutiveFrame sequence; reassembly aborted"
                             );
+                            let waiting_cop = state.waiting_cop;
                             reassembly.remove(&key);
+                            notes.push(IsoTpRxNote::Failed {
+                                error: PduErrorEvent::PduErrEvtFrameStruct,
+                                name: ISO15765_FRAME_NUM_NAME,
+                                waiting_cop,
+                            });
                             Vec::new()
                         }
                         isotp::ReassemblyStep::TimedOut => {
                             warn!(can_id, "software ISO-TP: N_Cr expired; reassembly aborted");
+                            let waiting_cop = state.waiting_cop;
                             reassembly.remove(&key);
+                            notes.push(n_cr_expired(waiting_cop));
                             Vec::new()
                         }
                     }
@@ -3744,13 +3760,163 @@ fn note_start_of_message(
     unique_resp_identifier: u32,
 ) {
     for r in registrants {
-        let waits_on_id = r.connect_generation == connect_generation
-            && r.expected.iter().any(|e| {
-                e.unique_resp_ids.is_empty() || e.unique_resp_ids.contains(&unique_resp_identifier)
-            });
-        if waits_on_id && !r.som_started.contains(&unique_resp_identifier) {
+        if waits_on_response_id(r, connect_generation, unique_resp_identifier)
+            && !r.som_started.contains(&unique_resp_identifier)
+        {
             r.som_started.push(unique_resp_identifier);
         }
+    }
+}
+
+/// `true` when `r` waits on a response from `unique_resp_identifier` on the
+/// connection `connect_generation` (`note_start_of_message`'s test).
+fn waits_on_response_id(
+    r: &CopRegistrant,
+    connect_generation: u64,
+    unique_resp_identifier: u32,
+) -> bool {
+    r.connect_generation == connect_generation
+        && r.expected.iter().any(|e| {
+            e.unique_resp_ids.is_empty() || e.unique_resp_ids.contains(&unique_resp_identifier)
+        })
+}
+
+/// The one COP among `registrants` that waits on `unique_resp_identifier`,
+/// or `None` when none or more than one does: the COP a software ISO-TP
+/// reassembly failure is bound to (`isotp::Reassembly::waiting_cop`).
+fn sole_waiting_cop(
+    registrants: &[CopRegistrant],
+    connect_generation: u64,
+    unique_resp_identifier: u32,
+) -> Option<u32> {
+    let mut waiting = registrants
+        .iter()
+        .filter(|r| waits_on_response_id(r, connect_generation, unique_resp_identifier));
+    match (waiting.next(), waiting.next()) {
+        (Some(r), None) => Some(r.cop_handle),
+        _ => None,
+    }
+}
+
+/// What a software ISO-TP entry's reassembly reports to `poll_rx_inner`
+/// besides its deliveries (`process_frame_for_entry`).
+#[derive(Debug, PartialEq, Eq)]
+enum IsoTpRxNote {
+    /// A first frame from this response ID started a segmented message, so a
+    /// receive timeout of a COP waiting on it is named `ISO15765_CF_TIMEOUT`
+    /// until the message ends (`note_start_of_message`).
+    Started(u32),
+    /// A reassembly failed and was dropped: raise `error` named `name`, bound
+    /// to the COP recorded at the first frame if it still waits.
+    Failed {
+        error: PduErrorEvent,
+        name: &'static str,
+        waiting_cop: Option<u32>,
+    },
+}
+
+/// Name of the frame-structure error raised when a software ISO-TP
+/// consecutive frame carries an unexpected sequence number (ISO 15765-2:2024
+/// 9.6.4.4 aborts the reception; ISO 22900-2:2022 Table D.8's name).
+pub(super) const ISO15765_FRAME_NUM_NAME: &str = "ISO15765_FRAME_NUM";
+
+/// The failure note of a reassembly whose N_Cr expired before its next
+/// consecutive frame (ISO 15765-2:2024 9.8.2), recorded for `waiting_cop`.
+fn n_cr_expired(waiting_cop: Option<u32>) -> IsoTpRxNote {
+    IsoTpRxNote::Failed {
+        error: PduErrorEvent::PduErrEvtRxTimeout,
+        name: ISO15765_CF_TIMEOUT_NAME,
+        waiting_cop,
+    }
+}
+
+/// Removes every reassembly whose N_Cr has expired from `reassembly`,
+/// returning the failure note of each.
+fn take_expired_reassemblies(
+    reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
+    now: Instant,
+) -> Vec<IsoTpRxNote> {
+    let mut expired = Vec::new();
+    reassembly.retain(|_, r| {
+        let keep = !r.is_expired(now);
+        if !keep {
+            expired.push(n_cr_expired(r.waiting_cop));
+        }
+        keep
+    });
+    expired
+}
+
+/// The COP a reassembly failure binds to: the one recorded at the first frame
+/// while it is still among `registrants`, with its tag from `cop_tags`.
+fn reassembly_failure_cop(
+    waiting_cop: Option<u32>,
+    registrants: &[CopRegistrant],
+    cop_tag: impl FnOnce(u32) -> Option<Vec<u8>>,
+) -> Option<ErrorCop> {
+    let cop_handle = waiting_cop.filter(|&h| registrants.iter().any(|r| r.cop_handle == h))?;
+    Some((cop_handle, cop_tag(cop_handle)))
+}
+
+/// Raises the error event of every software ISO-TP reassembly on `channel_id`
+/// whose N_Cr expired with no further frame: a consecutive frame that never
+/// comes reaches no frame path, so each poll pass sweeps for it. Under
+/// `logical_links`, each `isotp_rx` is taken and released in turn (the order
+/// `rpc_link.rs` uses), then `primitives` (as `build_cll_rx_entries`).
+async fn raise_expired_reassemblies(ctx: &ChannelPollCtx) {
+    let now = Instant::now();
+    let failures: Vec<(u32, IsoTpRxNote, Option<ErrorCop>)> = {
+        let links = ctx.logical_links.lock().await;
+        let mut expired = Vec::new();
+        for (&h, l) in links
+            .iter()
+            .filter(|(_, l)| l.software_isotp && l.channel_id == Some(ctx.channel_id))
+        {
+            for note in take_expired_reassemblies(&mut *l.isotp_rx.lock().await, now) {
+                expired.push((h, note));
+            }
+        }
+        if expired.is_empty() {
+            return;
+        }
+        let prims = ctx.primitives.lock().await;
+        expired
+            .into_iter()
+            .map(|(h, note)| {
+                let waiting_cop = match note {
+                    IsoTpRxNote::Failed { waiting_cop, .. } => waiting_cop,
+                    IsoTpRxNote::Started(_) => None,
+                };
+                let cop = reassembly_failure_cop(waiting_cop, &links[&h].registrants, |c| {
+                    prims.get(&c).and_then(|e| e.cop_tag.clone())
+                });
+                (h, note, cop)
+            })
+            .collect()
+    };
+    for (h, note, cop) in failures {
+        raise_reassembly_failure(ctx, h, note, cop).await;
+    }
+}
+
+/// Raises the error event of a software ISO-TP reassembly failure `note` on
+/// `cll_handle`, bound to `cop`; a `Started` note raises nothing.
+async fn raise_reassembly_failure(
+    ctx: &ChannelPollCtx,
+    cll_handle: u32,
+    note: IsoTpRxNote,
+    cop: Option<ErrorCop>,
+) {
+    if let IsoTpRxNote::Failed { error, name, .. } = note {
+        send_named_error_event(
+            &ctx.subscriptions,
+            &ctx.logical_links,
+            cll_handle,
+            error,
+            Some(name),
+            cop,
+        )
+        .await;
     }
 }
 
@@ -4439,12 +4605,9 @@ async fn poll_rx_inner(
         let api = ctx.api.lock().await;
         match api.read_messages(ctx.channel_id, MAX_POLL_MESSAGES, 0) {
             Ok(msgs) => Some(msgs),
+            // An empty buffer is the empty batch below, with `api` released.
             Err(j2534_0404::Error::ApiStatus { code, .. }) if code.is_buffer_empty() => {
-                ctx.drain_watermarks
-                    .lock()
-                    .await
-                    .insert(ctx.channel_id, read_started_at);
-                return PollOutcome::Drained;
+                Some(Vec::new())
             }
             Err(_) => None,
         }
@@ -4455,6 +4618,11 @@ async fn poll_rx_inner(
     };
 
     if messages.is_empty() {
+        // Every frame that arrived has been read, so a software ISO-TP
+        // reassembly still waiting past N_Cr has had no consecutive frame.
+        // Raised before the watermark, so a receive deadline that waits on
+        // this drain sees the error first.
+        raise_expired_reassemblies(ctx).await;
         ctx.drain_watermarks
             .lock()
             .await
@@ -4809,6 +4977,7 @@ async fn poll_rx_inner(
         }
 
         for entry in &mut cll_entries {
+            let mut isotp_notes = Vec::new();
             let deliveries = process_frame_for_entry(
                 &ctx.api,
                 ctx.channel_id,
@@ -4822,8 +4991,31 @@ async fn poll_rx_inner(
                 },
                 &data,
                 is_tx_side,
+                &mut isotp_notes,
             )
             .await;
+
+            // Software ISO-TP (ADR-046): a first frame marks the COPs that
+            // wait on its response ID as a native start-of-message
+            // indication does, so a receive timeout that follows is named
+            // `ISO15765_CF_TIMEOUT`; a failed reassembly raises its named
+            // error (ADR-351), bound to the COP recorded at the first frame
+            // while that COP still waits, and the COP's wait goes on.
+            for note in isotp_notes {
+                match note {
+                    IsoTpRxNote::Started(unique_resp_identifier) => note_start_of_message(
+                        &mut entry.registrants,
+                        entry.connect_generation,
+                        unique_resp_identifier,
+                    ),
+                    IsoTpRxNote::Failed { waiting_cop, .. } => {
+                        let cop = reassembly_failure_cop(waiting_cop, &entry.registrants, |c| {
+                            resolve_frame_cop_tag(entry, Some(c))
+                        });
+                        raise_reassembly_failure(ctx, entry.handle, note, cop).await;
+                    }
+                }
+            }
 
             for (delivery_data, unique_resp_identifier, raw, uudt_routed) in deliveries {
                 // ADR-051: for CAN, ISO15765, ISO9141, ISO14230, and J1850,
@@ -5011,11 +5203,14 @@ async fn poll_rx_inner(
                 // the native-mixed modes a raw UUDT frame routed to the same
                 // entry (`uudt_routed`) carries the same URID but completes no
                 // segmented message. (A start-of-message indication is ISO
-                // 15765 only, so the insert above needs no such gate.)
+                // 15765 only, so the insert above needs no such gate.) On a
+                // software ISO-TP entry the service reassembles itself, and
+                // a single or reassembled message (not `raw`) ends it.
                 if is_content_frame
                     && !is_tx_side
                     && !uudt_routed
-                    && is_native_iso15765_entry(entry)
+                    && (is_native_iso15765_entry(entry)
+                        || (matches!(entry.kind, RxEntryKind::SoftwareIsoTp(_)) && !raw))
                 {
                     note_message_ended(&mut entry.registrants, unique_resp_identifier);
                 }
@@ -5734,6 +5929,8 @@ async fn poll_rx_inner(
     // above has landed -- see this function's own doc comment for why the
     // ordering matters.
     if outcome.is_drained() {
+        // As for the empty batch above.
+        raise_expired_reassemblies(ctx).await;
         ctx.drain_watermarks
             .lock()
             .await

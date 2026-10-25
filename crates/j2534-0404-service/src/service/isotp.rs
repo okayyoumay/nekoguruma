@@ -303,6 +303,10 @@ pub(super) struct Reassembly {
     /// abandoned (ISO 15765-2 N_Cr).
     deadline: Instant,
     n_cr: Duration,
+    /// The COP that waited on this message's response ID when its first
+    /// frame arrived, when exactly one did: a reassembly failure is raised
+    /// bound to it (ADR-351). Set by the caller after [`Reassembly::start`].
+    pub(super) waiting_cop: Option<u32>,
 }
 
 impl Reassembly {
@@ -321,6 +325,7 @@ impl Reassembly {
             next_sn: 1,
             deadline: now + n_cr,
             n_cr,
+            waiting_cop: None,
         }
     }
 

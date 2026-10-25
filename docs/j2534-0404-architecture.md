@@ -432,7 +432,9 @@ Key internals:
   FirstFrames with a FlowControl built from
   `CP_BlockSize` / `CP_StMin`, sent to the `CP_CanPhysReqId` paired with the
   sender's `CP_CanRespUSDTId` in the UniqueRespIdTable, and abandons
-  reassembly on `CP_Cr` (N_Cr) expiry.
+  reassembly on `CP_Cr` (N_Cr) expiry or a wrong sequence number, raising a
+  named error event for each (ADR-351; "Named error cases on a native ISO
+  15765 channel" below).
 - Extended addressing (`isotp::Addressing::Extended(ae)`, ADR-047) is
   resolved per UniqueRespIdTable entry from the same `CP_Can*Format` bit 3 /
   `CP_Can*ExtAddr` pair the hardware `FLOW_CONTROL_FILTER` path already
@@ -964,7 +966,7 @@ On a native ISO 15765 channel (`dual-channel`, `single-channel`, `auto`, and the
 | `ISO15765_PADDING` | `PduErrEvtFrameStruct` | A received frame carries the `ISO15765_PADDING_ERROR` status bit and counts as a response match for its COP (the bind that completes one of the COP's expected responses). The frame is delivered exactly as before; the error follows it, bound to that COP (with its `cop_tag`). A pending-response frame (a short `7F xx 78` is typically padded) and an unbound frame raise none, so a COP that then times out still ends as a plain timeout. |
 | `ISO15765_CF_TIMEOUT` | `PduErrEvtRxTimeout` | A COP's receive phase ends on its deadline, and a message started from a response ID the COP waits on (a start-of-message indication, matched by the same unique-response-ID test that binds a response) and no ISO 15765 content message from that response ID has ended it since. One sender has one segmented message in progress, so any ISO 15765 content message from that ID ends it, whether it bound as a response, as a pending-response frame, or to nothing; a raw UUDT frame routed to the same entry under the native-mixed modes does not. Tracked per COP as the set `CopRegistrant::som_started` of started response IDs, merged back per poll pass like `pending_rc`. The indication counts whether or not `CP_StartMsgIndEnable` lets it reach the client. |
 
-Naming changes neither when a COP times out nor how it finishes: a timeout with no started message, or whose started messages all ended or came from response IDs the COP does not wait on, stays unnamed, as does every other error event. Software ISO-TP and plain CAN channels are unchanged and name nothing.
+Naming changes neither when a COP times out nor how it finishes: a timeout with no started message, or whose started messages all ended or came from response IDs the COP does not wait on, stays unnamed, as does every other error event. Plain CAN channels name nothing; software ISO-TP names its own cases (below).
 
 A native channel cannot tell apart the other ways a segmented response goes wrong: a flow control that does not come, more flow-control waits than the limit allows, and an overflow the peer reports in its flow control. The adapter reports none of them, so each reaches the client as the same unnamed receive timeout (when the response starts and stalls, as `ISO15765_CF_TIMEOUT`, which therefore says only that a started response did not complete) or as nothing.
 
@@ -977,6 +979,15 @@ Software ISO-TP (`can_channel_mode = "software-isotp"`, ADR-046) sees the flow c
 | `ISO15765_FC_OVERFLOW` | `PduErrEvtProtErr` | The peer's flow control reports an overflow. The name is this worker's own; ISO 22900-2:2022 Table D.8 gives no example for it. A reserved flow status is not parsed as a flow control at all, so it is ignored and the wait ends as `ISO15765_FC_TIMEOUT`. |
 
 ISO 22900-2:2022 Table D.8 lists `MAX_WAIT_FRAME` under the transmit error event, while this service raises it as `PduErrEvtProtErr`; only the name is added, the event code is not changed.
+
+Its receive side reassembles the response itself, so it names the two ways a reassembly fails (Table D.8's names, no code):
+
+| Name | Event | When |
+|------|-------|------|
+| `ISO15765_CF_TIMEOUT` | `PduErrEvtRxTimeout` | N_Cr (`CP_Cr`, `isotp_n_cr_timeout_ms`) passed after the first frame or the last consecutive frame with no further consecutive frame (ISO 15765-2:2024 9.8.2). The poll task sweeps for such reassemblies each time it has read the channel empty, before it stamps the drain watermark, so the error comes before a receive deadline that waits on that drain; a late consecutive frame that finds its reassembly expired raises the same error. |
+| `ISO15765_FRAME_NUM` | `PduErrEvtFrameStruct` | A consecutive frame carries an unexpected sequence number, which aborts the reception (ISO 15765-2:2024 9.6.4.4). |
+
+Either error drops the reassembly; a later consecutive frame from that response ID is ignored as stray. At the first frame the service records the COP that waits on the response ID, by the unique-response-ID test of `note_start_of_message`, when exactly one does; the error binds to that COP (with its `cop_tag`) while it still waits, and to none when no COP or more than one waited, or the recorded COP has finished since. The COP's wait goes on: the first frame marks every COP waiting on the response ID in `CopRegistrant::som_started` as a native start-of-message indication does, and a single or reassembled message from that ID ends the mark, so a deadline that follows a failure is named `ISO15765_CF_TIMEOUT` as on a native channel. A first frame that replaces an unfinished reassembly of the same response ID raises nothing for the replaced message.
 
 ---
 

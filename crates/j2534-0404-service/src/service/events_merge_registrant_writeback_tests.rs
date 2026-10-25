@@ -575,3 +575,64 @@ fn a_content_frame_ends_only_its_own_started_message() {
         assert_eq!(rx_timeout_name(&registrants, cop), None, "COP {cop}");
     }
 }
+
+/// A software ISO-TP reassembly failure binds to the one COP waiting on the
+/// response ID at the first frame: none when no COP or more than one waits,
+/// and none when the recorded COP no longer waits when the failure comes.
+#[test]
+fn a_reassembly_failure_binds_to_the_sole_waiting_cop_while_it_still_waits() {
+    let registrants = vec![
+        waiting(1, vec![1]),
+        waiting(2, vec![2]),
+        CopRegistrant {
+            connect_generation: 9,
+            ..waiting(3, vec![])
+        },
+    ];
+    assert_eq!(sole_waiting_cop(&registrants, 1, 1), Some(1));
+    assert_eq!(sole_waiting_cop(&registrants, 1, 3), None, "none waits");
+    let with_monitor = [registrants.clone(), vec![waiting(4, vec![])]].concat();
+    assert_eq!(
+        sole_waiting_cop(&with_monitor, 1, 1),
+        None,
+        "two wait on the response ID"
+    );
+
+    let tag = |c: u32| (c == 1).then(|| vec![0xAB]);
+    assert_eq!(
+        reassembly_failure_cop(Some(1), &registrants, tag),
+        Some((1, Some(vec![0xAB])))
+    );
+    assert_eq!(reassembly_failure_cop(None, &registrants, tag), None);
+    assert_eq!(
+        reassembly_failure_cop(Some(1), &registrants[1..], tag),
+        None,
+        "the recorded COP has finished"
+    );
+}
+
+/// Only the reassemblies past N_Cr are taken, each as a receive timeout named
+/// `ISO15765_CF_TIMEOUT` carrying the COP recorded at its first frame.
+#[test]
+fn only_reassemblies_past_n_cr_are_taken_as_cf_timeouts() {
+    let start = Instant::now();
+    let mut map = HashMap::new();
+    let mut late = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    late.waiting_cop = Some(5);
+    map.insert((0x7E8, false), late);
+    map.insert(
+        (0x7E9, false),
+        isotp::Reassembly::start(20, &[0; 6], start, Duration::from_secs(60)),
+    );
+    let expired = take_expired_reassemblies(&mut map, start + Duration::from_millis(11));
+    assert_eq!(
+        expired,
+        [IsoTpRxNote::Failed {
+            error: PduErrorEvent::PduErrEvtRxTimeout,
+            name: ISO15765_CF_TIMEOUT_NAME,
+            waiting_cop: Some(5),
+        }]
+    );
+    assert_eq!(map.len(), 1);
+    assert!(map.contains_key(&(0x7E9, false)));
+}

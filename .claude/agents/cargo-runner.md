@@ -43,6 +43,15 @@ Hard rules (these override anything else in your brief):
   crate (`work/README.md` lists the files). If the failing test is listed,
   re-run it alone (`cargo test -p <crate> <exact test name>`) three times in
   a row; report it as a known flake only if it passes in isolation.
+- **Check free disk space before a workspace-wide run.** Before a build,
+  clippy or test run over the whole workspace (`--workspace`, or the default
+  sweep below), run `df -h .` from the repository root. When less than 10 GB
+  is free, run `cargo clean` first and say so, with the free space before
+  and after, in the report's first lines. `cargo clean` deletes only the
+  untracked `target/` directory, so it does not break the first rule. A
+  cloud session's writable disk is a fixed allowance, so `df` reporting 0
+  available with little used means the allowance is spent; `cargo clean`
+  frees it the same way. A run scoped with `-p` needs no check.
 - **Never start cross-target or bindgen builds** (`--target <triple>`,
   `--features bindgen`, `cargo zigbuild`) unless the brief explicitly asks
   for that exact command. A bindgen build rewrites committed files in

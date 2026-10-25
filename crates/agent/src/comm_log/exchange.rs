@@ -910,6 +910,13 @@ impl Evidence {
         !self.pending.is_empty()
     }
 
+    /// The exchange holds an answer the worker bound to it: a final response or a pending. The
+    /// first frame of a response alone is not one (ADR-354): it confirms the send and counts as
+    /// an answer, but the worker may still have discarded the full response.
+    fn bound_answer(&self) -> bool {
+        self.answer_head().is_some()
+    }
+
     fn absorbing(&self) -> bool {
         self.pending_visibility == PendingVisibility::AbsorbedByVci
     }
@@ -993,6 +1000,9 @@ struct LinkEffect {
     rx_id: u32,
     sent: Sent,
     this_exchange: bool,
+    /// The answer is a final response or a pending, not a response start alone
+    /// ([`Evidence::bound_answer`]): only such an answer is a matched answer.
+    bound_answer: bool,
     /// The owed requests the answer could belong to.
     owners: Vec<u64>,
     final_response: bool,
@@ -1110,8 +1120,9 @@ impl LinkState {
     /// Takes in an exchange that was logged.
     ///
     /// - An answer counts in `answered` and `answered_since_error`. It is a matched answer for
-    ///   its key only when no owed request could own it and it did not accept an ECUReset or a
-    ///   session change (that answer does not count for the exchanges after it).
+    ///   its key only when it is a final response or a pending (a response start alone is not,
+    ///   ADR-354), no owed request could own it and it did not accept an ECUReset or a session
+    ///   change (that answer does not count for the exchanges after it).
     /// - A link error, on the exchange's own link or on another link of its physical channel,
     ///   ends the matched answers and the count since the error, not the owed requests
     ///   ([`LinkState::channel_link_error`], which the log also calls on the states of the
@@ -1140,7 +1151,7 @@ impl LinkState {
         if effect.this_exchange {
             self.answered += 1;
             self.answered_since_error += 1;
-            if !accepting && !unsure_restart && effect.owners.is_empty() {
+            if effect.bound_answer && !accepting && !unsure_restart && effect.owners.is_empty() {
                 *self.matched.entry(effect.key.clone()).or_insert(0) += 1;
             }
         }
@@ -1259,6 +1270,7 @@ impl ExchangeEntry {
             rx_id: evidence.rx_id,
             sent,
             this_exchange: history.this_exchange,
+            bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
             final_response: evidence.final_response().is_some(),
             positive: matches!(evidence.end, End::Positive(_)),
@@ -1457,8 +1469,9 @@ const READING_H2: &str = "a wrong address or filter may have hidden a negative r
 const READING_H3: &str = "a link error may have lost a frame (H3)";
 
 /// The hidden causes H1 to H3 (design 8.11 "Classification") that the evidence leaves open for
-/// an exchange: H1 unless `sent` is `confirmed` or `partial`, H2 unless the ECU answered in
-/// this exchange or a matched answer counts, H3 when a link error was reported on the exchange's
+/// an exchange: H1 unless `sent` is `confirmed` or `partial`, H2 unless the worker bound an
+/// answer to this exchange (a response start alone does not exclude it, ADR-354) or a matched
+/// answer counts, H3 when a link error was reported on the exchange's
 /// link or on another link of its channel. H4 is the caller's, since its test depends on the
 /// row.
 fn open_readings(
@@ -1471,7 +1484,7 @@ fn open_readings(
     if with_h1 && !matches!(sent, Sent::Confirmed | Sent::Partial) {
         open.push(READING_H1);
     }
-    if !history.this_exchange && history.answered_same_match == 0 {
+    if !evidence.bound_answer() && history.answered_same_match == 0 {
         open.push(READING_H2);
     }
     if evidence.any_link_error() {
@@ -1516,7 +1529,9 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
     let (sent, _) = sent_of(evidence, history);
     let absorbing = evidence.absorbing();
     let pending_seen = evidence.pending_seen();
-    let this_exchange = history.this_exchange;
+    // The rows below that rest on an answer in this exchange (a pending seen) need one the
+    // worker bound; a response start alone leaves them (ADR-354).
+    let this_exchange = history.this_exchange && evidence.bound_answer();
     let window = evidence.timing.window;
     let late = window == Window::Late;
     let timed_out_unjudged = matches!(window, Window::TimeoutEarly | Window::TimeoutLate);
@@ -1586,7 +1601,7 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         End::ResponseIncomplete => (
             Undetermined,
             to_owned(
-                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart (the transport is not logged).",
+                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, the ECU stopping, or a response the worker dropped because it matched no expected response or a wrong response filter (H2), cannot be told apart (the transport is not logged).",
             ),
         ),
         // Not implemented: `no_response` with `window` `timeout_early` or `timeout_late`

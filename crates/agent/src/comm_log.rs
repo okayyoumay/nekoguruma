@@ -2593,7 +2593,9 @@ mod tests {
     }
 
     /// The agent's own deadline is not the VCI ending the wait: the response may still be
-    /// arriving, so the outcome stays `no_response` while the start still is an answer.
+    /// arriving, so the outcome stays `no_response` while the start still is an answer. The
+    /// start is no pending and no bound answer (ADR-354): the rows of a pending seen do not
+    /// apply, and H2 stays open.
     #[test]
     fn a_start_of_message_does_not_make_an_agent_deadline_a_response_incomplete() {
         let (entries, unattached) = run_exchanges(vec![(
@@ -2608,6 +2610,10 @@ mod tests {
         assert_eq!(entries[0]["outcome"]["result"], "no_response");
         assert_eq!(entries[0]["sent"], "confirmed");
         assert_eq!(entries[0]["sent_evidence"], "answer");
+        assert_eq!(entries[0]["classification"], "undetermined");
+        let reason = entries[0]["reason"].as_str().unwrap();
+        assert!(!reason.contains("answered with a pending and then"), "{reason}");
+        assert!(reason.contains("(H2)"), "{reason}");
     }
 
     /// What does not attach: an exchange a refusal ended, and an item whose RxFlag also says it
@@ -2681,10 +2687,11 @@ mod tests {
         assert_eq!(entry["outcome"]["result"], "link_error");
     }
 
-    /// The started exchange is an answer for the later exchanges: it counts as answered and as a
-    /// matched answer (design 8.11 "Matched answer").
+    /// A response start alone is an answer but not a matched answer (ADR-354): the later
+    /// exchange counts it as answered, keeps H2 among its readings, and the started exchange's
+    /// own `response_incomplete` reason names H2. A final response is a matched answer.
     #[test]
-    fn a_started_response_counts_for_the_later_exchanges() {
+    fn a_started_response_is_answered_but_not_matched_for_the_later_exchanges() {
         let (entries, _) = run_exchanges(vec![
             (
                 vci_ended(exchange::End::NoResponse),
@@ -2692,9 +2699,25 @@ mod tests {
             ),
             (vci_ended(exchange::End::NoResponse), Vec::new()),
         ]);
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+        let started_reason = entries[0]["reason"].as_str().unwrap();
+        assert!(started_reason.contains("(H2)"), "{started_reason}");
         let history = &entries[1]["link_history"];
         assert_eq!(history["answered"], 1);
-        assert_eq!(history["answered_same_match"], 1);
+        assert_eq!(history["answered_same_match"], 0);
+        let later_reason = entries[1]["reason"].as_str().unwrap();
+        assert!(later_reason.contains("(H2)"), "{later_reason}");
+
+        // With a final response the next exchange has a matched answer.
+        let (entries, _) = run_exchanges(vec![
+            (
+                vci_ended(exchange::End::Positive(vec![0x62, 0xF1, 0x90])),
+                Vec::new(),
+            ),
+            (vci_ended(exchange::End::NoResponse), Vec::new()),
+        ]);
+        assert_eq!(entries[1]["link_history"]["answered_same_match"], 1);
     }
 
     #[test]

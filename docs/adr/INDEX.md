@@ -335,7 +335,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-343](ADR-343-the-guarded-socketcan-end-of-a-t0-loopback.md) | The Guarded SocketCAN End of a T0 Loopback | Accepted | `ngr-hw-checks` guard and T0 check, `j2534-0404-service` hardware and mock tests, design 13.5; ADR-275, ADR-333 |
 | [ADR-344](ADR-344-the-write-job-journal-binds-the-flash-artifact.md) | The Write-Job Journal Binds the Flash Artifact's Hash | Accepted | `agent` journal (`Record::ArtifactSha256`), runner restart order, restart (`OnSiteReason::ArtifactDiffers`), design 8.2.5 and 11.3; ADR-229, ADR-244, ADR-261, ADR-268, ADR-318, ADR-327, ADR-336 |
 | [ADR-345](ADR-345-the-agent-builds-its-source-table-from-the-job-s-document.md) | The Agent Builds Its Source Table From the Job's Document | Accepted | `agent` (`ServiceSources::from_document`, `check_job`, `JobError::Sources`, journal setup's table), design 8.9; ADR-245, ADR-336, ADR-338 |
-| [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351) | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
+| [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354) | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
 | [ADR-347](ADR-347-the-communication-log-s-file-and-writer.md) | The Communication Log's File and Writer | Accepted (Decision item 2 extended by ADR-348) | design 8.11; `agent` `comm_log`, job runner entry points (`JobRun`), journal writer lock; ADR-255, ADR-346 item 10 |
 | [ADR-348](ADR-348-operational-logs.md) | Operational Logs | Accepted | design 12.2, 8.7, 8.11 (`procedure_log`) and 16.2; `agent` logging setup and worker output capture, `vci-service-launcher` and `vci-service-config` file output and rotation, `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346 |
 | [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-251 |
@@ -343,6 +343,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-351](ADR-351-workers-name-their-extra-error-information.md) | Workers Name Their Extra Error Information, and the Agent Does Not Interpret It | Accepted | `vci-service-interface` (`ErrorData`), `iso22900-service`, `j2534-0404-service`, `ngr-library-resolver`, `agent` host and communication log, `docs/rpc-api-guide.md`; design 8.11, ADR-346 item 6, ADR-350 item 1 |
 | [ADR-352](ADR-352-tx-side-frames-route-by-the-physical-request-id.md) | TX-Side Frames Route by the Unique Response Entry's Physical Request ID | Accepted | `j2534-0404-service` RX routing, `sim-vci` TxDone indications, `docs/j2534-0404-architecture.md`, `docs/rpc-api-guide.md`; design 8.11, ADR-098, ADR-100, ADR-151, ADR-346 item 4 |
 | [ADR-353](ADR-353-event-items-name-the-clock-of-their-time.md) | Event Items Name the Clock of Their Time | Accepted | `vci-service-interface` (`EventItem.timestamp_clock`), `j2534-0404-service` and `iso22900-service` event items, `agent` communication log; design 8.11 "On one clock", design principle 6, ADR-120 |
+| [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`; ADR-346 item 6 |
 
 ## Status Legend
 
@@ -615,11 +616,12 @@ the predecessor repository these ADRs came from.
 - ADR-135 (superseded by ADR-187)
 - ADR-139
 - ADR-187
-- ADR-346 (item 6's cases resting on the extra error information superseded by ADR-351)
+- ADR-346 (item 6's cases resting on the extra error information superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354)
 - ADR-347
 - ADR-348
 - ADR-350 (item 1's agent use of a known code superseded by ADR-351)
 - ADR-351
+- ADR-354
 
 ### Configuration & Deployment
 - ADR-024 (default `VCI_CONFIG_PATH` and the non-Windows root superseded by ADR-228)

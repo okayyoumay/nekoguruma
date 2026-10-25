@@ -2594,8 +2594,8 @@ mod tests {
 
     /// The agent's own deadline is not the VCI ending the wait: the response may still be
     /// arriving, so the outcome stays `no_response` while the start still is an answer. The
-    /// start is no pending and no bound answer (ADR-354): the rows of a pending seen do not
-    /// apply, and H2 stays open.
+    /// start is no bound answer, so H2 stays open (ADR-354); the pending rows are checked on a
+    /// forwarding link in `a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer`.
     #[test]
     fn a_start_of_message_does_not_make_an_agent_deadline_a_response_incomplete() {
         let (entries, unattached) = run_exchanges(vec![(

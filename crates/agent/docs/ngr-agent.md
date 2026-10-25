@@ -367,11 +367,25 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
   a time on the job's one link, and the link starts no communication, so the API sends no
   tester present of its own (ISO 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1 run it only on a link
-  whose communication was started). Every other item is an `unattached` event, written in the order
-  read and before the exchange's entry: an item bound to an earlier primitive, a start-of-message
-  indication (not attached yet), and a transmit indication whose header is not a plain 4-byte
-  CAN identifier (extended or mixed addressing), which therefore never confirms a send. The
-  confirming indication's read time is the entry's `times.agent.tx_confirmed_us`.
+  whose communication was started). A start-of-message indication that carries the exchange's
+  response identifier is the first frame of its response, which counts as an answer of the ECU
+  (design 8.11 "Link settings for the log", "Answer of the ECU"), unless an owed request on the
+  link expecting a response on that identifier could own it (one that stays owed after a reopened
+  link too, so it only keeps the indication `unattached`). The exchange then has `sent`
+  `confirmed` with `sent_evidence` `answer` (a transmit indication still wins), and counts as
+  answered and as a matched answer for the later exchanges (design 8.11 "Matched answer"). Every
+  start with that identifier read during the exchange attaches, since the ECU may have aborted and
+  begun again. An exchange the VCI ended with no response (the worker reported a receive timeout
+  for the primitive) ends as `response_incomplete`, classified `undetermined`; one the agent's
+  own deadline ended keeps `no_response`, since the response may still be arriving (design 8.11
+  `vci_did_not_end`).
+  The log writes no time for the start yet: its VCI time needs per-clock epochs (ADR-353), and
+  the agent's entry has no field for it. Every other item is an `unattached` event, written in
+  the order read and before the exchange's entry: an item bound to an earlier primitive, a
+  start-of-message indication no exchange takes as above, and a transmit indication whose header
+  is not a plain 4-byte CAN identifier (extended or mixed addressing), which therefore never
+  confirms a send. The confirming indication's read time is the entry's
+  `times.agent.tx_confirmed_us`.
   Status and information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
   `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), a result's

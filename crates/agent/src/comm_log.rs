@@ -312,6 +312,22 @@ impl UnattachedItem {
                         && *id == identifier
             )
     }
+
+    /// Whether this is an unbound start-of-message indication (RxFlag `START_OF_MESSAGE`, and
+    /// neither a transmit indication nor a loopback, which [`UnattachedEntry`] tells apart the
+    /// same way) for response identifier `identifier`. One bound to an earlier primitive belongs
+    /// to that primitive's exchange (design 8.11 `late_item`).
+    fn is_start_indication_for(&self, identifier: u32) -> bool {
+        !self.earlier_primitive
+            && matches!(
+                &self.data,
+                UnattachedData::Result { rx_flag, identifier: Some(id), .. }
+                    if rx_flag.get(3).is_some_and(|flags| {
+                        flags & RX_FLAG_START_OF_MESSAGE != 0
+                            && flags & (RX_FLAG_TX_INDICATION | RX_FLAG_TX_MSG_TYPE) == 0
+                    }) && *id == identifier
+            )
+    }
 }
 
 /// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
@@ -935,6 +951,12 @@ impl CommLog {
     /// communication (`PDU_COPT_STARTCOMM`), so the API sends no tester present of its own (ISO
     /// 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1: tester present runs only on a link whose
     /// communication was started; `j2534-0404-service` arms it on `CoptStartcomm` alone).
+    ///
+    /// A start-of-message indication among them is the first frame of the exchange's response
+    /// when it carries the exchange's response identifier and no owed request on the link could
+    /// own it; no other exchange on the physical channel awaits a response on that identifier by
+    /// the same construction. The exchange then has an answer of the ECU, and one that ended
+    /// without a response ended with `response_incomplete`. Every other one is `unattached`.
     pub(crate) fn exchange_with(
         &self,
         mut evidence: exchange::Evidence,
@@ -971,6 +993,34 @@ impl CommLog {
             evidence.times.agent.tx_confirmed_us = read
                 .filter(|read| read.epoch == evidence.times.agent.epoch)
                 .map(|read| read.monotonic_us);
+        }
+        // A start-of-message indication carrying the exchange's response identifier is the
+        // first frame of its response, which counts as an answer of the ECU (design 8.11 "Link
+        // settings for the log", "Answer of the ECU"), unless an owed request on the link could
+        // own it. Nothing a refusal ended can have an answer. The start's time is not logged:
+        // its VCI time needs a clock per time (ADR-353), and the entry has no agent-side field
+        // for it.
+        if !matches!(
+            evidence.end,
+            exchange::End::NotSent(_)
+                | exchange::End::VciLost {
+                    refused_after_loss: true
+                }
+        ) && !inner.links[at].1.may_own_start_indication(evidence.rx_id)
+            && unbound
+                .iter()
+                .any(|item| item.is_start_indication_for(evidence.rx_id))
+        {
+            // Every start with the identifier is the same response's: with no other owner,
+            // the ECU aborted and began again.
+            let rx_id = evidence.rx_id;
+            unbound.retain(|item| !item.is_start_indication_for(rx_id));
+            evidence.response_started = true;
+            // Only a wait the VCI ended is an incomplete response; one the agent's own
+            // deadline ended may still be arriving (design 8.11 `vci_did_not_end`).
+            if evidence.vci_ended && matches!(evidence.end, exchange::End::NoResponse) {
+                evidence.end = exchange::End::ResponseIncomplete;
+            }
         }
         for item in &unbound {
             let event = Event::Unattached(UnattachedEntry::of(item));
@@ -2396,6 +2446,255 @@ mod tests {
             .collect();
         assert_eq!(unattached, [0x7E1, 0x7E0, 0x7E0]);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Evidence of a read of F190 that `end` ended, on a wait the VCI ended itself.
+    fn vci_ended(end: exchange::End) -> exchange::Evidence {
+        let mut evidence = evidence(endpoint(0x7E0), &[0x22, 0xF1, 0x90], end);
+        evidence.vci_ended = true;
+        evidence
+    }
+
+    /// Runs `exchanges` on one log, each with the unbound items read during it, and gives the
+    /// exchange entries and the `unattached` events, in the order written.
+    fn run_exchanges(
+        exchanges: Vec<(exchange::Evidence, Vec<UnattachedItem>)>,
+    ) -> (Vec<serde_json::Value>, Vec<serde_json::Value>) {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        for (evidence, unbound) in exchanges {
+            log.exchange_with(evidence, unbound).unwrap();
+        }
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let of = |event: &str| -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .filter(|line| line["event"] == event)
+                .cloned()
+                .collect()
+        };
+        (of("exchange"), of("unattached"))
+    }
+
+    /// A start-of-message indication for `identifier`, read during the exchange.
+    fn start_of_message(identifier: u32) -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0x02],
+                identifier: Some(identifier),
+                bytes: Vec::new(),
+            },
+            ..tx_done(identifier)
+        }
+    }
+
+    /// Design 8.11 "Link settings for the log": an unbound start-of-message indication is the
+    /// first frame of the response of the exchange it was read in when it carries that
+    /// exchange's response identifier and no owed request on the link could own it. The exchange
+    /// then has an answer of the ECU (so its send is confirmed by `answer`), and one that ended
+    /// without a response is `response_incomplete`; otherwise the indication is `unattached`.
+    #[test]
+    fn an_unbound_start_of_message_starts_its_exchange_s_response_unless_another_could_own_it() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let silent = || vci_ended(exchange::End::NoResponse);
+        // Another identifier's indication, one bound to an earlier primitive and a transmit
+        // indication stay unattached; the one for the response identifier attaches.
+        let earlier = UnattachedItem {
+            earlier_primitive: true,
+            ..start_of_message(0x7E8)
+        };
+        log.exchange_with(
+            silent(),
+            vec![
+                start_of_message(0x7E9),
+                earlier,
+                tx_done(0x7E8),
+                start_of_message(0x7E8),
+            ],
+        )
+        .unwrap();
+        // The first exchange is owed now (sent on the bus, no final response): an indication
+        // for the same response identifier could be its late one, so it is unattached and this
+        // exchange's send stays unknown.
+        log.exchange_with(silent(), vec![start_of_message(0x7E8)])
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let events = events(&lines);
+        assert_eq!(
+            &events[2..events.len() - 1],
+            [
+                "unattached",
+                "unattached",
+                "unattached",
+                "exchange",
+                "unattached",
+                "exchange"
+            ]
+        );
+        let entries: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        assert_eq!(entries[0]["sent"], "confirmed");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+        assert_eq!(entries[0]["classification"], "undetermined");
+        assert_eq!(entries[0]["link_history"]["this_exchange"], true);
+        assert_eq!(entries[1]["outcome"]["result"], "no_response");
+        assert_eq!(entries[1]["sent"], "unknown");
+        assert_eq!(entries[1]["link_history"]["this_exchange"], false);
+        let unattached: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "unattached")
+            .map(|line| {
+                (
+                    line["item"].as_str().unwrap(),
+                    line["identifier"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            unattached,
+            [
+                ("start_of_message", 0x7E9),
+                ("start_of_message", 0x7E8),
+                ("transmit_indication", 0x7E8),
+                ("start_of_message", 0x7E8)
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A second start for the same response identifier in one exchange (the ECU aborted and began
+    /// again) has no other owner: it is consumed with the first.
+    #[test]
+    fn every_start_of_message_for_the_response_identifier_in_one_exchange_attaches() {
+        let (entries, unattached) = run_exchanges(vec![(
+            vci_ended(exchange::End::NoResponse),
+            vec![
+                start_of_message(0x7E8),
+                start_of_message(0x7E9),
+                start_of_message(0x7E8),
+            ],
+        )]);
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        assert_eq!(unattached.len(), 1);
+        assert_eq!(unattached[0]["identifier"], 0x7E9);
+    }
+
+    /// The agent's own deadline is not the VCI ending the wait: the response may still be
+    /// arriving, so the outcome stays `no_response` while the start still is an answer.
+    #[test]
+    fn a_start_of_message_does_not_make_an_agent_deadline_a_response_incomplete() {
+        let (entries, unattached) = run_exchanges(vec![(
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::NoResponse,
+            ),
+            vec![start_of_message(0x7E8)],
+        )]);
+        assert!(unattached.is_empty());
+        assert_eq!(entries[0]["outcome"]["result"], "no_response");
+        assert_eq!(entries[0]["sent"], "confirmed");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+    }
+
+    /// What does not attach: an exchange a refusal ended, and an item whose RxFlag also says it
+    /// is a transmit indication or a loopback. What attaches changes no outcome the exchange
+    /// already has, and no send evidence a transmit indication gave.
+    #[test]
+    fn a_start_of_message_changes_no_outcome_and_skips_what_cannot_own_it() {
+        let refused = exchange::End::NotSent(exchange::RefusalCause::EarlierResponse);
+        let lost = exchange::End::VciLost {
+            refused_after_loss: true,
+        };
+        let mixed = |flags| UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, flags],
+                identifier: Some(0x7E8),
+                bytes: Vec::new(),
+            },
+            ..tx_done(0x7E8)
+        };
+        let one = |evidence, unbound| {
+            let (mut entries, unattached) = run_exchanges(vec![(evidence, unbound)]);
+            (entries.remove(0), unattached.len())
+        };
+        // The refused exchanges take nothing.
+        for end in [refused, lost] {
+            let (entry, unattached) = one(vci_ended(end), vec![start_of_message(0x7E8)]);
+            assert_eq!(entry["sent"], "not_sent");
+            assert_eq!(unattached, 1);
+        }
+        // START with TX_INDICATION, and with TX_MSG_TYPE, are not starts.
+        let (entry, unattached) = one(
+            vci_ended(exchange::End::NoResponse),
+            vec![mixed(0x0A), mixed(0x03)],
+        );
+        assert_eq!(entry["outcome"]["result"], "no_response");
+        assert_eq!(entry["sent"], "unknown");
+        assert_eq!(unattached, 2);
+        // A final response keeps its outcome and classification.
+        let (entry, unattached) = one(
+            vci_ended(exchange::End::Positive(vec![0x62, 0xF1, 0x90])),
+            vec![start_of_message(0x7E8)],
+        );
+        assert_eq!(entry["outcome"]["result"], "positive");
+        let (without, _) = one(
+            vci_ended(exchange::End::Positive(vec![0x62, 0xF1, 0x90])),
+            Vec::new(),
+        );
+        assert_eq!(entry["classification"], without["classification"]);
+        assert_eq!(unattached, 0);
+        // A transmit indication stays the send's evidence; the start is the response's.
+        let (entry, unattached) = one(
+            vci_ended(exchange::End::NoResponse),
+            vec![tx_done(0x7E0), start_of_message(0x7E8)],
+        );
+        assert_eq!(entry["sent_evidence"], "tx_indication");
+        assert_eq!(entry["outcome"]["result"], "response_incomplete");
+        assert_eq!(unattached, 0);
+        let (entry, unattached) = one(
+            vci_ended(exchange::End::VciDidNotEnd),
+            vec![start_of_message(0x7E8)],
+        );
+        assert_eq!(entry["outcome"]["result"], "vci_did_not_end");
+        assert_eq!(entry["sent"], "confirmed");
+        assert_eq!(unattached, 0);
+        let (entry, _) = one(
+            vci_ended(exchange::End::LinkError(
+                exchange::LinkErrorKind::VciHardwareFault,
+            )),
+            vec![start_of_message(0x7E8)],
+        );
+        assert_eq!(entry["outcome"]["result"], "link_error");
+    }
+
+    /// The started exchange is an answer for the later exchanges: it counts as answered and as a
+    /// matched answer (design 8.11 "Matched answer").
+    #[test]
+    fn a_started_response_counts_for_the_later_exchanges() {
+        let (entries, _) = run_exchanges(vec![
+            (
+                vci_ended(exchange::End::NoResponse),
+                vec![start_of_message(0x7E8)],
+            ),
+            (vci_ended(exchange::End::NoResponse), Vec::new()),
+        ]);
+        let history = &entries[1]["link_history"];
+        assert_eq!(history["answered"], 1);
+        assert_eq!(history["answered_same_match"], 1);
     }
 
     #[test]

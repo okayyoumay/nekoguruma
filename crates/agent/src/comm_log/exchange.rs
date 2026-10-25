@@ -483,8 +483,8 @@ impl UnknownCause {
 /// How the exchange ended, as the producer saw it: the input of `outcome`. The response bytes
 /// are raw here; [`Outcome`] carries them through [`redact`].
 ///
-/// Not given yet, with the rows that need them: `answers` and `response_incomplete`. No
-/// outcome rests on a worker's extra error information (ADR-351).
+/// Not given yet, with the rows that need them: `answers`. No outcome rests on a worker's extra
+/// error information (ADR-351).
 #[derive(Debug, Clone)]
 #[expect(
     clippy::enum_variant_names,
@@ -497,6 +497,11 @@ pub(crate) enum End {
     /// A negative response (`7F`, the SID, the code).
     Negative(Vec<u8>),
     NoResponse,
+    /// The ECU began a response and did not finish it: a start-of-message indication was
+    /// attached to an exchange the VCI ended without a response (design 8.11 "Link settings for
+    /// the log"). [`CommLog::exchange_with`](super::CommLog::exchange_with) turns a `NoResponse`
+    /// whose [`Evidence::vci_ended`] is set into it; a producer does not give it.
+    ResponseIncomplete,
     /// The agent's deadline passed before the VCI ended the exchange.
     VciDidNotEnd,
     LinkError(LinkErrorKind),
@@ -528,6 +533,7 @@ pub(crate) enum Outcome {
         nrc_kind: NrcKind,
     },
     NoResponse,
+    ResponseIncomplete,
     VciDidNotEnd,
     LinkError {
         error: LinkErrorKind,
@@ -561,6 +567,7 @@ impl Outcome {
                 }
             }
             End::NoResponse => Self::NoResponse,
+            End::ResponseIncomplete => Self::ResponseIncomplete,
             End::VciDidNotEnd => Self::VciDidNotEnd,
             End::LinkError(error) => Self::LinkError { error: *error },
             End::NotSent(cause) => Self::NotSent { cause: *cause },
@@ -799,6 +806,13 @@ pub(crate) struct Evidence {
     pub times: Times,
     /// A transmit confirmation the link gave. No link gives one yet.
     pub transmit_evidence: Option<TransmitEvidence>,
+    /// A start-of-message indication for this exchange's response was attached: the first
+    /// frame of a response is an answer of the ECU (design 8.11 "Answer of the ECU").
+    pub response_started: bool,
+    /// The VCI ended the exchange itself: the worker reported a receive timeout for the
+    /// primitive. An exchange the agent's own deadline ended did not (design 8.11
+    /// `vci_did_not_end`).
+    pub vci_ended: bool,
     /// A flow-control frame from the ECU was seen (`partial`).
     pub flow_control: bool,
     /// Link errors the exchange's own link reported during it, other than its outcome.
@@ -848,6 +862,8 @@ impl Evidence {
                 vci: None,
             },
             transmit_evidence: None,
+            response_started: false,
+            vci_ended: false,
             flow_control: false,
             link_errors: Vec::new(),
             channel_link_errors: Vec::new(),
@@ -1033,7 +1049,9 @@ impl LinkState {
                 .copied()
                 .unwrap_or(0),
             owed_matching: owners.len() as u32,
-            this_exchange: head.is_some(),
+            // A start-of-message indication is attached only when no owed request could own
+            // it, so it adds no owner.
+            this_exchange: head.is_some() || evidence.response_started,
             owners,
         }
     }
@@ -1056,6 +1074,16 @@ impl LinkState {
     /// although design 8.11 lets it own none: that only keeps later indications `unattached`.
     pub(crate) fn may_own_tx_indication(&self) -> bool {
         self.unknown_sends > 0
+    }
+
+    /// Whether an owed request on this link could still own a start-of-message indication with
+    /// response identifier `rx_id` (design 8.11 "Link settings for the log", "Owed request"): one
+    /// that expects a response on that identifier, however long ago it ended. The indication
+    /// carries no response bytes, so the identifier is all there is to match. The owed requests
+    /// outlive a reopened link, so one from before the reopening still counts: that only keeps
+    /// the indication `unattached`.
+    pub(crate) fn may_own_start_indication(&self, rx_id: u32) -> bool {
+        self.owed.iter().any(|owed| owed.rx_id == rx_id)
     }
 
     /// A link error came on the physical channel this link shares, logged as line `seq` (design
@@ -1332,6 +1360,7 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
             (Window::TimeoutAtLimit, Some(p2)) => format!("no response within P2 ({p2} ms)"),
             _ => "no response came".to_owned(),
         },
+        End::ResponseIncomplete => "the ECU began a response and it did not complete".to_owned(),
         End::VciDidNotEnd => {
             "the agent stopped waiting before the VCI ended the exchange".to_owned()
         }
@@ -1533,6 +1562,12 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         End::LinkError(kind) => kind.judge(),
+        End::ResponseIncomplete => (
+            Undetermined,
+            to_owned(
+                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart (the transport is not logged).",
+            ),
+        ),
         // Not implemented: `no_response` with `window` `timeout_early` or `timeout_late`
         // (`system`). Needs a judged window; evidence with one takes the last row. A window
         // `late` without a pending seen has no row for a missing response either.
@@ -1642,8 +1677,6 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
             (Undetermined, reason)
         }
-        // Not implemented: `response_incomplete` (needs a start-of-message indication with no
-        // response).
         End::NoResponse if this_exchange && !any_link_error => {
             if history.owed_matching == 0 {
                 (

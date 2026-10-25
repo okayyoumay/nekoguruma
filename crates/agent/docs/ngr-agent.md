@@ -357,14 +357,21 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   judged and no timing margin (`source` `none`), since no indication is used as evidence yet,
   and `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
   the agent does not know it yet.
-  The worker host reads every item of the link while a primitive runs. The result and error
-  items of no primitive (a transmit indication, a link error) or of an earlier primitive are
-  `unattached` events, written in the order read and before the entry of the exchange during
-  which they were read, for an exchange the host logs: nothing attaches them to an exchange yet
-  (ADR-346 item 4). Status and
-  information items are not written. Each gives the `link`, the `item` (from a result item's
+  The worker host reads every item of the link while a primitive runs and hands the result and
+  error items of no primitive (a transmit indication, a link error) or of an earlier primitive
+  to the log with the exchange during which it read them, for an exchange it logs
+  (`CommLog::exchange_with`). A transmit indication that carries the exchange's request
+  identifier (from the item's header) is the exchange's send evidence (`sent_evidence`
+  `tx_indication`), unless an ended exchange on the link could still own it: one with `sent`
+  `unknown`, which a late TxDone may belong to (design 8.11 `sent_evidence`, ADR-346 item 4).
+  Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
+  a time on the job's one link, and the link starts no communication, so the API sends no
+  tester present of its own. Every other item is an `unattached` event, written in the order
+  read and before the exchange's entry; a start-of-message indication is not attached yet.
+  Status and information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
-  `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), the raw
+  `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), a result's
+  `identifier` when its header carries one, the raw
   `vci_us`, which names no clock since the worker does not say which clock an item's time is on
   and the agent does not infer it from the worker (design principle 6), the agent's `epoch` and
   `read_us`,
@@ -412,8 +419,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   agent saw of it (`Evidence`) and the link's history (`LinkState`: answers, matched answers,
   owed requests, the last link error, an accepted ECUReset or session change), and classifies it
   by design 8.11's table, first matching row. It decides only the rows the agent's evidence
-  reaches today: transmit indications are logged `unattached`, not used as evidence, so a
-  request is `sent` `confirmed` only by an answer no owed request could own; without a transmit time the timing is `not_judged`, so on a link
+  reaches today: a request is `sent` `confirmed` by its transmit indication (above) or by an
+  answer no owed request could own, and a confirmed send with no response is `vehicle` from an
+  ECU that has answered requests matched this way with no link error, `undetermined` otherwise
+  (on a link whose VCI absorbs pendings, the possible-pending row below comes first); without a transmit time the timing is `not_judged`, so on a link
   whose VCI absorbs pendings every response is `undetermined` (a pending may have come first);
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes

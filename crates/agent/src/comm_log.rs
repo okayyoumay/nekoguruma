@@ -281,14 +281,31 @@ pub(crate) struct UnattachedItem {
 /// What an [`UnattachedItem`] carries.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum UnattachedData {
-    /// A result item: a received message or an indication, told apart by its RxFlag.
-    Result { rx_flag: Vec<u8>, bytes: Vec<u8> },
+    /// A result item: a received message or an indication, told apart by its RxFlag, with the
+    /// CAN identifier its header carries, when it carries one.
+    Result {
+        rx_flag: Vec<u8>,
+        identifier: Option<u32>,
+        bytes: Vec<u8>,
+    },
     /// An error event, with its extra error information as the worker gave it (ADR-351).
     Error {
         event: String,
         extra_error_info: Option<u32>,
         extra_error_info_name: Option<String>,
     },
+}
+
+impl UnattachedItem {
+    /// Whether this is a transmit indication (RxFlag `TX_INDICATION`) for `identifier`.
+    fn is_tx_indication_for(&self, identifier: u32) -> bool {
+        matches!(
+            &self.data,
+            UnattachedData::Result { rx_flag, identifier: Some(id), .. }
+                if rx_flag.get(3).is_some_and(|flags| flags & RX_FLAG_TX_INDICATION != 0)
+                    && *id == identifier
+        )
+    }
 }
 
 /// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
@@ -315,6 +332,9 @@ struct UnattachedEntry<'a> {
     /// The result item's RxFlag in hex.
     #[serde(skip_serializing_if = "Option::is_none")]
     rx_flag: Option<String>,
+    /// The CAN identifier the result item's header carries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    identifier: Option<u32>,
     /// The result item's message, as the log carries messages: what the tester sent for a
     /// transmit indication or a loopback, what it received otherwise.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -351,13 +371,18 @@ impl<'a> UnattachedEntry<'a> {
                 read_us: read.monotonic_us,
             }),
             rx_flag: None,
+            identifier: None,
             message: None,
             error_event: None,
             extra_error_info: None,
             extra_error_info_name: None,
         };
         match &item.data {
-            UnattachedData::Result { rx_flag, bytes } => {
+            UnattachedData::Result {
+                rx_flag,
+                identifier,
+                bytes,
+            } => {
                 let flags = rx_flag.get(3).copied().unwrap_or(0);
                 let (kind, direction) = if flags & RX_FLAG_TX_INDICATION != 0 {
                     ("transmit_indication", Direction::Request)
@@ -372,6 +397,7 @@ impl<'a> UnattachedEntry<'a> {
                 };
                 entry.item = kind;
                 entry.rx_flag = Some(to_hex(rx_flag));
+                entry.identifier = *identifier;
                 entry.message = Some(redact(direction, bytes));
             }
             UnattachedData::Error {
@@ -883,7 +909,26 @@ impl CommLog {
     /// error the entry carries ends the matched answers of every other target too: the run's
     /// targets share its one link, and so its physical channel. The entry's `seq` when it was
     /// written; `None` once the log has failed, and then the link state is left as it was.
+    #[cfg(test)]
     pub(crate) fn exchange(&self, evidence: exchange::Evidence) -> Option<u64> {
+        self.exchange_with(evidence, Vec::new())
+    }
+
+    /// Writes the exchange entry of `evidence` as [`CommLog::exchange`] does, after the items of
+    /// the link the host read during the exchange that no primitive or an earlier one owned
+    /// (`unbound`, in the order read). A transmit indication among them is the exchange's send
+    /// evidence (`tx_indication`, design 8.11 `sent_evidence`) when it carries the exchange's
+    /// request identifier and no ended exchange on the link could still own it; the others are
+    /// `unattached` events, written before the entry. The other conditions design 8.11 sets
+    /// hold on the agent's link by construction: the job runs one primitive at a time on its one
+    /// link, so no other exchange on the physical channel is in flight, and the link starts no
+    /// communication (`PDU_COPT_STARTCOMM`), so the API sends no tester present of its own (ISO
+    /// 22900-2:2022 enables it only once communication has started).
+    pub(crate) fn exchange_with(
+        &self,
+        mut evidence: exchange::Evidence,
+        mut unbound: Vec<UnattachedItem>,
+    ) -> Option<u64> {
         let mut inner = self.lock();
         if inner.failed.is_some() {
             return None;
@@ -901,6 +946,22 @@ impl CommLog {
                 inner.links.len() - 1
             }
         };
+        if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
+            && evidence.transmit_evidence.is_none()
+            && !inner.links[at].1.may_own_tx_indication()
+            && let Some(own) = unbound
+                .iter()
+                .position(|item| item.is_tx_indication_for(tx_id))
+        {
+            unbound.remove(own);
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
+        }
+        for item in &unbound {
+            let event = Event::Unattached(UnattachedEntry::of(item));
+            inner.append_with(|seq, line| {
+                serde_json::to_writer(line, &Line { seq, event: &event })
+            })?;
+        }
         let history = inner.links[at].1.history_for(&evidence);
         let entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
@@ -1080,6 +1141,7 @@ impl CommLog {
 
     /// Writes `item` as an `unattached` event (design 8.11 "Link settings for the log"). The
     /// event's `seq`; `None` once the log has failed.
+    #[cfg(test)]
     pub(crate) fn unattached(&self, item: &UnattachedItem) -> Option<u64> {
         let mut inner = self.lock();
         let event = Event::Unattached(UnattachedEntry::of(item));
@@ -1526,6 +1588,8 @@ mod tests {
             read: Some(read),
             data: UnattachedData::Result {
                 rx_flag: rx_flag.to_vec(),
+                // A transmit indication names the request identifier it confirms.
+                identifier: (rx_flag.get(3) == Some(&0x09)).then_some(0x7E0),
                 bytes: bytes.to_vec(),
             },
         };
@@ -1568,7 +1632,7 @@ mod tests {
             [
                 serde_json::json!({"event": "unattached", "link": 1,
                     "item": "transmit_indication", "primitive": "none", "vci_us": 42,
-                    "agent": agent, "rx_flag": "00000009",
+                    "agent": agent, "rx_flag": "00000009", "identifier": 0x7E0,
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "loopback",
                     "primitive": "none", "vci_us": 42, "agent": agent,
@@ -2217,6 +2281,82 @@ mod tests {
             tx_id,
             rx_id: 0x7E8,
         }
+    }
+
+    /// A TxDone indication for `identifier`, read during the exchange.
+    fn tx_done(identifier: u32) -> UnattachedItem {
+        UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            vci_us: 5,
+            read: None,
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0x09],
+                identifier: Some(identifier),
+                bytes: Vec::new(),
+            },
+        }
+    }
+
+    /// Design 8.11 `sent_evidence`: an unbound transmit indication confirms the send of the
+    /// exchange it was read in when it carries that exchange's request identifier and no ended
+    /// exchange on the link could still own it (one with `sent` `unknown`); otherwise it is
+    /// `unattached`, written before the entry.
+    #[test]
+    fn an_unbound_transmit_indication_confirms_its_exchange_unless_another_could_own_it() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let silent = || {
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::NoResponse,
+            )
+        };
+        // Another identifier's indication stays unattached; this exchange's confirms it.
+        log.exchange_with(silent(), vec![tx_done(0x7E1), tx_done(0x7E0)])
+            .unwrap();
+        // No indication: `sent` `unknown`, which could own a late one.
+        log.exchange_with(silent(), Vec::new()).unwrap();
+        // So the next exchange's indication is unattached, and its send stays unknown.
+        log.exchange_with(silent(), vec![tx_done(0x7E0)]).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let events = events(&lines);
+        assert_eq!(
+            &events[2..events.len() - 1],
+            [
+                "unattached",
+                "exchange",
+                "exchange",
+                "unattached",
+                "exchange"
+            ]
+        );
+        let entries: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        assert_eq!(entries[0]["sent"], "confirmed");
+        assert_eq!(entries[0]["sent_evidence"], "tx_indication");
+        assert!(!entries[0]["reason"].as_str().unwrap().contains("(H1)"));
+        for entry in &entries[1..] {
+            assert_eq!(entry["sent"], "unknown", "{entry}");
+            assert!(
+                entry["reason"].as_str().unwrap().contains("(H1)"),
+                "{entry}"
+            );
+        }
+        let unattached: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "unattached")
+            .map(|line| line["identifier"].clone())
+            .collect();
+        assert_eq!(unattached, [0x7E1, 0x7E0]);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

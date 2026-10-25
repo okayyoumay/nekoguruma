@@ -620,24 +620,14 @@ fn assert_comm_log(setup: &CommLogSetup) {
         serde_json::json!(["transmit_indication"]),
         "{opened}"
     );
-    // Nothing attaches an indication to an exchange yet, so each request's is logged
-    // `unattached`, before the entry of the exchange during which the host read it (design 8.11
-    // "Link settings for the log", ADR-346 item 4).
-    let after_opened: Vec<&str> = events[4..events.len() - 1].to_vec();
-    assert_eq!(after_opened, ["unattached", "exchange"].repeat(3), "{text}");
-    for indication in lines.iter().filter(|line| line["event"] == "unattached") {
-        assert_eq!(indication["item"], "transmit_indication", "{indication}");
-        assert_eq!(indication["primitive"], "none", "{indication}");
-        assert_eq!(indication["link"], 1, "{indication}");
-        assert_eq!(indication["rx_flag"], "00000009", "{indication}");
-        assert!(indication["vci_us"].as_u64().is_some(), "{indication}");
-        assert!(
-            indication["agent"]["read_us"].as_u64().is_some(),
-            "{indication}"
-        );
-        // The worker does not say which clock an item's time is on, so the time names none.
-        assert!(indication.get("clock").is_none(), "{indication}");
-    }
+    // Each request's TxDone carries its request identifier, and no earlier exchange could own
+    // it, so it is the exchange's send evidence rather than an `unattached` item (design 8.11
+    // `sent_evidence`, ADR-346 item 4).
+    assert_eq!(
+        &events[4..events.len() - 1],
+        ["exchange"].repeat(3),
+        "{text}"
+    );
     let entries: Vec<&serde_json::Value> = lines
         .iter()
         .filter(|line| line["event"] == "exchange")
@@ -682,7 +672,7 @@ fn assert_comm_log(setup: &CommLogSetup) {
     let (vin, unknown, dropped) = (entries[0], entries[1], entries[2]);
     assert_eq!(vin["outcome"]["result"], "positive", "{vin}");
     assert_eq!(vin["sent"], "confirmed", "{vin}");
-    assert_eq!(vin["sent_evidence"], "answer", "{vin}");
+    assert_eq!(vin["sent_evidence"], "tx_indication", "{vin}");
     assert_eq!(vin["classification"], "undetermined", "{vin}");
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
 
@@ -700,14 +690,17 @@ fn assert_comm_log(setup: &CommLogSetup) {
     assert_eq!(unknown["classification"], "undetermined", "{unknown}");
     assert_eq!(unknown["link_history"]["answered"], 1, "{unknown}");
 
-    // The dropped response: no evidence the request reached the bus, and H4 open.
+    // The dropped response: its TxDone shows the request reached the bus, so the no-response
+    // rows judge it by what else is open, not by the send (H1); on this link, whose VCI
+    // absorbs pendings and whose times are not judged, a pending may have come (H4).
     assert_eq!(dropped["outcome"]["result"], "no_response", "{dropped}");
-    assert_eq!(dropped["sent"], "unknown", "{dropped}");
+    assert_eq!(dropped["sent"], "confirmed", "{dropped}");
+    assert_eq!(dropped["sent_evidence"], "tx_indication", "{dropped}");
     assert_eq!(dropped["classification"], "undetermined", "{dropped}");
     assert_eq!(dropped["detail"]["host_error"], "NoResponse", "{dropped}");
     let reason = dropped["reason"].as_str().expect("a reason");
     assert!(
-        reason.contains("(H4)") && reason.contains("(H1)"),
+        reason.contains("(H4)") && !reason.contains("(H1)"),
         "{reason}"
     );
     assert_eq!(dropped["link_history"]["answered"], 2, "{dropped}");

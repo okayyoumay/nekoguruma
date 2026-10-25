@@ -1004,6 +1004,9 @@ pub(crate) struct LinkState {
     last_link_error: Option<(u64, LinkErrorKind)>,
     /// The `seq` of the last ECUReset or session change accepted.
     last_reset: Option<u64>,
+    /// How many logged exchanges on the link ended with `sent` `unknown`: each could still own a
+    /// transmit indication that comes late (design 8.11 `sent_evidence`).
+    unknown_sends: u32,
 }
 
 impl LinkState {
@@ -1041,6 +1044,17 @@ impl LinkState {
     /// ("Owed request": a response already on its way can still arrive).
     pub(crate) fn reopened(&mut self) {
         self.matched.clear();
+        // The worker gives an indication only to an open link, so one sent before the link was
+        // opened again cannot arrive on it.
+        self.unknown_sends = 0;
+    }
+
+    /// Whether an ended exchange on this link could still own a transmit indication: one whose
+    /// `sent` is `unknown`, however long ago it ended, on the same opened link (design 8.11
+    /// `sent_evidence`). An exchange that a refusal, a transmit error or a flow-control failure
+    /// ended has another `sent`, so it owns none.
+    pub(crate) fn may_own_tx_indication(&self) -> bool {
+        self.unknown_sends > 0
     }
 
     /// A link error came on the physical channel this link shares, logged as line `seq` (design
@@ -1096,6 +1110,9 @@ impl LinkState {
             self.last_reset = Some(entry.seq);
         } else if unsure_restart {
             self.matched.clear();
+        }
+        if effect.sent == Sent::Unknown {
+            self.unknown_sends += 1;
         }
         let placed_alone = effect.owners.is_empty() && (effect.final_response || accepting);
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
@@ -1650,10 +1667,24 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 send_phrase(sent)
             ),
         ),
-        // Not implemented: the two `no_response` rows that stand on `sent` `confirmed` without
-        // an answer of this exchange, or on a matched answer (`vehicle` when the ECU has
-        // answered requests matched this way, `undetermined` otherwise). Need a transmit
-        // confirmation.
+        End::NoResponse
+            if sent == Sent::Confirmed && history.answered_same_match > 0 && !any_link_error =>
+        {
+            (
+                Vehicle,
+                to_owned(
+                    "Sent on the bus; no response within the limit in force, from an ECU that has answered requests matched this way.",
+                ),
+            )
+        }
+        End::NoResponse if sent == Sent::Confirmed => {
+            let reason = if any_link_error {
+                "Sent on the bus, but a link error came during the exchange and may have lost a frame (H3)."
+            } else {
+                "Sent on the bus, but this ECU has not answered a request matched this way since the last link error or its last reset or session change, so a wrong address, response filter or response pattern, and with it a response the worker dropped, is not excluded (H2)."
+            };
+            (Undetermined, to_owned(reason))
+        }
         End::NoResponse if sent == Sent::Unknown => {
             let mut reason =
                 to_owned("There is no evidence that the request reached the bus (H1).");
@@ -2417,9 +2448,68 @@ mod tests {
                 sent_of(&sent, &LinkHistory::empty()),
                 (Sent::Confirmed, expected)
             );
-            // No `no_response` row that stands on a confirmed send is implemented yet.
+            // With no matched answer, a confirmed send and no response stays undetermined (H2).
             assert_eq!(verdict_of(&sent).0, Classification::Undetermined);
         }
+    }
+
+    /// Design 8.11's two `no_response` rows that stand on a confirmed send: `vehicle` from an
+    /// ECU that has answered requests matched this way and with no link error, `undetermined`
+    /// otherwise (H2 without a matched answer, H3 with a link error). Both come after the
+    /// possible-pending row, so a link that forwards pendings reaches them.
+    #[test]
+    fn a_confirmed_send_with_no_response_is_judged_by_its_matched_answers() {
+        let mut state = LinkState::default();
+        let answered = read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1]));
+        log(&mut state, 1, forwarding(answered));
+        let mut silent = forwarding(read([0xF1, 0x86], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let judged = |evidence: &Evidence, state: &LinkState| {
+            let verdict = classify(evidence, &state.history_for(evidence));
+            (verdict.classification, verdict.reason)
+        };
+        let (classification, reason) = judged(&silent, &state);
+        assert_eq!(classification, Classification::Vehicle, "{reason}");
+        assert!(reason.starts_with("Sent on the bus"), "{reason}");
+        // Another identifier has no matched answer: H2.
+        let other = {
+            let mut other = forwarding(read([0xF1, 0x90], End::NoResponse));
+            other.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            other
+        };
+        let (classification, reason) = judged(&other, &state);
+        assert_eq!(classification, Classification::Undetermined);
+        assert!(
+            reason.contains("(H2)") && !reason.contains("(H1)"),
+            "{reason}"
+        );
+        // A link error during the exchange: H3.
+        let mut erred = silent.clone();
+        erred.channel_link_errors = vec![LinkErrorKind::Receive];
+        let (classification, reason) = judged(&erred, &state);
+        assert_eq!(classification, Classification::Undetermined);
+        assert!(reason.contains("(H3)"), "{reason}");
+    }
+
+    /// An exchange that ended with `sent` `unknown` could still own a transmit indication that
+    /// comes late, on the same opened link (design 8.11 `sent_evidence`); one confirmed or not
+    /// sent owns none.
+    #[test]
+    fn an_unknown_send_may_own_a_late_transmit_indication_until_the_link_reopens() {
+        let mut state = LinkState::default();
+        let mut confirmed = read([0xF1, 0x86], End::NoResponse);
+        confirmed.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log(&mut state, 1, confirmed);
+        log(
+            &mut state,
+            2,
+            read([0xF1, 0x86], End::NotSent(RefusalCause::Policy)),
+        );
+        assert!(!state.may_own_tx_indication());
+        log(&mut state, 3, read([0xF1, 0x86], End::NoResponse));
+        assert!(state.may_own_tx_indication());
+        state.reopened();
+        assert!(!state.may_own_tx_indication());
     }
 
     /// Every outcome and cause the classification has, for the checks over all of them.

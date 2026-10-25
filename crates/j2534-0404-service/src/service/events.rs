@@ -4998,7 +4998,16 @@ async fn poll_rx_inner(
                         unique_resp_identifier,
                     );
                 }
-                if is_content_frame && !is_tx_side && is_native_iso15765_entry(entry) {
+                // Only an ISO 15765 (USDT) delivery ends a started message: in
+                // the native-mixed modes a raw UUDT frame routed to the same
+                // entry (`uudt_routed`) carries the same URID but completes no
+                // segmented message. (A start-of-message indication is ISO
+                // 15765 only, so the insert above needs no such gate.)
+                if is_content_frame
+                    && !is_tx_side
+                    && !uudt_routed
+                    && is_native_iso15765_entry(entry)
+                {
                     note_message_ended(&mut entry.registrants, unique_resp_identifier);
                 }
 

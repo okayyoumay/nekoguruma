@@ -312,6 +312,22 @@ impl UnattachedItem {
                         && *id == identifier
             )
     }
+
+    /// Whether this is an unbound start-of-message indication (RxFlag `START_OF_MESSAGE`, and
+    /// neither a transmit indication nor a loopback, which [`UnattachedEntry`] tells apart the
+    /// same way) for response identifier `identifier`. One bound to an earlier primitive belongs
+    /// to that primitive's exchange (design 8.11 `late_item`).
+    fn is_start_indication_for(&self, identifier: u32) -> bool {
+        !self.earlier_primitive
+            && matches!(
+                &self.data,
+                UnattachedData::Result { rx_flag, identifier: Some(id), .. }
+                    if rx_flag.get(3).is_some_and(|flags| {
+                        flags & RX_FLAG_START_OF_MESSAGE != 0
+                            && flags & (RX_FLAG_TX_INDICATION | RX_FLAG_TX_MSG_TYPE) == 0
+                    }) && *id == identifier
+            )
+    }
 }
 
 /// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
@@ -935,6 +951,12 @@ impl CommLog {
     /// communication (`PDU_COPT_STARTCOMM`), so the API sends no tester present of its own (ISO
     /// 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1: tester present runs only on a link whose
     /// communication was started; `j2534-0404-service` arms it on `CoptStartcomm` alone).
+    ///
+    /// A start-of-message indication among them is the first frame of the exchange's response
+    /// when it carries the exchange's response identifier and no owed request on the link could
+    /// own it; no other exchange on the physical channel awaits a response on that identifier by
+    /// the same construction. The exchange then has an answer of the ECU, and one that ended
+    /// without a response ended with `response_incomplete`. Every other one is `unattached`.
     pub(crate) fn exchange_with(
         &self,
         mut evidence: exchange::Evidence,
@@ -971,6 +993,29 @@ impl CommLog {
             evidence.times.agent.tx_confirmed_us = read
                 .filter(|read| read.epoch == evidence.times.agent.epoch)
                 .map(|read| read.monotonic_us);
+        }
+        // A start-of-message indication carrying the exchange's response identifier is the
+        // first frame of its response, which counts as an answer of the ECU (design 8.11 "Link
+        // settings for the log", "Answer of the ECU"), unless an owed request on the link could
+        // own it. Nothing a refusal ended can have an answer. The start's time is not logged:
+        // its VCI time needs a clock per time (ADR-353), and the entry has no agent-side field
+        // for it.
+        if !matches!(
+            evidence.end,
+            exchange::End::NotSent(_)
+                | exchange::End::VciLost {
+                    refused_after_loss: true
+                }
+        ) && !inner.links[at].1.may_own_start_indication(evidence.rx_id)
+            && let Some(own) = unbound
+                .iter()
+                .position(|item| item.is_start_indication_for(evidence.rx_id))
+        {
+            unbound.remove(own);
+            evidence.response_started = true;
+            if matches!(evidence.end, exchange::End::NoResponse) {
+                evidence.end = exchange::End::ResponseIncomplete;
+            }
         }
         for item in &unbound {
             let event = Event::Unattached(UnattachedEntry::of(item));
@@ -2395,6 +2440,106 @@ mod tests {
             .map(|line| line["identifier"].clone())
             .collect();
         assert_eq!(unattached, [0x7E1, 0x7E0, 0x7E0]);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A start-of-message indication for `identifier`, read during the exchange.
+    fn start_of_message(identifier: u32) -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0x02],
+                identifier: Some(identifier),
+                bytes: Vec::new(),
+            },
+            ..tx_done(identifier)
+        }
+    }
+
+    /// Design 8.11 "Link settings for the log": an unbound start-of-message indication is the
+    /// first frame of the response of the exchange it was read in when it carries that
+    /// exchange's response identifier and no owed request on the link could own it. The exchange
+    /// then has an answer of the ECU (so its send is confirmed by `answer`), and one that ended
+    /// without a response is `response_incomplete`; otherwise the indication is `unattached`.
+    #[test]
+    fn an_unbound_start_of_message_starts_its_exchange_s_response_unless_another_could_own_it() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let silent = || {
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::NoResponse,
+            )
+        };
+        // Another identifier's indication, one bound to an earlier primitive and a transmit
+        // indication stay unattached; the one for the response identifier attaches.
+        let earlier = UnattachedItem {
+            earlier_primitive: true,
+            ..start_of_message(0x7E8)
+        };
+        log.exchange_with(
+            silent(),
+            vec![
+                start_of_message(0x7E9),
+                earlier,
+                tx_done(0x7E8),
+                start_of_message(0x7E8),
+            ],
+        )
+        .unwrap();
+        // The first exchange is owed now (sent on the bus, no final response): an indication
+        // for the same response identifier could be its late one, so it is unattached and this
+        // exchange's send stays unknown.
+        log.exchange_with(silent(), vec![start_of_message(0x7E8)])
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let events = events(&lines);
+        assert_eq!(
+            &events[2..events.len() - 1],
+            [
+                "unattached",
+                "unattached",
+                "unattached",
+                "exchange",
+                "unattached",
+                "exchange"
+            ]
+        );
+        let entries: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        assert_eq!(entries[0]["sent"], "confirmed");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+        assert_eq!(entries[0]["classification"], "undetermined");
+        assert_eq!(entries[0]["link_history"]["this_exchange"], true);
+        assert_eq!(entries[1]["outcome"]["result"], "no_response");
+        assert_eq!(entries[1]["sent"], "unknown");
+        assert_eq!(entries[1]["link_history"]["this_exchange"], false);
+        let unattached: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "unattached")
+            .map(|line| {
+                (
+                    line["item"].as_str().unwrap(),
+                    line["identifier"].as_u64().unwrap(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            unattached,
+            [
+                ("start_of_message", 0x7E9),
+                ("start_of_message", 0x7E8),
+                ("transmit_indication", 0x7E8),
+                ("start_of_message", 0x7E8)
+            ]
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

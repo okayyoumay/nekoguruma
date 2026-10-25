@@ -1725,7 +1725,7 @@ async fn software_isotp_mode_wrong_sequence_number_names_the_error_and_the_deadl
 #[tokio::test]
 #[serial]
 async fn software_isotp_mode_single_frame_drops_an_unfinished_reassembly() {
-    let (server, mut events, _cop_handle) = software_isotp_response_started(
+    let (server, mut events, cop_handle) = software_isotp_response_started(
         &[
             (j2534_0404::DATA_RATE, 500_000),
             // N_Cr leaves the single frame half a second to arrive on a
@@ -1741,6 +1741,25 @@ async fn software_isotp_mode_single_frame_drops_an_unfinished_reassembly() {
         MOCK_CHANNEL_ID,
         &can_frame(0x7E8, &[0x03, 0x62, 0xF1, 0x90]),
         j2534_0404::CAN,
+    );
+
+    let mut answer = None;
+    wait_for_event(&mut events, 3000, |item| {
+        if let Some(event_item::Data::ResultData(data)) = &item.data {
+            answer = Some((item.cop_handle, data.data_bytes.clone()));
+            return true;
+        }
+        assert!(
+            !matches!(item.data, Some(event_item::Data::ErrorData(_))),
+            "no error before the answer: {item:?}"
+        );
+        false
+    })
+    .await;
+    assert_eq!(
+        answer,
+        Some((Some(cop_handle), vec![0x62, 0xF1, 0x90])),
+        "the single frame answers the COP"
     );
 
     let mut error = None;

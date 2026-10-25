@@ -1490,7 +1490,11 @@ async fn process_frame_for_entry(
                     // response ID (ISO 15765-2:2024 9.8.3) like a first frame
                     // that replaces it: dropped with no error, so the N_Cr
                     // sweep does not report a message the ECU already ended.
-                    ctx.reassembly.lock().await.remove(&reassembly_key);
+                    // One already past N_Cr is raised first, as there.
+                    let mut reassembly = ctx.reassembly.lock().await;
+                    notes.extend(take_expired_reassemblies(&mut reassembly, now));
+                    reassembly.remove(&reassembly_key);
+                    drop(reassembly);
                     let mut msg = can_id.to_be_bytes().to_vec();
                     msg.extend_from_slice(payload);
                     vec![(msg, uid, false, false)]

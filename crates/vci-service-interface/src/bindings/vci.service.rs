@@ -493,9 +493,11 @@ pub struct EventItem {
     /// for that COP. Absent otherwise -- never a zero-length sentinel.
     #[prost(bytes = "vec", optional, tag = "9")]
     pub cop_tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
-    /// ADR-353: the clock `timestamp` is on (design 8.11 "On one clock").
-    /// Each worker sets it per item; UNSPECIFIED means the worker does not
-    /// say, and a client then compares the time with no other.
+    /// ADR-353: the clock `timestamp` is on (design 8.11 "On one clock"),
+    /// and with it the times `result_data` carries (`tx_msg_done_timestamp`,
+    /// `start_msg_timestamp`). Each worker sets it per item; UNSPECIFIED means
+    /// the worker does not say, and a client then compares those times with
+    /// no other.
     #[prost(enumeration = "TimestampClock", tag = "11")]
     pub timestamp_clock: i32,
     #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 10, 8")]
@@ -1676,7 +1678,8 @@ impl CllCreateFlagBit {
 #[repr(i32)]
 pub enum TimestampClock {
     Unspecified = 0,
-    /// The VCI's own clock, as the vendor library reports it.
+    /// The VCI's own clock, as the vendor library reports it: the time base
+    /// of the item's module.
     Device = 1,
     /// The worker's synthetic clock (ADR-120), for an item the library gives
     /// no time for.

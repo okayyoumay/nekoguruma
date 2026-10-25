@@ -827,4 +827,18 @@ mod timestamp_clock_tests {
         let (device, worker) = (TimestampClock::Device as i32, TimestampClock::Worker as i32);
         assert_eq!(clocks, [device, worker, worker, worker, worker]);
     }
+
+    /// ADR-353: module and system items are on this service's synthetic
+    /// clock too.
+    #[tokio::test]
+    async fn module_and_system_items_name_the_worker_clock() {
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let module_buf = Arc::new(Mutex::new(VecDeque::new()));
+        let system_buf = Arc::new(Mutex::new(VecDeque::new()));
+        send_module_status(&subscriptions, &module_buf, PduModuleStatus::PduModstReady).await;
+        send_system_info(&subscriptions, &system_buf, PduInfo::ModuleListChg).await;
+        let worker = TimestampClock::Worker as i32;
+        assert_eq!(module_buf.lock().await[0].timestamp_clock, worker);
+        assert_eq!(system_buf.lock().await[0].timestamp_clock, worker);
+    }
 }

@@ -58,6 +58,18 @@ fn to_notification_handle(
     }
 }
 
+/// The clock of an item's times (ADR-353): an item of a module is timed by
+/// the library on that module's one time base (ISO 22900-2:2022 8.1.6.1), the
+/// VCI's own clock. A system-level item belongs to no module, and the standard
+/// names no time base for it, so its clock is left unspecified.
+fn item_clock(h_mod: ModuleHandle) -> vci_service_interface::TimestampClock {
+    if h_mod.0 == PDU_HANDLE_UNDEF {
+        vci_service_interface::TimestampClock::Unspecified
+    } else {
+        vci_service_interface::TimestampClock::Device
+    }
+}
+
 pub(super) fn to_proto_event_item(
     api: &DPduApi,
     borrowed: &BorrowedEventItem,
@@ -176,9 +188,7 @@ pub(super) fn to_proto_event_item(
     Ok(EventItem {
         cop_handle,
         timestamp: borrowed.timestamp(),
-        // Every item is the library's, on its module's one time base
-        // (ISO 22900-2:2022 8.1.6.1; ADR-353).
-        timestamp_clock: vci_service_interface::TimestampClock::Device as i32,
+        timestamp_clock: item_clock(h_mod) as i32,
         data,
         cop_tag,
     })
@@ -265,5 +275,24 @@ pub(super) async fn run_event_subscription_task(
                 None => break,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// ADR-353: a module's items are on the VCI's clock; a system-level item,
+    /// which belongs to no module, names none.
+    #[test]
+    fn an_item_of_a_module_is_on_the_device_clock_and_a_system_item_on_none() {
+        assert_eq!(
+            item_clock(ModuleHandle(1)),
+            vci_service_interface::TimestampClock::Device
+        );
+        assert_eq!(
+            item_clock(ModuleHandle(PDU_HANDLE_UNDEF)),
+            vci_service_interface::TimestampClock::Unspecified
+        );
     }
 }

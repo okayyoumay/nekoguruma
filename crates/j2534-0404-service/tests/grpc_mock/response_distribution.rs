@@ -11,7 +11,7 @@
 use serial_test::serial;
 use vci_service_interface::{
     ComPrimitiveCtrlData, ExpectedResponseData, StartComPrimitiveRequest, SubscribeEventRequest,
-    event_item, subscribe_event_request,
+    TimestampClock, event_item, subscribe_event_request,
 };
 
 use crate::harness::*;
@@ -675,11 +675,13 @@ async fn iso15765_start_of_message_frame_does_not_complete_a_pending_sendrecv() 
     // the pending COP (no cop_handle on the EventItem itself).
     let mut som_result: Option<vci_service_interface::ResultData> = None;
     let mut som_cop_handle: Option<vci_service_interface::ComPrimitiveHandle> = None;
+    let mut som_clock = None;
     assert!(
         wait_for_event(&mut events, 2000, |item| {
             if let Some(event_item::Data::ResultData(result)) = &item.data {
                 som_result = Some(result.clone());
                 som_cop_handle = item.cop_handle;
+                som_clock = Some(item.timestamp_clock);
                 return true;
             }
             false
@@ -700,6 +702,8 @@ async fn iso15765_start_of_message_frame_does_not_complete_a_pending_sendrecv() 
     // independent RxStatus bits.
     assert_eq!(som_result.start_msg_timestamp, Some(MOCK_TIMESTAMP));
     assert_eq!(som_result.tx_msg_done_timestamp, None);
+    // ADR-353: a frame the library read is timed on the device's clock.
+    assert_eq!(som_clock, Some(TimestampClock::Device as i32));
 
     // ...and must not finish the COP, even though the (empty mask/pattern)
     // descriptor would vacuously match its empty payload.
@@ -723,10 +727,12 @@ async fn iso15765_start_of_message_frame_does_not_complete_a_pending_sendrecv() 
     );
 
     let mut real_result: Option<vci_service_interface::ResultData> = None;
+    let mut real_clock = None;
     assert!(
         wait_for_event(&mut events, 2000, |item| {
             if let Some(event_item::Data::ResultData(result)) = &item.data {
                 real_result = Some(result.clone());
+                real_clock = Some(item.timestamp_clock);
                 return true;
             }
             false
@@ -738,15 +744,18 @@ async fn iso15765_start_of_message_frame_does_not_complete_a_pending_sendrecv() 
     assert_eq!(real_result.data_bytes, response_payload);
     assert_eq!(real_result.rx_flag, Vec::<u8>::new());
     assert_eq!(real_result.acceptance_id, 7);
+    assert_eq!(real_clock, Some(TimestampClock::Device as i32));
 
+    // ADR-353: J2534 times no status, so the worker's synthetic clock does.
     assert!(
         wait_for_event(&mut events, 2000, |item| matches!(
             item.data,
             Some(event_item::Data::CopStatus(status))
                 if status == vci_service_interface::PduComPrimitiveStatus::PduCopstFinished as i32
-        ))
+        ) && item.timestamp_clock
+            == TimestampClock::Worker as i32)
         .await,
-        "CoptSendrecv should finish on the real response"
+        "CoptSendrecv should finish on the real response, on the worker's clock"
     );
 
     drop(events);

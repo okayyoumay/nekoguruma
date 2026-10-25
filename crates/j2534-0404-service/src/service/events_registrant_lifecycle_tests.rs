@@ -462,6 +462,12 @@ async fn finalize_and_deliver_concat_buffers_if_live_delivers_and_advances_when_
             .all(|item| matches!(item, CllQueueItem::Frame(_))),
         "each delivered item must be a CllQueueItem::Frame"
     );
+    // ADR-353: a concatenated message's time is its first segment's library
+    // time, so it is on the device clock.
+    assert!(queue.items.iter().all(|item| matches!(
+        item,
+        CllQueueItem::Frame(frame) if frame.clock == vci_service_interface::TimestampClock::Device
+    )));
 }
 
 /// ADR-205 follow-up (edge-case-hunter finding, round 5): pins the fix's own

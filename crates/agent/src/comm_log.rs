@@ -183,6 +183,7 @@ enum Event<'a> {
     VciConnected(VciConnected<'a>),
     LinkOpened(LinkOpened<'a>),
     Identity(Identity),
+    Unattached(UnattachedEntry<'a>),
 }
 
 /// What the agent knows of the VCI it launched the job's worker for: the API its library
@@ -261,6 +262,132 @@ struct Identity {
     nrc: Option<u8>,
 }
 
+/// An item of a link that the host read but that no exchange takes (design 8.11 "Link settings
+/// for the log", ADR-346 item 4): one with no primitive (a transmit indication, a link error) or
+/// one of an earlier primitive. The log attaches none of them to an exchange yet, so each is
+/// logged `unattached`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct UnattachedItem {
+    pub link: u32,
+    /// Whether it named an earlier primitive; `false` for an item of no primitive.
+    pub earlier_primitive: bool,
+    /// The item's VCI time, raw (`EventItem.timestamp`).
+    pub vci_us: u32,
+    /// The agent's clocks when the host read it.
+    pub read: Option<AgentNow>,
+    pub data: UnattachedData,
+}
+
+/// What an [`UnattachedItem`] carries.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum UnattachedData {
+    /// A result item: a received message or an indication, told apart by its RxFlag.
+    Result { rx_flag: Vec<u8>, bytes: Vec<u8> },
+    /// An error event, with its extra error information as the worker gave it (ADR-351).
+    Error {
+        event: String,
+        extra_error_info: Option<u32>,
+        extra_error_info_name: Option<String>,
+    },
+}
+
+/// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
+const RX_FLAG_TX_MSG_TYPE: u8 = 0x01;
+const RX_FLAG_START_OF_MESSAGE: u8 = 0x02;
+const RX_FLAG_BREAK: u8 = 0x04;
+const RX_FLAG_TX_INDICATION: u8 = 0x08;
+
+/// The `unattached` event of an [`UnattachedItem`].
+#[derive(Serialize)]
+struct UnattachedEntry<'a> {
+    link: u32,
+    /// `transmit_indication`, `loopback`, `start_of_message`, `break`, `received` (a message
+    /// another node sent: a response, a pending, or anything else), or `error_event`.
+    item: &'static str,
+    /// `none` or `earlier`.
+    primitive: &'static str,
+    /// The item's VCI time, raw. It names no clock (design 8.11 "On one clock"): the worker
+    /// does not say which clock an item's time is on, and the agent does not infer it from the
+    /// worker (design principle 6).
+    vci_us: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    agent: Option<ReadAt>,
+    /// The result item's RxFlag in hex.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    rx_flag: Option<String>,
+    /// The result item's message, as the log carries messages: what the tester sent for a
+    /// transmit indication or a loopback, what it received otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<redaction::LoggedMessage>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error_event: Option<&'a str>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_error_info: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    extra_error_info_name: Option<&'a str>,
+}
+
+/// When the host read an item, on the agent's clock.
+#[derive(Serialize)]
+struct ReadAt {
+    epoch: u32,
+    read_us: u64,
+}
+
+impl<'a> UnattachedEntry<'a> {
+    fn of(item: &'a UnattachedItem) -> Self {
+        use redaction::{Direction, redact};
+        let mut entry = Self {
+            link: item.link,
+            item: "error_event",
+            primitive: if item.earlier_primitive {
+                "earlier"
+            } else {
+                "none"
+            },
+            vci_us: item.vci_us,
+            agent: item.read.map(|read| ReadAt {
+                epoch: read.epoch,
+                read_us: read.monotonic_us,
+            }),
+            rx_flag: None,
+            message: None,
+            error_event: None,
+            extra_error_info: None,
+            extra_error_info_name: None,
+        };
+        match &item.data {
+            UnattachedData::Result { rx_flag, bytes } => {
+                let flags = rx_flag.get(3).copied().unwrap_or(0);
+                let (kind, direction) = if flags & RX_FLAG_TX_INDICATION != 0 {
+                    ("transmit_indication", Direction::Request)
+                } else if flags & RX_FLAG_TX_MSG_TYPE != 0 {
+                    ("loopback", Direction::Request)
+                } else if flags & RX_FLAG_START_OF_MESSAGE != 0 {
+                    ("start_of_message", Direction::Response)
+                } else if flags & RX_FLAG_BREAK != 0 {
+                    ("break", Direction::Response)
+                } else {
+                    ("received", Direction::Response)
+                };
+                entry.item = kind;
+                entry.rx_flag = Some(to_hex(rx_flag));
+                entry.message = Some(redact(direction, bytes));
+            }
+            UnattachedData::Error {
+                event,
+                extra_error_info,
+                extra_error_info_name,
+            } => {
+                entry.error_event = Some(event);
+                entry.extra_error_info = *extra_error_info;
+                entry.extra_error_info_name = extra_error_info_name.as_deref();
+            }
+        }
+        entry
+    }
+}
+
 /// What a link the job opened has in force (design 8.11 "Header", ADR-346): written right
 /// after the link opens, before anything is sent on it.
 #[derive(Serialize)]
@@ -278,10 +405,9 @@ struct LinkOpened<'a> {
     /// Every ComParam by name: those the link sets, those the document declares, and the
     /// timing ones design 8.11 lists that neither sets, which keep the library's default.
     comparams: Vec<ComParamInForce<'a>>,
-    /// What can confirm a request's transmission on this link: nothing yet, since the agent
-    /// does not read the link's transmit indications yet, even where the library accepted
-    /// `CP_TransmitIndEnable`.
-    transmit_confirmation: [&'static str; 0],
+    /// What can confirm a request's transmission on this link: `transmit_indication` when the
+    /// library accepted `CP_TransmitIndEnable`. The link turns no loopback on.
+    transmit_confirmation: Vec<&'static str>,
     /// Whether response times can be judged on the link: not without a transmit time.
     response_times_judged: bool,
     /// Whether the worker passes each response pending on: not known to the agent yet, since
@@ -853,7 +979,11 @@ impl CommLog {
             request_id: config.tx_id,
             response_id: config.rx_id,
             comparams,
-            transmit_confirmation: [],
+            transmit_confirmation: if indications.transmit {
+                vec!["transmit_indication"]
+            } else {
+                Vec::new()
+            },
             response_times_judged: false,
             forwards_pendings: None,
             timing_margin: TimingMargin {
@@ -945,6 +1075,14 @@ impl CommLog {
             nrc,
         });
         let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
+    /// Writes `item` as an `unattached` event (design 8.11 "Link settings for the log"). The
+    /// event's `seq`; `None` once the log has failed.
+    pub(crate) fn unattached(&self, item: &UnattachedItem) -> Option<u64> {
+        let mut inner = self.lock();
+        let event = Event::Unattached(UnattachedEntry::of(item));
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -1354,6 +1492,164 @@ mod tests {
                     "outcome": "unreadable"}),
             ]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Design 8.11 "Link settings for the log": an item no exchange takes is an `unattached`
+    /// event that says what it is by its RxFlag (ISO 22900-2:2022 D.2.2) and carries its message
+    /// as every message is carried (a loopback echoes what the tester sent, so a key in it stays
+    /// hidden). Its VCI time names no clock, whatever API the job was told (design principle 6).
+    #[test]
+    fn unattached_items_say_what_they_are_and_keep_secrets_out() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(
+            &RunFacts {
+                vci: Some(VciFacts {
+                    api: crate::launch::Api::J2534,
+                    long_size: 8,
+                }),
+                ..facts()
+            },
+            RunKind::First,
+        );
+        let read = AgentNow {
+            epoch: 0,
+            monotonic_us: 1_500,
+            wall_unix_ms: 0,
+        };
+        let result = |earlier_primitive, rx_flag: &[u8], bytes: &[u8]| UnattachedItem {
+            link: 1,
+            earlier_primitive,
+            vci_us: 42,
+            read: Some(read),
+            data: UnattachedData::Result {
+                rx_flag: rx_flag.to_vec(),
+                bytes: bytes.to_vec(),
+            },
+        };
+        let items = [
+            result(false, &[0, 0, 0, 0x09], &[]),
+            // A SecurityAccess key request echoed back.
+            result(false, &[0, 0, 0, 0x01], &[0x27, 0x02, 0xAA, 0xBB]),
+            result(false, &[0, 0, 0, 0x02], &[]),
+            result(true, &[], &[0x62, 0xF1, 0x90, 0x41]),
+            UnattachedItem {
+                link: 1,
+                earlier_primitive: true,
+                vci_us: 43,
+                read: None,
+                data: UnattachedData::Error {
+                    event: "PDU_ERR_EVT_RX_TIMEOUT".to_owned(),
+                    extra_error_info: None,
+                    extra_error_info_name: Some("ISO15765_CF_TIMEOUT".to_owned()),
+                },
+            },
+        ];
+        for item in &items {
+            log.unattached(item).unwrap();
+        }
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let unattached: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "unattached")
+            .map(|line| {
+                let mut line = line.clone();
+                line.as_object_mut().unwrap().remove("seq");
+                line
+            })
+            .collect();
+        let agent = serde_json::json!({"epoch": 0, "read_us": 1_500});
+        assert_eq!(
+            unattached,
+            [
+                serde_json::json!({"event": "unattached", "link": 1,
+                    "item": "transmit_indication", "primitive": "none", "vci_us": 42,
+                    "agent": agent, "rx_flag": "00000009",
+                    "message": {"clear": ""}}),
+                serde_json::json!({"event": "unattached", "link": 1, "item": "loopback",
+                    "primitive": "none", "vci_us": 42, "agent": agent,
+                    "rx_flag": "00000001",
+                    "message": {"clear": "2702", "data": {"kind": "secret", "len": 2}}}),
+                serde_json::json!({"event": "unattached", "link": 1,
+                    "item": "start_of_message", "primitive": "none", "vci_us": 42,
+                    "agent": agent, "rx_flag": "00000002",
+                    "message": {"clear": ""}}),
+                serde_json::json!({"event": "unattached", "link": 1, "item": "received",
+                    "primitive": "earlier", "vci_us": 42, "agent": agent,
+                    "rx_flag": "", "message": {"clear": "62f19041"}}),
+                serde_json::json!({"event": "unattached", "link": 1, "item": "error_event",
+                    "primitive": "earlier", "vci_us": 43,
+                    "error_event": "PDU_ERR_EVT_RX_TIMEOUT",
+                    "extra_error_info_name": "ISO15765_CF_TIMEOUT"}),
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// `link_opened` names a link's transmit indication as a transmit-confirmation source only
+    /// when the library accepted `CP_TransmitIndEnable`.
+    #[test]
+    fn transmit_confirmation_names_the_indication_the_library_accepted() {
+        for (transmit, expected) in [
+            (true, serde_json::json!(["transmit_indication"])),
+            (false, serde_json::json!([])),
+        ] {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit,
+                    start_of_message: true,
+                },
+            )
+            .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            let opened = lines
+                .iter()
+                .find(|line| line["event"] == "link_opened")
+                .unwrap();
+            assert_eq!(opened["transmit_confirmation"], expected, "{transmit}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// An unattached error event gives its extra error code as the worker gave it (ADR-351).
+    #[test]
+    fn an_unattached_error_gives_its_extra_error_code() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.unattached(&UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            vci_us: 7,
+            read: None,
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: Some(9),
+                extra_error_info_name: None,
+            },
+        })
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let line = lines
+            .iter()
+            .find(|line| line["event"] == "unattached")
+            .unwrap();
+        assert!(line.get("clock").is_none(), "{line}");
+        assert_eq!(line["extra_error_info"], 9);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -7,7 +7,7 @@ ADR-095, ADR-098, ADR-099; amended by ADR-101 — cross-channel registrant write
 amended by ADR-151 — SOM/TxDone indication delivery gated by CP_StartMsgIndEnable/
 CP_TransmitIndEnable; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and the Out of
 scope section's Stage 3 inline-execution boundary for created-receive-only COPs superseded by
-ADR-182)
+ADR-182; amended by ADR-352 — a TX-side frame on CAN routes by the entry's CP_CanPhysReqId)
 **Affects:** `j2534-0404-service` service, events, rpc_primitive, rpc_link, names/comparam
 support (`CP_CyclicRespTimeout`), docs (GLOSSARY, RPC_API_GUIDE, j2534-0404-architecture)
 

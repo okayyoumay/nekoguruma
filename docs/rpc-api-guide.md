@@ -1174,7 +1174,10 @@ window and ends in `PDU_ERR_EVT_RX_TIMEOUT` instead (ADR-058).
 frame is attributed to at most one outstanding ComPrimitive, per ISO
 22900-2 §9.2.6.3.4's ordered scan: (1) indication frames (SOM/TxDone/
 loopback/RxBreak) bypass attribution entirely and are handled separately
-(see `RxStatus / RxFlag` in the glossary); (2) active Send/Receive COPs with
+(see `RxStatus / RxFlag` in the glossary), delivered with no `cop_handle`;
+on a CAN CLL with a UniqueRespIdTable a TxDone or loopback echo, which
+carries the request's CAN ID, reaches the CLL whose normally addressed
+entry names that `CP_CanPhysReqId` (ADR-352); (2) active Send/Receive COPs with
 a non-vacuous (specifically-expected) `expected_response_array`; (3) the
 service's own tester-present reply/SOM-herald/TX-echo signature, when
 `CP_TesterPresentReqRsp = 1` — a match here is discarded, per spec, and
@@ -1260,7 +1263,7 @@ the same override reason as their named-bit counterparts above, and
 
 | Variant | When fired |
 |---------|-----------|
-| `result_data` | COP completed with RX data, or a matched-but-unattributed indication frame (`cop_handle: None`, see "COP Response Attribution and Unbound Frames" above) — a content frame that binds to no COP is discarded instead and never produces a `result_data` item (ADR-100) |
+| `result_data` | COP completed with RX data, or a matched-but-unattributed indication frame (`cop_handle: None`, see "COP Response Attribution and Unbound Frames" above) — a content frame that binds to no COP is discarded instead and never produces a `result_data` item (ADR-100). A response pending (NRC 0x78) the worker sees while `CP_RC78Handling` keeps a COP waiting is passed on as a `result_data` item bound to that COP (`cop_handle` set), ahead of the final response, so a client can see it (design 8.11 "Link settings for the log"); a pending the native library absorbs never reaches the worker and is not passed on |
 | `module_status` | Module availability changed |
 | `cll_status` | CLL connected/disconnected/comm-started — queued in `rx_buf` for `GetEventItem` pollers, not just live `SubscribeEvent` subscribers (ADR-105 P2 follow-up, `CllQueueItem::Status`) |
 | `cop_status` | COP state transition — queued in `rx_buf` for `GetEventItem` pollers, not just live `SubscribeEvent` subscribers (ADR-140, `CllQueueItem::Status(StatusEvent::Cop)`); resolved from `logical_links` before `send_cop_status`'s callers acquire `primitives`, so ADR-128's `primitives`/`terminal_cops` atomicity guarantee is unaffected |

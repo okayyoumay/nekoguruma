@@ -613,6 +613,31 @@ fn assert_comm_log(setup: &CommLogSetup) {
     }
     // Whether the worker forwards pendings is not known to the agent yet.
     assert!(opened["forwards_pendings"].is_null(), "{opened}");
+    // `sim-vci` gives a TxDone indication for each request (SAE J2534-1 v04.04 clause 8.6),
+    // which the worker passes on with no primitive under `CP_TransmitIndEnable` (ADR-151).
+    assert_eq!(
+        opened["transmit_confirmation"],
+        serde_json::json!(["transmit_indication"]),
+        "{opened}"
+    );
+    // Nothing attaches an indication to an exchange yet, so each request's is logged
+    // `unattached`, before the entry of the exchange during which the host read it (design 8.11
+    // "Link settings for the log", ADR-346 item 4).
+    let after_opened: Vec<&str> = events[4..events.len() - 1].to_vec();
+    assert_eq!(after_opened, ["unattached", "exchange"].repeat(3), "{text}");
+    for indication in lines.iter().filter(|line| line["event"] == "unattached") {
+        assert_eq!(indication["item"], "transmit_indication", "{indication}");
+        assert_eq!(indication["primitive"], "none", "{indication}");
+        assert_eq!(indication["link"], 1, "{indication}");
+        assert_eq!(indication["rx_flag"], "00000009", "{indication}");
+        assert!(indication["vci_us"].as_u64().is_some(), "{indication}");
+        assert!(
+            indication["agent"]["read_us"].as_u64().is_some(),
+            "{indication}"
+        );
+        // The worker does not say which clock an item's time is on, so the time names none.
+        assert!(indication.get("clock").is_none(), "{indication}");
+    }
     let entries: Vec<&serde_json::Value> = lines
         .iter()
         .filter(|line| line["event"] == "exchange")

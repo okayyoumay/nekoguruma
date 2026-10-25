@@ -352,10 +352,25 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   sets). The link sets `CP_RC21Handling` and `CP_RC23Handling` to 0, so the API repeats no
   request on a busy answer, and turns `CP_TransmitIndEnable` and `CP_StartMsgIndEnable` on;
   their entries carry `accepted`, and a library that refuses one opens the link without it.
-  The event gives no transmit-confirmation source, response times not judged and no timing
-  margin (`source` `none`), since the agent does not read the indications yet, and
-  `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
+  `transmit_confirmation` names `transmit_indication` when the library accepted
+  `CP_TransmitIndEnable` (the link turns no loopback on). The event gives response times not
+  judged and no timing margin (`source` `none`), since no indication is used as evidence yet,
+  and `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
   the agent does not know it yet.
+  The worker host reads every item of the link while a primitive runs. The result and error
+  items of no primitive (a transmit indication, a link error) or of an earlier primitive are
+  `unattached` events, written in the order read and before the entry of the exchange during
+  which they were read, for an exchange the host logs: nothing attaches them to an exchange yet
+  (ADR-346 item 4). Status and
+  information items are not written. Each gives the `link`, the `item` (from a result item's
+  RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
+  `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), the raw
+  `vci_us`, which names no clock since the worker does not say which clock an item's time is on
+  and the agent does not infer it from the worker (design principle 6), the agent's `epoch` and
+  `read_us`,
+  and for a result its `rx_flag` in hex and its `message`, redacted as a request for a transmit
+  indication or a loopback and as a response otherwise; for an error event its name and its
+  extra error information as the worker gave it (ADR-351).
   Each ECU identity value the runner reads from a source the program declares (the hardware
   part number and software version a write job records at its plan's entry, and the VIN,
   hardware identity and software version a restart checks) is an `identity` event as it is
@@ -397,8 +412,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   agent saw of it (`Evidence`) and the link's history (`LinkState`: answers, matched answers,
   owed requests, the last link error, an accepted ECUReset or session change), and classifies it
   by design 8.11's table, first matching row. It decides only the rows the agent's evidence
-  reaches today: without transmit indications a request is `sent` `confirmed` only by an answer
-  no owed request could own; without a transmit time the timing is `not_judged`, so on a link
+  reaches today: transmit indications are logged `unattached`, not used as evidence, so a
+  request is `sent` `confirmed` only by an answer no owed request could own; without a transmit time the timing is `not_judged`, so on a link
   whose VCI absorbs pendings every response is `undetermined` (a pending may have come first);
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes

@@ -198,6 +198,49 @@ async fn unqualified_link_on_a_native_mixed_module_gets_native_mixed_true() {
     ));
 }
 
+/// ADR-352: an entry's `CP_CanPhysReqId` becomes its key's request ID when
+/// its requests are normally addressed, and none when `CP_CanPhysReqFormat`
+/// selects extended addressing, since entries behind one CAN ID that differ
+/// only by their address extension would share it.
+#[tokio::test]
+async fn the_physical_request_id_keys_only_a_normally_addressed_entry() {
+    let entry = |uid: u32, format: Option<u32>| {
+        let mut params = ComParamSet::default();
+        params.unum32.insert(PARAM_CAN_RESP_USDT_ID, 0x7E8 + uid);
+        params.unum32.insert(PARAM_CAN_PHYS_REQ_ID, 0x7E0 + uid);
+        if let Some(format) = format {
+            params.unum32.insert(PARAM_CAN_PHYS_REQ_FORMAT, format);
+        }
+        EcuUniqueRespEntry {
+            unique_resp_identifier: uid,
+            params,
+        }
+    };
+    let link = LogicalLinkState {
+        // No format, a normal-addressing format, and an extended one (bit 3).
+        active_unique_resp_id_table: vec![entry(0, None), entry(1, Some(0)), entry(2, Some(0x08))],
+        ..minimal_link()
+    };
+    let logical_links = Arc::new(Mutex::new(HashMap::from([(PRESENT_CLL, link)])));
+    let snapshot: HashMap<u32, u64> = HashMap::from([(PRESENT_CLL, 7)]);
+
+    let entries = build_cll_rx_entries(
+        CHANNEL,
+        &logical_links,
+        &no_cop_tags(),
+        &snapshot,
+        CanChannelMode::SingleChannel,
+    )
+    .await;
+
+    let request_ids: Vec<_> = entries[0]
+        .unique_resp_ids
+        .iter()
+        .map(|key| (key.unique_resp_identifier, key.can_phys_req_id))
+        .collect();
+    assert_eq!(request_ids, [(0, Some(0x7E0)), (1, Some(0x7E1)), (2, None)]);
+}
+
 /// ADR-184: an `active_unique_resp_id_table` entry keyed ONLY by
 /// `CP_J1939SourceAddress` (no `CP_CanRespUSDTId`/`CP_CanRespUUDTId`) now
 /// survives `build_cll_rx_entries`'s own CAN-ID-routable filter and carries

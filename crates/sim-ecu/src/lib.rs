@@ -553,6 +553,11 @@ pub struct Exchange {
     /// Response pending messages (`7F SID 78`) sent before the response, each with its delay
     /// from the request in milliseconds, in order ([`Fault::ResponsePending`]).
     pub pending: Vec<(u32, Vec<u8>)>,
+    /// Whether the request reached the ECU. It does not while the ECU is off, starting up after
+    /// a reset, when a [`Fault::BusError`] loses it, or when `EcuConfig::drop_at_block` loses
+    /// the block; the ECU then takes no part in the
+    /// transfer, so a segmented request gets no flow control from it.
+    pub reached: bool,
 }
 
 impl Exchange {
@@ -561,6 +566,7 @@ impl Exchange {
             response: SimResponse::NoResponse,
             delay_ms: 0,
             pending: Vec::new(),
+            reached: false,
         }
     }
 }
@@ -815,7 +821,10 @@ impl SimEcu {
         }
         let power_cycles = self.power_cycles;
         let delay_before = self.security_delay_until;
-        let (exchange, sent_after_ms) = self.handle(addressing, message);
+        let (mut exchange, sent_after_ms) = self.handle(addressing, message);
+        // `drop_at_block` loses its block and silences the ECU inside `handle`, as a power loss
+        // armed for the request does before it.
+        exchange.reached = !self.silent;
         if self.power_cycles != power_cycles {
             // The ECU applies a reset at once, but on a vehicle it follows the response, so a
             // security delay the reset restarts runs from when the response goes out, and one
@@ -901,6 +910,7 @@ impl SimEcu {
             response,
             delay_ms,
             pending,
+            reached: true,
         };
         (exchange, delay_ms)
     }

@@ -27,7 +27,7 @@ use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::{Condvar, Mutex, MutexGuard, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, status, tx_flag};
+use j2534_defs::consts::{connect_flag, filter, ioctl, protocol, rx_flag, status, tx_flag};
 use serde::{Deserialize, Serialize};
 use sim_ecu::{Addressing, EcuConfig, EcuSnapshot, Fault, SimEcu, SystemClock};
 
@@ -229,11 +229,19 @@ struct Pending {
     ready_at: Instant,
     /// `SimEcu::power_cycles` when the response was produced.
     power_cycle: u64,
+    /// The message's `RxStatus`: 0 for a response, [`TX_DONE`] for a TxDone indication.
+    rx_status: PassThruUlong,
     data: Vec<u8>,
     /// Whether the filters let the response in. Decided once it has appeared on the bus, with
-    /// the filters of that moment (`Channel::settle`).
+    /// the filters of that moment (`Channel::settle`); an indication passes no filter and is
+    /// accepted from the start.
     accepted: bool,
 }
+
+/// The `RxStatus` of a TxDone indication: a transmitted message (`TX_MSG_TYPE`) whose
+/// transmission is done (`TX_INDICATION`), SAE J2534-1 v04.04 clauses 8.6 and 8.7.1.
+const TX_DONE: PassThruUlong =
+    (rx_flag::RX_TX_MSG_TYPE | rx_flag::RX_FLAG_TX_INDICATION) as PassThruUlong;
 
 /// A flow-control filter (J2534-1 7.2.9): receive from `pattern`, send to `flow_control`.
 #[derive(Clone, Copy)]
@@ -702,20 +710,31 @@ impl Bus {
             ECU_PHYSICAL_REQUEST_ID => Addressing::Physical,
             FUNCTIONAL_REQUEST_ID => Addressing::Functional,
             // No simulated ECU listens on this ID.
-            _ => return Ok(()),
+            _ => {
+                self.tx_done_unanswered(channel_id, id, payload.len());
+                return Ok(());
+            }
         };
         if self.ecu.is_none() {
+            self.tx_done_unanswered(channel_id, id, payload.len());
             return Ok(());
         }
         self.trace_request(payload);
         let ecu = self.ecu.as_mut().expect("checked above");
         let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
+        let reached = exchange.reached;
         let power_cycle = ecu.power_cycles();
         self.after_ecu_change(before);
         // A request the next process must know about fails if it cannot be recorded; its
         // response is then not sent either.
         self.save_ecu()?;
+        if reached {
+            self.tx_done(channel_id, id);
+        } else {
+            // The ECU is off, starting up or lost the request on the bus.
+            self.tx_done_unanswered(channel_id, id, payload.len());
+        }
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return Ok(());
         };
@@ -735,12 +754,46 @@ impl Bus {
                 Pending {
                     ready_at,
                     power_cycle,
+                    rx_status: 0,
                     data,
                     accepted: false,
                 },
             );
         }
         Ok(())
+    }
+
+    /// Queues the TxDone indication of a message of `payload_len` bytes sent to `can_id` that no
+    /// simulated ECU takes (none listens there, or the ECU is off, starting up or lost the
+    /// request): a single frame goes out, but a segmented message gets no flow control and does
+    /// not complete, so it gives none (SAE J2534-1 v04.04 clause 8.6).
+    fn tx_done_unanswered(&mut self, channel_id: PassThruUlong, can_id: &[u8], payload_len: usize) {
+        if payload_len <= SINGLE_FRAME_MAX {
+            self.tx_done(channel_id, can_id);
+        }
+    }
+
+    /// Queues the TxDone indication of a message just sent to `can_id` on the channel that sent
+    /// it, ahead of any response to it. The device sends a whole message at once, so the
+    /// indication is readable at once. SAE J2534-1 v04.04 clause 8.6 gives it on ISO 15765, the
+    /// only protocol the simulator has, with the message's CAN ID as its data.
+    fn tx_done(&mut self, channel_id: PassThruUlong, can_id: &[u8]) {
+        let power_cycle = self.power_cycles();
+        let Some(channel) = self.channels.get_mut(&channel_id) else {
+            return;
+        };
+        let ready_at = Instant::now();
+        let at = channel.rx.partition_point(|p| p.ready_at <= ready_at);
+        channel.rx.insert(
+            at,
+            Pending {
+                ready_at,
+                power_cycle,
+                rx_status: TX_DONE,
+                data: can_id.to_vec(),
+                accepted: true,
+            },
+        );
     }
 }
 
@@ -1101,7 +1154,7 @@ pub unsafe extern "system" fn PassThruReadMsgs(
             let pending = channel.rx.pop_front().expect("front checked above");
             let mut msg = PassThruMsg {
                 protocol_id: channel.protocol_id,
-                rx_status: 0,
+                rx_status: pending.rx_status,
                 tx_flags: 0,
                 timestamp: timestamp(epoch, pending.ready_at),
                 data_size: pending.data.len() as PassThruUlong,
@@ -1141,8 +1194,9 @@ pub unsafe extern "system" fn PassThruReadMsgs(
 }
 
 /// Sends each message to the simulated ECU. The ECU handles the request at once; its response
-/// becomes readable after the delay it reports. No TxDone indications or loopback messages
-/// are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
+/// becomes readable after the delay it reports. Each message sent queues its TxDone indication
+/// ahead of the response, except a segmented message no ECU takes, which gets no flow control
+/// and does not complete; no loopback messages are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
 /// sent.
 ///
 /// # Safety

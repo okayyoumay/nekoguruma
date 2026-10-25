@@ -1104,6 +1104,12 @@ fn probe_main() {
         data.extend_from_slice(&did.to_be_bytes());
         api.write_messages(channel, &mut [message(&data)], 1_000)
             .expect("the request should be sent");
+        // The request's TxDone indication (`TX_MSG_TYPE` and `TX_INDICATION`) comes first
+        // (SAE J2534-1 v04.04 clause 8.6).
+        let indication = api
+            .read_messages(channel, 1, 2_000)
+            .expect("the request's TxDone indication");
+        assert_eq!(indication[0].rx_status(), 0x09);
         let responses = api
             .read_messages(channel, 1, 2_000)
             .expect("the ECU should answer");

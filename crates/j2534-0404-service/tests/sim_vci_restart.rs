@@ -20,6 +20,8 @@ const TEST_NAME: &str = "sim_ecu_state_survives_a_restart_of_the_loading_process
 
 const REQUEST_ID: u32 = 0x7E0;
 const RESPONSE_ID: u32 = 0x7E8;
+/// The `RxStatus` of a TxDone indication: `TX_MSG_TYPE` and `TX_INDICATION`.
+const TX_DONE: u32 = 0x09;
 /// tS3_Server of the configured ECU, in milliseconds.
 const S3_MS: u64 = 5_000;
 const BLOCK_LEN: usize = 16;
@@ -88,12 +90,26 @@ fn connect(api: &J2534Api0404) -> ChannelId {
 fn request(api: &J2534Api0404, channel: ChannelId, payload: &[u8]) -> Vec<u8> {
     api.write_messages(channel, &mut [message(&can(REQUEST_ID, payload))], 1_000)
         .expect("the request should be sent");
+    tx_done(api, channel);
     let responses = api
         .read_messages(channel, 1, 2_000)
         .expect("the ECU should answer");
     let data = responses[0].data().expect("response data");
     assert_eq!(data[..4], RESPONSE_ID.to_be_bytes(), "{data:02X?}");
     data[4..].to_vec()
+}
+
+/// Reads the TxDone indication of the request just sent, which precedes its response
+/// (SAE J2534-1 v04.04 clause 8.6).
+fn tx_done(api: &J2534Api0404, channel: ChannelId) {
+    let indication = api
+        .read_messages(channel, 1, 2_000)
+        .expect("the request's TxDone indication");
+    assert_eq!(indication[0].rx_status(), TX_DONE);
+    assert_eq!(
+        indication[0].data().expect("data"),
+        REQUEST_ID.to_be_bytes()
+    );
 }
 
 /// Reads a DID and returns its record.
@@ -182,6 +198,7 @@ fn run_step(step: &str) {
                 1_000,
             )
             .expect("the request should be sent");
+            tx_done(&api, channel);
             assert!(api.read_messages(channel, 1, 500).is_err(), "dropped");
             assert_eq!(request(&api, channel, &[0x3E, 0x00]), [0x7E, 0x00]);
         }

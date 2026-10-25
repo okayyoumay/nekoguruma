@@ -10,6 +10,7 @@ enum MatchKind {
     J1939Sa,
     Tp20RxId,
     Tp20TxId,
+    PhysReqId,
 }
 
 /// ADR-222: disambiguates a numeric CAN ID's configured width when the SAME
@@ -357,6 +358,18 @@ pub(super) struct UniqueRespIdKey {
     /// TX-side one (`RxStatus`'s `TX_MSG_TYPE`/`TX_INDICATION` bits), never
     /// for ordinary received content.
     pub(super) tp20_tx_id: Option<u32>,
+    /// `CP_CanPhysReqId` (ADR-352): the CAN ID this entry's requests go to.
+    /// A TxDone indication or a loopback echo of the tester's own send
+    /// carries that ID, not the response ID (SAE J2534-1 v04.04 clause 8.6),
+    /// so `matched` checks this field only for a TX-side frame -- the
+    /// CAN counterpart of `tp20_tx_id`. A received frame addressed to it is
+    /// another tester's request, never this entry's response. `None` for an
+    /// entry whose requests use extended addressing (`CP_CanPhysReqFormat`):
+    /// entries that differ only by their address extension share the CAN ID,
+    /// and this tier does not compare the extension byte. Not width-gated
+    /// (ADR-222): on a mixed-width channel an 11-bit and a 29-bit entry with
+    /// the same numeric request ID both take its TX-side frames.
+    pub(super) can_phys_req_id: Option<u32>,
     /// `CP_EcuRespSourceAddress` (ADR-203): the responding ECU's KWP
     /// (ISO9141/ISO14230) or SAE J1850 (VPW/PWM) source address, `[0,
     /// 0xFF]` (a single wire byte). Unlike every other field on this
@@ -401,7 +414,8 @@ impl UniqueRespIdKey {
     /// exclusive: `tp20_tx_id` only eligible when `is_tx_side` (round 10),
     /// `tp20_rx_id` only eligible when `!is_tx_side` (round 12, closing the
     /// symmetric leak the round-10 fix alone left open -- see each field's
-    /// own doc comment).
+    /// own doc comment). It also makes the `can_phys_req_id` tier eligible
+    /// (ADR-352): only a TX-side frame matches a request ID.
     ///
     /// `uudt_eligible` (ADR-217 Codex-review fix, PR #132 round 2): `false`
     /// makes the UUDT tier never match (fall through to the lower-precedence
@@ -440,6 +454,8 @@ impl UniqueRespIdKey {
             Some(MatchKind::Tp20RxId)
         } else if is_tx_side && self.tp20_tx_id == Some(can_id) {
             Some(MatchKind::Tp20TxId)
+        } else if is_tx_side && self.can_phys_req_id == Some(can_id) {
+            Some(MatchKind::PhysReqId)
         } else {
             None
         }
@@ -450,7 +466,8 @@ impl UniqueRespIdKey {
 /// `frame_can_id` to `entry`, or `None` when the frame should be dropped for
 /// this CLL (CAN ID not in the routing table). `is_tx_side` -- see
 /// `UniqueRespIdKey::matched`'s own doc comment -- gates the TP2.0
-/// `tp20_tx_id` tier only; every other tier is unaffected by it.
+/// `tp20_tx_id`/`tp20_rx_id` tiers and the CAN `can_phys_req_id` tier
+/// (ADR-352); the response-ID tiers are unaffected by it.
 ///
 /// `frame_source_addr` (ADR-203): the frame's own KWP/J1850 source-address
 /// byte (`kline_j1850_source_addr`, `events.rs`), consulted ONLY for a KWP/
@@ -516,8 +533,8 @@ impl UniqueRespIdKey {
 /// match a real `CP_EcuRespSourceAddress` entry, so a genuine content-frame
 /// echo -- e.g. a loopback frame that also happens to be tagged content --
 /// is naturally dropped in table mode with no special-case echo detection
-/// needed; `is_tx_side` gates the pre-existing TP2.0 `tp20_tx_id` tier
-/// below only, unrelated to KWP/J1850).
+/// needed; `is_tx_side` gates the TP2.0 and `can_phys_req_id` tiers below,
+/// unrelated to KWP/J1850).
 /// Combines what were previously two independent searches -- `route_frame`'s
 /// own uid lookup and `route_frame_matched_uudt`'s separate "was it a UUDT
 /// tier match" lookup -- into ONE, returning `(unique_resp_identifier,
@@ -1033,6 +1050,20 @@ pub(super) async fn build_cll_rx_entries(
                             j1939_source_address: j1939_sa,
                             tp20_rx_id: None,
                             tp20_tx_id: None,
+                            // ADR-352 item 2: an extended-addressed
+                            // request's TX-side frame carries the address
+                            // extension after the CAN ID, which this tier
+                            // does not compare, so only a normally
+                            // addressed entry gets one.
+                            can_phys_req_id: matches!(
+                                Addressing::from_format(
+                                    e.params.unum32.get(&PARAM_CAN_PHYS_REQ_FORMAT).copied(),
+                                    0,
+                                ),
+                                Addressing::Normal
+                            )
+                            .then(|| e.params.unum32.get(&PARAM_CAN_PHYS_REQ_ID).copied())
+                            .flatten(),
                             ecu_resp_source_addr: ecu_sa,
                         })
                 })
@@ -1097,6 +1128,7 @@ pub(super) async fn build_cll_rx_entries(
                     j1939_source_address: None,
                     tp20_rx_id,
                     tp20_tx_id,
+                    can_phys_req_id: None,
                     ecu_resp_source_addr: None,
                 });
             }

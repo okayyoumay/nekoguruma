@@ -546,13 +546,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         let handle = self.handle.clone();
         let sent = handle.block_on(self.send_recv_async(request, progress));
-        if logged.is_some() {
-            self.log_unattached(&sent.unbound);
-        }
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let link_errors = events_seen(&sent, &mut detail);
-            self.log(&request, before, end, detail, |evidence| {
+            let unbound = unattached_items(&sent.unbound);
+            self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.expected = expected;
                 evidence.link_errors.extend(link_errors);
             });
@@ -674,14 +672,18 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// Writes the exchange entry of `request`, which ended as `end`, when the host logs it
     /// (`before` is `Some`): with its origin ([`WorkerHost::origin`]), at the step's position
     /// for the procedure's, with the agent's times and `detail`, and what `complete` adds to the
-    /// evidence. A failure of the log never
-    /// reaches the job, a panic included (ADR-347).
+    /// evidence, after the link's `unbound` items read during the exchange
+    /// ([`CommLog::exchange_with`]). A failure of the log never reaches the job, a panic
+    /// included (ADR-347).
+    ///
+    /// [`CommLog::exchange_with`]: crate::comm_log::CommLog::exchange_with
     fn log(
         &mut self,
         request: &[u8],
         before: Option<AgentNow>,
         end: End,
         detail: Detail,
+        unbound: Vec<UnattachedItem>,
         complete: impl FnOnce(&mut Evidence),
     ) {
         let (Some(before), Some(log), Some(origin), Some((tx_id, rx_id))) =
@@ -709,7 +711,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 before_wall_unix_ms: Some(before.wall_unix_ms),
                 end_wall_unix_ms: Some(now.wall_unix_ms),
             };
-            log.exchange(evidence)
+            log.exchange_with(evidence, unbound)
         }));
         let seq = logged.unwrap_or_else(|_| {
             tracing::warn!("writing an exchange entry panicked");
@@ -717,43 +719,6 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         if request.first() == Some(&SID_REQUEST_DOWNLOAD) {
             self.download_seq = seq;
-        }
-    }
-
-    /// Writes each of `unbound` as an `unattached` event (design 8.11 "Link settings for the
-    /// log"): nothing attaches such an item to an exchange yet (ADR-346 item 4). The host calls
-    /// it only for an exchange it logs, and writes them before that exchange's entry, so every
-    /// `unattached` item lies within a logged exchange. A failure of the log never reaches the
-    /// job (ADR-347).
-    fn log_unattached(&self, unbound: &[Unbound]) {
-        let (Some(log), Some(_)) = (&self.comm_log, self.link_ids) else {
-            return;
-        };
-        for Unbound { item, read } in unbound {
-            let data = match &item.data {
-                Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
-                    rx_flag: result.rx_flag.clone(),
-                    bytes: result.data_bytes.clone(),
-                },
-                Some(event_item::Data::ErrorData(error)) => UnattachedData::Error {
-                    event: error_event_name(error.error_event),
-                    extra_error_info: error.extra_error_info,
-                    extra_error_info_name: error.extra_error_info_name.clone(),
-                },
-                _ => continue,
-            };
-            let item = UnattachedItem {
-                link: LOG_LINK,
-                earlier_primitive: item.cop_handle.is_some(),
-                vci_us: item.timestamp,
-                read: *read,
-                data,
-            };
-            let logged =
-                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.unattached(&item)));
-            if logged.is_err() {
-                tracing::warn!("writing an unattached item panicked");
-            }
         }
     }
 
@@ -771,10 +736,45 @@ impl<C: WorkerApi> WorkerHost<C> {
             host_error: Some(host_error_name(error)),
             ..Detail::default()
         };
-        self.log(request, before, end, detail, |evidence| {
+        self.log(request, before, end, detail, Vec::new(), |evidence| {
             evidence.caused_by = caused_by;
         });
     }
+}
+
+/// The communication log's form of the link's `unbound` items: the result and error items, with
+/// a result's CAN identifier taken from its header (four bytes, most significant first), where
+/// the worker split one off.
+fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
+    unbound
+        .iter()
+        .filter_map(|Unbound { item, read }| {
+            let data = match &item.data {
+                Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
+                    rx_flag: result.rx_flag.clone(),
+                    identifier: result
+                        .extra_info
+                        .as_ref()
+                        .and_then(|extra| <[u8; 4]>::try_from(extra.header_bytes.as_slice()).ok())
+                        .map(u32::from_be_bytes),
+                    bytes: result.data_bytes.clone(),
+                },
+                Some(event_item::Data::ErrorData(error)) => UnattachedData::Error {
+                    event: error_event_name(error.error_event),
+                    extra_error_info: error.extra_error_info,
+                    extra_error_info_name: error.extra_error_info_name.clone(),
+                },
+                _ => return None,
+            };
+            Some(UnattachedItem {
+                link: LOG_LINK,
+                earlier_primitive: item.cop_handle.is_some(),
+                vci_us: item.timestamp,
+                read: *read,
+                data,
+            })
+        })
+        .collect()
 }
 
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
@@ -2478,6 +2478,43 @@ mod tests {
         );
         assert!(matches!(lost, Some(Err(HostError::VciLost))));
         assert!(progress.unbound.is_empty());
+    }
+
+    /// The log's form of the unbound items takes a result's CAN identifier from its four header
+    /// bytes, and none from a header of another length.
+    #[test]
+    fn an_unbound_result_names_the_identifier_its_header_carries() {
+        let with_header = |header: &[u8]| Unbound {
+            item: event(
+                None,
+                event_item::Data::ResultData(vci_service_interface::ResultData {
+                    rx_flag: vec![0, 0, 0, 0x09],
+                    extra_info: Some(vci_service_interface::ExtraInfo {
+                        header_bytes: header.to_vec(),
+                        footer_bytes: Vec::new(),
+                    }),
+                    ..Default::default()
+                }),
+            ),
+            read: None,
+        };
+        let items = unattached_items(&[
+            with_header(&[0, 0, 7, 0xE0]),
+            with_header(&[0, 0, 7, 0xE0, 0x12]),
+            Unbound {
+                item: event(None, status(PduComPrimitiveStatus::PduCopstFinished)),
+                read: None,
+            },
+        ]);
+        let identifiers: Vec<_> = items
+            .iter()
+            .map(|item| match &item.data {
+                UnattachedData::Result { identifier, .. } => *identifier,
+                UnattachedData::Error { .. } => panic!("a result"),
+            })
+            .collect();
+        // The status item is not an item for the log.
+        assert_eq!(identifiers, [Some(0x7E0), None]);
     }
 
     /// A send-receive's answer is matched against its declared service and the declared

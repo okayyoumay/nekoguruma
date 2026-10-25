@@ -342,6 +342,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-350](ADR-350-worker-error-events-carry-extra-information-and-refusals-name-their-reason.md) | Worker Error Events Carry Their Extra Information, and Refusals Name Their Reason | Accepted (Decision item 1's agent use of a known code superseded by ADR-351: the worker names the information and the agent does not interpret it) | `vci-service-interface` (`EventItem`, `ErrorDetail`), `iso22900-service`, `j2534-0404-service`, `iso22900-mock`, `docs/rpc-api-guide.md`; design 8.11, ADR-105, ADR-346 |
 | [ADR-351](ADR-351-workers-name-their-extra-error-information.md) | Workers Name Their Extra Error Information, and the Agent Does Not Interpret It | Accepted | `vci-service-interface` (`ErrorData`), `iso22900-service`, `j2534-0404-service`, `ngr-library-resolver`, `agent` host and communication log, `docs/rpc-api-guide.md`; design 8.11, ADR-346 item 6, ADR-350 item 1 |
 | [ADR-352](ADR-352-tx-side-frames-route-by-the-physical-request-id.md) | TX-Side Frames Route by the Unique Response Entry's Physical Request ID | Accepted | `j2534-0404-service` RX routing, `sim-vci` TxDone indications, `docs/j2534-0404-architecture.md`, `docs/rpc-api-guide.md`; design 8.11, ADR-098, ADR-100, ADR-151, ADR-346 item 4 |
+| [ADR-353](ADR-353-event-items-name-the-clock-of-their-time.md) | Event Items Name the Clock of Their Time | Accepted | `vci-service-interface` (`EventItem.timestamp_clock`), `j2534-0404-service` and `iso22900-service` event items, `agent` communication log; design 8.11 "On one clock", design principle 6, ADR-120 |
 
 ## Status Legend
 
@@ -701,6 +702,7 @@ the predecessor repository these ADRs came from.
 - ADR-120
 - ADR-143
 - ADR-239
+- ADR-353
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

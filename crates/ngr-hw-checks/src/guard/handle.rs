@@ -2995,6 +2995,7 @@ mod tests {
         EventItem {
             cop_handle: cop,
             timestamp: 0,
+            timestamp_clock: 0,
             data: Some(data),
             cop_tag: None,
         }

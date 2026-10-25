@@ -176,6 +176,9 @@ pub(super) fn to_proto_event_item(
     Ok(EventItem {
         cop_handle,
         timestamp: borrowed.timestamp(),
+        // Every item is the library's, on its module's one time base
+        // (ISO 22900-2:2022 8.1.6.1; ADR-353).
+        timestamp_clock: vci_service_interface::TimestampClock::Device as i32,
         data,
         cop_tag,
     })

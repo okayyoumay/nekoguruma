@@ -3,6 +3,7 @@ use super::*;
 fn frame(timestamp: u32) -> CllQueueItem {
     CllQueueItem::Frame(ReceivedFrame {
         timestamp,
+        clock: vci_service_interface::TimestampClock::Device,
         data: Vec::new(),
         header_bytes: Vec::new(),
         footer_bytes: Vec::new(),

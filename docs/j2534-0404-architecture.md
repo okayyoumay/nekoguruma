@@ -968,6 +968,16 @@ Naming changes neither when a COP times out nor how it finishes: a timeout with 
 
 A native channel cannot tell apart the other ways a segmented response goes wrong: a flow control that does not come, more flow-control waits than the limit allows, and an overflow the peer reports in its flow control. The adapter reports none of them, so each reaches the client as the same unnamed receive timeout (when the response starts and stalls, as `ISO15765_CF_TIMEOUT`, which therefore says only that a started response did not complete) or as nothing.
 
+Software ISO-TP (`can_channel_mode = "software-isotp"`, ADR-046) sees the flow control itself, so its transmit side tells the three cases apart and names each, with no code (the event codes are unchanged):
+
+| Name | Event | When |
+|------|-------|------|
+| `ISO15765_FC_TIMEOUT` | `PduErrEvtRxTimeout` | No flow-control frame arrived within N_Bs after a first frame or a full block. |
+| `MAX_WAIT_FRAME` | `PduErrEvtProtErr` | More wait flow-control frames in a row than the sender's defensive bound allows (ADR-124). |
+| `ISO15765_FC_OVERFLOW` | `PduErrEvtProtErr` | The peer's flow control reports an overflow. The name is this worker's own; ISO 22900-2:2022 Table D.8 gives no example for it. A reserved flow status is not parsed as a flow control at all, so it is ignored and the wait ends as `ISO15765_FC_TIMEOUT`. |
+
+ISO 22900-2:2022 Table D.8 lists `MAX_WAIT_FRAME` under the transmit error event, while this service raises it as `PduErrEvtProtErr`; only the name is added, the event code is not changed.
+
 ---
 
 ### j2534-0404-mock — Test Mock

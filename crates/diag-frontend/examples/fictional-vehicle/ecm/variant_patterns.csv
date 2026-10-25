@@ -1,0 +1,3 @@
+variant,service,field,expected,note
+ecmV1,softwareVersion.read,softwareVersion,31 2E,"ASCII ""1."""
+ecmV2,softwareVersion.read,softwareVersion,32 2E,"ASCII ""2."""

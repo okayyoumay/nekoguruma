@@ -1,0 +1,13 @@
+conversion,lower,upper,text
+sessionName,0x01,,session.default
+sessionName,0x02,,session.programming
+sessionName,0x03,,session.extended
+selector,0x00,,selector.park
+selector,0x01,,selector.reverse
+selector,0x02,,selector.neutral
+selector,0x03,,selector.drive
+selector,0x04,,selector.manual
+adaptationResult,0x00,,routine.completed
+adaptationResult,0x01,0xFF,routine.failed
+checkResult,0x00,,check.correct
+checkResult,0x01,0xFF,check.incorrect

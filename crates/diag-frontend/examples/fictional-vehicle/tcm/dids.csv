@@ -1,0 +1,13 @@
+variants,name,did,read,write,note
+,activeSession,0xF186,yes,no,
+,sparePartNumber,0xF187,yes,no,
+,softwareVersion,0xF189,yes,no,
+,ecuSerialNumber,0xF18C,yes,no,
+,vin,0xF190,yes,no,
+,systemName,0xF197,yes,no,
+,flashState,0xFD00,yes,no,
+,selectorPosition,0x2000,yes,no,
+,currentGear,0x2001,yes,no,"0 neutral, 1 to 6, 0xFF reverse"
+,fluidTemperature,0x2002,yes,no,
+,inputShaftSpeed,0x2003,yes,no,
+,outputShaftSpeed,0x2004,yes,no,

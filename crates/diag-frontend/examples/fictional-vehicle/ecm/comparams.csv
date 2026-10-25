@@ -1,0 +1,3 @@
+protocol,name,value
+ISO15765,CP_BlockSize,0
+ISO15765,CP_StMin,0

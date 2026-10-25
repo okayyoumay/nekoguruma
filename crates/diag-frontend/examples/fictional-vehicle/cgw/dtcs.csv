@@ -1,0 +1,8 @@
+variants,code,display,text,status
+,0xC10000,U0100-00,dtc.cgw.noEngine,dtcStatus
+,0xC10100,U0101-00,dtc.cgw.noTransmission,dtcStatus
+,0xC12100,U0121-00,dtc.cgw.noBrakes,dtcStatus
+,0xC13100,U0131-00,dtc.cgw.noSteering,dtcStatus
+,0xC14000,U0140-00,dtc.cgw.noBody,dtcStatus
+,0xC15500,U0155-00,dtc.cgw.noCluster,dtcStatus
+,0xD00100,U1001-00,dtc.cgw.powertrainBusOff,dtcStatus

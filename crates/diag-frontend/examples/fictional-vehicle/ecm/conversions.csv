@@ -1,0 +1,12 @@
+name,kind,numerator,denominator,offset,default_text
+sessionName,text-table,,,,value.unknown
+tenMilliseconds,linear,10,1,0,
+quarterRpm,linear,1,4,0,
+minus40,linear,1,1,-40,
+percent255,linear,100,255,0,
+centivolt,linear,1,100,0,
+tenKilopascal,linear,10,1,0,
+yesNo,text-table,,,,value.unknown
+adaptationResult,text-table,,,,value.unknown
+learnState,text-table,,,,value.unknown
+checkResult,text-table,,,,value.unknown

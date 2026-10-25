@@ -6,7 +6,10 @@ format (CSV tables + Starlark) and how `diag-frontend` converts them into the IR
 part is written in Starlark (`starlark-subset.md`).
 
 An example definition of one ECU is in `crates/diag-frontend/examples/example-ecu/`. Every table
-below has rows there, and the examples in this document are taken from it.
+below has rows there, and the examples in this document are taken from it. A fictional vehicle of
+seven ECU definitions, a gateway in front of the others, is in
+`crates/diag-frontend/examples/fictional-vehicle/`, whose `README.md` is its communication
+specification.
 
 ---
 

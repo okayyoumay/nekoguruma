@@ -1,0 +1,24 @@
+key,id,text
+session.default,1001,Default session
+session.programming,1002,Programming session
+session.extended,1003,Extended diagnostic session
+value.unknown,1004,Unknown value
+nrc.subFunctionNotSupported,1021,Sub-function not supported
+nrc.incorrectMessageLength,1022,Incorrect message length or format
+nrc.conditionsNotCorrect,1023,Conditions not correct
+nrc.requestSequenceError,1024,Request sequence error
+nrc.requestOutOfRange,1025,Request out of range
+nrc.securityAccessDenied,1026,Security access denied
+nrc.invalidKey,1028,Invalid key
+nrc.exceededAttempts,1029,Too many false keys
+nrc.delayNotExpired,1030,Security delay still running
+nrc.serviceNotSupportedInSession,1033,Service not supported in the active session
+gateway.locked,1100,Locked
+gateway.unlocked,1101,Unlocked
+dtc.cgw.noEngine,1102,No messages received from the engine controller
+dtc.cgw.noTransmission,1103,No messages received from the transmission controller
+dtc.cgw.noBrakes,1104,No messages received from the brake controller
+dtc.cgw.noSteering,1105,No messages received from the steering controller
+dtc.cgw.noBody,1106,No messages received from the body controller
+dtc.cgw.noCluster,1107,No messages received from the instrument cluster
+dtc.cgw.powertrainBusOff,1108,Powertrain CAN bus off

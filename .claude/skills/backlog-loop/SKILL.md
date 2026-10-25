@@ -1,6 +1,6 @@
 ---
 name: backlog-loop
-description: Work through the nekoguruma backlog one item at a time. Handle open Dependabot pull requests first, then pick the next unblocked item, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. The final report ends with a retrospective on the loop itself. Run only when the maintainer asks for it.
+description: Work through the nekoguruma backlog one item at a time. Handle open Dependabot pull requests first, then pick the next unblocked item that, checked against the code before it is claimed, fits one pull request and leaves no design choice open, implement it in one pull request, run pr-review-loop, hand the PR to the maintainer, and start the next item only after the maintainer merges it. The final report ends with a retrospective on the loop itself. Run only when the maintainer asks for it.
 disable-model-invocation: true
 argument-hint: "[max items, default 3] [lowest priority to include: P1 (default) or P2] | pr=<number of the PR to resume>"
 ---
@@ -143,8 +143,15 @@ pick and the alternative that passes these checks:
 
 - **Blocked.** It has a `Blocked on:` clause. If `next-task` reports the blocker as resolved,
   verify that, remove the clause with the `backlog` skill, and take the item; otherwise skip it.
-- **Too big.** It does not fit in one pull request: record the split with the `backlog` skill and
-  skip it.
+- **Too big or undecided.** Judge this from the code, not from the item's text alone, before
+  claiming it: open the files the item names, estimate the files and lines the change touches
+  against `scripts/classify-pr-risk.sh`'s limits (20 files, 800 lines), and look for a design
+  choice the design document and the ADRs leave open (where the work belongs, an interface it
+  changes, an outcome or rule it would have to invent). If it does not fit one pull request,
+  record the split with the `backlog` skill and skip it. If a choice is open, add `Blocked on:
+  the maintainer's decision on ...` with the `backlog` skill (the forms in `work/README.md`) and
+  skip it. An estimate over the limits is no reason to split when the excess is tests or
+  generated code the one change needs; say so in the PR.
 - **Stale.** `next-task` reports it as already done: close it with the `backlog` skill and skip it.
   Close every other item `next-task` lists as stale the same way.
 
@@ -165,7 +172,7 @@ this repository; ADR-243). The title prefix is set when the PR is created, so th
 when either PR got its label. If one of them has a lower number than this one (two runs started together), mark this one "final" in its run
 state, close it with a comment naming the other, and stop the run. Backlog edits made while
 picking are dropped with it on purpose: the winning run, or a later one, finds the same stale,
-too-big or unblocked items with the same checks and makes those edits again. The final report
+too-big, undecided or unblocked items with the same checks and makes those edits again. The final report
 lists the dropped edits. The same check follows every loop PR this skill opens, including a
 backlog-only PR.
 

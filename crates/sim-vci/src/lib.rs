@@ -711,12 +711,12 @@ impl Bus {
             FUNCTIONAL_REQUEST_ID => Addressing::Functional,
             // No simulated ECU listens on this ID.
             _ => {
-                self.tx_done(channel_id, id);
+                self.tx_done_unanswered(channel_id, id, payload.len());
                 return Ok(());
             }
         };
         if self.ecu.is_none() {
-            self.tx_done(channel_id, id);
+            self.tx_done_unanswered(channel_id, id, payload.len());
             return Ok(());
         }
         self.trace_request(payload);
@@ -755,6 +755,15 @@ impl Bus {
             );
         }
         Ok(())
+    }
+
+    /// Queues the TxDone indication of a message of `payload_len` bytes sent to `can_id`, where
+    /// no simulated ECU listens: a single frame goes out, but a segmented message gets no flow
+    /// control and does not complete, so it gives none (SAE J2534-1 v04.04 clause 8.6).
+    fn tx_done_unanswered(&mut self, channel_id: PassThruUlong, can_id: &[u8], payload_len: usize) {
+        if payload_len <= SINGLE_FRAME_MAX {
+            self.tx_done(channel_id, can_id);
+        }
     }
 
     /// Queues the TxDone indication of a message just sent to `can_id` on the channel that sent

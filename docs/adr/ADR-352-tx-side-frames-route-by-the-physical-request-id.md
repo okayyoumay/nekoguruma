@@ -31,14 +31,21 @@ transmit ID (`tp20_tx_id`); CAN had no counterpart.
    frame whose CAN ID equals an entry's `CP_CanPhysReqId` is routed to that entry's link, with
    that entry's unique response identifier. ADR-151's per-link gate and ADR-098's delivery rules
    then apply as before.
-2. **Only a TX-side frame matches the request ID.** A received frame on a request ID is another
-   tester's request, never this link's response, so it still routes only by the response keys.
-   A TX-side frame whose CAN ID is no entry's request ID is not routed to that link.
+2. **Only a TX-side frame matches the request ID, and only a normally addressed entry's.** A
+   received frame on a request ID is another tester's request, never this link's response, so
+   it still routes only by the response keys. A TX-side frame whose CAN ID is no entry's request
+   ID is not routed to that link. An entry whose requests use extended addressing
+   (`CP_CanPhysReqFormat`) gets no request-ID key: several entries behind one CAN ID may differ
+   only by their address extension, which follows the CAN ID in the frame (clause 8.7.1), and
+   matching the CAN ID alone would give the frame the wrong entry's identifier.
 3. **`CP_CanFuncReqId` is not a key.** It is a channel ComParam, not a unique response table
    ComParam, so a TxDone of a functional request still reaches only links without a table.
 4. **`sim-vci` gives a TxDone indication for each message it sends**, ahead of any response to
    it, with the CAN ID as its data, and no filter applies to it (clause 8.6). A send that fails
-   gives none. This lets tests show a transmit indication end to end.
+   gives none, nor does a segmented message to an ID no simulated ECU answers, which gets no
+   flow control. This lets tests show a transmit indication end to end.
+5. **Scope: a native ISO 15765 channel.** A link in software ISO 15765-2 (ADR-046) runs on a raw
+   CAN channel, where the device gives no TxDone; its routing is unchanged.
 
 ## Consequences
 
@@ -49,5 +56,14 @@ transmit ID (`tp20_tx_id`); CAN had no counterpart.
   allow for an indication more than one exchange could own.
 - A client that reads `PassThruReadMsgs` from `sim-vci` directly now reads a TxDone before each
   response, as on a real ISO 15765 device; the tests that do so read it first.
-- A TxDone of a functional request does not reach a link with a table. No caller sends
-  functional requests on such a link yet.
+- A TxDone of a functional request, or of an extended-addressed one, does not reach a link with
+  a table. No caller sends either on such a link yet.
+- A link with a table now receives its tester present's own TxDone or loopback echo when it is
+  read after ADR-099's discard window, and a sibling that shares the request ID receives it
+  too, since each link's discard covers its own tester present only. A link without a table
+  already received both.
+- The request-ID tier is not width-gated (ADR-222): on a channel that carries both CAN ID
+  widths, an 11-bit and a 29-bit entry with the same numeric request ID both take its TX-side
+  frames.
+- In software ISO 15765-2 the worker still accepts `CP_TransmitIndEnable` though no TxDone
+  comes, so the agent names a transmit indication the link never gives.

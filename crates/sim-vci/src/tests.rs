@@ -601,6 +601,10 @@ fn each_message_sent_gives_a_tx_done_indication_before_its_response() {
         ERR_NO_FLOW_CONTROL
     );
     assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    // A segmented send to an ID no ECU answers gets no flow control and gives none either.
+    assert_eq!(start_filter(f.channel, 0x7E9, 0x7E1).0, STATUS_NOERROR);
+    write(f.channel, 0x7E1, &[0x2E; 20]);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
 }
 
 /// J2534-1 7.2.9: an ISO 15765 channel receives only what a flow-control filter lets in, and a

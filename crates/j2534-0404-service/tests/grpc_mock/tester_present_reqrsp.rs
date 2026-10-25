@@ -1952,16 +1952,16 @@ async fn reqrsp_1_discards_som_herald_of_response() {
 /// deliberately leaves the `UniqueRespIdTable` EMPTY.
 ///
 /// This is the only way to actually exercise `tx_can_id`-gated TX-side
-/// discard in this harness: `route_frame` only routes a CAN ID that is a
-/// UniqueRespIdTable entry's own `CP_CanRespUSDTId`/`CP_CanRespUUDTId` (or,
-/// with an empty table, routes every CAN ID unconditionally with
-/// `unique_resp_identifier = 0`, ADR-007's no-table wildcard mode) --
-/// tester-present's own TX CAN ID (`framed_data`'s leading 4 bytes,
-/// `CP_CanFuncReqId` here) is never itself a table entry, so a physically
-/// addressed CLL WITH a table (e.g. `create_routed_cll`) would have any
-/// frame on its own phys-req CAN ID dropped by routing before it ever
-/// reaches the tester-present discard check at all -- unrelated to whether
-/// the fix under test works. Leaving the table empty routes every CAN ID
+/// discard in this harness: `route_frame` routes a CAN ID only when it is a
+/// UniqueRespIdTable entry's own `CP_CanRespUSDTId`/`CP_CanRespUUDTId`, or,
+/// for a TX-side frame, its normally addressed `CP_CanPhysReqId`
+/// (ADR-352); with an empty table it routes every CAN ID unconditionally
+/// with `unique_resp_identifier = 0` (ADR-007's no-table wildcard mode).
+/// Tester-present's own TX CAN ID here (`framed_data`'s leading 4 bytes,
+/// `CP_CanFuncReqId`) is never a table key, so a CLL WITH a table would
+/// have a frame on it dropped by routing before it ever reaches the
+/// tester-present discard check at all -- unrelated to whether the fix
+/// under test works. Leaving the table empty routes every CAN ID
 /// unconditionally, letting a frame on `CP_CanFuncReqId` actually reach
 /// `poll_rx_inner`'s discard logic.
 async fn create_functional_no_table_cll(

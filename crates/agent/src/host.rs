@@ -546,7 +546,9 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         let handle = self.handle.clone();
         let sent = handle.block_on(self.send_recv_async(request, progress));
-        self.log_unattached(&sent.unbound);
+        if logged.is_some() {
+            self.log_unattached(&sent.unbound);
+        }
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let link_errors = events_seen(&sent, &mut detail);
@@ -719,9 +721,10 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 
     /// Writes each of `unbound` as an `unattached` event (design 8.11 "Link settings for the
-    /// log"), when the host has a log and knows its link: nothing attaches such an item to an
-    /// exchange yet (ADR-346 item 4). They are written before the entry of the exchange during
-    /// which they were read. A failure of the log never reaches the job (ADR-347).
+    /// log"): nothing attaches such an item to an exchange yet (ADR-346 item 4). The host calls
+    /// it only for an exchange it logs, and writes them before that exchange's entry, so every
+    /// `unattached` item lies within a logged exchange. A failure of the log never reaches the
+    /// job (ADR-347).
     fn log_unattached(&self, unbound: &[Unbound]) {
         let (Some(log), Some(_)) = (&self.comm_log, self.link_ids) else {
             return;

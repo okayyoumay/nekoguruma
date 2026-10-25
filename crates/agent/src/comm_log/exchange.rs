@@ -817,6 +817,11 @@ pub(crate) struct Evidence {
     pub flow_control: bool,
     /// Link errors the exchange's own link reported during it, other than its outcome.
     pub link_errors: Vec<LinkErrorKind>,
+    /// Every error in `link_errors` was read before the exchange's final response, in the
+    /// order the link's items were read (not by VCI time). An error read after the response, or
+    /// no order known, leaves it `false`, and the error ends the answer
+    /// ([`LinkState::record`]).
+    pub link_errors_before_answer: bool,
     /// Link errors on other links of the same physical channel: evidence only (H3).
     pub channel_link_errors: Vec<LinkErrorKind>,
     pub answers: Vec<AnswerItem>,
@@ -866,6 +871,7 @@ impl Evidence {
             vci_ended: false,
             flow_control: false,
             link_errors: Vec::new(),
+            link_errors_before_answer: false,
             channel_link_errors: Vec::new(),
             answers: Vec::new(),
             supply_voltage: None,
@@ -998,6 +1004,10 @@ struct LinkEffect {
     restarts_ecu: bool,
     /// A link error of this exchange's link or of another link of its channel.
     link_error: Option<LinkErrorKind>,
+    /// The exchange has a final response and every link error it saw, on its own link, came
+    /// before that response, with none from another link of the channel (which has no order
+    /// against it): the response counts as an answer since the error.
+    answer_after_error: bool,
 }
 
 /// Whether `request` is one whose acceptance ends the earlier requests' evidence: a
@@ -1105,7 +1115,9 @@ impl LinkState {
     /// - A link error, on the exchange's own link or on another link of its physical channel,
     ///   ends the matched answers and the count since the error, not the owed requests
     ///   ([`LinkState::channel_link_error`], which the log also calls on the states of the
-    ///   channel's other targets).
+    ///   channel's other targets). An answer that every own-link error of its exchange preceded
+    ///   (`Evidence::link_errors_before_answer`) counts as an answer since that error; any
+    ///   other error ends the answer of its exchange.
     /// - An accepted DiagnosticSessionControl (0x10) or ECUReset (0x11) of any type (ADR-346
     ///   item 6), or one sent with its positive response suppressed and classified `none`, ends
     ///   the matched answers and the owed requests: all of them when its answer could belong to
@@ -1120,6 +1132,11 @@ impl LinkState {
             && ((effect.positive && effect.final_response)
                 || (effect.suppressed && entry.classification == Classification::None));
         let unsure_restart = effect.restarts_ecu && effect.unusable;
+        // An error that came before the final response leaves the response counted since it:
+        // the error is applied first. Any other error ends the answer of its exchange.
+        if let (true, Some(kind)) = (effect.answer_after_error, effect.link_error) {
+            self.channel_link_error(entry.seq, kind);
+        }
         if effect.this_exchange {
             self.answered += 1;
             self.answered_since_error += 1;
@@ -1127,7 +1144,7 @@ impl LinkState {
                 *self.matched.entry(effect.key.clone()).or_insert(0) += 1;
             }
         }
-        if let Some(kind) = effect.link_error {
+        if let (false, Some(kind)) = (effect.answer_after_error, effect.link_error) {
             self.channel_link_error(entry.seq, kind);
         }
         if accepting {
@@ -1256,6 +1273,10 @@ impl ExchangeEntry {
                     .or_else(|| evidence.channel_link_errors.first())
                     .copied(),
             },
+            answer_after_error: evidence.link_errors_before_answer
+                && !evidence.link_errors.is_empty()
+                && evidence.channel_link_errors.is_empty()
+                && evidence.final_response().is_some(),
         };
         Self {
             event: EVENT,
@@ -2436,6 +2457,53 @@ mod tests {
                 history.answered_same_match
             ),
             (1, 0, 0)
+        );
+    }
+
+    #[test]
+    fn an_answer_after_an_error_of_its_exchange_counts_since_that_error() {
+        let probe = read([0xF1, 0x86], End::NoResponse);
+        let counts_after = |before_answer: bool| {
+            let mut state = LinkState::default();
+            let mut exchange = read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1]));
+            exchange.link_errors = vec![LinkErrorKind::Frame];
+            exchange.link_errors_before_answer = before_answer;
+            log(&mut state, 1, exchange);
+            assert_eq!(state.last_link_error(), Some((1, LinkErrorKind::Frame)));
+            let history = state.history_for(&probe);
+            (
+                history.answered,
+                history.answered_since_error,
+                history.answered_same_match,
+            )
+        };
+        // The answer came after the error: it is an answer since the error and a matched answer.
+        assert_eq!(counts_after(true), (1, 1, 1));
+        // The error came after the answer (or no order is known): it ends the answer.
+        assert_eq!(counts_after(false), (1, 0, 0));
+        // An error of another link of the channel has no order against the answer: it ends it.
+        let mut state = LinkState::default();
+        let mut exchange = read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1]));
+        exchange.link_errors = vec![LinkErrorKind::Frame];
+        exchange.link_errors_before_answer = true;
+        exchange.channel_link_errors = vec![LinkErrorKind::Receive];
+        log(&mut state, 1, exchange);
+        assert_eq!(state.history_for(&probe).answered_since_error, 0);
+        // Earlier matched answers still end with the error.
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            read([0xF1, 0x90], End::Positive(vec![0x62, 0xF1, 0x90, 1])),
+        );
+        let mut exchange = read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1]));
+        exchange.link_errors = vec![LinkErrorKind::Frame];
+        exchange.link_errors_before_answer = true;
+        log(&mut state, 2, exchange);
+        let history = state.history_for(&read([0xF1, 0x90], End::NoResponse));
+        assert_eq!(
+            (history.answered_since_error, history.answered_same_match),
+            (1, 0)
         );
     }
 

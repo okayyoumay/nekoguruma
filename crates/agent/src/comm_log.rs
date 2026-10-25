@@ -306,11 +306,10 @@ struct UnattachedEntry<'a> {
     item: &'static str,
     /// `none` or `earlier`.
     primitive: &'static str,
+    /// The item's VCI time, raw. It names no clock (design 8.11 "On one clock"): the worker
+    /// does not say which clock an item's time is on, and the agent does not infer it from the
+    /// worker (design principle 6).
     vci_us: u32,
-    /// The clock `vci_us` is on, when the job was told its VCI's API (design 8.11 "On one
-    /// clock").
-    #[serde(skip_serializing_if = "Option::is_none")]
-    clock: Option<exchange::Clock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<ReadAt>,
     /// The result item's RxFlag in hex.
@@ -336,8 +335,7 @@ struct ReadAt {
 }
 
 impl<'a> UnattachedEntry<'a> {
-    fn of(item: &'a UnattachedItem, api: Option<crate::launch::Api>) -> Self {
-        use crate::launch::Api;
+    fn of(item: &'a UnattachedItem) -> Self {
         use redaction::{Direction, redact};
         let mut entry = Self {
             link: item.link,
@@ -348,7 +346,6 @@ impl<'a> UnattachedEntry<'a> {
                 "none"
             },
             vci_us: item.vci_us,
-            clock: None,
             agent: item.read.map(|read| ReadAt {
                 epoch: read.epoch,
                 read_us: read.monotonic_us,
@@ -376,8 +373,6 @@ impl<'a> UnattachedEntry<'a> {
                 entry.item = kind;
                 entry.rx_flag = Some(to_hex(rx_flag));
                 entry.message = Some(redact(direction, bytes));
-                // Frame times are the VCI's on either API; a J2534 worker times its errors.
-                entry.clock = api.map(|_| exchange::Clock::Device);
             }
             UnattachedData::Error {
                 event,
@@ -387,10 +382,6 @@ impl<'a> UnattachedEntry<'a> {
                 entry.error_event = Some(event);
                 entry.extra_error_info = *extra_error_info;
                 entry.extra_error_info_name = extra_error_info_name.as_deref();
-                entry.clock = api.map(|api| match api {
-                    Api::J2534 => exchange::Clock::Worker,
-                    Api::Dpdu => exchange::Clock::Device,
-                });
             }
         }
         entry
@@ -1091,7 +1082,7 @@ impl CommLog {
     /// event's `seq`; `None` once the log has failed.
     pub(crate) fn unattached(&self, item: &UnattachedItem) -> Option<u64> {
         let mut inner = self.lock();
-        let event = Event::Unattached(UnattachedEntry::of(item, inner.vci.map(|vci| vci.api)));
+        let event = Event::Unattached(UnattachedEntry::of(item));
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -1505,9 +1496,9 @@ mod tests {
     }
 
     /// Design 8.11 "Link settings for the log": an item no exchange takes is an `unattached`
-    /// event that says what it is by its RxFlag (ISO 22900-2:2022 D.2.2), carries its message as
-    /// every message is carried (a loopback echoes what the tester sent, so a key in it stays
-    /// hidden), and tags its VCI time with the clock it is on.
+    /// event that says what it is by its RxFlag (ISO 22900-2:2022 D.2.2) and carries its message
+    /// as every message is carried (a loopback echoes what the tester sent, so a key in it stays
+    /// hidden). Its VCI time names no clock, whatever API the job was told (design principle 6).
     #[test]
     fn unattached_items_say_what_they_are_and_keep_secrets_out() {
         let dir = dir();
@@ -1577,22 +1568,21 @@ mod tests {
             [
                 serde_json::json!({"event": "unattached", "link": 1,
                     "item": "transmit_indication", "primitive": "none", "vci_us": 42,
-                    "clock": "device", "agent": agent, "rx_flag": "00000009",
+                    "agent": agent, "rx_flag": "00000009",
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "loopback",
-                    "primitive": "none", "vci_us": 42, "clock": "device", "agent": agent,
+                    "primitive": "none", "vci_us": 42, "agent": agent,
                     "rx_flag": "00000001",
                     "message": {"clear": "2702", "data": {"kind": "secret", "len": 2}}}),
                 serde_json::json!({"event": "unattached", "link": 1,
                     "item": "start_of_message", "primitive": "none", "vci_us": 42,
-                    "clock": "device", "agent": agent, "rx_flag": "00000002",
+                    "agent": agent, "rx_flag": "00000002",
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "received",
-                    "primitive": "earlier", "vci_us": 42, "clock": "device", "agent": agent,
+                    "primitive": "earlier", "vci_us": 42, "agent": agent,
                     "rx_flag": "", "message": {"clear": "62f19041"}}),
-                // A J2534 worker's error times are its own clock's.
                 serde_json::json!({"event": "unattached", "link": 1, "item": "error_event",
-                    "primitive": "earlier", "vci_us": 43, "clock": "worker",
+                    "primitive": "earlier", "vci_us": 43,
                     "error_event": "PDU_ERR_EVT_RX_TIMEOUT",
                     "extra_error_info_name": "ISO15765_CF_TIMEOUT"}),
             ]
@@ -1633,9 +1623,9 @@ mod tests {
         }
     }
 
-    /// Without the VCI's API, an unattached item's time has no clock.
+    /// An unattached error event gives its extra error code as the worker gave it (ADR-351).
     #[test]
-    fn an_unattached_item_of_an_unknown_api_has_no_clock() {
+    fn an_unattached_error_gives_its_extra_error_code() {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();

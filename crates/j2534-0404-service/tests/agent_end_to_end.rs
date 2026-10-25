@@ -635,7 +635,7 @@ fn assert_comm_log(setup: &CommLogSetup) {
             indication["agent"]["read_us"].as_u64().is_some(),
             "{indication}"
         );
-        // The job was not told its API, so the time names no clock.
+        // The worker does not say which clock an item's time is on, so the time names none.
         assert!(indication.get("clock").is_none(), "{indication}");
     }
     let entries: Vec<&serde_json::Value> = lines

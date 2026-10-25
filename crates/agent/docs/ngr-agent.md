@@ -365,8 +365,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
   `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), the raw
-  `vci_us` with its `clock` when the job was told its API (`device` for frames, and for a D-PDU
-  worker's errors; `worker` for a J2534 worker's errors), the agent's `epoch` and `read_us`,
+  `vci_us`, which names no clock since the worker does not say which clock an item's time is on
+  and the agent does not infer it from the worker (design principle 6), the agent's `epoch` and
+  `read_us`,
   and for a result its `rx_flag` in hex and its `message`, redacted as a request for a transmit
   indication or a loopback and as a response otherwise; for an error event its name and its
   extra error information as the worker gave it (ADR-351).

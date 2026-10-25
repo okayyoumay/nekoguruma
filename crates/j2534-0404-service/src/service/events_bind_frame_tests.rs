@@ -107,6 +107,7 @@ fn can_key(unique_resp_identifier: u32, usdt: Option<u32>, uudt: Option<u32>) ->
         j1939_source_address: None,
         tp20_rx_id: None,
         tp20_tx_id: None,
+        can_phys_req_id: None,
         ecu_resp_source_addr: None,
     }
 }
@@ -261,6 +262,7 @@ fn route_frame_matches_j1939_source_address() {
             j1939_source_address: Some(0x80),
             tp20_rx_id: None,
             tp20_tx_id: None,
+            can_phys_req_id: None,
             ecu_resp_source_addr: None,
         }],
         ..test_entry(1, Vec::new(), Vec::new())
@@ -275,6 +277,42 @@ fn route_frame_matches_j1939_source_address() {
     assert_eq!(
         route_frame(&entry, Some(0x18DA_2181), None, true, false),
         None
+    );
+}
+
+/// ADR-352: a CAN entry's `CP_CanPhysReqId` routes a TX-side frame (a
+/// TxDone indication or a loopback echo of the tester's own request, which
+/// carries the request's CAN ID, SAE J2534-1 v04.04 clause 8.6) to the
+/// entry's URID, and never a received frame on that ID, nor a TX-side frame
+/// of another request ID.
+#[test]
+fn route_frame_matches_a_tx_side_frame_by_the_entry_s_physical_request_id() {
+    let entry = CllRxEntry {
+        unique_resp_ids: vec![UniqueRespIdKey {
+            can_phys_req_id: Some(0x7E0),
+            ..can_key(5, Some(0x7E8), None)
+        }],
+        ..test_entry(1, Vec::new(), Vec::new())
+    };
+    assert_eq!(
+        route_frame(&entry, Some(0x7E0), None, false, true),
+        Some(5),
+        "the TxDone of our request is routed to its entry"
+    );
+    assert_eq!(
+        route_frame(&entry, Some(0x7E8), None, true, false),
+        Some(5),
+        "the response still routes by CP_CanRespUSDTId"
+    );
+    assert_eq!(
+        route_frame(&entry, Some(0x7E0), None, true, false),
+        None,
+        "a received frame on our request ID is another tester's request"
+    );
+    assert_eq!(
+        route_frame(&entry, Some(0x7E1), None, false, true),
+        None,
+        "a sibling's TxDone on another request ID is not ours"
     );
 }
 
@@ -297,6 +335,7 @@ fn route_frame_matches_tp20_tx_id_as_well_as_rx_id() {
             j1939_source_address: None,
             tp20_rx_id: Some(0x0321),
             tp20_tx_id: Some(0x1000_0321),
+            can_phys_req_id: None,
             ecu_resp_source_addr: None,
         }],
         ..test_entry(1, Vec::new(), Vec::new())
@@ -340,6 +379,7 @@ fn route_frame_never_matches_tp20_tx_id_on_a_non_tx_side_frame() {
             j1939_source_address: None,
             tp20_rx_id: Some(0x0321),
             tp20_tx_id: Some(0x0322),
+            can_phys_req_id: None,
             ecu_resp_source_addr: None,
         }],
         ..test_entry(1, Vec::new(), Vec::new())
@@ -381,6 +421,7 @@ fn route_frame_never_matches_tp20_rx_id_on_a_tx_side_frame() {
             j1939_source_address: None,
             tp20_rx_id: Some(0x1000_0321),
             tp20_tx_id: Some(0x0322),
+            can_phys_req_id: None,
             ecu_resp_source_addr: None,
         }],
         ..test_entry(1, Vec::new(), Vec::new())
@@ -430,6 +471,7 @@ fn route_frame_matched_uudt_false_for_a_j1939_sa_match() {
             j1939_source_address: Some(0x80),
             tp20_rx_id: None,
             tp20_tx_id: None,
+            can_phys_req_id: None,
             ecu_resp_source_addr: None,
         }],
         ..test_entry(1, Vec::new(), Vec::new())
@@ -454,6 +496,7 @@ fn route_frame_uudt_only_ignores_a_j1939_sa_only_entry() {
             j1939_source_address: Some(0x80),
             tp20_rx_id: None,
             tp20_tx_id: None,
+            can_phys_req_id: None,
             ecu_resp_source_addr: None,
         }],
         ..test_entry(1, Vec::new(), Vec::new())
@@ -477,6 +520,7 @@ fn sa_key(unique_resp_identifier: u32, ecu_resp_source_addr: u8) -> UniqueRespId
         j1939_source_address: None,
         tp20_rx_id: None,
         tp20_tx_id: None,
+        can_phys_req_id: None,
         ecu_resp_source_addr: Some(u32::from(ecu_resp_source_addr)),
     }
 }

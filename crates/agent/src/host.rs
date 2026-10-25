@@ -17,11 +17,11 @@ use vci_service_interface::{
     event_item, event_notification,
 };
 
-use crate::comm_log::AgentNow;
 use crate::comm_log::exchange::{
     AgentTimes, At, Detail, End, Evidence, Expected, LinkErrorKind, Origin, RefusalCause,
     SectionAttrs, SourcePos, Target, UnknownCause,
 };
+use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
 
@@ -546,6 +546,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         let handle = self.handle.clone();
         let sent = handle.block_on(self.send_recv_async(request, progress));
+        self.log_unattached(&sent.unbound);
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let link_errors = events_seen(&sent, &mut detail);
@@ -603,11 +604,14 @@ impl<C: WorkerApi> WorkerHost<C> {
                     error_events: Vec::new(),
                     rx_timeout: None,
                     vci_lost: None,
+                    unbound: Vec::new(),
                 };
             }
         };
 
         let events = &mut self.link.events;
+        let log = self.comm_log.as_ref();
+        let progress = &mut progress;
         let wait = async {
             loop {
                 let notification = events
@@ -618,7 +622,15 @@ impl<C: WorkerApi> WorkerHost<C> {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
-                if let Some(done) = progress.on_notification(notification.event_data, cop) {
+                let kept = progress.unbound.len();
+                let done = progress.on_notification(notification.event_data, cop);
+                if progress.unbound.len() > kept {
+                    let read = log.filter(|log| log.is_open()).map(|log| log.now());
+                    for unbound in &mut progress.unbound[kept..] {
+                        unbound.read = read;
+                    }
+                }
+                if let Some(done) = done {
                     return done;
                 }
             }
@@ -630,9 +642,10 @@ impl<C: WorkerApi> WorkerHost<C> {
         Sent {
             result,
             started: true,
-            error_events: progress.errors,
-            rx_timeout: progress.rx_timeout,
-            vci_lost: progress.vci_lost,
+            error_events: std::mem::take(&mut progress.errors),
+            rx_timeout: progress.rx_timeout.take(),
+            vci_lost: progress.vci_lost.take(),
+            unbound: std::mem::take(&mut progress.unbound),
         }
     }
 
@@ -705,6 +718,42 @@ impl<C: WorkerApi> WorkerHost<C> {
         }
     }
 
+    /// Writes each of `unbound` as an `unattached` event (design 8.11 "Link settings for the
+    /// log"), when the host has a log and knows its link: nothing attaches such an item to an
+    /// exchange yet (ADR-346 item 4). They are written before the entry of the exchange during
+    /// which they were read. A failure of the log never reaches the job (ADR-347).
+    fn log_unattached(&self, unbound: &[Unbound]) {
+        let (Some(log), Some(_)) = (&self.comm_log, self.link_ids) else {
+            return;
+        };
+        for Unbound { item, read } in unbound {
+            let data = match &item.data {
+                Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
+                    rx_flag: result.rx_flag.clone(),
+                    bytes: result.data_bytes.clone(),
+                },
+                Some(event_item::Data::ErrorData(error)) => UnattachedData::Error {
+                    event: error_event_name(error.error_event),
+                    extra_error_info: error.extra_error_info,
+                    extra_error_info_name: error.extra_error_info_name.clone(),
+                },
+                _ => continue,
+            };
+            let item = UnattachedItem {
+                link: LOG_LINK,
+                earlier_primitive: item.cop_handle.is_some(),
+                vci_us: item.timestamp,
+                read: *read,
+                data,
+            };
+            let logged =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.unattached(&item)));
+            if logged.is_err() {
+                tracing::warn!("writing an unattached item panicked");
+            }
+        }
+    }
+
     /// Writes the entry of a request the agent refused before sending it, for `error`
     /// (`not_sent`, design 8.11). `caused_by` is the entry whose response caused the refusal.
     fn log_refused(
@@ -748,13 +797,24 @@ impl ErrorSeen {
 
 /// How a primitive ended: its outcome, whether it started (a failure to start it sent
 /// nothing), the error events it reported before it ended, in order, the receive timeout if the
-/// worker reported one, and the lost VCI if the event stream reported it.
+/// worker reported one, the lost VCI if the event stream reported it, and the items of no
+/// primitive or of an earlier one read meanwhile.
 struct Sent {
     result: Result<Vec<u8>, HostError>,
     started: bool,
     error_events: Vec<ErrorSeen>,
     rx_timeout: Option<ErrorSeen>,
     vci_lost: Option<ErrorSeen>,
+    unbound: Vec<Unbound>,
+}
+
+/// An item of the link read while a primitive ran that is not that primitive's: one of no
+/// primitive or of an earlier one (design 8.11 "Link settings for the log"), with the agent's
+/// clocks when it was read, if the host has a log.
+#[derive(Debug)]
+struct Unbound {
+    item: EventItem,
+    read: Option<AgentNow>,
 }
 
 /// The error events the worker reported in an exchange beside the one it ended on: faults seen
@@ -1152,6 +1212,9 @@ struct Progress {
     rx_timeout: Option<ErrorSeen>,
     /// The lost VCI the worker reported, which ends the exchange at once.
     vci_lost: Option<ErrorSeen>,
+    /// The result and error items of no primitive or of an earlier one, in order, for the
+    /// communication log. Status and information items are not kept.
+    unbound: Vec<Unbound>,
 }
 
 impl Progress {
@@ -1166,6 +1229,7 @@ impl Progress {
             errors: Vec::new(),
             rx_timeout: None,
             vci_lost: None,
+            unbound: Vec::new(),
         })
     }
 
@@ -1180,6 +1244,7 @@ impl Progress {
             errors: Vec::new(),
             rx_timeout: None,
             vci_lost: None,
+            unbound: Vec::new(),
         }
     }
 
@@ -1225,8 +1290,15 @@ impl Progress {
             self.vci_lost = Some(ErrorSeen::of(data));
             return Some(Err(HostError::VciLost));
         }
-        // Events of earlier primitives, and of none, are not this request's.
+        // Events of earlier primitives, and of none, are not this request's; their results and
+        // errors are kept for the communication log.
         if item.cop_handle != Some(cop) {
+            if matches!(
+                item.data,
+                Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_))
+            ) {
+                self.unbound.push(Unbound { item, read: None });
+            }
             return None;
         }
         match item.data {
@@ -1749,6 +1821,7 @@ mod tests {
             error_events: error_events.iter().copied().map(seen).collect(),
             rx_timeout: rx_timeout.then(|| seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
             vci_lost: None,
+            unbound: Vec::new(),
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
@@ -1828,6 +1901,7 @@ mod tests {
             error_events: Vec::new(),
             rx_timeout: None,
             vci_lost: None,
+            unbound: Vec::new(),
         };
         let given = |sent: Sent| {
             let (_, mut detail) =
@@ -2335,7 +2409,7 @@ mod tests {
             ..COP
         };
         let got = outcome(vec![
-            // An earlier primitive's late events, and events of no primitive, are skipped.
+            // An earlier primitive's late events, and events of no primitive, do not end it.
             event(Some(other), result(&[0x50, 0x01])),
             event(Some(other), status(PduComPrimitiveStatus::PduCopstFinished)),
             event(None, result(&[0x7F, 0x10, 0x11])),
@@ -2346,6 +2420,61 @@ mod tests {
             event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
         ]);
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+    }
+
+    /// Design 8.11 "Link settings for the log": the result and error items of no primitive or
+    /// of an earlier one are kept, in order, for the communication log; status items and the
+    /// primitive's own items are not.
+    #[test]
+    fn items_of_no_primitive_or_an_earlier_one_are_kept_for_the_log() {
+        let other = ComPrimitiveHandle {
+            cop_handle: 6,
+            ..COP
+        };
+        let tx_done = event_item::Data::ResultData(vci_service_interface::ResultData {
+            rx_flag: vec![0, 0, 0, 0x09],
+            ..Default::default()
+        });
+        let error = |code: PduErrorEvent| {
+            event_item::Data::ErrorData(ErrorData {
+                error_event: code as i32,
+                extra_error_info: Some(3),
+                extra_error_info_name: None,
+            })
+        };
+        let kept = [
+            event(None, tx_done),
+            event(Some(other), result(&[0x50, 0x01])),
+            event(None, error(PduErrorEvent::PduErrEvtFrameStruct)),
+            event(Some(other), error(PduErrorEvent::PduErrEvtRxTimeout)),
+        ];
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let mut events = vec![
+            kept[0].clone(),
+            event(Some(other), status(PduComPrimitiveStatus::PduCopstFinished)),
+            kept[1].clone(),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstExecuting)),
+            kept[2].clone(),
+            event(Some(COP), result(&[0x62, 0xF1, 0x90])),
+            kept[3].clone(),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ];
+        let got = events
+            .drain(..)
+            .find_map(|item| progress.on_event(item, COP));
+        assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+        let unbound: Vec<_> = progress.unbound.iter().map(|u| u.item.clone()).collect();
+        assert_eq!(unbound, kept);
+        assert!(progress.errors.is_empty() && progress.rx_timeout.is_none());
+
+        // A lost VCI of no primitive ends the exchange and is its outcome, not an unbound item.
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let lost = progress.on_event(
+            event(None, error(PduErrorEvent::PduErrEvtLostCommToVci)),
+            COP,
+        );
+        assert!(matches!(lost, Some(Err(HostError::VciLost))));
+        assert!(progress.unbound.is_empty());
     }
 
     /// A send-receive's answer is matched against its declared service and the declared

@@ -150,10 +150,12 @@ suppressed, silent ECU) never appears, nor does one still being delayed when the
 
 Simplifications:
 
-- No TxDone indications or loopback messages are generated, and segmentation itself (flow
-  control frames, separation time) is not simulated: a request or response of any length moves
-  as one message.
-- `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus
+- Each message sent queues its TxDone indication (`RxStatus` `TX_MSG_TYPE` and `TX_INDICATION`,
+  the CAN ID as its data, SAE J2534-1 v04.04 clause 8.6) ahead of any response to it, readable
+  at once and passing no filter; a send that fails queues none (ADR-352). No loopback messages
+  are generated, and segmentation itself (flow control frames, separation time) is not
+  simulated: a request or response of any length moves as one message.
+- A response's `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus
   (after its delay), in microseconds since the library was first used.
 
 ## Fault injection

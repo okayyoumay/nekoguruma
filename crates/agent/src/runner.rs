@@ -15468,7 +15468,11 @@ def main():
             comparam("CP_TesterPresentHandling")["set_by"],
             "library_default"
         );
-        assert_eq!(opened["transmit_confirmation"], serde_json::json!([]));
+        // The library accepted `CP_TransmitIndEnable`.
+        assert_eq!(
+            opened["transmit_confirmation"],
+            serde_json::json!(["transmit_indication"])
+        );
         assert_eq!(opened["response_times_judged"], false);
         assert!(opened["forwards_pendings"].is_null());
         assert_eq!(opened["timing_margin"]["source"], "none");

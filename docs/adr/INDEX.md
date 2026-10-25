@@ -98,7 +98,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-097](ADR-097-iso22900-2-rxflag-start-of-message.md) | ISO 22900-2 RxFlag START_OF_MESSAGE Forwarding | **Superseded by ADR-098** | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-098](ADR-098-rxflag-all-status-bits.md) | ISO 22900-2 RxFlag Forwards All 5 Low RxStatus Bits | Accepted (amended by ADR-100, ADR-151; content-frame gate extended by ADR-172) | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-099](ADR-099-tester-present-indication-frame-discard.md) | Tester-Present Discard Extends to Indication Frames (SOM / TX_DONE / Loopback), and Now Windows on Every Successful Send | Accepted (amends ADR-088, ADR-093; amended by ADR-100) | `j2534-0404-service` service, events |
-| [ADR-100](ADR-100-cop-registry-two-tier-binding.md) | Two-Tier ComPrimitive Response-Binding Registry (ISO 22900-2 §9.2.6.3.4) | Accepted (amended by ADR-101, ADR-151; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182) | `j2534-0404-service` service, events, rpc_primitive, rpc_link |
+| [ADR-100](ADR-100-cop-registry-two-tier-binding.md) | Two-Tier ComPrimitive Response-Binding Registry (ISO 22900-2 §9.2.6.3.4) | Accepted (amended by ADR-101, ADR-151, ADR-352; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182) | `j2534-0404-service` service, events, rpc_primitive, rpc_link |
 | [ADR-101](ADR-101-cross-channel-registrant-writeback.md) | Cross-Channel Registrant Bookkeeping Uses Delta/Monotone Merge, Not Absolute Overwrite | Accepted (amends ADR-100) | `j2534-0404-service` events |
 | [ADR-102](ADR-102-p2star-reload-per-occurrence-rc78-ceiling-reinstated.md) | CP_P2Star Reloads Per 0x78; CP_RC78CompletionTimeout Reinstated as Total Ceiling | Accepted (amends ADR-056, ADR-057) | `j2534-0404-service` service, events, comparam_defaults, service_params |
 | [ADR-103](ADR-103-paramitem-name-based-addressing.md) | ParamItem Name-Based Addressing for Set-Family RPCs | Accepted | `vci-service-interface`, `iso22900-service`, `j2534-0404-service` |
@@ -341,6 +341,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-251 |
 | [ADR-350](ADR-350-worker-error-events-carry-extra-information-and-refusals-name-their-reason.md) | Worker Error Events Carry Their Extra Information, and Refusals Name Their Reason | Accepted (Decision item 1's agent use of a known code superseded by ADR-351: the worker names the information and the agent does not interpret it) | `vci-service-interface` (`EventItem`, `ErrorDetail`), `iso22900-service`, `j2534-0404-service`, `iso22900-mock`, `docs/rpc-api-guide.md`; design 8.11, ADR-105, ADR-346 |
 | [ADR-351](ADR-351-workers-name-their-extra-error-information.md) | Workers Name Their Extra Error Information, and the Agent Does Not Interpret It | Accepted | `vci-service-interface` (`ErrorData`), `iso22900-service`, `j2534-0404-service`, `ngr-library-resolver`, `agent` host and communication log, `docs/rpc-api-guide.md`; design 8.11, ADR-346 item 6, ADR-350 item 1 |
+| [ADR-352](ADR-352-tx-side-frames-route-by-the-physical-request-id.md) | TX-Side Frames Route by the Unique Response Entry's Physical Request ID | Accepted | `j2534-0404-service` RX routing, `sim-vci` TxDone indications, `docs/j2534-0404-architecture.md`, `docs/rpc-api-guide.md`; design 8.11, ADR-098, ADR-100, ADR-151, ADR-346 item 4 |
 
 ## Status Legend
 
@@ -399,7 +400,7 @@ the predecessor repository these ADRs came from.
 - ADR-061 (superseded)
 - ADR-097 (superseded)
 - ADR-098 (residual closed by ADR-143; RxFlag byte-1 scheme extended by ADR-146; amended by ADR-151; ADR-061-inherited RxStatus-CAN-ID premise narrowed by ADR-222)
-- ADR-100 (amended by ADR-151; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182)
+- ADR-100 (amended by ADR-151 and ADR-352; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182)
 - ADR-101
 - ADR-148 (amended)
 - ADR-151
@@ -573,6 +574,7 @@ the predecessor repository these ADRs came from.
 - ADR-184
 - ADR-203
 - ADR-222
+- ADR-352
 
 ### CAN Channel Modes
 - ADR-046

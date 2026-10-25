@@ -10,6 +10,7 @@ enum MatchKind {
     J1939Sa,
     Tp20RxId,
     Tp20TxId,
+    PhysReqId,
 }
 
 /// ADR-222: disambiguates a numeric CAN ID's configured width when the SAME
@@ -357,6 +358,13 @@ pub(super) struct UniqueRespIdKey {
     /// TX-side one (`RxStatus`'s `TX_MSG_TYPE`/`TX_INDICATION` bits), never
     /// for ordinary received content.
     pub(super) tp20_tx_id: Option<u32>,
+    /// `CP_CanPhysReqId` (ADR-352): the CAN ID this entry's requests go to.
+    /// A TxDone indication or a loopback echo of the tester's own send
+    /// carries that ID, not the response ID (SAE J2534-1 v04.04 clause 8.6),
+    /// so `matched` checks this field only for a TX-side frame -- the
+    /// CAN counterpart of `tp20_tx_id`. A received frame addressed to it is
+    /// another tester's request, never this entry's response.
+    pub(super) can_phys_req_id: Option<u32>,
     /// `CP_EcuRespSourceAddress` (ADR-203): the responding ECU's KWP
     /// (ISO9141/ISO14230) or SAE J1850 (VPW/PWM) source address, `[0,
     /// 0xFF]` (a single wire byte). Unlike every other field on this
@@ -440,6 +448,8 @@ impl UniqueRespIdKey {
             Some(MatchKind::Tp20RxId)
         } else if is_tx_side && self.tp20_tx_id == Some(can_id) {
             Some(MatchKind::Tp20TxId)
+        } else if is_tx_side && self.can_phys_req_id == Some(can_id) {
+            Some(MatchKind::PhysReqId)
         } else {
             None
         }
@@ -1033,6 +1043,7 @@ pub(super) async fn build_cll_rx_entries(
                             j1939_source_address: j1939_sa,
                             tp20_rx_id: None,
                             tp20_tx_id: None,
+                            can_phys_req_id: e.params.unum32.get(&PARAM_CAN_PHYS_REQ_ID).copied(),
                             ecu_resp_source_addr: ecu_sa,
                         })
                 })
@@ -1097,6 +1108,7 @@ pub(super) async fn build_cll_rx_entries(
                     j1939_source_address: None,
                     tp20_rx_id,
                     tp20_tx_id,
+                    can_phys_req_id: None,
                     ecu_resp_source_addr: None,
                 });
             }

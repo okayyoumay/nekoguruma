@@ -1718,3 +1718,42 @@ async fn software_isotp_mode_wrong_sequence_number_names_the_error_and_the_deadl
     drop(events);
     server.shutdown().await;
 }
+
+/// A single frame from the response ID ends an unfinished message as a first
+/// frame does: the reassembly is dropped with no error, so N_Cr passing
+/// afterwards raises nothing, and the single frame answers the COP.
+#[tokio::test]
+#[serial]
+async fn software_isotp_mode_single_frame_drops_an_unfinished_reassembly() {
+    let (server, mut events, _cop_handle) = software_isotp_response_started(
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            // N_Cr leaves the single frame half a second to arrive on a
+            // slow runner; the wait below outlasts it by as much again.
+            (CP_N_CR, 500_000),
+            (j2534_0404::P2_MAX, 3_000_000),
+        ],
+        false,
+        0x62,
+    )
+    .await;
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x03, 0x62, 0xF1, 0x90]),
+        j2534_0404::CAN,
+    );
+
+    let mut error = None;
+    let got_error = wait_for_event(&mut events, 1000, |item| {
+        if matches!(item.data, Some(event_item::Data::ErrorData(_))) {
+            error = Some(item.clone());
+            return true;
+        }
+        false
+    })
+    .await;
+    assert!(!got_error, "no error past N_Cr: {error:?}");
+
+    drop(events);
+    server.shutdown().await;
+}

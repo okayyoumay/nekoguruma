@@ -550,8 +550,10 @@ impl<C: WorkerApi> WorkerHost<C> {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let link_errors = events_seen(&sent, &mut detail);
             let unbound = unattached_items(&sent.unbound);
+            let vci_ended = sent.rx_timeout.is_some();
             self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.expected = expected;
+                evidence.vci_ended = vci_ended;
                 evidence.link_errors.extend(link_errors);
             });
         }

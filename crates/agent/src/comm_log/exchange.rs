@@ -498,9 +498,9 @@ pub(crate) enum End {
     Negative(Vec<u8>),
     NoResponse,
     /// The ECU began a response and did not finish it: a start-of-message indication was
-    /// attached to an exchange that ended without a response (design 8.11 "Link settings for
+    /// attached to an exchange the VCI ended without a response (design 8.11 "Link settings for
     /// the log"). [`CommLog::exchange_with`](super::CommLog::exchange_with) turns a `NoResponse`
-    /// into it; a producer does not give it.
+    /// whose [`Evidence::vci_ended`] is set into it; a producer does not give it.
     ResponseIncomplete,
     /// The agent's deadline passed before the VCI ended the exchange.
     VciDidNotEnd,
@@ -809,6 +809,10 @@ pub(crate) struct Evidence {
     /// A start-of-message indication for this exchange's response was attached: the first
     /// frame of a response is an answer of the ECU (design 8.11 "Answer of the ECU").
     pub response_started: bool,
+    /// The VCI ended the exchange itself: the worker reported a receive timeout for the
+    /// primitive. An exchange the agent's own deadline ended did not (design 8.11
+    /// `vci_did_not_end`).
+    pub vci_ended: bool,
     /// A flow-control frame from the ECU was seen (`partial`).
     pub flow_control: bool,
     /// Link errors the exchange's own link reported during it, other than its outcome.
@@ -859,6 +863,7 @@ impl Evidence {
             },
             transmit_evidence: None,
             response_started: false,
+            vci_ended: false,
             flow_control: false,
             link_errors: Vec::new(),
             channel_link_errors: Vec::new(),
@@ -1560,7 +1565,7 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         End::ResponseIncomplete => (
             Undetermined,
             to_owned(
-                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart.",
+                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart (the transport is not logged).",
             ),
         ),
         // Not implemented: `no_response` with `window` `timeout_early` or `timeout_late`

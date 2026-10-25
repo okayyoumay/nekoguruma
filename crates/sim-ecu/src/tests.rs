@@ -1575,7 +1575,9 @@ fn negative_response_fault_refuses_the_next_request_without_effect() {
 fn bus_error_fault_loses_the_request() {
     let mut ecu = ecu();
     ecu.inject(Fault::BusError);
-    assert!(!ecu.exchange(Addressing::Physical, &[0x10, 0x03]).reached);
+    let lost = ecu.exchange(Addressing::Physical, &[0x10, 0x03]);
+    assert_eq!(lost.response, SimResponse::NoResponse);
+    assert!(!lost.reached);
     // The request never reached the ECU.
     assert_eq!(ecu.session, Session::Default);
     // A suppressed request reaches it, though it sends nothing back.

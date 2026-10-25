@@ -615,6 +615,15 @@ fn a_segmented_send_no_ecu_takes_gives_no_tx_done() {
     let f = fixture();
     let tx_done = || (TX_DONE, ECU_PHYSICAL_REQUEST_ID.to_be_bytes().to_vec());
     let segmented = [0x2E; 20];
+    // A segmented message the ECU takes gets its TxDone, ahead of the ECU's answer.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    let (status, msgs) = read_raw(f.channel, 2, 100);
+    assert_eq!(status, STATUS_NOERROR);
+    assert_eq!(msgs[0], tx_done());
+    // A bus error loses it before the ECU.
+    with_ecu(|ecu| ecu.inject(Fault::BusError));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
     // The ECU loses power: it takes nothing until it is reconnected.
     with_ecu(|ecu| ecu.inject(Fault::PowerLoss));
     write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);

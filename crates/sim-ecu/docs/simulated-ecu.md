@@ -16,7 +16,10 @@ message)` takes the addressing mode. `message` is the A_Data starting with the S
 via `to_bytes()`), or no response. `exchange(addressing, message)` returns the same response
 together with the delay before it is sent (`EcuConfig::response_delay_ms` plus any injected
 delay); the VCI side (`sim-vci` for the J2534 worker, `iso22900-mock` for the D-PDU worker,
-ADR-299) applies it.
+ADR-299) applies it. Its `reached` says whether the request reached the ECU at all: not while
+the ECU is off or starting up after a reset, nor when a bus error or `drop_at_block` loses it.
+`sim-vci` gives such a request no TxDone when it is segmented, since no flow control would come
+(ADR-352).
 
 The ECU's own timers (the session timeout and the security delay, below) run on a `Clock`.
 `SimEcu::new` uses real time (`SystemClock`); `SimEcu::with_clock(config, clock)` takes another,

@@ -1,0 +1,2 @@
+variant,service,field,expected,note
+absEscV1,sparePartNumber.read,sparePartNumber,4D 4B 2D 41 42 53 2D 30 30 30 31,"ASCII ""MK-ABS-0001"""

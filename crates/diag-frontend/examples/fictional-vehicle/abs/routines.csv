@@ -1,0 +1,3 @@
+name,rid,start,stop,results,session,security
+pumpMotorTest,0x0401,yes,yes,yes,0x03,0x01
+brakeBleeding,0x0402,yes,yes,yes,0x03,0x01

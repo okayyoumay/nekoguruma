@@ -1,0 +1,8 @@
+key,id,symbol
+volt,101,V
+millisecond,102,ms
+rpm,103,rpm
+celsius,104,°C
+kmh,105,km/h
+percent,106,%
+kilopascal,107,kPa

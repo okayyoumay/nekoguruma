@@ -1,0 +1,26 @@
+key,id,text
+session.default,1001,Default session
+session.programming,1002,Programming session
+session.extended,1003,Extended diagnostic session
+value.unknown,1004,Unknown value
+value.no,1005,No
+value.yes,1006,Yes
+nrc.subFunctionNotSupported,1021,Sub-function not supported
+nrc.incorrectMessageLength,1022,Incorrect message length or format
+nrc.conditionsNotCorrect,1023,Conditions not correct
+nrc.requestSequenceError,1024,Request sequence error
+nrc.requestOutOfRange,1025,Request out of range
+nrc.securityAccessDenied,1026,Security access denied
+nrc.authenticationRequired,1027,Gateway not unlocked
+nrc.invalidKey,1028,Invalid key
+nrc.exceededAttempts,1029,Too many false keys
+nrc.delayNotExpired,1030,Security delay still running
+nrc.serviceNotSupportedInSession,1033,Service not supported in the active session
+ignition.off,1600,Off
+ignition.accessory,1601,Accessory
+ignition.on,1602,On
+ignition.cranking,1603,Cranking
+dtc.bcm.driverDoorSwitch,1604,Driver door switch signal implausible
+dtc.bcm.lowBeamLeft,1605,Left low beam circuit open
+dtc.bcm.lowBeamRight,1606,Right low beam circuit open
+dtc.bcm.keylessAntenna,1607,Keyless entry antenna circuit fault

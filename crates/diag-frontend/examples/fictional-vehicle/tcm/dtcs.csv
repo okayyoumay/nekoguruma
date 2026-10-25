@@ -1,0 +1,5 @@
+variants,code,display,text,status
+,0x071100,P0711-00,dtc.tcm.fluidSensorImplausible,dtcStatus
+,0x071500,P0715-00,dtc.tcm.inputSpeedMissing,dtcStatus
+,0x072000,P0720-00,dtc.tcm.outputSpeedMissing,dtcStatus
+,0xC10000,U0100-00,dtc.tcm.noEngine,dtcStatus

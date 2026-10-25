@@ -1,0 +1,9 @@
+variants,name,did,read,write,note
+,activeSession,0xF186,yes,no,
+,sparePartNumber,0xF187,yes,no,
+,softwareVersion,0xF189,yes,no,
+,ecuSerialNumber,0xF18C,yes,no,
+,vin,0xF190,yes,no,
+,systemName,0xF197,yes,no,
+,gatewayLockState,0x0100,yes,no,"0 locked, 1 unlocked for the ECUs behind the gateway"
+,busStatus,0x0101,yes,no,

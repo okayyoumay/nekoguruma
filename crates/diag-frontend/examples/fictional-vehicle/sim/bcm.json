@@ -1,0 +1,16 @@
+{
+  "vin": "NGRMKSA10VK000123",
+  "part_number": "MK-BCM-0002",
+  "sw_version": "1.0.0",
+  "response_delay_ms": 0,
+  "drop_at_block": null,
+  "require_security_access": true,
+  "require_gateway_auth": true,
+  "fail_checksum": false,
+  "dtcs": [
+    {
+      "dtc": 9637888,
+      "status": 8
+    }
+  ]
+}

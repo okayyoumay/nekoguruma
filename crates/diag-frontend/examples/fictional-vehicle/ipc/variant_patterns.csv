@@ -1,0 +1,2 @@
+variant,service,field,expected,note
+ipcV1,sparePartNumber.read,sparePartNumber,4D 4B 2D 49 50 43 2D 30 30 30 31,"ASCII ""MK-IPC-0001"""

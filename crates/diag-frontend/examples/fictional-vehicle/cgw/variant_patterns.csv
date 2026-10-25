@@ -1,0 +1,2 @@
+variant,service,field,expected,note
+cgwV1,sparePartNumber.read,sparePartNumber,4D 4B 2D 43 47 57 2D 30 30 30 31,"ASCII ""MK-CGW-0001"""

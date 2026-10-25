@@ -612,7 +612,8 @@ fn a_reassembly_failure_binds_to_the_sole_waiting_cop_while_it_still_waits() {
 }
 
 /// Only the reassemblies past N_Cr are taken, each as a receive timeout named
-/// `ISO15765_CF_TIMEOUT` carrying the COP recorded at its first frame.
+/// `ISO15765_CF_TIMEOUT` carrying the COP recorded at its first frame; the
+/// echo of the service's own request is dropped with no failure.
 #[test]
 fn only_reassemblies_past_n_cr_are_taken_as_cf_timeouts() {
     let start = Instant::now();
@@ -624,6 +625,9 @@ fn only_reassemblies_past_n_cr_are_taken_as_cf_timeouts() {
         (0x7E9, false),
         isotp::Reassembly::start(20, &[0; 6], start, Duration::from_secs(60)),
     );
+    let mut echo = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    echo.tx_echo = true;
+    map.insert((0x7E0, false), echo);
     let expired = take_expired_reassemblies(&mut map, start + Duration::from_millis(11));
     assert_eq!(
         expired,

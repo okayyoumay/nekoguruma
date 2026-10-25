@@ -1552,12 +1552,17 @@ async fn process_frame_for_entry(
                     // The COP a failure of this message binds to (ADR-351):
                     // the one waiting on this response ID now, if only one
                     // does. A first frame that replaces an unfinished one
-                    // raises nothing for the replaced message.
+                    // raises nothing for the replaced message. The echo of
+                    // this service's own request starts no response.
                     let mut started = isotp::Reassembly::start(total_len, payload, now, ctx.n_cr);
-                    started.waiting_cop =
-                        sole_waiting_cop(&entry.registrants, entry.connect_generation, uid);
+                    if is_tx_side {
+                        started.tx_echo = true;
+                    } else {
+                        started.waiting_cop =
+                            sole_waiting_cop(&entry.registrants, entry.connect_generation, uid);
+                        notes.push(IsoTpRxNote::Started(uid));
+                    }
                     reassembly.insert(reassembly_key, started);
-                    notes.push(IsoTpRxNote::Started(uid));
                     Vec::new()
                 }
                 Some(isotp::Frame::Consecutive {
@@ -1585,20 +1590,24 @@ async fn process_frame_for_entry(
                                 sequence_number,
                                 "software ISO-TP: wrong ConsecutiveFrame sequence; reassembly aborted"
                             );
-                            let waiting_cop = state.waiting_cop;
+                            let (waiting_cop, tx_echo) = (state.waiting_cop, state.tx_echo);
                             reassembly.remove(&key);
-                            notes.push(IsoTpRxNote::Failed {
-                                error: PduErrorEvent::PduErrEvtFrameStruct,
-                                name: ISO15765_FRAME_NUM_NAME,
-                                waiting_cop,
-                            });
+                            if !tx_echo {
+                                notes.push(IsoTpRxNote::Failed {
+                                    error: PduErrorEvent::PduErrEvtFrameStruct,
+                                    name: ISO15765_FRAME_NUM_NAME,
+                                    waiting_cop,
+                                });
+                            }
                             Vec::new()
                         }
                         isotp::ReassemblyStep::TimedOut => {
                             warn!(can_id, "software ISO-TP: N_Cr expired; reassembly aborted");
-                            let waiting_cop = state.waiting_cop;
+                            let (waiting_cop, tx_echo) = (state.waiting_cop, state.tx_echo);
                             reassembly.remove(&key);
-                            notes.push(n_cr_expired(waiting_cop));
+                            if !tx_echo {
+                                notes.push(n_cr_expired(waiting_cop));
+                            }
                             Vec::new()
                         }
                     }
@@ -3831,7 +3840,7 @@ fn n_cr_expired(waiting_cop: Option<u32>) -> IsoTpRxNote {
 }
 
 /// Removes every reassembly whose N_Cr has expired from `reassembly`,
-/// returning the failure note of each.
+/// returning the failure note of each that is not an echo of a request.
 fn take_expired_reassemblies(
     reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
     now: Instant,
@@ -3839,7 +3848,7 @@ fn take_expired_reassemblies(
     let mut expired = Vec::new();
     reassembly.retain(|_, r| {
         let keep = !r.is_expired(now);
-        if !keep {
+        if !keep && !r.tx_echo {
             expired.push(n_cr_expired(r.waiting_cop));
         }
         keep
@@ -4620,8 +4629,8 @@ async fn poll_rx_inner(
     if messages.is_empty() {
         // Every frame that arrived has been read, so a software ISO-TP
         // reassembly still waiting past N_Cr has had no consecutive frame.
-        // Raised before the watermark, so a receive deadline that waits on
-        // this drain sees the error first.
+        // Raised before the watermark, so a receive-only reap that waits on
+        // this drain comes after the error.
         raise_expired_reassemblies(ctx).await;
         ctx.drain_watermarks
             .lock()

@@ -1505,11 +1505,12 @@ async fn start_sendrecv_waiting_on_ecu_1(
 /// Connects a software ISO-TP link with `params`, entry 1 answering on 0x7E8
 /// to requests on 0x7E0, starts [`start_sendrecv_waiting_on_ecu_1`] (and,
 /// with `monitor`, a receive-only monitor that waits on every ECU first),
-/// and injects a 10-byte response's first frame once the request is out. It
-/// returns after the service's FlowControl frame.
+/// and injects the first frame of a 10-byte response starting with `sid` once
+/// the request is out. It returns after the service's FlowControl frame.
 async fn software_isotp_response_started(
     params: &[(u32, u32)],
     monitor: bool,
+    sid: u8,
 ) -> (
     TestServer,
     tonic::Streaming<EventNotification>,
@@ -1538,7 +1539,7 @@ async fn software_isotp_response_started(
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
     server.backdoor.inject_rx(
         MOCK_CHANNEL_ID,
-        &can_frame(0x7E8, &[0x10, 0x0A, 0x62, 0xF1, 0x90, 1, 2, 3]),
+        &can_frame(0x7E8, &[0x10, 0x0A, sid, 0xF1, 0x90, 1, 2, 3]),
         j2534_0404::CAN,
     );
     // The FlowControl (ContinueToSend) answer to the first frame.
@@ -1590,41 +1591,88 @@ fn assert_named_error(
 /// `ISO15765_CF_TIMEOUT`, bound to the COP that waited on the response ID at
 /// the first frame (to none when a receive-only monitor waits on it too). The
 /// COP's wait goes on, and its deadline's receive timeout is named the same.
+/// When the deadline comes first (the default timings: `CP_P2Max` 50 ms,
+/// `CP_Cr` 1 s), the COP has finished by N_Cr, so that error binds to none.
 #[tokio::test]
 #[serial]
 async fn software_isotp_mode_missing_consecutive_frame_names_n_cr_and_the_deadline() {
-    for monitor in [false, true] {
-        let case = if monitor { "with a monitor" } else { "alone" };
+    // (monitor, CP_Cr µs, CP_P2Max µs)
+    let cases = [
+        (false, 100_000, 1_000_000),
+        (true, 100_000, 1_000_000),
+        (false, 600_000, 100_000),
+    ];
+    for (monitor, n_cr_us, p2_us) in cases {
+        let case = format!("monitor {monitor}, N_Cr {n_cr_us} us, P2 {p2_us} us");
+        let n_cr_first = n_cr_us < p2_us;
         let (server, mut events, cop_handle) = software_isotp_response_started(
             &[
                 (j2534_0404::DATA_RATE, 500_000),
-                (CP_N_CR, 100_000),
-                (j2534_0404::P2_MAX, 1_000_000),
+                (CP_N_CR, n_cr_us),
+                (j2534_0404::P2_MAX, p2_us),
             ],
             monitor,
+            0x62,
         )
         .await;
 
-        let n_cr = next_error_item(&mut events, 3000).await;
-        assert_named_error(
-            &n_cr,
-            vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout,
-            "ISO15765_CF_TIMEOUT",
-            (!monitor).then_some(cop_handle),
-            case,
-        );
-        let deadline = next_error_item(&mut events, 3000).await;
-        assert_named_error(
-            &deadline,
-            vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout,
-            "ISO15765_CF_TIMEOUT",
-            Some(cop_handle),
-            case,
-        );
+        let n_cr_cop = (!monitor && n_cr_first).then_some(cop_handle);
+        let expected = if n_cr_first {
+            [n_cr_cop, Some(cop_handle)]
+        } else {
+            [Some(cop_handle), n_cr_cop]
+        };
+        for cop in expected {
+            let item = next_error_item(&mut events, 3000).await;
+            assert_named_error(
+                &item,
+                vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout,
+                "ISO15765_CF_TIMEOUT",
+                cop,
+                &case,
+            );
+        }
 
         drop(events);
         server.shutdown().await;
     }
+}
+
+/// A reassembled response from the response ID ends its started message
+/// whether or not it binds: one that matches no expected response leaves the
+/// COP to time out unnamed.
+#[tokio::test]
+#[serial]
+async fn software_isotp_mode_completed_message_leaves_the_deadline_unnamed() {
+    let (server, mut events, cop_handle) = software_isotp_response_started(
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (j2534_0404::P2_MAX, 600_000),
+        ],
+        false,
+        0x63,
+    )
+    .await;
+    // Completes the 10-byte message, which the `0x62` pattern does not match.
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x21, 4, 5, 6, 7]),
+        j2534_0404::CAN,
+    );
+
+    let item = next_error_item(&mut events, 3000).await;
+    let Some(event_item::Data::ErrorData(data)) = &item.data else {
+        panic!("expected ErrorData, got {:?}", item.data);
+    };
+    assert_eq!(
+        data.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
+    );
+    assert_eq!(data.extra_error_info_name, None, "the message ended");
+    assert_eq!(item.cop_handle, Some(cop_handle));
+
+    drop(events);
+    server.shutdown().await;
 }
 
 /// ADR-351, software ISO-TP (ADR-046): a consecutive frame with an unexpected
@@ -1640,6 +1688,7 @@ async fn software_isotp_mode_wrong_sequence_number_names_the_error_and_the_deadl
             (j2534_0404::P2_MAX, 600_000),
         ],
         false,
+        0x62,
     )
     .await;
     // Sequence number 2 where 1 is due.

@@ -307,6 +307,10 @@ pub(super) struct Reassembly {
     /// frame arrived, when exactly one did: a reassembly failure is raised
     /// bound to it (ADR-351). Set by the caller after [`Reassembly::start`].
     pub(super) waiting_cop: Option<u32>,
+    /// The message is the loopback echo or transmit indication of this
+    /// service's own request (reassembled only on a link with no unique
+    /// response table): its failure is no response's, so it raises nothing.
+    pub(super) tx_echo: bool,
 }
 
 impl Reassembly {
@@ -326,6 +330,7 @@ impl Reassembly {
             deadline: now + n_cr,
             n_cr,
             waiting_cop: None,
+            tx_echo: false,
         }
     }
 

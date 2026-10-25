@@ -360,7 +360,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   The worker host reads every item of the link while a primitive runs. The result and error
   items of no primitive (a transmit indication, a link error) or of an earlier primitive are
   `unattached` events, written in the order read and before the entry of the exchange during
-  which they were read: nothing attaches them to an exchange yet (ADR-346 item 4). Status and
+  which they were read, for an exchange the host logs: nothing attaches them to an exchange yet
+  (ADR-346 item 4). Status and
   information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
   `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), the raw

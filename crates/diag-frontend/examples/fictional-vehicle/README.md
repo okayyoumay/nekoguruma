@@ -9,10 +9,12 @@ data, routines behind security access and reprogrammable ECUs.
 
 Standards the choices follow (clause numbers refer to these editions; the text paraphrases them):
 
-- ISO 14229-1 (2026): services, sessions, security access, data identifier and routine
-  identifier ranges (Annex C.1, Annex F), DTC status bits (Annex D.2)
+- ISO 14229-1 (2026): the services (the clauses in section 4's table), negative response codes
+  (Annex A.1), data identifier and routine identifier ranges (Annex C.1, Annex F) and DTC status
+  bits (Annex D.2)
 - ISO 14229-2 (2021): session layer timings (clause 9.2, Table 4; clause 9.5, Table 5)
-- ISO 15765-2 (2024): transport over CAN
+- ISO 15765-2 (2024): segmentation and flow control over CAN (clause 9, with the block size and
+  minimum separation time of 9.6.5.3 and 9.6.5.4) and normal addressing (10.3.2)
 - ISO 22901-1 (2008) 7.3.10: the vehicle information model the vehicle definition (section 9)
   follows (ADR-326)
 
@@ -61,10 +63,12 @@ The example vehicle of `sim/` is `NGRMKSA10VK000123`: a 2027 automatic.
         +---------- powertrain CAN .. ECM 0x7E0 / 0x7E8, TCM 0x7E1 / 0x7E9 (MK-A only)
 ```
 
-Every bus runs at 500 kbit/s with 11-bit identifiers and normal addressing (ISO 15765-2). The
+Every bus runs at 500 kbit/s with 11-bit identifiers and normal addressing (ISO 15765-2 (2024)
+10.3.2). The
 gateway routes the diagnostic identifiers below between the diagnostic CAN and the internal buses
 unchanged, so a tester sees one bus; routing adds no protocol of its own. All ECUs listen on the
-functional identifier `0x7DF`. Flow control: block size 0, STmin 0 (`CP_BlockSize`, `CP_StMin`).
+functional identifier `0x7DF`. Flow control (ISO 15765-2 (2024) 9.6.5.3, 9.6.5.4): block size 0
+(no further flow control frames), STmin 0 (`CP_BlockSize`, `CP_StMin`).
 
 | Role | Directory | Variants | Request | Response | Bus | Optional | Reached through |
 |---|---|---|---|---|---|---|---|
@@ -106,25 +110,25 @@ tester keeps it with TesterPresent (`3E 00`). Any session change relocks securit
 
 Every ECU supports these services. A service not listed gets NRC `0x11`.
 
-| SID | Service | Sub-functions / parameters | Session | Security | Behind a locked gateway |
+| SID | Service (ISO 14229-1 (2026)) | Sub-functions / parameters | Session | Security | Behind a locked gateway |
 |---|---|---|---|---|---|
-| `0x10` | DiagnosticSessionControl | `01`, `03`; `02` on ECM and TCM | all | none | allowed |
-| `0x11` | ECUReset | `01` hard, `02` key off/on, `03` soft | all | none | allowed |
-| `0x14` | ClearDiagnosticInformation | group `FFFFFF` or one DTC | all | none | allowed |
-| `0x19` | ReadDTCInformation | `02` by status mask, `0A` supported DTCs | all | none | allowed |
-| `0x22` | ReadDataByIdentifier | up to 8 DIDs per request | all | none | allowed |
-| `0x27` | SecurityAccess | `01` requestSeed, `02` sendKey | extended, programming | - | allowed |
-| `0x2E` | WriteDataByIdentifier | writable DIDs (section 6) | extended | per DID | refused |
-| `0x31` | RoutineControl | per routine (section 6) | per routine | per routine | refused |
-| `0x34` | RequestDownload | ECM, TCM | programming | level 1 | refused |
-| `0x36` | TransferData | ECM, TCM | programming | level 1 | refused |
-| `0x37` | RequestTransferExit | ECM, TCM | programming | level 1 | refused |
-| `0x3E` | TesterPresent | `00` | all | none | allowed |
+| `0x10` | DiagnosticSessionControl (9.2) | `01`, `03`; `02` on ECM and TCM | all | none | allowed |
+| `0x11` | ECUReset (9.3) | `01` hard, `02` key off/on, `03` soft | all | none | allowed |
+| `0x14` | ClearDiagnosticInformation (11.2) | group `FFFFFF` or one DTC | all | none | allowed |
+| `0x19` | ReadDTCInformation (11.3) | `02` by status mask, `0A` supported DTCs | all | none | allowed |
+| `0x22` | ReadDataByIdentifier (10.2) | up to 8 DIDs per request | all | none | allowed |
+| `0x27` | SecurityAccess (9.4) | `01` requestSeed, `02` sendKey | extended, programming | - | allowed |
+| `0x2E` | WriteDataByIdentifier (10.7) | writable DIDs (section 6) | extended | per DID | refused |
+| `0x31` | RoutineControl (13.2) | per routine (section 6) | per routine | per routine | refused |
+| `0x34` | RequestDownload (14.2) | ECM, TCM | programming | level 1 | refused |
+| `0x36` | TransferData (14.4) | ECM, TCM | programming | level 1 | refused |
+| `0x37` | RequestTransferExit (14.5) | ECM, TCM | programming | level 1 | refused |
+| `0x3E` | TesterPresent (9.7) | `00` | all | none | allowed |
 
-Negative responses every ECU may give: `0x12`, `0x13`, `0x22`, `0x24`, `0x31`, `0x33` and
-`0x7F`; for SecurityAccess also `0x35`, `0x36` and `0x37`; behind the gateway also `0x34`
-(section 5). Routines add the condition codes listed with them (`0x83` engine running, `0x88`
-vehicle moving).
+Negative responses (ISO 14229-1 (2026) Annex A.1) every ECU may give: `0x12`, `0x13`, `0x22`,
+`0x24`, `0x31`, `0x33` and `0x7F`; for SecurityAccess also `0x35`, `0x36` and `0x37`; behind the
+gateway also `0x34` (section 5). Routines add the condition codes listed with them (`0x83` engine
+running, `0x88` vehicle moving).
 
 ## 5. Gateway Lock
 

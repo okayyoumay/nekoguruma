@@ -35,7 +35,8 @@ this request, so it shows that the worker matches the ECU's responses to it.
 2. **It does not exclude H2.** H2 is excluded by a final response or a pending in the exchange,
    or by a matched answer; a start alone leaves it open. `response_incomplete`'s reason names H2
    beside a frame lost in the network or the VCI's receive path and an ECU that stopped, unless a
-   matched answer excludes it, as every row follows from the one rule of design 8.11.
+   pending in the exchange or a matched answer excludes it, as every row follows from the one
+   rule of design 8.11.
 3. **The rows of a pending seen need a pending.** A `no_response` exchange with a start alone
    (the agent's own deadline passed while the response may still be arriving) is not classified
    by the rows that rest on a pending seen in the exchange. For every other row the start is

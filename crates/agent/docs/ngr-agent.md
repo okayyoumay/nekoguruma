@@ -381,7 +381,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   start with that identifier read during the exchange attaches, since the ECU may have aborted and
   begun again. An exchange the VCI ended with no response (the worker reported a receive timeout
   for the primitive) ends as `response_incomplete`, classified `undetermined`, with H2 among
-  its readings unless a matched answer excludes it; one the agent's
+  its readings unless a pending in the exchange or a matched answer excludes it; one the agent's
   own deadline ended keeps `no_response`, since the response may still be arriving (design 8.11
   `vci_did_not_end`).
   The log writes no time for the start yet: its VCI time needs per-clock epochs (ADR-353), and

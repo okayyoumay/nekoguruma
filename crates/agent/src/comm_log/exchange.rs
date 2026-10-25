@@ -1599,13 +1599,16 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         End::LinkError(kind) => kind.judge(),
-        // A response start alone does not exclude H2 (ADR-354); a matched answer does.
-        End::ResponseIncomplete if history.answered_same_match == 0 => (
-            Undetermined,
-            to_owned(
-                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, the ECU stopping, or a response the worker dropped because it matched no expected response (H2), cannot be told apart (the transport is not logged).",
-            ),
-        ),
+        // A response start alone does not exclude H2 (ADR-354); a pending bound to the
+        // exchange or a matched answer does (`open_readings`).
+        End::ResponseIncomplete if !evidence.bound_answer() && history.answered_same_match == 0 => {
+            (
+                Undetermined,
+                to_owned(
+                    "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, the ECU stopping, or a response the worker dropped because it matched no expected response (H2), cannot be told apart (the transport is not logged).",
+                ),
+            )
+        }
         End::ResponseIncomplete => (
             Undetermined,
             to_owned(

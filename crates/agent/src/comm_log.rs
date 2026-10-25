@@ -2765,6 +2765,20 @@ mod tests {
         assert_eq!(entries[1]["outcome"]["result"], "response_incomplete");
         let matched_reason = entries[1]["reason"].as_str().unwrap();
         assert!(!matched_reason.contains("(H2)"), "{matched_reason}");
+
+        // A pending in the incomplete exchange itself excludes H2 too.
+        let mut with_pending = vci_ended(exchange::End::NoResponse);
+        with_pending.pending_visibility = exchange::PendingVisibility::Forwarded;
+        with_pending.pending = vec![exchange::Pending {
+            vci_us: None,
+            clock: None,
+            agent_us: 10,
+            since_previous_ms: None,
+        }];
+        let (entries, _) = run_exchanges(vec![(with_pending, vec![start_of_message(0x7E8)])]);
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        let pending_reason = entries[0]["reason"].as_str().unwrap();
+        assert!(!pending_reason.contains("(H2)"), "{pending_reason}");
     }
 
     #[test]

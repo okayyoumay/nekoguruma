@@ -607,6 +607,28 @@ fn each_message_sent_gives_a_tx_done_indication_before_its_response() {
     assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
 }
 
+/// A segmented message the ECU does not take (it is off, or there is none) gets no flow
+/// control and gives no TxDone; a single frame still goes out and gives one.
+#[test]
+fn a_segmented_send_no_ecu_takes_gives_no_tx_done() {
+    // The fixture's filter lets segmented messages go to the ECU.
+    let f = fixture();
+    let tx_done = || (TX_DONE, ECU_PHYSICAL_REQUEST_ID.to_be_bytes().to_vec());
+    let segmented = [0x2E; 20];
+    // The ECU loses power: it takes nothing until it is reconnected.
+    with_ecu(|ecu| ecu.inject(Fault::PowerLoss));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read_raw(f.channel, 2, 0), (STATUS_NOERROR, vec![tx_done()]));
+    // With no ECU at all, the same.
+    lock().ecu = None;
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &segmented);
+    assert_eq!(read_raw(f.channel, 1, 0).0, ERR_BUFFER_EMPTY);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read_raw(f.channel, 2, 0), (STATUS_NOERROR, vec![tx_done()]));
+}
+
 /// J2534-1 7.2.9: an ISO 15765 channel receives only what a flow-control filter lets in, and a
 /// segmented request needs a filter whose flow-control ID is the request's.
 #[test]

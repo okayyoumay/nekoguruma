@@ -152,7 +152,9 @@ Simplifications:
 
 - Each message sent queues its TxDone indication (`RxStatus` `TX_MSG_TYPE` and `TX_INDICATION`,
   the CAN ID as its data, SAE J2534-1 v04.04 clause 8.6) ahead of any response to it, readable
-  at once and passing no filter; a send that fails queues none (ADR-352). No loopback messages
+  at once and passing no filter. A send that fails queues none, nor does a segmented message no
+  ECU takes (none listens on its ID, or the ECU is off, starting up after a reset or loses the
+  request to a bus error), since it gets no flow control and does not complete (ADR-352). No loopback messages
   are generated, and segmentation itself (flow control frames, separation time) is not
   simulated: a request or response of any length moves as one message.
 - A response's `RxStatus` is always zero. The timestamp is the moment the response appeared on the bus

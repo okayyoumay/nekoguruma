@@ -42,8 +42,8 @@ transmit ID (`tp20_tx_id`); CAN had no counterpart.
    ComParam, so a TxDone of a functional request still reaches only links without a table.
 4. **`sim-vci` gives a TxDone indication for each message it sends**, ahead of any response to
    it, with the CAN ID as its data, and no filter applies to it (clause 8.6). A send that fails
-   gives none, nor does a segmented message to an ID no simulated ECU answers, which gets no
-   flow control. This lets tests show a transmit indication end to end.
+   gives none, nor does a segmented message no simulated ECU takes (none listens on its ID, or
+   the ECU is off, starting up or loses it to a bus error), which gets no flow control. This lets tests show a transmit indication end to end.
 5. **Scope: a native ISO 15765 channel.** A link in software ISO 15765-2 (ADR-046) runs on a raw
    CAN channel, where the device gives no TxDone; its routing is unchanged.
 

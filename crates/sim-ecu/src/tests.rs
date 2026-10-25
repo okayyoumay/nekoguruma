@@ -1482,6 +1482,7 @@ fn exchange_reports_the_configured_response_delay() {
             response: pos(&[0x7E, 0x00]),
             delay_ms: 20,
             pending: Vec::new(),
+            reached: true,
         }
     );
     // A suppressed response has no delay.
@@ -1491,6 +1492,7 @@ fn exchange_reports_the_configured_response_delay() {
             response: SimResponse::NoResponse,
             delay_ms: 0,
             pending: Vec::new(),
+            reached: true,
         }
     );
 }
@@ -1573,9 +1575,11 @@ fn negative_response_fault_refuses_the_next_request_without_effect() {
 fn bus_error_fault_loses_the_request() {
     let mut ecu = ecu();
     ecu.inject(Fault::BusError);
-    assert_eq!(ecu.request(&[0x10, 0x03]), SimResponse::NoResponse);
+    assert!(!ecu.exchange(Addressing::Physical, &[0x10, 0x03]).reached);
     // The request never reached the ECU.
     assert_eq!(ecu.session, Session::Default);
+    // A suppressed request reaches it, though it sends nothing back.
+    assert!(ecu.exchange(Addressing::Physical, &[0x3E, 0x80]).reached);
     assert_eq!(
         ecu.request(&[0x10, 0x03]),
         pos(&[0x50, 0x03, 0x00, 0x32, 0x01, 0xF4])
@@ -2448,7 +2452,10 @@ fn response_pending_fault_precedes_the_response_with_nrc_78() {
     // Suppressed: nothing goes out, and the fault waits for a request that is answered.
     assert_eq!(
         ecu.exchange(Addressing::Physical, &[0x3E, 0x80]),
-        Exchange::none()
+        Exchange {
+            reached: true,
+            ..Exchange::none()
+        }
     );
     let pending = |at| (at, vec![0x7F, 0x22, 0x78]);
     assert_eq!(
@@ -2464,6 +2471,7 @@ fn response_pending_fault_precedes_the_response_with_nrc_78() {
             response: pos(&[0x7E, 0x00]),
             delay_ms: 20,
             pending: Vec::new(),
+            reached: true,
         }
     );
 }

@@ -723,12 +723,18 @@ impl Bus {
         let ecu = self.ecu.as_mut().expect("checked above");
         let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
+        let reached = exchange.reached;
         let power_cycle = ecu.power_cycles();
         self.after_ecu_change(before);
         // A request the next process must know about fails if it cannot be recorded; its
         // response is then not sent either.
         self.save_ecu()?;
-        self.tx_done(channel_id, id);
+        if reached {
+            self.tx_done(channel_id, id);
+        } else {
+            // The ECU is off, starting up or lost the request on the bus.
+            self.tx_done_unanswered(channel_id, id, payload.len());
+        }
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return Ok(());
         };
@@ -757,9 +763,10 @@ impl Bus {
         Ok(())
     }
 
-    /// Queues the TxDone indication of a message of `payload_len` bytes sent to `can_id`, where
-    /// no simulated ECU listens: a single frame goes out, but a segmented message gets no flow
-    /// control and does not complete, so it gives none (SAE J2534-1 v04.04 clause 8.6).
+    /// Queues the TxDone indication of a message of `payload_len` bytes sent to `can_id` that no
+    /// simulated ECU takes (none listens there, or the ECU is off, starting up or lost the
+    /// request): a single frame goes out, but a segmented message gets no flow control and does
+    /// not complete, so it gives none (SAE J2534-1 v04.04 clause 8.6).
     fn tx_done_unanswered(&mut self, channel_id: PassThruUlong, can_id: &[u8], payload_len: usize) {
         if payload_len <= SINGLE_FRAME_MAX {
             self.tx_done(channel_id, can_id);
@@ -1188,7 +1195,8 @@ pub unsafe extern "system" fn PassThruReadMsgs(
 
 /// Sends each message to the simulated ECU. The ECU handles the request at once; its response
 /// becomes readable after the delay it reports. Each message sent queues its TxDone indication
-/// ahead of the response; no loopback messages are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
+/// ahead of the response, except a segmented message no ECU takes, which gets no flow control
+/// and does not complete; no loopback messages are generated. A call that `Command::FailWrites` fails returns `ERR_FAILED` with no message
 /// sent.
 ///
 /// # Safety

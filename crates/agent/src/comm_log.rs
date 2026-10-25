@@ -2612,7 +2612,10 @@ mod tests {
         assert_eq!(entries[0]["sent_evidence"], "answer");
         assert_eq!(entries[0]["classification"], "undetermined");
         let reason = entries[0]["reason"].as_str().unwrap();
-        assert!(!reason.contains("answered with a pending and then"), "{reason}");
+        assert!(
+            !reason.contains("answered with a pending and then"),
+            "{reason}"
+        );
         assert!(reason.contains("(H2)"), "{reason}");
     }
 

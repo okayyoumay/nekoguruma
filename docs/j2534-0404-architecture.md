@@ -955,6 +955,19 @@ ADR-126's check-and-write atomicity).
 | `PduErrorEvent` | An error occurred |
 | `PDU_EVT_DATA_LOST` | A CLL's event queue (`rx_buf`) reached its configured capacity and dropped an entry — sent only to a live `SubscribeEvent` subscriber, never as a `GetEventItem` queue item (ADR-115). Single-consumer semantics: a live subscriber opportunistically drains `rx_buf`, but the cap/mode policy is enforced on every push regardless of subscriber state, so a stale backlog can still cross the cap on the next push and fire one `Lost` even to a healthy, actively-draining subscriber — this is rare in practice (the queue empties every cycle for a keeping-up subscriber) but not structurally impossible |
 
+##### Named error cases on a native ISO 15765 channel (ADR-351)
+
+On a native ISO 15765 channel (`dual-channel`, `single-channel`, `auto`, and the native-mixed modes; not `software-isotp`, not plain CAN) the adapter runs the transport, and SAE J2534-1 v04.04 reports only the receive status and the start-of-message indication (Appendix A.2, A.4); it has no end-of-message indication, the completed message itself marks the end. The service tells two cases apart from that and gives each an error event named in `ErrorData.extra_error_info_name`, with no `extra_error_info` code (J2534 has none; the names follow ISO 22900-2:2022 Table D.8):
+
+| Name | Event | When |
+|------|-------|------|
+| `ISO15765_PADDING` | `PduErrEvtFrameStruct` | A received frame carries the `ISO15765_PADDING_ERROR` status bit and counts as a response match for its COP (the bind that completes one of the COP's expected responses). The frame is delivered exactly as before; the error follows it, bound to that COP (with its `cop_tag`). A pending-response frame (a short `7F xx 78` is typically padded) and an unbound frame raise none, so a COP that then times out still ends as a plain timeout. |
+| `ISO15765_CF_TIMEOUT` | `PduErrEvtRxTimeout` | A COP's receive phase ends on its deadline, and a message started from a response ID the COP waits on (a start-of-message indication, matched by the same unique-response-ID test that binds a response) and no ISO 15765 content message from that response ID has ended it since. One sender has one segmented message in progress, so any ISO 15765 content message from that ID ends it, whether it bound as a response, as a pending-response frame, or to nothing; a raw UUDT frame routed to the same entry under the native-mixed modes does not. Tracked per COP as the set `CopRegistrant::som_started` of started response IDs, merged back per poll pass like `pending_rc`. The indication counts whether or not `CP_StartMsgIndEnable` lets it reach the client. |
+
+Naming changes neither when a COP times out nor how it finishes: a timeout with no started message, or whose started messages all ended or came from response IDs the COP does not wait on, stays unnamed, as does every other error event. Software ISO-TP and plain CAN channels are unchanged and name nothing.
+
+A native channel cannot tell apart the other ways a segmented response goes wrong: a flow control that does not come, more flow-control waits than the limit allows, and an overflow the peer reports in its flow control. The adapter reports none of them, so each reaches the client as the same unnamed receive timeout (when the response starts and stalls, as `ISO15765_CF_TIMEOUT`, which therefore says only that a started response did not complete) or as nothing.
+
 ---
 
 ### j2534-0404-mock — Test Mock

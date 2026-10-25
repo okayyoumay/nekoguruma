@@ -1853,6 +1853,19 @@ pub(super) struct CopRegistrant {
     /// contribution can be diffed against a baseline the same way. Always
     /// `0` when `concat_enabled` is `false`.
     pub(super) concat_segments_got: u32,
+    /// Unique response IDs (URIDs) whose message has started and not ended,
+    /// for a response this registrant waits on, on a native ISO 15765
+    /// channel (SAE J2534-1 v04.04 Appendix A.2, A.4: the start-of-message
+    /// indication marks the start; the completed message itself, a content
+    /// frame from that sender, marks the end). `poll_rx_inner` inserts the
+    /// URID of a start-of-message indication into every registrant waiting on
+    /// it and removes it from every registrant on any content frame from that
+    /// URID, bound or not. Read when the receive phase times out: a non-empty
+    /// set names the timeout `ISO15765_CF_TIMEOUT`. Always empty on every
+    /// other channel kind. Merged back like `pending_rc`: a pass's value wins
+    /// only if the pass changed it against its baseline
+    /// (`merge_registrant_writeback`).
+    pub(super) som_started: Vec<u32>,
 }
 
 /// Accumulator for one in-progress `CP_EnableConcatenation` segment merge
@@ -3573,6 +3586,11 @@ pub(super) struct TrackedError {
     /// added (`Vec<u8>` isn't `Copy`) -- callers that used to copy a
     /// `TrackedError` out of a lock now clone it instead.
     pub(super) cop_tag: Option<Vec<u8>>,
+    /// This service's own name for the case (ADR-351), sent as
+    /// `ErrorData.extra_error_info_name`: set only where the service tells
+    /// the case apart itself (`ISO15765_PADDING`, `ISO15765_CF_TIMEOUT`, see
+    /// `docs/j2534-0404-architecture.md`), `None` everywhere else.
+    pub(super) name: Option<&'static str>,
 }
 
 /// The `(cll_handle, cop_handle)` pair a [`TrackedError`] pertains to.
@@ -3616,6 +3634,7 @@ impl Default for ModuleState {
                 timestamp: 0,
                 cop: None,
                 cop_tag: None,
+                name: None,
             },
         }
     }

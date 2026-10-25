@@ -360,6 +360,7 @@ mod tests {
                 timestamp: 12_345,
                 cop: None,
                 cop_tag: None,
+                name: None,
             }),
         );
         assert_eq!(with_tracked_error.code(), Code::Internal);
@@ -394,6 +395,7 @@ mod tests {
                 timestamp: 12_345,
                 cop: None,
                 cop_tag: None,
+                name: None,
             }),
         );
         assert!(
@@ -442,6 +444,7 @@ mod tests {
                     cop_handle: 42,
                 }),
                 cop_tag: None,
+                name: None,
             }),
         );
         let detail = error_detail_from_status(&status).expect("ErrorDetail should be attached");
@@ -531,6 +534,7 @@ mod tests {
                 timestamp: 42,
                 cop: None,
                 cop_tag: None,
+                name: None,
             }),
         );
         let detail = error_detail_from_status(&status).unwrap();

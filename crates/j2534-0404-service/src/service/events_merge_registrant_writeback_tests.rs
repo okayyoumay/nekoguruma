@@ -24,6 +24,7 @@ fn registrant(matches_got: u32, pending_rc: Option<u8>) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 
@@ -33,6 +34,7 @@ fn baseline(matches_got: u32, pending_rc: Option<u8>) -> RegistrantBaseline {
         matches_got,
         pending_rc,
         concat_segments_got: 0,
+        som_started: Vec::new(),
         timing_accumulator: None,
     }
 }
@@ -252,14 +254,17 @@ fn absolute_overwrite_would_have_pulled_the_deadline_backward() {
 fn concat_segments_got_delta_merge_sums_the_passs_own_contribution() {
     let mut live = CopRegistrant {
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     let snap = CopRegistrant {
         concat_segments_got: 3,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..baseline(0, None)
     };
 
@@ -307,10 +312,12 @@ fn concat_buffers_are_written_back_from_the_snapshot() {
     let snap = CopRegistrant {
         concat: vec![buf_a.clone(), buf_b.clone()],
         concat_segments_got: 2,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 0,
+        som_started: Vec::new(),
         ..baseline(0, None)
     };
 
@@ -347,6 +354,7 @@ fn concat_buffer_finalize_clears_live_too() {
     let mut live = CopRegistrant {
         concat: vec![stale_buf],
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..registrant(0, None)
     };
     // This pass's own snapshot already finalized the buffer (e.g. via
@@ -355,11 +363,13 @@ fn concat_buffer_finalize_clears_live_too() {
     let snap = CopRegistrant {
         concat: Vec::new(),
         concat_segments_got: 1,
+        som_started: Vec::new(),
         matches_got: 1,
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 1,
+        som_started: Vec::new(),
         ..baseline(0, None)
     };
 
@@ -454,4 +464,114 @@ fn merge_registrant_writeback_applies_a_genuinely_changed_timing_accumulator() {
         live.timing_accumulator, new_value,
         "a snapshot that genuinely changed since its own baseline must still be applied"
     );
+}
+
+/// A pass that saw a message start adds its URID live; a pass carrying the
+/// unchanged set forward never undoes a change another pass merged; a pass
+/// that ended the message (a content frame from that URID) removes it.
+#[test]
+fn som_started_merges_only_a_change_made_by_the_pass_itself() {
+    let mut live = registrant(0, None);
+    let set = CopRegistrant {
+        som_started: vec![1],
+        ..registrant(0, None)
+    };
+    merge_registrant_writeback(&mut live, &set, &baseline(0, None));
+    assert_eq!(
+        live.som_started,
+        [1],
+        "a pass that started a message sets it live"
+    );
+
+    // A stale pass: baseline empty, snapshot empty -- no change, set stays.
+    merge_registrant_writeback(&mut live, &registrant(0, None), &baseline(0, None));
+    assert_eq!(
+        live.som_started,
+        [1],
+        "an unchanged snapshot must not clear it"
+    );
+
+    // A pass that started from [1] and ended it.
+    let base = RegistrantBaseline {
+        som_started: vec![1],
+        ..baseline(0, None)
+    };
+    merge_registrant_writeback(&mut live, &registrant(0, None), &base);
+    assert!(
+        live.som_started.is_empty(),
+        "a pass that ended it clears it live"
+    );
+}
+
+fn waiting(cop_handle: u32, ids: Vec<u32>) -> CopRegistrant {
+    CopRegistrant {
+        cop_handle,
+        expected: vec![ExpectedResponse {
+            mask: Vec::new(),
+            pattern: Vec::new(),
+            unique_resp_ids: ids,
+            acceptance_id: 0,
+        }],
+        ..registrant(0, None)
+    }
+}
+
+/// Only a registrant that waits on the indication's response ID (and belongs
+/// to this connection) is marked, and the timeout is named only for a marked
+/// registrant.
+#[test]
+fn start_of_message_marks_only_registrants_waiting_on_that_response_id() {
+    let mut registrants = vec![
+        waiting(1, vec![1]),
+        waiting(2, vec![2]),
+        waiting(3, vec![]),
+        CopRegistrant {
+            connect_generation: 9,
+            ..waiting(4, vec![])
+        },
+        CopRegistrant {
+            expected: Vec::new(),
+            ..registrant(0, None)
+        },
+    ];
+    registrants[4].cop_handle = 5;
+    note_start_of_message(&mut registrants, 1, 1);
+    note_start_of_message(&mut registrants, 1, 1);
+    assert_eq!(registrants[0].som_started, [1], "marked once");
+    assert_eq!(
+        rx_timeout_name(&registrants, 1),
+        Some("ISO15765_CF_TIMEOUT")
+    );
+    assert_eq!(rx_timeout_name(&registrants, 2), None);
+    assert_eq!(
+        rx_timeout_name(&registrants, 3),
+        Some("ISO15765_CF_TIMEOUT"),
+        "a descriptor that accepts any ECU waits on every response ID"
+    );
+    assert_eq!(rx_timeout_name(&registrants, 4), None, "another connection");
+    assert_eq!(rx_timeout_name(&registrants, 5), None, "no descriptors");
+    assert_eq!(rx_timeout_name(&registrants, 99), None);
+}
+
+/// A content frame from a URID ends that URID's started message for every
+/// registrant, and only that URID's: another ECU's started message stays, so
+/// the timeout stays named while one is still open. Fails if the ending is
+/// removed.
+#[test]
+fn a_content_frame_ends_only_its_own_started_message() {
+    let mut registrants = vec![waiting(1, vec![]), waiting(2, vec![])];
+    note_start_of_message(&mut registrants, 1, 1);
+    note_start_of_message(&mut registrants, 1, 2);
+    note_message_ended(&mut registrants, 1);
+    for cop in [1, 2] {
+        assert_eq!(
+            rx_timeout_name(&registrants, cop),
+            Some("ISO15765_CF_TIMEOUT"),
+            "ECU 2's message is still open for COP {cop}"
+        );
+    }
+    note_message_ended(&mut registrants, 2);
+    for cop in [1, 2] {
+        assert_eq!(rx_timeout_name(&registrants, cop), None, "COP {cop}");
+    }
 }

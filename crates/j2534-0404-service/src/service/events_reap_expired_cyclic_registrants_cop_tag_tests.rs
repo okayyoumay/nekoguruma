@@ -79,6 +79,7 @@ fn expired_finite_n_registrant(deadline: tokio::time::Instant) -> CopRegistrant 
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 

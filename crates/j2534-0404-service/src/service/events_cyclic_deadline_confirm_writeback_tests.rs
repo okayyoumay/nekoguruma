@@ -84,6 +84,7 @@ fn cyclic_registrant(cop_handle: u32, deadline: tokio::time::Instant) -> CopRegi
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 
@@ -310,6 +311,7 @@ fn a_finite_count_tier_one_registrant_never_enters_confirm_scope() {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     };
     assert!(
         !is_eager_cyclic_deadline_confirm_scope(&tier1),

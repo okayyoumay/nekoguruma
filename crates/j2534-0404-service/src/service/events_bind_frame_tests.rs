@@ -32,6 +32,7 @@ fn registrant(cop_handle: u32, connect_generation: u64) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_started: Vec::new(),
     }
 }
 

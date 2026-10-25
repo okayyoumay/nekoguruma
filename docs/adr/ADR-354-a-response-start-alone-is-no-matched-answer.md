@@ -34,11 +34,13 @@ this request, so it shows that the worker matches the ECU's responses to it.
    `answered_since_error`, as evidence that the ECU was answering.
 2. **It does not exclude H2.** H2 is excluded by a final response or a pending in the exchange,
    or by a matched answer; a start alone leaves it open. `response_incomplete`'s reason names H2
-   beside a frame lost in the network or the VCI's receive path and an ECU that stopped.
+   beside a frame lost in the network or the VCI's receive path and an ECU that stopped, unless a
+   matched answer excludes it, as every row follows from the one rule of design 8.11.
 3. **The rows of a pending seen need a pending.** A `no_response` exchange with a start alone
-   (the agent's own deadline passed while the response may still be arriving) is classified by
-   the rows for a send without an answer the worker bound, not by the rows that rest on a pending
-   seen in the exchange.
+   (the agent's own deadline passed while the response may still be arriving) is not classified
+   by the rows that rest on a pending seen in the exchange. For every other row the start is
+   still an answer of the ECU: a request whose positive response is suppressed does not take the
+   rows for no answer of the ECU.
 4. **Unchanged.** A start still confirms the send (`sent` `confirmed`, `sent_evidence`
    `answer`, ADR-346 item 4) and still makes an exchange the VCI ended `response_incomplete`.
    `link_history.this_exchange` still says whether the ECU answered in the exchange, a start

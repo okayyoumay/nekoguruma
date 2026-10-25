@@ -2619,6 +2619,43 @@ mod tests {
         assert!(reason.contains("(H2)"), "{reason}");
     }
 
+    /// The rows of a pending seen need a pending (ADR-354): on a link that forwards pendings,
+    /// with a judged window, a start alone ended by the agent's deadline is no pending answer.
+    /// A request whose positive response is suppressed still has an answer of the ECU in the
+    /// start, so it does not take the rows for no answer of the ECU.
+    #[test]
+    fn a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer() {
+        let mut forwarded = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        forwarded.pending_visibility = exchange::PendingVisibility::Forwarded;
+        forwarded.timing.window = exchange::Window::WithinP2;
+        let mut suppressed = evidence(
+            endpoint(0x7E0),
+            &[0x31, 0x81, 0xFF, 0x00],
+            exchange::End::NoResponse,
+        );
+        suppressed.suppressed = true;
+        for (case, evidence) in [("forwarded", forwarded), ("suppressed", suppressed)] {
+            let (entries, _) = run_exchanges(vec![(evidence, vec![start_of_message(0x7E8)])]);
+            let entry = &entries[0];
+            assert_eq!(entry["sent_evidence"], "answer", "{case}");
+            assert_eq!(entry["link_history"]["this_exchange"], true, "{case}");
+            assert_ne!(entry["classification"], "vehicle", "{case}");
+            let reason = entry["reason"].as_str().unwrap();
+            assert!(
+                !reason.contains("answered with a pending and then"),
+                "{case}: {reason}"
+            );
+            assert!(
+                !reason.contains("No response was expected"),
+                "{case}: {reason}"
+            );
+        }
+    }
+
     /// What does not attach: an exchange a refusal ended, and an item whose RxFlag also says it
     /// is a transmit indication or a loopback. What attaches changes no outcome the exchange
     /// already has, and no send evidence a transmit indication gave.
@@ -2712,15 +2749,22 @@ mod tests {
         let later_reason = entries[1]["reason"].as_str().unwrap();
         assert!(later_reason.contains("(H2)"), "{later_reason}");
 
-        // With a final response the next exchange has a matched answer.
+        // With a final response the next exchange has a matched answer, which excludes H2 for
+        // a later start alone too.
         let (entries, _) = run_exchanges(vec![
             (
                 vci_ended(exchange::End::Positive(vec![0x62, 0xF1, 0x90])),
                 Vec::new(),
             ),
-            (vci_ended(exchange::End::NoResponse), Vec::new()),
+            (
+                vci_ended(exchange::End::NoResponse),
+                vec![start_of_message(0x7E8)],
+            ),
         ]);
         assert_eq!(entries[1]["link_history"]["answered_same_match"], 1);
+        assert_eq!(entries[1]["outcome"]["result"], "response_incomplete");
+        let matched_reason = entries[1]["reason"].as_str().unwrap();
+        assert!(!matched_reason.contains("(H2)"), "{matched_reason}");
     }
 
     #[test]

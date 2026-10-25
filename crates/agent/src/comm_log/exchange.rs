@@ -1529,9 +1529,10 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
     let (sent, _) = sent_of(evidence, history);
     let absorbing = evidence.absorbing();
     let pending_seen = evidence.pending_seen();
-    // The rows below that rest on an answer in this exchange (a pending seen) need one the
-    // worker bound; a response start alone leaves them (ADR-354).
-    let this_exchange = history.this_exchange && evidence.bound_answer();
+    let this_exchange = history.this_exchange;
+    // The rows of a pending seen need an answer the worker bound; a response start alone, which
+    // is still an answer of the ECU for every other row, leaves them (ADR-354).
+    let pending_answer = this_exchange && evidence.bound_answer();
     let window = evidence.timing.window;
     let late = window == Window::Late;
     let timed_out_unjudged = matches!(window, Window::TimeoutEarly | Window::TimeoutLate);
@@ -1598,10 +1599,17 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         End::LinkError(kind) => kind.judge(),
+        // A response start alone does not exclude H2 (ADR-354); a matched answer does.
+        End::ResponseIncomplete if history.answered_same_match == 0 => (
+            Undetermined,
+            to_owned(
+                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, the ECU stopping, or a response the worker dropped because it matched no expected response (H2), cannot be told apart (the transport is not logged).",
+            ),
+        ),
         End::ResponseIncomplete => (
             Undetermined,
             to_owned(
-                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, the ECU stopping, or a response the worker dropped because it matched no expected response or a wrong response filter (H2), cannot be told apart (the transport is not logged).",
+                "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart (the transport is not logged).",
             ),
         ),
         // Not implemented: `no_response` with `window` `timeout_early` or `timeout_late`
@@ -1713,7 +1721,7 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
             (Undetermined, reason)
         }
-        End::NoResponse if this_exchange && !any_link_error => {
+        End::NoResponse if pending_answer && !any_link_error => {
             if history.owed_matching == 0 {
                 (
                     Vehicle,
@@ -1730,7 +1738,7 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 )
             }
         }
-        End::NoResponse if this_exchange => (
+        End::NoResponse if pending_answer => (
             Undetermined,
             format!(
                 "{}, and the ECU answered with a pending, but a link error came on this link or another link of its channel and may have lost a frame (H3).",

@@ -343,7 +343,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-351](ADR-351-workers-name-their-extra-error-information.md) | Workers Name Their Extra Error Information, and the Agent Does Not Interpret It | Accepted | `vci-service-interface` (`ErrorData`), `iso22900-service`, `j2534-0404-service`, `ngr-library-resolver`, `agent` host and communication log, `docs/rpc-api-guide.md`; design 8.11, ADR-346 item 6, ADR-350 item 1 |
 | [ADR-352](ADR-352-tx-side-frames-route-by-the-physical-request-id.md) | TX-Side Frames Route by the Unique Response Entry's Physical Request ID | Accepted | `j2534-0404-service` RX routing, `sim-vci` TxDone indications, `docs/j2534-0404-architecture.md`, `docs/rpc-api-guide.md`; design 8.11, ADR-098, ADR-100, ADR-151, ADR-346 item 4 |
 | [ADR-353](ADR-353-event-items-name-the-clock-of-their-time.md) | Event Items Name the Clock of Their Time | Accepted | `vci-service-interface` (`EventItem.timestamp_clock`), `j2534-0404-service` and `iso22900-service` event items, `agent` communication log; design 8.11 "On one clock", design principle 6, ADR-120 |
-| [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`; ADR-346 item 6 |
+| [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`, `crates/agent/docs/ngr-agent.md`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`, "Settlement" `late_item`; ADR-346 item 6 |
 
 ## Status Legend
 

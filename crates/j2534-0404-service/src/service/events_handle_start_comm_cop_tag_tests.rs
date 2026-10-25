@@ -506,6 +506,9 @@ async fn cop_tag_capture_survives_a_primitives_removal_racing_the_kline_fast_ini
          primitives removal landing before the K-line fast-init keybyte delivery arm's \
          ReceivedFrame construction"
     );
+    // ADR-353: the keybyte response is made up here, so its time is this
+    // service's synthetic clock, not the library's.
+    assert_eq!(frame.clock, vci_service_interface::TimestampClock::Worker);
 }
 
 /// design-advisor review (round 5, ADR-205 follow-up): the two sibling tests

@@ -1259,6 +1259,8 @@ the same override reason as their named-bit counterparts above, and
 
 **`PDU_IOCTL_SET_EVENT_QUEUE_PROPERTIES` is pre-Connect-only (ADR-126):** per ISO 22900-2 §9.5.16, it can only be called before `ConnectComLogicalLink`; calling it on a connected CLL is rejected with `PDU_ERR_CLL_CONNECTED` (`Code::FailedPrecondition`) and applies no change. A client must `DisconnectComLogicalLink` before reconfiguring an already-connected CLL's event queue.
 
+**`EventItem.timestamp_clock` (ADR-353):** the clock `timestamp` is on, and with it `result_data`'s `tx_msg_done_timestamp` and `start_msg_timestamp`, so a client can tell which times it may compare (design 8.11 "On one clock") without knowing which worker gave them. `TIMESTAMP_CLOCK_DEVICE` is the VCI's own clock as the library reports it, the time base of the item's module (two modules' `DEVICE` times are not comparable); `TIMESTAMP_CLOCK_WORKER` is the worker's synthetic clock (`module_timestamp_us()`, ADR-120), for an item the library gives no time for; `TIMESTAMP_CLOCK_UNSPECIFIED` (0, and what a worker built before the field sends) means the worker does not say. `iso22900-service` gives `DEVICE` on every item of a module, since the library times them all on that module's one time base (ISO 22900-2:2022 8.1.6.1), and `UNSPECIFIED` on a system-level item, which belongs to no module. `j2534-0404-service` gives `DEVICE` on a frame it read (`PASSTHRU_MSG.Timestamp`, a reassembled or concatenated message included), and `WORKER` on a frame it makes up itself (the K-line fast-init response and 5-baud init keybytes) and on every error, status and information item, since J2534 times none of them.
+
 **`EventItem` data variants:**
 
 | Variant | When fired |

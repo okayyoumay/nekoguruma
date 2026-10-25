@@ -376,9 +376,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
   `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), a result's
   `identifier` when its header carries one, the raw
-  `vci_us`, which names no clock since the worker does not say which clock an item's time is on
-  and the agent does not infer it from the worker (design principle 6), the agent's `epoch` and
-  `read_us`,
+  `vci_us` with the `clock` the worker gives the item (`device` or `worker`, ADR-353), or none
+  when the worker gives none, since the agent does not infer it from the worker (design
+  principle 6), the agent's `epoch` and `read_us`,
   and for a result its `rx_flag` in hex and its `message`, redacted as a request for a transmit
   indication or a loopback and as a response otherwise; for an error event its name and its
   extra error information as the worker gave it (ADR-351).

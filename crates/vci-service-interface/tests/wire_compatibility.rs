@@ -10,8 +10,8 @@
 use prost::Message;
 use vci_service_interface::{
     ComPrimitiveCtrlData, ComPrimitiveHandle, DataItem, ErrorData, ErrorDetail, EventItem,
-    ParamItem, PduComPrimitiveStatus, PduError, PduParamClass, com_primitive_ctrl_data, data_item,
-    event_item, param_item,
+    ParamItem, PduComPrimitiveStatus, PduError, PduParamClass, TimestampClock,
+    com_primitive_ctrl_data, data_item, event_item, param_item,
 };
 
 fn decode<M: Message + Default>(bytes: &[u8]) -> M {
@@ -101,6 +101,8 @@ fn an_event_item_keeps_an_absent_and_an_empty_cop_tag_apart() {
             cop_handle: 4001,
         }),
         timestamp: 4242,
+        // A writer from before ADR-353 sends no clock: unspecified.
+        timestamp_clock: 0,
         cop_tag: None,
         data: Some(event_item::Data::CopStatus(
             PduComPrimitiveStatus::PduCopstFinished as i32,
@@ -117,6 +119,28 @@ fn an_event_item_keeps_an_absent_and_an_empty_cop_tag_apart() {
     };
     assert_eq!(decode::<EventItem>(&with_empty_tag), expected);
     assert_round_trip(&expected);
+}
+
+/// ADR-353: `timestamp_clock` is tag 11, an enum.
+#[test]
+fn an_event_item_carries_the_clock_of_its_time_at_tag_11() {
+    let bytes = [
+        0x10, 0x92, 0x21, // 2: timestamp = 4242
+        0x30, 0x92, 0x80, 0x02, // 6: cop_status = PDU_COPST_FINISHED
+        0x58, 0x02, // 11: timestamp_clock = TIMESTAMP_CLOCK_WORKER
+    ];
+    let expected = EventItem {
+        cop_handle: None,
+        timestamp: 4242,
+        timestamp_clock: TimestampClock::Worker as i32,
+        cop_tag: None,
+        data: Some(event_item::Data::CopStatus(
+            PduComPrimitiveStatus::PduCopstFinished as i32,
+        )),
+    };
+    assert_eq!(decode::<EventItem>(&bytes), expected);
+    assert_round_trip(&expected);
+    assert_eq!(TimestampClock::Device as i32, 1);
 }
 
 /// The cycle counts are `sint32`, since negative counts carry meaning (for

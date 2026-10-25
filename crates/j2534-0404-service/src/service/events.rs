@@ -5195,6 +5195,8 @@ async fn poll_rx_inner(
                     let cop_tag = resolve_frame_cop_tag(entry, frame_cop_handle);
                     let frame = ReceivedFrame {
                         timestamp,
+                        // `PASSTHRU_MSG.Timestamp`, read above (ADR-353).
+                        clock: vci_service_interface::TimestampClock::Device,
                         data: payload,
                         header_bytes: header,
                         footer_bytes: footer,
@@ -11004,6 +11006,8 @@ async fn handle_start_comm(
                             cll_handle,
                             CllQueueItem::Frame(ReceivedFrame {
                                 timestamp: ts,
+                                // Synthetic: no library time (ADR-353).
+                                clock: vci_service_interface::TimestampClock::Worker,
                                 data: payload,
                                 header_bytes: header,
                                 footer_bytes: footer,

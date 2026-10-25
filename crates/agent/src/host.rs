@@ -14,11 +14,11 @@ use tokio::runtime::Handle;
 use vci_service_interface::{
     ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, ErrorData, EventItem,
     ExpectedResponseData, PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest,
-    event_item, event_notification,
+    TimestampClock, event_item, event_notification,
 };
 
 use crate::comm_log::exchange::{
-    AgentTimes, At, Detail, End, Evidence, Expected, LinkErrorKind, Origin, RefusalCause,
+    AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin, RefusalCause,
     SectionAttrs, SourcePos, Target, UnknownCause,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
@@ -770,11 +770,23 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
                 link: LOG_LINK,
                 earlier_primitive: item.cop_handle.is_some(),
                 vci_us: item.timestamp,
+                clock: clock_of(item),
                 read: *read,
                 data,
             })
         })
         .collect()
+}
+
+/// The clock the worker says an item's time is on (design 8.11 "On one clock", ADR-353), or none
+/// when it does not say. The agent takes it from the item alone, never from which worker or API
+/// gave it (design principle 6).
+fn clock_of(item: &EventItem) -> Option<Clock> {
+    match TimestampClock::try_from(item.timestamp_clock) {
+        Ok(TimestampClock::Device) => Some(Clock::Device),
+        Ok(TimestampClock::Worker) => Some(Clock::Worker),
+        Ok(TimestampClock::Unspecified) | Err(_) => None,
+    }
 }
 
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
@@ -2515,6 +2527,32 @@ mod tests {
             .collect();
         // The status item is not an item for the log.
         assert_eq!(identifiers, [Some(0x7E0), None]);
+    }
+
+    /// Design 8.11 "On one clock" (ADR-353): an unbound item names the clock its worker gave it,
+    /// and none when the worker gives none or a value this agent does not know.
+    #[test]
+    fn an_unbound_item_names_the_clock_its_worker_gave_it() {
+        let with_clock = |timestamp_clock| Unbound {
+            item: EventItem {
+                timestamp_clock,
+                ..event(None, result(&[0x62]))
+            },
+            read: None,
+        };
+        let clocks: Vec<_> = unattached_items(&[
+            with_clock(TimestampClock::Device as i32),
+            with_clock(TimestampClock::Worker as i32),
+            with_clock(TimestampClock::Unspecified as i32),
+            with_clock(99),
+        ])
+        .iter()
+        .map(|item| item.clock)
+        .collect();
+        assert_eq!(
+            clocks,
+            [Some(Clock::Device), Some(Clock::Worker), None, None]
+        );
     }
 
     /// A send-receive's answer is matched against its declared service and the declared

@@ -40,6 +40,10 @@ pub(super) type SubscriptionKey = (u32, u32);
 #[derive(Debug)]
 pub(super) struct ReceivedFrame {
     pub(super) timestamp: u32,
+    /// The clock `timestamp` is on (ADR-353): `Device` for a frame the
+    /// library read (`PASSTHRU_MSG.Timestamp`), `Worker` for one this
+    /// service makes up itself, such as the fast-init response.
+    pub(super) clock: vci_service_interface::TimestampClock,
     /// Payload only — leading header bytes (e.g. a CAN ID) and trailing
     /// footer bytes (e.g. a KWP2000/J1850 checksum) are split into
     /// `header_bytes`/`footer_bytes` instead, for the protocols ADR-051

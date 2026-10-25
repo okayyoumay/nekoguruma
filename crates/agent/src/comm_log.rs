@@ -273,6 +273,9 @@ pub(crate) struct UnattachedItem {
     pub earlier_primitive: bool,
     /// The item's VCI time, raw (`EventItem.timestamp`).
     pub vci_us: u32,
+    /// The clock the worker says `vci_us` is on (`EventItem.timestamp_clock`, ADR-353); `None`
+    /// when it does not say.
+    pub clock: Option<exchange::Clock>,
     /// The agent's clocks when the host read it.
     pub read: Option<AgentNow>,
     pub data: UnattachedData,
@@ -326,10 +329,13 @@ struct UnattachedEntry<'a> {
     item: &'static str,
     /// `none` or `earlier`.
     primitive: &'static str,
-    /// The item's VCI time, raw. It names no clock (design 8.11 "On one clock"): the worker
-    /// does not say which clock an item's time is on, and the agent does not infer it from the
-    /// worker (design principle 6).
+    /// The item's VCI time, raw.
     vci_us: u32,
+    /// The clock `vci_us` is on (design 8.11 "On one clock"), as the worker gave it (ADR-353).
+    /// Absent when the worker gives none: the agent does not infer it from the worker (design
+    /// principle 6).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    clock: Option<exchange::Clock>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<ReadAt>,
     /// The result item's RxFlag in hex.
@@ -369,6 +375,7 @@ impl<'a> UnattachedEntry<'a> {
                 "none"
             },
             vci_us: item.vci_us,
+            clock: item.clock,
             agent: item.read.map(|read| ReadAt {
                 epoch: read.epoch,
                 read_us: read.monotonic_us,
@@ -1569,7 +1576,8 @@ mod tests {
     /// Design 8.11 "Link settings for the log": an item no exchange takes is an `unattached`
     /// event that says what it is by its RxFlag (ISO 22900-2:2022 D.2.2) and carries its message
     /// as every message is carried (a loopback echoes what the tester sent, so a key in it stays
-    /// hidden). Its VCI time names no clock, whatever API the job was told (design principle 6).
+    /// hidden). Its VCI time names the clock the worker gave the item and none when it gave none,
+    /// whatever API the job was told (design 8.11 "On one clock", design principle 6, ADR-353).
     #[test]
     fn unattached_items_say_what_they_are_and_keep_secrets_out() {
         let dir = dir();
@@ -1594,6 +1602,9 @@ mod tests {
             link: 1,
             earlier_primitive,
             vci_us: 42,
+            // The worker's clock where a J2534 library's would be the device's: the log takes
+            // it from the item.
+            clock: Some(exchange::Clock::Worker),
             read: Some(read),
             data: UnattachedData::Result {
                 rx_flag: rx_flag.to_vec(),
@@ -1612,6 +1623,7 @@ mod tests {
                 link: 1,
                 earlier_primitive: true,
                 vci_us: 43,
+                clock: None,
                 read: None,
                 data: UnattachedData::Error {
                     event: "PDU_ERR_EVT_RX_TIMEOUT".to_owned(),
@@ -1640,19 +1652,19 @@ mod tests {
             unattached,
             [
                 serde_json::json!({"event": "unattached", "link": 1,
-                    "item": "transmit_indication", "primitive": "none", "vci_us": 42,
+                    "item": "transmit_indication", "primitive": "none", "vci_us": 42, "clock": "worker",
                     "agent": agent, "rx_flag": "00000009", "identifier": 0x7E0,
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "loopback",
-                    "primitive": "none", "vci_us": 42, "agent": agent,
+                    "primitive": "none", "vci_us": 42, "clock": "worker", "agent": agent,
                     "rx_flag": "00000001",
                     "message": {"clear": "2702", "data": {"kind": "secret", "len": 2}}}),
                 serde_json::json!({"event": "unattached", "link": 1,
-                    "item": "start_of_message", "primitive": "none", "vci_us": 42,
+                    "item": "start_of_message", "primitive": "none", "vci_us": 42, "clock": "worker",
                     "agent": agent, "rx_flag": "00000002",
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "received",
-                    "primitive": "earlier", "vci_us": 42, "agent": agent,
+                    "primitive": "earlier", "vci_us": 42, "clock": "worker", "agent": agent,
                     "rx_flag": "", "message": {"clear": "62f19041"}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "error_event",
                     "primitive": "earlier", "vci_us": 43,
@@ -1707,6 +1719,7 @@ mod tests {
             link: 1,
             earlier_primitive: false,
             vci_us: 7,
+            clock: None,
             read: None,
             data: UnattachedData::Error {
                 event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
@@ -2298,6 +2311,7 @@ mod tests {
             link: 1,
             earlier_primitive: false,
             vci_us: 5,
+            clock: Some(exchange::Clock::Device),
             read: None,
             data: UnattachedData::Result {
                 rx_flag: vec![0, 0, 0, 0x09],

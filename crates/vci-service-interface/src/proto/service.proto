@@ -522,6 +522,23 @@ message EventItem {
     // cop_handle is set above and a tag was supplied at StartComPrimitive
     // for that COP. Absent otherwise -- never a zero-length sentinel.
     optional bytes cop_tag = 9;
+    // ADR-353: the clock `timestamp` is on (design 8.11 "On one clock"),
+    // and with it the times `result_data` carries (`tx_msg_done_timestamp`,
+    // `start_msg_timestamp`). Each worker sets it per item; UNSPECIFIED means
+    // the worker does not say, and a client then compares those times with
+    // no other.
+    TimestampClock timestamp_clock = 11;
+}
+
+// ADR-353: the clock an item's timestamp is on.
+enum TimestampClock {
+    TIMESTAMP_CLOCK_UNSPECIFIED = 0;
+    // The VCI's own clock, as the vendor library reports it: the time base
+    // of the item's module.
+    TIMESTAMP_CLOCK_DEVICE = 1;
+    // The worker's synthetic clock (ADR-120), for an item the library gives
+    // no time for.
+    TIMESTAMP_CLOCK_WORKER = 2;
 }
 
 // ADR-350: an error event item's data (ISO 22900-2:2022 PDU_ERROR_DATA).

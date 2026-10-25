@@ -215,6 +215,7 @@ impl VciService for FakeWorker {
                     event_data: Some(vci::event_notification::EventData::Item(vci::EventItem {
                         cop_handle: Some(cop),
                         timestamp: 0,
+                        timestamp_clock: 0,
                         data: Some(data),
                         cop_tag: None,
                     })),

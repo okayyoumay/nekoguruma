@@ -1,5 +1,5 @@
 use super::*;
-use vci_service_interface::ErrorData;
+use vci_service_interface::{ErrorData, TimestampClock};
 
 fn make_cll_notification(
     cll_handle: u32,
@@ -25,6 +25,8 @@ fn make_cll_notification(
                 cop_handle,
             }),
             timestamp,
+            // Every caller's time is `module_timestamp_us()` (ADR-120, ADR-353).
+            timestamp_clock: TimestampClock::Worker as i32,
             data: Some(data),
             cop_tag,
         })),
@@ -100,6 +102,7 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                     cop_handle,
                 }),
                 timestamp: frame.timestamp,
+                timestamp_clock: frame.clock as i32,
                 data: Some(EventItemData::ResultData(ResultData {
                     rx_flag: rx_flag_bytes(
                         frame.rx_status_flags,
@@ -135,6 +138,7 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                 cop_handle: c.cop_handle,
             }),
             timestamp: tracked.timestamp,
+            timestamp_clock: TimestampClock::Worker as i32,
             data: Some(EventItemData::ErrorData(ErrorData {
                 error_event: tracked.event as i32,
                 extra_error_info: None,
@@ -153,6 +157,7 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
             StatusEvent::Cll(status) => EventItem {
                 cop_handle: None,
                 timestamp: tracked.timestamp,
+                timestamp_clock: TimestampClock::Worker as i32,
                 data: Some(EventItemData::CllStatus(*status as i32)),
                 cop_tag: None,
             },
@@ -167,6 +172,7 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
                     cop_handle: *cop_handle,
                 }),
                 timestamp: tracked.timestamp,
+                timestamp_clock: TimestampClock::Worker as i32,
                 data: Some(EventItemData::CopStatus(*status as i32)),
                 cop_tag: cop_tag.clone(),
             },
@@ -367,6 +373,7 @@ pub(in crate::service) async fn send_cop_status(
                             cop_handle,
                         }),
                         timestamp: module_timestamp_us(),
+                        timestamp_clock: TimestampClock::Worker as i32,
                         data: Some(EventItemData::CopStatus(status as i32)),
                         cop_tag,
                     })),
@@ -709,6 +716,7 @@ pub(in crate::service) async fn send_system_info(
     let item = EventItem {
         cop_handle: None,
         timestamp,
+        timestamp_clock: TimestampClock::Worker as i32,
         data: Some(EventItemData::InfoData(info as i32)),
         cop_tag: None,
     };
@@ -740,6 +748,7 @@ pub(super) async fn send_module_status(
     let item = EventItem {
         cop_handle: None,
         timestamp,
+        timestamp_clock: TimestampClock::Worker as i32,
         data: Some(EventItemData::ModuleStatus(status as i32)),
         cop_tag: None,
     };
@@ -759,5 +768,77 @@ pub(super) async fn send_module_status(
             event_data: Some(EventNotificationData::Item(item)),
         };
         let _ = sub.send(Ok(n));
+    }
+}
+
+#[cfg(test)]
+mod timestamp_clock_tests {
+    use super::*;
+
+    fn frame(clock: TimestampClock) -> CllQueueItem {
+        CllQueueItem::Frame(ReceivedFrame {
+            timestamp: 7,
+            clock,
+            data: Vec::new(),
+            header_bytes: Vec::new(),
+            footer_bytes: Vec::new(),
+            unique_resp_identifier: 0,
+            acceptance_id: 0,
+            cop_handle: None,
+            cop_tag: None,
+            rx_status_flags: 0,
+            ecu_timing_change: false,
+            sw_can_hv_rx: false,
+        })
+    }
+
+    /// ADR-353 (design 8.11 "On one clock"): a frame's item names the clock
+    /// its frame was timed on, the library's for one it read and this
+    /// service's for one it made up; an error or status item, which J2534
+    /// gives no time for, names this service's synthetic clock (ADR-120).
+    #[test]
+    fn each_queued_item_names_the_clock_of_its_time() {
+        let items = [
+            frame(TimestampClock::Device),
+            frame(TimestampClock::Worker),
+            CllQueueItem::Error(TrackedError {
+                event: PduErrorEvent::PduErrEvtRxTimeout,
+                timestamp: 7,
+                cop: None,
+                cop_tag: None,
+            }),
+            CllQueueItem::Status(TrackedStatus {
+                event: StatusEvent::Cll(PduComLogicalLinkStatus::PduCllstOnline),
+                timestamp: 7,
+            }),
+            CllQueueItem::Status(TrackedStatus {
+                event: StatusEvent::Cop {
+                    cop_handle: 3,
+                    status: PduComPrimitiveStatus::PduCopstFinished,
+                    cop_tag: None,
+                },
+                timestamp: 7,
+            }),
+        ];
+        let clocks: Vec<_> = items
+            .iter()
+            .map(|item| cll_queue_item_to_event_item(1, None, item).timestamp_clock)
+            .collect();
+        let (device, worker) = (TimestampClock::Device as i32, TimestampClock::Worker as i32);
+        assert_eq!(clocks, [device, worker, worker, worker, worker]);
+    }
+
+    /// ADR-353: module and system items are on this service's synthetic
+    /// clock too.
+    #[tokio::test]
+    async fn module_and_system_items_name_the_worker_clock() {
+        let subscriptions = Arc::new(Mutex::new(HashMap::new()));
+        let module_buf = Arc::new(Mutex::new(VecDeque::new()));
+        let system_buf = Arc::new(Mutex::new(VecDeque::new()));
+        send_module_status(&subscriptions, &module_buf, PduModuleStatus::PduModstReady).await;
+        send_system_info(&subscriptions, &system_buf, PduInfo::ModuleListChg).await;
+        let worker = TimestampClock::Worker as i32;
+        assert_eq!(module_buf.lock().await[0].timestamp_clock, worker);
+        assert_eq!(system_buf.lock().await[0].timestamp_clock, worker);
     }
 }

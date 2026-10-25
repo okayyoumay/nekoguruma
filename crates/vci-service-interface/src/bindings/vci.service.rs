@@ -493,6 +493,13 @@ pub struct EventItem {
     /// for that COP. Absent otherwise -- never a zero-length sentinel.
     #[prost(bytes = "vec", optional, tag = "9")]
     pub cop_tag: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// ADR-353: the clock `timestamp` is on (design 8.11 "On one clock"),
+    /// and with it the times `result_data` carries (`tx_msg_done_timestamp`,
+    /// `start_msg_timestamp`). Each worker sets it per item; UNSPECIFIED means
+    /// the worker does not say, and a client then compares those times with
+    /// no other.
+    #[prost(enumeration = "TimestampClock", tag = "11")]
+    pub timestamp_clock: i32,
     #[prost(oneof = "event_item::Data", tags = "3, 4, 5, 6, 10, 8")]
     pub data: ::core::option::Option<event_item::Data>,
 }
@@ -1662,6 +1669,40 @@ impl CllCreateFlagBit {
             "CLL_CREATE_FLAG_BIT_UNSPECIFIED" => Some(Self::Unspecified),
             "CLL_CREATE_FLAG_CHECKSUM_MODE" => Some(Self::CllCreateFlagChecksumMode),
             "CLL_CREATE_FLAG_RAW_MODE" => Some(Self::CllCreateFlagRawMode),
+            _ => None,
+        }
+    }
+}
+/// ADR-353: the clock an item's timestamp is on.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum TimestampClock {
+    Unspecified = 0,
+    /// The VCI's own clock, as the vendor library reports it: the time base
+    /// of the item's module.
+    Device = 1,
+    /// The worker's synthetic clock (ADR-120), for an item the library gives
+    /// no time for.
+    Worker = 2,
+}
+impl TimestampClock {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "TIMESTAMP_CLOCK_UNSPECIFIED",
+            Self::Device => "TIMESTAMP_CLOCK_DEVICE",
+            Self::Worker => "TIMESTAMP_CLOCK_WORKER",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "TIMESTAMP_CLOCK_UNSPECIFIED" => Some(Self::Unspecified),
+            "TIMESTAMP_CLOCK_DEVICE" => Some(Self::Device),
+            "TIMESTAMP_CLOCK_WORKER" => Some(Self::Worker),
             _ => None,
         }
     }

@@ -243,6 +243,11 @@ async fn create_default_cll(client: &mut VciServiceClient<Channel>) -> ComLogica
 
 fn assert_result_event_item(event_item: &EventItem, expected_cop_handle: u32) {
     assert_eq!(event_item.timestamp, MOCK_TIMESTAMP);
+    // ADR-353: every item is the library's, on the VCI's own clock.
+    assert_eq!(
+        event_item.timestamp_clock,
+        vci_service_interface::TimestampClock::Device as i32
+    );
     assert_eq!(
         event_item
             .cop_handle

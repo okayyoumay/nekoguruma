@@ -3716,6 +3716,15 @@ pub(super) const ISO15765_PADDING_NAME: &str = "ISO15765_PADDING";
 /// Table D.8; ADR-351).
 pub(super) const ISO15765_CF_TIMEOUT_NAME: &str = "ISO15765_CF_TIMEOUT";
 
+/// Names of the transmit-side errors of the software ISO-TP sender (ADR-046,
+/// ADR-351): no FlowControl frame within N_Bs (ISO 22900-2:2022 Table D.8's
+/// name), more FS_WAIT frames than the defensive bound (Table D.8's
+/// `MAX_WAIT_FRAME`), and an FS_OVERFLOW frame (a name of this worker's own;
+/// Table D.8 gives none for it).
+pub(super) const ISO15765_FC_TIMEOUT_NAME: &str = "ISO15765_FC_TIMEOUT";
+pub(super) const MAX_WAIT_FRAME_NAME: &str = "MAX_WAIT_FRAME";
+pub(super) const ISO15765_FC_OVERFLOW_NAME: &str = "ISO15765_FC_OVERFLOW";
+
 /// `true` when `entry` is a channel on which the adapter runs the ISO 15765
 /// transport (`dual-channel`, `single-channel`, `auto`, native mixed): not a
 /// software ISO-TP entry, not the UUDT companion, not plain CAN.
@@ -6449,7 +6458,9 @@ async fn should_skip_cancelled_item(
 enum TxFailure {
     /// A frame failed to build or write; report `PduErrorEvent` and finish
     /// the COP as today.
-    Event(PduErrorEvent),
+    /// The optional name is this service's own name for the case
+    /// (`ErrorData.extra_error_info_name`, ADR-351), `None` when unnamed.
+    Event(PduErrorEvent, Option<&'static str>),
     /// A hard channel error occurred mid-transmission;
     /// `handle_channel_hard_error` has already emitted the full
     /// loss-of-comms event sequence (including `PduCopstCancelled` for this
@@ -6497,8 +6508,8 @@ async fn write_can_frame(
             Ok(mut msg) => api
                 .write_messages(ctx.channel_id, std::slice::from_mut(&mut msg), 0)
                 .map(|_| ())
-                .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError)),
-            Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct)),
+                .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)),
+            Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct, None)),
         }
     };
     if result.is_ok() && count_as_bus_activity {
@@ -6708,7 +6719,12 @@ async fn isotp_send(
             };
             match fc {
                 // N_Bs expired without a FlowControl frame.
-                None => return Err(TxFailure::Event(PduErrorEvent::PduErrEvtRxTimeout)),
+                None => {
+                    return Err(TxFailure::Event(
+                        PduErrorEvent::PduErrEvtRxTimeout,
+                        Some(ISO15765_FC_TIMEOUT_NAME),
+                    ));
+                }
                 Some((isotp::FS_CONTINUE_TO_SEND, block_size, st_min)) => {
                     // Any frame(s) still queued after this batch's terminal
                     // CTS are a spurious trailing FC N_PDU (ISO 15765-2:
@@ -6729,12 +6745,24 @@ async fn isotp_send(
                 Some((isotp::FS_WAIT, ..)) => {
                     wait_frames += 1;
                     if wait_frames > ISOTP_TX_MAX_CONSECUTIVE_RX_WAIT_FRAMES {
-                        return Err(TxFailure::Event(PduErrorEvent::PduErrEvtProtErr));
+                        return Err(TxFailure::Event(
+                            PduErrorEvent::PduErrEvtProtErr,
+                            Some(MAX_WAIT_FRAME_NAME),
+                        ));
                     }
                     continue;
                 }
-                // FS_OVERFLOW (or reserved): the ECU cannot take the message.
-                Some((..)) => return Err(TxFailure::Event(PduErrorEvent::PduErrEvtProtErr)),
+                // FS_OVERFLOW: the ECU cannot take the message.
+                Some((isotp::FS_OVERFLOW, ..)) => {
+                    return Err(TxFailure::Event(
+                        PduErrorEvent::PduErrEvtProtErr,
+                        Some(ISO15765_FC_OVERFLOW_NAME),
+                    ));
+                }
+                // A reserved flow status never reaches here (`isotp::parse_frame`
+                // rejects it, so it is not captured as a FlowControl frame and
+                // the wait ends as an N_Bs expiry); kept unnamed for safety.
+                Some((..)) => return Err(TxFailure::Event(PduErrorEvent::PduErrEvtProtErr, None)),
             }
         };
 
@@ -6921,8 +6949,8 @@ fn transmit_request_locked(
         Ok(mut msg) => api
             .write_messages(channel_id, std::slice::from_mut(&mut msg), 0)
             .map(|_| ())
-            .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError)),
-        Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct)),
+            .map_err(|_| TxFailure::Event(PduErrorEvent::PduErrEvtTxError, None)),
+        Err(_) => Err(TxFailure::Event(PduErrorEvent::PduErrEvtFrameStruct, None)),
     }
 }
 
@@ -8389,7 +8417,7 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                 }
                 true
             }
-            Some(Err(TxFailure::Event(error_event))) => {
+            Some(Err(TxFailure::Event(error_event, error_name))) => {
                 // Recheck generation (ADR-086, round 9 fix): the transmit
                 // above performs real I/O and can span a disconnect+
                 // reconnect completing during the call, even though the
@@ -8411,11 +8439,12 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                     })
                 };
                 if still_on_this_channel {
-                    send_error_event(
+                    send_named_error_event(
                         &ctx.subscriptions,
                         &ctx.logical_links,
                         cll_handle,
                         error_event,
+                        error_name,
                         Some((cop_handle, cop_tag.clone())),
                     )
                     .await;
@@ -12976,7 +13005,7 @@ async fn handle_start_comm(
                         // a timed-out/re-request-failed receive phase skips
                         // PDU_CLLST_COMM_STARTED.
                     }
-                    Err(TxFailure::Event(error_event)) => {
+                    Err(TxFailure::Event(error_event, error_name)) => {
                         // ADR-111: the optional message never reached the
                         // bus, so this COP must NOT transition to
                         // COMM_STARTED -- unlike every other failed-transmit
@@ -13027,11 +13056,12 @@ async fn handle_start_comm(
                             )
                             .await;
                         }
-                        send_error_event(
+                        send_named_error_event(
                             &ctx.subscriptions,
                             &ctx.logical_links,
                             cll_handle,
                             error_event,
+                            error_name,
                             Some((cop_handle, cop_tag.clone())),
                         )
                         .await;
@@ -13863,7 +13893,7 @@ async fn handle_stop_comm(
                                 }
                             }
                         }
-                        Err(TxFailure::Event(error_event)) => {
+                        Err(TxFailure::Event(error_event, error_name)) => {
                             // Recheck generation before reporting (Codex review,
                             // PR #90 round 8, ADR-086): `transmit_request` itself
                             // does I/O, so a disconnect+reconnect can complete
@@ -13884,11 +13914,12 @@ async fn handle_stop_comm(
                                 })
                             };
                             if still_on_this_channel {
-                                send_error_event(
+                                send_named_error_event(
                                     &ctx.subscriptions,
                                     &ctx.logical_links,
                                     cll_handle,
                                     error_event,
+                                    error_name,
                                     Some((cop_handle, cop_tag.clone())),
                                 )
                                 .await;
@@ -16957,7 +16988,7 @@ async fn wait_for_expected_response_inner(
                             .await
                             {
                                 Ok(()) => {}
-                                Err(TxFailure::Event(ev)) => {
+                                Err(TxFailure::Event(ev, ev_name)) => {
                                     // Recheck generation (ADR-086, round 9
                                     // fix): transmit_request performs real
                                     // I/O and can span a disconnect+reconnect
@@ -16994,11 +17025,12 @@ async fn wait_for_expected_response_inner(
                                         .await;
                                         return ReceivePhaseOutcome::Terminal;
                                     }
-                                    send_error_event(
+                                    send_named_error_event(
                                         &ctx.subscriptions,
                                         &ctx.logical_links,
                                         cll_handle,
                                         ev,
+                                        ev_name,
                                         Some((cop_handle, cop_tag.clone())),
                                     )
                                     .await;

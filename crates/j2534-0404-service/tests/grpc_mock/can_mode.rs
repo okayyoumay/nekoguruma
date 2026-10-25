@@ -6,7 +6,7 @@
 
 use serial_test::serial;
 use vci_service_interface::{
-    ComLogicalLinkHandle, ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest, ErrorData,
+    ComLogicalLinkHandle, ConnectComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
     EventNotification, StartComPrimitiveRequest, SubscribeEventRequest, TxFlagBit, event_item,
     subscribe_event_request, vci_service_client::VciServiceClient,
 };
@@ -1341,14 +1341,28 @@ async fn software_isotp_mode_fs_wait_exceeds_internal_bound_aborts_with_prot_err
             .inject_rx(MOCK_CHANNEL_ID, &wait_frame, j2534_0404::CAN);
     }
 
+    let mut error = None;
     assert!(
-        wait_for_event(&mut events, 5000, |item| matches!(
-            &item.data,
-            Some(event_item::Data::ErrorData(ErrorData { error_event: error, .. }))
-                if *error == vci_service_interface::PduErrorEvent::PduErrEvtProtErr as i32
-        ))
+        wait_for_event(&mut events, 5000, |item| {
+            if let Some(event_item::Data::ErrorData(data)) = &item.data {
+                error = Some(data.clone());
+                return true;
+            }
+            false
+        })
         .await,
         "exceeding the internal WAIT-flood guard should fire PduErrEvtProtErr"
+    );
+    // ADR-351: the case is named, with no code.
+    let error = error.expect("error captured");
+    assert_eq!(
+        error.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtProtErr as i32
+    );
+    assert_eq!(error.extra_error_info, None);
+    assert_eq!(
+        error.extra_error_info_name.as_deref(),
+        Some("MAX_WAIT_FRAME")
     );
     assert!(
         wait_for_event(&mut events, 5000, |item| matches!(
@@ -1365,4 +1379,92 @@ async fn software_isotp_mode_fs_wait_exceeds_internal_bound_aborts_with_prot_err
 
     drop(events);
     server.shutdown().await;
+}
+
+/// Starts a 20-byte (segmented) software ISO-TP request and returns the
+/// first `ErrorData` the transmit raises, after `inject` has run.
+async fn software_isotp_first_tx_error(
+    inject: impl FnOnce(&TestServer),
+) -> vci_service_interface::ErrorData {
+    let server = TestServer::start_with_can_mode(Some("software-isotp")).await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll(
+        &mut client,
+        j2534_0404::ISO15765,
+        &[(j2534_0404::DATA_RATE, 500_000)],
+    )
+    .await;
+    set_can_phys_req_id_and_promote(&mut client, cll_handle, 0x7E0).await;
+    let mut events = subscribe(&mut client, cll_handle).await;
+    client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll_handle),
+            cop_type: vci_service_interface::ComOperationType::CoptSendrecv as i32,
+            cop_data: (1..=20).collect(),
+            cop_ctrl_data: Some(vci_service_interface::ComPrimitiveCtrlData {
+                num_send_cycles: 1,
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("start_com_primitive should succeed");
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+    inject(&server);
+    let mut error = None;
+    assert!(
+        wait_for_event(&mut events, 5000, |item| {
+            if let Some(event_item::Data::ErrorData(data)) = &item.data {
+                error = Some(data.clone());
+                return true;
+            }
+            false
+        })
+        .await,
+        "the transmit should raise an error event"
+    );
+    drop(events);
+    server.shutdown().await;
+    error.expect("error captured")
+}
+
+/// ADR-351: a FlowControl frame that never comes ends the wait at N_Bs with
+/// a receive timeout named `ISO15765_FC_TIMEOUT`, no code.
+#[tokio::test]
+#[serial]
+async fn software_isotp_mode_missing_flow_control_names_the_timeout() {
+    let error = software_isotp_first_tx_error(|_| {}).await;
+    assert_eq!(
+        error.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
+    );
+    assert_eq!(error.extra_error_info, None);
+    assert_eq!(
+        error.extra_error_info_name.as_deref(),
+        Some("ISO15765_FC_TIMEOUT")
+    );
+}
+
+/// ADR-351: an FS_OVERFLOW FlowControl frame ends the transmit with a
+/// protocol error named `ISO15765_FC_OVERFLOW`, no code.
+#[tokio::test]
+#[serial]
+async fn software_isotp_mode_flow_control_overflow_names_the_error() {
+    let error = software_isotp_first_tx_error(|server| {
+        let mut fc = 0x7E8_u32.to_be_bytes().to_vec();
+        fc.extend_from_slice(&[0x32, 0x00, 0x00]);
+        server
+            .backdoor
+            .inject_rx(MOCK_CHANNEL_ID, &fc, j2534_0404::CAN);
+    })
+    .await;
+    assert_eq!(
+        error.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtProtErr as i32
+    );
+    assert_eq!(error.extra_error_info, None);
+    assert_eq!(
+        error.extra_error_info_name.as_deref(),
+        Some("ISO15765_FC_OVERFLOW")
+    );
 }

@@ -926,7 +926,8 @@ impl CommLog {
     /// hold on the agent's link by construction: the job runs one primitive at a time on its one
     /// link, so no other exchange on the physical channel is in flight, and the link starts no
     /// communication (`PDU_COPT_STARTCOMM`), so the API sends no tester present of its own (ISO
-    /// 22900-2:2022 enables it only once communication has started).
+    /// 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1: tester present runs only on a link whose
+    /// communication was started; `j2534-0404-service` arms it on `CoptStartcomm` alone).
     pub(crate) fn exchange_with(
         &self,
         mut evidence: exchange::Evidence,

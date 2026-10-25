@@ -366,7 +366,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `unknown`, which a late TxDone may belong to (design 8.11 `sent_evidence`, ADR-346 item 4).
   Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
   a time on the job's one link, and the link starts no communication, so the API sends no
-  tester present of its own. Every other item is an `unattached` event, written in the order
+  tester present of its own (ISO 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1 run it only on a link
+  whose communication was started). Every other item is an `unattached` event, written in the order
   read and before the exchange's entry: an item bound to an earlier primitive, a start-of-message
   indication (not attached yet), and a transmit indication whose header is not a plain 4-byte
   CAN identifier (extended or mixed addressing), which therefore never confirms a send. The

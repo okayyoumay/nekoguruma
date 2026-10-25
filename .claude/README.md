@@ -18,7 +18,7 @@ capability unless the user asks for one.
 | Agent | Model (effort) | Tools | Use for |
 |---|---|---|---|
 | `code-scout` | haiku | read-only | Fan-out searches across many crates or docs; returns conclusions and `path:line`, never file dumps |
-| `cargo-runner` | haiku | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files |
+| `cargo-runner` | haiku | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files; runs `cargo clean` before a workspace-wide run when less than 10 GB is free |
 | `doc-sync-checker` | sonnet (medium) | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
 | `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
 | `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |

@@ -140,6 +140,7 @@ fn frame_and_error_entries_share_one_fifo_in_arrival_order() {
             timestamp: 2,
             cop: None,
             cop_tag: None,
+            name: None,
         }),
     );
     push_cll_event(&mut buf, 3, EventQueueMode::OverwriteOldest, frame(3));
@@ -178,6 +179,7 @@ fn status_entries_share_one_fifo_with_frame_and_error_in_arrival_order() {
             timestamp: 3,
             cop: None,
             cop_tag: None,
+            name: None,
         }),
     );
     push_cll_event(
@@ -216,6 +218,7 @@ fn status_entry_evicts_the_oldest_entry_under_overwrite_oldest() {
             timestamp: 2,
             cop: None,
             cop_tag: None,
+            name: None,
         }),
     );
     assert_eq!(timestamps(&buf), vec![1, 2]);

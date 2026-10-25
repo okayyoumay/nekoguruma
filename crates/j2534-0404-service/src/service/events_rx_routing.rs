@@ -1288,6 +1288,7 @@ pub(super) async fn build_cll_rx_entries(
                     matches_got: r.matches_got,
                     pending_rc: r.pending_rc,
                     concat_segments_got: r.concat_segments_got,
+                    som_pending: r.som_pending,
                     timing_accumulator: r.timing_accumulator,
                 })
                 .collect();

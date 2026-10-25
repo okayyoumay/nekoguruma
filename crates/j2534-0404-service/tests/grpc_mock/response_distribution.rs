@@ -2176,3 +2176,243 @@ async fn receive_only_monitors_do_not_wedge_sibling_cops_or_each_other() {
     drop(events_a);
     server.shutdown().await;
 }
+
+/// What a native ISO 15765 `CoptSendrecv` test sends: one request, one
+/// response, an `0x62`-prefixed expected response (restricted to the given
+/// unique response identifiers, empty for any ECU).
+async fn start_native_sendrecv(
+    client: &mut vci_service_interface::vci_service_client::VciServiceClient<
+        tonic::transport::Channel,
+    >,
+    cll_handle: vci_service_interface::ComLogicalLinkHandle,
+    unique_resp_ids: Vec<u32>,
+    cop_tag: Option<Vec<u8>>,
+) -> vci_service_interface::ComPrimitiveHandle {
+    client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cop_tag,
+            cll_handle: Some(cll_handle),
+            cop_type: vci_service_interface::ComOperationType::CoptSendrecv as i32,
+            cop_data: vec![0x22, 0xF1, 0x90],
+            cop_ctrl_data: Some(ComPrimitiveCtrlData {
+                time: 0,
+                num_send_cycles: 1,
+                num_receive_cycles: 1,
+                temp_param_update: 0,
+                expected_response_array: vec![ExpectedResponseData {
+                    response_type: 0,
+                    acceptance_id: 7,
+                    mask_data: vec![0xFF],
+                    pattern_data: vec![0x62],
+                    unique_resp_ids,
+                }],
+                tx_flag: None,
+            }),
+        })
+        .await
+        .expect("start_com_primitive(CoptSendrecv) should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("cop_handle should be present")
+}
+
+/// Waits for the next `ErrorData` item and returns it with its COP binding.
+async fn next_error_item(
+    events: &mut tonic::Streaming<vci_service_interface::EventNotification>,
+    timeout_ms: u64,
+) -> Option<vci_service_interface::EventItem> {
+    let mut found = None;
+    wait_for_event(events, timeout_ms, |item| {
+        if matches!(item.data, Some(event_item::Data::ErrorData(_))) {
+            found = Some(item.clone());
+            return true;
+        }
+        false
+    })
+    .await;
+    found
+}
+
+fn error_data(item: &vci_service_interface::EventItem) -> &vci_service_interface::ErrorData {
+    match &item.data {
+        Some(event_item::Data::ErrorData(data)) => data,
+        other => panic!("expected ErrorData, got {other:?}"),
+    }
+}
+
+/// SAE J2534-1 v04.04 A.2: on a native ISO 15765 channel the adapter reports a
+/// short last CAN frame only as the `ISO15765_PADDING_ERROR` receive-status
+/// bit. The frame is still delivered as the response (and completes the COP);
+/// a frame-structure error named `ISO15765_PADDING`, with no code, follows it,
+/// bound to the COP the frame bound to and carrying that COP's tag.
+#[tokio::test]
+#[serial]
+async fn native_iso15765_padding_error_frame_raises_a_named_frame_structure_error() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll(
+        &mut client,
+        j2534_0404::ISO15765,
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (j2534_0404::P2_MAX, 5_000_000),
+        ],
+    )
+    .await;
+    set_unique_resp_table_and_promote(
+        &mut client,
+        cll_handle,
+        vec![ecu_entry(
+            1,
+            vec![
+                unum32_param(CP_CAN_RESP_USDT_ID, 0x7E8),
+                unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E0),
+            ],
+        )],
+    )
+    .await;
+    let mut events = client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+
+    let cop_tag = vec![0xAB, 0xCD];
+    let cop_handle =
+        start_native_sendrecv(&mut client, cll_handle, vec![], Some(cop_tag.clone())).await;
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x62, 0xF1, 0x90]),
+        j2534_0404::ISO15765,
+        0x0000_0010, // ISO15765_PADDING_ERROR
+    );
+
+    // Frame first, then the error.
+    let mut order = Vec::new();
+    let mut error_item = None;
+    wait_for_event(&mut events, 2000, |item| {
+        match &item.data {
+            Some(event_item::Data::ResultData(_)) => order.push("frame"),
+            Some(event_item::Data::ErrorData(_)) => {
+                order.push("error");
+                error_item = Some(item.clone());
+                return true;
+            }
+            _ => {}
+        }
+        false
+    })
+    .await;
+    assert_eq!(order, ["frame", "error"], "the frame precedes its error");
+    let error_item = error_item.expect("the padding error should be raised");
+    let data = error_data(&error_item);
+    assert_eq!(
+        data.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtFrameStruct as i32
+    );
+    assert_eq!(data.extra_error_info, None);
+    assert_eq!(
+        data.extra_error_info_name.as_deref(),
+        Some("ISO15765_PADDING")
+    );
+    assert_eq!(error_item.cop_handle, Some(cop_handle));
+    assert_eq!(error_item.cop_tag, Some(cop_tag));
+    assert_eq!(error_item.timestamp_clock, TimestampClock::Worker as i32);
+
+    drop(events);
+    server.shutdown().await;
+}
+
+/// SAE J2534-1 v04.04 A.4: a start-of-message indication says a response began.
+/// On a native ISO 15765 channel, when no response completes before the
+/// deadline, the receive timeout is named `ISO15765_CF_TIMEOUT` (no code); with
+/// no indication, or one from a response ID the COP does not wait on, it stays
+/// unnamed. The indication is counted whether or not `CP_StartMsgIndEnable`
+/// lets it reach the client.
+#[tokio::test]
+#[serial]
+async fn native_iso15765_started_response_that_does_not_complete_names_its_timeout() {
+    // (SOM CAN ID to inject, if any, expected name of the timeout)
+    let cases: [(Option<u32>, Option<&str>); 3] = [
+        (Some(0x7E8), Some("ISO15765_CF_TIMEOUT")),
+        (None, None),
+        (Some(0x7E9), None),
+    ];
+    for (som_can_id, expected_name) in cases {
+        let server = TestServer::start().await;
+        let mut client = server.client().await;
+        let cll_handle = create_and_connect_cll(
+            &mut client,
+            j2534_0404::ISO15765,
+            &[
+                (j2534_0404::DATA_RATE, 500_000),
+                (j2534_0404::P2_MAX, 600_000),
+            ],
+        )
+        .await;
+        set_unique_resp_table_and_promote(
+            &mut client,
+            cll_handle,
+            vec![
+                ecu_entry(
+                    1,
+                    vec![
+                        unum32_param(CP_CAN_RESP_USDT_ID, 0x7E8),
+                        unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E0),
+                    ],
+                ),
+                ecu_entry(
+                    2,
+                    vec![
+                        unum32_param(CP_CAN_RESP_USDT_ID, 0x7E9),
+                        unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E1),
+                    ],
+                ),
+            ],
+        )
+        .await;
+        let mut events = client
+            .subscribe_event(SubscribeEventRequest {
+                handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
+            })
+            .await
+            .expect("subscribe_event should succeed")
+            .into_inner();
+
+        // The COP waits on entry 1 (0x7E8) only.
+        let cop_handle = start_native_sendrecv(&mut client, cll_handle, vec![1], None).await;
+        wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+        if let Some(can_id) = som_can_id {
+            server.backdoor.inject_rx_with_status(
+                MOCK_CHANNEL_ID,
+                &can_frame(can_id, &[]),
+                j2534_0404::ISO15765,
+                0x0000_0002, // START_OF_MESSAGE
+            );
+        }
+
+        let error_item = next_error_item(&mut events, 3000)
+            .await
+            .expect("the deadline should raise a receive timeout");
+        let data = error_data(&error_item);
+        assert_eq!(
+            data.error_event,
+            vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32,
+            "som {som_can_id:?}"
+        );
+        assert_eq!(data.extra_error_info, None, "som {som_can_id:?}");
+        assert_eq!(
+            data.extra_error_info_name.as_deref(),
+            expected_name,
+            "som {som_can_id:?}"
+        );
+        assert_eq!(error_item.cop_handle, Some(cop_handle));
+
+        drop(events);
+        server.shutdown().await;
+    }
+}

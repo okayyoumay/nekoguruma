@@ -1853,6 +1853,15 @@ pub(super) struct CopRegistrant {
     /// contribution can be diffed against a baseline the same way. Always
     /// `0` when `concat_enabled` is `false`.
     pub(super) concat_segments_got: u32,
+    /// A start-of-message indication for a response this registrant waits on
+    /// arrived on a native ISO 15765 channel and no response has completed
+    /// for it since (SAE J2534-1 v04.04 Appendix A.2, A.4). Set by
+    /// `poll_rx_inner` on a matching indication, cleared by `bind_registrant`
+    /// when a response completes a match; read when the receive phase times
+    /// out, to name the timeout `ISO15765_CF_TIMEOUT`. Always `false` on every
+    /// other channel kind. Merged back like `pending_rc`: a pass's change
+    /// against its own baseline wins (`merge_registrant_writeback`).
+    pub(super) som_pending: bool,
 }
 
 /// Accumulator for one in-progress `CP_EnableConcatenation` segment merge
@@ -3573,6 +3582,11 @@ pub(super) struct TrackedError {
     /// added (`Vec<u8>` isn't `Copy`) -- callers that used to copy a
     /// `TrackedError` out of a lock now clone it instead.
     pub(super) cop_tag: Option<Vec<u8>>,
+    /// This service's own name for the case (ADR-351), sent as
+    /// `ErrorData.extra_error_info_name`: set only where the service tells
+    /// the case apart itself (`ISO15765_PADDING`, `ISO15765_CF_TIMEOUT`, see
+    /// `docs/j2534-0404-architecture.md`), `None` everywhere else.
+    pub(super) name: Option<&'static str>,
 }
 
 /// The `(cll_handle, cop_handle)` pair a [`TrackedError`] pertains to.
@@ -3616,6 +3630,7 @@ impl Default for ModuleState {
                 timestamp: 0,
                 cop: None,
                 cop_tag: None,
+                name: None,
             },
         }
     }

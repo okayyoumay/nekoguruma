@@ -24,6 +24,7 @@ fn registrant(matches_got: u32, pending_rc: Option<u8>) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_pending: false,
     }
 }
 
@@ -33,6 +34,7 @@ fn baseline(matches_got: u32, pending_rc: Option<u8>) -> RegistrantBaseline {
         matches_got,
         pending_rc,
         concat_segments_got: 0,
+        som_pending: false,
         timing_accumulator: None,
     }
 }
@@ -252,14 +254,17 @@ fn absolute_overwrite_would_have_pulled_the_deadline_backward() {
 fn concat_segments_got_delta_merge_sums_the_passs_own_contribution() {
     let mut live = CopRegistrant {
         concat_segments_got: 1,
+        som_pending: false,
         ..registrant(0, None)
     };
     let snap = CopRegistrant {
         concat_segments_got: 3,
+        som_pending: false,
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 1,
+        som_pending: false,
         ..baseline(0, None)
     };
 
@@ -307,10 +312,12 @@ fn concat_buffers_are_written_back_from_the_snapshot() {
     let snap = CopRegistrant {
         concat: vec![buf_a.clone(), buf_b.clone()],
         concat_segments_got: 2,
+        som_pending: false,
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 0,
+        som_pending: false,
         ..baseline(0, None)
     };
 
@@ -347,6 +354,7 @@ fn concat_buffer_finalize_clears_live_too() {
     let mut live = CopRegistrant {
         concat: vec![stale_buf],
         concat_segments_got: 1,
+        som_pending: false,
         ..registrant(0, None)
     };
     // This pass's own snapshot already finalized the buffer (e.g. via
@@ -355,11 +363,13 @@ fn concat_buffer_finalize_clears_live_too() {
     let snap = CopRegistrant {
         concat: Vec::new(),
         concat_segments_got: 1,
+        som_pending: false,
         matches_got: 1,
         ..registrant(0, None)
     };
     let base = RegistrantBaseline {
         concat_segments_got: 1,
+        som_pending: false,
         ..baseline(0, None)
     };
 
@@ -454,4 +464,75 @@ fn merge_registrant_writeback_applies_a_genuinely_changed_timing_accumulator() {
         live.timing_accumulator, new_value,
         "a snapshot that genuinely changed since its own baseline must still be applied"
     );
+}
+
+/// A pass that saw a response begin sets the live flag; a pass carrying the
+/// unchanged value forward never undoes a change another pass merged; a pass
+/// that cleared it (a response completed) does.
+#[test]
+fn som_pending_merges_only_a_change_made_by_the_pass_itself() {
+    let mut live = registrant(0, None);
+    let set = CopRegistrant {
+        som_pending: true,
+        ..registrant(0, None)
+    };
+    merge_registrant_writeback(&mut live, &set, &baseline(0, None));
+    assert!(live.som_pending, "a pass that set the flag sets it live");
+
+    // A stale pass: baseline false, snapshot false -- no change, flag stays.
+    merge_registrant_writeback(&mut live, &registrant(0, None), &baseline(0, None));
+    assert!(live.som_pending, "an unchanged snapshot must not clear it");
+
+    // A pass that started from true and cleared it.
+    let cleared = registrant(1, None);
+    let base = RegistrantBaseline {
+        som_pending: true,
+        ..baseline(0, None)
+    };
+    merge_registrant_writeback(&mut live, &cleared, &base);
+    assert!(
+        !live.som_pending,
+        "a pass that cleared the flag clears it live"
+    );
+}
+
+/// Only a registrant that waits on the indication's response ID is marked,
+/// and the timeout is named only for a marked registrant.
+#[test]
+fn start_of_message_marks_only_registrants_waiting_on_that_response_id() {
+    let waits_on = |ids: Vec<u32>| CopRegistrant {
+        expected: vec![ExpectedResponse {
+            mask: Vec::new(),
+            pattern: Vec::new(),
+            unique_resp_ids: ids,
+            acceptance_id: 0,
+        }],
+        ..registrant(0, None)
+    };
+    let mut registrants = vec![
+        CopRegistrant {
+            cop_handle: 1,
+            ..waits_on(vec![1])
+        },
+        CopRegistrant {
+            cop_handle: 2,
+            ..waits_on(vec![2])
+        },
+        CopRegistrant {
+            cop_handle: 3,
+            ..waits_on(vec![])
+        },
+    ];
+    note_start_of_message(&mut registrants, 1);
+    assert_eq!(
+        rx_timeout_name(&registrants, 1),
+        Some("ISO15765_CF_TIMEOUT")
+    );
+    assert_eq!(rx_timeout_name(&registrants, 2), None);
+    assert_eq!(
+        rx_timeout_name(&registrants, 3),
+        Some("ISO15765_CF_TIMEOUT"),
+        "a registrant that accepts any ECU waits on every response ID"
+    );
+    assert_eq!(rx_timeout_name(&registrants, 99), None);
 }

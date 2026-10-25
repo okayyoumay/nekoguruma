@@ -439,6 +439,7 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
                     timestamp: module_timestamp_us(),
                     cop: None,
                     cop_tag: None,
+                    name: None,
                 });
                 l.comm_started = false;
                 l.stop_comm_pending = false;
@@ -680,6 +681,7 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
             timestamp: module_timestamp_us(),
             cop: None,
             cop_tag: None,
+            name: None,
         };
     }
     send_module_status(
@@ -801,6 +803,9 @@ struct RegistrantBaseline {
     /// `CopRegistrant::concat_segments_got` at pass start -- merged the same
     /// delta way as `matches_got` (ADR-148). Always `0` for a non-concat registrant.
     concat_segments_got: u32,
+    /// `CopRegistrant::som_pending` at pass start, so the writeback merge can
+    /// tell this pass's own change from a carried-forward value.
+    som_pending: bool,
     /// `CopRegistrant::timing_accumulator` at pass start (ADR-150) -- used by
     /// `merge_registrant_writeback`'s baseline guard to distinguish "this
     /// pass's own snapshot actually changed the accumulator" from "this
@@ -2712,6 +2717,9 @@ fn bind_registrant(
                         continue;
                     }
                     r.matches_got += 1;
+                    // A completed response ends any start-of-message
+                    // indication the timeout naming was tracking for it.
+                    r.som_pending = false;
                     // ADR-147 correction: this registrant bound the frame --
                     // classification is computed FRESH, right here, from
                     // THIS registrant's own `rc_cfg`, for every scan variant
@@ -3698,6 +3706,50 @@ fn bind_frame(
 /// this is called.
 fn resolve_frame_cop_tag(entry: &CllRxEntry, cop_handle: Option<u32>) -> Option<Vec<u8>> {
     cop_handle.and_then(|h| entry.cop_tags.get(&h).cloned())
+}
+
+/// Name of the frame-structure error raised for a frame the adapter tagged
+/// `ISO15765_PADDING_ERROR` on a native ISO 15765 channel (ISO 22900-2:2022
+/// Table D.8; ADR-351).
+pub(super) const ISO15765_PADDING_NAME: &str = "ISO15765_PADDING";
+
+/// Name of the receive timeout raised for a response that began (a
+/// start-of-message indication arrived) but did not complete before the
+/// receive deadline on a native ISO 15765 channel (ISO 22900-2:2022
+/// Table D.8; ADR-351).
+pub(super) const ISO15765_CF_TIMEOUT_NAME: &str = "ISO15765_CF_TIMEOUT";
+
+/// `true` when `entry` is a channel on which the adapter runs the ISO 15765
+/// transport (`dual-channel`, `single-channel`, `auto`, native mixed): not a
+/// software ISO-TP entry, not the UUDT companion, not plain CAN.
+fn is_native_iso15765_entry(entry: &CllRxEntry) -> bool {
+    matches!(entry.kind, RxEntryKind::Hardware { .. })
+        && entry.header_protocol == j2534_0404::ISO15765
+}
+
+/// Marks every registrant that waits on the response ID behind
+/// `unique_resp_identifier` as having seen a response begin (same URID test as
+/// `bind_registrant`'s unique-response gate). `CopRegistrant::som_pending`.
+fn note_start_of_message(registrants: &mut [CopRegistrant], unique_resp_identifier: u32) {
+    for r in registrants {
+        let waits_on_id = r.expected.is_empty()
+            || r.expected.iter().any(|e| {
+                e.unique_resp_ids.is_empty() || e.unique_resp_ids.contains(&unique_resp_identifier)
+            });
+        if waits_on_id {
+            r.som_pending = true;
+        }
+    }
+}
+
+/// The name for a receive timeout on `registrants`' COP: `ISO15765_CF_TIMEOUT`
+/// when a response began and none completed since, otherwise unnamed.
+fn rx_timeout_name(registrants: &[CopRegistrant], cop_handle: u32) -> Option<&'static str> {
+    registrants
+        .iter()
+        .find(|r| r.cop_handle == cop_handle)
+        .is_some_and(|r| r.som_pending)
+        .then_some(ISO15765_CF_TIMEOUT_NAME)
 }
 
 /// FlowControl capture state used by the software ISO-TP TX driver (ADR-046):
@@ -4908,6 +4960,20 @@ async fn poll_rx_inner(
                     &mut wrote_suspend,
                 );
 
+                // A start-of-message indication on a native ISO 15765 channel
+                // (SAE J2534-1 v04.04 A.4) says an ECU began a response; mark
+                // every registrant that waits on this response ID, so a
+                // receive phase that then ends without a completed response
+                // can name its timeout (`note_start_of_message`). A
+                // tester-present herald is not a response to any COP.
+                if rx_status_flags & RX_START_OF_MESSAGE as u8 != 0
+                    && !is_tx_side
+                    && !matches!(binding, FrameBinding::TesterPresent)
+                    && is_native_iso15765_entry(entry)
+                {
+                    note_start_of_message(&mut entry.registrants, unique_resp_identifier);
+                }
+
                 // ADR-147 fifth amendment (split direction-specific
                 // anchors): this frame's classification just folded
                 // `Suspend` into `entry.queue_error_class` (`bind_frame` set
@@ -5193,6 +5259,10 @@ async fn poll_rx_inner(
                     // delivered. See `CllRxEntry::cop_tags`'s own doc comment
                     // for the full argument.
                     let cop_tag = resolve_frame_cop_tag(entry, frame_cop_handle);
+                    let padding_error_cop = (rx_status_flags & RX_ISO15765_PADDING_ERROR as u8
+                        != 0
+                        && is_native_iso15765_entry(entry))
+                    .then(|| frame_cop_handle.map(|h| (h, cop_tag.clone())));
                     let frame = ReceivedFrame {
                         timestamp,
                         // `PASSTHRU_MSG.Timestamp`, read above (ADR-353).
@@ -5225,6 +5295,22 @@ async fn poll_rx_inner(
                     } else {
                         deliver_or_enqueue(&entry.rx_buf, entry.handle, CllQueueItem::Frame(frame))
                             .await;
+                    }
+                    // The adapter runs the transport on a native ISO 15765
+                    // channel and only tags a frame whose last CAN frame was
+                    // short (SAE J2534-1 v04.04 A.2); the frame itself is
+                    // delivered above unchanged, and the error follows it,
+                    // bound to the COP the frame bound to (none if unbound).
+                    if let Some(error_cop) = padding_error_cop {
+                        send_named_error_event(
+                            &ctx.subscriptions,
+                            &ctx.logical_links,
+                            entry.handle,
+                            PduErrorEvent::PduErrEvtFrameStruct,
+                            Some(ISO15765_PADDING_NAME),
+                            error_cop,
+                        )
+                        .await;
                     }
                 }
             }
@@ -5922,6 +6008,13 @@ fn merge_registrant_writeback(
     live.concat_segments_got = live
         .concat_segments_got
         .saturating_add(snap.concat_segments_got - base.concat_segments_got);
+    // `som_pending`: adopt this pass's value only when this pass itself
+    // changed it (set by an indication, cleared by a completed response), so a
+    // snapshot carried forward unchanged never undoes a change another pass
+    // already merged.
+    if snap.som_pending != base.som_pending {
+        live.som_pending = snap.som_pending;
+    }
     // `concat` (the open buffers' own contents, as opposed to the segment
     // COUNT above) is overwritten wholesale from `snap` (ADR-148 Amendment:
     // now a `Vec<ConcatBuf>`, still one plain overwrite of the whole `Vec`)
@@ -9284,6 +9377,9 @@ struct ReapedReceiveOnly {
     /// form and its caller-supplied-tag sibling into one signature -- see
     /// that function's own doc comment).
     cop_tag: Option<Vec<u8>>,
+    /// The name for the timeout error (`rx_timeout_name`), read from the
+    /// registrant in the same critical section that removes it.
+    timeout_name: Option<&'static str>,
 }
 
 async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
@@ -9409,6 +9505,7 @@ async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
                         }
                     }
                 }
+                let timeout_name = rx_timeout_name(&link.registrants, cop_handle);
                 link.registrants.retain(|r| r.cop_handle != cop_handle);
                 // Drain any stale `cancelled_cops` entry for this COP, same
                 // as `reap_cancelled_detached_registrants` and the
@@ -9424,6 +9521,7 @@ async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
                     cop_handle,
                     emit_timeout_error,
                     cop_tag,
+                    timeout_name,
                 });
             }
         }
@@ -9459,11 +9557,12 @@ async fn reap_expired_cyclic_registrants(ctx: &ChannelPollCtx) {
             // `logical_links`/`primitives` have both been released and a
             // concurrent first-wins removal of this same `cop_handle` could
             // otherwise have already dropped its tag.
-            send_error_event(
+            send_named_error_event(
                 &ctx.subscriptions,
                 &ctx.logical_links,
                 reaped.cll_handle,
                 PduErrorEvent::PduErrEvtRxTimeout,
+                reaped.timeout_name,
                 Some((reaped.cop_handle, reaped.cop_tag.clone())),
             )
             .await;
@@ -16197,6 +16296,7 @@ async fn wait_for_expected_response(
                 concat_enabled,
                 concat: Vec::new(),
                 concat_segments_got: 0,
+                som_pending: false,
             },
         )
         .await;
@@ -17318,9 +17418,10 @@ async fn wait_for_expected_response_inner(
         // captured from the SAME `l` reference in this SAME critical
         // section -- see that function's own doc comment for why the
         // callee needs them.
-        let (still_on_this_channel, suspended_periodic): (
+        let (still_on_this_channel, suspended_periodic, timeout_name): (
             bool,
             Option<SuspendedBroadcastPeriodicEntry>,
+            Option<&'static str>,
         ) = {
             let mut links = ctx.logical_links.lock().await;
             match links.get_mut(&cll_handle) {
@@ -17370,9 +17471,9 @@ async fn wait_for_expected_response_inner(
                             .take()
                             .map(|p| (p, l.channel_id, l.connect_generation, l.channel_key));
                     }
-                    (true, periodic)
+                    (true, periodic, rx_timeout_name(&l.registrants, cop_handle))
                 }
-                _ => (false, None),
+                _ => (false, None, None),
             }
         };
         if let Some((periodic, channel_id, connect_generation, channel_key)) = suspended_periodic {
@@ -17387,11 +17488,12 @@ async fn wait_for_expected_response_inner(
                 .await;
         }
         if still_on_this_channel {
-            send_error_event(
+            send_named_error_event(
                 &ctx.subscriptions,
                 &ctx.logical_links,
                 cll_handle,
                 PduErrorEvent::PduErrEvtRxTimeout,
+                timeout_name,
                 Some((cop_handle, cop_tag.clone())),
             )
             .await;

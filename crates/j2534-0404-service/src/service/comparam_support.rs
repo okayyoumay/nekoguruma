@@ -2743,6 +2743,7 @@ mod tests {
                 timestamp: 7,
                 cop: None,
                 cop_tag: None,
+                name: None,
             }),
         )
         .unwrap_err();

@@ -687,6 +687,7 @@ mod tests {
             timestamp: 123,
             cop: None,
             cop_tag: None,
+            name: None,
         };
 
         let status = service

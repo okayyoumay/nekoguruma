@@ -504,6 +504,7 @@ fn minimal_registrant(cop_handle: u32) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
+        som_pending: false,
     }
 }
 

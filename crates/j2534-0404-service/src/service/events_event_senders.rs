@@ -142,7 +142,7 @@ pub(in crate::service) fn cll_queue_item_to_event_item(
             data: Some(EventItemData::ErrorData(ErrorData {
                 error_event: tracked.event as i32,
                 extra_error_info: None,
-                extra_error_info_name: None,
+                extra_error_info_name: tracked.name.map(str::to_owned),
             })),
             // ADR-204: echoed verbatim whenever `cop_handle` (i.e.
             // `tracked.cop`) is present -- `send_error_event` resolved this
@@ -626,6 +626,20 @@ pub(in crate::service) async fn send_error_event(
     error: PduErrorEvent,
     cop: Option<ErrorCop>,
 ) {
+    send_named_error_event(subscriptions, logical_links, cll_handle, error, None, cop).await;
+}
+
+/// [`send_error_event`] for a case this service tells apart itself: `name` is
+/// carried on the event as `ErrorData.extra_error_info_name` (ADR-351), with no
+/// code. Every other contract of `send_error_event` applies unchanged.
+pub(in crate::service) async fn send_named_error_event(
+    subscriptions: &Arc<Mutex<HashMap<SubscriptionKey, SubscriptionSender>>>,
+    logical_links: &Arc<Mutex<HashMap<u32, LogicalLinkState>>>,
+    cll_handle: u32,
+    error: PduErrorEvent,
+    name: Option<&'static str>,
+    cop: Option<ErrorCop>,
+) {
     let (cop_handle, cop_tag) = match cop {
         Some((cop_handle, cop_tag)) => (Some(cop_handle), cop_tag),
         None => (None, None),
@@ -651,6 +665,7 @@ pub(in crate::service) async fn send_error_event(
                 timestamp,
                 cop,
                 cop_tag: cop_tag.clone(),
+                name,
             });
             Arc::clone(&link.rx_buf)
         })
@@ -670,7 +685,7 @@ pub(in crate::service) async fn send_error_event(
                 EventItemData::ErrorData(ErrorData {
                     error_event: error as i32,
                     extra_error_info: None,
-                    extra_error_info_name: None,
+                    extra_error_info_name: name.map(str::to_owned),
                 }),
                 cop_tag,
             );
@@ -696,6 +711,7 @@ pub(in crate::service) async fn send_error_event(
             timestamp,
             cop,
             cop_tag,
+            name,
         }),
     )
     .await;
@@ -806,6 +822,7 @@ mod timestamp_clock_tests {
                 timestamp: 7,
                 cop: None,
                 cop_tag: None,
+                name: None,
             }),
             CllQueueItem::Status(TrackedStatus {
                 event: StatusEvent::Cll(PduComLogicalLinkStatus::PduCllstOnline),
@@ -826,6 +843,30 @@ mod timestamp_clock_tests {
             .collect();
         let (device, worker) = (TimestampClock::Device as i32, TimestampClock::Worker as i32);
         assert_eq!(clocks, [device, worker, worker, worker, worker]);
+    }
+
+    /// ADR-351: a queued error item carries its tracked name, and none when
+    /// the case is not one the service names.
+    #[test]
+    fn queued_error_item_carries_its_name() {
+        let error = |name| {
+            CllQueueItem::Error(TrackedError {
+                event: PduErrorEvent::PduErrEvtFrameStruct,
+                timestamp: 7,
+                cop: None,
+                cop_tag: None,
+                name,
+            })
+        };
+        let name_of = |item: &CllQueueItem| match cll_queue_item_to_event_item(1, None, item).data {
+            Some(EventItemData::ErrorData(data)) => data.extra_error_info_name,
+            other => panic!("expected ErrorData, got {other:?}"),
+        };
+        assert_eq!(
+            name_of(&error(Some("ISO15765_PADDING"))).as_deref(),
+            Some("ISO15765_PADDING")
+        );
+        assert_eq!(name_of(&error(None)), None);
     }
 
     /// ADR-353: module and system items are on this service's synthetic

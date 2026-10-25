@@ -795,7 +795,7 @@ enum RxEntryKind {
 /// (ADR-101 Decision §A) to compute this pass's own delta contribution --
 /// never read anywhere else, and deliberately not folded into
 /// `CopRegistrant` (see `CllRxEntry::registrant_baselines`'s doc comment).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct RegistrantBaseline {
     cop_handle: u32,
     matches_got: u32,
@@ -803,9 +803,9 @@ struct RegistrantBaseline {
     /// `CopRegistrant::concat_segments_got` at pass start -- merged the same
     /// delta way as `matches_got` (ADR-148). Always `0` for a non-concat registrant.
     concat_segments_got: u32,
-    /// `CopRegistrant::som_pending` at pass start, so the writeback merge can
+    /// `CopRegistrant::som_started` at pass start, so the writeback merge can
     /// tell this pass's own change from a carried-forward value.
-    som_pending: bool,
+    som_started: Vec<u32>,
     /// `CopRegistrant::timing_accumulator` at pass start (ADR-150) -- used by
     /// `merge_registrant_writeback`'s baseline guard to distinguish "this
     /// pass's own snapshot actually changed the accumulator" from "this
@@ -2717,9 +2717,6 @@ fn bind_registrant(
                         continue;
                     }
                     r.matches_got += 1;
-                    // A completed response ends any start-of-message
-                    // indication the timeout naming was tracking for it.
-                    r.som_pending = false;
                     // ADR-147 correction: this registrant bound the frame --
                     // classification is computed FRESH, right here, from
                     // THIS registrant's own `rc_cfg`, for every scan variant
@@ -3727,28 +3724,45 @@ fn is_native_iso15765_entry(entry: &CllRxEntry) -> bool {
         && entry.header_protocol == j2534_0404::ISO15765
 }
 
-/// Marks every registrant that waits on the response ID behind
-/// `unique_resp_identifier` as having seen a response begin (same URID test as
-/// `bind_registrant`'s unique-response gate). `CopRegistrant::som_pending`.
-fn note_start_of_message(registrants: &mut [CopRegistrant], unique_resp_identifier: u32) {
+/// Records that a message from `unique_resp_identifier` has started in every
+/// registrant of this connection that waits on it (the same URID test as
+/// `bind_registrant`'s positive scan, which never binds a registrant with no
+/// descriptors, and the same `connect_generation` check).
+/// `CopRegistrant::som_started`.
+fn note_start_of_message(
+    registrants: &mut [CopRegistrant],
+    connect_generation: u64,
+    unique_resp_identifier: u32,
+) {
     for r in registrants {
-        let waits_on_id = r.expected.is_empty()
-            || r.expected.iter().any(|e| {
+        let waits_on_id = r.connect_generation == connect_generation
+            && r.expected.iter().any(|e| {
                 e.unique_resp_ids.is_empty() || e.unique_resp_ids.contains(&unique_resp_identifier)
             });
-        if waits_on_id {
-            r.som_pending = true;
+        if waits_on_id && !r.som_started.contains(&unique_resp_identifier) {
+            r.som_started.push(unique_resp_identifier);
         }
     }
 }
 
+/// A content frame from `unique_resp_identifier` ended that sender's message
+/// (one sender has one segmented message in progress): drops the URID from
+/// every registrant's started set, whether the frame bound, was a pending-RC
+/// frame, or was discarded.
+fn note_message_ended(registrants: &mut [CopRegistrant], unique_resp_identifier: u32) {
+    for r in registrants {
+        r.som_started.retain(|&id| id != unique_resp_identifier);
+    }
+}
+
 /// The name for a receive timeout on `registrants`' COP: `ISO15765_CF_TIMEOUT`
-/// when a response began and none completed since, otherwise unnamed.
+/// when a message from a response ID it waits on started and no content frame
+/// from that ID has ended it since, otherwise unnamed.
 fn rx_timeout_name(registrants: &[CopRegistrant], cop_handle: u32) -> Option<&'static str> {
     registrants
         .iter()
         .find(|r| r.cop_handle == cop_handle)
-        .is_some_and(|r| r.som_pending)
+        .is_some_and(|r| !r.som_started.is_empty())
         .then_some(ISO15765_CF_TIMEOUT_NAME)
 }
 
@@ -4934,6 +4948,7 @@ async fn poll_rx_inner(
                 // full reasoning.
                 let mut finalized_concat: Vec<ConcatDelivery> = Vec::new();
                 let mut wrote_suspend = false;
+                let matches_before: u32 = entry.registrants.iter().map(|r| r.matches_got).sum();
                 let binding = bind_frame(
                     entry,
                     FrameContext {
@@ -4960,6 +4975,12 @@ async fn poll_rx_inner(
                     &mut wrote_suspend,
                 );
 
+                // Whether this frame completed a match for its COP (not a
+                // pending-RC frame, not an unbound one): only such a frame
+                // raises the padding error below.
+                let counted_as_match =
+                    entry.registrants.iter().map(|r| r.matches_got).sum::<u32>() > matches_before;
+
                 // A start-of-message indication on a native ISO 15765 channel
                 // (SAE J2534-1 v04.04 A.4) says an ECU began a response; mark
                 // every registrant that waits on this response ID, so a
@@ -4971,7 +4992,14 @@ async fn poll_rx_inner(
                     && !matches!(binding, FrameBinding::TesterPresent)
                     && is_native_iso15765_entry(entry)
                 {
-                    note_start_of_message(&mut entry.registrants, unique_resp_identifier);
+                    note_start_of_message(
+                        &mut entry.registrants,
+                        entry.connect_generation,
+                        unique_resp_identifier,
+                    );
+                }
+                if is_content_frame && !is_tx_side && is_native_iso15765_entry(entry) {
+                    note_message_ended(&mut entry.registrants, unique_resp_identifier);
                 }
 
                 // ADR-147 fifth amendment (split direction-specific
@@ -5261,8 +5289,10 @@ async fn poll_rx_inner(
                     let cop_tag = resolve_frame_cop_tag(entry, frame_cop_handle);
                     let padding_error_cop = (rx_status_flags & RX_ISO15765_PADDING_ERROR as u8
                         != 0
+                        && counted_as_match
                         && is_native_iso15765_entry(entry))
-                    .then(|| frame_cop_handle.map(|h| (h, cop_tag.clone())));
+                    .then(|| frame_cop_handle.map(|h| (h, cop_tag.clone())))
+                    .flatten();
                     let frame = ReceivedFrame {
                         timestamp,
                         // `PASSTHRU_MSG.Timestamp`, read above (ADR-353).
@@ -5300,7 +5330,10 @@ async fn poll_rx_inner(
                     // channel and only tags a frame whose last CAN frame was
                     // short (SAE J2534-1 v04.04 A.2); the frame itself is
                     // delivered above unchanged, and the error follows it,
-                    // bound to the COP the frame bound to (none if unbound).
+                    // bound to the COP whose response the frame completed. A
+                    // pending-RC frame (a short `7F xx 78` is typically padded)
+                    // and an unbound frame raise none, so a COP that later
+                    // times out still ends as a plain timeout.
                     if let Some(error_cop) = padding_error_cop {
                         send_named_error_event(
                             &ctx.subscriptions,
@@ -5308,7 +5341,7 @@ async fn poll_rx_inner(
                             entry.handle,
                             PduErrorEvent::PduErrEvtFrameStruct,
                             Some(ISO15765_PADDING_NAME),
-                            error_cop,
+                            Some(error_cop),
                         )
                         .await;
                     }
@@ -6008,12 +6041,12 @@ fn merge_registrant_writeback(
     live.concat_segments_got = live
         .concat_segments_got
         .saturating_add(snap.concat_segments_got - base.concat_segments_got);
-    // `som_pending`: adopt this pass's value only when this pass itself
+    // `som_started`: adopt this pass's value only when this pass itself
     // changed it (set by an indication, cleared by a completed response), so a
     // snapshot carried forward unchanged never undoes a change another pass
     // already merged.
-    if snap.som_pending != base.som_pending {
-        live.som_pending = snap.som_pending;
+    if snap.som_started != base.som_started {
+        live.som_started = snap.som_started.clone();
     }
     // `concat` (the open buffers' own contents, as opposed to the segment
     // COUNT above) is overwritten wholesale from `snap` (ADR-148 Amendment:
@@ -16296,7 +16329,7 @@ async fn wait_for_expected_response(
                 concat_enabled,
                 concat: Vec::new(),
                 concat_segments_got: 0,
-                som_pending: false,
+                som_started: Vec::new(),
             },
         )
         .await;

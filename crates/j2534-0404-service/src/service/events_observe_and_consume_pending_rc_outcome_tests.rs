@@ -25,7 +25,7 @@ fn registrant(matches_got: u32, pending_rc: Option<u8>) -> CopRegistrant {
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
-        som_pending: false,
+        som_started: Vec::new(),
     }
 }
 
@@ -121,7 +121,7 @@ fn two_successive_occurrences_are_each_independently_observed_and_consumed() {
 fn absorbed_outcome_preserves_pending_rc_not_cleared() {
     let mut reg = CopRegistrant {
         concat_segments_got: 1,
-        som_pending: false,
+        som_started: Vec::new(),
         ..registrant(0, Some(0x78))
     };
 
@@ -152,7 +152,7 @@ fn absorbed_outcome_preserves_pending_rc_not_cleared() {
 fn absorbed_then_next_pass_reports_preserved_pending_rc_and_clears_it() {
     let mut reg = CopRegistrant {
         concat_segments_got: 1,
-        som_pending: false,
+        som_started: Vec::new(),
         ..registrant(0, Some(0x78))
     };
 

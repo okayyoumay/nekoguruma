@@ -2300,6 +2300,13 @@ async fn native_iso15765_padding_error_frame_raises_a_named_frame_structure_erro
             Some(event_item::Data::ErrorData(_)) => {
                 order.push("error");
                 error_item = Some(item.clone());
+            }
+            Some(event_item::Data::CopStatus(status))
+                if *status
+                    == vci_service_interface::PduComPrimitiveStatus::PduCopstFinished as i32
+                    && item.cop_handle == Some(cop_handle) =>
+            {
+                order.push("finished");
                 return true;
             }
             _ => {}
@@ -2307,7 +2314,11 @@ async fn native_iso15765_padding_error_frame_raises_a_named_frame_structure_erro
         false
     })
     .await;
-    assert_eq!(order, ["frame", "error"], "the frame precedes its error");
+    assert_eq!(
+        order,
+        ["frame", "error", "finished"],
+        "the frame precedes its error, which precedes the COP's end"
+    );
     let error_item = error_item.expect("the padding error should be raised");
     let data = error_data(&error_item);
     assert_eq!(
@@ -2415,4 +2426,189 @@ async fn native_iso15765_started_response_that_does_not_complete_names_its_timeo
         drop(events);
         server.shutdown().await;
     }
+}
+
+/// A padded `7F xx 78` frame is a pending response, not a completed one, so it
+/// raises no `ISO15765_PADDING` error (the COP would otherwise end as a frame
+/// error instead of a plain timeout). It is still a content frame from that
+/// response ID, so it ends a started message: the later timeout stays unnamed.
+#[tokio::test]
+#[serial]
+async fn native_iso15765_padded_pending_frame_raises_no_error_and_ends_a_started_message() {
+    const CP_RC78_HANDLING: u32 = 0x8027;
+    const CP_RC_BYTE_OFFSET: u32 = 0x8028;
+    const CP_P2_STAR: u32 = 0x8011;
+
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll(
+        &mut client,
+        j2534_0404::ISO15765,
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (j2534_0404::P2_MAX, 10_000_000),
+            (CP_RC78_HANDLING, 1),
+            (CP_RC_BYTE_OFFSET, 2),
+            (CP_P2_STAR, 300_000),
+        ],
+    )
+    .await;
+    set_unique_resp_table_and_promote(
+        &mut client,
+        cll_handle,
+        vec![ecu_entry(
+            1,
+            vec![
+                unum32_param(CP_CAN_RESP_USDT_ID, 0x7E8),
+                unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E0),
+            ],
+        )],
+    )
+    .await;
+    let mut events = client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+
+    let cop_handle = start_native_sendrecv(&mut client, cll_handle, vec![], None).await;
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[]),
+        j2534_0404::ISO15765,
+        0x0000_0002, // START_OF_MESSAGE
+    );
+    // The padded pending frame follows: it ends the started message.
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7F, 0x22, 0x78]),
+        j2534_0404::ISO15765,
+        0x0000_0010, // ISO15765_PADDING_ERROR
+    );
+
+    let mut errors = Vec::new();
+    assert!(
+        wait_for_event(&mut events, 2000, |item| {
+            match &item.data {
+                Some(event_item::Data::ErrorData(data)) => errors.push(data.clone()),
+                Some(event_item::Data::CopStatus(status))
+                    if *status
+                        == vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
+                            as i32
+                        && item.cop_handle == Some(cop_handle) =>
+                {
+                    return true;
+                }
+                _ => {}
+            }
+            false
+        })
+        .await,
+        "the COP should end at the pending ceiling"
+    );
+    assert_eq!(errors.len(), 1, "only the timeout: {errors:?}");
+    assert_eq!(
+        errors[0].error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
+    );
+    assert_eq!(errors[0].extra_error_info_name, None);
+
+    drop(events);
+    server.shutdown().await;
+}
+
+/// The detached receive-only path (a finite-count COP with no send, timed by
+/// `CP_CyclicRespTimeout` and finished by the periodic reap) names its
+/// timeout the same way: a started message that no content frame ended gives
+/// `ISO15765_CF_TIMEOUT`.
+#[tokio::test]
+#[serial]
+async fn native_iso15765_receive_only_reap_names_a_timeout_after_a_started_response() {
+    const CP_CYCLIC_RESP_TIMEOUT: u32 = 0x8010;
+
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll(
+        &mut client,
+        j2534_0404::ISO15765,
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (CP_CYCLIC_RESP_TIMEOUT, 700_000),
+        ],
+    )
+    .await;
+    set_unique_resp_table_and_promote(
+        &mut client,
+        cll_handle,
+        vec![ecu_entry(
+            1,
+            vec![
+                unum32_param(CP_CAN_RESP_USDT_ID, 0x7E8),
+                unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E0),
+            ],
+        )],
+    )
+    .await;
+    let mut events = client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+
+    let cop_handle = client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cop_tag: None,
+            cll_handle: Some(cll_handle),
+            cop_type: vci_service_interface::ComOperationType::CoptSendrecv as i32,
+            cop_data: vec![],
+            cop_ctrl_data: Some(ComPrimitiveCtrlData {
+                time: 0,
+                num_send_cycles: 0,
+                num_receive_cycles: 1,
+                temp_param_update: 0,
+                expected_response_array: vec![ExpectedResponseData {
+                    response_type: 0,
+                    acceptance_id: 7,
+                    mask_data: vec![0xFF],
+                    pattern_data: vec![0x62],
+                    unique_resp_ids: vec![],
+                }],
+                tx_flag: None,
+            }),
+        })
+        .await
+        .expect("start_com_primitive(CoptSendrecv) should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("cop_handle should be present");
+    tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[]),
+        j2534_0404::ISO15765,
+        0x0000_0002, // START_OF_MESSAGE
+    );
+
+    let error_item = next_error_item(&mut events, 4000)
+        .await
+        .expect("the reap should raise a receive timeout");
+    let data = error_data(&error_item);
+    assert_eq!(
+        data.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout as i32
+    );
+    assert_eq!(
+        data.extra_error_info_name.as_deref(),
+        Some("ISO15765_CF_TIMEOUT")
+    );
+    assert_eq!(error_item.cop_handle, Some(cop_handle));
+
+    drop(events);
+    server.shutdown().await;
 }

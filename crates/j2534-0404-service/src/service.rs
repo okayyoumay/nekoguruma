@@ -1853,15 +1853,19 @@ pub(super) struct CopRegistrant {
     /// contribution can be diffed against a baseline the same way. Always
     /// `0` when `concat_enabled` is `false`.
     pub(super) concat_segments_got: u32,
-    /// A start-of-message indication for a response this registrant waits on
-    /// arrived on a native ISO 15765 channel and no response has completed
-    /// for it since (SAE J2534-1 v04.04 Appendix A.2, A.4). Set by
-    /// `poll_rx_inner` on a matching indication, cleared by `bind_registrant`
-    /// when a response completes a match; read when the receive phase times
-    /// out, to name the timeout `ISO15765_CF_TIMEOUT`. Always `false` on every
-    /// other channel kind. Merged back like `pending_rc`: a pass's change
-    /// against its own baseline wins (`merge_registrant_writeback`).
-    pub(super) som_pending: bool,
+    /// Unique response IDs (URIDs) whose message has started and not ended,
+    /// for a response this registrant waits on, on a native ISO 15765
+    /// channel (SAE J2534-1 v04.04 Appendix A.2, A.4: the start-of-message
+    /// indication marks the start; the completed message itself, a content
+    /// frame from that sender, marks the end). `poll_rx_inner` inserts the
+    /// URID of a start-of-message indication into every registrant waiting on
+    /// it and removes it from every registrant on any content frame from that
+    /// URID, bound or not. Read when the receive phase times out: a non-empty
+    /// set names the timeout `ISO15765_CF_TIMEOUT`. Always empty on every
+    /// other channel kind. Merged back like `pending_rc`: a pass's value wins
+    /// only if the pass changed it against its baseline
+    /// (`merge_registrant_writeback`).
+    pub(super) som_started: Vec<u32>,
 }
 
 /// Accumulator for one in-progress `CP_EnableConcatenation` segment merge

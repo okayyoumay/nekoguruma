@@ -9846,7 +9846,7 @@ mod ioctl_clear_tx_queue_cancelled_cops_tests {
             concat_enabled: false,
             concat: Vec::new(),
             concat_segments_got: 0,
-            som_pending: false,
+            som_started: Vec::new(),
         }
     }
 

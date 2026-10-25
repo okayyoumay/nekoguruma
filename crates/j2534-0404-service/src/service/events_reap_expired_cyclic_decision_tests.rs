@@ -27,7 +27,7 @@ fn finite_n_registrant(cop_handle: u32, deadline: tokio::time::Instant) -> CopRe
         concat_enabled: false,
         concat: Vec::new(),
         concat_segments_got: 0,
-        som_pending: false,
+        som_started: Vec::new(),
     }
 }
 

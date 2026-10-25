@@ -6,7 +6,9 @@ The repository is MIT-licensed and will be public: write review comments as if a
 More rules for Rust, documentation and CI files are in `.github/instructions/`. The skills in
 `.claude/skills/` are workflows for the sessions that write pull requests (for example
 `pr-review-loop` answers your findings); they are not review rules, so do not apply them when
-reviewing.
+reviewing. The same holds for `CLAUDE.md`'s Guidelines on asking the maintainer before changing
+an ambiguous instruction and on confirming a design summary after a design answer: they govern
+how a writing session works, and a diff cannot show whether they were followed.
 
 ## P0
 

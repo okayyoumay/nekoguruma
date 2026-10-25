@@ -24,6 +24,13 @@ If an instruction contains a contradiction, ambiguity or missing information tha
 outcome, ask before making changes. When a choice is reversible and the instruction leaves it
 open, pick the reasonable default and say which one you picked.
 
+After the maintainer answers a design question, do not implement from that one answer. First
+write a short design summary and get it confirmed: which layer does what (design principle 6:
+the agent does not branch on the worker, the workers absorb their APIs' differences), which
+interfaces, design sections and ADRs change, and which further choices the answer leaves
+open. Ask those choices together, not one at a time after implementing. A run that may be
+unattended follows the `unattended-clarification` skill instead of waiting for the answer.
+
 ### Temporary vs. permanent files
 
 `work/` holds temporary working material (task lists, open items, status notes, the worker-crate

@@ -1051,8 +1051,9 @@ impl LinkState {
 
     /// Whether an ended exchange on this link could still own a transmit indication: one whose
     /// `sent` is `unknown`, however long ago it ended, on the same opened link (design 8.11
-    /// `sent_evidence`). An exchange that a refusal, a transmit error or a flow-control failure
-    /// ended has another `sent`, so it owns none.
+    /// `sent_evidence`). A refusal makes `sent` `not_sent`, so a refused exchange owns none. An
+    /// exchange a transmit error or a flow-control failure ended is `unknown` today and counts,
+    /// although design 8.11 lets it own none: that only keeps later indications `unattached`.
     pub(crate) fn may_own_tx_indication(&self) -> bool {
         self.unknown_sends > 0
     }
@@ -1677,14 +1678,13 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 ),
             )
         }
-        End::NoResponse if sent == Sent::Confirmed => {
-            let reason = if any_link_error {
-                "Sent on the bus, but a link error came during the exchange and may have lost a frame (H3)."
-            } else {
-                "Sent on the bus, but this ECU has not answered a request matched this way since the last link error or its last reset or session change, so a wrong address, response filter or response pattern, and with it a response the worker dropped, is not excluded (H2)."
-            };
-            (Undetermined, to_owned(reason))
-        }
+        End::NoResponse if sent == Sent::Confirmed => (
+            Undetermined,
+            format!(
+                "Sent on the bus, but {}.",
+                open_readings(evidence, history, sent, false).join("; ")
+            ),
+        ),
         End::NoResponse if sent == Sent::Unknown => {
             let mut reason =
                 to_owned("There is no evidence that the request reached the bus (H1).");
@@ -2489,6 +2489,24 @@ mod tests {
         let (classification, reason) = judged(&erred, &state);
         assert_eq!(classification, Classification::Undetermined);
         assert!(reason.contains("(H3)"), "{reason}");
+        // A link error and no matched answer: both readings stay open.
+        let mut both = other.clone();
+        both.channel_link_errors = vec![LinkErrorKind::Receive];
+        let (_, reason) = judged(&both, &state);
+        assert!(
+            reason.contains("(H2)") && reason.contains("(H3)"),
+            "{reason}"
+        );
+        // On a link whose VCI absorbs pendings, with the time not judged, the possible-pending
+        // row comes first (H4).
+        let mut absorbed = silent.clone();
+        absorbed.pending_visibility = PendingVisibility::AbsorbedByVci;
+        let (classification, reason) = judged(&absorbed, &state);
+        assert_eq!(classification, Classification::Undetermined);
+        assert!(
+            reason.contains("(H4)") && !reason.contains("(H1)"),
+            "{reason}"
+        );
     }
 
     /// An exchange that ended with `sent` `unknown` could still own a transmit indication that
@@ -2566,6 +2584,10 @@ mod tests {
                             case.pending_visibility = PendingVisibility::Forwarded;
                         }
                         cases.push(case.clone());
+                        // A confirmed send alone, which the rows standing on one take.
+                        let mut confirmed = case.clone();
+                        confirmed.transmit_evidence = Some(TransmitEvidence::TxIndication);
+                        cases.push(confirmed);
                         case.pending = vec![pending()];
                         cases.push(case.clone());
                         case.link_errors = vec![LinkErrorKind::Receive];
@@ -2618,12 +2640,20 @@ mod tests {
         ];
         let cases = all_cases();
         assert!(cases.len() > 1000);
-        for case in cases {
+        for (index, case) in cases.into_iter().enumerate() {
             let mut state = LinkState::default();
-            // An owed request makes the case an ownership case as well.
+            // An owed request makes the case an ownership case as well; every other case also
+            // has a matched answer before it, which the rows on a confirmed send take.
             log(&mut state, 1, read([0xF1, 0x86], End::NoResponse));
+            if index % 2 == 1 {
+                log(
+                    &mut state,
+                    2,
+                    read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+                );
+            }
             let history = state.history_for(&case);
-            let entry = ExchangeEntry::build(2, case, history);
+            let entry = ExchangeEntry::build(3, case, history);
             for field in [&entry.text, &entry.reason] {
                 let lower = field.to_lowercase();
                 for denied in DENIED_WORDS {

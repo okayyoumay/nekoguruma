@@ -297,14 +297,17 @@ pub(crate) enum UnattachedData {
 }
 
 impl UnattachedItem {
-    /// Whether this is a transmit indication (RxFlag `TX_INDICATION`) for `identifier`.
+    /// Whether this is an unbound transmit indication (RxFlag `TX_INDICATION`) for
+    /// `identifier`. One bound to an earlier primitive belongs to that primitive's exchange
+    /// (design 8.11 `late_item`), so it never confirms another's.
     fn is_tx_indication_for(&self, identifier: u32) -> bool {
-        matches!(
-            &self.data,
-            UnattachedData::Result { rx_flag, identifier: Some(id), .. }
-                if rx_flag.get(3).is_some_and(|flags| flags & RX_FLAG_TX_INDICATION != 0)
-                    && *id == identifier
-        )
+        !self.earlier_primitive
+            && matches!(
+                &self.data,
+                UnattachedData::Result { rx_flag, identifier: Some(id), .. }
+                    if rx_flag.get(3).is_some_and(|flags| flags & RX_FLAG_TX_INDICATION != 0)
+                        && *id == identifier
+            )
     }
 }
 
@@ -953,8 +956,13 @@ impl CommLog {
                 .iter()
                 .position(|item| item.is_tx_indication_for(tx_id))
         {
-            unbound.remove(own);
+            let read = unbound.remove(own).read;
             evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
+            // The agent's time of the transmit confirmation is when the host read it, on the
+            // entry's agent epoch.
+            evidence.times.agent.tx_confirmed_us = read
+                .filter(|read| read.epoch == evidence.times.agent.epoch)
+                .map(|read| read.monotonic_us);
         }
         for item in &unbound {
             let event = Event::Unattached(UnattachedEntry::of(item));
@@ -2315,8 +2323,22 @@ mod tests {
                 exchange::End::NoResponse,
             )
         };
-        // Another identifier's indication stays unattached; this exchange's confirms it.
-        log.exchange_with(silent(), vec![tx_done(0x7E1), tx_done(0x7E0)])
+        let read_at = |read_us| AgentNow {
+            epoch: 0,
+            monotonic_us: read_us,
+            wall_unix_ms: 0,
+        };
+        // Another identifier's indication, and one bound to an earlier primitive, stay
+        // unattached; this exchange's own confirms it, at the time the host read it.
+        let earlier = UnattachedItem {
+            earlier_primitive: true,
+            ..tx_done(0x7E0)
+        };
+        let own = UnattachedItem {
+            read: Some(read_at(1_234)),
+            ..tx_done(0x7E0)
+        };
+        log.exchange_with(silent(), vec![tx_done(0x7E1), earlier, own])
             .unwrap();
         // No indication: `sent` `unknown`, which could own a late one.
         log.exchange_with(silent(), Vec::new()).unwrap();
@@ -2330,6 +2352,7 @@ mod tests {
             &events[2..events.len() - 1],
             [
                 "unattached",
+                "unattached",
                 "exchange",
                 "exchange",
                 "unattached",
@@ -2342,6 +2365,7 @@ mod tests {
             .collect();
         assert_eq!(entries[0]["sent"], "confirmed");
         assert_eq!(entries[0]["sent_evidence"], "tx_indication");
+        assert_eq!(entries[0]["times"]["agent"]["tx_confirmed_us"], 1_234);
         assert!(!entries[0]["reason"].as_str().unwrap().contains("(H1)"));
         for entry in &entries[1..] {
             assert_eq!(entry["sent"], "unknown", "{entry}");
@@ -2355,7 +2379,7 @@ mod tests {
             .filter(|line| line["event"] == "unattached")
             .map(|line| line["identifier"].clone())
             .collect();
-        assert_eq!(unattached, [0x7E1, 0x7E0]);
+        assert_eq!(unattached, [0x7E1, 0x7E0, 0x7E0]);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

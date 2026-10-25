@@ -367,7 +367,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
   a time on the job's one link, and the link starts no communication, so the API sends no
   tester present of its own. Every other item is an `unattached` event, written in the order
-  read and before the exchange's entry; a start-of-message indication is not attached yet.
+  read and before the exchange's entry: an item bound to an earlier primitive, a start-of-message
+  indication (not attached yet), and a transmit indication whose header is not a plain 4-byte
+  CAN identifier (extended or mixed addressing), which therefore never confirms a send. The
+  confirming indication's read time is the entry's `times.agent.tx_confirmed_us`.
   Status and information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
   `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), a result's

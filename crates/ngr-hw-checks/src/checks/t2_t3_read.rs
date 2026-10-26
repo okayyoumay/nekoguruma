@@ -170,7 +170,8 @@ async fn run_job(
     let document = JobDocument::new(document).map_err(|e| failed(e.to_string()))?;
     let job = Job::from_document(document)
         .map_err(|e| failed(e.to_string()))?
-        .with_comm_log_dir(work.join("commlog"));
+        .with_comm_log_dir(work.join("commlog"))
+        .with_vci_margins(client.vci_margins());
     if job.writes() {
         return Err(CheckError::Refused(format!(
             "the {job_name} job writes, and the check runs reads only"

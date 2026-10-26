@@ -1875,6 +1875,11 @@ impl GuardedHandle {
             .map(|()| vci_service_interface::Response::default())
     }
 
+    /// The margins the profile gives its VCI ([`Vci::margins`]).
+    pub fn vci_margins(&self) -> agent::VciMargins {
+        self.shared.vci.margins()
+    }
+
     /// The timing margin the profile gives its VCI (`timing_margin_us`, design 8.11 "Timing
     /// margin"), if it gives one.
     pub fn timing_margin(&self) -> Option<Duration> {

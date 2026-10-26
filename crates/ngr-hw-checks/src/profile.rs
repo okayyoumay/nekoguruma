@@ -106,9 +106,27 @@ pub struct Vci {
     /// without it judges nothing (ADR-356).
     #[serde(default)]
     pub timing_margin_us: Option<u32>,
+    /// How far the VCI's clock may run from the agent's, in parts per million (design 8.11
+    /// "Drift bound"); without it the agent takes its default (ADR-357).
+    #[serde(default)]
+    pub drift_bound_ppm: Option<u32>,
+    /// The tolerance of one reading of the VCI's clock in microseconds (design 8.11 "Drift
+    /// bound"); without it the agent takes its default (ADR-357).
+    #[serde(default)]
+    pub clock_margin_us: Option<u32>,
 }
 
 impl Vci {
+    /// The margins this profile gives its VCI, for a job the harness runs on it (ADR-357): each
+    /// key it leaves out takes the agent's default.
+    pub fn margins(&self) -> agent::VciMargins {
+        agent::VciMargins {
+            timing_margin_us: self.timing_margin_us,
+            drift_bound_ppm: self.drift_bound_ppm,
+            clock_margin_us: self.clock_margin_us,
+        }
+    }
+
     /// Whether `other` may name the same module. Names are compared exactly, as the library
     /// resolvers match them (design 7.1). A J2534 worker opens the configured entry its label
     /// selects, and its `pname` identifies the device (ADR-281), so for J2534 the same label or

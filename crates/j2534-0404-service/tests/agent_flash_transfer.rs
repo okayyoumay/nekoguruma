@@ -478,7 +478,7 @@ fn assert_comm_log(journal_dir: &std::path::Path) {
     );
     assert!(version["api_version"].is_u64(), "{connected}");
     assert!(version.get("vendor").is_none(), "{connected}");
-    assert_eq!(connected["drift_bound"]["source"], "none", "{connected}");
+    assert_eq!(connected["drift_bound"]["source"], "default", "{connected}");
     let identities: Vec<(&str, &str)> = lines
         .iter()
         .filter(|line| line["event"] == "identity")

@@ -42,7 +42,9 @@ pub mod send_receive;
 
 pub use artifact::Artifact;
 pub use client::WorkerApi;
-pub use comm_log::{CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus, VciFacts, run_key};
+pub use comm_log::{
+    CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus, VciFacts, VciMargins, run_key,
+};
 pub use document::JobDocument;
 pub use host::{HostError, Timings, WorkerHost};
 pub use journal::Vin;

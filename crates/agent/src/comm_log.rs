@@ -2593,7 +2593,9 @@ mod tests {
     }
 
     /// The agent's own deadline is not the VCI ending the wait: the response may still be
-    /// arriving, so the outcome stays `no_response` while the start still is an answer.
+    /// arriving, so the outcome stays `no_response` while the start still is an answer. The
+    /// start is no bound answer, so H2 stays open (ADR-354); the pending rows are checked on a
+    /// forwarding link in `a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer`.
     #[test]
     fn a_start_of_message_does_not_make_an_agent_deadline_a_response_incomplete() {
         let (entries, unattached) = run_exchanges(vec![(
@@ -2608,6 +2610,50 @@ mod tests {
         assert_eq!(entries[0]["outcome"]["result"], "no_response");
         assert_eq!(entries[0]["sent"], "confirmed");
         assert_eq!(entries[0]["sent_evidence"], "answer");
+        assert_eq!(entries[0]["classification"], "undetermined");
+        let reason = entries[0]["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("answered with a pending and then"),
+            "{reason}"
+        );
+        assert!(reason.contains("(H2)"), "{reason}");
+    }
+
+    /// The rows of a pending seen need a pending (ADR-354): on a link that forwards pendings,
+    /// with a judged window, a start alone ended by the agent's deadline is no pending answer.
+    /// A request whose positive response is suppressed still has an answer of the ECU in the
+    /// start, so it does not take the rows for no answer of the ECU.
+    #[test]
+    fn a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer() {
+        let mut forwarded = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        forwarded.pending_visibility = exchange::PendingVisibility::Forwarded;
+        forwarded.timing.window = exchange::Window::WithinP2;
+        let mut suppressed = evidence(
+            endpoint(0x7E0),
+            &[0x31, 0x81, 0xFF, 0x00],
+            exchange::End::NoResponse,
+        );
+        suppressed.suppressed = true;
+        for (case, evidence) in [("forwarded", forwarded), ("suppressed", suppressed)] {
+            let (entries, _) = run_exchanges(vec![(evidence, vec![start_of_message(0x7E8)])]);
+            let entry = &entries[0];
+            assert_eq!(entry["sent_evidence"], "answer", "{case}");
+            assert_eq!(entry["link_history"]["this_exchange"], true, "{case}");
+            assert_ne!(entry["classification"], "vehicle", "{case}");
+            let reason = entry["reason"].as_str().unwrap();
+            assert!(
+                !reason.contains("answered with a pending and then"),
+                "{case}: {reason}"
+            );
+            assert!(
+                !reason.contains("No response was expected"),
+                "{case}: {reason}"
+            );
+        }
     }
 
     /// What does not attach: an exchange a refusal ended, and an item whose RxFlag also says it
@@ -2681,10 +2727,11 @@ mod tests {
         assert_eq!(entry["outcome"]["result"], "link_error");
     }
 
-    /// The started exchange is an answer for the later exchanges: it counts as answered and as a
-    /// matched answer (design 8.11 "Matched answer").
+    /// A response start alone is an answer but not a matched answer (ADR-354): the later
+    /// exchange counts it as answered, keeps H2 among its readings, and the started exchange's
+    /// own `response_incomplete` reason names H2. A final response is a matched answer.
     #[test]
-    fn a_started_response_counts_for_the_later_exchanges() {
+    fn a_started_response_is_answered_but_not_matched_for_the_later_exchanges() {
         let (entries, _) = run_exchanges(vec![
             (
                 vci_ended(exchange::End::NoResponse),
@@ -2692,9 +2739,46 @@ mod tests {
             ),
             (vci_ended(exchange::End::NoResponse), Vec::new()),
         ]);
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+        let started_reason = entries[0]["reason"].as_str().unwrap();
+        assert!(started_reason.contains("(H2)"), "{started_reason}");
         let history = &entries[1]["link_history"];
         assert_eq!(history["answered"], 1);
-        assert_eq!(history["answered_same_match"], 1);
+        assert_eq!(history["answered_same_match"], 0);
+        let later_reason = entries[1]["reason"].as_str().unwrap();
+        assert!(later_reason.contains("(H2)"), "{later_reason}");
+
+        // With a final response the next exchange has a matched answer, which excludes H2 for
+        // a later start alone too.
+        let (entries, _) = run_exchanges(vec![
+            (
+                vci_ended(exchange::End::Positive(vec![0x62, 0xF1, 0x90])),
+                Vec::new(),
+            ),
+            (
+                vci_ended(exchange::End::NoResponse),
+                vec![start_of_message(0x7E8)],
+            ),
+        ]);
+        assert_eq!(entries[1]["link_history"]["answered_same_match"], 1);
+        assert_eq!(entries[1]["outcome"]["result"], "response_incomplete");
+        let matched_reason = entries[1]["reason"].as_str().unwrap();
+        assert!(!matched_reason.contains("(H2)"), "{matched_reason}");
+
+        // A pending in the incomplete exchange itself excludes H2 too.
+        let mut with_pending = vci_ended(exchange::End::NoResponse);
+        with_pending.pending_visibility = exchange::PendingVisibility::Forwarded;
+        with_pending.pending = vec![exchange::Pending {
+            vci_us: None,
+            clock: None,
+            agent_us: 10,
+            since_previous_ms: None,
+        }];
+        let (entries, _) = run_exchanges(vec![(with_pending, vec![start_of_message(0x7E8)])]);
+        assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
+        let pending_reason = entries[0]["reason"].as_str().unwrap();
+        assert!(!pending_reason.contains("(H2)"), "{pending_reason}");
     }
 
     #[test]

@@ -373,10 +373,15 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   link expecting a response on that identifier could own it (one that stays owed after a reopened
   link too, so it only keeps the indication `unattached`). The exchange then has `sent`
   `confirmed` with `sent_evidence` `answer` (a transmit indication still wins), and counts as
-  answered and as a matched answer for the later exchanges (design 8.11 "Matched answer"). Every
+  answered for the later exchanges. A start with no final response or pending is no matched
+  answer and leaves H2 open, in this exchange and the later ones, since the worker may have
+  discarded the full response (`Evidence::bound_answer`, design 8.11 "Matched answer",
+  ADR-354); the rows of a pending seen do not take it either, while every other row still
+  counts it as an answer of the ECU. Every
   start with that identifier read during the exchange attaches, since the ECU may have aborted and
   begun again. An exchange the VCI ended with no response (the worker reported a receive timeout
-  for the primitive) ends as `response_incomplete`, classified `undetermined`; one the agent's
+  for the primitive) ends as `response_incomplete`, classified `undetermined`, with H2 among
+  its readings unless a pending in the exchange or a matched answer excludes it; one the agent's
   own deadline ended keeps `no_response`, since the response may still be arriving (design 8.11
   `vci_did_not_end`).
   The log writes no time for the start yet: its VCI time needs per-clock epochs (ADR-353), and

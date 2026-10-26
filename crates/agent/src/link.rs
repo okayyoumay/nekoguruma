@@ -824,7 +824,7 @@ async fn set_indication<C: WorkerApi>(
 }
 
 /// Whether `status` is the worker refusing a request, rather than the connection to it failing.
-pub(crate) fn refused(status: &tonic::Status) -> bool {
+fn refused(status: &tonic::Status) -> bool {
     !matches!(
         status.code(),
         tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown

@@ -391,10 +391,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   VCI ended the wait. A primitive whose end the host did not read may still hold the link: its
   own deadline, lost events or a failed event stream ended the wait, though not a lost VCI,
   whose primitives the worker cancels. The host cancels such a primitive before the link's next
-  request (`WorkerHost::stray`, design 8.11 "Settlement"). A worker that refuses the cancel has
-  no such primitive any more. Any other failure leaves the link held, so the request is not
-  started. An item the cancelled primitive leaves is logged `unattached` with `primitive`
-  `earlier`.
+  request (`WorkerHost::stray`, design 8.11 "Settlement"). The primitive is gone when the cancel
+  succeeds, when the worker names its handle invalid (`PDU_ERR_INVALID_HANDLE`: it had ended), or
+  when the VCI was lost. Any other answer leaves the link held: the request is not started
+  (`HostError::LinkHeld`, logged `not_sent`, refused by the agent with the cause `link_held`), and
+  the next request tries the cancel again. An item the cancelled primitive leaves is logged
+  `unattached` with `primitive` `earlier`.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs

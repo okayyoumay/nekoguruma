@@ -23,7 +23,7 @@ use crate::comm_log::exchange::{
     VciTimes,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
-use crate::link::{Link, LinkConfig, refused};
+use crate::link::{Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
 
 /// The `link` of the host's exchange entries and of the log's `link_opened`: a job has one
@@ -39,6 +39,10 @@ pub enum HostError {
     },
     #[error("the worker did not answer {0} in time")]
     WorkerUnresponsive(&'static str),
+    /// A primitive the host stopped waiting for still holds the link, and the worker did not
+    /// cancel it: the request was not started (design 8.11 "Settlement").
+    #[error("an earlier primitive the worker did not cancel still holds the link")]
+    LinkHeld,
     #[error("the worker's event stream ended")]
     EventStreamEnded,
     #[error("no response from the ECU")]
@@ -175,6 +179,14 @@ fn lost_vci_between_primitives(error: HostError) -> HostError {
         }
         _ => error,
     }
+}
+
+/// Whether the worker refused a call because it knows no object with the handle given
+/// (`PDU_ERR_INVALID_HANDLE`, ISO 22900-2:2022 D.3): for a cancel, a primitive that has ended.
+fn names_invalid_handle(status: &tonic::Status) -> bool {
+    vci_service_interface::error_detail_from_status(status).is_some_and(|detail| {
+        detail.pdu_error == vci_service_interface::PduError::PduErrInvalidHandle as i32
+    })
 }
 
 /// Calls a unary RPC with a deadline (ADR-235 item 6).
@@ -603,9 +615,10 @@ impl<C: WorkerApi> WorkerHost<C> {
             }),
         };
         // A primitive the host stopped waiting for may still hold the link, which runs one
-        // primitive at a time (ISO 22900-2:2022 8.4.17.2): cancel it first. A worker that
-        // answers with a refusal has no such primitive any more; any other failure leaves the
-        // link held, so the request is not started.
+        // primitive at a time (ISO 22900-2:2022 8.4.17.2): cancel it first. It is gone when the
+        // cancel succeeds, when the worker names its handle invalid (it had ended), or when the
+        // VCI was lost (the worker cancelled it). Any other answer leaves the link held, so the
+        // request is not started and the next one tries the cancel again.
         if let Some(stray) = self.stray.take() {
             let cancelled = unary(
                 self.timings.unary,
@@ -614,13 +627,14 @@ impl<C: WorkerApi> WorkerHost<C> {
                     cop_handle: Some(stray),
                 }),
             )
-            .await;
+            .await
+            .map_err(lost_vci_between_primitives);
             match cancelled {
-                Ok(_) => {}
-                Err(HostError::Rpc { status, .. }) if refused(&status) => {}
-                Err(error) => {
+                Ok(_) | Err(HostError::VciLost) => {}
+                Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => {}
+                Err(_) => {
                     self.stray = Some(stray);
-                    return Sent::not_started(Err(error));
+                    return Sent::not_started(Err(HostError::LinkHeld));
                 }
             }
         }
@@ -1077,6 +1091,8 @@ fn sent_end(
     };
     let end = match error {
         HostError::NoResponse => End::NoResponse,
+        // The agent did not start it: an earlier primitive still holds the link.
+        HostError::LinkHeld => End::NotSent(RefusalCause::LinkHeld),
         HostError::EventsLost => End::Unknown(UnknownCause::EventsLost),
         HostError::EventStreamEnded => End::Unknown(UnknownCause::EventsEnded),
         HostError::WorkerUnresponsive(_) => End::Unknown(UnknownCause::WorkerNotAnswering),
@@ -1166,6 +1182,7 @@ fn host_error_name(error: &HostError) -> &'static str {
     match error {
         HostError::Rpc { .. } => "Rpc",
         HostError::WorkerUnresponsive(_) => "WorkerUnresponsive",
+        HostError::LinkHeld => "LinkHeld",
         HostError::EventStreamEnded => "EventStreamEnded",
         HostError::NoResponse => "NoResponse",
         HostError::EventsLost => "EventsLost",
@@ -2714,6 +2731,25 @@ mod tests {
         assert_eq!(logged[0].vci_us, Some(10));
         assert_eq!(logged[0].clock, Some(Clock::Device));
         assert_eq!(logged[0].agent_us, 100);
+    }
+
+    /// A request the host did not start because an earlier primitive still holds the link is
+    /// `not_sent`, refused by the agent (design 8.11 `sent`).
+    #[test]
+    fn a_request_behind_a_held_link_is_not_sent() {
+        let read = [0x22, 0xF1, 0x90];
+        let (end, detail) = sent_end(
+            &read,
+            &Err(HostError::LinkHeld),
+            &NegativeShape::uds(),
+            read[0],
+            false,
+        );
+        assert!(
+            matches!(end, End::NotSent(RefusalCause::LinkHeld)),
+            "{end:?}"
+        );
+        assert_eq!(detail.host_error, Some("LinkHeld"));
     }
 
     /// Design 8.11 "Settlement": only a primitive whose end was read counts as ended, so one

@@ -489,6 +489,9 @@ pub(crate) enum RefusalCause {
     /// The worker refused it for its own reasons: invalid parameters, a full queue, a request
     /// the protocol cannot carry.
     SystemOwnReasons,
+    /// An earlier primitive the agent stopped waiting for still holds the link, and the worker
+    /// did not cancel it (design 8.11 "Settlement").
+    LinkHeld,
 }
 
 impl RefusalCause {
@@ -515,6 +518,7 @@ impl RefusalCause {
                 "the job's definition does not declare this service, or its number is not one a request can carry".to_owned()
             }
             Self::SystemOwnReasons => "the system refused it for its own reasons (invalid parameters, a full queue or a request the protocol cannot carry)".to_owned(),
+            Self::LinkHeld => "an earlier request the agent stopped waiting for still holds the link, and the system could not cancel it".to_owned(),
         }
     }
 }
@@ -2244,6 +2248,7 @@ mod tests {
             RefusalCause::EmptyRequest,
             RefusalCause::UndeclaredService,
             RefusalCause::SystemOwnReasons,
+            RefusalCause::LinkHeld,
         ] {
             let evidence = evidence(&[0x36, 1], End::NotSent(cause));
             let entry = ExchangeEntry::build(4, evidence, LinkHistory::empty());

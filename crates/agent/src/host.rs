@@ -551,9 +551,17 @@ impl<C: WorkerApi> WorkerHost<C> {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let end = deadline_end(end, sent.agent_deadline);
             let (link_errors, error_at) = events_seen(&sent, &mut detail);
+            // A response's times only for an exchange that ended with that response: one read
+            // before the agent's deadline, lost events or a lost VCI ended the wait is not the
+            // entry's outcome.
+            let response_times = if sent.result.is_ok() {
+                sent.response_times
+            } else {
+                VciTimes::default()
+            };
             let vci = VciTimes {
                 error: error_at,
-                ..sent.response_times
+                ..response_times
             };
             let unbound = unattached_items(&sent.unbound);
             let before_answer = errors_before_answer(&sent);
@@ -2743,7 +2751,7 @@ mod tests {
         };
         let timed_out = sent(&mut silent, Err(HostError::NoResponse));
         assert_eq!(named(&timed_out), on(1_500, Some(Clock::Worker)));
-        // A link error before the timeout is the event named, with its time.
+        // A failed primitive names its link error, with that item's time.
         let mut faulted = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
         assert!(faulted.on_event(fault, COP).is_none());
         let failed = sent(

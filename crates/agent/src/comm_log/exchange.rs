@@ -302,6 +302,17 @@ impl VciTime {
             epoch: 0,
         }
     }
+
+    /// Of an indication's time and the one the response's item carries for the same point,
+    /// the response's (`given`), unless only the indication's names a clock: a time with none
+    /// is compared with no other.
+    pub(crate) fn prefer(indication: Self, given: Self) -> Self {
+        if given.clock.is_none() && indication.clock.is_some() {
+            indication
+        } else {
+            given
+        }
+    }
 }
 
 /// VCI times of an exchange, each as its item gave it, with its own clock: on a J2534 link a
@@ -318,8 +329,8 @@ pub(crate) struct VciTimes {
     /// The response's end: the final response's own time.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub rx_end: Option<VciTime>,
-    /// The error event that ended the primitive: a lost VCI, else a receive timeout, else the
-    /// last error the primitive reported.
+    /// The error event the entry names (`detail`): a lost VCI, a failed primitive's last error,
+    /// else the last link error the primitive reported or else its receive timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<VciTime>,
 }

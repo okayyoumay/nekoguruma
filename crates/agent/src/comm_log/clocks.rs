@@ -79,6 +79,10 @@ pub(crate) struct ClockEpoch {
 pub(crate) struct Tolerance {
     pub drift_bound_ppm: u32,
     pub clock_margin_us: u32,
+    /// When the exchange whose times are placed began, on the agent's clock: its primitive's
+    /// own items were taken after it, so the clock can have run since its latest time at least
+    /// as long as the agent has since then.
+    pub began_us: Option<u64>,
 }
 
 impl Tolerance {
@@ -173,8 +177,16 @@ impl VciClocks {
             (Some(_), true) => EpochReason::Reconnect,
             (Some(mut epoch), false) => {
                 let raw = i128::from(raw);
-                let reach = i128::from(read_us) - epoch.least_delay
+                let mut reach = i128::from(read_us) - epoch.least_delay
                     + tolerance.over(read_us.saturating_sub(epoch.least_at_us));
+                // Times read together, or soon after a late read, can lie past that reach by
+                // the read's delay; the agent's time since the exchange began bounds the run
+                // since the latest time, if that was taken in the exchange.
+                if let Some(began_us) = tolerance.began_us {
+                    let since = read_us.saturating_sub(began_us);
+                    reach = reach
+                        .max(epoch.latest.unwrapped + i128::from(since) + tolerance.over(since));
+                }
                 let lower = epoch.latest.unwrapped - i128::from(tolerance.clock_margin_us);
                 // The first value at or above `lower`, and the wraps it lies past the latest.
                 let unwrapped = raw - (raw - lower).div_euclid(WRAP) * WRAP;
@@ -234,6 +246,16 @@ impl VciClocks {
         )
     }
 
+    /// The clock's latest unwrapped time in its current epoch.
+    pub(crate) fn latest(&self, clock: Clock) -> Option<i64> {
+        let state = match clock {
+            Clock::Device => &self.device,
+            Clock::Worker => &self.worker,
+        };
+        let latest = state.current?.latest.unwrapped;
+        i64::try_from(latest).ok()
+    }
+
     /// Places `raw`, a time on `clock` with no read time of its own, nearest the clock's latest
     /// time, without taking it into the clock's state. `None` when the clock has no epoch, or
     /// the VCI connected again since its latest time.
@@ -250,6 +272,13 @@ impl VciClocks {
             unwrapped: i64::try_from(raw + k * WRAP).ok()?,
         })
     }
+}
+
+/// The unwrapped value of `raw` nearest `anchor`.
+pub(crate) fn nearest(anchor: i64, raw: u64) -> i64 {
+    let raw = i128::from(raw);
+    let k = (i128::from(anchor) - raw + WRAP / 2).div_euclid(WRAP);
+    i64::try_from(raw + k * WRAP).unwrap_or(i64::MAX)
 }
 
 /// Places `raw`, a time an item carries with a later one of its own (`anchor`, on the same
@@ -272,6 +301,7 @@ mod tests {
     const TOLERANCE: Tolerance = Tolerance {
         drift_bound_ppm: 100,
         clock_margin_us: 1_000,
+        began_us: None,
     };
     const SPAN: u64 = 1 << 32;
 
@@ -410,6 +440,37 @@ mod tests {
         // take the clock margin and 100 ppm of the 11 ms.
         assert_eq!(wrap_at(1_011_000), None);
         assert_eq!(wrap_at(1_010_998), Some(EpochReason::BackwardStep));
+    }
+
+    /// Times of one exchange read together across a wrap: the agent's time since the exchange
+    /// began bounds how far the clock can have run, so the wrap is unwrapped, while a reset in
+    /// the exchange is still a step back.
+    #[test]
+    fn the_exchange_s_time_bounds_a_wrap_read_together() {
+        let in_exchange = Tolerance {
+            began_us: Some(40_000),
+            ..TOLERANCE
+        };
+        let together = |raw| {
+            let mut clocks = VciClocks::default();
+            clocks.read(Clock::Device, SPAN - 5_000, 50_000, 0, in_exchange);
+            clocks.read(Clock::Device, raw, 50_000, 0, in_exchange)
+        };
+        assert_eq!(together(3_000), (placed(0, (SPAN + 3_000) as i64), None));
+        // Without the exchange's start the same pair reads as a step back.
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, SPAN - 5_000, 50_000);
+        let (_, opened) = read(&mut clocks, 3_000, 50_000);
+        assert_eq!(
+            opened.map(|opened| opened.reason),
+            Some(EpochReason::BackwardStep)
+        );
+        // 10 ms into the exchange, the clock cannot have run 20 ms.
+        let (_, opened) = together(16_000);
+        assert_eq!(
+            opened.map(|opened| opened.reason),
+            Some(EpochReason::BackwardStep)
+        );
     }
 
     #[test]

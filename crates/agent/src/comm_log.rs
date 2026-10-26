@@ -805,6 +805,8 @@ struct Inner {
     margins: VciMargins,
     /// The VCI's clocks as the run's entries placed their times (ADR-361).
     clocks: clocks::VciClocks,
+    /// When the exchange whose times are being placed began, on the agent's clock.
+    exchange_began_us: Option<u64>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -912,6 +914,7 @@ impl CommLog {
             margins: VciMargins::default(),
             links: Vec::new(),
             clocks: clocks::VciClocks::starting_at(scan.next_clock_epoch),
+            exchange_began_us: None,
         })))
     }
 
@@ -1065,6 +1068,7 @@ impl CommLog {
         // Each VCI time placed on its clock (ADR-361), in the order the host read it (times
         // read together in their VCI order); the epochs they open are written first, before
         // the lines that use them.
+        inner.exchange_began_us = Some(evidence.times.agent.before_us);
         let mut unbound_placed = vec![None; unbound.len()];
         let mut pending_placed = vec![None; evidence.pending.len()];
         let mut reads = Vec::new();
@@ -1072,19 +1076,30 @@ impl CommLog {
             if let Some(read) = item.read {
                 reads.push((
                     read.monotonic_us,
-                    u64::from(item.vci_us),
+                    item.clock,
+                    Some(u64::from(item.vci_us)),
                     HostRead::Unbound(index),
                 ));
             }
         }
         for (index, pending) in evidence.pending.iter().enumerate() {
             if let Some(raw) = pending.vci_us {
-                reads.push((pending.agent_us, raw, HostRead::Pending(index)));
+                reads.push((
+                    pending.agent_us,
+                    pending.clock,
+                    Some(raw),
+                    HostRead::Pending(index),
+                ));
             }
         }
         for (index, rejected) in evidence.rejected.iter().enumerate() {
             if let Some(raw) = rejected.vci_us {
-                reads.push((rejected.agent_us, raw, HostRead::Rejected(index)));
+                reads.push((
+                    rejected.agent_us,
+                    rejected.clock,
+                    Some(raw),
+                    HostRead::Rejected(index),
+                ));
             }
         }
         // The final response's item, when the host read it; without that time, as read when
@@ -1093,15 +1108,42 @@ impl CommLog {
         if let Some(end) = vci.rx_end {
             reads.push((
                 vci.response_read_us.unwrap_or(end_us),
-                if vci.response_read_us.is_some() {
-                    end.us
-                } else {
-                    u64::MAX
-                },
+                end.clock,
+                vci.response_read_us.map(|_| end.us),
                 HostRead::End,
             ));
         }
-        reads.sort_by_key(|(read_us, raw, _)| (*read_us, *raw));
+        // Among times read together, the VCI order is taken on each clock nearest its latest
+        // time, or nearest the clock's first time read here when it has none, so a wrap between
+        // them keeps their order.
+        let anchor = |clock| {
+            inner.clocks.latest(clock).or_else(|| {
+                reads
+                    .iter()
+                    .filter(|(_, of, _, _)| *of == Some(clock))
+                    .min_by_key(|(read_us, _, _, _)| *read_us)
+                    .and_then(|(_, _, raw, _)| raw.and_then(|raw| i64::try_from(raw).ok()))
+            })
+        };
+        let anchors = [
+            anchor(exchange::Clock::Device),
+            anchor(exchange::Clock::Worker),
+        ];
+        let mut reads: Vec<_> = reads
+            .into_iter()
+            .map(|(read_us, clock, raw, read)| {
+                let order = match (raw, clock) {
+                    (None, _) => i64::MAX,
+                    (Some(raw), Some(clock)) => match anchors[clock as usize] {
+                        Some(anchor) => clocks::nearest(anchor, raw),
+                        None => raw as i64,
+                    },
+                    (Some(raw), None) => raw as i64,
+                };
+                (read_us, order, read)
+            })
+            .collect();
+        reads.sort_by_key(|(read_us, order, _)| (*read_us, *order));
         let agent_epoch = evidence.times.agent.epoch;
         let read_at = |read_us| {
             Some(AgentNow {
@@ -1170,6 +1212,7 @@ impl CommLog {
                     inner.place_unread(item.clock, u64::from(item.vci_us), end_read)?;
             }
         }
+        inner.exchange_began_us = None;
         // The response's own transmit done, which the host read from its item.
         let response_tx_done = vci.tx_done.is_some();
         if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
@@ -1530,6 +1573,7 @@ impl Inner {
         clocks::Tolerance {
             drift_bound_ppm: self.margins.drift_bound().0,
             clock_margin_us: self.margins.clock_margin().0,
+            began_us: self.exchange_began_us,
         }
     }
 
@@ -3236,6 +3280,7 @@ mod tests {
         });
         // The VCI's clock is the agent's less 1 000 us: the pending 5 ms before the wrap.
         let agent_of = |vci_us: u64| vci_us + 1_000;
+        wrapped.times.agent.before_us = agent_of(span - 6_000);
         wrapped.times.agent.end_us = agent_of(span + 25_000);
         wrapped.times.vci.as_mut().unwrap().response_read_us = Some(agent_of(span + 20_000));
         wrapped.pending = vec![exchange::Pending {
@@ -3263,6 +3308,7 @@ mod tests {
         // The VCI connects again: its next time opens an epoch.
         log.vci_connected(None).unwrap();
         let mut again = evidence(endpoint(0x7E0), &request, exchange::End::NoResponse);
+        again.times.agent.before_us = agent_of(span + 35_000);
         again.times.agent.end_us = agent_of(span + 40_000);
         again.times.vci = Some(exchange::VciTimes {
             rx_end: Some(device(30_000)),
@@ -3292,6 +3338,53 @@ mod tests {
         assert_eq!(entry["rejected"][0]["epoch"], 0, "{entry}");
         assert_eq!(entry["pending"][0]["epoch"], 0, "{entry}");
         assert_eq!(exchanges[2]["times"]["vci"]["rx_end"]["epoch"], 1);
+    }
+
+    /// ADR-361 item 3: times read together keep their VCI order across a wrap, so two pendings
+    /// read in one notification on each side of it give their intervals and open no epoch.
+    #[test]
+    fn times_read_together_keep_their_order_across_a_wrap() {
+        let span = 1_u64 << 32;
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+        );
+        let pending = |vci_us| exchange::Pending {
+            vci_us: Some(vci_us),
+            clock: Some(exchange::Clock::Device),
+            epoch: None,
+            agent_us: 50_000,
+            since_previous_ms: None,
+        };
+        answered.pending = vec![pending(span - 5_000), pending(3_000)];
+        answered.times.agent.end_us = 60_000;
+        answered.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device(span - 6_000)),
+            rx_end: Some(device(4_000)),
+            response_read_us: Some(51_000),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(answered).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let epochs = lines
+            .iter()
+            .filter(|line| line["event"] == "clock_epoch")
+            .count();
+        assert_eq!(epochs, 1, "{lines:?}");
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .unwrap();
+        assert_eq!(entry["pending"][0]["since_previous_ms"], 1.0, "{entry}");
+        assert_eq!(entry["pending"][1]["since_previous_ms"], 8.0, "{entry}");
+        assert_eq!(entry["times"]["vci"]["rx_end"]["epoch"], 0, "{entry}");
     }
 
     /// A start-of-message indication for `identifier`, read during the exchange.

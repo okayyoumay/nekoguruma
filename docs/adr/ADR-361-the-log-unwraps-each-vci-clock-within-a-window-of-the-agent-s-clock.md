@@ -40,7 +40,9 @@ The maintainer chose the rules below.
    - The reach: A less the least delay, plus the tolerance. The tolerance is the drift bound
      times the agent time since the least delay was seen, plus the clock margin, both as
      `vci_connected` records them. A time taken when the read had the least delay seen would be
-     there.
+     there. During an exchange the reach is at least the clock's latest time plus the agent time
+     since the exchange began, with the same tolerance: the primitive's own items were taken
+     after it began, so times read together or soon after a late read can lie that far on.
    - A value past a wrap beyond the reach opens a new epoch with `backward_step`: the time
      stepped back, and the clock cannot have run to the next wrap since.
    - A value a wrap later still within the reach opens one with `gap_beyond_wrap`: the agent read
@@ -52,7 +54,9 @@ The maintainer chose the rules below.
      to 30 ms ahead of the reach that read set. The least delay then moves to the time ahead.
 
 3. **Times are placed in the order the host read them.**
-   - Read items, ordered by agent read time, and by VCI time among those read together:
+   - Read items, ordered by agent read time, and by VCI time among those read together, each
+     taken nearest its clock's latest time (or the clock's first time read in the entry) so a
+     wrap between them keeps their order:
      unbound items, pendings, rejected results and the final response's item, whose read time
      the host records. Without that time the end is placed last, as read when the primitive
      ended (the entry's agent end time, which is no earlier than the true read).

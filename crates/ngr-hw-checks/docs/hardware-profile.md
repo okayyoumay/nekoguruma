@@ -63,7 +63,9 @@ does not take. A T3 profile can add nothing.
 | `module` | D-PDU API: the device name or serial number the library reports (see "The module match"). J2534: a description only, not compared with the device |
 | `label`, `pname` | J2534 only, and required there, not empty, and the label is not `j2534-0404` (the worker's default entry): the label and the device name of the configured `modules` entry (ADR-281) |
 | `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 with no leading zero |
-| `timing_margin_us` | Optional: the VCI's timing margin in microseconds (design 8.11 "Timing margin"), the key the agent reads too. The T2 timing check judges the latency the VCI measured only beyond it, and without it judges nothing (see "The T2 timing check", ADR-356) |
+| `timing_margin_us` | Optional: the VCI's timing margin in microseconds (design 8.11 "Timing margin"), the key the agent reads too. The T2 timing check judges the latency the VCI measured only beyond it, and without it judges nothing (see "The T2 timing check", ADR-356). A job the harness runs takes it as its links' timing margin; without it the job takes the agent's default (2 ms, ADR-357) |
+| `drift_bound_ppm` | Optional: how far the VCI's clock may run from the agent's, in parts per million (design 8.11 "Drift bound"). A job the harness runs takes it; without it the job takes the agent's default (100 ppm, ADR-357) |
+| `clock_margin_us` | Optional: the tolerance of one reading of the VCI's clock in microseconds (design 8.11 "Drift bound"). A job the harness runs takes it; without it the job takes the agent's default (1 ms, ADR-357) |
 
 `[link]`, the values an IR `Protocol` declaration carries:
 

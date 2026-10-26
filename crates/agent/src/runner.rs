@@ -21,7 +21,7 @@ use std::time::Duration;
 use crate::artifact::{Artifact, SHA256_LEN, to_hex};
 use crate::client::WorkerApi;
 use crate::comm_log::{
-    CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciFacts,
+    CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciFacts, VciMargins,
 };
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
@@ -94,6 +94,8 @@ pub struct Job {
     comm_log_dir: Option<PathBuf>,
     /// The VCI the worker was launched for, for the log's `vci_connected` (design 8.11).
     vci: Option<VciFacts>,
+    /// The VCI's margins a hardware profile gives, for the log (ADR-357).
+    vci_margins: VciMargins,
 }
 
 impl Job {
@@ -106,6 +108,7 @@ impl Job {
             comm_log: None,
             comm_log_dir: None,
             vci: None,
+            vci_margins: VciMargins::default(),
         })
     }
 
@@ -132,6 +135,14 @@ impl Job {
     /// width, which the communication log's `vci_connected` records (design 8.11).
     pub fn with_vci(mut self, vci: VciFacts) -> Self {
         self.vci = Some(vci);
+        self
+    }
+
+    /// Gives the job the margins a hardware profile states for its VCI (design 8.11 "Timing
+    /// margin", "Drift bound", 13.5, ADR-357). Each value the profile leaves out takes the
+    /// agent's default, as every value does for a job never told any; the log records which.
+    pub fn with_vci_margins(mut self, margins: VciMargins) -> Self {
+        self.vci_margins = margins;
         self
     }
 
@@ -188,6 +199,7 @@ impl From<Program> for Job {
             comm_log: None,
             comm_log_dir: None,
             vci: None,
+            vci_margins: VciMargins::default(),
         }
     }
 }
@@ -991,6 +1003,7 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
         target_vin: setup.and_then(|setup| setup.vin.as_ref()).cloned(),
         writes: job.writes(),
         vci: job.vci,
+        margins: job.vci_margins,
     }
 }
 
@@ -1055,6 +1068,7 @@ async fn run_checked<C: WorkerApi>(
         comm_log: _,
         comm_log_dir: _,
         vci: _,
+        vci_margins: _,
     } = job;
     let artifact = artifact.map(|(_, artifact)| artifact);
     let config = config.clone();
@@ -10345,6 +10359,7 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
+            vci_margins: VciMargins::default(),
         };
         check_job(&job(READ_DTC, document()), Permission::ReadOnly).unwrap();
         assert!(!job(READ_DTC, document()).writes());
@@ -10434,6 +10449,7 @@ def main():
                 comm_log: None,
                 comm_log_dir: None,
                 vci: None,
+                vci_margins: VciMargins::default(),
             }
         };
         for (service, sid) in [(SESSION, 0x10), (RESET, 0x11)] {
@@ -10484,6 +10500,7 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
+            vci_margins: VciMargins::default(),
         };
         assert!(check_job(&job, Permission::ReadOnly).is_ok());
         // A field the document does not declare is refused before anything is sent, also
@@ -10500,6 +10517,7 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
+            vci_margins: VciMargins::default(),
         };
         assert!(
             matches!(
@@ -10559,6 +10577,7 @@ def main():
             comm_log: None,
             comm_log_dir: None,
             vci: None,
+            vci_margins: VciMargins::default(),
         };
         let refused = check_job(&job, Permission::ReadOnly);
         assert!(
@@ -15710,8 +15729,15 @@ def main():
         let connected = &lines[2];
         assert!(connected["version"].is_null(), "{connected}");
         assert!(connected.get("api").is_none(), "{connected}");
-        assert_eq!(connected["drift_bound"]["source"], "none");
-        assert_eq!(connected["clock_margin"]["source"], "none");
+        // A job told no margins takes the agent's defaults (ADR-357).
+        assert_eq!(
+            connected["drift_bound"],
+            serde_json::json!({ "ppm": 100, "source": "default" })
+        );
+        assert_eq!(
+            connected["clock_margin"],
+            serde_json::json!({ "us": 1_000, "source": "default" })
+        );
         // What the link has in force (design 8.11 "Header").
         let opened = &lines[3];
         assert_eq!(opened["link"], 1);
@@ -15758,8 +15784,49 @@ def main():
         assert_eq!(opened["response_times_judged"], false);
         // The mock worker does not say whether it forwards pendings (ADR-355).
         assert!(opened["forwards_pendings"].is_null());
-        assert_eq!(opened["timing_margin"]["source"], "none");
+        assert_eq!(
+            opened["timing_margin"],
+            serde_json::json!({ "us": 2_000, "source": "default" })
+        );
         assert_eq!(lines[4]["outcome"], "ok");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-357: each margin a hardware profile gives is the one in force, with `source`
+    /// `profile`; one it leaves out takes the agent's default.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_profile_s_margins_are_in_force_and_the_rest_take_the_defaults() {
+        let dir = journal_dir("comm-log-margins");
+        let job = Job::from(program(Vec::new()))
+            .with_comm_log(comm_log_setup_in(&dir))
+            .with_vci_margins(VciMargins {
+                timing_margin_us: Some(500),
+                drift_bound_ppm: Some(30),
+                clock_margin_us: None,
+            });
+        let run = bare_run(job, "comm-log-margins").await;
+        run.result.expect("the program runs");
+        let lines = comm_log_lines(&dir);
+        let event = |name: &str| {
+            lines
+                .iter()
+                .find(|line| line["event"] == name)
+                .unwrap_or_else(|| panic!("{name} in {lines:?}"))
+                .clone()
+        };
+        let connected = event("vci_connected");
+        assert_eq!(
+            connected["drift_bound"],
+            serde_json::json!({ "ppm": 30, "source": "profile" })
+        );
+        assert_eq!(
+            connected["clock_margin"],
+            serde_json::json!({ "us": 1_000, "source": "default" })
+        );
+        assert_eq!(
+            event("link_opened")["timing_margin"],
+            serde_json::json!({ "us": 500, "source": "profile" })
+        );
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

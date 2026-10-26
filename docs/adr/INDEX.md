@@ -346,6 +346,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`, `crates/agent/docs/ngr-agent.md`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`, "Settlement" `late_item`; ADR-346 item 6 |
 | [ADR-355](ADR-355-a-link-says-whether-it-forwards-every-pending.md) | A Link Says Whether It Forwards Every Pending | Accepted | `vci-service-interface` (`ComLogicalLinkResponse.pending_forwarding`), `j2534-0404-service` and `iso22900-service` `CreateComLogicalLink`, `agent` link and communication log; design 8.11 `link_opened`, `pending`, H4; design principle 6, ADR-346 item 3 |
 | [ADR-356](ADR-356-the-t2-timing-check-judges-the-latency-the-vci-measured.md) | The T2 Timing Check Judges the Latency the VCI Measured | Accepted | `ngr-hw-checks` guarded handle (`send_receive_timed`, the link's indications), profile (`timing_margin_us`) and T2 timing check, `crates/ngr-hw-checks/docs/hardware-profile.md`; design 13.5, design 8.11 "Timing margin", "Timing judged", "On one clock"; ADR-275, ADR-333, ADR-353 |
+| [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
 
 ## Status Legend
 
@@ -709,6 +710,7 @@ the predecessor repository these ADRs came from.
 - ADR-143
 - ADR-239
 - ADR-353
+- ADR-357
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

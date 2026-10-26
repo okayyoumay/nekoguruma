@@ -161,6 +161,8 @@ pub(crate) struct RunFacts {
     pub writes: bool,
     /// The VCI the worker was launched for, when the job was told (`Job::with_vci`).
     pub vci: Option<VciFacts>,
+    /// The VCI's margins a hardware profile gave (`Job::with_vci_margins`).
+    pub margins: VciMargins,
 }
 
 /// A line of the log: its sequence number and its event.
@@ -195,6 +197,50 @@ pub struct VciFacts {
     pub long_size: u8,
 }
 
+/// A VCI's timing tolerances as a hardware profile gives them (design 8.11 "Timing margin",
+/// "Drift bound", 13.5, ADR-357): each value the profile does not give is `None` and takes the
+/// agent's default ([`VciMargins::DEFAULT_TIMING_MARGIN_US`] and the others). A job told none
+/// ([`crate::Job::with_vci_margins`]) takes every default.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VciMargins {
+    /// A link's timing margin, in microseconds.
+    pub timing_margin_us: Option<u32>,
+    /// How far the VCI's clock may run from the agent's, in parts per million.
+    pub drift_bound_ppm: Option<u32>,
+    /// The tolerance of one reading of the VCI's clock, in microseconds.
+    pub clock_margin_us: Option<u32>,
+}
+
+impl VciMargins {
+    /// The agent's timing margin: a USB VCI's timestamps and their latency vary by up to about
+    /// a millisecond, so two.
+    pub const DEFAULT_TIMING_MARGIN_US: u32 = 2_000;
+    /// The agent's drift bound: a common crystal is within 50 ppm, on each side.
+    pub const DEFAULT_DRIFT_BOUND_PPM: u32 = 100;
+    /// The agent's clock margin.
+    pub const DEFAULT_CLOCK_MARGIN_US: u32 = 1_000;
+
+    fn timing_margin(&self) -> (u32, &'static str) {
+        sourced(self.timing_margin_us, Self::DEFAULT_TIMING_MARGIN_US)
+    }
+
+    fn drift_bound(&self) -> (u32, &'static str) {
+        sourced(self.drift_bound_ppm, Self::DEFAULT_DRIFT_BOUND_PPM)
+    }
+
+    fn clock_margin(&self) -> (u32, &'static str) {
+        sourced(self.clock_margin_us, Self::DEFAULT_CLOCK_MARGIN_US)
+    }
+}
+
+/// A value and where it came from: `profile` when the profile gave it, else `default`.
+fn sourced(given: Option<u32>, default: u32) -> (u32, &'static str) {
+    match given {
+        Some(value) => (value, "profile"),
+        None => (default, "default"),
+    }
+}
+
 /// The VCI's connection (design 8.11 "Header"): written when the job's link has opened the
 /// module, before `link_opened`.
 #[derive(Serialize)]
@@ -208,10 +254,10 @@ struct VciConnected<'a> {
     unsigned_long_bytes: Option<u8>,
     /// The worker's version data as far as the API gives it; `null` when the worker gave none.
     version: Option<VciVersion<'a>>,
-    /// How far the VCI's clock may run from the agent's, and the tolerance of one clock reading:
-    /// neither is configured yet, so the log uses none.
-    drift_bound: Configured,
-    clock_margin: Configured,
+    /// How far the VCI's clock may run from the agent's, and the tolerance of one clock reading,
+    /// each with where it came from ([`VciMargins`]).
+    drift_bound: DriftBound,
+    clock_margin: ClockMargin,
 }
 
 /// A worker's version data. J2534 v04.04's `PassThruReadVersion` gives the firmware, library
@@ -239,9 +285,14 @@ enum VciVersion<'a> {
 
 /// A value the log uses and where it came from (design 8.11 "Drift bound").
 #[derive(Serialize)]
-struct Configured {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    value: Option<u32>,
+struct DriftBound {
+    ppm: u32,
+    source: &'static str,
+}
+
+#[derive(Serialize)]
+struct ClockMargin {
+    us: u32,
     source: &'static str,
 }
 
@@ -505,8 +556,7 @@ enum SetBy {
 /// compared with a limit beyond one.
 #[derive(Serialize)]
 struct TimingMargin {
-    #[serde(skip_serializing_if = "Option::is_none")]
-    ms: Option<u32>,
+    us: u32,
     source: &'static str,
 }
 
@@ -734,6 +784,8 @@ struct Inner {
     links: Vec<(exchange::Target, exchange::LinkState)>,
     /// The run's VCI, from its facts, for `vci_connected`.
     vci: Option<VciFacts>,
+    /// The run's VCI margins, from its facts, for `vci_connected` and `link_opened`.
+    margins: VciMargins,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -838,6 +890,7 @@ impl CommLog {
             ended: false,
             _lock: lock,
             vci: None,
+            margins: VciMargins::default(),
             links: Vec::new(),
         })))
     }
@@ -857,6 +910,7 @@ impl CommLog {
     pub(crate) fn begin(&self, facts: &RunFacts, run: RunKind) {
         let mut inner = self.lock();
         inner.vci = facts.vci;
+        inner.margins = facts.margins;
         let Some(opening) = inner.opening.take() else {
             return;
         };
@@ -1175,9 +1229,9 @@ impl CommLog {
             },
             response_times_judged: false,
             forwards_pendings,
-            timing_margin: TimingMargin {
-                ms: None,
-                source: "none",
+            timing_margin: {
+                let (us, source) = self.lock().margins.timing_margin();
+                TimingMargin { us, source }
             },
         });
         let mut inner = self.lock();
@@ -1192,7 +1246,10 @@ impl CommLog {
         version: Option<&vci_service_interface::VersionData>,
     ) -> Option<u64> {
         use crate::launch::Api;
-        let vci = self.lock().vci;
+        let (vci, margins) = {
+            let inner = self.lock();
+            (inner.vci, inner.margins)
+        };
         let api = vci.map(|vci| vci.api);
         let event = Event::VciConnected(VciConnected {
             api: api.map(|api| match api {
@@ -1219,13 +1276,13 @@ impl CommLog {
                     api_library_version: v.pdu_api_sw_version,
                 },
             }),
-            drift_bound: Configured {
-                value: None,
-                source: "none",
+            drift_bound: {
+                let (ppm, source) = margins.drift_bound();
+                DriftBound { ppm, source }
             },
-            clock_margin: Configured {
-                value: None,
-                source: "none",
+            clock_margin: {
+                let (us, source) = margins.clock_margin();
+                ClockMargin { us, source }
             },
         });
         let mut inner = self.lock();
@@ -1576,6 +1633,7 @@ mod tests {
             target_vin: Some(Vin::new("WVWZZZ1JZXW000001".to_owned())),
             writes: false,
             vci: None,
+            margins: VciMargins::default(),
         }
     }
 

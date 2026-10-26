@@ -89,6 +89,34 @@ fn a_profile_names_its_vci_and_complete_link() {
     assert!(profile.operations.is_empty());
 }
 
+/// ADR-357: the `[vci]` margins a profile gives are the job's, and each key it leaves out takes
+/// the agent's default.
+#[test]
+fn a_profile_s_vci_margins_are_the_keys_it_gives() {
+    let profile = parse(&t1("")).unwrap();
+    let Setup::Link { vci, .. } = &profile.setup else {
+        panic!("{profile:?}");
+    };
+    assert_eq!(vci.margins(), agent::VciMargins::default());
+
+    let text = t1("").replace(
+        "library_version = \"4.5\"\n",
+        "library_version = \"4.5\"\ntiming_margin_us = 500\ndrift_bound_ppm = 30\n",
+    );
+    let profile = parse(&text).unwrap();
+    let Setup::Link { vci, .. } = &profile.setup else {
+        panic!("{profile:?}");
+    };
+    assert_eq!(
+        vci.margins(),
+        agent::VciMargins {
+            timing_margin_us: Some(500),
+            drift_bound_ppm: Some(30),
+            clock_margin_us: None,
+        }
+    );
+}
+
 #[test]
 fn a_profile_can_only_narrow_its_class() {
     // T1 narrowed to reads and routines.

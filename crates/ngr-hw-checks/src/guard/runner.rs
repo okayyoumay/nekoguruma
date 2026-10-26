@@ -59,6 +59,7 @@ pub struct GuardedClient {
     handle: Arc<AsyncMutex<GuardedHandle>>,
     module: ModuleHandle,
     trace: Trace,
+    margins: agent::VciMargins,
 }
 
 impl GuardedClient {
@@ -95,11 +96,19 @@ impl GuardedClient {
     fn from_handle(handle: GuardedHandle) -> Self {
         let trace = handle.enable_trace();
         let module = handle.module_handle();
+        let margins = handle.vci_margins();
         Self {
             handle: Arc::new(AsyncMutex::new(handle)),
             module,
             trace,
+            margins,
         }
+    }
+
+    /// The margins the profile gives the client's VCI, which a job run on it takes
+    /// (`agent::Job::with_vci_margins`, ADR-357).
+    pub fn vci_margins(&self) -> agent::VciMargins {
+        self.margins
     }
 
     /// Every decision of the guard so far, in order: the job's calls, what the client added to

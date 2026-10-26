@@ -343,7 +343,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
     version, and API library name and version;
   - a J2534 worker's firmware, library and API versions only, which is all v04.04 gives.
 
-  Its `drift_bound` and `clock_margin` have `source` `none`, since neither is configured yet.
+  Its `drift_bound` (`ppm`) and `clock_margin` (`us`), and `link_opened`'s `timing_margin`
+  (`us`), each give the value in force and its `source` (ADR-357): `profile` when the job was
+  given it (`Job::with_vci_margins`, which the hardware harness fills from its profile's
+  `[vci]` keys), else `default`, the agent's own (`VciMargins::DEFAULT_TIMING_MARGIN_US` 2 ms,
+  `DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms).
   `link_opened` then gives the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those

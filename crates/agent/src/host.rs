@@ -636,6 +636,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let end = deadline_end(end, sent.agent_deadline);
             let end = unanswered_end(end, &sent);
+            let end_rejected = matches!(end, End::PositiveUnusable(_)) && sent.result.is_err();
             let (link_errors, error_at) = events_seen(&sent, &mut detail);
             // A response's times only for an exchange that ended with that response: one read
             // before the agent's deadline, lost events or a lost VCI ended the wait is not the
@@ -664,6 +665,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.pending = pending;
                 evidence.rejected = rejected;
                 evidence.events_lost = events_lost;
+                evidence.end_rejected = end_rejected;
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
                 evidence.link_errors.extend(link_errors);

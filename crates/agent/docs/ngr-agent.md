@@ -394,7 +394,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   link's), bytes, times and reason (`wrong_echo` or `pattern_mismatch`, ADR-359); it counts for
   neither the classification nor `link_history`, except that a primitive that ended with no answer
   after a rejected result of positive form gives that response as the entry's outcome,
-  `positive_unusable` (`unanswered_end`); the job still gets no answer. Lost events end the wait at the worker's first
+  `positive_unusable` (`unanswered_end`, `Evidence::end_rejected`), redacted as a rejected result
+  and counted for no answer in `link_history`; the job still gets no answer. Lost events end the wait at the worker's first
   report, which the entry records in `events_lost` with the agent time it was read. When the
   agent's own deadline, not the
   worker's receive timeout, ends an exchange with no response, the entry's outcome is

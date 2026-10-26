@@ -959,6 +959,10 @@ pub(crate) struct Evidence {
     pub rejected: Vec<Rejected>,
     /// The worker's report of lost events, when it ended the exchange.
     pub events_lost: Option<EventsLost>,
+    /// The end is a rejected result the worker took as the primitive's end (`positive_unusable`,
+    /// ADR-359 item 3): it is no answer of the request, so the link's history does not count it,
+    /// and its bytes are redacted as a rejected result's are.
+    pub end_rejected: bool,
     pub supply_voltage: Option<SupplyVoltage>,
     pub detail: Detail,
 }
@@ -1010,6 +1014,7 @@ impl Evidence {
             answers: Vec::new(),
             rejected: Vec::new(),
             events_lost: None,
+            end_rejected: false,
             supply_voltage: None,
             detail: Detail::default(),
         }
@@ -1033,6 +1038,10 @@ impl Evidence {
     /// response, or else the pending a pending seen stands for (the negative response with code
     /// 0x78 for this request's SID).
     fn answer_head(&self) -> Option<Vec<u8>> {
+        // A rejected result the worker ended the primitive with answers nothing (ADR-359).
+        if self.end_rejected {
+            return None;
+        }
         if let Some(response) = self.final_response() {
             return Some(response.to_vec());
         }
@@ -1412,7 +1421,7 @@ impl ExchangeEntry {
             this_exchange: history.this_exchange,
             bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
-            final_response: evidence.final_response().is_some(),
+            final_response: evidence.final_response().is_some() && !evidence.end_rejected,
             positive: matches!(evidence.end, End::Positive(_)),
             unusable: matches!(evidence.end, End::PositiveUnusable(_)),
             suppressed: evidence.suppressed,
@@ -1446,7 +1455,14 @@ impl ExchangeEntry {
             sent,
             sent_evidence,
             caused_by: evidence.caused_by,
-            outcome: Outcome::of(&evidence.end),
+            outcome: match &evidence.end {
+                End::PositiveUnusable(bytes) if evidence.end_rejected => {
+                    Outcome::PositiveUnusable {
+                        response: redact_unanswering(bytes),
+                    }
+                }
+                end => Outcome::of(end),
+            },
             answers: evidence.answers,
             rejected: evidence
                 .rejected
@@ -2183,6 +2199,33 @@ mod tests {
             none.get("rejected").is_none() && none.get("events_lost").is_none(),
             "{none}"
         );
+    }
+
+    /// ADR-359 item 3: an end the worker took from a rejected result is `positive_unusable`,
+    /// redacted as a rejected result is, and it counts for no answer in the link's history: the
+    /// request stays owed.
+    #[test]
+    fn an_end_taken_from_a_rejected_result_is_no_answer_of_the_link() {
+        let mut state = LinkState::default();
+        let mut cut = forwarding(evidence(
+            &[0x27, 0x01],
+            End::PositiveUnusable(vec![0x67, 0x02, 0xAA, 0xBB]),
+        ));
+        cut.end_rejected = true;
+        let entry = log(&mut state, 1, cut);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["outcome"]["result"], "positive_unusable");
+        assert_eq!(
+            json["outcome"]["response"],
+            serde_json::json!({"clear": "6702", "data": {"kind": "secret", "len": 2}})
+        );
+        assert_eq!(json["link_history"]["this_exchange"], false);
+        let next = state.history_for(&forwarding(evidence(
+            &[0x27, 0x01],
+            End::Positive(vec![0x67, 0x01, 0x11]),
+        )));
+        assert_eq!(next.answered, 0);
+        assert_eq!(next.owed_matching, 1);
     }
 
     #[test]

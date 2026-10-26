@@ -44,7 +44,9 @@ The maintainer decided where the entry records both, and what it says of lost ev
    rejected one of positive form (`wrong_echo`): the worker took that response as the
    primitive's end. The entry's outcome is then that response, `positive_unusable`, which design
    8.11's `outcome` row names for a wrong echo or a response too short, and it is classified by
-   that row (`undetermined`). The maintainer chose this over keeping `no_response`, which
+   that row (`undetermined`). It is still no answer of the request: the link's history does not
+   count it (the request stays owed), and its bytes in the outcome are redacted as a rejected
+   result's are. The maintainer chose this over keeping `no_response`, which
    contradicted the listed response. The job still gets no answer. The exception does not apply
    when the agent's deadline or the VCI's receive timeout ended the exchange.
 4. **The exchange entry gains `events_lost`.** When the worker reports lost events, it records

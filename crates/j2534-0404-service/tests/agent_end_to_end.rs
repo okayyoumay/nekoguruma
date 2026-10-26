@@ -733,10 +733,14 @@ fn assert_comm_log(setup: &CommLogSetup) {
         .filter(|line| line["event"] == "exchange")
         .collect();
     assert_eq!(entries.len(), 3, "{text}");
-    for (entry, (pc, request)) in entries
-        .iter()
-        .zip([(1, "22f190"), (3, "221234"), (5, "22f187")])
-    {
+    // Each window judged from the transmit indication on the device clock (design 8.11 "Timing
+    // judged"): the VIN read's end after its pendings, within P2*; the refusal's end within P2;
+    // the dropped read's receive timeout, which the worker times on its own clock, not judged.
+    for (entry, (pc, request, window)) in entries.iter().zip([
+        (1, "22f190", "within_p2_star"),
+        (3, "221234", "within_p2"),
+        (5, "22f187", "not_judged"),
+    ]) {
         assert_eq!(entry["origin"], "procedure", "{entry}");
         assert_eq!(entry["link"], 1, "{entry}");
         assert_eq!(entry["target"]["link"], 1, "{entry}");
@@ -749,7 +753,7 @@ fn assert_comm_log(setup: &CommLogSetup) {
         );
         assert_eq!(entry["request"]["bytes"]["clear"], request, "{entry}");
         assert_eq!(entry["pending_visibility"], "forwarded", "{entry}");
-        assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
+        assert_eq!(entry["timing"]["window"], window, "{entry}");
         assert!(
             entry["times"]["agent"]["end_us"].as_u64()
                 >= entry["times"]["agent"]["before_us"].as_u64()
@@ -769,6 +773,13 @@ fn assert_comm_log(setup: &CommLogSetup) {
         "{seqs:?}"
     );
 
+    // The worker times the receive timeout on its own clock (ADR-120), which the transmit
+    // indication's device time is not compared with.
+    assert_eq!(
+        entries[2]["timing"]["not_judged_reason"], "other_clock",
+        "{}",
+        entries[2]
+    );
     let (vin, unknown, dropped) = (entries[0], entries[1], entries[2]);
     assert_eq!(vin["outcome"]["result"], "positive", "{vin}");
     assert_eq!(vin["sent"], "confirmed", "{vin}");

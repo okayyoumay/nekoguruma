@@ -649,6 +649,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             let vci = VciTimes {
                 error: error_at,
                 deadline: sent.deadline_reading,
+                rx_timeout: sent.rx_timeout.as_ref().and_then(|timeout| timeout.at),
                 ..response_times
             };
             let unbound = unattached_items(&sent.unbound);
@@ -1846,6 +1847,7 @@ impl Progress {
                     error: None,
                     deadline: None,
                     response_read_us: None,
+                    rx_timeout: None,
                 };
                 self.response = Some(result.data_bytes);
                 self.errors_before_response = Some(self.errors.len());
@@ -3290,6 +3292,7 @@ mod tests {
                 error: None,
                 deadline: None,
                 response_read_us: None,
+                rx_timeout: None,
             }
         );
         // A receive timeout, the event a silent exchange names, has its own item's time and

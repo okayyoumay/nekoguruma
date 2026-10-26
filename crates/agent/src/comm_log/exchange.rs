@@ -367,6 +367,10 @@ pub(crate) struct VciTimes {
     /// (`vci_did_not_end`, design 8.11 "Settlement"), with its round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<ClockReading>,
+    /// When the host read the final response's item, on the entry's agent epoch: the log places
+    /// its times in the order the host read them (ADR-361). Not written.
+    #[serde(skip)]
+    pub response_read_us: Option<u64>,
 }
 
 /// A reading of the VCI's clock (`GetTimestamp`): the time, with the clock the worker says it is
@@ -3424,6 +3428,7 @@ mod tests {
                     time: VciTime::new(9, Some(Clock::Device)),
                     round_trip_us: 700,
                 }),
+                response_read_us: Some(8),
             }),
         })
         .unwrap();

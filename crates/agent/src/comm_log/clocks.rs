@@ -3,13 +3,15 @@
 //! monotonic clock and unwrapped, and a new epoch opened where the time base did not carry on.
 //!
 //! A clock's alignment is the least delay seen in its epoch between a VCI time and the agent
-//! reading the item that carried it. A time can have been taken no later than the agent read it,
-//! less that least delay, give or take the drift bound over the agent time since that least
-//! delay was seen plus the clock margin (design 8.11 "Drift bound"), and no earlier than the
-//! clock's latest time, less the clock margin. A raw time is unwrapped to the one value in that
-//! window; none (the time stepped back without wrapping, or ahead of the agent's clock) or more
-//! than one (the agent read nothing on the clock for longer than a wrap) opens a new epoch, and
-//! so does the first time read after the VCI reconnected.
+//! reading the item that carried it. A raw time is unwrapped to the first value at or above the
+//! clock's latest time less the clock margin: a clock does not run back. That value is checked
+//! against the most the clock can have run since: the agent's read time less that least delay,
+//! plus the drift bound over the agent time since the least delay was seen and the clock margin
+//! (design 8.11 "Drift bound"). A value past a wrap that the clock cannot have reached is a step
+//! back that no wrap explains, and one a wrap later still within it means the agent read nothing
+//! on the clock for longer than a wrap; each opens a new epoch, and so does the first time read
+//! after the VCI reconnected. A value ahead of that bound without a wrap is kept: it shows only
+//! that the reads before it came later than their times, since the delay of a read has no ceiling.
 
 use serde::Serialize;
 
@@ -24,10 +26,9 @@ const WRAP: i128 = 1 << 32;
 pub(crate) enum EpochReason {
     /// The clock's first time in this run of the log.
     First,
-    /// The time lies behind the clock's latest one, by more than a wrap could explain.
+    /// The time lies behind the clock's latest one, and the clock cannot have run to the next
+    /// wrap since.
     BackwardStep,
-    /// The time lies ahead of when the agent read it, beyond the tolerance.
-    ForwardStep,
     /// The agent read nothing on the clock for longer than a wrap, so how many wraps passed is
     /// unknown.
     GapBeyondWrap,
@@ -172,38 +173,34 @@ impl VciClocks {
             (Some(_), true) => EpochReason::Reconnect,
             (Some(mut epoch), false) => {
                 let raw = i128::from(raw);
-                let upper = i128::from(read_us) - epoch.least_delay
+                let reach = i128::from(read_us) - epoch.least_delay
                     + tolerance.over(read_us.saturating_sub(epoch.least_at_us));
                 let lower = epoch.latest.unwrapped - i128::from(tolerance.clock_margin_us);
-                // The wraps that put the time in the window: from the first at or above
-                // `lower` to the last at or below `upper`.
-                let first = -(raw - lower).div_euclid(WRAP);
-                let last = (upper - raw).div_euclid(WRAP);
-                match last - first {
-                    0 => {
-                        let unwrapped = raw + first * WRAP;
-                        if unwrapped > epoch.latest.unwrapped {
-                            epoch.latest = reading(unwrapped);
-                        }
-                        let delay = i128::from(read_us) - unwrapped;
-                        if delay < epoch.least_delay {
-                            epoch.least_delay = delay;
-                            epoch.least_at_us = read_us;
-                        }
-                        state.current = Some(epoch);
-                        return (
-                            Placed {
-                                epoch: epoch.number,
-                                unwrapped: i64::try_from(unwrapped).unwrap_or(i64::MAX),
-                            },
-                            None,
-                        );
+                // The first value at or above `lower`, and the wraps it lies past the latest.
+                let unwrapped = raw - (raw - lower).div_euclid(WRAP) * WRAP;
+                let wrapped =
+                    (unwrapped - raw) > (epoch.latest.unwrapped - i128::from(epoch.latest.raw));
+                if wrapped && unwrapped > reach {
+                    EpochReason::BackwardStep
+                } else if unwrapped + WRAP <= reach {
+                    EpochReason::GapBeyondWrap
+                } else {
+                    if unwrapped > epoch.latest.unwrapped {
+                        epoch.latest = reading(unwrapped);
                     }
-                    gap if gap > 0 => EpochReason::GapBeyondWrap,
-                    // No value fits: a raw time below the latest one stepped back without
-                    // wrapping, one above it stepped ahead of the agent's clock.
-                    _ if raw < i128::from(epoch.latest.raw) => EpochReason::BackwardStep,
-                    _ => EpochReason::ForwardStep,
+                    let delay = i128::from(read_us) - unwrapped;
+                    if delay < epoch.least_delay {
+                        epoch.least_delay = delay;
+                        epoch.least_at_us = read_us;
+                    }
+                    state.current = Some(epoch);
+                    return (
+                        Placed {
+                            epoch: epoch.number,
+                            unwrapped: i64::try_from(unwrapped).unwrap_or(i64::MAX),
+                        },
+                        None,
+                    );
                 }
             }
         };
@@ -370,29 +367,49 @@ mod tests {
         assert_eq!((at, opened), (placed(1, 12_000), None));
     }
 
+    /// The times `sim-vci` gave in one job: the transmit was read late, and the pendings and the
+    /// response after it in a burst, each ahead of what the first read's delay allowed.
     #[test]
-    fn a_time_ahead_of_the_agent_opens_a_new_epoch() {
+    fn times_read_in_a_burst_after_a_late_read_stay_in_the_epoch() {
         let mut clocks = VciClocks::default();
-        read(&mut clocks, 1_000, 1_000);
-        // 10 ms of agent time, but the VCI's time moved 5 s.
-        let (at, opened) = read(&mut clocks, 5_001_000, 11_000);
-        assert_eq!(at, placed(1, 5_001_000));
+        read(&mut clocks, 886_982, 151_939);
+        for (raw, read_us) in [
+            (886_985, 151_962),
+            (916_985, 151_983),
+            (946_985, 174_555),
+            (953_676, 220_310),
+            (953_679, 220_310),
+        ] {
+            let (at, opened) = read(&mut clocks, raw, read_us);
+            assert_eq!((at, opened), (placed(0, raw as i64), None), "{raw}");
+        }
+        // A VCI clock ahead of the agent's: kept too, as a read before it that came late.
+        let (at, opened) = read(&mut clocks, 60_000_000, 230_000);
+        assert_eq!((at, opened), (placed(0, 60_000_000), None));
+        // That moved the alignment: a wrap now needs the agent time to reach it.
+        let (_, opened) = read(&mut clocks, 1_000, 240_000);
         assert_eq!(
             opened.map(|opened| opened.reason),
-            Some(EpochReason::ForwardStep)
+            Some(EpochReason::BackwardStep)
         );
-        // Ahead by no more than the tolerance stays: 1 ms margin plus 100 ppm of 10 s.
-        let mut clocks = VciClocks::default();
-        read(&mut clocks, 1_000, 1_000);
-        let (at, opened) = read(&mut clocks, 10_003_000, 10_001_000);
-        assert_eq!((at, opened), (placed(0, 10_003_000), None));
-        let mut clocks = VciClocks::default();
-        read(&mut clocks, 1_000, 1_000);
-        let (_, opened) = read(&mut clocks, 10_003_001, 10_001_000);
-        assert_eq!(
-            opened.map(|opened| opened.reason),
-            Some(EpochReason::ForwardStep)
-        );
+    }
+
+    /// A wrap is unwrapped only when the clock can have run to it since its latest time: by the
+    /// agent's time less the least delay, within the drift bound and the clock margin.
+    #[test]
+    fn a_wrap_needs_the_time_to_reach_it() {
+        let wrap_at = |read_us| {
+            let mut clocks = VciClocks::default();
+            // 10 ms before the wrap, read with no delay.
+            read(&mut clocks, SPAN - 10_000, 1_000_000);
+            read(&mut clocks, 2_000, read_us)
+                .1
+                .map(|opened| opened.reason)
+        };
+        // 12 ms of the VCI's time: the agent must have read it at 1 012 000 or later, give or
+        // take the clock margin and 100 ppm of the 11 ms.
+        assert_eq!(wrap_at(1_011_000), None);
+        assert_eq!(wrap_at(1_010_998), Some(EpochReason::BackwardStep));
     }
 
     #[test]

@@ -33,29 +33,36 @@ The maintainer chose the rules below.
 
    The least delay is the alignment. The state lives as long as one run of the log.
 
-2. **A time read at agent time A is unwrapped within a window.**
-   - Upper bound: A less the least delay, plus the tolerance. A time cannot have been taken
-     after the agent read it. The tolerance is the drift bound times the agent time since the
-     least delay was seen, plus the clock margin, both as `vci_connected` records them.
-   - Lower bound: the clock's latest time less the clock margin. A clock does not run back.
-   - Of the values "raw plus a whole number of wraps", exactly one in the window keeps the epoch.
-     If it lies past a wrap, it is unwrapped past it.
-   - No value in the window opens a new epoch. When the raw time is below the latest raw time,
-     the reason is `backward_step`: it stepped back, and no wrap explains it. Otherwise the reason
-     is `forward_step`: it ran ahead of the agent's clock.
-   - More than one value in the window means the agent read nothing on the clock for longer than
-     a wrap. How many wraps passed is unknown, so a new epoch opens with `gap_beyond_wrap`.
+2. **A time read at agent time A is unwrapped above the clock's latest time and checked
+   against how far the clock can have run.**
+   - The value: of "raw plus a whole number of wraps", the first at or above the clock's latest
+     time less the clock margin. A clock does not run back.
+   - The reach: A less the least delay, plus the tolerance. The tolerance is the drift bound
+     times the agent time since the least delay was seen, plus the clock margin, both as
+     `vci_connected` records them. A time taken when the read had the least delay seen would be
+     there.
+   - A value past a wrap beyond the reach opens a new epoch with `backward_step`: the time
+     stepped back, and the clock cannot have run to the next wrap since.
+   - A value a wrap later still within the reach opens one with `gap_beyond_wrap`: the agent read
+     nothing on the clock for longer than a wrap, so how many passed is unknown.
+   - Any other value keeps the epoch, also one ahead of the reach. A time ahead shows only that
+     the reads before it came later than their times: the delay of a read has no ceiling, so the
+     least delay seen can exceed the event path's own. The first job run against `sim-vci` shows
+     it: its transmit indication was read late, and the pendings that followed in a burst were up
+     to 30 ms ahead of the reach that read set. The least delay then moves to the time ahead.
 
 3. **Times are placed in the order the host read them.**
-   - Read items, ordered by agent read time: unbound items, pendings and rejected results.
-   - Then the final response's end, as read when the primitive ended (the entry's agent end
-     time, which is no earlier than the true read).
+   - Read items, ordered by agent read time, and by VCI time among those read together:
+     unbound items, pendings, rejected results and the final response's item, whose read time
+     the host records. Without that time the end is placed last, as read when the primitive
+     ended (the entry's agent end time, which is no earlier than the true read).
    - A transmit done or a start that the response's own item carries comes before that end on
      its clock. It is placed at or before the end, in the end's epoch, without moving the
      clock's state.
-   - The error time and any time read at no known agent time are placed nearest the clock's
-     latest time. On a clock that has no epoch yet, they are read as at the entry's end.
-   - The reading taken at the agent's deadline is read as at the entry's end.
+   - The reading taken at the agent's deadline is read as at the entry's end, since it was taken
+     after everything else.
+   - The error time and any time read at no known agent time come last. Each is placed nearest
+     the clock's latest time; on a clock that has no epoch yet, it is read as at the entry's end.
 
 4. **A reconnect opens a new epoch on every clock that had one.** `vci_connected` marks each
    clock. Its next time opens an epoch with `reconnect`. Whether the time base carried on over
@@ -63,8 +70,8 @@ The maintainer chose the rules below.
    a break.
 
 5. **`clock_epoch` is written before the first line that uses the epoch.** It carries:
-   - the clock, the epoch, the reason (`first`, `backward_step`, `forward_step`,
-     `gap_beyond_wrap` or `reconnect`), and the agent epoch;
+   - the clock, the epoch, the reason (`first`, `backward_step`, `gap_beyond_wrap` or
+     `reconnect`), and the agent epoch;
    - `first`: the raw time that began the epoch and when the host read it;
    - `previous`: the latest raw time of the epoch it ends, with that epoch and when it was read,
      when this run had one.
@@ -90,12 +97,17 @@ The maintainer chose the rules below.
 
 - A pending interval across a wrap is now given, and a reset no longer passes for a long gap or
   a wrap within one exchange.
-- Accepted limitation: a reset that happens to land inside the window reads as a wrap. The
-  window is as wide as the agent time since the last read, plus the excess delay of that read,
-  so the chance grows with long silences on the clock. Nothing in the log can tell such a reset
-  apart; `vci_loss_settled` does no better with a reading that fits both readings.
-- A slow event path widens the window and never causes a new epoch, since the delay has no
-  ceiling. A VCI clock that runs ahead of the agent's beyond the tolerance does cause one.
+- Accepted limitation: a reset that happens to land within the reach reads as a wrap. The reach
+  grows with the agent time since the last read, so the chance grows with long silences on the
+  clock. Nothing in the log can tell such a reset apart; `vci_loss_settled` does no better with
+  a reading that fits both readings.
+- Accepted limitation: a VCI clock that jumps ahead is not seen; it reads as earlier reads that
+  came late. A reset jumps back, which is seen.
+- A slow event path never opens an epoch. When the reads an epoch began with were all late, a
+  wrap soon after can fall beyond the reach and open an epoch as a `backward_step`. That costs
+  continuity only: no difference is ever taken across the break.
+- Reads the host takes in one notification share one agent time; their VCI order stands in for
+  the order read.
 - A reconnect always opens an epoch. A clock that carried on over a short loss loses its
   continuity until `vci_loss_settled` lets it keep the epoch.
 - Every log gains `clock_epoch` lines, and every placed VCI time an `epoch`; the `epoch` 0 that

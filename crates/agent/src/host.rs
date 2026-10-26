@@ -789,7 +789,7 @@ fn pending_visibility(forwards_pendings: Option<bool>) -> PendingVisibility {
 /// The communication log's form of the pendings bound to the primitive (design 8.11 `pending`):
 /// each with its VCI time on the clock its item names, and the agent's time when the host read
 /// it. A pending read with no log open has no agent time and is left out; the log then writes
-/// no entry either. The interval from the transmit or the previous pending is not given yet.
+/// no entry either. The log gives each its interval from the transmit or the previous pending.
 fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
     pendings
         .iter()

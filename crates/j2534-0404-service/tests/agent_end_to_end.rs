@@ -461,14 +461,22 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     .expect("the control file should be writable");
     std::fs::rename(control_dir.join("001.tmp"), control_dir.join("001.json"))
         .expect("the control file should be renamed");
-    // And it answers the VIN read with one response pending before the response, which the
-    // worker passes on and the log lists (design 8.11 `pending`, ADR-355).
+    // And it answers the VIN read with two response pendings before the response, which the
+    // worker passes on and the log lists with their intervals (design 8.11 `pending`, ADR-355).
     std::fs::write(
         control_dir.join("002.tmp"),
-        r#"{"command": "inject_fault", "request": [34, 241, 144], "fault": {"response_pending": {"count": 1, "interval_ms": 10}}}"#,
+        r#"{"command": "inject_fault", "request": [34, 241, 144], "fault": {"response_pending": {"count": 2, "interval_ms": 30}}}"#,
     )
     .expect("the control file should be writable");
     std::fs::rename(control_dir.join("002.tmp"), control_dir.join("002.json"))
+        .expect("the control file should be renamed");
+    // And it refuses the read of 1234 with an ECU-state code, conditionsNotCorrect.
+    std::fs::write(
+        control_dir.join("003.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 18, 52], "fault": {"negative_response": {"nrc": "conditions_not_correct"}}}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("003.tmp"), control_dir.join("003.json"))
         .expect("the control file should be renamed");
     let setup = CommLogSetup {
         dir: comm_log_dir.to_owned(),
@@ -685,26 +693,45 @@ fn assert_comm_log(setup: &CommLogSetup) {
     // The worker forwards every pending, so none can have been absorbed (H4, ADR-355), and a
     // positive response confirmed on the bus leaves nothing open.
     assert_eq!(vin["classification"], "none", "{vin}");
-    // Its pending is listed, with the VCI time on the device clock and the agent's read time.
+    // Its pendings are listed, with the VCI time on the device clock, the agent's read time and
+    // the interval from the transmit indication or the previous pending, on the device clock.
     let pending = vin["pending"].as_array().expect("a pending list");
-    assert_eq!(pending.len(), 1, "{vin}");
-    assert!(pending[0]["vci_us"].is_u64(), "{vin}");
-    assert_eq!(pending[0]["clock"], "device", "{vin}");
-    assert!(pending[0]["agent_us"].is_u64(), "{vin}");
+    assert_eq!(pending.len(), 2, "{vin}");
+    for (index, item) in pending.iter().enumerate() {
+        assert!(item["vci_us"].is_u64(), "{vin}");
+        assert_eq!(item["clock"], "device", "{vin}");
+        assert!(item["agent_us"].is_u64(), "{vin}");
+        let interval = item["since_previous_ms"]
+            .as_f64()
+            .unwrap_or_else(|| panic!("pending {index} has an interval: {vin}"));
+        assert!(interval >= 0.0, "{vin}");
+    }
+    // The second follows the first by the injected interval: sim-vci stamps each pending from
+    // its scheduled time, so the difference is exact whatever the runner's load.
+    assert!(
+        (29.9..=30.1).contains(&pending[1]["since_previous_ms"].as_f64().unwrap()),
+        "{vin}"
+    );
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
 
     // The ECU's negative response, with its code named.
     assert_eq!(unknown["outcome"]["result"], "negative", "{unknown}");
-    assert_eq!(unknown["outcome"]["nrc"], "0x31", "{unknown}");
+    assert_eq!(unknown["outcome"]["nrc"], "0x22", "{unknown}");
     assert_eq!(
-        unknown["outcome"]["nrc_name"], "requestOutOfRange",
+        unknown["outcome"]["nrc_name"], "conditionsNotCorrect",
         "{unknown}"
     );
     assert_eq!(
-        unknown["outcome"]["response"]["clear"], "7f2231",
+        unknown["outcome"]["response"]["clear"], "7f2222",
         "{unknown}"
     );
-    assert_eq!(unknown["classification"], "undetermined", "{unknown}");
+    // An ECU-state code says the vehicle refused it, and the reason names the code.
+    assert_eq!(unknown["classification"], "vehicle", "{unknown}");
+    let unknown_reason = unknown["reason"].as_str().expect("a reason");
+    assert!(
+        unknown_reason.contains("conditionsNotCorrect"),
+        "{unknown_reason}"
+    );
     assert_eq!(unknown["link_history"]["answered"], 1, "{unknown}");
 
     // The dropped response: its TxDone shows the request reached the bus, so the no-response

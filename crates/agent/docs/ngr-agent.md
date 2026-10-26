@@ -360,7 +360,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   worker, `null` from a worker that does not say. The agent takes it from that answer alone, and
   each exchange on the link has `pending_visibility` `forwarded` only when it is `true`, since
   the link has the API handle 0x78 alone (`send_receive`'s supported pending codes); otherwise
-  `absorbed_by_vci`.
+  `absorbed_by_vci`. The host keeps each pending bound to the primitive for the exchange's
+  `pending` list, with its VCI time and clock as the worker gave them and the agent's time when
+  the host read it (not yet its interval from the transmit or the previous pending), so a
+  forwarded link's empty list means no pending came.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs

@@ -18,7 +18,7 @@ use vci_service_interface::{
 };
 
 use crate::comm_log::exchange::{
-    AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin,
+    AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin, Pending,
     PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
@@ -552,7 +552,9 @@ impl<C: WorkerApi> WorkerHost<C> {
             let unbound = unattached_items(&sent.unbound);
             let before_answer = errors_before_answer(&sent);
             let vci_ended = sent.rx_timeout.is_some();
+            let pending = pendings_of(&sent.pendings);
             self.log(&request, before, end, detail, unbound, |evidence| {
+                evidence.pending = pending;
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
                 evidence.link_errors.extend(link_errors);
@@ -610,6 +612,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     rx_timeout: None,
                     vci_lost: None,
                     unbound: Vec::new(),
+                    pendings: Vec::new(),
                 };
             }
         };
@@ -627,12 +630,15 @@ impl<C: WorkerApi> WorkerHost<C> {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
-                let kept = progress.unbound.len();
+                let (kept, kept_pendings) = (progress.unbound.len(), progress.pendings.len());
                 let done = progress.on_notification(notification.event_data, cop);
-                if progress.unbound.len() > kept {
+                if progress.unbound.len() > kept || progress.pendings.len() > kept_pendings {
                     let read = log.filter(|log| log.is_open()).map(|log| log.now());
                     for unbound in &mut progress.unbound[kept..] {
                         unbound.read = read;
+                    }
+                    for pending in &mut progress.pendings[kept_pendings..] {
+                        pending.read = read;
                     }
                 }
                 if let Some(done) = done {
@@ -652,6 +658,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             rx_timeout: progress.rx_timeout.take(),
             vci_lost: progress.vci_lost.take(),
             unbound: std::mem::take(&mut progress.unbound),
+            pendings: std::mem::take(&mut progress.pendings),
         }
     }
 
@@ -708,11 +715,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         // on every pending. The link has the API handle 0x78 alone (`send_receive`'s supported
         // pending codes), so no profile's 0x21 or 0x23 makes it absorb a busy answer the log
         // cannot see; a link that does stays `absorbed_by_vci`.
-        evidence.pending_visibility = if self.link.forwards_pendings == Some(true) {
-            PendingVisibility::Forwarded
-        } else {
-            PendingVisibility::AbsorbedByVci
-        };
+        evidence.pending_visibility = pending_visibility(self.link.forwards_pendings);
         evidence.suppressed = suppresses_positive_response(request);
         evidence.detail = detail;
         complete(&mut evidence);
@@ -755,6 +758,34 @@ impl<C: WorkerApi> WorkerHost<C> {
             evidence.caused_by = caused_by;
         });
     }
+}
+
+/// An exchange's `pending_visibility` on a link whose worker said `forwards_pendings`: forwarded
+/// only when it said the link forwards every pending (ADR-355).
+fn pending_visibility(forwards_pendings: Option<bool>) -> PendingVisibility {
+    if forwards_pendings == Some(true) {
+        PendingVisibility::Forwarded
+    } else {
+        PendingVisibility::AbsorbedByVci
+    }
+}
+
+/// The communication log's form of the pendings bound to the primitive (design 8.11 `pending`):
+/// each with its VCI time on the clock its item names, and the agent's time when the host read
+/// it. A pending read with no log open has no agent time and is left out; the log then writes
+/// no entry either. The interval from the transmit or the previous pending is not given yet.
+fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
+    pendings
+        .iter()
+        .filter_map(|pending| {
+            Some(Pending {
+                vci_us: Some(pending.vci_us),
+                clock: pending.clock,
+                agent_us: pending.read?.monotonic_us,
+                since_previous_ms: None,
+            })
+        })
+        .collect()
 }
 
 /// The communication log's form of the link's `unbound` items: the result and error items, with
@@ -838,6 +869,17 @@ struct Sent {
     rx_timeout: Option<ErrorSeen>,
     vci_lost: Option<ErrorSeen>,
     unbound: Vec<Unbound>,
+    /// The response pendings the worker passed on, bound to the primitive, in order.
+    pendings: Vec<PendingRead>,
+}
+
+/// A response pending (0x78) bound to the primitive (design 8.11 `pending`): its VCI time and
+/// clock as the worker gave them, and the agent's clocks when the host read it, if it has a log.
+#[derive(Debug)]
+struct PendingRead {
+    vci_us: u64,
+    clock: Option<Clock>,
+    read: Option<AgentNow>,
 }
 
 /// An item of the link read while a primitive ran that is not that primitive's: one of no
@@ -1257,6 +1299,8 @@ struct Progress {
     /// The result and error items of no primitive or of an earlier one, in order, for the
     /// communication log. Status and information items are not kept.
     unbound: Vec<Unbound>,
+    /// The response pendings bound to the primitive, in order, for the communication log.
+    pendings: Vec<PendingRead>,
 }
 
 impl Progress {
@@ -1273,6 +1317,7 @@ impl Progress {
             rx_timeout: None,
             vci_lost: None,
             unbound: Vec::new(),
+            pendings: Vec::new(),
         })
     }
 
@@ -1289,6 +1334,7 @@ impl Progress {
             rx_timeout: None,
             vci_lost: None,
             unbound: Vec::new(),
+            pendings: Vec::new(),
         }
     }
 
@@ -1344,6 +1390,18 @@ impl Progress {
                 self.unbound.push(Unbound { item, read: None });
             }
             return None;
+        }
+        // A response pending the worker passed on is kept for the log (design 8.11 `pending`),
+        // with the item's time and clock as the worker gave them (ADR-353).
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && self.answers(&result.data_bytes)
+            && self.negative.is_pending(self.sid, &result.data_bytes)
+        {
+            self.pendings.push(PendingRead {
+                vci_us: u64::from(item.timestamp),
+                clock: clock_of(&item),
+                read: None,
+            });
         }
         match item.data {
             // A response pending the worker passes on, and anything that does not answer this
@@ -1868,6 +1926,7 @@ mod tests {
             rx_timeout: rx_timeout.then(|| seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
             vci_lost: None,
             unbound: Vec::new(),
+            pendings: Vec::new(),
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
@@ -1949,6 +2008,7 @@ mod tests {
             rx_timeout: None,
             vci_lost: None,
             unbound: Vec::new(),
+            pendings: Vec::new(),
         };
         let given = |sent: Sent| {
             let (_, mut detail) =
@@ -2469,6 +2529,64 @@ mod tests {
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
     }
 
+    /// ADR-355: only a link the worker said forwards every pending is `forwarded`.
+    #[test]
+    fn only_a_link_said_to_forward_every_pending_is_forwarded() {
+        assert_eq!(pending_visibility(Some(true)), PendingVisibility::Forwarded);
+        assert_eq!(
+            pending_visibility(Some(false)),
+            PendingVisibility::AbsorbedByVci
+        );
+        assert_eq!(pending_visibility(None), PendingVisibility::AbsorbedByVci);
+    }
+
+    /// Design 8.11 `pending`: each response pending bound to the primitive is kept for the log,
+    /// with its time and clock as the worker gave them; another primitive's is not. The log's
+    /// form takes the agent's time when the host read it and leaves out one read with no log.
+    #[test]
+    fn the_pendings_bound_to_the_primitive_are_kept_for_the_log() {
+        let other = ComPrimitiveHandle {
+            cop_handle: 6,
+            ..COP
+        };
+        let pending = |cop, timestamp| EventItem {
+            timestamp,
+            timestamp_clock: TimestampClock::Device as i32,
+            ..event(cop, result(&[0x7F, 0x22, 0x78]))
+        };
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let got = [
+            pending(Some(other), 5),
+            pending(Some(COP), 10),
+            pending(Some(COP), 20),
+            event(Some(COP), result(&[0x62, 0xF1, 0x90])),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]
+        .into_iter()
+        .find_map(|item| progress.on_event(item, COP));
+        assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
+        let times: Vec<_> = progress
+            .pendings
+            .iter()
+            .map(|pending| (pending.vci_us, pending.clock))
+            .collect();
+        assert_eq!(
+            times,
+            [(10, Some(Clock::Device)), (20, Some(Clock::Device))]
+        );
+
+        progress.pendings[0].read = Some(AgentNow {
+            epoch: 0,
+            monotonic_us: 100,
+            wall_unix_ms: 0,
+        });
+        let logged = pendings_of(&progress.pendings);
+        assert_eq!(logged.len(), 1, "the one read with no log is left out");
+        assert_eq!(logged[0].vci_us, Some(10));
+        assert_eq!(logged[0].clock, Some(Clock::Device));
+        assert_eq!(logged[0].agent_us, 100);
+    }
+
     /// Design 8.11 "Matched answer": the order the items were read in says which of the
     /// exchange's link errors came before its final response.
     #[test]
@@ -2499,6 +2617,7 @@ mod tests {
                 rx_timeout: None,
                 vci_lost: None,
                 unbound: Vec::new(),
+                pendings: Vec::new(),
             }
         };
         let before = sent_of(vec![fault(), answer(), finished()]);

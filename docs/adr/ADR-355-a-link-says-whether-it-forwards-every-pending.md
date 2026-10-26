@@ -47,6 +47,11 @@ their clock (ADR-353).
    (design 8.11 "Link settings for the log", ADR-309 item 5); the agent supports 0x78 alone as a
    pending code today (`send_receive`), so no such link exists yet, and one that comes must keep
    this rule.
+5. **The host records the pendings it is shown.** On a forwarding link an empty `pending` list
+   reads as "no pending came", so the host keeps every pending bound to the primitive for the
+   exchange's list (its VCI time and clock as the worker gave them, ADR-353, and the agent's time
+   when the host read it). Without this a pending the worker passed on would be dropped and the
+   log would presume it absent, which design 8.11 forbids.
 
 ## Consequences
 

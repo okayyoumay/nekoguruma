@@ -670,13 +670,17 @@ async fn create_link<C: WorkerApi>(
     let cll_handle = created
         .cll_handle
         .ok_or(HostError::Setup("no logical link handle"))?;
-    // ADR-355: what the worker says, and only that; an unknown value is not a guess.
-    let forwards_pendings = match PendingForwarding::try_from(created.pending_forwarding) {
+    Ok((cll_handle, forwards_pendings(created.pending_forwarding)))
+}
+
+/// Whether the worker said the link forwards every pending (ADR-355): what it says, and only
+/// that; an unspecified or unknown value is not a guess.
+fn forwards_pendings(pending_forwarding: i32) -> Option<bool> {
+    match PendingForwarding::try_from(pending_forwarding) {
         Ok(PendingForwarding::All) => Some(true),
         Ok(PendingForwarding::NotAll) => Some(false),
         Ok(PendingForwarding::Unspecified) | Err(_) => None,
-    };
-    Ok((cll_handle, forwards_pendings))
+    }
 }
 
 async fn set_up_link<C: WorkerApi>(
@@ -915,6 +919,22 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// ADR-355: the worker's answer, and only it, says whether the link forwards every pending;
+    /// an unspecified or unknown value is unknown.
+    #[test]
+    fn forwards_pendings_is_what_the_worker_answered() {
+        assert_eq!(forwards_pendings(PendingForwarding::All as i32), Some(true));
+        assert_eq!(
+            forwards_pendings(PendingForwarding::NotAll as i32),
+            Some(false)
+        );
+        assert_eq!(
+            forwards_pendings(PendingForwarding::Unspecified as i32),
+            None
+        );
+        assert_eq!(forwards_pendings(7), None);
+    }
 
     /// Only a refusal or a missing resource proves a failed create left no link: a create that
     /// answered without a handle, or a timeout, may have created one the runner cannot name.

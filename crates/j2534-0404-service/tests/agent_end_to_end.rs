@@ -550,9 +550,9 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
 }
 
 /// The fifth job's exchange entries (design 8.11 "Exchange entry"): one per request, at the
-/// instruction that sent it, classified as today's evidence allows. The J2534 worker's link
-/// absorbs pendings and no time is judged yet, so a pending may have come first (H4) behind
-/// every answer and every silence: none of them is `none` or `vehicle` yet.
+/// instruction that sent it, classified as today's evidence allows. The J2534 worker says its
+/// link forwards every pending (ADR-355), so no absorbed pending stands behind an answer or a
+/// silence (H4): a confirmed positive response is `none`, while no time is judged yet.
 fn assert_comm_log(setup: &CommLogSetup) {
     let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
     let lines: Vec<serde_json::Value> = text

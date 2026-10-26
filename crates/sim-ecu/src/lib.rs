@@ -880,7 +880,7 @@ impl SimEcu {
                 if let Some(Fault::TruncateResponse { len }) =
                     self.take_armed(|f| matches!(f, Fault::TruncateResponse { .. }))
                 {
-                    bytes.truncate(len);
+                    bytes.truncate(len.max(1));
                 }
                 SimResponse::Positive(bytes)
             }
@@ -1088,6 +1088,9 @@ pub enum Fault {
     NegativeResponse { nrc: Nrc },
     /// The next positive response the ECU sends is cut to its first `len` bytes, as a response
     /// that does not answer its request (ADR-359): the request is handled as usual. A request
-    /// with no positive response leaves the fault armed.
+    /// with no positive response leaves the fault armed; a `len` at or above the response's
+    /// length uses the fault up without cutting anything. A `len` of 0 leaves a message no
+    /// transport carries, so the response is cut to its service identifier instead. With
+    /// [`Fault::DropResponse`] armed too, both fire on the response: it is cut, then lost.
     TruncateResponse { len: usize },
 }

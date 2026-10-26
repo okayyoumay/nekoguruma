@@ -26,7 +26,9 @@ The maintainer decided where the entry records both, and what it says of lost ev
 1. **The exchange entry gains a `rejected` list.** It has one item per result bound to the
    primitive that the host did not take as its answer. Each item gives:
    - the response identifier: the header's when the worker split one off, else the link's;
-   - the bytes, redacted as a response's are;
+   - the bytes, redacted as a response's are, except that a SecurityAccess positive response
+     keeps only its service and sub-function: its sub-function need not be the request's, so it
+     cannot show the response carries no seed (`redact_unanswering`);
    - the VCI time with its clock, and the agent time the host read it;
    - the reason:
      - `wrong_echo`: not negative, and not beginning as the request's positive response does;
@@ -41,7 +43,8 @@ The maintainer decided where the entry records both, and what it says of lost ev
    waiting at the first report, so there is one. `LostEventItemNotification` carries no count,
    so the interface does not change. The outcome stays `unknown`.
 5. **The simulator can send a response that does not answer.** `sim-ecu`'s
-   `Fault::TruncateResponse { len }` cuts the next positive response to its first `len` bytes.
+   `Fault::TruncateResponse { len }` cuts the next positive response to its first `len` bytes,
+   keeping at least its service identifier.
    The J2534 worker passes the cut response on as the primitive's result, and the host rejects
    it.
 

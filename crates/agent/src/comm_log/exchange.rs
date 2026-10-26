@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
 use serde::Serialize;
 
-use super::redaction::{Direction, LoggedMessage, redact};
+use super::redaction::{Direction, LoggedMessage, redact, redact_unanswering};
 use crate::host::positive_prefix;
 
 /// The `event` of an exchange entry.
@@ -672,7 +672,7 @@ fn negative_code(response: &[u8]) -> Option<u8> {
 }
 
 /// A result bound to the exchange's primitive that the host did not take as its answer (design
-/// 8.11 `rejected`, ADR-359), raw; the entry carries its bytes through [`redact`]. It counts for
+/// 8.11 `rejected`, ADR-359), raw; the entry carries its bytes through `redact_unanswering`. It counts for
 /// neither the classification nor `link_history`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rejected {
@@ -1453,7 +1453,7 @@ impl ExchangeEntry {
                 .into_iter()
                 .map(|rejected| RejectedItem {
                     rx_id: rejected.rx_id,
-                    response: redact(Direction::Response, &rejected.bytes),
+                    response: redact_unanswering(&rejected.bytes),
                     vci_us: rejected.vci_us,
                     clock: rejected.clock,
                     agent_us: rejected.agent_us,
@@ -2128,6 +2128,61 @@ mod tests {
         assert_eq!(json["outcome"]["nrc_name"], "conditionsNotCorrect");
         assert_eq!(json["outcome"]["nrc_kind"], "ecu_state");
         assert_eq!(json["request"]["service"], "RoutineControl");
+    }
+
+    /// ADR-359: the entry lists the rejected results, redacted as unanswering responses, and
+    /// the lost events; neither changes its classification.
+    #[test]
+    fn an_entry_lists_its_rejected_results_and_lost_events() {
+        let plain = forwarding(evidence(&READ_F186, End::NoResponse));
+        let mut with = plain.clone();
+        with.rejected = vec![
+            Rejected {
+                rx_id: 0x7E8,
+                bytes: vec![0x62, 0xF1],
+                vci_us: Some(5),
+                clock: Some(Clock::Device),
+                agent_us: 9,
+                reason: RejectedReason::WrongEcho,
+            },
+            Rejected {
+                rx_id: 0x7E8,
+                bytes: vec![0x67, 0x02, 0xAA, 0xBB],
+                vci_us: None,
+                clock: None,
+                agent_us: 10,
+                reason: RejectedReason::WrongEcho,
+            },
+        ];
+        with.events_lost = Some(EventsLost {
+            agent_us: 11,
+            notifications: 1,
+        });
+        assert_eq!(
+            verdict(&with).classification,
+            verdict(&plain).classification
+        );
+        let json =
+            serde_json::to_value(ExchangeEntry::build(1, with, LinkHistory::empty())).unwrap();
+        assert_eq!(
+            json["rejected"],
+            serde_json::json!([
+                {"rx_id": 0x7E8, "response": {"clear": "62f1"}, "vci_us": 5, "clock": "device",
+                 "agent_us": 9, "reason": "wrong_echo"},
+                {"rx_id": 0x7E8, "response": {"clear": "6702", "data": {"kind": "secret", "len": 2}},
+                 "agent_us": 10, "reason": "wrong_echo"},
+            ])
+        );
+        assert_eq!(
+            json["events_lost"],
+            serde_json::json!({"agent_us": 11, "notifications": 1})
+        );
+        let none =
+            serde_json::to_value(ExchangeEntry::build(1, plain, LinkHistory::empty())).unwrap();
+        assert!(
+            none.get("rejected").is_none() && none.get("events_lost").is_none(),
+            "{none}"
+        );
     }
 
     #[test]

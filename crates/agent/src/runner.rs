@@ -15126,6 +15126,33 @@ def main():
         assert!(fake.primitive_calls().is_empty());
     }
 
+    /// ADR-359: lost events end the exchange as `unknown`, and its entry records when the host
+    /// read the worker's report.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_exchange_that_lost_its_events_records_them() {
+        let dir = journal_dir("events-lost");
+        let (client, _fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((Duration::from_millis(20), StartEvent::Lose)),
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let results = reads_past_the_deadline_logged(client, 1, Some(log)).await;
+        assert!(
+            matches!(results[0], Err(HostError::EventsLost)),
+            "{results:?}"
+        );
+        let lines = comm_log_lines(&dir);
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .expect("the read has an entry");
+        assert_eq!(entry["outcome"]["result"], "unknown", "{entry}");
+        assert_eq!(entry["events_lost"]["notifications"], 1, "{entry}");
+        assert!(entry["events_lost"]["agent_us"].is_u64(), "{entry}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A cancel the worker answers with an invalid handle finds the primitive ended, so the
     /// request starts.
     #[tokio::test(flavor = "multi_thread")]

@@ -979,10 +979,6 @@ fn pending_visibility(forwards_pendings: Option<bool>) -> PendingVisibility {
     }
 }
 
-/// The communication log's form of the pendings bound to the primitive (design 8.11 `pending`):
-/// each with its VCI time on the clock its item names, and the agent's time when the host read
-/// it. A pending read with no log open has no agent time and is left out; the log then writes
-/// no entry either. The log gives each its interval from the transmit or the previous pending.
 /// The communication log's form of the rejected results: each read with a log, its response
 /// identifier the header's, or the link's when the worker split none off.
 fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
@@ -1001,6 +997,10 @@ fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
         .collect()
 }
 
+/// The communication log's form of the pendings bound to the primitive (design 8.11 `pending`):
+/// each with its VCI time on the clock its item names, and the agent's time when the host read
+/// it. A pending read with no log open has no agent time and is left out; the log then writes
+/// no entry either. The log gives each its interval from the transmit or the previous pending.
 fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
     pendings
         .iter()
@@ -3030,8 +3030,8 @@ mod tests {
         assert_eq!(detail.host_error, Some("LinkHeld"));
     }
 
-    /// ADR-358: at job end a stray primitive has ended on its own finished or cancelled status,
-    /// or on a lost VCI of no primitive or of it.
+    /// ADR-359: a result of the primitive that does not answer the request is rejected, with its
+    /// reason; an indication, a result of no primitive and the answer are not.
     #[test]
     fn a_result_of_the_primitive_that_does_not_answer_is_rejected() {
         let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
@@ -3083,6 +3083,8 @@ mod tests {
         assert_eq!(logged[0].agent_us, 9);
     }
 
+    /// ADR-358: at job end a stray primitive has ended on its own finished or cancelled status,
+    /// or on a lost VCI of no primitive or of it.
     #[test]
     fn a_stray_primitive_ends_on_its_own_end_or_a_lost_vci() {
         let other = ComPrimitiveHandle {

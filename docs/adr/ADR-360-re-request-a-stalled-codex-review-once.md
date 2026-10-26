@@ -2,7 +2,7 @@
 
 **Date:** 2026-10-26
 **Status:** Accepted
-**Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Step 1, Codex; Step 5's review summary), `CLAUDE.md` ("Pull requests"); ADR-312 Decision item 1
+**Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Step 0, Codex; Step 5's review summary), `CLAUDE.md` ("Pull requests"); ADR-312 Decision item 1
 
 ## Context
 

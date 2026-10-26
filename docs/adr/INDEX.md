@@ -349,7 +349,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
 | [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
-| [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Step 1), `CLAUDE.md`; ADR-312 |
+| [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 5), `CLAUDE.md`; ADR-312 |
 
 ## Status Legend
 

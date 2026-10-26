@@ -375,6 +375,10 @@ async fn grpc_server_responds_through_mock_library() {
         .expect("get_timestamp should succeed")
         .into_inner();
     assert_eq!(timestamp.timestamp, MOCK_TIMESTAMP);
+    assert_eq!(
+        timestamp.timestamp_clock(),
+        vci_service_interface::TimestampClock::Device
+    );
 
     let cll_handle = create_default_cll(&mut client).await;
 

@@ -596,6 +596,9 @@ impl J2534Service {
 
         Ok(Response::new(vci_service_interface::TimestampResponse {
             timestamp: events::module_timestamp_us(),
+            // ADR-353: J2534 v04.04 gives no call that reads the device's clock, so the reading
+            // is the worker's own (ADR-120).
+            timestamp_clock: vci_service_interface::TimestampClock::Worker as i32,
         }))
     }
 }

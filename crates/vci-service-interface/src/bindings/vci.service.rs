@@ -719,6 +719,13 @@ pub struct UniqueRespIdTableResponse {
 pub struct TimestampResponse {
     #[prost(uint32, tag = "1")]
     pub timestamp: u32,
+    /// ADR-353: the clock `timestamp` is on, as `EventItem.timestamp_clock`
+    /// names an item's (design 8.11 "On one clock"): DEVICE when the library
+    /// reads the VCI's own clock, WORKER for the worker's synthetic one.
+    /// UNSPECIFIED means the worker does not say, and a client then compares
+    /// the reading with no other time.
+    #[prost(enumeration = "TimestampClock", tag = "2")]
+    pub timestamp_clock: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct IoCtlRequest {

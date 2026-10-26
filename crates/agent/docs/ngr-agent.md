@@ -388,7 +388,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   worker's receive timeout, ends an exchange with no response, the entry's outcome is
   `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
   have run out, with or without a pending; a pending then silence is `vehicle` only when the
-  VCI ended the wait. A primitive whose end the host did not read may still hold the link: its
+  VCI ended the wait. At that deadline the host reads the VCI's clock for an exchange whose entry
+  it writes (`GetTimestamp` of the link's module, one more unary call's budget at most), and the entry's `times.vci.deadline`
+  gives the reading with the clock the worker names in `TimestampResponse.timestamp_clock` and
+  the read's round trip (`round_trip_us`); a read that fails gives none. A primitive whose end the host did not read may still hold the link: its
   own deadline, lost events or a failed event stream ended the wait, though not a lost VCI,
   whose primitives the worker cancels. The host cancels such a primitive before the link's next
   request (`WorkerHost::stray`, design 8.11 "Settlement"). The primitive is gone when the cancel
@@ -1137,7 +1140,8 @@ restart's own checks read the same sources and still treat any non-integer readi
 
 The runner, the host and the link set-up call the worker through the trait `agent::client::WorkerApi`
 (ADR-334): one method per RPC they use (`CancelComPrimitive` among them, which the host sends
-for a primitive it stopped waiting for), with the generated gRPC client's signatures, and
+for a primitive it stopped waiting for, and `GetTimestamp`, its reading of the VCI's clock at
+its deadline), with the generated gRPC client's signatures, and
 `held_module()`. `ngr-agent` uses `worker_host::client::WorkerClient`, which implements the trait by
 delegating, so a production call is unchanged. A client that holds the worker's module itself
 (`held_module()` is `Some`) is used by the hardware harness's guarded client

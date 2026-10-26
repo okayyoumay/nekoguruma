@@ -721,6 +721,12 @@ message UniqueRespIdTableResponse {
 
 message TimestampResponse {
     uint32 timestamp = 1;
+    // ADR-353: the clock `timestamp` is on, as `EventItem.timestamp_clock`
+    // names an item's (design 8.11 "On one clock"): DEVICE when the library
+    // reads the VCI's own clock, WORKER for the worker's synthetic one.
+    // UNSPECIFIED means the worker does not say, and a client then compares
+    // the reading with no other time.
+    TimestampClock timestamp_clock = 2;
 }
 
 // ============================================================================

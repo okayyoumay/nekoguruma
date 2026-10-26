@@ -14406,10 +14406,23 @@ def main():
         }
         async fn get_timestamp(
             &self,
-            _: tonic::Request<vci_service_interface::GetTimestampRequest>,
+            request: tonic::Request<vci_service_interface::GetTimestampRequest>,
         ) -> Result<tonic::Response<vci_service_interface::TimestampResponse>, tonic::Status>
         {
-            unimplemented()
+            if !self.starts {
+                return unimplemented();
+            }
+            self.note("GetTimestamp");
+            // The fake's only module, the one its links are on.
+            if request.into_inner().module_handle != Some(ModuleHandle { module_handle: 1 }) {
+                return Err(tonic::Status::invalid_argument("not the link's module"));
+            }
+            Ok(tonic::Response::new(
+                vci_service_interface::TimestampResponse {
+                    timestamp: DEADLINE_READING,
+                    timestamp_clock: vci_service_interface::TimestampClock::Device as i32,
+                },
+            ))
         }
         async fn get_resource_status(
             &self,
@@ -14701,6 +14714,9 @@ def main():
         }
     }
 
+    /// The VCI time a [`FakeWorker`] whose primitives start gives a reading of its clock.
+    const DEADLINE_READING: u32 = 4_242;
+
     /// A [`FakeWorker`] whose primitives start and never end, answering a cancel as `cancel`.
     async fn fake_worker_starting(cancel: CancelAnswer) -> (WorkerClient, Started) {
         let calls = Arc::new(Mutex::new(Vec::new()));
@@ -14761,8 +14777,17 @@ def main():
     /// Runs `requests` reads of F190 on a host over `client` whose send-receive deadline is
     /// short, so each primitive the fake starts passes it.
     async fn reads_past_the_deadline(
+        client: WorkerClient,
+        requests: usize,
+    ) -> Vec<Result<Vec<u8>, HostError>> {
+        reads_past_the_deadline_logged(client, requests, None).await
+    }
+
+    /// [`reads_past_the_deadline`], writing their entries to `comm_log` as the identity reads'.
+    async fn reads_past_the_deadline_logged(
         mut client: WorkerClient,
         requests: usize,
+        comm_log: Option<crate::comm_log::CommLog>,
     ) -> Vec<Result<Vec<u8>, HostError>> {
         use diag_ir::DiagHost;
         let config = LinkConfig::iso15765(0x7E0, 0x7E8);
@@ -14776,6 +14801,11 @@ def main():
         };
         tokio::task::spawn_blocking(move || {
             let mut host = WorkerHost::new(handle, client, link, timings);
+            if comm_log.is_some() {
+                host.set_comm_log(comm_log);
+                host.set_link_ids(0x7E0, 0x7E8);
+                host.own_reads(Some(OwnRead::Identification));
+            }
             (0..requests)
                 .map(|_| host.service_request(0x22, &[0xF1, 0x90]))
                 .collect()
@@ -14806,6 +14836,46 @@ def main():
         );
         assert_eq!(*fake.started.lock().unwrap(), [7, 8]);
         assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+        // With no entry to write, the host reads no clock at its deadline.
+        assert!(
+            !fake.calls.lock().unwrap().contains(&"GetTimestamp"),
+            "{:?}",
+            fake.calls
+        );
+    }
+
+    /// Design 8.11 "Settlement": when the agent's deadline ends the wait, the host reads the
+    /// VCI's clock once, and the entry records the reading with the clock the worker named and
+    /// the read's round trip.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_vci_s_clock_is_read_at_the_agent_s_deadline() {
+        let dir = journal_dir("deadline-reading");
+        let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let results = reads_past_the_deadline_logged(client, 1, Some(log)).await;
+        assert!(
+            matches!(results[0], Err(HostError::NoResponse)),
+            "{results:?}"
+        );
+        let calls = fake.calls.lock().unwrap().clone();
+        let started = calls.iter().position(|call| *call == "StartComPrimitive");
+        let read = calls.iter().position(|call| *call == "GetTimestamp");
+        assert!(started < read && read.is_some(), "{calls:?}");
+        assert_eq!(
+            calls.iter().filter(|call| **call == "GetTimestamp").count(),
+            1
+        );
+        let lines = comm_log_lines(&dir);
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .expect("the read has an entry");
+        assert_eq!(entry["outcome"]["result"], "vci_did_not_end");
+        let reading = &entry["times"]["vci"]["deadline"];
+        assert_eq!(reading["us"], DEADLINE_READING);
+        assert_eq!(reading["clock"], "device");
+        assert!(reading["round_trip_us"].is_u64(), "{reading}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A cancel the worker answers with an invalid handle finds the primitive ended, so the
@@ -15070,6 +15140,7 @@ def main():
             module_connect(vci_service_interface::ModuleConnectRequest) -> vci_service_interface::Response;
             module_disconnect(vci_service_interface::ModuleDisconnectRequest) -> vci_service_interface::Response;
             get_version(vci_service_interface::GetVersionRequest) -> vci_service_interface::VersionResponse;
+            get_timestamp(vci_service_interface::GetTimestampRequest) -> vci_service_interface::TimestampResponse;
             get_resource_ids(vci_service_interface::GetResourceIdsRequest) -> vci_service_interface::ResourceIdsResponse;
             get_object_id(vci_service_interface::GetObjectIdRequest) -> vci_service_interface::ObjectIdResponse;
             destroy_com_logical_link(vci_service_interface::DestroyComLogicalLinkRequest) -> vci_service_interface::Response;

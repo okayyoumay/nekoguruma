@@ -31,16 +31,22 @@ The maintainer decided the bound.
      control requests (`CP_STmin`).
 
    The sum is capped at 10 s.
-2. **Unset ComParams take fixed values.** A `CP_Cr` the link leaves to the library counts as
-   1 s, the timeout ISO 15765-2:2024 9.8.1 gives the receiver's wait for the next consecutive
+2. **Unset ComParams take fixed values.** A `CP_Cr` the link leaves to the library, or
+   declares as 0 (as a zero P2 is the library's default), counts as 1 s, the timeout ISO 15765-2:2024 9.8.1 gives the receiver's wait for the next consecutive
    frame. An unset `CP_STmin` counts as none. On a 500 kbit/s link with neither set, the wait
    is about 1.19 s.
-3. **No limit in force is added.** The agent's deadline already lies past every limit in force.
+3. **The wait starts at the agent's own deadline for the primitive.** That deadline lies past
+   every limit in force, so no limit is added after it. A primitive the host left at its
+   deadline is waited for from the job's end. One it left earlier, on lost events, is waited for
+   to that deadline first, since it may still be within its limits.
 4. **The host waits, then cancels.** `WorkerHost::settle_at_end` runs before the link closes.
    - The wait ends early when the primitive's own finished or cancelled status arrives, or on a
      lost VCI, whose primitives the worker cancels (ADR-289).
    - When the wait passes, or the event stream fails or ends so that the end is unknown, the
      host cancels the primitive by its handle.
+   - A primitive whose cancel before a request already failed is cancelled at once, without the
+     wait: the worker may not be answering, and a wait on top of the cancel's own deadline and
+     the link's close would delay the job's end for nothing.
    - A cancel answered with an invalid handle, or a lost VCI, counts as done (as before the
      next request). Any other failure is logged and does not change the job's result.
 5. **What the primitive gives meanwhile is read but not logged yet.** Its `primitive_ended`
@@ -49,6 +55,8 @@ The maintainer decided the bound.
 ## Consequences
 
 - A job whose last exchange outlasted the agent's deadline ends up to the job-end wait later.
+  One whose last exchange lost its events ends up to the rest of that exchange's deadline and
+  the job-end wait later.
 - The link is no longer closed under a running primitive, so a library that queues the close
   behind it no longer holds the VCI.
 - An ECU that sends its frames more slowly than `CP_STmin` can outlast the wait. The cap also

@@ -152,17 +152,13 @@ impl LinkConfig {
         (self.protocol_short_name == PROTOCOL_UDS_ON_CAN).then_some(ApplicationLayer::Uds)
     }
 
-    /// Refuses values the worker would read differently from the host: the worker replaces a
-    /// zero P2 or P2* with its own default and reads a zero 0x78 completion timeout as no
-    /// limit, while the host would compute its deadline from zero; and a timing above
-    /// [`MAX_TIMING_MS`] does not fit the worker's microsecond ComParams.
     /// How long the agent keeps the link open at job end for a primitive past its deadline
     /// before it cancels it (design 8.11 "Settlement", ADR-358): the link's worst case for a
     /// response already under way, one wait for a consecutive frame (`CP_Cr`) plus the transfer
     /// of the longest response a classic ISO-TP message carries, received at the separation
     /// time the tester's flow control requests (`CP_STmin`, ISO 15765-2:2024 9.6.5, 9.8.1), each
     /// frame taking at most [`JOB_END_FRAME_BITS`] at the baud rate; at most
-    /// [`JOB_END_WAIT_MAX`]. A `CP_Cr` the link leaves to the library counts as
+    /// [`JOB_END_WAIT_MAX`]. A `CP_Cr` the link leaves to the library, or declares 0, counts as
     /// [`JOB_END_DEFAULT_CR_US`], an unset `CP_STmin` as none. By the agent's deadline every
     /// limit in force has passed, so none is added; an ECU that sends slower than `CP_STmin`
     /// is cut off by the cap.
@@ -173,7 +169,10 @@ impl LinkConfig {
                 .find(|(given, _)| given.eq_ignore_ascii_case(name))
                 .map(|(_, value)| u64::from(*value))
         };
-        let cr_us = param("CP_Cr").unwrap_or(JOB_END_DEFAULT_CR_US);
+        // A zero `CP_Cr` is taken as the library's default, as a zero P2 is (`validate`).
+        let cr_us = param("CP_Cr")
+            .filter(|&cr| cr != 0)
+            .unwrap_or(JOB_END_DEFAULT_CR_US);
         let st_min_us = param("CP_STmin").unwrap_or(0);
         // A first frame carries 6 bytes and each consecutive frame 7.
         let frames = 1 + (JOB_END_RESPONSE_BYTES - 6).div_ceil(7);
@@ -182,6 +181,10 @@ impl LinkConfig {
         wait.min(JOB_END_WAIT_MAX)
     }
 
+    /// Refuses values the worker would read differently from the host: the worker replaces a
+    /// zero P2 or P2* with its own default and reads a zero 0x78 completion timeout as no
+    /// limit, while the host would compute its deadline from zero; and a timing above
+    /// [`MAX_TIMING_MS`] does not fit the worker's microsecond ComParams.
     pub fn validate(&self) -> Result<(), HostError> {
         // The read-only policy judges UDS service IDs, and the link set-up (flow-control table,
         // response pending handling) is for UDS on CAN. On any other protocol, raw CAN for

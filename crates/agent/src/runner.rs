@@ -1244,6 +1244,7 @@ fn run_job<C: WorkerApi>(
     host.set_artifact(artifact);
     host.set_comm_log(comm_log);
     host.set_link_ids(config.tx_id, config.rx_id);
+    host.set_job_end_wait(config.job_end_wait());
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -1279,6 +1280,10 @@ fn run_job<C: WorkerApi>(
         ),
     }))
     .unwrap_or(Err(JobError::Panicked));
+    // A primitive past its deadline is waited for, or cancelled, before the link closes.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| host.settle_at_end())).is_err() {
+        tracing::warn!("settling a primitive past its deadline at job end panicked");
+    }
     // The event stream goes before the link is closed.
     drop(host);
     open_link.close();
@@ -14342,6 +14347,24 @@ def main():
         cancelled: Arc<Mutex<Vec<u32>>>,
         /// How CancelComPrimitive answers.
         cancel: CancelAnswer,
+        /// What the link's events give after each start, and when.
+        on_start: Option<(Duration, StartEvent)>,
+        /// The sender of the link's event stream, once subscribed.
+        events: Arc<Mutex<Option<EventSender>>>,
+    }
+
+    /// The sender of a [`FakeWorker`]'s event stream.
+    type EventSender = tokio::sync::mpsc::UnboundedSender<
+        Result<vci_service_interface::EventNotification, tonic::Status>,
+    >;
+
+    /// An event a [`FakeWorker`] gives after a start.
+    #[derive(Clone, Copy)]
+    enum StartEvent {
+        /// The primitive's finished status.
+        Finish,
+        /// A lost-events notification.
+        Lose,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14575,6 +14598,34 @@ def main():
                 started.push(next);
                 next
             };
+            if let Some((after, event)) = self.on_start {
+                let sender = self.events.lock().unwrap().clone();
+                tokio::spawn(async move {
+                    tokio::time::sleep(after).await;
+                    use vci_service_interface::event_notification::EventData;
+                    let data = match event {
+                        StartEvent::Finish => EventData::Item(vci_service_interface::EventItem {
+                            cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
+                                module_handle: 1,
+                                cll_handle: 1,
+                                cop_handle,
+                            }),
+                            data: Some(vci_service_interface::event_item::Data::CopStatus(
+                                vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
+                                    as i32,
+                            )),
+                            ..Default::default()
+                        }),
+                        StartEvent::Lose => EventData::Lost(Default::default()),
+                    };
+                    if let Some(sender) = sender {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(data),
+                            ..Default::default()
+                        }));
+                    }
+                });
+            }
             Ok(tonic::Response::new(
                 vci_service_interface::ComPrimitiveResponse {
                     cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
@@ -14623,14 +14674,20 @@ def main():
         {
             unimplemented()
         }
-        type SubscribeEventStream = tonic::codegen::tokio_stream::Pending<
+        type SubscribeEventStream = tonic::codegen::tokio_stream::wrappers::UnboundedReceiverStream<
             Result<vci_service_interface::EventNotification, tonic::Status>,
         >;
         async fn subscribe_event(
             &self,
             _: tonic::Request<vci_service_interface::SubscribeEventRequest>,
         ) -> Result<tonic::Response<Self::SubscribeEventStream>, tonic::Status> {
-            Ok(tonic::Response::new(tonic::codegen::tokio_stream::pending()))
+            // The sender stays here, so the stream stays open with no events unless a start
+            // gives one.
+            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            *self.events.lock().unwrap() = Some(sender);
+            Ok(tonic::Response::new(
+                tonic::codegen::tokio_stream::wrappers::UnboundedReceiverStream::new(receiver),
+            ))
         }
         async fn io_ctl(
             &self,
@@ -14708,6 +14765,8 @@ def main():
             started: Arc::default(),
             cancelled: Arc::default(),
             cancel: CancelAnswer::Done,
+            on_start: None,
+            events: Arc::default(),
         };
         serve(service, calls, set).await
     }
@@ -14738,6 +14797,14 @@ def main():
 
     /// A [`FakeWorker`] whose primitives start and never end, answering a cancel as `cancel`.
     async fn fake_worker_starting(cancel: CancelAnswer) -> (WorkerClient, Started) {
+        fake_worker_starting_with(cancel, None).await
+    }
+
+    /// [`fake_worker_starting`], whose link gives `on_start`'s event that long after each start.
+    async fn fake_worker_starting_with(
+        cancel: CancelAnswer,
+        on_start: Option<(Duration, StartEvent)>,
+    ) -> (WorkerClient, Started) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let (started, cancelled) = (Arc::default(), Arc::default());
@@ -14752,6 +14819,8 @@ def main():
             started: Arc::clone(&started),
             cancelled: Arc::clone(&cancelled),
             cancel,
+            on_start,
+            events: Arc::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (
@@ -14895,6 +14964,166 @@ def main():
         assert_eq!(reading["clock"], "device");
         assert!(reading["round_trip_us"].is_u64(), "{reading}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Opens a link on `client`, sends `reads` reads past the deadline (`send_recv`), each
+    /// giving its result, then settles the job's end with a job-end wait of `wait`; returns the
+    /// reads' results and how long the job's end took.
+    async fn reads_then_job_end(
+        mut client: WorkerClient,
+        reads: usize,
+        send_recv: Duration,
+        wait: Duration,
+    ) -> (Vec<Result<Vec<u8>, HostError>>, Duration) {
+        use diag_ir::DiagHost;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv,
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_job_end_wait(wait);
+            let results = (0..reads)
+                .map(|_| host.service_request(0x22, &[0xF1, 0x90]))
+                .collect();
+            let at = std::time::Instant::now();
+            host.settle_at_end();
+            (results, at.elapsed())
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Design 8.11 "Settlement", ADR-358: at job end the host keeps the link open for a
+    /// primitive past its deadline for the job-end wait, then cancels it by its handle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_past_the_deadline_is_waited_for_then_cancelled_at_job_end() {
+        let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let wait = Duration::from_millis(200);
+        let (results, took) = reads_then_job_end(client, 1, Duration::from_millis(50), wait).await;
+        assert!(
+            matches!(results[0], Err(HostError::NoResponse)),
+            "{results:?}"
+        );
+        assert!(took >= wait, "{took:?}");
+        assert_eq!(
+            fake.primitive_calls(),
+            ["StartComPrimitive", "CancelComPrimitive"]
+        );
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+    }
+
+    /// A primitive that ends within the job-end wait ends the wait and is not cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_that_ends_within_the_job_end_wait_is_not_cancelled() {
+        let (client, fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((Duration::from_millis(150), StartEvent::Finish)),
+        )
+        .await;
+        let wait = Duration::from_secs(5);
+        let (results, took) = reads_then_job_end(client, 1, Duration::from_millis(50), wait).await;
+        assert!(
+            matches!(results[0], Err(HostError::NoResponse)),
+            "{results:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(fake.primitive_calls(), ["StartComPrimitive"]);
+    }
+
+    /// A primitive left by lost events, before the agent's deadline, is waited for to that
+    /// deadline and then for the job-end wait: the deadline lies past every limit in force.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_left_by_lost_events_is_waited_for_past_its_deadline() {
+        let (client, fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((Duration::from_millis(20), StartEvent::Lose)),
+        )
+        .await;
+        let send_recv = Duration::from_millis(600);
+        let wait = Duration::from_millis(100);
+        let (results, took) = reads_then_job_end(client, 1, send_recv, wait).await;
+        assert!(
+            matches!(results[0], Err(HostError::EventsLost)),
+            "{results:?}"
+        );
+        // The read ended after the loss, at about 20 ms; its deadline is at 600 ms.
+        assert!(took >= Duration::from_millis(500), "{took:?}");
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+    }
+
+    /// A primitive whose cancel before a request failed is cancelled at job end without the
+    /// wait: the worker may not answer.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_whose_cancel_failed_is_cancelled_at_job_end_at_once() {
+        let (client, fake) = fake_worker_starting(CancelAnswer::Failed).await;
+        let wait = Duration::from_secs(5);
+        let (results, took) = reads_then_job_end(client, 2, Duration::from_millis(50), wait).await;
+        assert!(
+            matches!(results[1], Err(HostError::LinkHeld)),
+            "{results:?}"
+        );
+        assert!(took < Duration::from_secs(2), "{took:?}");
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7, 7]);
+    }
+
+    /// The runner settles the job's end before the link closes (ADR-358): a job whose read
+    /// outlasts the agent's deadline cancels the primitive after the link's job-end wait.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_cancels_its_primitive_past_the_deadline_before_its_link_closes() {
+        let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let config = LinkConfig {
+            p2_max_ms: 1,
+            p2_star_ms: 1,
+            rc78_completion_ms: 1,
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        let job = Job::from(program(vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x22 },
+        ]));
+        let run = run_program(
+            client,
+            &config,
+            job,
+            JobLimits::default(),
+            vci_only_guards("job-end-cancel"),
+        )
+        .await;
+        assert!(run.result.is_err(), "{:?}", run.result);
+        let calls = fake.calls.lock().unwrap().clone();
+        let cancel = calls.iter().position(|call| *call == "CancelComPrimitive");
+        let close = calls
+            .iter()
+            .position(|call| *call == "DisconnectComLogicalLink");
+        assert!(cancel.is_some() && cancel < close, "{calls:?}");
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+    }
+
+    /// A job with no primitive past its deadline sends no cancel at its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_end_with_no_primitive_in_flight_cancels_nothing() {
+        let (mut client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_millis(50),
+        };
+        tokio::task::spawn_blocking(move || {
+            WorkerHost::new(handle, client, link, timings).settle_at_end();
+        })
+        .await
+        .unwrap();
+        assert!(fake.primitive_calls().is_empty());
     }
 
     /// A cancel the worker answers with an invalid handle finds the primitive ended, so the

@@ -19,6 +19,17 @@ use crate::host::{HostError, unary};
 use crate::oplog::LogSafe;
 use crate::policy::{ApplicationLayer, Permission};
 
+/// The longest a classic ISO-TP message carries (a 12-bit length), the response the job-end
+/// wait allows for ([`LinkConfig::job_end_wait`]).
+pub const JOB_END_RESPONSE_BYTES: u64 = 4_095;
+/// An upper bound of one classic CAN frame's bits on the bus, stuffing included.
+pub const JOB_END_FRAME_BITS: u64 = 160;
+/// The `CP_Cr` the job-end wait takes when the link leaves it to the library: the timeout
+/// ISO 15765-2:2024 9.8.1 gives the receiver's wait for the next consecutive frame, 1 s.
+pub const JOB_END_DEFAULT_CR_US: u64 = 1_000_000;
+/// The job-end wait's cap (ADR-358).
+pub const JOB_END_WAIT_MAX: Duration = Duration::from_secs(10);
+
 /// What a job's link needs: from the protocol a job's document declares
 /// ([`LinkConfig::declared`], ADR-324), or built by the caller for a program without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -139,6 +150,35 @@ impl LinkConfig {
     /// accepts, and none on any other, so that a read-only job could send nothing on it.
     pub fn application_layer(&self) -> Option<ApplicationLayer> {
         (self.protocol_short_name == PROTOCOL_UDS_ON_CAN).then_some(ApplicationLayer::Uds)
+    }
+
+    /// How long the agent keeps the link open at job end for a primitive past its deadline
+    /// before it cancels it (design 8.11 "Settlement", ADR-358): the link's worst case for a
+    /// response already under way, one wait for a consecutive frame (`CP_Cr`) plus the transfer
+    /// of the longest response a classic ISO-TP message carries, received at the separation
+    /// time the tester's flow control requests (`CP_STmin`, ISO 15765-2:2024 9.6.5, 9.8.1), each
+    /// frame taking at most [`JOB_END_FRAME_BITS`] at the baud rate; at most
+    /// [`JOB_END_WAIT_MAX`]. A `CP_Cr` the link leaves to the library, or declares 0, counts as
+    /// [`JOB_END_DEFAULT_CR_US`], an unset `CP_STmin` as none. By the agent's deadline every
+    /// limit in force has passed, so none is added; an ECU that sends slower than `CP_STmin`
+    /// is cut off by the cap.
+    pub fn job_end_wait(&self) -> Duration {
+        let param = |name: &str| {
+            self.params
+                .iter()
+                .find(|(given, _)| given.eq_ignore_ascii_case(name))
+                .map(|(_, value)| u64::from(*value))
+        };
+        // A zero `CP_Cr` is taken as the library's default, as a zero P2 is (`validate`).
+        let cr_us = param("CP_Cr")
+            .filter(|&cr| cr != 0)
+            .unwrap_or(JOB_END_DEFAULT_CR_US);
+        let st_min_us = param("CP_STmin").unwrap_or(0);
+        // A first frame carries 6 bytes and each consecutive frame 7.
+        let frames = 1 + (JOB_END_RESPONSE_BYTES - 6).div_ceil(7);
+        let frame_us = (JOB_END_FRAME_BITS * 1_000_000).div_ceil(u64::from(self.baud_rate.max(1)));
+        let wait = Duration::from_micros(cr_us + frames * (frame_us + st_min_us));
+        wait.min(JOB_END_WAIT_MAX)
     }
 
     /// Refuses values the worker would read differently from the host: the worker replaces a
@@ -919,6 +959,34 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// ADR-358: the job-end wait is one `CP_Cr` wait plus a 4095-byte response at `CP_STmin`,
+    /// a frame taking at most 160 bits, capped at 10 s; unset ComParams count as 1 s and none.
+    #[test]
+    fn the_job_end_wait_is_the_link_s_worst_case_for_a_response() {
+        // 586 frames of 320 µs at 500 kbit/s, after the 1 s default.
+        let plain = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(
+            plain.job_end_wait(),
+            Duration::from_micros(1_000_000 + 586 * 320)
+        );
+        let declared = LinkConfig {
+            params: vec![
+                ("cp_cr".to_owned(), 150_000),
+                ("CP_STmin".to_owned(), 1_000),
+            ],
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        assert_eq!(
+            declared.job_end_wait(),
+            Duration::from_micros(150_000 + 586 * (320 + 1_000))
+        );
+        let slow = LinkConfig {
+            baud_rate: 10_000,
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        assert_eq!(slow.job_end_wait(), JOB_END_WAIT_MAX);
+    }
 
     /// ADR-355: the worker's answer, and only it, says whether the link forwards every pending;
     /// an unspecified or unknown value is unknown.

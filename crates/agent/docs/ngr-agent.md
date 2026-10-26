@@ -403,7 +403,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   when the VCI was lost. Any other answer leaves the link held: the request is not started
   (`HostError::LinkHeld`, logged `not_sent`, refused by the agent with the cause `link_held`), and
   the next request tries the cancel again. An item the cancelled primitive leaves is logged
-  `unattached` with `primitive` `earlier`.
+  `unattached` with `primitive` `earlier`. At job end (`WorkerHost::settle_at_end`, before the
+  link closes) the host keeps the link open for such a primitive until it ends (its finished or
+  cancelled status, or a lost VCI) or the link's job-end wait passes after the agent's own
+  deadline for it (`LinkConfig::job_end_wait`, ADR-358: one `CP_Cr` wait, 1 s when unset or 0,
+  plus a 4095-byte response at `CP_STmin`, capped at 10 s), then cancels it; one whose cancel
+  before a request already failed, or whose event stream fails, is cancelled at once; a failed cancel is logged and leaves
+  the job's result as it was. What the primitive gives meanwhile is not logged yet.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs

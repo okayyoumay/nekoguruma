@@ -336,10 +336,12 @@ const RX_FLAG_START_OF_MESSAGE: u8 = 0x02;
 const RX_FLAG_BREAK: u8 = 0x04;
 const RX_FLAG_TX_INDICATION: u8 = 0x08;
 
-/// The longest response a single CAN frame carries under every addressing format (ISO
-/// 15765-2:2024 9.6.2: one byte of protocol information, and one more for an address byte): a
-/// response no longer has no start-of-message indication of its own.
-const SINGLE_FRAME_MAX: usize = 6;
+/// The longest response a single classic CAN frame can carry, under normal addressing (ISO
+/// 15765-2:2024 9.6.2: one byte of protocol information): a longer response spans frames
+/// whatever the addressing format, while a response this long or shorter may fit one frame and
+/// so may have no start-of-message indication of its own. The log does not know the link's
+/// addressing format, so it takes no start for such a response.
+const SINGLE_FRAME_MAX: usize = 7;
 
 /// The `unattached` event of an [`UnattachedItem`].
 #[derive(Serialize)]
@@ -2590,7 +2592,7 @@ mod tests {
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
         // A response that spans frames, and one that fits one frame.
         let long = [0x62, 0xF1, 0x90, 1, 2, 3, 4, 5];
-        let short = [0x62, 0xF1, 0x90, 1];
+        let short = [0x62, 0xF1, 0x90, 1, 2, 3, 4];
         let answered = |response: &[u8], times: exchange::VciTimes| {
             let mut evidence = evidence(
                 endpoint(0x7E0),

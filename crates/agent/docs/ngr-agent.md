@@ -370,8 +370,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
     indication did (`sent_evidence` `tx_done_time`).
   - The response's start comes from its own `start_msg_timestamp`, or else from the latest
     attached start of message. That start counts only when it came after the last pending and the
-    response is longer than six bytes: a start comes only with a multi-frame response's first
-    frame, so one before a single-frame answer was a transfer the ECU aborted.
+    response is longer than seven bytes, so that it spans frames whatever the addressing format: a
+    start comes only with a multi-frame response's first frame, so one before a single-frame
+    answer was a transfer the ECU aborted.
   - Of two times for one point, the one with a clock wins.
   - The response's end comes from the final response's item. Its times are kept only when the
     exchange ended with that response.

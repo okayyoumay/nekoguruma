@@ -1,0 +1,2 @@
+component,value,definition,variant,service,field,expected,note
+model_year,2027,exampleEcu,exampleEcuV2,softwareVersion.read,softwareVersion,32,The second software generation came with model year 2027

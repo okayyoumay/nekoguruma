@@ -76,8 +76,9 @@ impl ApplicationLayer {
 
 /// UDS's read-only services: ReadDTCInformation and ReadDataByIdentifier, which change nothing
 /// on the ECU. TesterPresent is left out: it keeps the ECU's current session alive, which a job
-/// may only do once it owns that session.
-pub const UDS_READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
+/// may only do once it owns that session. The list is `diag_ir`'s, which the converters check
+/// identification reads against too (ADR-327 item 1).
+pub const UDS_READ_ONLY_SERVICES: &[u8] = diag_ir::UDS_READ_ONLY_SERVICES;
 
 /// The most a job may get in this build, before the VCI behind the worker is known: the
 /// simulator permission in a debug build, read-only in a release build (ADR-247). The

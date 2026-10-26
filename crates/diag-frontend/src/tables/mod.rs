@@ -15,6 +15,7 @@ mod restart;
 pub mod rows;
 mod sheet;
 pub(crate) mod values;
+pub mod vehicle;
 
 use std::collections::HashMap;
 use std::path::Path;

@@ -14406,13 +14406,17 @@ def main():
         }
         async fn get_timestamp(
             &self,
-            _: tonic::Request<vci_service_interface::GetTimestampRequest>,
+            request: tonic::Request<vci_service_interface::GetTimestampRequest>,
         ) -> Result<tonic::Response<vci_service_interface::TimestampResponse>, tonic::Status>
         {
             if !self.starts {
                 return unimplemented();
             }
             self.note("GetTimestamp");
+            // The fake's only module, the one its links are on.
+            if request.into_inner().module_handle != Some(ModuleHandle { module_handle: 1 }) {
+                return Err(tonic::Status::invalid_argument("not the link's module"));
+            }
             Ok(tonic::Response::new(
                 vci_service_interface::TimestampResponse {
                     timestamp: DEADLINE_READING,
@@ -14832,6 +14836,12 @@ def main():
         );
         assert_eq!(*fake.started.lock().unwrap(), [7, 8]);
         assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+        // With no entry to write, the host reads no clock at its deadline.
+        assert!(
+            !fake.calls.lock().unwrap().contains(&"GetTimestamp"),
+            "{:?}",
+            fake.calls
+        );
     }
 
     /// Design 8.11 "Settlement": when the agent's deadline ends the wait, the host reads the

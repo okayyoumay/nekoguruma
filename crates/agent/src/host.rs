@@ -563,7 +563,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             )
         });
         let handle = self.handle.clone();
-        let sent = handle.block_on(self.send_recv_async(request, progress));
+        let sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let end = deadline_end(end, sent.agent_deadline);
@@ -597,8 +597,14 @@ impl<C: WorkerApi> WorkerHost<C> {
         sent.result
     }
 
-    /// Sends `request` and waits for the primitive to end.
-    async fn send_recv_async(&mut self, request: Vec<u8>, mut progress: Progress) -> Sent {
+    /// Sends `request` and waits for the primitive to end; `logged` when its entry is written,
+    /// which alone takes a reading of the VCI's clock at the agent's deadline.
+    async fn send_recv_async(
+        &mut self,
+        request: Vec<u8>,
+        mut progress: Progress,
+        logged: bool,
+    ) -> Sent {
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -698,8 +704,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         let agent_deadline = waited.is_err() && progress.rx_timeout.is_none();
         // Design 8.11 "Settlement": the VCI's clock when the agent stopped waiting shows how far
         // the VCI's own limits had run. It is read after the deadline, so it costs one more
-        // unary call's budget at most.
-        let deadline_reading = if agent_deadline {
+        // unary call's budget at most, so only an exchange whose entry is written takes it.
+        let deadline_reading = if agent_deadline && logged {
             self.read_clock().await
         } else {
             None

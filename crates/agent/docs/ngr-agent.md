@@ -512,9 +512,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   a VCI time on the same clock and epoch (ADR-361): a response start and the receive timeout
   both ways, a response end only as proof the response was on time, and on a link whose VCI
   absorbs pendings past P2 as `possible_pending` up to the bound from the transmit (P2 plus the
-  completion limit). A receive timeout early or late is `system`, also where a response had
-  begun; a final response whose start is late is `system`; a suppressed request's silence with
-  a timeout at P2 and no hidden cause is `none`. Without a transmit time on the same clock the
+  completion limit), narrowed by any pending the worker still passes on there (ADR-362). A
+  receive timeout after a response may have begun is the transport's and is not judged; one
+  early or late otherwise is `system`; a final response whose start is late is `system`; a
+  suppressed request's silence with a timeout at P2, a confirmed send and no hidden cause is
+  `none`. Without a transmit time on the same clock the
   timing is `not_judged`, with the reason, so on a link whose VCI absorbs pendings a response
   with no pending seen is `undetermined` (a pending may have come first), while one after a
   pending seen takes its own row;

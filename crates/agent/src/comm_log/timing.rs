@@ -12,13 +12,14 @@ use super::clocks::Placed;
 use super::exchange::{Clock, MeasuredBy, NotJudgedReason, Timing, Window};
 
 /// The limits of a link, as `link_opened` records them, and its timing margin, in
-/// microseconds. A completion limit of 0 is none (`link::LinkConfig::validate`).
+/// microseconds, and whether its start-of-message indications are on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub p2_us: u64,
     pub p2_star_us: u64,
     pub completion_us: Option<u64>,
     pub margin_us: u64,
+    pub start_indications: bool,
 }
 
 /// A time placed on its clock.
@@ -34,6 +35,9 @@ pub(crate) struct Times<'a> {
     pub end: At,
     /// The VCI's receive timeout, when it ended the exchange.
     pub timeout: At,
+    /// The ECU may have begun a response: a start of its response was seen, or a start no
+    /// exchange could own, or the link has no start-of-message indications to show one.
+    pub response_may_have_begun: bool,
 }
 
 /// What the times show against the limits, on a link that forwards pendings (`absorbing`
@@ -66,27 +70,26 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
     }
     let margin = to_i64(limits.margin_us);
     let p2 = to_i64(limits.p2_us);
-    // The limit in force, in microseconds from the transmit: P2 until a pending, then the
-    // earlier of P2* from the latest and the completion limit from the first. `None` when a
-    // pending seen is not on the transmit's clock and epoch.
-    let limit = if absorbing || times.pendings.is_empty() {
-        Some(p2)
-    } else {
-        let placed: Option<Vec<i64>> = times.pendings.iter().map(|at| since(*at)).collect();
-        placed.map(|pendings| {
-            let latest = pendings.last().copied().unwrap_or_default() + to_i64(limits.p2_star_us);
-            match limits.completion_us {
-                Some(completion) => latest.min(pendings[0] + to_i64(completion)),
-                None => latest,
-            }
-        })
+    let p2_star = to_i64(limits.p2_star_us);
+    let completion = limits.completion_us.map(to_i64);
+    let not_judged = |timing: &mut Timing, reason: NotJudgedReason| {
+        timing.window = Window::NotJudged;
+        timing.not_judged_reason = Some(reason);
+        timing.window_by_ms = None;
     };
-    // On a link whose VCI absorbs pendings, the latest an unseen chain can end: a first pending
-    // within P2 and the completion limit from it. None without a completion limit.
-    let bound = limits
-        .completion_us
-        .map(|completion| p2 + to_i64(completion));
-    let within = if times.pendings.is_empty() {
+    // The pendings seen, in microseconds from the transmit; `None` when one is not on the
+    // transmit's clock and epoch, which leaves the limit after it unknown.
+    let Some(pendings) = times
+        .pendings
+        .iter()
+        .map(|at| since(*at))
+        .collect::<Option<Vec<i64>>>()
+    else {
+        not_judged(&mut timing, NotJudgedReason::OtherClock);
+        return timing;
+    };
+    let limits = limit_in_force(p2, p2_star, completion, &pendings, absorbing);
+    let within = if pendings.is_empty() {
         Window::WithinP2
     } else {
         Window::WithinP2Star
@@ -96,56 +99,108 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
         timing.window_by_ms = by_us.map(ms);
         timing.not_judged_reason = None;
     };
-    let not_judged = |timing: &mut Timing, reason: NotJudgedReason| {
-        timing.window = Window::NotJudged;
-        timing.not_judged_reason = Some(reason);
-    };
-    let Some(limit) = limit else {
-        not_judged(&mut timing, NotJudgedReason::OtherClock);
+    let start = since(times.start);
+    let end = since(times.end);
+    let timeout = since(times.timeout);
+    if [start, end, timeout].into_iter().flatten().any(|us| us < 0) {
+        not_judged(&mut timing, NotJudgedReason::BeforeTransmit);
         return timing;
-    };
-    if let Some(timeout) = since(times.timeout) {
-        if timeout < limit - margin {
-            set(&mut timing, Window::TimeoutEarly, Some(limit - timeout));
-        } else if timeout <= limit + margin {
+    }
+    // A receive timeout after a response began is the transport's consecutive-frame timer,
+    // not the limit in force, so it is judged only when no response may have begun.
+    let timeout = timeout.filter(|_| !times.response_may_have_begun);
+    if let Some(timeout) = timeout {
+        if timeout < limits.earliest - margin {
+            set(
+                &mut timing,
+                Window::TimeoutEarly,
+                Some(limits.earliest - timeout),
+            );
+        } else if (timeout - limits.expected).abs() <= margin {
             set(&mut timing, Window::TimeoutAtLimit, None);
-        } else if !absorbing {
-            set(&mut timing, Window::TimeoutLate, Some(timeout - limit));
+        } else if let Some(latest) = limits.latest
+            && timeout > latest + margin
+        {
+            set(&mut timing, Window::TimeoutLate, Some(timeout - latest));
         } else {
-            match bound {
-                Some(bound) if timeout > bound + margin => {
-                    set(&mut timing, Window::TimeoutLate, Some(timeout - bound))
-                }
-                _ => set(&mut timing, Window::PossiblePending, None),
-            }
+            set(&mut timing, Window::PossiblePending, None);
         }
-    } else if let Some(start) = since(times.start) {
-        if start <= limit + margin {
+    } else if let Some(start) = start {
+        if start <= limits.expected + margin {
             set(&mut timing, within, None);
-        } else if !absorbing {
-            set(&mut timing, Window::Late, Some(start - limit));
+        } else if let Some(latest) = limits.latest
+            && start > latest + margin
+        {
+            set(&mut timing, Window::Late, Some(start - latest));
         } else {
-            match bound {
-                Some(bound) if start > bound + margin => {
-                    set(&mut timing, Window::Late, Some(start - bound))
-                }
-                _ => set(&mut timing, Window::PossiblePending, None),
-            }
+            set(&mut timing, Window::PossiblePending, None);
         }
-    } else if let Some(end) = since(times.end) {
+    } else if let Some(end) = end {
         // An end within the limit proves the response on time; one past it proves nothing,
         // since the end includes the response's own transfer.
-        if end <= limit + margin {
+        if end <= limits.expected + margin {
             set(&mut timing, within, None);
         } else {
             not_judged(&mut timing, NotJudgedReason::EndAfterLimit);
         }
+    } else if times.timeout.is_some() && times.response_may_have_begun {
+        not_judged(&mut timing, NotJudgedReason::ResponseBegun);
     } else if times.start.is_some() || times.end.is_some() || times.timeout.is_some() {
         not_judged(&mut timing, NotJudgedReason::OtherClock);
     } else {
         not_judged(&mut timing, NotJudgedReason::NoTimeToJudge);
     }
     timing
+}
+
+/// The limit in force, in microseconds from the transmit (design 8.11 "Limit in force").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct InForce {
+    /// The limit the pendings seen give: P2 until a pending, then the earlier of P2* from the
+    /// latest and the completion limit from the first.
+    expected: i64,
+    /// The earliest the limit can be, whatever pendings the VCI absorbed unseen.
+    earliest: i64,
+    /// The latest it can be; `None` when nothing bounds it (no completion limit, on a link
+    /// whose VCI absorbs pendings).
+    latest: Option<i64>,
+}
+
+fn limit_in_force(
+    p2: i64,
+    p2_star: i64,
+    completion: Option<i64>,
+    pendings: &[i64],
+    absorbing: bool,
+) -> InForce {
+    let after = |first: i64, latest: i64| {
+        let star = latest + p2_star;
+        completion.map_or(star, |completion| star.min(first + completion))
+    };
+    let expected = match (pendings.first(), pendings.last()) {
+        (Some(first), Some(latest)) => after(*first, *latest),
+        _ => p2,
+    };
+    if !absorbing {
+        return InForce {
+            expected,
+            earliest: expected,
+            latest: Some(expected),
+        };
+    }
+    // Unseen pendings: the first, seen or not, came at or after the transmit and within P2,
+    // and the latest at or after the latest seen; the completion limit runs from the first.
+    let earliest = match pendings.last() {
+        // An unseen pending at the transmit gives the earliest end of a chain.
+        None => p2.min(after(0, 0)),
+        Some(latest) => after(0, *latest),
+    };
+    let latest = completion.map(|completion| pendings.first().copied().unwrap_or(p2) + completion);
+    InForce {
+        expected,
+        earliest: earliest.min(expected),
+        latest: latest.map(|latest| latest.max(expected)),
+    }
 }
 
 fn to_i64(us: u64) -> i64 {
@@ -171,6 +226,7 @@ mod tests {
         p2_star_us: 5_000_000,
         completion_us: Some(25_000_000),
         margin_us: 2_000,
+        start_indications: true,
     };
 
     /// A device time `us` microseconds after a transmit at 1 000 000, epoch 0.
@@ -337,6 +393,102 @@ mod tests {
         assert_eq!(
             judge(unbounded, true, timeout(99_000_000)).window,
             Window::PossiblePending
+        );
+    }
+
+    /// A receive timeout after the ECU may have begun a response is the transport's
+    /// consecutive-frame timer, not the limit in force: the start is judged instead, and with
+    /// no start on the clock nothing is.
+    #[test]
+    fn a_timeout_after_a_response_began_is_not_judged_against_p2() {
+        let begun = |start: At| Times {
+            transmit: transmit(),
+            start,
+            timeout: at(1_020_000),
+            response_may_have_begun: true,
+            ..Times::default()
+        };
+        assert_eq!(judged(false, begun(at(20_000))).0, Window::WithinP2);
+        assert_eq!(
+            judged(false, begun(None)),
+            (
+                Window::NotJudged,
+                None,
+                Some(NotJudgedReason::ResponseBegun)
+            )
+        );
+    }
+
+    /// On a link whose VCI absorbs pendings, a pending the worker still passed on restarts the
+    /// limit: a timeout at P2 after it is early, whatever unseen pendings there were.
+    #[test]
+    fn a_pending_seen_on_an_absorbing_link_counts() {
+        let pendings = [at(30_000)];
+        let timeout = |us| Times {
+            transmit: transmit(),
+            pendings: &pendings,
+            timeout: at(us),
+            ..Times::default()
+        };
+        assert_eq!(
+            judged(true, timeout(50_500)),
+            (Window::TimeoutEarly, Some(4_979.5), None)
+        );
+        assert_eq!(judged(true, timeout(5_030_000)).0, Window::TimeoutAtLimit);
+        // Past P2* from the seen pending, an unseen later one may have restarted it.
+        assert_eq!(judged(true, timeout(6_000_000)).0, Window::PossiblePending);
+        // Past the completion limit from the seen first: late on any history.
+        assert_eq!(
+            judged(true, timeout(25_033_000)),
+            (Window::TimeoutLate, Some(3.0), None)
+        );
+        let start = Times {
+            transmit: transmit(),
+            pendings: &pendings,
+            start: at(4_000_000),
+            ..Times::default()
+        };
+        assert_eq!(judged(true, start).0, Window::WithinP2Star);
+    }
+
+    /// With a completion limit below P2, an unseen pending can end the chain before P2, so
+    /// only a timeout before that is early on an absorbing link.
+    #[test]
+    fn the_earliest_limit_on_an_absorbing_link_is_the_shortest() {
+        let short = Limits {
+            completion_us: Some(5_000),
+            ..LIMITS
+        };
+        let timeout = |us| Times {
+            transmit: transmit(),
+            timeout: at(us),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(short, true, timeout(15_000)).window,
+            Window::PossiblePending
+        );
+        assert_eq!(
+            judge(short, true, timeout(2_000)).window,
+            Window::TimeoutEarly
+        );
+    }
+
+    #[test]
+    fn a_time_before_the_transmit_is_not_judged() {
+        let before = Times {
+            transmit: transmit(),
+            start: at(-500),
+            end: at(3_000),
+            ..Times::default()
+        };
+        assert_eq!(
+            judged(false, before),
+            (
+                Window::NotJudged,
+                None,
+                Some(NotJudgedReason::BeforeTransmit)
+            )
         );
     }
 

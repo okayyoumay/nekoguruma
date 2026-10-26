@@ -1341,6 +1341,12 @@ impl CommLog {
                 .zip(&pending_placed)
                 .map(|(pending, placed)| pending.clock.zip(*placed))
                 .collect();
+            let rx_id = evidence.rx_id;
+            let response_may_have_begun = evidence.response_started
+                || !limits.start_indications
+                || unbound
+                    .iter()
+                    .any(|item| item.is_start_indication_for(rx_id));
             evidence.timing = timing::judge(
                 *limits,
                 evidence.absorbing(),
@@ -1350,6 +1356,7 @@ impl CommLog {
                     start: vci.rx_start.and_then(|time| time.placed()),
                     end: vci.rx_end.and_then(|time| time.placed()),
                     timeout: vci.rx_timeout.and_then(|time| time.placed()),
+                    response_may_have_begun,
                 },
             );
         }
@@ -1458,6 +1465,7 @@ impl CommLog {
             completion_us: (config.rc78_completion_ms != 0)
                 .then(|| u64::from(config.rc78_completion_ms) * 1000),
             margin_us: u64::from(inner.margins.timing_margin().0),
+            start_indications: indications.start_of_message,
         };
         inner.limits.retain(|(of, _)| *of != link);
         inner.limits.push((link, limits));
@@ -3468,8 +3476,8 @@ mod tests {
             });
             evidence
         };
-        // 100 ms early, where the ECU had begun a response (first, while no earlier request
-        // is owed that could own the start).
+        // A receive timeout where the ECU had begun a response (first, while no earlier
+        // request is owed that could own the start).
         let start = UnattachedItem {
             vci_us: 10_700,
             read: Some(AgentNow {
@@ -3490,9 +3498,16 @@ mod tests {
             .iter()
             .filter(|line| line["event"] == "exchange")
             .collect();
+        // The timeout after the response began is the transport's, not judged against P2: the
+        // start is judged instead, within P2.
         let begun = exchanges[0];
         assert_eq!(begun["outcome"]["result"], "response_incomplete", "{begun}");
-        assert_eq!(begun["classification"], "system", "{begun}");
+        assert_eq!(begun["timing"]["window"], "within_p2", "{begun}");
+        assert_eq!(
+            begun["timing"]["measured_by"], "vci_tx_done_to_rx_start",
+            "{begun}"
+        );
+        assert_eq!(begun["classification"], "undetermined", "{begun}");
         let at_limit = exchanges[1];
         assert_eq!(
             at_limit["timing"]["window"], "timeout_at_limit",

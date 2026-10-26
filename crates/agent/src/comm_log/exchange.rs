@@ -236,6 +236,11 @@ pub(crate) enum NotJudgedReason {
     EndAfterLimit,
     /// No response start, end or receive timeout has a VCI time.
     NoTimeToJudge,
+    /// A time to judge lies before the transmit done.
+    BeforeTransmit,
+    /// The receive timeout came after the ECU may have begun a response, so it is the
+    /// transport's consecutive-frame timer, not the limit in force.
+    ResponseBegun,
 }
 
 /// The entry's timing group (design 8.11, `timing`).
@@ -1835,23 +1840,6 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         End::LinkError(kind) => kind.judge(),
-        // A receive timeout judged early or late. It is the VCI's own fault whatever else
-        // happened, so it also wins over a response that did not complete (design 8.11: the
-        // most severe row wins).
-        End::NoResponse | End::ResponseIncomplete if window == Window::TimeoutEarly => (
-            System,
-            format!(
-                "The VCI gave up waiting before the limit in force, by {} ms.",
-                by_ms(&evidence.timing)
-            ),
-        ),
-        End::NoResponse | End::ResponseIncomplete if window == Window::TimeoutLate => (
-            System,
-            format!(
-                "The VCI ended its wait after the limit in force, by {} ms: its own timer did not fire in time.",
-                by_ms(&evidence.timing)
-            ),
-        ),
         // A response start alone does not exclude H2 (ADR-354); a pending bound to the
         // exchange or a matched answer does (`open_readings`).
         End::ResponseIncomplete if !evidence.bound_answer() && history.answered_same_match == 0 => {
@@ -1868,6 +1856,22 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart (the transport is not logged).",
             ),
         ),
+        // A receive timeout judged early or late (a timeout after a response began is the
+        // transport's, and is not judged).
+        End::NoResponse if window == Window::TimeoutEarly => (
+            System,
+            format!(
+                "The VCI gave up waiting before the limit in force, by {} ms.",
+                by_ms(&evidence.timing)
+            ),
+        ),
+        End::NoResponse if window == Window::TimeoutLate => (
+            System,
+            format!(
+                "The VCI ended its wait after the limit in force, by {} ms: its own timer did not fire in time.",
+                by_ms(&evidence.timing)
+            ),
+        ),
         // A missing response has no row for a window `late`, which only a response gives.
         End::NoResponse if late => last_row(),
         End::NoResponse if suppressed && !this_exchange && !answers_listed => {
@@ -1875,13 +1879,23 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             if absorbing && !matches!(window, Window::TimeoutAtLimit | Window::WithinP2) {
                 hidden.push("a pending the VCI absorbed may have obliged an answer (H4)");
             }
-            if hidden.is_empty() {
-                // Sent, matched as earlier answers were, no link error, and a receive timeout at
-                // P2 on one clock or a link that would have shown a pending.
+            // The VCI's own timeout at P2 on one clock, or on a link that would have shown a
+            // pending, whose worker times P2 itself.
+            let timed_out_at_p2 =
+                window == Window::TimeoutAtLimit || (!absorbing && evidence.vci_ended);
+            if hidden.is_empty() && sent == Sent::Confirmed && timed_out_at_p2 {
+                // Sent, matched as earlier answers were, no link error, no pending hidden.
                 (
                     NoFault,
                     to_owned(
                         "No response was expected, and none came: the request was sent, the ECU has answered requests matched this way, no link error came and no pending was hidden.",
+                    ),
+                )
+            } else if hidden.is_empty() {
+                (
+                    Undetermined,
+                    to_owned(
+                        "No response was expected and none came, and no hidden cause (H1 to H4) is open, but the VCI's receive timeout at P2 is not shown, so nothing shows the wait ran its course.",
                     ),
                 )
             } else {
@@ -2747,9 +2761,9 @@ mod tests {
         let (class, reason) = verdict_of(&refused);
         assert_eq!(class, Classification::System);
         assert!(reason.contains("conditionsNotCorrect"), "{reason}");
-        // A receive timeout early or late, also where a response had begun: the most severe
-        // row wins over `response_incomplete`.
-        for end in [End::NoResponse, End::ResponseIncomplete] {
+        // A receive timeout early or late. Where a response had begun, the timeout is the
+        // transport's and `timing` does not judge it, so only `no_response` has these rows.
+        for end in [End::NoResponse] {
             for (window, phrase) in [
                 (Window::TimeoutEarly, "gave up waiting before"),
                 (Window::TimeoutLate, "after the limit in force"),

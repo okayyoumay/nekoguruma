@@ -671,6 +671,52 @@ fn negative_code(response: &[u8]) -> Option<u8> {
     }
 }
 
+/// A result bound to the exchange's primitive that the host did not take as its answer (design
+/// 8.11 `rejected`, ADR-359), raw; the entry carries its bytes through [`redact`]. It counts for
+/// neither the classification nor `link_history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rejected {
+    pub rx_id: u32,
+    pub bytes: Vec<u8>,
+    pub vci_us: Option<u64>,
+    pub clock: Option<Clock>,
+    pub agent_us: u64,
+    pub reason: RejectedReason,
+}
+
+/// Why a result bound to the primitive was not the exchange's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RejectedReason {
+    /// A response that is not negative and does not begin as the request's positive response
+    /// does (its SID or its echo).
+    WrongEcho,
+    /// A negative response that is not a complete negative response to the request's SID.
+    PatternMismatch,
+}
+
+/// A [`Rejected`] result as the entry gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct RejectedItem {
+    pub rx_id: u32,
+    pub response: LoggedMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vci_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<Clock>,
+    pub agent_us: u64,
+    pub reason: RejectedReason,
+}
+
+/// The worker's report that the link's events were lost during the exchange (design 8.11
+/// `events_lost`, ADR-359): when the host read it and how many such notifications it read. The
+/// host stops waiting at the first, so it gives one; the exchange's outcome is `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct EventsLost {
+    pub agent_us: u64,
+    pub notifications: u32,
+}
+
 /// One answer of a request that collects every answer, or the further answers of one meant for
 /// one ECU (design 8.11, `answers`). No producer gives them yet; the answers rows are not
 /// implemented, so an entry that has one is classified by the last row.
@@ -909,6 +955,10 @@ pub(crate) struct Evidence {
     /// Link errors on other links of the same physical channel: evidence only (H3).
     pub channel_link_errors: Vec<LinkErrorKind>,
     pub answers: Vec<AnswerItem>,
+    /// The results bound to the primitive that it did not take as its answer.
+    pub rejected: Vec<Rejected>,
+    /// The worker's report of lost events, when it ended the exchange.
+    pub events_lost: Option<EventsLost>,
     pub supply_voltage: Option<SupplyVoltage>,
     pub detail: Detail,
 }
@@ -958,6 +1008,8 @@ impl Evidence {
             link_errors_before_answer: false,
             channel_link_errors: Vec::new(),
             answers: Vec::new(),
+            rejected: Vec::new(),
+            events_lost: None,
             supply_voltage: None,
             detail: Detail::default(),
         }
@@ -1319,6 +1371,10 @@ pub(crate) struct ExchangeEntry {
     pub outcome: Outcome,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<AnswerItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_lost: Option<EventsLost>,
     pub pending: Vec<Pending>,
     pub pending_visibility: PendingVisibility,
     pub timing: Timing,
@@ -1392,6 +1448,19 @@ impl ExchangeEntry {
             caused_by: evidence.caused_by,
             outcome: Outcome::of(&evidence.end),
             answers: evidence.answers,
+            rejected: evidence
+                .rejected
+                .into_iter()
+                .map(|rejected| RejectedItem {
+                    rx_id: rejected.rx_id,
+                    response: redact(Direction::Response, &rejected.bytes),
+                    vci_us: rejected.vci_us,
+                    clock: rejected.clock,
+                    agent_us: rejected.agent_us,
+                    reason: rejected.reason,
+                })
+                .collect(),
+            events_lost: evidence.events_lost,
             pending: evidence.pending,
             pending_visibility: evidence.pending_visibility,
             timing: evidence.timing,

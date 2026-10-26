@@ -1530,6 +1530,27 @@ fn drop_response_fault_keeps_the_state_change() {
 }
 
 #[test]
+fn truncate_response_fault_cuts_the_next_positive_response() {
+    let mut ecu = ecu();
+    ecu.inject(Fault::TruncateResponse { len: 2 });
+    // A refusal is no positive response, so the fault stays armed.
+    assert!(matches!(
+        ecu.request(&[0x22, 0x00, 0x00]),
+        SimResponse::Negative { .. }
+    ));
+    assert_eq!(ecu.request(&[0x22, 0xF1, 0x86]), pos(&[0x62, 0xF1]));
+    // The request is handled as usual: a session change takes effect, only its response cut.
+    ecu.inject(Fault::TruncateResponse { len: 1 });
+    assert_eq!(ecu.request(&[0x10, 0x03]), pos(&[0x50]));
+    assert_eq!(ecu.session, Session::Extended);
+    assert!(ecu.armed_faults().is_empty());
+    assert_eq!(
+        ecu.request(&[0x22, 0xF1, 0x86]),
+        pos(&[0x62, 0xF1, 0x86, 0x03])
+    );
+}
+
+#[test]
 fn drop_response_fault_on_a_block_lets_the_client_repeat_it() {
     let mut ecu = ready_to_download();
     ecu.request(&request_download(0, 4));

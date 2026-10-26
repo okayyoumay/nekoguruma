@@ -875,6 +875,17 @@ impl SimEcu {
             Some(response) => response,
             None => self.respond(addressing, message),
         };
+        let response = match response {
+            SimResponse::Positive(mut bytes) => {
+                if let Some(Fault::TruncateResponse { len }) =
+                    self.take_armed(|f| matches!(f, Fault::TruncateResponse { .. }))
+                {
+                    bytes.truncate(len);
+                }
+                SimResponse::Positive(bytes)
+            }
+            other => other,
+        };
         let dropped = self
             .take_armed(|f| matches!(f, Fault::DropResponse))
             .is_some();
@@ -1075,4 +1086,8 @@ pub enum Fault {
     /// ECU does not dispatch it, so no state changes. The refusal is sent whatever the
     /// addressing and the request's suppress bit.
     NegativeResponse { nrc: Nrc },
+    /// The next positive response the ECU sends is cut to its first `len` bytes, as a response
+    /// that does not answer its request (ADR-359): the request is handled as usual. A request
+    /// with no positive response leaves the fault armed.
+    TruncateResponse { len: usize },
 }

@@ -713,6 +713,21 @@ fn assert_comm_log(setup: &CommLogSetup) {
         "{vin}"
     );
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
+    // Its VCI times, each with its own clock (design 8.11 `times`, ADR-353): the transmit
+    // indication and the response's end are frames, on the device clock.
+    let vci = &vin["times"]["vci"];
+    for time in ["tx_done", "rx_end"] {
+        assert_eq!(vci[time]["clock"], "device", "{vin}");
+        assert_eq!(vci[time]["epoch"], 0, "{vin}");
+    }
+    let tx_done = vci["tx_done"]["us"].as_u64().expect("a transmit done");
+    assert!(vci["rx_end"]["us"].as_u64().unwrap() >= tx_done, "{vin}");
+    // The first pending's interval runs from that transmit done.
+    let first = pending[0]["vci_us"].as_u64().unwrap() - tx_done;
+    assert!(
+        (pending[0]["since_previous_ms"].as_f64().unwrap() - first as f64 / 1000.0).abs() < 1e-9,
+        "{vin}"
+    );
 
     // The ECU's negative response, with its code named.
     assert_eq!(unknown["outcome"]["result"], "negative", "{unknown}");
@@ -749,6 +764,13 @@ fn assert_comm_log(setup: &CommLogSetup) {
         "{reason}"
     );
     assert_eq!(dropped["link_history"]["answered"], 2, "{dropped}");
+    // The transmit indication is a frame, on the device clock; the receive timeout is the J2534
+    // worker's own event, on its clock (design 8.11 "On one clock").
+    let vci = &dropped["times"]["vci"];
+    assert_eq!(vci["tx_done"]["clock"], "device", "{dropped}");
+    assert_eq!(vci["error"]["clock"], "worker", "{dropped}");
+    assert!(vci["error"]["us"].is_u64(), "{dropped}");
+    assert!(vci.get("rx_end").is_none(), "{dropped}");
 
     assert_eq!(lines.last().expect("a line")["event"], "job_end", "{text}");
 }

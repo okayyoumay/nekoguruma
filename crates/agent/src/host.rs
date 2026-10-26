@@ -548,6 +548,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let sent = handle.block_on(self.send_recv_async(request, progress));
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
+            let end = deadline_end(end, sent.agent_deadline);
             let link_errors = events_seen(&sent, &mut detail);
             let unbound = unattached_items(&sent.unbound);
             let before_answer = errors_before_answer(&sent);
@@ -613,6 +614,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     vci_lost: None,
                     unbound: Vec::new(),
                     pendings: Vec::new(),
+                    agent_deadline: false,
                 };
             }
         };
@@ -646,8 +648,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
             }
         };
-        let result = tokio::time::timeout_at(deadline, wait)
-            .await
+        let waited = tokio::time::timeout_at(deadline, wait).await;
+        let agent_deadline = waited.is_err();
+        let result = waited
             .map_err(|_| HostError::NoResponse)
             .and_then(|outcome| outcome);
         Sent {
@@ -659,6 +662,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             vci_lost: progress.vci_lost.take(),
             unbound: std::mem::take(&mut progress.unbound),
             pendings: std::mem::take(&mut progress.pendings),
+            agent_deadline,
         }
     }
 
@@ -757,6 +761,16 @@ impl<C: WorkerApi> WorkerHost<C> {
         self.log(request, before, end, detail, Vec::new(), |evidence| {
             evidence.caused_by = caused_by;
         });
+    }
+}
+
+/// The end an exchange's entry gives when the agent's own deadline (`agent_deadline`) ended the
+/// wait: not the VCI's receive timeout, so the limit in force may not have run out and the VCI
+/// did not end the exchange (design 8.11 `vci_did_not_end`).
+fn deadline_end(end: End, agent_deadline: bool) -> End {
+    match end {
+        End::NoResponse if agent_deadline => End::VciDidNotEnd,
+        end => end,
     }
 }
 
@@ -871,6 +885,9 @@ struct Sent {
     unbound: Vec<Unbound>,
     /// The response pendings the worker passed on, bound to the primitive, in order.
     pendings: Vec<PendingRead>,
+    /// The agent's own deadline ended the wait, not the worker: the VCI had not ended the
+    /// exchange (design 8.11 `vci_did_not_end`).
+    agent_deadline: bool,
 }
 
 /// A response pending (0x78) bound to the primitive (design 8.11 `pending`): its VCI time and
@@ -1927,6 +1944,7 @@ mod tests {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            agent_deadline: false,
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
@@ -2009,6 +2027,7 @@ mod tests {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            agent_deadline: false,
         };
         let given = |sent: Sent| {
             let (_, mut detail) =
@@ -2529,6 +2548,24 @@ mod tests {
         assert_eq!(got.unwrap().unwrap(), [0x62, 0xF1, 0x90]);
     }
 
+    /// Design 8.11 `vci_did_not_end`: the agent's own deadline ending the wait is no response
+    /// within the VCI's limit; a receive timeout the worker reported is.
+    #[test]
+    fn the_agent_s_deadline_is_vci_did_not_end() {
+        assert!(matches!(
+            deadline_end(End::NoResponse, true),
+            End::VciDidNotEnd
+        ));
+        assert!(matches!(
+            deadline_end(End::NoResponse, false),
+            End::NoResponse
+        ));
+        assert!(matches!(
+            deadline_end(End::Positive(vec![0x62]), true),
+            End::Positive(_)
+        ));
+    }
+
     /// ADR-355: only a link the worker said forwards every pending is `forwarded`.
     #[test]
     fn only_a_link_said_to_forward_every_pending_is_forwarded() {
@@ -2618,6 +2655,7 @@ mod tests {
                 vci_lost: None,
                 unbound: Vec::new(),
                 pendings: Vec::new(),
+                agent_deadline: false,
             }
         };
         let before = sent_of(vec![fault(), answer(), finished()]);

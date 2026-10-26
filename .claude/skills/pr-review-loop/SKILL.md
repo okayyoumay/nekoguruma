@@ -257,6 +257,11 @@ finding already fixed as "Fix the kind, not the spot" says:
 - **Siblings.** A rule, check or fix applied to one case covers every case built the same way:
   the other rows of a table, the other kinds of entry or item, the other callers of a function,
   the other workers and targets, the other branch of a condition.
+- **Worker answers.** Code that branches on a worker's failed RPC (in the agent or in
+  `ngr-hw-checks`) reads it as `docs/rpc-api-guide.md` "Reading a Worker's Answer" does, in that
+  table's order: by the `ErrorDetail` and the status code classes, not by which worker answered.
+  In particular, an `INTERNAL` from a D-PDU worker is the library's answer, not a failed
+  connection.
 - **Restart binding.** What a journaled marker binds to at a restart (the instruction, the
   request bytes, the target, the identity read) is the same in the code that writes it, the code
   that reads it and the documents that describe it.

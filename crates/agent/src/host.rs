@@ -635,6 +635,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let end = deadline_end(end, sent.agent_deadline);
+            let end = unanswered_end(end, &sent);
             let (link_errors, error_at) = events_seen(&sent, &mut detail);
             // A response's times only for an exchange that ended with that response: one read
             // before the agent's deadline, lost events or a lost VCI ended the wait is not the
@@ -966,6 +967,23 @@ fn deadline_end(end: End, agent_deadline: bool) -> End {
     match end {
         End::NoResponse if agent_deadline => End::VciDidNotEnd,
         end => end,
+    }
+}
+
+/// The end an exchange's entry gives when its primitive ended with no answer and its last
+/// result was a rejected one of positive form (ADR-359): the response the worker took but the
+/// agent cannot use, `positive_unusable` (design 8.11 `outcome`). An exchange the agent's
+/// deadline or the VCI's receive timeout ended keeps its end.
+fn unanswered_end(end: End, sent: &Sent) -> End {
+    match (end, sent.rejected.last()) {
+        (End::NoResponse, Some(last))
+            if sent.rx_timeout.is_none()
+                && !sent.agent_deadline
+                && last.reason == RejectedReason::WrongEcho =>
+        {
+            End::PositiveUnusable(last.bytes.clone())
+        }
+        (end, _) => end,
     }
 }
 
@@ -3028,6 +3046,46 @@ mod tests {
             "{end:?}"
         );
         assert_eq!(detail.host_error, Some("LinkHeld"));
+    }
+
+    /// ADR-359: a primitive that ended with no answer after a rejected result of positive form
+    /// ends as that response, `positive_unusable`; a negative one, or an end the agent's
+    /// deadline or the VCI's receive timeout gave, keeps its end.
+    #[test]
+    fn a_primitive_ended_on_a_rejected_positive_result_is_positive_unusable() {
+        let rejected = |reason| RejectedRead {
+            identifier: None,
+            bytes: vec![0x62, 0xF1],
+            vci_us: 0,
+            clock: None,
+            reason,
+            read: None,
+        };
+        let sent = |reason, agent_deadline| Sent {
+            rejected: vec![rejected(reason)],
+            agent_deadline,
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &sent(RejectedReason::WrongEcho, false)),
+            End::PositiveUnusable(bytes) if bytes == [0x62, 0xF1]
+        ));
+        assert!(matches!(
+            unanswered_end(
+                End::NoResponse,
+                &sent(RejectedReason::PatternMismatch, false)
+            ),
+            End::NoResponse
+        ));
+        assert!(matches!(
+            unanswered_end(End::VciDidNotEnd, &sent(RejectedReason::WrongEcho, true)),
+            End::VciDidNotEnd
+        ));
+        let none = Sent::not_started(Err(HostError::NoResponse));
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &none),
+            End::NoResponse
+        ));
     }
 
     /// ADR-359: a result of the primitive that does not answer the request is rejected, with its

@@ -36,8 +36,17 @@ The maintainer decided where the entry records both, and what it says of lost ev
 2. **Indications are not results of the ECU.** A result whose RxFlag marks a transmit or
    start-of-message indication, a transmitted message or a break is not listed (ISO 22900-2:2022
    D.2.2).
-3. **A rejected result counts for nothing else.** It counts for neither the classification nor
-   `link_history`'s `answered`. It is evidence for a reader, not an answer of the ECU's.
+3. **A rejected result counts for nothing else, except as the outcome of an exchange it ended.**
+   It counts for neither the classification nor `link_history`'s `answered`; it is evidence for a
+   reader, not an answer of the ECU's.
+
+   There is one exception. Sometimes the primitive ends with no answer and its last result was a
+   rejected one of positive form (`wrong_echo`): the worker took that response as the
+   primitive's end. The entry's outcome is then that response, `positive_unusable`, which design
+   8.11's `outcome` row names for a wrong echo or a response too short, and it is classified by
+   that row (`undetermined`). The maintainer chose this over keeping `no_response`, which
+   contradicted the listed response. The job still gets no answer. The exception does not apply
+   when the agent's deadline or the VCI's receive timeout ended the exchange.
 4. **The exchange entry gains `events_lost`.** When the worker reports lost events, it records
    the agent time the host read the report and how many such reports it read. The host stops
    waiting at the first report, so there is one. `LostEventItemNotification` carries no count,
@@ -53,5 +62,6 @@ The maintainer decided where the entry records both, and what it says of lost ev
 - A read the ECU answered wrongly is no longer logged as silence alone: its entry shows what came.
 - The entry lists rejected results only. The `answers` list, for a request that collects every
   answer, keeps its own meaning.
-- A rejected result does not change how the exchange is classified. Whether one should, for
-  example as evidence that the request reached the ECU, is left open.
+- A rejected result changes the exchange's classification only when it is the end the worker
+  gave (item 3). Whether an earlier one should count, for example as evidence that the request
+  reached the ECU, is left open.

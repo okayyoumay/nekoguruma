@@ -60,6 +60,21 @@ pub const IR_SCHEMA_VERSION: u32 = 20;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
+
+/// UDS's read-only services (ADR-235 item 8, ADR-309 item 4): ReadDTCInformation and
+/// ReadDataByIdentifier, which change nothing on the ECU. TesterPresent is left out: it keeps
+/// the ECU's current session alive, which a job may only do once it owns that session.
+pub const UDS_READ_ONLY_SERVICES: &[u8] = &[0x19, 0x22];
+
+/// The service identifiers a read-only job may send on the application layer a protocol names
+/// (`Protocol::application_layer`), or `None` for a layer without a list (ADR-327 item 1: a
+/// variant pattern, a VIN source or a matching rule may name only these).
+pub fn read_only_services(layer: &str) -> Option<&'static [u8]> {
+    match layer {
+        "UDS" => Some(UDS_READ_ONLY_SERVICES),
+        _ => None,
+    }
+}
 /// The longest detail of a `Fail`, in bytes of text, that a caller keeps (ADR-280).
 pub const MAX_FAILURE_DETAIL_LEN: usize = 1024;
 /// The longest byte string `Concat` builds: the bound of an encoded request

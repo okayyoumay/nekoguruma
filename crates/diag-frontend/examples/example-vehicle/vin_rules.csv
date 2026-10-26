@@ -1,0 +1,2 @@
+component,value,start,end,expected,definition,variant,service,field,note
+oem,Nekoguruma Motors,1,3,NGR,exampleEcu,exampleEcuV1,vin.read,vin,The world manufacturer identifier

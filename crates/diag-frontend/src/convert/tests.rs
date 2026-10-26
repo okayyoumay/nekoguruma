@@ -2124,3 +2124,27 @@ fn an_error_only_some_variants_give_names_them() {
         ]
     );
 }
+
+/// 4.15 and ADR-363: every document of the directory carries the definition's identifier, and
+/// none when the definition declares none.
+#[test]
+fn every_document_carries_the_definition_s_identifier() {
+    let converted = convert(example());
+    let ids: Vec<_> = documents(&converted)
+        .into_iter()
+        .map(|document| document.definition_id)
+        .collect();
+    assert!(!ids.is_empty());
+    assert!(
+        ids.iter().all(|id| id.as_deref() == Some("exampleEcu")),
+        "{ids:?}"
+    );
+    let mut files = example();
+    files.retain(|(name, _)| name != "definition.csv");
+    let without = documents(&convert(files));
+    assert!(
+        without
+            .iter()
+            .all(|document| document.definition_id.is_none())
+    );
+}

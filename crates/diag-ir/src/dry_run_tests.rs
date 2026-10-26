@@ -10,6 +10,7 @@ use crate::{IR_SCHEMA_VERSION, Op};
 fn document(services: Vec<ServiceT>, layouts: Vec<LayoutT>) -> Vec<u8> {
     encode_ecu_document(&EcuDocumentT {
         schema_version: IR_SCHEMA_VERSION,
+        definition_id: None,
         source_format: Some("csv-starlark".into()),
         source_digest: Some("00".into()),
         variant: Some(Box::new(EcuVariantT {
@@ -623,6 +624,7 @@ fn flash_document(segment: crate::declaration::FlashSegmentT) -> Vec<u8> {
     use crate::declaration::FlashSessionT;
     encode_ecu_document(&EcuDocumentT {
         schema_version: IR_SCHEMA_VERSION,
+        definition_id: None,
         source_format: Some("csv-starlark".into()),
         source_digest: Some("00".into()),
         variant: Some(Box::new(EcuVariantT {

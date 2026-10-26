@@ -7696,6 +7696,7 @@ impl<'a> EcuDocument<'a> {
   pub const VT_SOURCE_DIGEST: ::flatbuffers::VOffsetT = 8;
   pub const VT_VARIANT: ::flatbuffers::VOffsetT = 10;
   pub const VT_PROCEDURE: ::flatbuffers::VOffsetT = 12;
+  pub const VT_DEFINITION_ID: ::flatbuffers::VOffsetT = 14;
 
   #[inline]
   pub unsafe fn init_from_table(table: ::flatbuffers::Table<'a>) -> Self {
@@ -7707,6 +7708,7 @@ impl<'a> EcuDocument<'a> {
     args: &'args EcuDocumentArgs<'args>
   ) -> ::flatbuffers::WIPOffset<EcuDocument<'bldr>> {
     let mut builder = EcuDocumentBuilder::new(_fbb);
+    if let Some(x) = args.definition_id { builder.add_definition_id(x); }
     if let Some(x) = args.procedure { builder.add_procedure(x); }
     if let Some(x) = args.variant { builder.add_variant(x); }
     if let Some(x) = args.source_digest { builder.add_source_digest(x); }
@@ -7729,12 +7731,16 @@ impl<'a> EcuDocument<'a> {
     let procedure = self.procedure().map(|x| {
       x.into_iter().collect()
     });
+    let definition_id = self.definition_id().map(|x| {
+      alloc::string::ToString::to_string(x)
+    });
     EcuDocumentT {
       schema_version,
       source_format,
       source_digest,
       variant,
       procedure,
+      definition_id,
     }
   }
 
@@ -7773,6 +7779,13 @@ impl<'a> EcuDocument<'a> {
     // which contains a valid value in this slot
     unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'a, u8>>>(EcuDocument::VT_PROCEDURE, None)}
   }
+  #[inline]
+  pub fn definition_id(&self) -> Option<&'a str> {
+    // Safety:
+    // Created from valid Table for this object
+    // which contains a valid value in this slot
+    unsafe { self._tab.get::<::flatbuffers::ForwardsUOffset<&str>>(EcuDocument::VT_DEFINITION_ID, None)}
+  }
 }
 
 impl ::flatbuffers::Verifiable for EcuDocument<'_> {
@@ -7786,6 +7799,7 @@ impl ::flatbuffers::Verifiable for EcuDocument<'_> {
      .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("source_digest", Self::VT_SOURCE_DIGEST, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<EcuVariant>>("variant", Self::VT_VARIANT, false)?
      .visit_field::<::flatbuffers::ForwardsUOffset<::flatbuffers::Vector<'_, u8>>>("procedure", Self::VT_PROCEDURE, false)?
+     .visit_field::<::flatbuffers::ForwardsUOffset<&str>>("definition_id", Self::VT_DEFINITION_ID, false)?
      .finish();
     Ok(())
   }
@@ -7796,6 +7810,7 @@ pub struct EcuDocumentArgs<'a> {
     pub source_digest: Option<::flatbuffers::WIPOffset<&'a str>>,
     pub variant: Option<::flatbuffers::WIPOffset<EcuVariant<'a>>>,
     pub procedure: Option<::flatbuffers::WIPOffset<::flatbuffers::Vector<'a, u8>>>,
+    pub definition_id: Option<::flatbuffers::WIPOffset<&'a str>>,
 }
 impl<'a> Default for EcuDocumentArgs<'a> {
   #[inline]
@@ -7806,6 +7821,7 @@ impl<'a> Default for EcuDocumentArgs<'a> {
       source_digest: None,
       variant: None,
       procedure: None,
+      definition_id: None,
     }
   }
 }
@@ -7836,6 +7852,10 @@ impl<'a: 'b, 'b, A: ::flatbuffers::Allocator + 'a> EcuDocumentBuilder<'a, 'b, A>
     self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(EcuDocument::VT_PROCEDURE, procedure);
   }
   #[inline]
+  pub fn add_definition_id(&mut self, definition_id: ::flatbuffers::WIPOffset<&'b  str>) {
+    self.fbb_.push_slot_always::<::flatbuffers::WIPOffset<_>>(EcuDocument::VT_DEFINITION_ID, definition_id);
+  }
+  #[inline]
   pub fn new(_fbb: &'b mut ::flatbuffers::FlatBufferBuilder<'a, A>) -> EcuDocumentBuilder<'a, 'b, A> {
     let start = _fbb.start_table();
     EcuDocumentBuilder {
@@ -7858,6 +7878,7 @@ impl ::core::fmt::Debug for EcuDocument<'_> {
       ds.field("source_digest", &self.source_digest());
       ds.field("variant", &self.variant());
       ds.field("procedure", &self.procedure());
+      ds.field("definition_id", &self.definition_id());
       ds.finish()
   }
 }
@@ -7869,6 +7890,7 @@ pub struct EcuDocumentT {
   pub source_digest: Option<alloc::string::String>,
   pub variant: Option<alloc::boxed::Box<EcuVariantT>>,
   pub procedure: Option<alloc::vec::Vec<u8>>,
+  pub definition_id: Option<alloc::string::String>,
 }
 impl Default for EcuDocumentT {
   fn default() -> Self {
@@ -7878,6 +7900,7 @@ impl Default for EcuDocumentT {
       source_digest: None,
       variant: None,
       procedure: None,
+      definition_id: None,
     }
   }
 }
@@ -7899,12 +7922,16 @@ impl EcuDocumentT {
     let procedure = self.procedure.as_ref().map(|x|{
       _fbb.create_vector(x)
     });
+    let definition_id = self.definition_id.as_ref().map(|x|{
+      _fbb.create_string(x)
+    });
     EcuDocument::create(_fbb, &EcuDocumentArgs{
       schema_version,
       source_format,
       source_digest,
       variant,
       procedure,
+      definition_id,
     })
   }
 }

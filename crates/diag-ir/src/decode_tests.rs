@@ -38,6 +38,7 @@ fn decode_nested(
     };
     let document = EcuDocumentT {
         schema_version: IR_SCHEMA_VERSION,
+        definition_id: None,
         source_format: Some("csv-starlark".into()),
         source_digest: Some("00".into()),
         variant: Some(Box::new(EcuVariantT {
@@ -1438,6 +1439,7 @@ fn a_dtc_list_follows_nested_layouts_too() {
     ];
     let document = EcuDocumentT {
         schema_version: IR_SCHEMA_VERSION,
+        definition_id: None,
         source_format: Some("csv-starlark".into()),
         source_digest: Some("00".into()),
         variant: Some(Box::new(EcuVariantT {
@@ -1861,6 +1863,7 @@ fn decode_dtc(
 ) -> Result<Vec<DecodedField>, DecodeError> {
     let document = EcuDocumentT {
         schema_version: IR_SCHEMA_VERSION,
+        definition_id: None,
         source_format: Some("csv-starlark".into()),
         source_digest: Some("00".into()),
         variant: Some(Box::new(EcuVariantT {

@@ -292,6 +292,7 @@ mod tests {
         };
         EcuDocumentT {
             schema_version: IR_SCHEMA_VERSION,
+            definition_id: None,
             source_format: Some("csv-starlark".into()),
             source_digest: Some("00".repeat(32)),
             variant: Some(Box::new(variant)),
@@ -581,6 +582,7 @@ mod tests {
             &mut fbb,
             &EcuDocumentArgs {
                 schema_version: IR_SCHEMA_VERSION,
+                definition_id: None,
                 source_format: Some(format),
                 source_digest: Some(digest),
                 variant: Some(variant),
@@ -666,6 +668,7 @@ mod tests {
             &mut fbb,
             &EcuDocumentArgs {
                 schema_version: IR_SCHEMA_VERSION,
+                definition_id: None,
                 source_format: Some(format),
                 source_digest: Some(digest),
                 variant: Some(variant),
@@ -849,6 +852,7 @@ mod tests {
             &mut fbb,
             &EcuDocumentArgs {
                 schema_version: IR_SCHEMA_VERSION,
+                definition_id: None,
                 source_format: Some(format),
                 source_digest: Some(digest),
                 variant: Some(variant),

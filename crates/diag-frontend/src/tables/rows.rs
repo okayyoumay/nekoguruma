@@ -1230,6 +1230,32 @@ pub(crate) fn preconditions(sheet: &Sheet, errors: &mut Errors) -> Vec<Precondit
     })
 }
 
+// ---------------------------------------------------------------- 4.15 Definition
+
+/// The `definition.csv` row (4.15): the identifier a vehicle definition names the ECU
+/// definition by (ADR-363).
+#[derive(Debug, Clone, PartialEq)]
+pub struct DefinitionRow {
+    pub line: Line,
+    pub id: String,
+}
+
+pub(crate) const DEFINITION: Spec = Spec {
+    file: "definition.csv",
+    scoped: false,
+    columns: &[("id", true)],
+};
+
+pub(crate) fn definition(sheet: &Sheet, errors: &mut Errors) -> Vec<DefinitionRow> {
+    sheet.rows(errors, |row, e| {
+        let id = row.required(e, "id", values::name);
+        Some(DefinitionRow {
+            line: row.line,
+            id: id?,
+        })
+    })
+}
+
 // ---------------------------------------------------------------- 5 Fields
 
 /// Which part of a routine a `routine:` container holds.

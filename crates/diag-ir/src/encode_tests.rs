@@ -28,6 +28,7 @@ fn document(prefix: &[u8], fields: Vec<FieldT>) -> Vec<u8> {
     };
     encode_ecu_document(&EcuDocumentT {
         schema_version: IR_SCHEMA_VERSION,
+        definition_id: None,
         source_format: Some("csv-starlark".into()),
         source_digest: Some("00".into()),
         variant: Some(Box::new(EcuVariantT {

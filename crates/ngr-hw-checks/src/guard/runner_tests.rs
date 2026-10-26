@@ -31,6 +31,8 @@ fn unimplemented<T>() -> Reply<T> {
 #[derive(Clone, Default)]
 struct FakeWorker {
     log: Arc<Mutex<Vec<String>>>,
+    /// CancelComPrimitive names the handle invalid, as a worker does for a primitive that ended.
+    cancel_ended: Arc<std::sync::atomic::AtomicBool>,
     /// ComParam names by the id given out for them.
     ids: Arc<Mutex<BTreeMap<String, u32>>>,
     events: Arc<Mutex<Option<Events>>>,
@@ -244,6 +246,16 @@ impl VciService for FakeWorker {
         _: tonic::Request<vci::CancelComPrimitiveRequest>,
     ) -> Reply<vci::Response> {
         self.note("CancelComPrimitive");
+        if self.cancel_ended.load(std::sync::atomic::Ordering::SeqCst) {
+            return Err(vci::status_with_error_detail(
+                tonic::Code::NotFound,
+                "PDU_ERR_INVALID_HANDLE",
+                vci::ErrorDetail {
+                    pdu_error: vci::PduError::PduErrInvalidHandle as i32,
+                    ..Default::default()
+                },
+            ));
+        }
         Ok(tonic::Response::new(Default::default()))
     }
     async fn get_status(
@@ -545,6 +557,49 @@ async fn a_job_with_many_primitives_costs_one_cancel_at_the_disconnect() {
     assert_eq!(count("CancelComPrimitive"), 1, "{log:#?}");
     // And the trace still matches what the worker saw.
     assert_eq!(rpc_names(&log), granted(&client.trace()));
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+}
+
+/// Design 8.11 "Settlement": the agent's host takes a primitive the worker names invalid (it had
+/// ended) as gone. The guarded client gives that answer as success, since its errors carry no
+/// error detail the host could read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_of_an_ended_primitive_passes_the_guarded_client_as_done() {
+    let Setup_ {
+        fake,
+        mut client,
+        mut run,
+        ..
+    } = setup().await;
+    fake.cancel_ended
+        .store(true, std::sync::atomic::Ordering::SeqCst);
+    let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+    let link = agent::link::open(&mut client, &config, Duration::from_secs(5))
+        .await
+        .expect("the link opens");
+    let cancelled = agent::client::WorkerApi::cancel_com_primitive(
+        &mut client,
+        vci::CancelComPrimitiveRequest {
+            cop_handle: Some(vci::ComPrimitiveHandle {
+                module_handle: link.cll_handle.module_handle,
+                cll_handle: link.cll_handle.cll_handle,
+                cop_handle: 9,
+            }),
+        },
+    )
+    .await;
+    assert!(cancelled.is_ok(), "{cancelled:?}");
+    assert!(
+        fake.log
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|entry| entry == "CancelComPrimitive")
+    );
+    agent::link::close(&mut client, link, Duration::from_secs(5))
+        .await
+        .expect("the link closes");
     run.pass();
     assert!(run.run_teardown().is_empty());
 }

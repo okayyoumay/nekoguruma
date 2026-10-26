@@ -14315,6 +14315,24 @@ def main():
         set: Arc<Mutex<Vec<(String, u32, i32)>>>,
         /// A ComParam whose SetComParam the worker refuses, by its lower-case name.
         refuse_set: Option<&'static str>,
+        /// StartComPrimitive gives a primitive, which never ends: the link's events never come.
+        starts: bool,
+        /// The primitive handles given out, the last first; each start gives a new one.
+        started: Arc<Mutex<Vec<u32>>>,
+        /// The handle of each CancelComPrimitive.
+        cancelled: Arc<Mutex<Vec<u32>>>,
+        /// How CancelComPrimitive answers.
+        cancel: CancelAnswer,
+    }
+
+    /// How a [`FakeWorker`] answers CancelComPrimitive.
+    #[derive(Clone, Copy)]
+    enum CancelAnswer {
+        Done,
+        /// The library failed to cancel it (`Internal`, with no handle error).
+        Failed,
+        /// The handle is not known: the primitive had ended (`PDU_ERR_INVALID_HANDLE`).
+        InvalidHandle,
     }
 
     impl FakeWorker {
@@ -14516,13 +14534,49 @@ def main():
         ) -> Result<tonic::Response<vci_service_interface::ComPrimitiveResponse>, tonic::Status>
         {
             self.note("StartComPrimitive");
-            unimplemented()
+            if !self.starts {
+                return unimplemented();
+            }
+            let cop_handle = {
+                let mut started = self.started.lock().unwrap();
+                let next = 7 + u32::try_from(started.len()).unwrap();
+                started.push(next);
+                next
+            };
+            Ok(tonic::Response::new(
+                vci_service_interface::ComPrimitiveResponse {
+                    cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
+                        module_handle: 1,
+                        cll_handle: 1,
+                        cop_handle,
+                    }),
+                },
+            ))
         }
         async fn cancel_com_primitive(
             &self,
-            _: tonic::Request<vci_service_interface::CancelComPrimitiveRequest>,
+            request: tonic::Request<vci_service_interface::CancelComPrimitiveRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
-            unimplemented()
+            self.note("CancelComPrimitive");
+            let handle = request
+                .into_inner()
+                .cop_handle
+                .map_or(0, |cop| cop.cop_handle);
+            self.cancelled.lock().unwrap().push(handle);
+            match self.cancel {
+                CancelAnswer::Done => Ok(tonic::Response::new(Default::default())),
+                CancelAnswer::Failed => Err(tonic::Status::internal("PDU_ERR_FCT_FAILED")),
+                CancelAnswer::InvalidHandle => {
+                    Err(vci_service_interface::status_with_error_detail(
+                        tonic::Code::NotFound,
+                        "PDU_ERR_INVALID_HANDLE",
+                        vci_service_interface::ErrorDetail {
+                            pdu_error: vci_service_interface::PduError::PduErrInvalidHandle as i32,
+                            ..Default::default()
+                        },
+                    ))
+                }
+            }
         }
         async fn get_status(
             &self,
@@ -14618,7 +14672,70 @@ def main():
             comparams: Mutex::new(Vec::new()),
             set: Arc::clone(&set),
             refuse_set,
+            starts: false,
+            started: Arc::default(),
+            cancelled: Arc::default(),
+            cancel: CancelAnswer::Done,
         };
+        serve(service, calls, set).await
+    }
+
+    /// What a [`FakeWorker`] whose primitives start recorded: every RPC, the handles it gave
+    /// out and the handle of each cancel.
+    struct Started {
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        started: Arc<Mutex<Vec<u32>>>,
+        cancelled: Arc<Mutex<Vec<u32>>>,
+    }
+
+    impl Started {
+        /// The StartComPrimitive and CancelComPrimitive calls, in order.
+        fn primitive_calls(&self) -> Vec<&'static str> {
+            self.calls
+                .lock()
+                .unwrap()
+                .iter()
+                .copied()
+                .filter(|call| matches!(*call, "StartComPrimitive" | "CancelComPrimitive"))
+                .collect()
+        }
+    }
+
+    /// A [`FakeWorker`] whose primitives start and never end, answering a cancel as `cancel`.
+    async fn fake_worker_starting(cancel: CancelAnswer) -> (WorkerClient, Started) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let (started, cancelled) = (Arc::default(), Arc::default());
+        let service = FakeWorker {
+            fail_disconnect: false,
+            fail_open: false,
+            calls: Arc::clone(&calls),
+            comparams: Mutex::new(Vec::new()),
+            set: Arc::clone(&set),
+            refuse_set: None,
+            starts: true,
+            started: Arc::clone(&started),
+            cancelled: Arc::clone(&cancelled),
+            cancel,
+        };
+        let (client, calls, _) = serve(service, calls, set).await;
+        (
+            client,
+            Started {
+                calls,
+                started,
+                cancelled,
+            },
+        )
+    }
+
+    /// Serves `service` on a loopback port; returns a client for it, with its `calls` and
+    /// `set` logs.
+    async fn serve(
+        service: FakeWorker,
+        calls: Arc<Mutex<Vec<&'static str>>>,
+        set: SetComParams,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>, SetComParams) {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -14639,6 +14756,96 @@ def main():
             worker_host::client::BearerAuth::new([0; 32], "test"),
         );
         (client, calls, set)
+    }
+
+    /// Runs `requests` reads of F190 on a host over `client` whose send-receive deadline is
+    /// short, so each primitive the fake starts passes it.
+    async fn reads_past_the_deadline(
+        mut client: WorkerClient,
+        requests: usize,
+    ) -> Vec<Result<Vec<u8>, HostError>> {
+        use diag_ir::DiagHost;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_millis(50),
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            (0..requests)
+                .map(|_| host.service_request(0x22, &[0xF1, 0x90]))
+                .collect()
+        })
+        .await
+        .unwrap()
+    }
+
+    /// Design 8.11 "Settlement": a primitive the host stopped waiting for at its own deadline
+    /// may still hold the link, so the host cancels it, by its own handle, before the link's
+    /// next request, and only that once.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_past_the_deadline_is_cancelled_before_the_next_request() {
+        let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let results = reads_past_the_deadline(client, 2).await;
+        for result in &results {
+            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+        }
+        // The first primitive is cancelled before the second starts; the second, also left
+        // running, waits for a next request that does not come.
+        assert_eq!(
+            fake.primitive_calls(),
+            [
+                "StartComPrimitive",
+                "CancelComPrimitive",
+                "StartComPrimitive"
+            ]
+        );
+        assert_eq!(*fake.started.lock().unwrap(), [7, 8]);
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+    }
+
+    /// A cancel the worker answers with an invalid handle finds the primitive ended, so the
+    /// request starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancel_of_an_ended_primitive_lets_the_request_start() {
+        let (client, fake) = fake_worker_starting(CancelAnswer::InvalidHandle).await;
+        reads_past_the_deadline(client, 2).await;
+        assert_eq!(
+            fake.primitive_calls(),
+            [
+                "StartComPrimitive",
+                "CancelComPrimitive",
+                "StartComPrimitive"
+            ]
+        );
+    }
+
+    /// A cancel that fails leaves the link held: the request is not started, which its entry
+    /// gives as `not_sent`, and the next request tries the cancel of the same primitive again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_cancel_keeps_the_link_held_and_is_tried_again() {
+        let (client, fake) = fake_worker_starting(CancelAnswer::Failed).await;
+        let results = reads_past_the_deadline(client, 3).await;
+        assert!(
+            matches!(results[0], Err(HostError::NoResponse)),
+            "{results:?}"
+        );
+        for held in &results[1..] {
+            assert!(matches!(held, Err(HostError::LinkHeld)), "{held:?}");
+        }
+        assert_eq!(
+            fake.primitive_calls(),
+            [
+                "StartComPrimitive",
+                "CancelComPrimitive",
+                "CancelComPrimitive"
+            ]
+        );
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7, 7]);
     }
 
     /// The host checks every request against its link's application layer (ADR-342): on a
@@ -14871,6 +15078,7 @@ def main():
             set_com_param(vci_service_interface::SetComParamRequest) -> vci_service_interface::Response;
             set_unique_resp_id_table(vci_service_interface::SetUniqueRespIdTableRequest) -> vci_service_interface::Response;
             start_com_primitive(vci_service_interface::StartComPrimitiveRequest) -> vci_service_interface::ComPrimitiveResponse;
+            cancel_com_primitive(vci_service_interface::CancelComPrimitiveRequest) -> vci_service_interface::Response;
             subscribe_event(vci_service_interface::SubscribeEventRequest) -> tonic::Streaming<vci_service_interface::EventNotification>;
             io_ctl(vci_service_interface::IoCtlRequest) -> vci_service_interface::IoCtlResponse;
         }

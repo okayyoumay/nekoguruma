@@ -1858,6 +1858,23 @@ impl GuardedHandle {
             .map(LinkTimings::ceiling)
     }
 
+    /// `CancelComPrimitive`, decided like the others, with a primitive the worker names invalid
+    /// (`PDU_ERR_INVALID_HANDLE`: it had ended) taken as cancelled. The handle's errors carry no
+    /// error detail, so a caller could not tell that answer from a failed cancel (design 8.11
+    /// "Settlement": the agent's host takes an ended primitive as gone).
+    pub async fn cancel_com_primitive_settling(
+        &mut self,
+        request: CancelComPrimitiveRequest,
+    ) -> Result<vci_service_interface::Response, HandleError> {
+        let Some(cop) = request.cop_handle else {
+            return self.cancel_com_primitive(request).await;
+        };
+        self.shared
+            .cancel_maybe_ended(&mut self.client.clone(), cop)
+            .await
+            .map(|()| vci_service_interface::Response::default())
+    }
+
     /// The timing margin the profile gives its VCI (`timing_margin_us`, design 8.11 "Timing
     /// margin"), if it gives one.
     pub fn timing_margin(&self) -> Option<Duration> {

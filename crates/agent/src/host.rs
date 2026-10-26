@@ -12,9 +12,9 @@ use crate::client::WorkerApi;
 use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
-    ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle, ErrorData, EventItem,
-    ExpectedResponseData, PduComPrimitiveStatus, PduErrorEvent, StartComPrimitiveRequest,
-    TimestampClock, event_item, event_notification,
+    CancelComPrimitiveRequest, ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle,
+    ErrorData, EventItem, ExpectedResponseData, PduComPrimitiveStatus, PduErrorEvent,
+    StartComPrimitiveRequest, TimestampClock, event_item, event_notification,
 };
 
 use crate::comm_log::exchange::{
@@ -39,6 +39,10 @@ pub enum HostError {
     },
     #[error("the worker did not answer {0} in time")]
     WorkerUnresponsive(&'static str),
+    /// A primitive the host stopped waiting for still holds the link, and the worker did not
+    /// cancel it: the request was not started (design 8.11 "Settlement").
+    #[error("an earlier primitive the worker did not cancel still holds the link")]
+    LinkHeld,
     #[error("the worker's event stream ended")]
     EventStreamEnded,
     #[error("no response from the ECU")]
@@ -175,6 +179,14 @@ fn lost_vci_between_primitives(error: HostError) -> HostError {
         }
         _ => error,
     }
+}
+
+/// Whether the worker refused a call because it knows no object with the handle given
+/// (`PDU_ERR_INVALID_HANDLE`, ISO 22900-2:2022 D.3): for a cancel, a primitive that has ended.
+fn names_invalid_handle(status: &tonic::Status) -> bool {
+    vci_service_interface::error_detail_from_status(status).is_some_and(|detail| {
+        detail.pdu_error == vci_service_interface::PduError::PduErrInvalidHandle as i32
+    })
 }
 
 /// Calls a unary RPC with a deadline (ADR-235 item 6).
@@ -422,6 +434,10 @@ pub struct WorkerHost<C: WorkerApi> {
     /// The `seq` of the entry of the last RequestDownload, which a block refused for its
     /// response names (`caused_by`).
     download_seq: Option<u64>,
+    /// A primitive the host stopped waiting for before it ended (its own deadline, lost events,
+    /// a failed event stream), which may still hold the link: it is cancelled before the link's
+    /// next request (design 8.11 "Settlement").
+    stray: Option<ComPrimitiveHandle>,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -441,6 +457,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             at: None,
             own: None,
             download_seq: None,
+            stray: None,
         }
     }
 
@@ -597,6 +614,30 @@ impl<C: WorkerApi> WorkerHost<C> {
                 tx_flag: None,
             }),
         };
+        // A primitive the host stopped waiting for may still hold the link, which runs one
+        // primitive at a time (ISO 22900-2:2022 8.4.17.2): cancel it first. It is gone when the
+        // cancel succeeds, when the worker names its handle invalid (it had ended), or when the
+        // VCI was lost (the worker cancelled it). Any other answer leaves the link held, so the
+        // request is not started and the next one tries the cancel again.
+        if let Some(stray) = self.stray.take() {
+            let cancelled = unary(
+                self.timings.unary,
+                "CancelComPrimitive",
+                self.client.cancel_com_primitive(CancelComPrimitiveRequest {
+                    cop_handle: Some(stray),
+                }),
+            )
+            .await
+            .map_err(lost_vci_between_primitives);
+            match cancelled {
+                Ok(_) | Err(HostError::VciLost) => {}
+                Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => {}
+                Err(_) => {
+                    self.stray = Some(stray);
+                    return Sent::not_started(Err(HostError::LinkHeld));
+                }
+            }
+        }
         // One deadline from the request to the end of the primitive.
         let now = tokio::time::Instant::now();
         let deadline = now + self.timings.send_recv;
@@ -618,20 +659,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         let cop = match started {
             Ok(cop) => cop,
-            Err(error) => {
-                return Sent {
-                    result: Err(error),
-                    started: false,
-                    error_events: Vec::new(),
-                    errors_before_response: None,
-                    rx_timeout: None,
-                    vci_lost: None,
-                    unbound: Vec::new(),
-                    pendings: Vec::new(),
-                    agent_deadline: false,
-                    response_times: VciTimes::default(),
-                };
-            }
+            Err(error) => return Sent::not_started(Err(error)),
         };
 
         let events = &mut self.link.events;
@@ -667,6 +695,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         // A receive timeout the worker already reported ended the VCI's wait, even when the
         // primitive's end had not been read before the deadline.
         let agent_deadline = waited.is_err() && progress.rx_timeout.is_none();
+        // A primitive whose end was not read may still run; after a lost VCI the worker
+        // cancelled it.
+        if !progress.ended && progress.vci_lost.is_none() {
+            self.stray = Some(cop);
+        }
         let result = waited
             .map_err(|_| HostError::NoResponse)
             .and_then(|outcome| outcome);
@@ -919,6 +952,24 @@ struct Sent {
     response_times: VciTimes,
 }
 
+impl Sent {
+    /// A request whose primitive did not start, ending as `result`.
+    fn not_started(result: Result<Vec<u8>, HostError>) -> Self {
+        Self {
+            result,
+            started: false,
+            error_events: Vec::new(),
+            errors_before_response: None,
+            rx_timeout: None,
+            vci_lost: None,
+            unbound: Vec::new(),
+            pendings: Vec::new(),
+            agent_deadline: false,
+            response_times: VciTimes::default(),
+        }
+    }
+}
+
 /// A response pending (0x78) bound to the primitive (design 8.11 `pending`): its VCI time and
 /// clock as the worker gave them, and the agent's clocks when the host read it, if it has a log.
 #[derive(Debug)]
@@ -1040,6 +1091,8 @@ fn sent_end(
     };
     let end = match error {
         HostError::NoResponse => End::NoResponse,
+        // The agent did not start it: an earlier primitive still holds the link.
+        HostError::LinkHeld => End::NotSent(RefusalCause::LinkHeld),
         HostError::EventsLost => End::Unknown(UnknownCause::EventsLost),
         HostError::EventStreamEnded => End::Unknown(UnknownCause::EventsEnded),
         HostError::WorkerUnresponsive(_) => End::Unknown(UnknownCause::WorkerNotAnswering),
@@ -1129,6 +1182,7 @@ fn host_error_name(error: &HostError) -> &'static str {
     match error {
         HostError::Rpc { .. } => "Rpc",
         HostError::WorkerUnresponsive(_) => "WorkerUnresponsive",
+        HostError::LinkHeld => "LinkHeld",
         HostError::EventStreamEnded => "EventStreamEnded",
         HostError::NoResponse => "NoResponse",
         HostError::EventsLost => "EventsLost",
@@ -1352,6 +1406,8 @@ struct Progress {
     pendings: Vec<PendingRead>,
     /// The VCI times the final response's item gave, for the communication log.
     response_times: VciTimes,
+    /// The primitive's end (finished or cancelled) was read.
+    ended: bool,
 }
 
 impl Progress {
@@ -1370,6 +1426,7 @@ impl Progress {
             unbound: Vec::new(),
             pendings: Vec::new(),
             response_times: VciTimes::default(),
+            ended: false,
         })
     }
 
@@ -1388,6 +1445,7 @@ impl Progress {
             unbound: Vec::new(),
             pendings: Vec::new(),
             response_times: VciTimes::default(),
+            ended: false,
         }
     }
 
@@ -1491,6 +1549,7 @@ impl Progress {
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
                     || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
             {
+                self.ended = true;
                 return Some(match (self.response.take(), self.error) {
                     (Some(response), _) => Ok(response),
                     (None, Some(code)) => Err(HostError::PrimitiveFailed(code)),
@@ -2672,6 +2731,61 @@ mod tests {
         assert_eq!(logged[0].vci_us, Some(10));
         assert_eq!(logged[0].clock, Some(Clock::Device));
         assert_eq!(logged[0].agent_us, 100);
+    }
+
+    /// A request the host did not start because an earlier primitive still holds the link is
+    /// `not_sent`, refused by the agent (design 8.11 `sent`).
+    #[test]
+    fn a_request_behind_a_held_link_is_not_sent() {
+        let read = [0x22, 0xF1, 0x90];
+        let (end, detail) = sent_end(
+            &read,
+            &Err(HostError::LinkHeld),
+            &NegativeShape::uds(),
+            read[0],
+            false,
+        );
+        assert!(
+            matches!(end, End::NotSent(RefusalCause::LinkHeld)),
+            "{end:?}"
+        );
+        assert_eq!(detail.host_error, Some("LinkHeld"));
+    }
+
+    /// Design 8.11 "Settlement": only a primitive whose end was read counts as ended, so one
+    /// the host stopped waiting for is cancelled before the next request.
+    #[test]
+    fn a_primitive_counts_as_ended_only_when_its_end_was_read() {
+        let mut finished = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        assert!(
+            finished
+                .on_event(event(Some(COP), result(&[0x62, 0xF1, 0x90])), COP)
+                .is_none()
+        );
+        assert!(!finished.ended, "a response alone does not end it");
+        assert!(
+            finished
+                .on_event(
+                    event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+                    COP
+                )
+                .is_some()
+        );
+        assert!(finished.ended);
+        let mut cancelled = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        cancelled.on_event(
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
+            COP,
+        );
+        assert!(cancelled.ended);
+        // Lost events end the wait, not the primitive.
+        let mut lost = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let done = lost.on_notification(
+            Some(event_notification::EventData::Lost(Default::default())),
+            COP,
+        );
+        assert!(matches!(done, Some(Err(HostError::EventsLost))), "{done:?}");
+        assert!(!lost.ended);
     }
 
     /// Design 8.11 `times`: the final response's item gives the response's end, and the

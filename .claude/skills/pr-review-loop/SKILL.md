@@ -82,11 +82,12 @@ signal. All of Codex's output is by `chatgpt-codex-connector[bot]` (in `get_revi
   posts a separate PR comment starting "Codex Review: Didn't find any major issues" that names the
   reviewed commit; it confirms the same result.
 - **Error**: a PR comment starting "Codex Review: Something went wrong", usually with the cause in
-  a code block. Request again once on the same head; a second error on that head counts as a stall
-  (below).
+  a code block. Re-request it under "Codex requested but never finished" below, which an error
+  and a stall share.
 
 Only a result posted after the latest request whose reviewed commit is a prefix of the current
-head counts as that request's result.
+head counts as that request's result (after a retry, below, a result of the request it retried
+counts too).
 
 **Codex not set up.** If the request gets no summary comment and no result by the second check-in
 and the app has never answered on this repository, or Codex answers that it is not set up for the
@@ -100,12 +101,19 @@ starts with Codex again.
 
 **Codex requested but never finished.** If a check-in finds no result for the latest request,
 schedule one more check-in 15 minutes later. While the summary's state shows `status: running` for
-the current head, keep scheduling check-ins instead of counting the round as stalled, but only up
-to 45 minutes after the request (a Codex review usually takes under ten); a state still running
-after that counts as stalled too. If the second check-in finds no result and no running state, or
-the 45 minutes have passed, or Codex errored twice
-on the head, the round has stalled: tell the maintainer once in the thread and switch the PR to
-Copilot for this head.
+the current head, keep scheduling check-ins instead of counting the request as stalled, but only
+up to 30 minutes after the request (a Codex review usually takes under ten); a state still running
+after that counts as stalled too. A request has stalled when the second check-in finds no result
+and no running state, or the 30 minutes have passed.
+
+A stalled or errored request is retried once per head (ADR-360): the Codex service is known to
+leave some reviews running indefinitely, and a new request on the same head usually completes.
+Post a new `@codex review` comment as under "Request" above, schedule its check-in, and say
+nothing in the thread yet; the timing above starts again from the new request. A result of
+either request on the current head then counts. If the earlier one also finishes, its result is
+on the same head: route only the findings the other result has not already raised. If the retry
+also stalls or errors on the head, the round has stalled: tell the maintainer once in the thread
+and switch the PR to Copilot for this head. Each new head gets its own retry.
 
 ### Copilot
 
@@ -437,7 +445,7 @@ fallback review in Step 0 is done:
      naming the head commit;
    - the review summary: the reviewer (and why the PR switched to Copilot, if it did), each
      round and its outcome (`get_reviews`, and `get_comments` for Codex's clean and error
-     results), the number of findings fixed, accepted (2c) and declined (2d), any
+     results), any Codex request retried after a stall or error, the number of findings fixed, accepted (2c) and declined (2d), any
      `edge-case-hunter` pass, and the Low-rated findings fixed after the last review
      when the loop ended without a re-request (Step 4);
    - any line the loop's fixes made untrue, such as a test count or a list of changes.

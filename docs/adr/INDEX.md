@@ -301,7 +301,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-309](ADR-309-application-layer-profiles.md) | Application-Layer Profiles for Protocol-Neutral Diagnostic Calls | Accepted (items 2 and 5 given their form by ADR-314; item 3's one program per variant lowered per combination of target variants, each call against its target's declarations, by ADR-325 item 6; item 4's per-layer read-only lists and the end of `ReadDtc`'s request building given their form in the agent by ADR-342; item 5's pending absorbed in the worker replaced, for 0x78, by a worker that passes on each pending it sees, bound to the primitive, by ADR-346) | `diag-frontend` lowering and CSV tables, `diag-ir` primitives, `agent` host and read-only policy; ADR-235 items 2, 3 and 8; design 8.2.4, 8.4 |
 | [ADR-310](ADR-310-one-line-message-notation.md) | A One-Line Message Notation for the Vehicle-Knowledge Format | Accepted | `diag-frontend` message shapes (`messages.txt` replacing the CSV field tables), CSV format sections 1 and 5; design 8.4 |
 | [ADR-311](ADR-311-lowering-each-procedure-once-per-variant.md) | Lowering Each Procedure Once per Variant | Accepted (item 4 amended by ADR-313; item 1's per-variant lowering extended to combinations of target variants by ADR-325) | `diag-frontend` conversion and Starlark lowering, CSV format section 1, Starlark subset section 5 |
-| [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted (Decision item 4 amended: comparison done, Codex kept) | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
+| [ADR-312](ADR-312-codex-as-pr-reviewer-with-copilot-fallback.md) | Codex as the Pull Request Reviewer, with Copilot as Fallback | Accepted (Decision item 4 amended: comparison done, Codex kept; Decision item 1's switch on a stalled review amended by ADR-360) | `.claude/skills/pr-review-loop` (Steps 0, 1, 4-5), `AGENTS.md`, `CLAUDE.md`; ADR-251 |
 | [ADR-313](ADR-313-selecting-a-request-service-from-a-table-index.md) | Selecting a Request's Service from an Index of the Tables | Accepted (item 5 superseded by ADR-317; items 1 and 2's single variant and index given per target for a procedure with several targets by ADR-325 item 6; item 4 amended by ADR-341) | `diag-frontend` conversion and Starlark lowering, CSV format 5.3, Starlark subset 3.1, 3.2 and 3.4; ADR-311 item 4 |
 | [ADR-314](ADR-314-application-layer-profiles-as-typed-frontend-data.md) | Application-Layer Profiles as Typed Frontend Data | Accepted | `diag-frontend` profiles, Starlark subset 3.2 and 3.4, CSV format 5.3; ADR-309 items 2 and 5 |
 | [ADR-315](ADR-315-variant-patterns-grouped-into-patterns.md) | Variant Pattern Entries Grouped into Patterns | Accepted (item 3's first matching variant: reported in full by identification jobs, guarded for jobs that change an ECU, and replaced by the operator's pick for a read-only job, by ADR-327) | `diag-ir` schema and decoder (`IR_SCHEMA_VERSION` 10), `diag-frontend` CSV variant patterns, CSV format 4.2, design 8.9.1; ADR-306 |
@@ -349,6 +349,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
 | [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
+| [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Step 1), `CLAUDE.md`; ADR-312 |
 
 ## Status Legend
 
@@ -700,12 +701,13 @@ the predecessor repository these ADRs came from.
 - ADR-283
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
 - ADR-299
-- ADR-312 (Decision item 4 amended: comparison done, Codex kept)
+- ADR-312 (Decision item 4 amended: comparison done, Codex kept; Decision item 1's switch on a stalled review amended by ADR-360)
 - ADR-333 (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342)
 - ADR-334
 - ADR-343
 - ADR-349
 - ADR-356
+- ADR-360
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

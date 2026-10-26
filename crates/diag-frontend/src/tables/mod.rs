@@ -52,6 +52,8 @@ pub struct Tables {
     pub flash_segments: Vec<FlashSegmentRow>,
     pub identity: Vec<IdentityRow>,
     pub preconditions: Vec<PreconditionRow>,
+    /// The definition's identifier (4.15): one row at most, none when it declares none.
+    pub definition: Vec<DefinitionRow>,
     /// The names and contents, as stored, of the table files present, sorted by name in byte
     /// order: what `source_digest` covers besides a procedure file (section 6).
     pub sources: Vec<(String, Vec<u8>)>,
@@ -73,7 +75,7 @@ pub enum ReadError {
 }
 
 /// Every table of section 1, in the order of its table.
-const SPECS: [&Spec; 21] = [
+const SPECS: [&Spec; 22] = [
     &VARIANTS,
     &VARIANT_PATTERNS,
     &PROTOCOLS,
@@ -95,6 +97,7 @@ const SPECS: [&Spec; 21] = [
     &FLASH_SEGMENTS,
     &IDENTITY,
     &PRECONDITIONS,
+    &DEFINITION,
 ];
 
 /// The tables a definition must have.
@@ -278,6 +281,7 @@ fn read_entries(
         flash_segments: flash_segments(sheet(&FLASH_SEGMENTS), e),
         identity: identity(sheet(&IDENTITY), e),
         preconditions: preconditions(sheet(&PRECONDITIONS), e),
+        definition: definition(sheet(&DEFINITION), e),
         sources: {
             sources.sort_unstable_by(|a, b| a.0.cmp(&b.0));
             sources
@@ -288,6 +292,21 @@ fn read_entries(
         },
     };
     check_duplicates(&sheets, e);
+    // A definition has one identifier (4.15).
+    if let [first, rest @ ..] = tables.definition.as_slice() {
+        for row in rest {
+            e.push(
+                ErrorCode::Duplicate,
+                "definition.csv",
+                Some(row.line),
+                None,
+                format!(
+                    "a definition has one identifier, already given on line {}",
+                    first.line
+                ),
+            );
+        }
+    }
     if errors.0.is_empty() {
         Ok(tables)
     } else {

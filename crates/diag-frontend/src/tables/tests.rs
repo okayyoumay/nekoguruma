@@ -2581,3 +2581,42 @@ fn many_selects_find_their_keys_in_linear_time() {
     assert_eq!(resolved(files), vec![]);
     assert!(started.elapsed() < std::time::Duration::from_secs(20));
 }
+
+/// 4.15: `definition.csv` gives the definition's identifier, one row at most, a name.
+#[test]
+fn the_definition_has_one_identifier_at_most() {
+    use ErrorCode::*;
+    assert_eq!(
+        read_files(example()).expect("reads").definition,
+        vec![DefinitionRow {
+            line: 2,
+            id: "exampleEcu".to_owned()
+        }]
+    );
+    // Optional: a directory without it declares none.
+    assert!(
+        read_files(without("definition.csv"))
+            .expect("reads")
+            .definition
+            .is_empty()
+    );
+    assert!(
+        read_files(with("definition.csv", "id\n"))
+            .expect("reads")
+            .definition
+            .is_empty()
+    );
+    assert_eq!(
+        table_errors("definition.csv", "id", &["first", "second"]),
+        vec![(Duplicate, Some(3), None)]
+    );
+    assert_eq!(
+        table_errors("definition.csv", "id", &["not-a-name"]),
+        vec![(BadValue, Some(2), Some("id".to_owned()))]
+    );
+    // The header must name it.
+    assert_eq!(
+        table_errors("definition.csv", "note", &["x"]),
+        vec![(MissingColumn, Some(1), Some("id".to_owned()))]
+    );
+}

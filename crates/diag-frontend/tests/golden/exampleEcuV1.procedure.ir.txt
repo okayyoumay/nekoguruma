@@ -1,10 +1,10 @@
 EcuDocumentT {
-    schema_version: 19,
+    schema_version: 20,
     source_format: Some(
         "csv-starlark",
     ),
     source_digest: Some(
-        "9070824569b10dccc621614ee59b732730faeff904cad60965bb6fc4def86f52",
+        "8899fd14bef6d099a3832c84656994aeb6a3249375cd664fc727ecb65cd21608",
     ),
     variant: Some(
         EcuVariantT {
@@ -2520,9 +2520,12 @@ EcuDocumentT {
         },
     ),
     procedure: None,
+    definition_id: Some(
+        "exampleEcu",
+    ),
 }
 Program {
-    schema_version: 19,
+    schema_version: 20,
     code: [
         PushBytes(
             0,

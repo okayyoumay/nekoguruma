@@ -43,6 +43,7 @@ directory, a link to nothing) is rejected (`CSV_UNKNOWN_FILE`).
 | `flash_segments.csv` | no | 4.12 | `FlashSegment` |
 | `identity.csv` | no; all three kinds when a procedure of the variant has a flash plan that allows a restart (`starlark-subset.md` 4.9) | 4.13 | `Program.identity` of each program of the variant (ADR-336) |
 | `preconditions.csv` | no | 4.14 | `Program.preconditions` of each program of the variant, those the procedure names (ADR-336) |
+| `definition.csv` | no | 4.15 | `EcuDocument.definition_id` of every document of the directory (ADR-363) |
 
 The table conversion produces the declaration part of each variant's documents (design 8.2.6),
 with `source_format` set to `csv-starlark` (ADR-254). Each `.star` file directly in the
@@ -528,6 +529,18 @@ a service source and the range must agree on the unit. Every violation is `CSV_B
 (`CSV_UNKNOWN_REFERENCE` for a service or field that does not exist). The programming-session
 source is read by a restart only, after the plan's own steps have put the ECU in that session.
 
+### 4.15 `definition.csv`
+
+The definition's identifier, by which a vehicle definition names it among its ECU entries'
+alternatives and in its matching rules (design 8.8.2, ADR-326 item 1, ADR-363). At most one row
+(`CSV_DUPLICATE` for a second); every document the directory converts to carries it in
+`EcuDocument.definition_id`. A directory without the table, or with only its header, declares
+none: its documents carry no identifier, and no vehicle definition can name them.
+
+| Column | Type | Required | Meaning |
+|---|---|---|---|
+| `id` | name | yes | The identifier, unique among the ECU definitions a vehicle definition is converted with |
+
 ---
 
 ## 5. Fields
@@ -878,6 +891,7 @@ does not have:
   (`starlark-subset.md` 4.9). The example write procedure keeps the default recovery point at the
   erase, which allows no restart after it.
 - `preconditions.csv`: the five preconditions, all read from the agent's inputs.
+- `definition.csv`: the identifier `exampleEcu`, which every document of the example carries.
 
 A row of `fields.csv` from it, the VIN in its data record:
 

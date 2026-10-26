@@ -54,7 +54,9 @@ use crate::declaration::{EcuVariant, Shape};
 /// 19: `Op` gained `HmiRequestFromStack`, and `VmError` gained `BadHmiForm` and
 /// `HmiFormTooLong`; the constant of `HmiRequest` and `RecordInput` is an encoded
 /// [`hmi::HmiTemplate`] (ADR-340).
-pub const IR_SCHEMA_VERSION: u32 = 19;
+/// 20: `EcuDocument` gained `definition_id`, the identifier of the ECU definition a vehicle
+/// definition names (ADR-363); a document of version 19 has none.
+pub const IR_SCHEMA_VERSION: u32 = 20;
 
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;

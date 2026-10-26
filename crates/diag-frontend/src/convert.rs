@@ -281,6 +281,7 @@ fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
         document.schema_version = IR_SCHEMA_VERSION;
         document.source_format = Some(SOURCE_FORMAT.to_owned());
         document.source_digest = Some(String::new());
+        document.definition_id = tables.definition.first().map(|row| row.id.clone());
         document.variant = Some(Box::new(ecu));
         documents.push(document);
     }

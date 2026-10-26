@@ -369,8 +369,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
     attached transmit indication. A response-carried transmit done confirms the send when no
     indication did (`sent_evidence` `tx_done_time`).
   - The response's start comes from its own `start_msg_timestamp`, or else from the latest
-    attached start of message. That start counts only when it came after the last pending and the
-    response is longer than seven bytes, so that it spans frames whatever the addressing format: a
+    attached start of message. That start counts only when it came after the last pending on one
+    clock (with a pending whose time or clock is unknown the order is unknown, so it does not) and
+    the response is longer than seven bytes, so that it spans frames whatever the addressing format: a
     start comes only with a multi-frame response's first frame, so one before a single-frame
     answer was a transfer the ECU aborted.
   - Of two times for one point, the one with a clock wins.

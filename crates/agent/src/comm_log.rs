@@ -1046,20 +1046,20 @@ impl CommLog {
                 | exchange::End::Negative(bytes) => Some(bytes.len()),
                 _ => None,
             };
-            let last_pending = evidence
-                .pending
-                .last()
-                .and_then(|pending| pending.vci_us.zip(pending.clock));
             if let Some(start) = unbound
                 .iter()
                 .rev()
                 .find(|item| item.is_start_indication_for(rx_id))
             {
                 let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock);
-                let after_pending = match (last_pending, time.clock) {
-                    (None, _) => true,
-                    (Some((at, clock)), Some(own)) => clock == own && time.us >= at,
-                    (Some(_), None) => false,
+                // After the last pending, on one clock: with a pending whose time or clock is
+                // unknown, or a start with no clock, the order is unknown and no start is taken.
+                let after_pending = match evidence.pending.last() {
+                    None => true,
+                    Some(pending) => match (pending.vci_us.zip(pending.clock), time.clock) {
+                        (Some((at, clock)), Some(own)) => clock == own && time.us >= at,
+                        _ => false,
+                    },
                 };
                 let spans_frames = response_len.is_none_or(|len| len > SINGLE_FRAME_MAX);
                 if after_pending && spans_frames {
@@ -2680,7 +2680,20 @@ mod tests {
             since_previous_ms: None,
         }];
         log.exchange_with(carried, Vec::new()).unwrap();
-        // 6: with no time at all, the entry has no VCI times.
+        // 6: a pending whose clock is unknown leaves the order unknown, so no start is taken.
+        let mut unclocked_pending = answered(&long, ended(90));
+        unclocked_pending.pending = vec![exchange::Pending {
+            vci_us: Some(10),
+            clock: None,
+            agent_us: 0,
+            since_previous_ms: None,
+        }];
+        log.exchange_with(
+            unclocked_pending,
+            vec![tx_done(0x7E0), start_at(20, exchange::Clock::Device)],
+        )
+        .unwrap();
+        // 7: with no time at all, the entry has no VCI times.
         log.exchange_with(answered(&long, exchange::VciTimes::default()), Vec::new())
             .unwrap();
         log.end("ok");
@@ -2707,7 +2720,7 @@ mod tests {
             exchanges[2]["times"]["vci"],
             serde_json::json!({ "tx_done": time(5, "device") })
         );
-        for dropped in [3, 4] {
+        for dropped in [3, 4, 6] {
             let vci = &exchanges[dropped]["times"]["vci"];
             assert!(vci.get("rx_start").is_none(), "{}", exchanges[dropped]);
             // The start still shows the ECU answered.
@@ -2721,9 +2734,9 @@ mod tests {
         assert_eq!(exchanges[5]["sent"], "confirmed", "{}", exchanges[5]);
         assert_eq!(exchanges[5]["pending"][0]["since_previous_ms"], 2.5);
         assert!(
-            exchanges[6]["times"].get("vci").is_none(),
+            exchanges[7]["times"].get("vci").is_none(),
             "{}",
-            exchanges[6]
+            exchanges[7]
         );
     }
 

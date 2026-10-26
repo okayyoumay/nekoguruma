@@ -764,19 +764,26 @@ impl<C: WorkerApi> WorkerHost<C> {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
-                let (kept, kept_pendings, kept_rejected) = (
+                let (kept, kept_pendings, kept_rejected, kept_response) = (
                     progress.unbound.len(),
                     progress.pendings.len(),
                     progress.rejected.len(),
+                    progress.response_times.rx_end,
                 );
                 let done = progress.on_notification(notification.event_data, cop);
                 let lost = matches!(done, Some(Err(HostError::EventsLost)));
+                let responded = progress.response_times.rx_end != kept_response;
                 if progress.unbound.len() > kept
                     || progress.pendings.len() > kept_pendings
                     || progress.rejected.len() > kept_rejected
                     || lost
+                    || responded
                 {
                     let read = log.filter(|log| log.is_open()).map(|log| log.now());
+                    if responded {
+                        progress.response_times.response_read_us =
+                            read.map(|read| read.monotonic_us);
+                    }
                     for unbound in &mut progress.unbound[kept..] {
                         unbound.read = read;
                     }
@@ -1012,6 +1019,7 @@ fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
                 bytes: rejected.bytes.clone(),
                 vci_us: Some(rejected.vci_us),
                 clock: rejected.clock,
+                epoch: None,
                 agent_us: rejected.read?.monotonic_us,
                 reason: rejected.reason,
             })
@@ -1030,6 +1038,7 @@ fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
             Some(Pending {
                 vci_us: Some(pending.vci_us),
                 clock: pending.clock,
+                epoch: None,
                 agent_us: pending.read?.monotonic_us,
                 since_previous_ms: None,
             })
@@ -1836,6 +1845,7 @@ impl Progress {
                     rx_end: Some(at),
                     error: None,
                     deadline: None,
+                    response_read_us: None,
                 };
                 self.response = Some(result.data_bytes);
                 self.errors_before_response = Some(self.errors.len());
@@ -3279,6 +3289,7 @@ mod tests {
                 rx_end: on(900, Some(Clock::Device)),
                 error: None,
                 deadline: None,
+                response_read_us: None,
             }
         );
         // A receive timeout, the event a silent exchange names, has its own item's time and

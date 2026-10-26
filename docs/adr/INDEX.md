@@ -350,6 +350,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
 | [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 5), `CLAUDE.md`; ADR-312 |
+| [ADR-361](ADR-361-the-log-unwraps-each-vci-clock-within-a-window-of-the-agent-s-clock.md) | The Log Unwraps Each VCI Clock Within a Window of the Agent's Clock | Accepted | `agent` communication log (`VciClocks`, `clock_epoch`, `pending_intervals`, the reopen scan); design 8.11 "Timing judged", `clock_epoch`; ADR-353, ADR-357 |
 
 ## Status Legend
 
@@ -716,6 +717,7 @@ the predecessor repository these ADRs came from.
 - ADR-239
 - ADR-353
 - ADR-357
+- ADR-361
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

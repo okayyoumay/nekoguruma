@@ -701,9 +701,31 @@ fn assert_comm_log(setup: &CommLogSetup) {
     // Each request's TxDone carries its request identifier, and no earlier exchange could own
     // it, so it is the exchange's send evidence rather than an `unattached` item (design 8.11
     // `sent_evidence`, ADR-346 item 4).
+    // Each clock's first time opens its epoch, written before the entry that uses it, and no
+    // time of the job opens another: the device clock's for the frames, the worker's for the
+    // receive timeout (design 8.11 `clock_epoch`, ADR-361).
     assert_eq!(
         &events[4..events.len() - 1],
-        ["exchange"].repeat(3),
+        [
+            "clock_epoch",
+            "exchange",
+            "exchange",
+            "clock_epoch",
+            "exchange"
+        ],
+        "{text}"
+    );
+    let epochs: Vec<(&serde_json::Value, &serde_json::Value, &serde_json::Value)> = lines
+        .iter()
+        .filter(|line| line["event"] == "clock_epoch")
+        .map(|line| (&line["clock"], &line["epoch"], &line["reason"]))
+        .collect();
+    assert_eq!(
+        epochs,
+        [
+            (&"device".into(), &0.into(), &"first".into()),
+            (&"worker".into(), &0.into(), &"first".into())
+        ],
         "{text}"
     );
     let entries: Vec<&serde_json::Value> = lines

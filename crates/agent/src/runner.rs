@@ -16037,7 +16037,8 @@ def main():
             opened["transmit_confirmation"],
             serde_json::json!(["transmit_indication"])
         );
-        assert_eq!(opened["response_times_judged"], false);
+        // A transmit indication gives a transmit time, so response times can be judged.
+        assert_eq!(opened["response_times_judged"], true);
         // The mock worker does not say whether it forwards pendings (ADR-355).
         assert!(opened["forwards_pendings"].is_null());
         assert_eq!(

@@ -506,9 +506,18 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   reaches today: a request is `sent` `confirmed` by its transmit indication (above) or by an
   answer no owed request could own, and a confirmed send with no response is `vehicle` from an
   ECU that has answered requests matched this way with no link error, `undetermined` otherwise
-  (on a link whose VCI absorbs pendings, the possible-pending row below comes first); without a transmit time the timing is `not_judged`, so on a link
-  whose VCI absorbs pendings a response with no pending seen is `undetermined` (a pending may
-  have come first), while one after a pending seen takes its own row;
+  (on a link whose VCI absorbs pendings, the possible-pending row below comes first).
+  `comm_log::timing` judges the window against the limits `link_opened` recorded for the link
+  (P2, P2* and the 0x78 completion timeout, with the timing margin), from the transmit done to
+  a VCI time on the same clock and epoch (ADR-361): a response start and the receive timeout
+  both ways, a response end only as proof the response was on time, and on a link whose VCI
+  absorbs pendings past P2 as `possible_pending` up to the bound from the transmit (P2 plus the
+  completion limit). A receive timeout early or late is `system`, also where a response had
+  begun; a final response whose start is late is `system`; a suppressed request's silence with
+  a timeout at P2 and no hidden cause is `none`. Without a transmit time on the same clock the
+  timing is `not_judged`, with the reason, so on a link whose VCI absorbs pendings a response
+  with no pending seen is `undetermined` (a pending may have come first), while one after a
+  pending seen takes its own row;
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
   later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched

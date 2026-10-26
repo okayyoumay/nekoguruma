@@ -50,6 +50,9 @@ pub(crate) mod clocks;
 )]
 pub(crate) mod exchange;
 
+/// The judgement of an exchange's times against the limit in force (design 8.11).
+pub(crate) mod timing;
+
 /// Where a job keeps its communication log and under which key. The journaled entry points
 /// derive it from the journal's setup (same directory and key); a job without a journal gets one
 /// through `Job::with_comm_log`, or, when its procedure logs with `diag.log`, one of its own in
@@ -807,6 +810,9 @@ struct Inner {
     clocks: clocks::VciClocks,
     /// When the exchange whose times are being placed began, on the agent's clock.
     exchange_began_us: Option<u64>,
+    /// The limits and the margin of each link `link_opened` recorded, by link, which an
+    /// exchange's timing is judged against.
+    limits: Vec<(u32, timing::Limits)>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -915,6 +921,7 @@ impl CommLog {
             links: Vec::new(),
             clocks: clocks::VciClocks::starting_at(scan.next_clock_epoch),
             exchange_began_us: None,
+            limits: Vec::new(),
         })))
     }
 
@@ -1206,6 +1213,10 @@ impl CommLog {
         if let Some(error) = vci.error {
             vci.error = Some(error.at(inner.place_unread(error.clock, error.us, end_read)?));
         }
+        if let Some(timeout) = vci.rx_timeout {
+            vci.rx_timeout =
+                Some(timeout.at(inner.place_unread(timeout.clock, timeout.us, end_read)?));
+        }
         for (index, item) in unbound.iter().enumerate() {
             if item.read.is_none() {
                 unbound_placed[index] =
@@ -1321,6 +1332,27 @@ impl CommLog {
         // The transmit done starts the first pending's interval.
         let transmit = vci.tx_done.and_then(|time| time.placed());
         exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
+        // The times judged against the limits of the link `link_opened` recorded (design 8.11
+        // "Timing judged"); evidence on a link the log did not open keeps the timing it gives.
+        if let Some((_, limits)) = inner.limits.iter().find(|(of, _)| *of == evidence.link) {
+            let pendings: Vec<_> = evidence
+                .pending
+                .iter()
+                .zip(&pending_placed)
+                .map(|(pending, placed)| pending.clock.zip(*placed))
+                .collect();
+            evidence.timing = timing::judge(
+                *limits,
+                evidence.absorbing(),
+                timing::Times {
+                    transmit,
+                    pendings: &pendings,
+                    start: vci.rx_start.and_then(|time| time.placed()),
+                    end: vci.rx_end.and_then(|time| time.placed()),
+                    timeout: vci.rx_timeout.and_then(|time| time.placed()),
+                },
+            );
+        }
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
         for (item, placed) in unbound.iter().zip(unbound_placed) {
             let event = Event::Unattached(UnattachedEntry::of(item, placed));
@@ -1412,7 +1444,7 @@ impl CommLog {
             } else {
                 Vec::new()
             },
-            response_times_judged: false,
+            response_times_judged: indications.transmit,
             forwards_pendings,
             timing_margin: {
                 let (us, source) = self.lock().margins.timing_margin();
@@ -1420,6 +1452,15 @@ impl CommLog {
             },
         });
         let mut inner = self.lock();
+        let limits = timing::Limits {
+            p2_us: u64::from(config.p2_max_ms) * 1000,
+            p2_star_us: u64::from(config.p2_star_ms) * 1000,
+            completion_us: (config.rc78_completion_ms != 0)
+                .then(|| u64::from(config.rc78_completion_ms) * 1000),
+            margin_us: u64::from(inner.margins.timing_margin().0),
+        };
+        inner.limits.retain(|(of, _)| *of != link);
+        inner.limits.push((link, limits));
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -3385,6 +3426,92 @@ mod tests {
         assert_eq!(entry["pending"][0]["since_previous_ms"], 1.0, "{entry}");
         assert_eq!(entry["pending"][1]["since_previous_ms"], 8.0, "{entry}");
         assert_eq!(entry["times"]["vci"]["rx_end"]["epoch"], 0, "{entry}");
+    }
+
+    /// Design 8.11 "Timing judged": once `link_opened` has recorded the link's limits, an
+    /// exchange's window is judged from its VCI times on one clock and epoch, and the rows that
+    /// need it classify: a receive timeout early is `system`, also where a response had begun.
+    #[test]
+    fn windows_are_judged_against_the_link_s_limits() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        // P2 1 s, P2* 5 s, completion 25 s; the agent's 2 ms margin.
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let silent = |timeout_us: u64, before_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = before_us;
+            evidence.times.agent.end_us = before_us + timeout_us + 2_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(before_us + 500)),
+                rx_timeout: Some(device(before_us + 500 + timeout_us)),
+                error: Some(device(before_us + 500 + timeout_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        // 100 ms early, where the ECU had begun a response (first, while no earlier request
+        // is owed that could own the start).
+        let start = UnattachedItem {
+            vci_us: 10_700,
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 11_000,
+                wall_unix_ms: 0,
+            }),
+            ..start_of_message(0x7E8)
+        };
+        log.exchange_with(silent(900_000, 10_000), vec![start])
+            .unwrap();
+        // At P2 within the margin, then 100 ms early.
+        log.exchange(silent(1_001_000, 2_000_000)).unwrap();
+        log.exchange(silent(900_000, 4_000_000)).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let exchanges: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        let begun = exchanges[0];
+        assert_eq!(begun["outcome"]["result"], "response_incomplete", "{begun}");
+        assert_eq!(begun["classification"], "system", "{begun}");
+        let at_limit = exchanges[1];
+        assert_eq!(
+            at_limit["timing"]["window"], "timeout_at_limit",
+            "{at_limit}"
+        );
+        assert_eq!(at_limit["timing"]["p2_ms"], 1_000);
+        assert_eq!(at_limit["timing"]["margin_ms"], 2);
+        assert!(at_limit["timing"].get("not_judged_reason").is_none());
+        let early = exchanges[2];
+        assert_eq!(early["timing"]["window"], "timeout_early", "{early}");
+        assert_eq!(early["timing"]["window_by_ms"], 100.0, "{early}");
+        assert_eq!(early["classification"], "system", "{early}");
+        assert!(
+            early["text"]
+                .as_str()
+                .unwrap()
+                .contains("100.0 ms before the limit"),
+            "{early}"
+        );
     }
 
     /// A start-of-message indication for `identifier`, read during the exchange.

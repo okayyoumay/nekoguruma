@@ -10,10 +10,10 @@
 //!
 //! The rows of design 8.11's table that today's evidence can reach are implemented in the
 //! table's order by [`classify`]; each row it cannot reach yet is named by a comment where it
-//! would stand. What today's evidence cannot give: no transmit indication or loopback, no extra
-//! error information, no timing margin, and one answer per send-receive (`num_receive_cycles`
-//! 1). So `sent` is `confirmed` only by an answer of the ECU, `not_sent` only by a refusal, and
-//! `window` is `not_judged`.
+//! would stand. What today's evidence cannot give: no loopback, and one answer per send-receive
+//! (`num_receive_cycles` 1). The window is judged by [`super::timing`] once `link_opened` has
+//! recorded the link's limits; evidence on a link the log did not open keeps the timing it
+//! gives.
 //!
 //! `text` and `reason` are built from the domain enums only, never from an internal name (a
 //! host error, a gRPC status, an error event); those go to [`Detail`].
@@ -226,8 +226,16 @@ pub(crate) enum Window {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum NotJudgedReason {
-    /// No link gives a transmit time yet.
+    /// The exchange has no transmit time on a clock.
     NoTransmitTime,
+    /// A time to judge, or a pending the limit depends on, is not on the transmit's clock and
+    /// epoch (design 8.11 "On one clock").
+    OtherClock,
+    /// The response's end, with no start, came after the limit: it includes the response's
+    /// own transfer, so it proves the response neither on time nor late.
+    EndAfterLimit,
+    /// No response start, end or receive timeout has a VCI time.
+    NoTimeToJudge,
 }
 
 /// The entry's timing group (design 8.11, `timing`).
@@ -367,6 +375,10 @@ pub(crate) struct VciTimes {
     /// (`vci_did_not_end`, design 8.11 "Settlement"), with its round trip.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<ClockReading>,
+    /// The VCI's receive timeout that ended the exchange, which `timing` judges; `error` gives
+    /// it only when no other error is named. Not written.
+    #[serde(skip)]
+    pub rx_timeout: Option<VciTime>,
     /// When the host read the final response's item, on the entry's agent epoch: the log places
     /// its times in the order the host read them (ADR-361). Not written.
     #[serde(skip)]
@@ -1106,7 +1118,7 @@ impl Evidence {
         self.answer_head().is_some()
     }
 
-    fn absorbing(&self) -> bool {
+    pub(crate) fn absorbing(&self) -> bool {
         self.pending_visibility == PendingVisibility::AbsorbedByVci
     }
 
@@ -1587,8 +1599,9 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
     let mut outcome = match &evidence.end {
         End::Positive(_) => {
             let timing = match evidence.timing.window {
-                Window::NotJudged => " (its time is not judged)",
-                _ => "",
+                Window::NotJudged => " (its time is not judged)".to_owned(),
+                Window::Late => format!(" {} ms after the limit in force", by_ms(&evidence.timing)),
+                _ => String::new(),
             };
             format!("the ECU responded positively{timing}")
         }
@@ -1604,7 +1617,18 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
             None => "the ECU sent a negative response without a code".to_owned(),
         },
         End::NoResponse => match (evidence.timing.window, evidence.timing.p2_ms) {
-            (Window::TimeoutAtLimit, Some(p2)) => format!("no response within P2 ({p2} ms)"),
+            (Window::TimeoutAtLimit, Some(p2)) if !evidence.pending_seen() => {
+                format!("no response within P2 ({p2} ms)")
+            }
+            (Window::TimeoutAtLimit, _) => "no response within the limit in force".to_owned(),
+            (Window::TimeoutEarly, _) => format!(
+                "the VCI stopped waiting {} ms before the limit in force",
+                by_ms(&evidence.timing)
+            ),
+            (Window::TimeoutLate, _) => format!(
+                "the VCI stopped waiting {} ms after the limit in force",
+                by_ms(&evidence.timing)
+            ),
             _ => "no response came".to_owned(),
         },
         End::ResponseIncomplete => "the ECU began a response and it did not complete".to_owned(),
@@ -1636,10 +1660,10 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
 /// never decides between possible owners).
 ///
 /// The rows are in the table's order. A row that today's evidence cannot reach is named by a
-/// comment where it would stand; evidence that only such a row could classify (a late pending
-/// before any outcome, a window `timeout_early` or `timeout_late`, an answers list, a final
-/// response with a window `late`) takes the last row at the place where that row stands, so a
-/// row before it (a refusal, a lost VCI, a failure of the system, a link error) still decides.
+/// comment where it would stand; evidence that only such a row could classify (an answers
+/// list, a window `timeout_early` or `timeout_late` on a response, a window `late` on a missing
+/// response) takes the last row at the place where that row stands, so a row before it (a
+/// refusal, a lost VCI, a failure of the system, a link error) still decides.
 pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
     let (mut classification, mut reason) = row(evidence, history);
     for kind in &evidence.link_errors {
@@ -1774,10 +1798,8 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         // Not implemented, and standing here: any outcome after a forwarded pending past the
-        // limit in force before it (`system`). It needs a judged pending (the transmit time and
-        // the limits in force, no producer yet), so a window `late` after a pending takes the
-        // last row.
-        _ if late && pending_seen => last_row(),
+        // limit in force before it (`system`). The log judges no pending against its limit yet,
+        // so a window `late` is a final response's.
         End::VciLost { refused_after_loss } => {
             let mut reason = if *refused_after_loss {
                 to_owned(
@@ -1813,6 +1835,23 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         End::LinkError(kind) => kind.judge(),
+        // A receive timeout judged early or late. It is the VCI's own fault whatever else
+        // happened, so it also wins over a response that did not complete (design 8.11: the
+        // most severe row wins).
+        End::NoResponse | End::ResponseIncomplete if window == Window::TimeoutEarly => (
+            System,
+            format!(
+                "The VCI gave up waiting before the limit in force, by {} ms.",
+                by_ms(&evidence.timing)
+            ),
+        ),
+        End::NoResponse | End::ResponseIncomplete if window == Window::TimeoutLate => (
+            System,
+            format!(
+                "The VCI ended its wait after the limit in force, by {} ms: its own timer did not fire in time.",
+                by_ms(&evidence.timing)
+            ),
+        ),
         // A response start alone does not exclude H2 (ADR-354); a pending bound to the
         // exchange or a matched answer does (`open_readings`).
         End::ResponseIncomplete if !evidence.bound_answer() && history.answered_same_match == 0 => {
@@ -1829,23 +1868,20 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 "The ECU began a response that did not complete: a consecutive frame lost in the vehicle network or in the VCI's receive path, or the ECU stopping, cannot be told apart (the transport is not logged).",
             ),
         ),
-        // Not implemented: `no_response` with `window` `timeout_early` or `timeout_late`
-        // (`system`). Needs a judged window; evidence with one takes the last row. A window
-        // `late` without a pending seen has no row for a missing response either.
-        End::NoResponse if timed_out_unjudged || late => last_row(),
+        // A missing response has no row for a window `late`, which only a response gives.
+        End::NoResponse if late => last_row(),
         End::NoResponse if suppressed && !this_exchange && !answers_listed => {
-            // Not implemented, and standing here: a suppressed no-response that is `none`. It
-            // needs `sent` `confirmed`, a matched answer and a judged timeout (or a forwarding
-            // link), which no evidence gives together yet.
             let mut hidden = open_readings(evidence, history, sent, true);
             if absorbing && !matches!(window, Window::TimeoutAtLimit | Window::WithinP2) {
                 hidden.push("a pending the VCI absorbed may have obliged an answer (H4)");
             }
             if hidden.is_empty() {
+                // Sent, matched as earlier answers were, no link error, and a receive timeout at
+                // P2 on one clock or a link that would have shown a pending.
                 (
-                    Undetermined,
+                    NoFault,
                     to_owned(
-                        "No response was expected and none came, and no hidden cause (H1 to H4) is open; the log still does not decide, since not every condition that would show that nothing was missed can be checked yet.",
+                        "No response was expected, and none came: the request was sent, the ECU has answered requests matched this way, no link error came and no pending was hidden.",
                     ),
                 )
             } else {
@@ -1876,9 +1912,23 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 )
             }
         }
-        // Not implemented: a final response with `window` `late` (`system`). Needs a judged
-        // window; evidence with one takes the last row.
-        End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_) if late => last_row(),
+        End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_) if late => {
+            let outcome = match &evidence.end {
+                End::Positive(_) => "it responded positively".to_owned(),
+                End::Negative(response) => format!(
+                    "it refused the request: {}",
+                    named_code(negative_code(response))
+                ),
+                _ => "its response does not match the definition".to_owned(),
+            };
+            (
+                System,
+                format!(
+                    "Two faults seen together: the ECU answered after the limit in force, by {} ms, and the VCI did not end its wait at that limit but still took the answer; {outcome}.",
+                    by_ms(&evidence.timing)
+                ),
+            )
+        }
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
             if possible_pending && !pending_seen =>
         {
@@ -2016,6 +2066,11 @@ fn send_phrase(sent: Sent) -> &'static str {
 }
 
 /// The last row of the table: anything else.
+/// By how much a window was early or late, in milliseconds, as a reason gives it.
+fn by_ms(timing: &Timing) -> String {
+    format!("{:.1}", timing.window_by_ms.unwrap_or_default())
+}
+
 fn last_row() -> (Classification, String) {
     (
         Classification::Undetermined,
@@ -2678,12 +2733,38 @@ mod tests {
     }
 
     #[test]
-    fn what_only_a_row_not_implemented_could_classify_takes_the_last_row() {
+    fn a_final_response_or_a_timeout_past_the_limit_is_system() {
+        // A final response after the limit in force: two faults, the outcome named.
         let mut late = forwarding(evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86])));
         late.timing.window = Window::Late;
+        late.timing.window_by_ms = Some(12.5);
         let (class, reason) = verdict_of(&late);
-        assert_eq!(class, Classification::Undetermined);
-        assert!(reason.contains("could not decide"));
+        assert_eq!(class, Classification::System);
+        assert!(reason.contains("by 12.5 ms"), "{reason}");
+        assert!(reason.contains("responded positively"), "{reason}");
+        let mut refused = evidence(&READ_F186, End::Negative(vec![0x7F, 0x22, 0x22]));
+        refused.timing.window = Window::Late;
+        let (class, reason) = verdict_of(&refused);
+        assert_eq!(class, Classification::System);
+        assert!(reason.contains("conditionsNotCorrect"), "{reason}");
+        // A receive timeout early or late, also where a response had begun: the most severe
+        // row wins over `response_incomplete`.
+        for end in [End::NoResponse, End::ResponseIncomplete] {
+            for (window, phrase) in [
+                (Window::TimeoutEarly, "gave up waiting before"),
+                (Window::TimeoutLate, "after the limit in force"),
+            ] {
+                let mut timed_out = evidence(&READ_F186, end.clone());
+                timed_out.timing.window = window;
+                timed_out.timing.window_by_ms = Some(3.0);
+                let (class, reason) = verdict_of(&timed_out);
+                assert_eq!(class, Classification::System, "{reason}");
+                assert!(
+                    reason.contains(phrase) && reason.contains("by 3.0 ms"),
+                    "{reason}"
+                );
+            }
+        }
     }
 
     #[test]
@@ -3429,6 +3510,7 @@ mod tests {
                     round_trip_us: 700,
                 }),
                 response_read_us: Some(8),
+                rx_timeout: None,
             }),
         })
         .unwrap();
@@ -3626,11 +3708,23 @@ mod tests {
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         silent.timing.window = Window::TimeoutAtLimit;
         silent.timing.not_judged_reason = None;
-        let entry = log(&mut state, 2, silent);
+        let entry = log(&mut state, 2, silent.clone());
         assert_eq!(entry.link_history.answered_same_match, 1);
-        assert_eq!(entry.classification, Classification::Undetermined);
+        // Sent, matched, no link error and a timeout at P2: nothing was missed (design 8.11).
+        assert_eq!(entry.classification, Classification::None);
         assert!(!entry.reason.contains("but the evidence does not show"));
-        assert!(entry.reason.contains("no hidden cause"), "{}", entry.reason);
+        assert!(
+            entry
+                .reason
+                .contains("No response was expected, and none came"),
+            "{}",
+            entry.reason
+        );
+        // On a link whose VCI absorbs pendings, a time not judged may hide one.
+        silent.timing.window = Window::NotJudged;
+        let entry = log(&mut state, 3, silent);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(entry.reason.contains("(H4)"), "{}", entry.reason);
     }
 
     #[test]
@@ -3657,22 +3751,17 @@ mod tests {
         let (class, reason) = verdict_of(&lost);
         assert_eq!(class, Classification::Undetermined);
         assert!(reason.contains("lost"), "{reason}");
-        // The rows after it still take the last row: a silence with a window `timeout_late`, an
-        // answers list on a final response, a final response with a window `late`.
+        // The rows after it still take the last row: an answers list on a final response, and
+        // a window `timeout_late` on one.
         for case in [
-            {
-                let mut e = evidence(&READ_F186, End::NoResponse);
-                e.timing.window = Window::TimeoutLate;
-                e
-            },
             {
                 let mut e = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
                 e.answers = vec![an_answer()];
                 e
             },
             {
-                let mut e = evidence(&READ_F186, End::Negative(vec![0x7F, 0x22, 0x22]));
-                e.timing.window = Window::Late;
+                let mut e = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
+                e.timing.window = Window::TimeoutLate;
                 e
             },
         ] {

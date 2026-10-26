@@ -667,6 +667,13 @@ pub struct ResourceStatusResponse {
 pub struct ComLogicalLinkResponse {
     #[prost(message, optional, tag = "1")]
     pub cll_handle: ::core::option::Option<ComLogicalLinkHandle>,
+    /// ADR-355: whether the worker passes on every response pending (0x78)
+    /// the link sees, bound to its primitive (design 8.11 "Link settings for
+    /// the log"). UNSPECIFIED means the worker does not say, as a worker
+    /// built before the field does; a client then treats a pending as
+    /// possibly absorbed.
+    #[prost(enumeration = "PendingForwarding", tag = "2")]
+    pub pending_forwarding: i32,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct ComParamResponse {
@@ -1740,6 +1747,38 @@ impl RefusalReason {
             "REFUSAL_REASON_INVALID_PARAMETERS" => Some(Self::InvalidParameters),
             "REFUSAL_REASON_QUEUE_FULL" => Some(Self::QueueFull),
             "REFUSAL_REASON_PROTOCOL_CANNOT_CARRY" => Some(Self::ProtocolCannotCarry),
+            _ => None,
+        }
+    }
+}
+/// ADR-355: whether a link shows a client every response pending.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, ::prost::Enumeration)]
+#[repr(i32)]
+pub enum PendingForwarding {
+    Unspecified = 0,
+    /// The worker passes on every pending the ECU sends on the link.
+    All = 1,
+    /// The library may handle a pending itself without delivering it.
+    NotAll = 2,
+}
+impl PendingForwarding {
+    /// String value of the enum field names used in the ProtoBuf definition.
+    ///
+    /// The values are not transformed in any way and thus are considered stable
+    /// (if the ProtoBuf definition does not change) and safe for programmatic use.
+    pub fn as_str_name(&self) -> &'static str {
+        match self {
+            Self::Unspecified => "PENDING_FORWARDING_UNSPECIFIED",
+            Self::All => "PENDING_FORWARDING_ALL",
+            Self::NotAll => "PENDING_FORWARDING_NOT_ALL",
+        }
+    }
+    /// Creates an enum from field names used in the ProtoBuf definition.
+    pub fn from_str_name(value: &str) -> ::core::option::Option<Self> {
+        match value {
+            "PENDING_FORWARDING_UNSPECIFIED" => Some(Self::Unspecified),
+            "PENDING_FORWARDING_ALL" => Some(Self::All),
+            "PENDING_FORWARDING_NOT_ALL" => Some(Self::NotAll),
             _ => None,
         }
     }

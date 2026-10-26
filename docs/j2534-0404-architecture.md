@@ -650,7 +650,7 @@ findings and loads it.
 | `GetResourceStatus` | Query whether a protocol/resource is currently in use (accepts a table resource ID/name or a legacy raw/extended `ChannelProtocol` value/name, ADR-069) |
 | `GetResourceIds` | List resource IDs (ADR-069's opaque `0x0200`-namespace table, §6) matching a protocol/bus-type/pin filter |
 | `GetConflictingResources` | Report resource-table rows that share a DLC pin, or sit on the same physical controller (same `bus_type_id`), with a given resource, computed statically from the table (independent of CLL/connection state, ADR-106) |
-| `CreateComLogicalLink` | Allocate a CLL handle from a resource ID/name (table row, or legacy raw/extended `ChannelProtocol` fallback, ADR-069); defers `PassThruConnect` |
+| `CreateComLogicalLink` | Allocate a CLL handle from a resource ID/name (table row, or legacy raw/extended `ChannelProtocol` fallback, ADR-069); defers `PassThruConnect`; answers `pending_forwarding` `PENDING_FORWARDING_ALL`, since the service runs the response-pending handling itself and passes each pending on (ADR-355) |
 | `DestroyComLogicalLink` | Free the CLL and cancel any queued COPs |
 | `ConnectComLogicalLink` | Call `PassThruConnect`, apply params, spawn poll task |
 | `DisconnectComLogicalLink` | Disconnect the channel and release locks |

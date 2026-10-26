@@ -462,9 +462,8 @@ struct LinkOpened<'a> {
     transmit_confirmation: Vec<&'static str>,
     /// Whether response times can be judged on the link: not without a transmit time.
     response_times_judged: bool,
-    /// Whether the worker passes each response pending on: not known to the agent yet, since
-    /// it depends on the worker (the J2534 worker forwards them, a D-PDU library may absorb
-    /// them), so `null` rather than a guess.
+    /// Whether the worker passes on every response pending the link sees, as the worker's
+    /// answer to `CreateComLogicalLink` says (ADR-355); `null` when the worker does not say.
     forwards_pendings: Option<bool>,
     timing_margin: TimingMargin,
 }
@@ -1052,6 +1051,7 @@ impl CommLog {
         config: &crate::link::LinkConfig,
         valued_by_document: &[&str],
         indications: crate::link::Indications,
+        forwards_pendings: Option<bool>,
     ) -> Option<u64> {
         let mut comparams: Vec<ComParamInForce<'_>> = crate::link::own_comparams(config)
             .into_iter()
@@ -1112,7 +1112,7 @@ impl CommLog {
                 Vec::new()
             },
             response_times_judged: false,
-            forwards_pendings: None,
+            forwards_pendings,
             timing_margin: TimingMargin {
                 ms: None,
                 source: "none",
@@ -1745,6 +1745,7 @@ mod tests {
                     transmit,
                     start_of_message: true,
                 },
+                None,
             )
             .unwrap();
             log.end("ok");
@@ -1754,6 +1755,38 @@ mod tests {
                 .find(|line| line["event"] == "link_opened")
                 .unwrap();
             assert_eq!(opened["transmit_confirmation"], expected, "{transmit}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `forwards_pendings` is what the worker said when the link was created (ADR-355), and
+    /// `null` when it did not say.
+    #[test]
+    fn forwards_pendings_records_what_the_worker_said() {
+        for (said, expected) in [
+            (Some(true), serde_json::json!(true)),
+            (Some(false), serde_json::json!(false)),
+            (None, serde_json::Value::Null),
+        ] {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications::default(),
+                said,
+            )
+            .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            let opened = lines
+                .iter()
+                .find(|line| line["event"] == "link_opened")
+                .unwrap();
+            assert_eq!(opened["forwards_pendings"], expected, "{said:?}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }

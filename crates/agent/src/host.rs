@@ -18,8 +18,8 @@ use vci_service_interface::{
 };
 
 use crate::comm_log::exchange::{
-    AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin, RefusalCause,
-    SectionAttrs, SourcePos, Target, UnknownCause,
+    AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin,
+    PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
@@ -704,6 +704,15 @@ impl<C: WorkerApi> WorkerHost<C> {
         };
         let mut evidence = Evidence::new(origin, target, LOG_LINK, rx_id, request.to_vec(), end);
         evidence.at = self.at.clone();
+        // Design 8.11 `pending`, ADR-355: forwarded only when the worker says the link passes
+        // on every pending. The link has the API handle 0x78 alone (`send_receive`'s supported
+        // pending codes), so no profile's 0x21 or 0x23 makes it absorb a busy answer the log
+        // cannot see; a link that does stays `absorbed_by_vci`.
+        evidence.pending_visibility = if self.link.forwards_pendings == Some(true) {
+            PendingVisibility::Forwarded
+        } else {
+            PendingVisibility::AbsorbedByVci
+        };
         evidence.suppressed = suppresses_positive_response(request);
         evidence.detail = detail;
         complete(&mut evidence);

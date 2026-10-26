@@ -112,7 +112,7 @@ A ComLogicalLink (CLL) represents one logical view of a physical bus channel. Mu
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `CreateComLogicalLink` | `CreateComLogicalLinkRequest` | `ComLogicalLinkResponse` | Create a CLL handle for a protocol/resource combination |
+| `CreateComLogicalLink` | `CreateComLogicalLinkRequest` | `ComLogicalLinkResponse` | Create a CLL handle for a protocol/resource combination; the response also says whether the link forwards every response pending (`pending_forwarding`, below) |
 | `ConnectComLogicalLink` | `ConnectComLogicalLinkRequest` | `Response` | Open the underlying physical channel (PassThruConnect) |
 | `DisconnectComLogicalLink` | `DisconnectComLogicalLinkRequest` | `Response` | Close the physical channel (stops communication) |
 | `DestroyComLogicalLink` | `DestroyComLogicalLinkRequest` | `Response` | Release the CLL handle |
@@ -127,6 +127,20 @@ known to the client before any action that could produce a CLL-scoped event
 correlation is sufficient here and no tag is needed. Contrast with
 `cop_tag` below, which exists precisely because the equivalent handle-based
 argument does *not* hold for `StartComPrimitive`.
+
+**Whether the link forwards every pending (ADR-355):** `ComLogicalLinkResponse.pending_forwarding`
+says whether the worker passes on every response pending (0x78) the link sees, bound to its
+primitive:
+
+| Value | Worker | Meaning |
+|---|---|---|
+| `PENDING_FORWARDING_ALL` | `j2534-0404-service` | The service runs the response-pending handling itself and passes each pending on |
+| `PENDING_FORWARDING_NOT_ALL` | `iso22900-service` | The D-PDU library handles a pending itself (`CP_RC78Handling`) and need not deliver it |
+| `PENDING_FORWARDING_UNSPECIFIED` | a worker built before the field | The worker does not say; a client treats a pending as possibly absorbed |
+
+A client takes the value from this field alone, not from which worker it talks to (design
+principle 6). The agent's communication log records it as `link_opened`'s `forwards_pendings`
+and uses it for `pending_visibility` (design 8.11).
 
 **CLL state machine:**
 

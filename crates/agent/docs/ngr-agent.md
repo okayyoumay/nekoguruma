@@ -354,9 +354,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   their entries carry `accepted`, and a library that refuses one opens the link without it.
   `transmit_confirmation` names `transmit_indication` when the library accepted
   `CP_TransmitIndEnable` (the link turns no loopback on). The event gives response times not
-  judged and no timing margin (`source` `none`), since no indication is used as evidence yet,
-  and `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
-  the agent does not know it yet.
+  judged and no timing margin (`source` `none`), since no indication is used as evidence yet.
+  `forwards_pendings` is what the worker answered to `CreateComLogicalLink`
+  (`Link::forwards_pendings`, ADR-355): `true` for the J2534 worker, `false` for the D-PDU
+  worker, `null` from a worker that does not say. The agent takes it from that answer alone, and
+  each exchange on the link has `pending_visibility` `forwarded` only when it is `true`, since
+  the link has the API handle 0x78 alone (`send_receive`'s supported pending codes); otherwise
+  `absorbed_by_vci`.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs

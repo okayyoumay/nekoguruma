@@ -611,8 +611,8 @@ fn assert_comm_log(setup: &CommLogSetup) {
         assert_eq!(comparam(name)["value"], 1, "{name} in {opened}");
         assert_eq!(comparam(name)["accepted"], true, "{name} in {opened}");
     }
-    // Whether the worker forwards pendings is not known to the agent yet.
-    assert!(opened["forwards_pendings"].is_null(), "{opened}");
+    // The J2534 worker says it passes on every pending (ADR-355).
+    assert_eq!(opened["forwards_pendings"], true, "{opened}");
     // `sim-vci` gives a TxDone indication for each request (SAE J2534-1 v04.04 clause 8.6),
     // which the worker passes on with no primitive under `CP_TransmitIndEnable` (ADR-151).
     assert_eq!(
@@ -648,7 +648,7 @@ fn assert_comm_log(setup: &CommLogSetup) {
             "{entry}"
         );
         assert_eq!(entry["request"]["bytes"]["clear"], request, "{entry}");
-        assert_eq!(entry["pending_visibility"], "absorbed_by_vci", "{entry}");
+        assert_eq!(entry["pending_visibility"], "forwarded", "{entry}");
         assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
         assert!(
             entry["times"]["agent"]["end_us"].as_u64()
@@ -673,7 +673,9 @@ fn assert_comm_log(setup: &CommLogSetup) {
     assert_eq!(vin["outcome"]["result"], "positive", "{vin}");
     assert_eq!(vin["sent"], "confirmed", "{vin}");
     assert_eq!(vin["sent_evidence"], "tx_indication", "{vin}");
-    assert_eq!(vin["classification"], "undetermined", "{vin}");
+    // The worker forwards every pending, so none can have been absorbed (H4, ADR-355), and a
+    // positive response confirmed on the bus leaves nothing open.
+    assert_eq!(vin["classification"], "none", "{vin}");
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
 
     // The ECU's negative response, with its code named.
@@ -691,8 +693,9 @@ fn assert_comm_log(setup: &CommLogSetup) {
     assert_eq!(unknown["link_history"]["answered"], 1, "{unknown}");
 
     // The dropped response: its TxDone shows the request reached the bus, so the no-response
-    // rows judge it by what else is open, not by the send (H1); on this link, whose VCI
-    // absorbs pendings and whose times are not judged, a pending may have come (H4).
+    // rows judge it by what else is open, not by the send (H1). The link forwards every
+    // pending, so no absorbed pending explains it (H4, ADR-355); no answer was matched this
+    // way, so a dropped response is (H2).
     assert_eq!(dropped["outcome"]["result"], "no_response", "{dropped}");
     assert_eq!(dropped["sent"], "confirmed", "{dropped}");
     assert_eq!(dropped["sent_evidence"], "tx_indication", "{dropped}");
@@ -700,7 +703,7 @@ fn assert_comm_log(setup: &CommLogSetup) {
     assert_eq!(dropped["detail"]["host_error"], "NoResponse", "{dropped}");
     let reason = dropped["reason"].as_str().expect("a reason");
     assert!(
-        reason.contains("(H4)") && !reason.contains("(H1)"),
+        reason.contains("(H2)") && !reason.contains("(H4)") && !reason.contains("(H1)"),
         "{reason}"
     );
     assert_eq!(dropped["link_history"]["answered"], 2, "{dropped}");

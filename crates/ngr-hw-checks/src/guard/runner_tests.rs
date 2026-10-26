@@ -146,6 +146,7 @@ impl VciService for FakeWorker {
                 module_handle: 1,
                 cll_handle: 1,
             }),
+            pending_forwarding: vci::PendingForwarding::Unspecified as i32,
         }))
     }
     async fn destroy_com_logical_link(

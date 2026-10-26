@@ -670,6 +670,21 @@ message ResourceStatusResponse {
 
 message ComLogicalLinkResponse {
     ComLogicalLinkHandle cll_handle = 1;
+    // ADR-355: whether the worker passes on every response pending (0x78)
+    // the link sees, bound to its primitive (design 8.11 "Link settings for
+    // the log"). UNSPECIFIED means the worker does not say, as a worker
+    // built before the field does; a client then treats a pending as
+    // possibly absorbed.
+    PendingForwarding pending_forwarding = 2;
+}
+
+// ADR-355: whether a link shows a client every response pending.
+enum PendingForwarding {
+    PENDING_FORWARDING_UNSPECIFIED = 0;
+    // The worker passes on every pending the ECU sends on the link.
+    PENDING_FORWARDING_ALL = 1;
+    // The library may handle a pending itself without delivering it.
+    PENDING_FORWARDING_NOT_ALL = 2;
 }
 
 message ComParamResponse {

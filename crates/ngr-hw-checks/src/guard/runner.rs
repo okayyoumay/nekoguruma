@@ -177,7 +177,7 @@ impl WorkerApi for GuardedClient {
         set_com_param(SetComParamRequest) -> Response = |h, r| h.set_com_param(r);
         set_unique_resp_id_table(SetUniqueRespIdTableRequest) -> Response = |h, r| h.set_table_completed(r);
         start_com_primitive(StartComPrimitiveRequest) -> ComPrimitiveResponse = |h, r| h.start_com_primitive(r);
-        cancel_com_primitive(CancelComPrimitiveRequest) -> Response = |h, r| h.cancel_com_primitive(r);
+        cancel_com_primitive(CancelComPrimitiveRequest) -> Response = |h, r| h.cancel_com_primitive_settling(r);
         subscribe_event(SubscribeEventRequest) -> Streaming<EventNotification> = |h, r| h.subscribe_event(r);
         io_ctl(IoCtlRequest) -> IoCtlResponse = |h, r| h.io_ctl(r);
     }

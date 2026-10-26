@@ -303,18 +303,33 @@ fn the_rules_between_the_tables_are_checked() {
 #[test]
 fn the_ecu_definitions_named_are_checked() {
     use ErrorCode::*;
-    // An identifier no ECU definition declares.
+    // An identifier no ECU definition declares; the rules on the example ECU then read no ECU
+    // of the vehicle's entries.
     assert_eq!(
         errors(with(
             "entry_definitions.csv",
             "role,order,definition\nengine,1,otherEcu\n"
         )),
-        vec![at(
-            UnknownReference,
-            "entry_definitions.csv",
-            Some(2),
-            Some("definition")
-        )]
+        vec![
+            at(
+                UnknownReference,
+                "entry_definitions.csv",
+                Some(2),
+                Some("definition")
+            ),
+            at(
+                UnknownReference,
+                "field_rules.csv",
+                Some(2),
+                Some("definition")
+            ),
+            at(
+                UnknownReference,
+                "vin_rules.csv",
+                Some(2),
+                Some("definition")
+            ),
+        ]
     );
     let field = |row: &str| {
         with(
@@ -386,5 +401,130 @@ fn the_ecu_definitions_named_are_checked() {
             Some("definition")
         )),
         "{twice:?}"
+    );
+}
+
+#[test]
+fn a_source_is_a_parameterless_scalar_read_of_one_of_the_vehicle_s_ecus() {
+    use ErrorCode::*;
+    let field = |row: &str| {
+        with(
+            "field_rules.csv",
+            &format!("component,value,definition,variant,service,field,expected\n{row}\n"),
+        )
+    };
+    // A read whose request needs a value (the status mask) has none to send.
+    assert_eq!(
+        errors(field(
+            "model_year,2027,exampleEcu,exampleEcuV2,readDtcByStatusMask,availabilityMask,FF"
+        )),
+        vec![at(BadValue, "field_rules.csv", Some(2), Some("service"))]
+    );
+    // A shaped field (a selection) is no value to compare.
+    assert_eq!(
+        errors(field(
+            "model_year,2027,exampleEcu,exampleEcuV2,lastResetReason.read,details,01"
+        )),
+        vec![at(BadValue, "field_rules.csv", Some(2), Some("field"))]
+    );
+    // The documents of one ECU definition all carry its identifier.
+    let tables = read_vehicle_files(example()).expect("reads");
+    let mut mixed = example_ecu();
+    mixed.last_mut().expect("a document").definition_id = None;
+    let refused = located(convert_vehicle(tables, &[&mixed]).expect_err("refused"));
+    assert!(
+        refused.contains(&at(
+            UnknownReference,
+            "entry_definitions.csv",
+            Some(2),
+            Some("definition")
+        )),
+        "{refused:?}"
+    );
+    // A rule reads one of the vehicle's own ECUs, one an entry names.
+    let mut body = example_ecu();
+    for document in &mut body {
+        document.definition_id = Some("bodyEcu".to_owned());
+    }
+    let tables = read_vehicle_files(field(
+        "model_year,2027,bodyEcu,exampleEcuV2,softwareVersion.read,softwareVersion,32",
+    ))
+    .expect("reads");
+    let ecu = example_ecu();
+    assert_eq!(
+        located(convert_vehicle(tables, &[&ecu, &body]).expect_err("refused")),
+        vec![at(
+            UnknownReference,
+            "field_rules.csv",
+            Some(2),
+            Some("definition")
+        )]
+    );
+}
+
+#[test]
+fn reading_reports_what_the_ecu_tables_report() {
+    use ErrorCode::*;
+    // A VIN can hold no I, O or Q, nor small letters.
+    assert_eq!(
+        read_errors(with(
+            "vin_rules.csv",
+            "component,value,start,end,expected,definition,variant,service,field\noem,Nekoguruma Motors,1,3,NgR,exampleEcu,exampleEcuV1,vin.read,vin\n"
+        )),
+        vec![at(BadValue, "vin_rules.csv", Some(2), Some("expected"))]
+    );
+    // A file given twice, known or not.
+    let mut twice = example();
+    twice.push(("foo.csv".to_owned(), Vec::new()));
+    twice.push(("foo.csv".to_owned(), Vec::new()));
+    assert_eq!(
+        read_errors(twice),
+        vec![
+            at(UnknownFile, "foo.csv", None, None),
+            at(Duplicate, "foo.csv", None, None),
+        ]
+    );
+    // A repeat names the first line it repeats.
+    let tables = read_vehicle_files(with(
+        "identification.csv",
+        "component,value\nvehicle_model,Example\nvehicle_model,Example\nvehicle_model,Example\noem,Nekoguruma Motors\nmodel_year,2027\n",
+    ))
+    .expect("reads");
+    let ecu = example_ecu();
+    let rejected = convert_vehicle(tables, &[&ecu]).expect_err("refused");
+    assert!(
+        rejected
+            .errors
+            .iter()
+            .filter(|e| e.code == Duplicate)
+            .all(|e| e.hint.contains("line 2")),
+        "{rejected}"
+    );
+    // A vehicle definition with no identifier or no entry.
+    assert_eq!(
+        errors(with("vehicle.csv", "id\n")),
+        vec![at(MissingColumn, "vehicle.csv", None, None)]
+    );
+}
+
+#[test]
+fn the_names_are_checked_only_once_the_tables_hold() {
+    use ErrorCode::*;
+    let mut files: Vec<_> = example()
+        .into_iter()
+        .filter(|(n, _)| n != "entries.csv" && n != "entry_definitions.csv")
+        .collect();
+    files.push((
+        "entries.csv".to_owned(),
+        b"role,optional,gateway\nengine,no,\nengine,no,\n".to_vec(),
+    ));
+    files.push((
+        "entry_definitions.csv".to_owned(),
+        b"role,order,definition\nengine,1,nopeEcu\n".to_vec(),
+    ));
+    // The unknown identifier, a stage-3 error, is not reported beside the duplicate role.
+    assert_eq!(
+        errors(files),
+        vec![at(Duplicate, "entries.csv", Some(3), Some("role"))]
     );
 }

@@ -10,7 +10,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::Path;
 
-use diag_ir::declaration::{DataKind, EcuDocumentT, FieldT, ServiceT};
+use diag_ir::declaration::{DataKind, EcuDocumentT, FieldT, ServiceT, ShapeT};
 
 use super::ReadError;
 use super::error::{ErrorCode, Errors, Rejected};
@@ -240,11 +240,12 @@ fn read(
 ) -> Result<VehicleTables, Rejected> {
     let mut errors = Errors::default();
     let mut sheets: HashMap<&'static str, Sheet> = HashMap::new();
+    let mut seen = HashSet::new();
     for (name, contents) in files {
         if !name.to_ascii_lowercase().ends_with(".csv") {
             continue;
         }
-        if sheets.keys().any(|file| *file == name) {
+        if !seen.insert(name.clone()) {
             errors.push(
                 ErrorCode::Duplicate,
                 &name,
@@ -338,13 +339,19 @@ fn read(
                 row.error(e, ErrorCode::BadValue, "end", "end is before start");
                 return None;
             }
-            if !expected.is_ascii() || expected.len() != usize::from(end - start + 1) {
+            // A well-formed VIN has digits and capital letters other than I, O and Q
+            // (ADR-261 item 3), so any other text could never match.
+            let vin_character =
+                |c: char| c.is_ascii_digit() || (c.is_ascii_uppercase() && !"IOQ".contains(c));
+            if !expected.chars().all(vin_character)
+                || expected.len() != usize::from(end - start + 1)
+            {
                 row.error(
                     e,
                     ErrorCode::BadValue,
                     "expected",
                     format!(
-                        "expected must be {} ASCII characters, one per position from start to end",
+                        "expected must be {} VIN characters (0-9, A-Z but I, O and Q), one per position from start to end",
                         end - start + 1
                     ),
                 );
@@ -540,6 +547,21 @@ pub fn convert_vehicle(
     })
 }
 
+/// The line `key` was first given on, or `None` (recording `line`) when this is the first.
+fn first_line<K: Eq + std::hash::Hash>(
+    map: &mut HashMap<K, Line>,
+    key: K,
+    line: Line,
+) -> Option<Line> {
+    match map.entry(key) {
+        std::collections::hash_map::Entry::Occupied(first) => Some(*first.get()),
+        std::collections::hash_map::Entry::Vacant(vacant) => {
+            vacant.insert(line);
+            None
+        }
+    }
+}
+
 /// The rules between the tables of the vehicle definition itself.
 fn check_tables(tables: &VehicleTables, errors: &mut Errors) {
     // One identifier.
@@ -569,7 +591,7 @@ fn check_tables(tables: &VehicleTables, errors: &mut Errors) {
     // Each value of a component once.
     let mut values: HashMap<(Component, &str), Line> = HashMap::new();
     for row in &tables.identification {
-        if let Some(earlier) = values.insert((row.component, &row.value), row.line) {
+        if let Some(earlier) = first_line(&mut values, (row.component, &row.value), row.line) {
             errors.push(
                 ErrorCode::Duplicate,
                 IDENTIFICATION.file,
@@ -611,7 +633,7 @@ fn check_tables(tables: &VehicleTables, errors: &mut Errors) {
     // Role names are unique.
     let mut roles: HashMap<&str, Line> = HashMap::new();
     for row in &tables.entries {
-        if let Some(earlier) = roles.insert(&row.role, row.line) {
+        if let Some(earlier) = first_line(&mut roles, &row.role, row.line) {
             errors.push(
                 ErrorCode::Duplicate,
                 ENTRIES.file,
@@ -654,7 +676,8 @@ fn check_tables(tables: &VehicleTables, errors: &mut Errors) {
         let mut at = row.role.as_str();
         while let Some(&next) = gateway_of.get(at) {
             if !seen.insert(next) {
-                // Reported once, on the entry that closes the cycle back to itself.
+                // Reported on each entry whose own chain comes back to it: every entry in a
+                // cycle, not one that only leads into it.
                 if next == row.role {
                     errors.push(
                         ErrorCode::BadValue,
@@ -685,7 +708,7 @@ fn check_tables(tables: &VehicleTables, errors: &mut Errors) {
                 ),
             );
         }
-        if let Some(earlier) = orders.insert((&row.role, row.order), row.line) {
+        if let Some(earlier) = first_line(&mut orders, (&row.role, row.order), row.line) {
             errors.push(
                 ErrorCode::Duplicate,
                 ENTRY_DEFINITIONS.file,
@@ -697,7 +720,8 @@ fn check_tables(tables: &VehicleTables, errors: &mut Errors) {
                 ),
             );
         }
-        if let Some(earlier) = alternatives.insert((&row.role, &row.definition), row.line) {
+        if let Some(earlier) = first_line(&mut alternatives, (&row.role, &row.definition), row.line)
+        {
             errors.push(
                 ErrorCode::Duplicate,
                 ENTRY_DEFINITIONS.file,
@@ -746,16 +770,37 @@ fn check_names(tables: &VehicleTables, ecu_definitions: &[&[EcuDocumentT]], erro
         }
     }
     let named = |id: &str| -> Result<&[EcuDocumentT], String> {
-        match by_id.get(id).map(Vec::as_slice) {
-            None | Some([]) => Err(format!(
-                "no ECU definition this vehicle definition is converted with has the identifier {id}"
-            )),
-            Some([one]) => Ok(ecu_definitions[*one]),
-            Some(_) => Err(format!(
-                "more than one ECU definition has the identifier {id}"
-            )),
+        let documents = match by_id.get(id).map(Vec::as_slice) {
+            None | Some([]) => {
+                return Err(format!(
+                    "no ECU definition this vehicle definition is converted with has the identifier {id}"
+                ));
+            }
+            Some([one]) => ecu_definitions[*one],
+            Some(_) => {
+                return Err(format!(
+                    "more than one ECU definition has the identifier {id}"
+                ));
+            }
+        };
+        // Every document of one definition carries its identifier (ADR-363 item 2).
+        if documents
+            .iter()
+            .all(|document| document.definition_id.as_deref() == Some(id))
+        {
+            Ok(documents)
+        } else {
+            Err(format!(
+                "the documents given for the ECU definition {id} do not all carry its identifier"
+            ))
         }
     };
+    // A rule reads one of the vehicle's own ECUs (ADR-326 item 2): a definition an entry names.
+    let alternatives: HashSet<&str> = tables
+        .entry_definitions
+        .iter()
+        .map(|row| row.definition.as_str())
+        .collect();
     for row in &tables.entry_definitions {
         if let Err(hint) = named(&row.definition) {
             errors.push(
@@ -781,6 +826,17 @@ fn check_names(tables: &VehicleTables, ecu_definitions: &[&[EcuDocumentT]], erro
         let mut report = |code: ErrorCode, column: &str, hint: String| {
             errors.push(code, file, Some(line), Some(column), hint);
         };
+        if !alternatives.contains(source.definition.as_str()) {
+            report(
+                ErrorCode::UnknownReference,
+                "definition",
+                format!(
+                    "{} is not an ECU definition of this vehicle definition's entries",
+                    source.definition
+                ),
+            );
+            continue;
+        }
         let documents = match named(&source.definition) {
             Ok(documents) => documents,
             Err(hint) => {
@@ -830,6 +886,24 @@ fn check_names(tables: &VehicleTables, ecu_definitions: &[&[EcuDocumentT]], erro
             );
             continue;
         }
+        // The read is sent as declared: a request that needs a value has none to send, as for
+        // an identity source (`csv-tables.md` 4.13).
+        if service
+            .request
+            .as_ref()
+            .and_then(|request| request.params.as_ref())
+            .is_some_and(|params| !params.is_empty())
+        {
+            report(
+                ErrorCode::BadValue,
+                "service",
+                format!(
+                    "{} needs a value in its request, which a rule cannot give",
+                    source.service
+                ),
+            );
+            continue;
+        }
         let Some(field) = top_field(service, &source.field) else {
             report(
                 ErrorCode::UnknownReference,
@@ -841,7 +915,16 @@ fn check_names(tables: &VehicleTables, ecu_definitions: &[&[EcuDocumentT]], erro
             );
             continue;
         };
-        if vin && !matches!(field.kind, DataKind::Ascii | DataKind::Utf8) {
+        if !matches!(field.shape, ShapeT::NONE) {
+            report(
+                ErrorCode::BadValue,
+                "field",
+                format!(
+                    "{} is shaped (a repeat, selection or group), not a value a rule can compare",
+                    source.field
+                ),
+            );
+        } else if vin && !matches!(field.kind, DataKind::Ascii | DataKind::Utf8) {
             report(
                 ErrorCode::BadValue,
                 "field",

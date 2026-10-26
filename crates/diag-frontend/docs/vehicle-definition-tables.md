@@ -64,7 +64,7 @@ vehicle's `component` is `value`. The VIN is read from the rule's source (ADR-32
 | `component` | as in 2.2 | yes | The component the rule establishes |
 | `value` | text | yes | The value it establishes, one `identification.csv` gives for that component (`CSV_UNKNOWN_REFERENCE` otherwise) |
 | `start`, `end` | integer, 1 to 17, `end` no less than `start` | yes | The VIN positions compared, from 1, inclusive |
-| `expected` | text | yes | Exactly one ASCII character per position (`CSV_BAD_VALUE` otherwise) |
+| `expected` | text | yes | Exactly one character per position, each a digit or a capital letter other than I, O and Q, as a well-formed VIN has (ADR-261 item 3; `CSV_BAD_VALUE` otherwise) |
 | `definition`, `variant`, `service`, `field` | source | yes | Where the VIN is read (2.6); the field is text (`ascii` or `utf8`) |
 
 ### 2.4 `field_rules.csv`
@@ -109,14 +109,18 @@ A rule's source names a service and a field of one variant of an ECU definition,
 definition's tables name them, since service and field identifiers are local to a document
 (ADR-318):
 
-- `definition`: the identifier of exactly one of the ECU definitions the vehicle definition is
-  converted with. None, or more than one with that identifier, is `CSV_UNKNOWN_REFERENCE`.
+- `definition`: the identifier of one of the vehicle's own ECU definitions, one an entry names in
+  `entry_definitions.csv` (ADR-326 item 2), and of exactly one of the ECU definitions the vehicle
+  definition is converted with, all of whose documents carry it (ADR-363 item 2). Anything else
+  is `CSV_UNKNOWN_REFERENCE`.
 - `variant`: a variant of that definition, by its `variants.csv` name.
 - `service`: a service of that variant, by its service name, generated ones included
   (`vin.read`). It must be in the read-only set of the application layer the variant's protocols
-  name (ADR-327 item 1; for UDS, ReadDataByIdentifier and ReadDTCInformation), or it is
-  `CSV_BAD_VALUE`.
-- `field`: a field at the top of that service's positive response.
+  name (ADR-327 item 1; for UDS, ReadDataByIdentifier and ReadDTCInformation), and its request
+  needs no value (no field other than constants, as for an identity source, `csv-tables.md`
+  4.13), or it is `CSV_BAD_VALUE`.
+- `field`: a field at the top of that service's positive response (`CSV_UNKNOWN_REFERENCE`
+  otherwise) that is not shaped: not a repeat, a selection or a group (`CSV_BAD_VALUE`).
 
 An ECU definition's identifier in `entry_definitions.csv` is checked the same way.
 
@@ -128,6 +132,9 @@ As for ECU definitions (ADR-298), the checks run in stages, and each lists all o
 2. the rules between the vehicle definition's own tables: one identifier, values stated once,
    rules naming stated values, roles, gateways and alternatives (2.1 to 2.5);
 3. the names the definition gives the ECU definitions it is converted with (2.6).
+
+A repeat (a table given twice, a value, role, order or alternative given again) names the line
+that first gave it.
 
 A later stage runs only when the earlier ones found no error.
 

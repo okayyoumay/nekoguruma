@@ -362,8 +362,15 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   the link has the API handle 0x78 alone (`send_receive`'s supported pending codes); otherwise
   `absorbed_by_vci`. The host keeps each pending bound to the primitive for the exchange's
   `pending` list, with its VCI time and clock as the worker gave them and the agent's time when
-  the host read it, so a forwarded link's empty list means no pending came. Each pending gives its
-  interval from the attached transmit indication or the previous pending
+  the host read it, so a forwarded link's empty list means no pending came. The entry's VCI
+  times (`times.vci`, `exchange::VciTimes`) each come from their item, with that item's clock
+  and an epoch of 0 until the log unwraps them: the transmit done from the response's own
+  `tx_msg_done_timestamp` or else the attached transmit indication, the response's start from its
+  own `start_msg_timestamp` or else the latest attached start of message, the response's end from
+  the final response's item, and the error from the error event the entry names (a lost VCI, a
+  failed primitive's last error, else the last link error or the receive timeout), so on a J2534
+  link a frame's time is on `device` and the receive timeout's on `worker`. Each pending gives its
+  interval from that transmit done or the previous pending
   (`exchange::pending_intervals`), only between two VCI times on one clock and only forward (a
   raw time below the one before, a wrap or a reset, gives none, since the log does not unwrap the
   32-bit VCI times yet); otherwise none. When the agent's own deadline, not the

@@ -19,7 +19,8 @@ use vci_service_interface::{
 
 use crate::comm_log::exchange::{
     AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin, Pending,
-    PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause,
+    PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause, VciTime,
+    VciTimes,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
@@ -549,7 +550,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let end = deadline_end(end, sent.agent_deadline);
-            let link_errors = events_seen(&sent, &mut detail);
+            let (link_errors, error_at) = events_seen(&sent, &mut detail);
+            let vci = VciTimes {
+                error: error_at,
+                ..sent.response_times
+            };
             let unbound = unattached_items(&sent.unbound);
             let before_answer = errors_before_answer(&sent);
             let vci_ended = sent.rx_timeout.is_some();
@@ -560,6 +565,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.vci_ended = vci_ended;
                 evidence.link_errors.extend(link_errors);
                 evidence.link_errors_before_answer = before_answer;
+                evidence.times.vci = (!vci.is_empty()).then_some(vci);
             });
         }
         sent.result
@@ -615,6 +621,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     unbound: Vec::new(),
                     pendings: Vec::new(),
                     agent_deadline: false,
+                    response_times: VciTimes::default(),
                 };
             }
         };
@@ -665,6 +672,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             unbound: std::mem::take(&mut progress.unbound),
             pendings: std::mem::take(&mut progress.pendings),
             agent_deadline,
+            response_times: progress.response_times,
         }
     }
 
@@ -854,22 +862,30 @@ fn clock_of(item: &EventItem) -> Option<Clock> {
 const SID_REQUEST_DOWNLOAD: u8 = 0x34;
 
 /// One error event the worker reported: its code and its extra error information
-/// (ISO 22900-2:2022 D.4.2), the code and the name the worker gives it (ADR-351).
+/// (ISO 22900-2:2022 D.4.2), the code and the name the worker gives it (ADR-351), and its VCI
+/// time with the clock its item names (ADR-353).
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct ErrorSeen {
     event: i32,
     extra: Option<u32>,
     extra_name: Option<String>,
+    at: Option<VciTime>,
 }
 
 impl ErrorSeen {
-    fn of(data: &ErrorData) -> Self {
+    fn of(data: &ErrorData, at: VciTime) -> Self {
         Self {
             event: data.error_event,
             extra: data.extra_error_info,
             extra_name: data.extra_error_info_name.clone(),
+            at: Some(at),
         }
     }
+}
+
+/// An event item's VCI time, on the clock the item names.
+fn vci_time(item: &EventItem) -> VciTime {
+    VciTime::new(u64::from(item.timestamp), clock_of(item))
 }
 
 /// How a primitive ended: its outcome, whether it started (a failure to start it sent
@@ -890,6 +906,9 @@ struct Sent {
     /// The agent's own deadline ended the wait, not the worker: the VCI had not ended the
     /// exchange (design 8.11 `vci_did_not_end`).
     agent_deadline: bool,
+    /// The VCI times the final response's item gave: its end, and the transmit done and start
+    /// it may carry.
+    response_times: VciTimes,
 }
 
 /// A response pending (0x78) bound to the primitive (design 8.11 `pending`): its VCI time and
@@ -935,7 +954,7 @@ fn errors_before_answer(sent: &Sent) -> bool {
 /// event that ended the exchange (a lost VCI, a failed primitive). A receive timeout is named
 /// but is no link error. The named event's extra error information goes in too, its code and its
 /// name as the worker gave them (ADR-351): the agent does not interpret either.
-fn events_seen(sent: &Sent, detail: &mut Detail) -> Vec<LinkErrorKind> {
+fn events_seen(sent: &Sent, detail: &mut Detail) -> (Vec<LinkErrorKind>, Option<VciTime>) {
     let seen = also_seen(&sent.result, &sent.error_events);
     // The event `sent_end` named, when it named one: the one that ended the exchange.
     let named = match &sent.result {
@@ -952,9 +971,12 @@ fn events_seen(sent: &Sent, detail: &mut Detail) -> Vec<LinkErrorKind> {
     };
     detail.extra_error_info = named.and_then(|seen| seen.extra);
     detail.extra_error_info_name = named.and_then(|seen| seen.extra_name.clone());
-    seen.iter()
+    let kinds = seen
+        .iter()
         .map(|seen| link_error_kind(seen.event))
-        .collect()
+        .collect();
+    // The entry's error time is the named event's (design 8.11 `times`).
+    (kinds, named.and_then(|seen| seen.at))
 }
 
 /// Whether `request` asks for its positive response to be suppressed: bit 7 of the
@@ -1320,6 +1342,8 @@ struct Progress {
     unbound: Vec<Unbound>,
     /// The response pendings bound to the primitive, in order, for the communication log.
     pendings: Vec<PendingRead>,
+    /// The VCI times the final response's item gave, for the communication log.
+    response_times: VciTimes,
 }
 
 impl Progress {
@@ -1337,6 +1361,7 @@ impl Progress {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            response_times: VciTimes::default(),
         })
     }
 
@@ -1354,6 +1379,7 @@ impl Progress {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            response_times: VciTimes::default(),
         }
     }
 
@@ -1396,7 +1422,7 @@ impl Progress {
             && let Some(event_item::Data::ErrorData(data)) = &item.data
             && data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
         {
-            self.vci_lost = Some(ErrorSeen::of(data));
+            self.vci_lost = Some(ErrorSeen::of(data, vci_time(&item)));
             return Some(Err(HostError::VciLost));
         }
         // Events of earlier primitives, and of none, are not this request's; their results and
@@ -1422,6 +1448,7 @@ impl Progress {
                 read: None,
             });
         }
+        let at = vci_time(&item);
         match item.data {
             // A response pending the worker passes on, and anything that does not answer this
             // request, is not the final response (ADR-235 item 3).
@@ -1429,6 +1456,15 @@ impl Progress {
                 if self.answers(&result.data_bytes)
                     && !self.negative.is_pending(self.sid, &result.data_bytes) =>
             {
+                // The response's own item is its end; it may carry its request's transmit done
+                // and its own start, on the same clock (ISO 22900-2:2022 10.1.4.11.4).
+                let on_its_clock = |us: u32| VciTime::new(u64::from(us), at.clock);
+                self.response_times = VciTimes {
+                    tx_done: result.tx_msg_done_timestamp.map(on_its_clock),
+                    rx_start: result.start_msg_timestamp.map(on_its_clock),
+                    rx_end: Some(at),
+                    error: None,
+                };
                 self.response = Some(result.data_bytes);
                 self.errors_before_response = Some(self.errors.len());
             }
@@ -1437,11 +1473,11 @@ impl Progress {
             Some(event_item::Data::ErrorData(data))
                 if data.error_event == PduErrorEvent::PduErrEvtRxTimeout as i32 =>
             {
-                self.rx_timeout = Some(ErrorSeen::of(&data));
+                self.rx_timeout = Some(ErrorSeen::of(&data, at));
             }
             Some(event_item::Data::ErrorData(data)) => {
                 self.error = Some(data.error_event);
-                self.errors.push(ErrorSeen::of(&data));
+                self.errors.push(ErrorSeen::of(&data, at));
             }
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32
@@ -1910,6 +1946,7 @@ mod tests {
             event,
             extra: None,
             extra_name: None,
+            at: None,
         }
     }
 
@@ -1947,11 +1984,12 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             agent_deadline: false,
+            response_times: VciTimes::default(),
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
                 sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
-            let link_errors = events_seen(sent, &mut detail);
+            let (link_errors, _) = events_seen(sent, &mut detail);
             assert_eq!(detail.extra_error_info, None);
             assert_eq!(detail.extra_error_info_name, None);
             (detail.error_event, link_errors)
@@ -2016,6 +2054,7 @@ mod tests {
             event: event as i32,
             extra,
             extra_name: name.map(str::to_owned),
+            at: None,
         };
         let tx = |extra, name| event(PduErrorEvent::PduErrEvtTxError, extra, name);
         let timeout = |extra, name| event(PduErrorEvent::PduErrEvtRxTimeout, extra, name);
@@ -2030,6 +2069,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             agent_deadline: false,
+            response_times: VciTimes::default(),
         };
         let given = |sent: Sent| {
             let (_, mut detail) =
@@ -2626,6 +2666,95 @@ mod tests {
         assert_eq!(logged[0].agent_us, 100);
     }
 
+    /// Design 8.11 `times`: the final response's item gives the response's end, and the
+    /// transmit done and start it carries, on its clock; the error time is that of the error
+    /// event the entry names.
+    #[test]
+    fn the_response_s_item_and_the_named_error_give_their_vci_times() {
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let response = EventItem {
+            timestamp: 900,
+            timestamp_clock: TimestampClock::Device as i32,
+            ..event(
+                Some(COP),
+                event_item::Data::ResultData(vci_service_interface::ResultData {
+                    data_bytes: vec![0x62, 0xF1, 0x90],
+                    tx_msg_done_timestamp: Some(100),
+                    start_msg_timestamp: Some(600),
+                    ..Default::default()
+                }),
+            )
+        };
+        assert!(progress.on_event(response, COP).is_none());
+        let on = |us, clock: Option<Clock>| Some(VciTime::new(us, clock));
+        assert_eq!(
+            progress.response_times,
+            VciTimes {
+                tx_done: on(100, Some(Clock::Device)),
+                rx_start: on(600, Some(Clock::Device)),
+                rx_end: on(900, Some(Clock::Device)),
+                error: None,
+            }
+        );
+        // A receive timeout, the event a silent exchange names, has its own item's time and
+        // clock; an item that names no clock gives a time with none.
+        let mut silent = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let timeout = EventItem {
+            timestamp: 1_500,
+            timestamp_clock: TimestampClock::Worker as i32,
+            ..event(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtRxTimeout as i32,
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                }),
+            )
+        };
+        let fault = EventItem {
+            timestamp: 1_200,
+            ..event(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtFrameStruct as i32,
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                }),
+            )
+        };
+        assert!(silent.on_event(timeout, COP).is_none());
+        let sent = |progress: &mut Progress, result| Sent {
+            result,
+            started: true,
+            error_events: std::mem::take(&mut progress.errors),
+            errors_before_response: None,
+            rx_timeout: progress.rx_timeout.take(),
+            vci_lost: None,
+            unbound: Vec::new(),
+            pendings: Vec::new(),
+            agent_deadline: false,
+            response_times: progress.response_times,
+        };
+        let read = [0x22, 0xF1, 0x90];
+        let named = |sent: &Sent| {
+            let (_, mut detail) =
+                sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
+            events_seen(sent, &mut detail).1
+        };
+        let timed_out = sent(&mut silent, Err(HostError::NoResponse));
+        assert_eq!(named(&timed_out), on(1_500, Some(Clock::Worker)));
+        // A link error before the timeout is the event named, with its time.
+        let mut faulted = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        assert!(faulted.on_event(fault, COP).is_none());
+        let failed = sent(
+            &mut faulted,
+            Err(HostError::PrimitiveFailed(
+                PduErrorEvent::PduErrEvtFrameStruct as i32,
+            )),
+        );
+        assert_eq!(named(&failed), on(1_200, None));
+    }
+
     /// Design 8.11 "Matched answer": the order the items were read in says which of the
     /// exchange's link errors came before its final response.
     #[test]
@@ -2658,6 +2787,7 @@ mod tests {
                 unbound: Vec::new(),
                 pendings: Vec::new(),
                 agent_deadline: false,
+                response_times: VciTimes::default(),
             }
         };
         let before = sent_of(vec![fault(), answer(), finished()]);

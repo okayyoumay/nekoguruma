@@ -282,19 +282,52 @@ pub(crate) struct AgentTimes {
     pub end_wall_unix_ms: Option<u64>,
 }
 
-/// VCI times of an exchange, raw, with their clock and epoch.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
-pub(crate) struct VciTimes {
-    pub clock: Clock,
+/// One VCI time of an exchange (design 8.11 `times`): the raw microseconds, the clock its item
+/// named (absent when it named none: the time is then compared with no other, "On one clock",
+/// ADR-353) and that clock's epoch. The log does not unwrap the 32-bit times yet, so the epoch
+/// stays 0.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct VciTime {
+    pub us: u64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<Clock>,
     pub epoch: u32,
+}
+
+impl VciTime {
+    pub(crate) fn new(us: u64, clock: Option<Clock>) -> Self {
+        Self {
+            us,
+            clock,
+            epoch: 0,
+        }
+    }
+}
+
+/// VCI times of an exchange, each as its item gave it, with its own clock: on a J2534 link a
+/// frame's time is on `device` and an error's on `worker` (design 8.11 "On one clock").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize)]
+pub(crate) struct VciTimes {
+    /// The transmit done: a transmit indication's time, or the one the response's item carries.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub tx_done_us: Option<u64>,
+    pub tx_done: Option<VciTime>,
+    /// The response's start: a start-of-message indication's time, or the one the response's
+    /// item carries.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_start_us: Option<u64>,
+    pub rx_start: Option<VciTime>,
+    /// The response's end: the final response's own time.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub rx_end_us: Option<u64>,
+    pub rx_end: Option<VciTime>,
+    /// The error event that ended the primitive: a lost VCI, else a receive timeout, else the
+    /// last error the primitive reported.
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_us: Option<u64>,
+    pub error: Option<VciTime>,
+}
+
+impl VciTimes {
+    pub(crate) fn is_empty(&self) -> bool {
+        *self == Self::default()
+    }
 }
 
 /// Gives each pending its interval from the transmit (`transmit`, the attached transmit
@@ -3085,16 +3118,27 @@ mod tests {
                 end_wall_unix_ms: Some(5),
             },
             vci: Some(VciTimes {
-                clock: Clock::Device,
-                epoch: 0,
-                tx_done_us: Some(1),
-                rx_start_us: Some(2),
-                rx_end_us: Some(3),
-                error_us: Some(4),
+                tx_done: Some(VciTime::new(1, Some(Clock::Device))),
+                rx_start: Some(VciTime::new(2, Some(Clock::Device))),
+                rx_end: None,
+                error: Some(VciTime::new(4, Some(Clock::Worker))),
             }),
         })
         .unwrap();
-        assert_eq!(times["vci"]["clock"], "device");
+        // Each time carries its own clock and epoch; an absent one is left out.
+        assert_eq!(
+            times["vci"],
+            json!({
+                "tx_done": { "us": 1, "clock": "device", "epoch": 0 },
+                "rx_start": { "us": 2, "clock": "device", "epoch": 0 },
+                "error": { "us": 4, "clock": "worker", "epoch": 0 },
+            })
+        );
+        // A time whose item named no clock has none.
+        assert_eq!(
+            serde_json::to_value(VciTime::new(7, None)).unwrap(),
+            json!({ "us": 7, "epoch": 0 })
+        );
         let pending = serde_json::to_value(Pending {
             vci_us: Some(1),
             clock: Some(Clock::Worker),

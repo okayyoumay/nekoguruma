@@ -978,9 +978,9 @@ impl CommLog {
                 inner.links.len() - 1
             }
         };
-        // The transmit indication's VCI time and clock, when one attaches: the start of the
-        // first pending's interval.
-        let mut transmit_vci = None;
+        // The entry's VCI times (design 8.11 `times`): those the host read from the primitive's
+        // own items, completed by the indications that attach, each on its item's clock.
+        let mut vci = evidence.times.vci.take().unwrap_or_default();
         if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
             && evidence.transmit_evidence.is_none()
             && !inner.links[at].1.may_own_tx_indication()
@@ -990,9 +990,10 @@ impl CommLog {
         {
             let indication = unbound.remove(own);
             let read = indication.read;
-            transmit_vci = indication
-                .clock
-                .map(|clock| (u64::from(indication.vci_us), clock));
+            vci.tx_done.get_or_insert(exchange::VciTime::new(
+                u64::from(indication.vci_us),
+                indication.clock,
+            ));
             evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
             // The agent's time of the transmit confirmation is when the host read it, on the
             // entry's agent epoch.
@@ -1003,9 +1004,8 @@ impl CommLog {
         // A start-of-message indication carrying the exchange's response identifier is the
         // first frame of its response, which counts as an answer of the ECU (design 8.11 "Link
         // settings for the log", "Answer of the ECU"), unless an owed request on the link could
-        // own it. Nothing a refusal ended can have an answer. The start's time is not logged:
-        // its VCI time needs a clock per time (ADR-353), and the entry has no agent-side field
-        // for it.
+        // own it. Nothing a refusal ended can have an answer. The latest start is the
+        // response's (the entry has no agent-side field for it).
         if !matches!(
             evidence.end,
             exchange::End::NotSent(_)
@@ -1020,6 +1020,14 @@ impl CommLog {
             // Every start with the identifier is the same response's: with no other owner,
             // the ECU aborted and began again.
             let rx_id = evidence.rx_id;
+            if let Some(start) = unbound
+                .iter()
+                .rev()
+                .find(|item| item.is_start_indication_for(rx_id))
+            {
+                vci.rx_start
+                    .get_or_insert(exchange::VciTime::new(u64::from(start.vci_us), start.clock));
+            }
             unbound.retain(|item| !item.is_start_indication_for(rx_id));
             evidence.response_started = true;
             // Only a wait the VCI ended is an incomplete response; one the agent's own
@@ -1028,7 +1036,12 @@ impl CommLog {
                 evidence.end = exchange::End::ResponseIncomplete;
             }
         }
-        exchange::pending_intervals(&mut evidence.pending, transmit_vci);
+        // The transmit done starts the first pending's interval.
+        let transmit = vci
+            .tx_done
+            .and_then(|time| time.clock.map(|clock| (time.us, clock)));
+        exchange::pending_intervals(&mut evidence.pending, transmit);
+        evidence.times.vci = (!vci.is_empty()).then_some(vci);
         for item in &unbound {
             let event = Event::Unattached(UnattachedEntry::of(item));
             inner.append_with(|seq, line| {
@@ -2520,6 +2533,81 @@ mod tests {
                 .collect()
         };
         (of("exchange"), of("unattached"))
+    }
+
+    /// Design 8.11 `times`: each VCI time with its own clock and epoch. The times the host read
+    /// from the primitive's own items stand; an attached transmit indication gives the transmit
+    /// done and the latest attached start of message the response's start, each on its item's
+    /// clock; a time no item gives is left out.
+    #[test]
+    fn each_vci_time_comes_from_its_item_with_its_clock() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let at = |us, clock| exchange::VciTime::new(us, Some(clock));
+        let answered = |times: exchange::VciTimes| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+            );
+            evidence.times.vci = Some(times);
+            evidence
+        };
+        // The host gave the response's end; the indications give the transmit and the start.
+        let first = UnattachedItem {
+            vci_us: 20,
+            ..start_of_message(0x7E8)
+        };
+        let latest = UnattachedItem {
+            vci_us: 30,
+            clock: Some(exchange::Clock::Worker),
+            ..start_of_message(0x7E8)
+        };
+        log.exchange_with(
+            answered(exchange::VciTimes {
+                rx_end: Some(at(50, exchange::Clock::Device)),
+                ..exchange::VciTimes::default()
+            }),
+            vec![tx_done(0x7E0), first, latest],
+        )
+        .unwrap();
+        // The response's own transmit done stands beside an attached indication.
+        log.exchange_with(
+            answered(exchange::VciTimes {
+                tx_done: Some(at(3, exchange::Clock::Worker)),
+                ..exchange::VciTimes::default()
+            }),
+            vec![tx_done(0x7E0)],
+        )
+        .unwrap();
+        // With no time at all, the entry has no VCI times.
+        log.exchange_with(answered(exchange::VciTimes::default()), Vec::new())
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let exchanges: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        assert_eq!(
+            exchanges[0]["times"]["vci"],
+            serde_json::json!({
+                "tx_done": { "us": 5, "clock": "device", "epoch": 0 },
+                "rx_start": { "us": 30, "clock": "worker", "epoch": 0 },
+                "rx_end": { "us": 50, "clock": "device", "epoch": 0 },
+            })
+        );
+        assert_eq!(
+            exchanges[1]["times"]["vci"],
+            serde_json::json!({ "tx_done": { "us": 3, "clock": "worker", "epoch": 0 } })
+        );
+        assert!(
+            exchanges[2]["times"].get("vci").is_none(),
+            "{}",
+            exchanges[2]
+        );
     }
 
     /// A start-of-message indication for `identifier`, read during the exchange.

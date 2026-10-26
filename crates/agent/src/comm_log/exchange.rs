@@ -23,6 +23,7 @@ use std::collections::HashMap;
 use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
 use serde::Serialize;
 
+use super::clocks::Placed;
 use super::redaction::{Direction, LoggedMessage, redact, redact_unanswering};
 use crate::host::positive_prefix;
 
@@ -187,6 +188,10 @@ pub(crate) struct Pending {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock: Option<Clock>,
     pub agent_us: u64,
+    /// The epoch of `vci_us` on its clock (design 8.11 `clock_epoch`, ADR-361); absent when the
+    /// time names no clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u32>,
     /// The interval from the transmit or the previous pending.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub since_previous_ms: Option<f64>,
@@ -284,23 +289,48 @@ pub(crate) struct AgentTimes {
 
 /// One VCI time of an exchange (design 8.11 `times`): the raw microseconds, the clock its item
 /// named (absent when it named none: the time is then compared with no other, "On one clock",
-/// ADR-353) and that clock's epoch. The log does not unwrap the 32-bit times yet, so the epoch
-/// stays 0.
+/// ADR-353) and that clock's epoch, which the log gives it when it places the time on its clock
+/// (ADR-361), with the time unwrapped within the epoch.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct VciTime {
     pub us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock: Option<Clock>,
-    pub epoch: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u32>,
+    #[serde(skip)]
+    pub unwrapped: Option<i64>,
 }
 
 impl VciTime {
+    /// A raw time on `clock`, not placed yet.
     pub(crate) fn new(us: u64, clock: Option<Clock>) -> Self {
         Self {
             us,
             clock,
-            epoch: 0,
+            epoch: None,
+            unwrapped: None,
         }
+    }
+
+    /// The time placed on its clock at `placed`.
+    pub(crate) fn at(self, placed: Option<Placed>) -> Self {
+        Self {
+            epoch: placed.map(|placed| placed.epoch),
+            unwrapped: placed.map(|placed| placed.unwrapped),
+            ..self
+        }
+    }
+
+    /// Where the time stands on its clock, once placed.
+    pub(crate) fn placed(&self) -> Option<(Clock, Placed)> {
+        Some((
+            self.clock?,
+            Placed {
+                epoch: self.epoch?,
+                unwrapped: self.unwrapped?,
+            },
+        ))
     }
 
     /// Of an indication's time and the one the response's item carries for the same point,
@@ -355,21 +385,29 @@ impl VciTimes {
     }
 }
 
-/// Gives each pending its interval from the transmit (`transmit`, the attached transmit
-/// indication's VCI time and clock) or the previous pending (design 8.11 `pending`): a
-/// difference only between two VCI times on the same clock ("On one clock"), and only forward:
-/// the log does not unwrap the 32-bit VCI times yet, so a later raw time below an earlier one,
-/// whether a wrap or a reset, gives no interval rather than a wrong one. A pending with no time
-/// or clock starts no interval.
-pub(crate) fn pending_intervals(pending: &mut [Pending], transmit: Option<(u64, Clock)>) {
+/// Gives each pending its interval from the transmit (`transmit`, the transmit done placed on
+/// its clock) or the previous pending (design 8.11 `pending`), each pending placed at `placed`
+/// (ADR-361): a difference only between two VCI times on the same clock and epoch ("On one
+/// clock"), unwrapped, so an interval across a wrap is given, and only forward. A pending with
+/// no time, clock or place starts no interval.
+pub(crate) fn pending_intervals(
+    pending: &mut [Pending],
+    placed: &[Option<Placed>],
+    transmit: Option<(Clock, Placed)>,
+) {
     let mut previous = transmit;
-    for pending in pending {
-        let this = pending.vci_us.zip(pending.clock);
+    for (index, pending) in pending.iter_mut().enumerate() {
+        let this = pending
+            .clock
+            .zip(placed.get(index).copied().flatten())
+            .filter(|_| pending.vci_us.is_some());
         pending.since_previous_ms = match (previous, this) {
-            (Some((before, before_clock)), Some((at, clock)))
-                if before_clock == clock && at >= before =>
+            (Some((before_clock, before)), Some((clock, at)))
+                if before_clock == clock
+                    && before.epoch == at.epoch
+                    && at.unwrapped >= before.unwrapped =>
             {
-                Some((at - before) as f64 / 1000.0)
+                Some((at.unwrapped - before.unwrapped) as f64 / 1000.0)
             }
             _ => None,
         };
@@ -680,6 +718,8 @@ pub(crate) struct Rejected {
     pub bytes: Vec<u8>,
     pub vci_us: Option<u64>,
     pub clock: Option<Clock>,
+    /// The epoch of `vci_us` on its clock, which the log gives it (ADR-361).
+    pub epoch: Option<u32>,
     pub agent_us: u64,
     pub reason: RejectedReason,
 }
@@ -704,6 +744,8 @@ pub(crate) struct RejectedItem {
     pub vci_us: Option<u64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub clock: Option<Clock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u32>,
     pub agent_us: u64,
     pub reason: RejectedReason,
 }
@@ -1470,6 +1512,7 @@ impl ExchangeEntry {
                     response: redact_unanswering(&rejected.bytes),
                     vci_us: rejected.vci_us,
                     clock: rejected.clock,
+                    epoch: rejected.epoch,
                     agent_us: rejected.agent_us,
                     reason: rejected.reason,
                 })
@@ -2008,6 +2051,7 @@ mod tests {
         Pending {
             vci_us: None,
             clock: None,
+            epoch: None,
             agent_us: 10,
             since_previous_ms: None,
         }
@@ -2156,6 +2200,7 @@ mod tests {
                 bytes: vec![0x62, 0xF1],
                 vci_us: Some(5),
                 clock: Some(Clock::Device),
+                epoch: None,
                 agent_us: 9,
                 reason: RejectedReason::WrongEcho,
             },
@@ -2164,6 +2209,7 @@ mod tests {
                 bytes: vec![0x67, 0x02, 0xAA, 0xBB],
                 vci_us: None,
                 clock: None,
+                epoch: None,
                 agent_us: 10,
                 reason: RejectedReason::WrongEcho,
             },
@@ -2237,6 +2283,7 @@ mod tests {
         cut.pending = vec![Pending {
             vci_us: Some(1),
             clock: Some(Clock::Device),
+            epoch: None,
             agent_us: 2,
             since_previous_ms: None,
         }];
@@ -2338,20 +2385,24 @@ mod tests {
     }
 
     /// Design 8.11 `pending`, "On one clock": an interval from the transmit or the previous
-    /// pending, between two VCI times on one clock and forward only.
+    /// pending, between two unwrapped VCI times on one clock and epoch, forward only (ADR-361).
     #[test]
-    fn a_pending_interval_is_taken_on_one_clock_and_forward_only() {
+    fn a_pending_interval_is_taken_on_one_clock_and_epoch_and_forward_only() {
         let at = |vci_us, clock| Pending {
             vci_us: Some(vci_us),
             clock: Some(clock),
+            epoch: None,
             agent_us: 0,
             since_previous_ms: None,
         };
+        let on = |epoch, unwrapped| Some(Placed { epoch, unwrapped });
         let mut pending = vec![
             at(11_500, Clock::Device),
             at(41_500, Clock::Device),
             at(50_000, Clock::Worker),
             at(60_000, Clock::Worker),
+            // Raw 10 after a wrap of the 32-bit time, then 10 again in a new epoch.
+            at(10, Clock::Worker),
             at(10, Clock::Worker),
             Pending {
                 vci_us: None,
@@ -2363,8 +2414,32 @@ mod tests {
                 ..at(80_000, Clock::Worker)
             },
             at(90_000, Clock::Worker),
+            at(95_000, Clock::Worker),
+            at(94_000, Clock::Worker),
         ];
-        pending_intervals(&mut pending, Some((10_000, Clock::Device)));
+        let wrapped = (1_i64 << 32) + 10;
+        let placed = [
+            on(0, 11_500),
+            on(0, 41_500),
+            on(0, 50_000),
+            on(0, (1_i64 << 32) - 5_000),
+            on(0, wrapped),
+            on(1, 10),
+            None,
+            on(1, 70_000),
+            None,
+            on(1, 90_000),
+            None,
+            on(1, 94_000),
+        ];
+        let transmit = Some((
+            Clock::Device,
+            Placed {
+                epoch: 0,
+                unwrapped: 10_000,
+            },
+        ));
+        pending_intervals(&mut pending, &placed, transmit);
         let intervals: Vec<_> = pending.iter().map(|p| p.since_previous_ms).collect();
         assert_eq!(
             intervals,
@@ -2372,17 +2447,24 @@ mod tests {
                 Some(1.5),  // from the transmit
                 Some(30.0), // from the previous pending
                 None,       // another clock
-                Some(10.0),
-                None, // backward: a wrap or a reset, not unwrapped yet
-                None, // no time
-                None, // after one with no time
-                None, // a time but no clock
-                None, // after one with no clock
+                Some(4_294_912.296),
+                Some(5.01), // across the wrap
+                None,       // another epoch
+                None,       // no time
+                None,       // after one with no time
+                None,       // a time but no clock
+                None,       // after one with no clock
+                None,       // not placed
+                None,       // after one not placed
             ]
         );
+        // Backward within one epoch gives none.
+        let mut back = vec![at(2_000, Clock::Device), at(1_000, Clock::Device)];
+        pending_intervals(&mut back, &[on(0, 2_000), on(0, 1_000)], None);
+        assert_eq!(back[1].since_previous_ms, None);
         // Without a transmit time the first has no interval.
         let mut first = vec![at(5_000, Clock::Device)];
-        pending_intervals(&mut first, None);
+        pending_intervals(&mut first, &[on(0, 5_000)], None);
         assert_eq!(first[0].since_previous_ms, None);
     }
 
@@ -3334,7 +3416,10 @@ mod tests {
                 tx_done: Some(VciTime::new(1, Some(Clock::Device))),
                 rx_start: Some(VciTime::new(2, Some(Clock::Device))),
                 rx_end: None,
-                error: Some(VciTime::new(4, Some(Clock::Worker))),
+                error: Some(VciTime::new(4, Some(Clock::Worker)).at(Some(Placed {
+                    epoch: 3,
+                    unwrapped: 4,
+                }))),
                 deadline: Some(ClockReading {
                     time: VciTime::new(9, Some(Clock::Device)),
                     round_trip_us: 700,
@@ -3342,24 +3427,26 @@ mod tests {
             }),
         })
         .unwrap();
-        // Each time carries its own clock and epoch; an absent one is left out.
+        // Each time carries its own clock and, once placed, its epoch; an absent one is left
+        // out, and the unwrapped value is not written.
         assert_eq!(
             times["vci"],
             json!({
-                "tx_done": { "us": 1, "clock": "device", "epoch": 0 },
-                "rx_start": { "us": 2, "clock": "device", "epoch": 0 },
-                "error": { "us": 4, "clock": "worker", "epoch": 0 },
-                "deadline": { "us": 9, "clock": "device", "epoch": 0, "round_trip_us": 700 },
+                "tx_done": { "us": 1, "clock": "device" },
+                "rx_start": { "us": 2, "clock": "device" },
+                "error": { "us": 4, "clock": "worker", "epoch": 3 },
+                "deadline": { "us": 9, "clock": "device", "round_trip_us": 700 },
             })
         );
-        // A time whose item named no clock has none.
+        // A time whose item named no clock has none, and no epoch.
         assert_eq!(
             serde_json::to_value(VciTime::new(7, None)).unwrap(),
-            json!({ "us": 7, "epoch": 0 })
+            json!({ "us": 7 })
         );
         let pending = serde_json::to_value(Pending {
             vci_us: Some(1),
             clock: Some(Clock::Worker),
+            epoch: None,
             agent_us: 2,
             since_previous_ms: Some(3.0),
         })

@@ -1012,6 +1012,7 @@ fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
                 bytes: rejected.bytes.clone(),
                 vci_us: Some(rejected.vci_us),
                 clock: rejected.clock,
+                epoch: None,
                 agent_us: rejected.read?.monotonic_us,
                 reason: rejected.reason,
             })
@@ -1030,6 +1031,7 @@ fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
             Some(Pending {
                 vci_us: Some(pending.vci_us),
                 clock: pending.clock,
+                epoch: None,
                 agent_us: pending.read?.monotonic_us,
                 since_previous_ms: None,
             })

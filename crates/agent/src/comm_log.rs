@@ -36,6 +36,9 @@ use crate::runner::JobError;
 /// What an exchange entry carries of a message's bytes (design 8.11, ADR-347).
 pub(crate) mod redaction;
 
+/// The VCI's clocks: alignment, unwrapping and epochs (design 8.11 `clock_epoch`, ADR-361).
+pub(crate) mod clocks;
+
 /// The exchange entry, its evidence, the per-link history and the classification (design 8.11,
 /// ADR-346 items 2, 3 and 6).
 #[cfg_attr(
@@ -186,6 +189,7 @@ enum Event<'a> {
     LinkOpened(LinkOpened<'a>),
     Identity(Identity),
     Unattached(UnattachedEntry<'a>),
+    ClockEpoch(clocks::ClockEpoch),
 }
 
 /// What the agent knows of the VCI it launched the job's worker for: the API its library
@@ -410,6 +414,9 @@ struct UnattachedEntry<'a> {
     /// principle 6).
     #[serde(skip_serializing_if = "Option::is_none")]
     clock: Option<exchange::Clock>,
+    /// The epoch of `vci_us` on its clock (ADR-361); absent when it names no clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    epoch: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     agent: Option<ReadAt>,
     /// The result item's RxFlag in hex.
@@ -438,7 +445,7 @@ struct ReadAt {
 }
 
 impl<'a> UnattachedEntry<'a> {
-    fn of(item: &'a UnattachedItem) -> Self {
+    fn of(item: &'a UnattachedItem, placed: Option<clocks::Placed>) -> Self {
         use redaction::{Direction, redact};
         let mut entry = Self {
             link: item.link,
@@ -450,6 +457,7 @@ impl<'a> UnattachedEntry<'a> {
             },
             vci_us: item.vci_us,
             clock: item.clock,
+            epoch: placed.map(|placed| placed.epoch),
             agent: item.read.map(|read| ReadAt {
                 epoch: read.epoch,
                 read_us: read.monotonic_us,
@@ -763,6 +771,13 @@ enum Opening {
     Reopened,
 }
 
+/// A VCI time the host read during an exchange, by where the evidence holds it.
+enum HostRead {
+    Unbound(usize),
+    Pending(usize),
+    Rejected(usize),
+}
+
 struct Inner {
     sink: Box<dyn LineSink>,
     next_seq: u64,
@@ -786,6 +801,8 @@ struct Inner {
     vci: Option<VciFacts>,
     /// The run's VCI margins, from its facts, for `vci_connected` and `link_opened`.
     margins: VciMargins,
+    /// The VCI's clocks as the run's entries placed their times (ADR-361).
+    clocks: clocks::VciClocks,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -892,6 +909,7 @@ impl CommLog {
             vci: None,
             margins: VciMargins::default(),
             links: Vec::new(),
+            clocks: clocks::VciClocks::starting_at(scan.next_clock_epoch),
         })))
     }
 
@@ -1042,6 +1060,90 @@ impl CommLog {
         // The entry's VCI times (design 8.11 `times`): those the host read from the primitive's
         // own items, completed by the indications that attach, each on its item's clock.
         let mut vci = evidence.times.vci.take().unwrap_or_default();
+        // Each VCI time placed on its clock (ADR-361), in the order the host read it; the
+        // epochs they open are written first, before the lines that use them.
+        let mut unbound_placed = vec![None; unbound.len()];
+        let mut pending_placed = vec![None; evidence.pending.len()];
+        let mut reads = Vec::new();
+        for (index, item) in unbound.iter().enumerate() {
+            if let Some(read) = item.read {
+                reads.push((read.monotonic_us, HostRead::Unbound(index)));
+            }
+        }
+        for (index, pending) in evidence.pending.iter().enumerate() {
+            reads.push((pending.agent_us, HostRead::Pending(index)));
+        }
+        for (index, rejected) in evidence.rejected.iter().enumerate() {
+            reads.push((rejected.agent_us, HostRead::Rejected(index)));
+        }
+        reads.sort_by_key(|(read_us, _)| *read_us);
+        let agent_epoch = evidence.times.agent.epoch;
+        let read_at = |read_us| {
+            Some(AgentNow {
+                epoch: agent_epoch,
+                monotonic_us: read_us,
+                wall_unix_ms: 0,
+            })
+        };
+        for (read_us, read) in reads {
+            match read {
+                HostRead::Unbound(index) => {
+                    let item = &unbound[index];
+                    unbound_placed[index] =
+                        inner.place_read(item.clock, u64::from(item.vci_us), item.read)?;
+                }
+                HostRead::Pending(index) => {
+                    let pending = &evidence.pending[index];
+                    if let Some(raw) = pending.vci_us {
+                        let placed = inner.place_read(pending.clock, raw, read_at(read_us))?;
+                        pending_placed[index] = placed;
+                        evidence.pending[index].epoch = placed.map(|placed| placed.epoch);
+                    }
+                }
+                HostRead::Rejected(index) => {
+                    let rejected = &evidence.rejected[index];
+                    if let Some(raw) = rejected.vci_us {
+                        let placed = inner.place_read(rejected.clock, raw, read_at(read_us))?;
+                        evidence.rejected[index].epoch = placed.map(|placed| placed.epoch);
+                    }
+                }
+            }
+        }
+        // The final response's item was read last, when the primitive ended: its end is read
+        // then, and the transmit done and start it carries come at or before that end. An
+        // error's time is placed nearest its clock's latest time, and the reading at the
+        // agent's deadline was taken after everything else.
+        let end_read = read_at(evidence.times.agent.end_us);
+        if let Some(end) = vci.rx_end {
+            vci.rx_end = Some(end.at(inner.place_read(end.clock, end.us, end_read)?));
+        }
+        let anchor = vci.rx_end.and_then(|end| end.placed());
+        for time in [&mut vci.tx_done, &mut vci.rx_start].into_iter().flatten() {
+            let placed = match anchor {
+                Some((clock, anchor)) if time.clock == Some(clock) => {
+                    Some(clocks::before(anchor, time.us))
+                }
+                _ => inner.place_read(time.clock, time.us, end_read)?,
+            };
+            *time = time.at(placed);
+        }
+        if let Some(error) = vci.error {
+            vci.error = Some(error.at(inner.place_unread(error.clock, error.us, end_read)?));
+        }
+        for (index, item) in unbound.iter().enumerate() {
+            if item.read.is_none() {
+                unbound_placed[index] =
+                    inner.place_unread(item.clock, u64::from(item.vci_us), end_read)?;
+            }
+        }
+        if let Some(mut deadline) = vci.deadline {
+            deadline.time = deadline.time.at(inner.place_read(
+                deadline.time.clock,
+                deadline.time.us,
+                end_read,
+            )?);
+            vci.deadline = Some(deadline);
+        }
         // The response's own transmit done, which the host read from its item.
         let response_tx_done = vci.tx_done.is_some();
         if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
@@ -1052,11 +1154,11 @@ impl CommLog {
                 .position(|item| item.is_tx_indication_for(tx_id))
         {
             let indication = unbound.remove(own);
+            let placed = unbound_placed.remove(own);
             let read = indication.read;
-            vci.tx_done = Some(exchange::VciTime::new(
-                u64::from(indication.vci_us),
-                indication.clock,
-            ))
+            vci.tx_done = Some(
+                exchange::VciTime::new(u64::from(indication.vci_us), indication.clock).at(placed),
+            )
             .into_iter()
             .chain(vci.tx_done)
             .reduce(exchange::VciTime::prefer);
@@ -1100,12 +1202,13 @@ impl CommLog {
                 | exchange::End::Negative(bytes) => Some(bytes.len()),
                 _ => None,
             };
-            if let Some(start) = unbound
+            if let Some(at) = unbound
                 .iter()
-                .rev()
-                .find(|item| item.is_start_indication_for(rx_id))
+                .rposition(|item| item.is_start_indication_for(rx_id))
             {
-                let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock);
+                let start = &unbound[at];
+                let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock)
+                    .at(unbound_placed[at]);
                 // After the last pending, on one clock: with a pending whose time or clock is
                 // unknown, or a start with no clock, the order is unknown and no start is taken.
                 let after_pending = match evidence.pending.last() {
@@ -1123,6 +1226,12 @@ impl CommLog {
                         .reduce(exchange::VciTime::prefer);
                 }
             }
+            let mut keep = unbound
+                .iter()
+                .map(|item| !item.is_start_indication_for(rx_id))
+                .collect::<Vec<_>>()
+                .into_iter();
+            unbound_placed.retain(|_| keep.next().unwrap_or(true));
             unbound.retain(|item| !item.is_start_indication_for(rx_id));
             evidence.response_started = true;
             // Only a wait the VCI ended is an incomplete response; one the agent's own
@@ -1132,13 +1241,11 @@ impl CommLog {
             }
         }
         // The transmit done starts the first pending's interval.
-        let transmit = vci
-            .tx_done
-            .and_then(|time| time.clock.map(|clock| (time.us, clock)));
-        exchange::pending_intervals(&mut evidence.pending, transmit);
+        let transmit = vci.tx_done.and_then(|time| time.placed());
+        exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
-        for item in &unbound {
-            let event = Event::Unattached(UnattachedEntry::of(item));
+        for (item, placed) in unbound.iter().zip(unbound_placed) {
+            let event = Event::Unattached(UnattachedEntry::of(item, placed));
             inner.append_with(|seq, line| {
                 serde_json::to_writer(line, &Line { seq, event: &event })
             })?;
@@ -1286,6 +1393,9 @@ impl CommLog {
             },
         });
         let mut inner = self.lock();
+        // A time base that carried on over the connection is not shown yet: each clock's next
+        // time opens a new epoch.
+        inner.clocks.reconnect();
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -1329,7 +1439,17 @@ impl CommLog {
     #[cfg(test)]
     pub(crate) fn unattached(&self, item: &UnattachedItem) -> Option<u64> {
         let mut inner = self.lock();
-        let event = Event::Unattached(UnattachedEntry::of(item));
+        let clock = inner.clock();
+        let now = Some(AgentNow {
+            epoch: u32::try_from(clock.epoch).unwrap_or(u32::MAX),
+            monotonic_us: clock.monotonic_us,
+            wall_unix_ms: clock.wall_unix_ms,
+        });
+        let placed = match item.read {
+            Some(_) => inner.place_read(item.clock, u64::from(item.vci_us), item.read)?,
+            None => inner.place_unread(item.clock, u64::from(item.vci_us), now)?,
+        };
+        let event = Event::Unattached(UnattachedEntry::of(item, placed));
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -1372,6 +1492,62 @@ impl Inner {
 
     /// Writes `event` as the next line unless the log has failed. A failure is recorded and
     /// stops the log.
+    /// The tolerance the VCI's clocks are followed with, as `vci_connected` records it.
+    fn tolerance(&self) -> clocks::Tolerance {
+        clocks::Tolerance {
+            drift_bound_ppm: self.margins.drift_bound().0,
+            clock_margin_us: self.margins.clock_margin().0,
+        }
+    }
+
+    /// Places `raw` on `clock` as the host read it at `read`, or nearest the clock's latest
+    /// time when no read time is known, and writes the `clock_epoch` it opened. `None` once the
+    /// log has failed; `Some(None)` for a time with no clock, or none to place it by.
+    fn place_read(
+        &mut self,
+        clock: Option<exchange::Clock>,
+        raw: u64,
+        read: Option<AgentNow>,
+    ) -> Option<Option<clocks::Placed>> {
+        let Some(clock) = clock else {
+            return Some(None);
+        };
+        let Some(read) = read else {
+            return Some(self.clocks.near_latest(clock, raw));
+        };
+        let tolerance = self.tolerance();
+        let (placed, opened) =
+            self.clocks
+                .read(clock, raw, read.monotonic_us, read.epoch, tolerance);
+        if let Some(opened) = opened {
+            self.append_with(|seq, line| {
+                serde_json::to_writer(
+                    line,
+                    &Line {
+                        seq,
+                        event: &Event::ClockEpoch(opened),
+                    },
+                )
+            })?;
+        }
+        Some(Some(placed))
+    }
+
+    /// Places `raw`, a time on `clock` the host read at no known time, nearest the clock's
+    /// latest time; on a clock with no epoch yet, as read at `fallback`, a time after it was
+    /// read.
+    fn place_unread(
+        &mut self,
+        clock: Option<exchange::Clock>,
+        raw: u64,
+        fallback: Option<AgentNow>,
+    ) -> Option<Option<clocks::Placed>> {
+        match clock.and_then(|clock| self.clocks.near_latest(clock, raw)) {
+            Some(placed) => Some(Some(placed)),
+            None => self.place_read(clock, raw, fallback),
+        }
+    }
+
     fn append(&mut self, event: &Event<'_>) {
         self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event }));
     }
@@ -1446,6 +1622,9 @@ struct Scan {
     next_seq: u64,
     /// The agent epoch the next reopen starts: one more than the largest read.
     next_epoch: u64,
+    /// The VCI clock epoch each clock opens next (`device`, then `worker`): one more than the
+    /// largest `clock_epoch` read for it (ADR-361).
+    next_clock_epoch: [u32; 2],
     /// The last of them is a `job_end`.
     clean_close: bool,
     /// The file was there, empty: an earlier run created it and stopped before its header.
@@ -1508,6 +1687,21 @@ fn scan(bytes: &[u8]) -> Option<Scan> {
             }
             _ => {
                 since_opening = since_opening.map(|before| before && whole);
+                if event == Some("clock_epoch") {
+                    let clock = match object.and_then(|object| object.get("clock")?.as_str()) {
+                        Some("device") => Some(0),
+                        Some("worker") => Some(1),
+                        _ => None,
+                    };
+                    let epoch = object
+                        .and_then(|object| object.get("epoch")?.as_u64())
+                        .and_then(|epoch| u32::try_from(epoch).ok());
+                    if let Some((clock, epoch)) = clock.zip(epoch) {
+                        let next = epoch.checked_add(1)?;
+                        let slot = &mut scan.next_clock_epoch[clock];
+                        *slot = (*slot).max(next);
+                    }
+                }
                 if event == Some("job_end") {
                     scan.clean_close = true;
                 }
@@ -1822,19 +2016,19 @@ mod tests {
             unattached,
             [
                 serde_json::json!({"event": "unattached", "link": 1,
-                    "item": "transmit_indication", "primitive": "none", "vci_us": 42, "clock": "worker",
+                    "item": "transmit_indication", "primitive": "none", "vci_us": 42, "clock": "worker", "epoch": 0,
                     "agent": agent, "rx_flag": "00000009", "identifier": 0x7E0,
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "loopback",
-                    "primitive": "none", "vci_us": 42, "clock": "worker", "agent": agent,
+                    "primitive": "none", "vci_us": 42, "clock": "worker", "epoch": 0, "agent": agent,
                     "rx_flag": "00000001",
                     "message": {"clear": "2702", "data": {"kind": "secret", "len": 2}}}),
                 serde_json::json!({"event": "unattached", "link": 1,
-                    "item": "start_of_message", "primitive": "none", "vci_us": 42, "clock": "worker",
+                    "item": "start_of_message", "primitive": "none", "vci_us": 42, "clock": "worker", "epoch": 0,
                     "agent": agent, "rx_flag": "00000002",
                     "message": {"clear": ""}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "received",
-                    "primitive": "earlier", "vci_us": 42, "clock": "worker", "agent": agent,
+                    "primitive": "earlier", "vci_us": 42, "clock": "worker", "epoch": 0, "agent": agent,
                     "rx_flag": "", "message": {"clear": "62f19041"}}),
                 serde_json::json!({"event": "unattached", "link": 1, "item": "error_event",
                     "primitive": "earlier", "vci_us": 43,
@@ -2569,6 +2763,8 @@ mod tests {
         assert_eq!(
             &events[2..events.len() - 1],
             [
+                // The first VCI time opens its clock's epoch (ADR-361).
+                "clock_epoch",
                 "unattached",
                 "unattached",
                 "exchange",
@@ -2714,6 +2910,7 @@ mod tests {
         after_pending.pending = vec![exchange::Pending {
             vci_us: Some(40),
             clock: Some(exchange::Clock::Device),
+            epoch: None,
             agent_us: 0,
             since_previous_ms: None,
         }];
@@ -2731,18 +2928,22 @@ mod tests {
                 ..ended(9_000)
             },
         );
+        // The agent reads the pending and the end after the VCI's times, on its own clock.
         carried.pending = vec![exchange::Pending {
             vci_us: Some(3_500),
             clock: Some(exchange::Clock::Device),
-            agent_us: 0,
+            epoch: None,
+            agent_us: 5_000,
             since_previous_ms: None,
         }];
+        carried.times.agent.end_us = 10_000;
         log.exchange_with(carried, Vec::new()).unwrap();
         // 6: a pending whose clock is unknown leaves the order unknown, so no start is taken.
         let mut unclocked_pending = answered(&long, ended(90));
         unclocked_pending.pending = vec![exchange::Pending {
             vci_us: Some(10),
             clock: None,
+            epoch: None,
             agent_us: 0,
             since_previous_ms: None,
         }];
@@ -2798,6 +2999,121 @@ mod tests {
         );
     }
 
+    /// Design 8.11 "Timing judged" and `clock_epoch` (ADR-361): the log unwraps each clock's
+    /// times, so a pending interval across a wrap is given; a reset opens a new epoch, written
+    /// before the entry that uses it; and a reopened log goes on with new epoch numbers.
+    #[test]
+    fn vci_times_are_unwrapped_and_a_reset_opens_a_new_epoch() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let span = 1_u64 << 32;
+        // An exchange with a transmit done and an end the response's item carries, and one
+        // pending, each VCI time with the agent time when the host read it.
+        let exchange = |tx_done: u64, pending: (u64, u64), end: (u64, u64)| {
+            let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1, 2, 3, 4, 5]),
+            );
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(tx_done)),
+                rx_end: Some(device(end.0)),
+                ..exchange::VciTimes::default()
+            });
+            evidence.times.agent.end_us = end.1;
+            evidence.pending = vec![exchange::Pending {
+                vci_us: Some(pending.0),
+                clock: Some(exchange::Clock::Device),
+                epoch: None,
+                agent_us: pending.1,
+                since_previous_ms: None,
+            }];
+            evidence
+        };
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        // 0: the transmit 2 ms before the 32-bit time wraps, the pending 3 ms after it.
+        log.exchange(exchange(
+            span - 2_000,
+            (3_000, 1_005_500),
+            (50_000, 1_052_500),
+        ))
+        .unwrap();
+        // 1: the VCI restarted: its times start again near 0, long before a wrap.
+        log.exchange(exchange(500, (1_000, 1_100_000), (4_000, 1_103_000)))
+            .unwrap();
+        log.end("ok");
+        drop(log);
+        // A later run of the job opens new epochs after the ones the log holds.
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::Resume);
+        // Its times are on the agent epoch it starts.
+        let mut later = exchange(100, (200, 300), (400, 500));
+        later.times.agent.epoch = 1;
+        log.exchange(later).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let epochs: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "clock_epoch")
+            .collect();
+        let exchanges: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        // Each epoch is written just before the first entry that uses it.
+        for (epoch, exchange) in epochs.iter().zip(&exchanges) {
+            assert_eq!(
+                epoch["seq"].as_u64().unwrap() + 1,
+                exchange["seq"].as_u64().unwrap()
+            );
+        }
+        assert_eq!(epochs.len(), 3);
+        assert_eq!(
+            *epochs[0],
+            serde_json::json!({"seq": epochs[0]["seq"], "event": "clock_epoch",
+                "clock": "device", "epoch": 0, "reason": "first", "agent_epoch": 0,
+                "first": {"us": 3_000, "read_us": 1_005_500}})
+        );
+        assert_eq!(
+            *epochs[1],
+            serde_json::json!({"seq": epochs[1]["seq"], "event": "clock_epoch",
+                "clock": "device", "epoch": 1, "reason": "backward_step", "agent_epoch": 0,
+                "first": {"us": 1_000, "read_us": 1_100_000},
+                "previous": {"epoch": 0, "us": 50_000, "read_us": 1_052_500}})
+        );
+        assert_eq!(
+            (
+                &epochs[2]["epoch"],
+                &epochs[2]["reason"],
+                &epochs[2]["agent_epoch"]
+            ),
+            (
+                &serde_json::json!(2),
+                &serde_json::json!("first"),
+                &serde_json::json!(1)
+            )
+        );
+        // The raw times stay in the entry, each with its epoch; the interval is taken across
+        // the wrap.
+        let time =
+            |us: u64, epoch: u32| serde_json::json!({"us": us, "clock": "device", "epoch": epoch});
+        assert_eq!(
+            exchanges[0]["times"]["vci"],
+            serde_json::json!({"tx_done": time(span - 2_000, 0), "rx_end": time(50_000, 0)})
+        );
+        assert_eq!(exchanges[0]["pending"][0]["epoch"], 0);
+        assert_eq!(exchanges[0]["pending"][0]["since_previous_ms"], 5.0);
+        assert_eq!(
+            exchanges[1]["times"]["vci"],
+            serde_json::json!({"tx_done": time(500, 1), "rx_end": time(4_000, 1)})
+        );
+        assert_eq!(exchanges[1]["pending"][0]["since_previous_ms"], 0.5);
+        assert_eq!(exchanges[2]["times"]["vci"]["rx_end"]["epoch"], 2);
+    }
+
     /// A start-of-message indication for `identifier`, read during the exchange.
     fn start_of_message(identifier: u32) -> UnattachedItem {
         UnattachedItem {
@@ -2850,6 +3166,8 @@ mod tests {
         assert_eq!(
             &events[2..events.len() - 1],
             [
+                // The first VCI time opens its clock's epoch (ADR-361).
+                "clock_epoch",
                 "unattached",
                 "unattached",
                 "unattached",
@@ -3106,6 +3424,7 @@ mod tests {
         with_pending.pending = vec![exchange::Pending {
             vci_us: None,
             clock: None,
+            epoch: None,
             agent_us: 10,
             since_previous_ms: None,
         }];

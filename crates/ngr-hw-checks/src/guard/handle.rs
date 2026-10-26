@@ -62,12 +62,13 @@ use vci_service_interface::{
     GetTimestampRequest, GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest,
     IoCtlResponse, LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
     ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduError, PduErrorEvent,
-    PduParamClass, PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse, ResultData,
-    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse,
-    SubscribeEventRequest, TimestampClock, TimestampResponse, TxFlag, TxFlagBit,
-    UniqueRespIdTableItem, UniqueRespIdTableResponse, UnlockResourceRequest, VersionResponse,
-    com_primitive_ctrl_data, create_com_logical_link_request, event_item, event_notification,
-    io_ctl_request, param_item, pin_data, resource_data, subscribe_event_request,
+    PduParamClass, PendingForwarding, PinData, ResourceData, ResourceIdsResponse,
+    ResourceStatusResponse, ResultData, SetComParamRequest, SetUniqueRespIdTableRequest,
+    StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest, TimestampClock,
+    TimestampResponse, TxFlag, TxFlagBit, UniqueRespIdTableItem, UniqueRespIdTableResponse,
+    UnlockResourceRequest, VersionResponse, com_primitive_ctrl_data,
+    create_com_logical_link_request, event_item, event_notification, io_ctl_request, param_item,
+    pin_data, resource_data, subscribe_event_request,
 };
 use worker_host::client::WorkerClient;
 use worker_host::service::Stopped;
@@ -248,6 +249,9 @@ struct State {
     session_back: BTreeSet<u32>,
     /// The response timings of each link, which decide how long a send-receive may take.
     timings: BTreeMap<u32, LinkTimings>,
+    /// The links the handle created whose worker said it passes on every response pending
+    /// (`CreateComLogicalLink`'s `pending_forwarding`, ADR-355).
+    forwards_pendings: BTreeSet<u32>,
     /// Links whose return-to-default-session step is registered and has not started.
     session_registered: BTreeSet<u32>,
     /// The primitive being waited for on each link, while a wait is under way. A wait whose
@@ -386,6 +390,7 @@ impl Shared {
                 state.closing.remove(cll);
                 state.session_back.remove(cll);
                 state.timings.remove(cll);
+                state.forwards_pendings.remove(cll);
                 state.session_registered.remove(cll);
                 state.inflight.remove(cll);
                 state.monitors.remove(cll);
@@ -780,6 +785,12 @@ impl Progress {
                 }
                 self.response = Some(result.data_bytes);
             }
+            // A response pending (0x78) to the request: the limit in force is no longer P2.
+            Some(event_item::Data::ResultData(result))
+                if expected.is_some_and(|expected| expected.is_pending(&result.data_bytes)) =>
+            {
+                self.times.pending_seen = true;
+            }
             // The ECU did not answer: reported as no response when the primitive ends.
             Some(event_item::Data::ErrorData(ErrorData {
                 error_event: code, ..
@@ -851,6 +862,23 @@ impl Progress {
     }
 }
 
+/// Whether `error` is the worker or its library refusing an indication ComParam, which leaves
+/// the link without it, rather than the connection to the worker failing; the agent's link
+/// draws the line the same way (`crates/agent/src/link.rs`). A D-PDU worker reports a library's
+/// refusal as an internal error, and a library may answer a name it does not know with an
+/// error rather than with no id. An indication set or not changes no traffic, so a refusal
+/// that may have been applied in part is harmless.
+fn refuses_indication(error: &HandleError) -> bool {
+    match error {
+        HandleError::Setup(_) | HandleError::WorkerRefused { .. } => true,
+        HandleError::Rpc { code, .. } => !matches!(
+            code,
+            tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown
+        ),
+        _ => false,
+    }
+}
+
 /// RxFlag bits of a result item's fourth byte (as the agent's communication log reads them): a
 /// transmitted message, a start-of-message indication and a transmit indication.
 const RX_TX_MSG_TYPE: u8 = 0x01;
@@ -900,12 +928,15 @@ impl VciTime {
 }
 
 /// The VCI times of one send-receive (design 8.11 "Timing judged"): the transmit done, and the
-/// response's start and end, each as an event item gave it.
+/// response's start and end, each as an event item gave it; and whether a response pending to
+/// the request was passed on, after which the limit in force is no longer P2 (design 8.11
+/// "Limit in force").
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VciTimes {
     pub tx_done: Option<VciTime>,
     pub rx_start: Option<VciTime>,
     pub rx_end: Option<VciTime>,
+    pub pending_seen: bool,
 }
 
 /// A final response with the VCI times of its exchange.
@@ -913,6 +944,9 @@ pub struct VciTimes {
 pub struct Timed {
     pub response: Vec<u8>,
     pub times: VciTimes,
+    /// Whether the worker said the link passes on every response pending (ADR-355): without
+    /// that, a pending the VCI absorbed leaves no trace (design 8.11 "Possible pending").
+    pub forwards_pendings: bool,
 }
 
 /// How waiting for a primitive ended.
@@ -952,6 +986,11 @@ impl Expectation {
             [] => Vec::new(),
         };
         Self { sid, positive }
+    }
+
+    /// Whether `response` is a response pending (0x78) to the request's service.
+    fn is_pending(&self, response: &[u8]) -> bool {
+        matches!(response, [0x7F, sid, 0x78, ..] if *sid == self.sid)
     }
 
     /// Whether `response` is a final answer: a positive response that begins as expected, or a
@@ -1863,7 +1902,7 @@ impl GuardedHandle {
             .ok_or_else(|| {
                 HandleError::Setup("the worker has no resource for the link".to_owned())
             })?;
-        let cll = self
+        let created = self
             .create_com_logical_link(CreateComLogicalLinkRequest {
                 module_handle: Some(module),
                 resource: Some(create_com_logical_link_request::Resource::ResourceId(
@@ -1878,9 +1917,14 @@ impl GuardedHandle {
                     )
                 }),
             })
-            .await?
+            .await?;
+        let forwards = created.pending_forwarding == PendingForwarding::All as i32;
+        let cll = created
             .cll_handle
             .ok_or_else(|| HandleError::Setup("no logical link handle".to_owned()))?;
+        if forwards {
+            self.shared.lock().forwards_pendings.insert(cll.cll_handle);
+        }
 
         self.shared.lock().timings.insert(
             cll.cll_handle,
@@ -1935,7 +1979,7 @@ impl GuardedHandle {
     ) -> Result<(), HandleError> {
         let id = match self.param_id(name).await {
             Ok(id) => id,
-            Err(HandleError::Setup(_) | HandleError::WorkerRefused { .. }) => return Ok(()),
+            Err(error) if refuses_indication(&error) => return Ok(()),
             Err(error) => return Err(error),
         };
         match self
@@ -1949,7 +1993,8 @@ impl GuardedHandle {
             })
             .await
         {
-            Ok(_) | Err(HandleError::WorkerRefused { .. }) => Ok(()),
+            Ok(_) => Ok(()),
+            Err(error) if refuses_indication(&error) => Ok(()),
             Err(error) => Err(error),
         }
     }
@@ -2924,7 +2969,16 @@ impl GuardedHandle {
             )
             .await?;
         self.shared.observe_session(cll, request, &response);
-        Ok(Timed { response, times })
+        let forwards_pendings = self
+            .shared
+            .lock()
+            .forwards_pendings
+            .contains(&cll.cll_handle);
+        Ok(Timed {
+            response,
+            times,
+            forwards_pendings,
+        })
     }
 
     passthrough! {
@@ -3398,6 +3452,7 @@ mod tests {
                 tx_done: device(1_000),
                 rx_start: device(4_000),
                 rx_end: device(5_000),
+                pending_seen: false,
             }
         );
         // Without the link's identifiers no unbound indication is taken.
@@ -3456,6 +3511,7 @@ mod tests {
                 tx_done: device(1_000),
                 rx_start: device(4_000),
                 rx_end: device(5_000),
+                pending_seen: false,
             }
         );
         // An item that names no clock gives times compared with no other.
@@ -3476,6 +3532,62 @@ mod tests {
         );
         assert_eq!(tx.clock, None);
         assert_eq!(tx.until(end), None);
+    }
+
+    #[test]
+    fn a_pending_to_the_request_is_noted_and_is_not_the_response() {
+        let expected = Expectation::of(&[0x10, 0x01]);
+        let mut progress = Progress::default();
+        let on = |p: &mut Progress, data: Vec<u8>| {
+            p.on_item(
+                event(
+                    Some(COP),
+                    event_item::Data::ResultData(ResultData {
+                        data_bytes: data,
+                        ..ResultData::default()
+                    }),
+                ),
+                COP,
+                Some(&expected),
+            )
+        };
+        // Another service's pending is not this request's.
+        assert!(on(&mut progress, vec![0x7F, 0x22, 0x78]).is_none());
+        assert!(!progress.times.pending_seen);
+        assert!(on(&mut progress, vec![0x7F, 0x10, 0x78]).is_none());
+        assert!(progress.times.pending_seen);
+        assert!(progress.response.is_none());
+    }
+
+    #[test]
+    fn a_refused_indication_is_any_answer_of_the_worker_but_a_lost_connection() {
+        let rpc = |code| HandleError::Rpc {
+            call: "SetComParam",
+            code,
+            message: String::new(),
+        };
+        // A D-PDU worker reports the library's refusal as an internal error.
+        assert!(refuses_indication(&rpc(tonic::Code::Internal)));
+        assert!(refuses_indication(&HandleError::Setup(
+            "the worker does not know ComParam CP_StartMsgIndEnable".to_owned()
+        )));
+        assert!(refuses_indication(&HandleError::WorkerRefused {
+            call: "SetComParam",
+            code: tonic::Code::InvalidArgument,
+            message: String::new(),
+        }));
+        // A connection that failed says nothing of the library, and ends the opening.
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+        ] {
+            assert!(!refuses_indication(&rpc(code)), "{code:?}");
+        }
+        assert!(!refuses_indication(&HandleError::Timeout {
+            call: "SetComParam",
+            timeout: Duration::from_secs(1),
+        }));
     }
 
     #[test]

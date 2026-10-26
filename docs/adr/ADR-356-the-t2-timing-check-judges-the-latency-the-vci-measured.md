@@ -32,8 +32,11 @@ The maintainer decided three things:
 
 1. **The handle gives the VCI times of an exchange.**
    - On T1 to T3, `open_link` turns both indications on, as the agent's link does. A library
-     that refuses one, or does not know it, leaves the link without it. A raw T0 link has no
-     exchanges to time, so it turns neither on.
+     that refuses one, or does not know it, leaves the link without it. The line between a
+     refusal and a failed connection is the agent's: every answer of the worker counts as a
+     refusal, a D-PDU worker's internal error for the library's refusal included, except a
+     status that says the connection failed (`Unavailable`, `Cancelled`, `Unknown`). A raw T0
+     link has no exchanges to time, so it turns neither on.
    - `send_receive_timed` returns the final response with three times:
      - the transmit done;
      - the response's start;
@@ -49,6 +52,9 @@ The maintainer decided three things:
        transmit and its own start (ISO 22900-2 (2022) 10.1.4.11.4), and those then take
        precedence.
    - An indication is never taken as the response.
+   - The handle notes a response pending (0x78) to the request passed on during the exchange.
+     It also notes whether the worker said the link passes on every pending
+     (`pending_forwarding`, ADR-355).
    - The handle sends one request at a time on a link. So among the unbound indications, it
      keeps the latest one before the response; one after the response belongs to another
      exchange.
@@ -60,6 +66,12 @@ The maintainer decided three things:
      are not unwrapped, so a wrap or a reset gives no latency rather than a wrong one.
    - The limit is the P2 the ECU reported in its session response, plus the profile's margin.
      The same P2 applies to the TesterPresent requests, since they are sent in that session.
+   - A response within the limit is on time, whatever came before it. A response past the limit
+     is judged late only when no pending was passed on and the link passes on every pending.
+     Otherwise it is not judged:
+     - a pending moves the limit in force to P2* from it (design 8.11 "Limit in force"), which
+       the check does not follow;
+     - a pending the VCI absorbed leaves no trace ("Possible pending").
    - A response end past the limit proves the response late only when the response fits one
      frame under every addressing format (six bytes at most), and only by more than one frame's
      transfer at the link's baud rate (an upper bound of 160 bits per classic CAN frame).
@@ -86,5 +98,12 @@ The maintainer decided three things:
   items is covered by the handle's unit tests, not end to end.
 - Every guarded link on T1 to T3 now has the indications on. The handle's other readers ignore
   them: an indication is never a response, and the raw frame reader serves only T0.
+- The API's own tester present can send on the request identifier during an exchange, when a
+  profile pins `CP_TesterPresentHandling` on. Its unbound transmit indication would then
+  replace the request's, which can only shorten a latency, never make an on-time response
+  late. It comes only after the link has been idle for the tester-present time, which is far
+  longer than the check's exchanges, so the check does not guard against it.
+- On a D-PDU link the worker does not say it passes on every pending. There a response past P2
+  is not judged, only a response within it.
 - The key is the one the agent will read. Its timing margin, still `source` `none` in
   `link_opened`, comes from a profile once the agent takes it from there.

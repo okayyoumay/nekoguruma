@@ -548,8 +548,10 @@ profile's link, and CI runs it against `sim-vci` behind `j2534-0404-service`
   `[vci]` each latency is judged against the reported P2 plus the margin: a start both ways, an
   end one way only, so an end past the limit proves a response of at most six bytes (one frame
   under every addressing format) late only past one frame's transfer at the link's baud rate,
-  and never proves a longer one late. Without the key the latency is recorded and nothing
-  judged. Against `sim-vci` the latency runs to the response's end, since `sim-vci` gives no
+  and never proves a longer one late. A response past the limit is not judged after a response
+  pending (the limit in force is then P2*, design 8.11 "Limit in force") or on a link whose
+  worker does not say it passes on every pending (`pending_forwarding`, ADR-355), since the VCI
+  may have absorbed one. Without the key the latency is recorded and nothing judged. Against `sim-vci` the latency runs to the response's end, since `sim-vci` gives no
   start of message for a single frame.
 - **Result.** It passes when the ECU answers every request with its positive response; the
   report's message holds the comparison and each latency with its verdict. A reported value

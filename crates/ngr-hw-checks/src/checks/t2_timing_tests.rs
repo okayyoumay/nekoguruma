@@ -43,6 +43,12 @@ fn device(us: u32) -> Option<VciTime> {
 
 const P2: Duration = Duration::from_millis(25);
 const MARGIN: Option<Duration> = Some(Duration::from_micros(500));
+const LIMITS: Limits = Limits {
+    p2: P2,
+    margin: MARGIN,
+    baud_rate: Some(500_000),
+    forwards_pendings: true,
+};
 
 #[test]
 fn the_simulator_s_own_answer_reads_as_its_timing() {
@@ -136,8 +142,9 @@ fn the_latency_runs_from_the_transmit_to_the_response_start_and_is_judged_both_w
         tx_done: device(1_000),
         rx_start: device(4_000),
         rx_end: device(9_000),
+        pending_seen: false,
     };
-    let (latency, judgement) = judge(&times, 2, P2, MARGIN, Some(500_000));
+    let (latency, judgement) = judge(&times, 2, &LIMITS);
     assert_eq!(
         latency,
         Some((Duration::from_micros(3_000), MeasuredBy::VciTxDoneToRxStart))
@@ -149,7 +156,7 @@ fn the_latency_runs_from_the_transmit_to_the_response_start_and_is_judged_both_w
         ..times
     };
     assert_eq!(
-        judge(&late, 2, P2, MARGIN, Some(500_000)).1,
+        judge(&late, 2, &LIMITS).1,
         Judgement::Late(Duration::from_micros(1_200))
     );
     // At the limit is within it.
@@ -157,12 +164,16 @@ fn the_latency_runs_from_the_transmit_to_the_response_start_and_is_judged_both_w
         rx_start: device(1_000 + 25_500),
         ..times
     };
-    assert_eq!(
-        judge(&at_limit, 2, P2, MARGIN, Some(500_000)).1,
-        Judgement::WithinP2
-    );
+    assert_eq!(judge(&at_limit, 2, &LIMITS).1, Judgement::WithinP2);
     // Without a margin the latency is recorded and nothing judged.
-    let (latency, judgement) = judge(&late, 2, P2, None, Some(500_000));
+    let (latency, judgement) = judge(
+        &late,
+        2,
+        &Limits {
+            margin: None,
+            ..LIMITS
+        },
+    );
     assert!(latency.is_some());
     assert_eq!(
         judgement,
@@ -178,8 +189,9 @@ fn a_response_end_is_judged_one_way_only() {
         tx_done: device(0),
         rx_start: None,
         rx_end: device(us),
+        pending_seen: false,
     };
-    let (latency, judgement) = judge(&end(20_000), 2, P2, MARGIN, Some(500_000));
+    let (latency, judgement) = judge(&end(20_000), 2, &LIMITS);
     assert_eq!(
         latency,
         Some((Duration::from_micros(20_000), MeasuredBy::VciTxDoneToRxEnd))
@@ -188,23 +200,31 @@ fn a_response_end_is_judged_one_way_only() {
     // One frame takes at most 320 us at 500 kbit/s: an end within that past the limit proves
     // nothing, one past it proves a single-frame response late.
     assert_eq!(
-        judge(&end(25_500 + 320), 2, P2, MARGIN, Some(500_000)).1,
+        judge(&end(25_500 + 320), 2, &LIMITS).1,
         Judgement::NotJudged("the response end lies within one frame's transfer past the limit")
     );
     assert_eq!(
-        judge(&end(25_500 + 320 + 80), 2, P2, MARGIN, Some(500_000)).1,
+        judge(&end(25_500 + 320 + 80), 2, &LIMITS).1,
         Judgement::Late(Duration::from_micros(80))
     );
     // A response that may span frames is never late by its end, and nor is one on a link whose
     // baud rate is not known.
     assert_eq!(
-        judge(&end(40_000), 7, P2, MARGIN, Some(500_000)).1,
+        judge(&end(40_000), 7, &LIMITS).1,
         Judgement::NotJudged(
             "a response end past the limit does not prove a multi-frame response late"
         )
     );
     assert_eq!(
-        judge(&end(40_000), 2, P2, MARGIN, None).1,
+        judge(
+            &end(40_000),
+            2,
+            &Limits {
+                baud_rate: None,
+                ..LIMITS
+            }
+        )
+        .1,
         Judgement::NotJudged("the link's baud rate is not known")
     );
 }
@@ -224,9 +244,10 @@ fn times_on_different_clocks_or_with_none_are_not_judged() {
             tx_done: device(1_000),
             rx_start: later,
             rx_end: later,
+            pending_seen: false,
         };
         assert_eq!(
-            judge(&times, 2, P2, MARGIN, Some(500_000)),
+            judge(&times, 2, &LIMITS),
             (
                 None,
                 Judgement::NotJudged("the VCI gave no response time on the transmit's clock")
@@ -239,13 +260,14 @@ fn times_on_different_clocks_or_with_none_are_not_judged() {
         tx_done: device(1_000),
         rx_start: worker,
         rx_end: device(5_000),
+        pending_seen: false,
     };
     assert_eq!(
-        judge(&times, 2, P2, MARGIN, Some(500_000)).0,
+        judge(&times, 2, &LIMITS).0,
         Some((Duration::from_micros(4_000), MeasuredBy::VciTxDoneToRxEnd))
     );
     assert_eq!(
-        judge(&VciTimes::default(), 2, P2, MARGIN, Some(500_000)),
+        judge(&VciTimes::default(), 2, &LIMITS),
         (None, Judgement::NotJudged("the VCI gave no transmit time"))
     );
 }
@@ -267,5 +289,59 @@ fn the_summary_names_each_latency_with_what_measured_it() {
              (vci_tx_done_to_rx_end), late by 4.180 ms"
         ),
         "{summary}"
+    );
+}
+
+#[test]
+fn past_p2_a_pending_or_a_link_that_may_absorb_one_leaves_the_response_unjudged() {
+    let late = VciTimes {
+        tx_done: device(0),
+        rx_start: device(40_000),
+        rx_end: device(41_000),
+        pending_seen: false,
+    };
+    assert_eq!(
+        judge(&late, 6, &LIMITS).1,
+        Judgement::Late(Duration::from_micros(14_500))
+    );
+    // A pending passed on moves the limit in force to P2*, which the check does not judge.
+    let after_pending = VciTimes {
+        pending_seen: true,
+        ..late
+    };
+    assert_eq!(
+        judge(&after_pending, 6, &LIMITS).1,
+        Judgement::NotJudged("a response pending moved the limit in force to P2*")
+    );
+    // A link that may not pass every pending on may have hidden one.
+    let absorbing = Limits {
+        forwards_pendings: false,
+        ..LIMITS
+    };
+    assert_eq!(
+        judge(&late, 6, &absorbing).1,
+        Judgement::NotJudged("the VCI may have absorbed a response pending")
+    );
+    // Within P2 the response is on time either way.
+    let on_time = VciTimes {
+        rx_start: device(20_000),
+        ..after_pending
+    };
+    assert_eq!(judge(&on_time, 6, &absorbing).1, Judgement::WithinP2);
+}
+
+#[test]
+fn the_session_response_s_six_bytes_are_one_frame() {
+    // DiagnosticSessionControl's positive response fits one frame under every addressing format,
+    // so its end past the limit and one frame's transfer proves it late.
+    let end = VciTimes {
+        tx_done: device(0),
+        rx_start: None,
+        rx_end: device(25_500 + 320 + 1),
+        pending_seen: false,
+    };
+    assert_eq!(
+        judge(&end, 6, &LIMITS).1,
+        Judgement::Late(Duration::from_micros(1))
     );
 }

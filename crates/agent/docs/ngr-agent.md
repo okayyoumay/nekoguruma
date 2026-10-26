@@ -510,7 +510,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `comm_log::timing` judges the window against the limits `link_opened` recorded for the link
   (P2, P2* and the 0x78 completion timeout, with the timing margin), from the transmit done to
   a VCI time on the same clock and epoch (ADR-361): a response start and the receive timeout
-  both ways, a response end only as proof the response was on time, and on a link whose VCI
+  both ways, a response end as proof the response was on time and, for a response of at most
+  six bytes on UDS on CAN (one frame whatever the addressing, at most 160 bits at the baud rate,
+  `LinkConfig::single_frame`), as proof it was late past the limit, the margin and that frame's
+  transfer, each forwarded pending against the limit in force before it in the same way (a late
+  one makes the window `late` with `late_pending`, and the exchange `system` whatever follows,
+  ADR-364), and on a link whose VCI
   absorbs pendings past P2 as `possible_pending` up to the bound from the transmit (P2 plus the
   completion limit), narrowed by any pending the worker still passes on there (ADR-362). A
   receive timeout after a response may have begun is the transport's and is not judged; one

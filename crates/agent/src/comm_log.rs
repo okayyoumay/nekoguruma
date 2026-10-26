@@ -1355,6 +1355,7 @@ impl CommLog {
                     pendings: &pendings,
                     start: vci.rx_start.and_then(|time| time.placed()),
                     end: vci.rx_end.and_then(|time| time.placed()),
+                    end_len: evidence.end.response().map(<[u8]>::len),
                     timeout: vci.rx_timeout.and_then(|time| time.placed()),
                     response_may_have_begun,
                 },
@@ -1466,6 +1467,7 @@ impl CommLog {
                 .then(|| u64::from(config.rc78_completion_ms) * 1000),
             margin_us: u64::from(inner.margins.timing_margin().0),
             start_indications: indications.start_of_message,
+            single_frame: config.single_frame(),
         };
         inner.limits.retain(|(of, _)| *of != link);
         inner.limits.push((link, limits));
@@ -3526,6 +3528,105 @@ mod tests {
                 .unwrap()
                 .contains("100.0 ms before the limit"),
             "{early}"
+        );
+    }
+
+    /// Design 8.11 "Timing judged" and "Limit in force": on UDS on CAN at 500 kbit/s a frame
+    /// takes at most 320 µs, so a single-frame response's end, or a forwarded pending's, past
+    /// P2 plus the margin by more than that is late; a multi-frame response's end is not judged.
+    #[test]
+    fn single_frame_ends_and_forwarded_pendings_are_judged_late() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        // P2 1 s, P2* 5 s, completion 25 s; the agent's 2 ms margin.
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let answered = |response: Vec<u8>, end_us: u64, before_us: u64, pendings: &[u64]| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(response),
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = before_us;
+            evidence.times.agent.end_us = before_us + end_us + 2_000;
+            evidence.pending = pendings
+                .iter()
+                .map(|&us| exchange::Pending {
+                    vci_us: Some(before_us + 500 + us),
+                    clock: Some(exchange::Clock::Device),
+                    agent_us: before_us + us + 1_000,
+                    epoch: None,
+                    since_previous_ms: None,
+                })
+                .collect();
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(before_us + 500)),
+                rx_end: Some(device(before_us + 500 + end_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        log.exchange(answered(
+            vec![0x62, 0xF1, 0x90, 0x01],
+            1_002_321,
+            10_000,
+            &[],
+        ))
+        .unwrap();
+        log.exchange(answered(
+            vec![0x62, 0xF1, 0x90, 0x01],
+            3_000_000,
+            2_000_000,
+            &[1_002_321],
+        ))
+        .unwrap();
+        log.exchange(answered(
+            [0x62, 0xF1, 0x90].into_iter().chain([0x41; 17]).collect(),
+            1_500_000,
+            8_000_000,
+            &[],
+        ))
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let exchanges: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .collect();
+        let late_end = exchanges[0];
+        assert_eq!(late_end["timing"]["window"], "late", "{late_end}");
+        assert_eq!(late_end["timing"]["window_by_ms"], 2.001, "{late_end}");
+        assert!(late_end["timing"].get("late_pending").is_none());
+        assert_eq!(late_end["classification"], "system", "{late_end}");
+        let late_pending = exchanges[1];
+        assert_eq!(late_pending["timing"]["window"], "late", "{late_pending}");
+        assert_eq!(late_pending["timing"]["late_pending"], 0, "{late_pending}");
+        assert_eq!(late_pending["classification"], "system", "{late_pending}");
+        assert!(
+            late_pending["reason"]
+                .as_str()
+                .unwrap()
+                .contains("did not end its wait"),
+            "{late_pending}"
+        );
+        let multi_frame = exchanges[2];
+        assert_eq!(
+            multi_frame["timing"]["not_judged_reason"], "end_after_limit",
+            "{multi_frame}"
         );
     }
 

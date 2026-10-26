@@ -4,15 +4,23 @@
 //! Every time compared is a VCI time placed on its clock (ADR-361), and a difference is taken
 //! only between two times on one clock and epoch, from the transmit done. A response start and
 //! the VCI's receive timeout are judged both ways; a response end only as proof that the
-//! response was on time, since it includes the response's own transfer. On a link whose VCI
+//! response was on time, since it includes the response's own transfer, except that the end of
+//! a message sent as one frame, past the limit by more than that frame's longest transfer,
+//! proves it late; a forwarded pending, always one frame, is judged so too (ADR-364). On a link
+//! whose VCI
 //! absorbs pendings the limit that depends on them is bounded from the transmit: the first
 //! pending came within P2, and the 0x78 completion limit runs from it.
 
 use super::clocks::Placed;
 use super::exchange::{Clock, MeasuredBy, NotJudgedReason, Timing, Window};
+use crate::link::SingleFrame;
+
+/// The length of a response pending (`7F`, the SID, `78`).
+const PENDING_BYTES: usize = 3;
 
 /// The limits of a link, as `link_opened` records them, and its timing margin, in
-/// microseconds, and whether its start-of-message indications are on.
+/// microseconds, whether its start-of-message indications are on, and what it sends as one
+/// frame (`None` when the log has no bound for the link's protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub p2_us: u64,
@@ -20,6 +28,7 @@ pub(crate) struct Limits {
     pub completion_us: Option<u64>,
     pub margin_us: u64,
     pub start_indications: bool,
+    pub single_frame: Option<SingleFrame>,
 }
 
 /// A time placed on its clock.
@@ -33,6 +42,8 @@ pub(crate) struct Times<'a> {
     pub pendings: &'a [At],
     pub start: At,
     pub end: At,
+    /// The length of the response whose end `end` is.
+    pub end_len: Option<usize>,
     /// The VCI's receive timeout, when it ended the exchange.
     pub timeout: At,
     /// The ECU may have begun a response: a start of its response was seen, or a start no
@@ -72,6 +83,13 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
     let p2 = to_i64(limits.p2_us);
     let p2_star = to_i64(limits.p2_star_us);
     let completion = limits.completion_us.map(to_i64);
+    // The longest transfer of a message of `len` bytes the link surely sends as one frame.
+    let single_frame = limits.single_frame;
+    let transfer = |len: usize| {
+        single_frame
+            .filter(|frame| len <= frame.max_bytes)
+            .map(|frame| to_i64(frame.transfer_us))
+    };
     let not_judged = |timing: &mut Timing, reason: NotJudgedReason| {
         timing.window = Window::NotJudged;
         timing.not_judged_reason = Some(reason);
@@ -88,7 +106,7 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
         not_judged(&mut timing, NotJudgedReason::OtherClock);
         return timing;
     };
-    let limits = limit_in_force(p2, p2_star, completion, &pendings, absorbing);
+    let in_force = limit_in_force(p2, p2_star, completion, &pendings, absorbing);
     let within = if pendings.is_empty() {
         Window::WithinP2
     } else {
@@ -106,19 +124,38 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
         not_judged(&mut timing, NotJudgedReason::BeforeTransmit);
         return timing;
     }
+    // Each forwarded pending against the limit in force before it, by its time, which is its
+    // end: one past that limit plus the margin and its frame's transfer makes the exchange late,
+    // whatever follows (design 8.11 "Limit in force").
+    if let Some(pending_transfer) = transfer(PENDING_BYTES) {
+        for (place, &at) in pendings.iter().enumerate() {
+            let before = limit_in_force(p2, p2_star, completion, &pendings[..place], absorbing);
+            if let Some(latest) = before.latest
+                && at > latest + margin + pending_transfer
+            {
+                set(
+                    &mut timing,
+                    Window::Late,
+                    Some(at - pending_transfer - latest),
+                );
+                timing.late_pending = Some(place);
+                return timing;
+            }
+        }
+    }
     // A receive timeout after a response began is the transport's consecutive-frame timer,
     // not the limit in force, so it is judged only when no response may have begun.
     let timeout = timeout.filter(|_| !times.response_may_have_begun);
     if let Some(timeout) = timeout {
-        if timeout < limits.earliest - margin {
+        if timeout < in_force.earliest - margin {
             set(
                 &mut timing,
                 Window::TimeoutEarly,
-                Some(limits.earliest - timeout),
+                Some(in_force.earliest - timeout),
             );
-        } else if (timeout - limits.expected).abs() <= margin {
+        } else if (timeout - in_force.expected).abs() <= margin {
             set(&mut timing, Window::TimeoutAtLimit, None);
-        } else if let Some(latest) = limits.latest
+        } else if let Some(latest) = in_force.latest
             && timeout > latest + margin
         {
             set(&mut timing, Window::TimeoutLate, Some(timeout - latest));
@@ -126,9 +163,9 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             set(&mut timing, Window::PossiblePending, None);
         }
     } else if let Some(start) = start {
-        if start <= limits.expected + margin {
+        if start <= in_force.expected + margin {
             set(&mut timing, within, None);
-        } else if let Some(latest) = limits.latest
+        } else if let Some(latest) = in_force.latest
             && start > latest + margin
         {
             set(&mut timing, Window::Late, Some(start - latest));
@@ -136,10 +173,16 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             set(&mut timing, Window::PossiblePending, None);
         }
     } else if let Some(end) = end {
-        // An end within the limit proves the response on time; one past it proves nothing,
-        // since the end includes the response's own transfer.
-        if end <= limits.expected + margin {
+        // An end within the limit proves the response on time. One past it proves nothing,
+        // since the end includes the response's own transfer, unless the response came as one
+        // frame and its end is past the limit by more than that frame's longest transfer.
+        if end <= in_force.expected + margin {
             set(&mut timing, within, None);
+        } else if let Some(transfer) = times.end_len.and_then(transfer)
+            && let Some(latest) = in_force.latest
+            && end > latest + margin + transfer
+        {
+            set(&mut timing, Window::Late, Some(end - transfer - latest));
         } else {
             not_judged(&mut timing, NotJudgedReason::EndAfterLimit);
         }
@@ -227,6 +270,10 @@ mod tests {
         completion_us: Some(25_000_000),
         margin_us: 2_000,
         start_indications: true,
+        single_frame: Some(SingleFrame {
+            max_bytes: 6,
+            transfer_us: 320,
+        }),
     };
 
     /// A device time `us` microseconds after a transmit at 1 000 000, epoch 0.
@@ -305,7 +352,14 @@ mod tests {
             (Window::Late, Some(3.0), None)
         );
         // The completion limit from the first, when it is earlier.
-        let chain = [at(10_000), at(24_000_000)];
+        let chain = [
+            at(10_000),
+            at(5_000_000),
+            at(10_000_000),
+            at(15_000_000),
+            at(20_000_000),
+            at(24_000_000),
+        ];
         let times = Times {
             transmit: transmit(),
             pendings: &chain,
@@ -351,6 +405,138 @@ mod tests {
                 None,
                 Some(NotJudgedReason::EndAfterLimit)
             )
+        );
+    }
+
+    /// An end `us` after the transmit of a response of `len` bytes.
+    fn end_of(len: usize, us: i64) -> Times<'static> {
+        Times {
+            transmit: transmit(),
+            end: at(us),
+            end_len: Some(len),
+            ..Times::default()
+        }
+    }
+
+    #[test]
+    fn a_single_frame_end_past_the_limit_and_its_transfer_is_late() {
+        // P2 50 ms, the margin 2 ms and one frame's 320 µs.
+        assert_eq!(judged(false, end_of(6, 30_000)).0, Window::WithinP2);
+        assert_eq!(
+            judged(false, end_of(6, 52_320)),
+            (
+                Window::NotJudged,
+                None,
+                Some(NotJudgedReason::EndAfterLimit)
+            )
+        );
+        // Late by how much its start was at least past P2.
+        assert_eq!(
+            judged(false, end_of(3, 52_321)),
+            (Window::Late, Some(2.001), None)
+        );
+        assert_eq!(judge(LIMITS, false, end_of(3, 52_321)).late_pending, None);
+    }
+
+    #[test]
+    fn a_multi_frame_end_is_never_late() {
+        assert_eq!(
+            judged(false, end_of(7, 9_000_000)),
+            (
+                Window::NotJudged,
+                None,
+                Some(NotJudgedReason::EndAfterLimit)
+            )
+        );
+        // Nor an end whose length or link gives no frame to bound.
+        assert_eq!(
+            judged(
+                false,
+                Times {
+                    end_len: None,
+                    ..end_of(3, 9_000_000)
+                }
+            )
+            .2,
+            Some(NotJudgedReason::EndAfterLimit)
+        );
+        let unbounded = Limits {
+            single_frame: None,
+            ..LIMITS
+        };
+        assert_eq!(
+            judge(unbounded, false, end_of(3, 9_000_000)).not_judged_reason,
+            Some(NotJudgedReason::EndAfterLimit)
+        );
+    }
+
+    #[test]
+    fn a_forwarded_pending_is_judged_against_the_limit_before_it() {
+        let times = |pendings| Times {
+            transmit: transmit(),
+            pendings,
+            start: at(5_000_000),
+            ..Times::default()
+        };
+        // The first against P2, by its end less its frame's transfer.
+        let on_time = [at(52_320)];
+        assert_eq!(judged(false, times(&on_time)).0, Window::WithinP2Star);
+        let late = [at(52_321)];
+        let timing = judge(LIMITS, false, times(&late));
+        assert_eq!(
+            (timing.window, timing.window_by_ms, timing.late_pending),
+            (Window::Late, Some(2.001), Some(0))
+        );
+        // A later one against P2* from the one before it.
+        let second = [at(10_000), at(5_012_321)];
+        let timing = judge(LIMITS, false, times(&second));
+        assert_eq!(
+            (timing.window, timing.window_by_ms, timing.late_pending),
+            (Window::Late, Some(2.001), Some(1))
+        );
+        // Whatever follows: a receive timeout at the limit after it.
+        let timing = judge(
+            LIMITS,
+            false,
+            Times {
+                transmit: transmit(),
+                pendings: &late,
+                timeout: at(5_052_321),
+                ..Times::default()
+            },
+        );
+        assert_eq!(
+            (timing.window, timing.late_pending),
+            (Window::Late, Some(0))
+        );
+        // No bound for the link's frames: the pendings are not judged.
+        let unbounded = Limits {
+            single_frame: None,
+            ..LIMITS
+        };
+        assert_eq!(
+            judge(unbounded, false, times(&late)).window,
+            Window::WithinP2Star
+        );
+    }
+
+    #[test]
+    fn on_an_absorbing_link_a_pending_is_late_only_past_the_latest_limit() {
+        let times = |pendings| Times {
+            transmit: transmit(),
+            pendings,
+            start: at(30_000_000),
+            ..Times::default()
+        };
+        // Unseen pendings may have come before it: the latest limit is the completion limit
+        // from P2.
+        let passed_on = [at(25_052_320)];
+        assert_ne!(judge(LIMITS, true, times(&passed_on)).late_pending, Some(0));
+        let late = [at(25_052_321)];
+        let timing = judge(LIMITS, true, times(&late));
+        assert_eq!(
+            (timing.window, timing.window_by_ms, timing.late_pending),
+            (Window::Late, Some(2.001), Some(0))
         );
     }
 

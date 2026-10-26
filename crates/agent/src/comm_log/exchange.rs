@@ -299,9 +299,10 @@ pub(crate) struct VciTimes {
 
 /// Gives each pending its interval from the transmit (`transmit`, the attached transmit
 /// indication's VCI time and clock) or the previous pending (design 8.11 `pending`): a
-/// difference only between two VCI times on the same clock ("On one clock"), and only forward,
-/// since a later raw time below an earlier one has wrapped or restarted (a new epoch the log
-/// cannot place here); otherwise absent. A pending with no time or clock starts no interval.
+/// difference only between two VCI times on the same clock ("On one clock"), and only forward:
+/// the log does not unwrap the 32-bit VCI times yet, so a later raw time below an earlier one,
+/// whether a wrap or a reset, gives no interval rather than a wrong one. A pending with no time
+/// or clock starts no interval.
 pub(crate) fn pending_intervals(pending: &mut [Pending], transmit: Option<(u64, Clock)>) {
     let mut previous = transmit;
     for pending in pending {
@@ -2112,6 +2113,11 @@ mod tests {
                 ..at(0, Clock::Worker)
             },
             at(70_000, Clock::Worker),
+            Pending {
+                clock: None,
+                ..at(80_000, Clock::Worker)
+            },
+            at(90_000, Clock::Worker),
         ];
         pending_intervals(&mut pending, Some((10_000, Clock::Device)));
         let intervals: Vec<_> = pending.iter().map(|p| p.since_previous_ms).collect();
@@ -2122,9 +2128,11 @@ mod tests {
                 Some(30.0), // from the previous pending
                 None,       // another clock
                 Some(10.0),
-                None, // backward: wrapped or restarted
+                None, // backward: a wrap or a reset, not unwrapped yet
                 None, // no time
                 None, // after one with no time
+                None, // a time but no clock
+                None, // after one with no clock
             ]
         );
         // Without a transmit time the first has no interval.

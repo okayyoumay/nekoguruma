@@ -365,7 +365,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   the host read it, so a forwarded link's empty list means no pending came. Each pending gives its
   interval from the attached transmit indication or the previous pending
   (`exchange::pending_intervals`), only between two VCI times on one clock and only forward (a
-  raw time below the one before has wrapped or restarted); otherwise none. When the agent's own deadline, not the
+  raw time below the one before, a wrap or a reset, gives none, since the log does not unwrap the
+  32-bit VCI times yet); otherwise none. When the agent's own deadline, not the
   worker's receive timeout, ends an exchange with no response, the entry's outcome is
   `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
   have run out, with or without a pending; a pending then silence is `vehicle` only when the

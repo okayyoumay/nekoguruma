@@ -706,9 +706,10 @@ fn assert_comm_log(setup: &CommLogSetup) {
             .unwrap_or_else(|| panic!("pending {index} has an interval: {vin}"));
         assert!(interval >= 0.0, "{vin}");
     }
-    // The second follows the first by the ECU's interval (30 ms), less the scheduling slack.
+    // The second follows the first by the injected interval: sim-vci stamps each pending from
+    // its scheduled time, so the difference is exact whatever the runner's load.
     assert!(
-        pending[1]["since_previous_ms"].as_f64().unwrap() >= 20.0,
+        (29.9..=30.1).contains(&pending[1]["since_previous_ms"].as_f64().unwrap()),
         "{vin}"
     );
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");

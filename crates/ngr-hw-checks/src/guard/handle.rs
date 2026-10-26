@@ -26,8 +26,9 @@
 //! `CreateComLogicalLink` (RawMode on T0 only), the ComParams `link::required` lists with the
 //! profile's values (those a response table holds in `SetUniqueRespIdTable` with one entry, the
 //! others in `SetComParam`), the same timing and response-pending defaults the agent's link sets
-//! (unless the profile pins them), `ConnectComLogicalLink` and a subscription to the link's
-//! events. Every one of these requests is itself decided, like a check's.
+//! (unless the profile pins them), on T1 to T3 the transmit and start-of-message indications the
+//! agent's link turns on (ADR-356; a library may refuse them), `ConnectComLogicalLink` and a
+//! subscription to the link's events. Every one of these requests is itself decided, like a check's.
 //!
 //! The handle also serves the agent's job runner (`GuardedClient`, ADR-334): `open_with` and
 //! `attach_with` can hold the device without creating links, subscribe only when the handle reads
@@ -61,10 +62,11 @@ use vci_service_interface::{
     GetTimestampRequest, GetUniqueRespIdTableRequest, GetVersionRequest, IoCtlRequest,
     IoCtlResponse, LockResourceRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
     ObjectIdResponse, ObjectType, ParamItem, PduComPrimitiveStatus, PduError, PduErrorEvent,
-    PduParamClass, PinData, ResourceData, ResourceIdsResponse, ResourceStatusResponse,
-    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest, StatusResponse,
-    SubscribeEventRequest, TimestampResponse, TxFlag, TxFlagBit, UniqueRespIdTableItem,
-    UniqueRespIdTableResponse, UnlockResourceRequest, VersionResponse, com_primitive_ctrl_data,
+    PduParamClass, PendingForwarding, PinData, ResourceData, ResourceIdsResponse,
+    ResourceStatusResponse, ResultData, SetComParamRequest, SetUniqueRespIdTableRequest,
+    StartComPrimitiveRequest, StatusResponse, SubscribeEventRequest, TimestampClock,
+    TimestampResponse, TxFlag, TxFlagBit, UniqueRespIdTableItem, UniqueRespIdTableResponse,
+    UnlockResourceRequest, VersionResponse, com_primitive_ctrl_data,
     create_com_logical_link_request, event_item, event_notification, io_ctl_request, param_item,
     pin_data, resource_data, subscribe_event_request,
 };
@@ -115,6 +117,11 @@ const SPELLINGS: [(&str, &str); 15] = [
     ("cp_canfillerbyte", "CP_CanFillerByte"),
     ("cp_testerpresentmessage", "CP_TesterPresentMessage"),
 ];
+
+/// The indication ComParams the handle turns on, as the agent's link does
+/// (`crates/agent/src/link.rs`): the transmit and start-of-message indications (ISO 22900-2
+/// (2022) B.5.1).
+const INDICATIONS: [&str; 2] = ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"];
 
 /// The tester-present request the handle sets as the link's message: TesterPresent with the
 /// suppress-response bit set (ISO 14229-1 (2026) 9.8, the sub-function is zero).
@@ -242,6 +249,9 @@ struct State {
     session_back: BTreeSet<u32>,
     /// The response timings of each link, which decide how long a send-receive may take.
     timings: BTreeMap<u32, LinkTimings>,
+    /// The links the handle created whose worker said it passes on every response pending
+    /// (`CreateComLogicalLink`'s `pending_forwarding`, ADR-355).
+    forwards_pendings: BTreeSet<u32>,
     /// Links whose return-to-default-session step is registered and has not started.
     session_registered: BTreeSet<u32>,
     /// The primitive being waited for on each link, while a wait is under way. A wait whose
@@ -380,6 +390,7 @@ impl Shared {
                 state.closing.remove(cll);
                 state.session_back.remove(cll);
                 state.timings.remove(cll);
+                state.forwards_pendings.remove(cll);
                 state.session_registered.remove(cll);
                 state.inflight.remove(cll);
                 state.monitors.remove(cll);
@@ -465,11 +476,27 @@ impl Shared {
         expected: Option<Expectation>,
         cap: Option<Duration>,
     ) -> Result<Vec<u8>, HandleError> {
+        self.await_primitive_timed(client, cll, cop, expected, cap, None)
+            .await
+            .map(|(response, _)| response)
+    }
+
+    /// [`Shared::await_primitive`], with the VCI times of the exchange: its transmit and
+    /// start-of-message indications are matched by `ids` when they come unbound.
+    async fn await_primitive_timed(
+        &self,
+        client: &mut WorkerClient,
+        cll: ComLogicalLinkHandle,
+        cop: ComPrimitiveHandle,
+        expected: Option<Expectation>,
+        cap: Option<Duration>,
+        ids: Option<Identifiers>,
+    ) -> Result<(Vec<u8>, VciTimes), HandleError> {
         self.lock().inflight.insert(cll.cll_handle, cop);
         let subscribed = self.ensure_events(client, cll).await;
-        let outcome = match subscribed {
-            Ok(()) => self.read_outcome(cll, cop, expected, cap).await,
-            Err(error) => Outcome::Running(error),
+        let (outcome, times) = match subscribed {
+            Ok(()) => self.read_outcome(cll, cop, expected, cap, ids).await,
+            Err(error) => (Outcome::Running(error), VciTimes::default()),
         };
         let result = match outcome {
             Outcome::Ended(result) => result,
@@ -487,7 +514,7 @@ impl Shared {
             started.retain(|started| *started != cop);
         }
         drop(state);
-        result
+        result.map(|response| (response, times))
     }
 
     /// Subscribes to the events of `cll` through the guard when the handle holds no stream for
@@ -641,53 +668,62 @@ impl Shared {
         }
     }
 
-    /// Reads the link's events until primitive `cop` ends or the wait does. Sends nothing.
+    /// Reads the link's events until primitive `cop` ends or the wait does, with the VCI times
+    /// the events gave on the way (none without `ids`). Sends nothing.
     async fn read_outcome(
         &self,
         cll: ComLogicalLinkHandle,
         cop: ComPrimitiveHandle,
         expected: Option<Expectation>,
         cap: Option<Duration>,
-    ) -> Outcome {
+        ids: Option<Identifiers>,
+    ) -> (Outcome, VciTimes) {
         let Some(events) = self.lock().events.get(&cll.cll_handle).cloned() else {
-            return Outcome::Running(HandleError::Setup(
-                "the link has no event stream".to_owned(),
-            ));
+            return (
+                Outcome::Running(HandleError::Setup(
+                    "the link has no event stream".to_owned(),
+                )),
+                VciTimes::default(),
+            );
         };
         let timeout = self.wait_for(cll);
         let timeout = cap.map_or(timeout, |cap| timeout.min(cap));
-        let mut progress = Progress::default();
+        let mut progress = Progress {
+            ids,
+            ..Progress::default()
+        };
         let now = tokio::time::Instant::now();
         // A timeout too long to add is, in effect, none.
         let deadline = now
             .checked_add(timeout)
             .unwrap_or_else(|| now + Duration::from_secs(86_400 * 365));
         let mut stream = events.lock().await;
-        loop {
+        let outcome = loop {
             let notification = match tokio::time::timeout_at(deadline, stream.message()).await {
-                Err(_) => return Outcome::Running(HandleError::NoResponse),
+                Err(_) => break Outcome::Running(HandleError::NoResponse),
                 Ok(Err(status)) => {
-                    return Outcome::Running(HandleError::Rpc {
+                    break Outcome::Running(HandleError::Rpc {
                         call: "SubscribeEvent",
                         code: status.code(),
                         message: status.to_string(),
                     });
                 }
-                Ok(Ok(None)) => return Outcome::Running(HandleError::EventStreamEnded),
+                Ok(Ok(None)) => break Outcome::Running(HandleError::EventStreamEnded),
                 Ok(Ok(Some(notification))) => notification,
             };
             let item = match notification.event_data {
                 Some(event_notification::EventData::Item(item)) => item,
                 // The end of the primitive may be among the lost events.
                 Some(event_notification::EventData::Lost(_)) => {
-                    return Outcome::Running(HandleError::EventsLost);
+                    break Outcome::Running(HandleError::EventsLost);
                 }
                 None => continue,
             };
             if let Some(outcome) = progress.on_item(item, cop, expected.as_ref()) {
-                return outcome;
+                break outcome;
             }
-        }
+        };
+        (outcome, progress.times)
     }
 }
 
@@ -696,6 +732,9 @@ impl Shared {
 struct Progress {
     response: Option<Vec<u8>>,
     error: Option<i32>,
+    /// The link's identifiers, to match its unbound indications; none are matched without.
+    ids: Option<Identifiers>,
+    times: VciTimes,
 }
 
 impl Progress {
@@ -719,15 +758,38 @@ impl Progress {
         {
             return Some(Outcome::Ended(Err(HandleError::VciLost)));
         }
+        // An indication only gives a time: it is never the response.
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && self.note_indication(&item, result, cop)
+        {
+            return None;
+        }
         // Events of earlier primitives, and of none, are not this request's.
         if item.cop_handle != Some(cop) {
             return None;
         }
+        let (timestamp, clock) = (item.timestamp, item.timestamp_clock);
+        let at = |us| VciTime::on(us, clock);
         match item.data {
             Some(event_item::Data::ResultData(result))
                 if expected.is_some_and(|expected| expected.answers(&result.data_bytes)) =>
             {
+                // The response's own item is its end; it may carry its start and its request's
+                // transmit too (ISO 22900-2 (2022) 10.1.4.11.4), which are this response's.
+                self.times.rx_end = Some(at(timestamp));
+                if let Some(us) = result.tx_msg_done_timestamp {
+                    self.times.tx_done = Some(at(us));
+                }
+                if let Some(us) = result.start_msg_timestamp {
+                    self.times.rx_start = Some(at(us));
+                }
                 self.response = Some(result.data_bytes);
+            }
+            // A response pending (0x78) to the request: the limit in force is no longer P2.
+            Some(event_item::Data::ResultData(result))
+                if expected.is_some_and(|expected| expected.is_pending(&result.data_bytes)) =>
+            {
+                self.times.pending_seen = true;
             }
             // The ECU did not answer: reported as no response when the primitive ends.
             Some(event_item::Data::ErrorData(ErrorData {
@@ -752,6 +814,139 @@ impl Progress {
         }
         None
     }
+}
+
+impl Progress {
+    /// Takes the time of a transmit or start-of-message indication of this exchange (design 8.11
+    /// "Timing judged"): one bound to the primitive, or an unbound one naming the link's request
+    /// or response identifier, the latest before the response, since the handle sends one
+    /// request at a time on a link. Returns whether the item is an indication, of this exchange
+    /// or not.
+    fn note_indication(
+        &mut self,
+        item: &EventItem,
+        result: &ResultData,
+        cop: ComPrimitiveHandle,
+    ) -> bool {
+        let flags = result.rx_flag.get(3).copied().unwrap_or(0);
+        let transmit = flags & RX_TX_INDICATION != 0;
+        let start =
+            flags & RX_START_OF_MESSAGE != 0 && flags & (RX_TX_INDICATION | RX_TX_MSG_TYPE) == 0;
+        if !transmit && !start {
+            return false;
+        }
+        let ours = match item.cop_handle {
+            Some(handle) => handle == cop,
+            None => {
+                // The CAN identifier the worker split off into the header, most significant first.
+                let identifier = result
+                    .extra_info
+                    .as_ref()
+                    .and_then(|extra| <[u8; 4]>::try_from(extra.header_bytes.as_slice()).ok())
+                    .map(u32::from_be_bytes);
+                self.ids.is_some_and(|ids| {
+                    identifier == Some(if transmit { ids.request } else { ids.response })
+                })
+            }
+        };
+        if ours && self.times.rx_end.is_none() {
+            if transmit {
+                let us = result.tx_msg_done_timestamp.unwrap_or(item.timestamp);
+                self.times.tx_done = Some(VciTime::of(us, item));
+            } else {
+                let us = result.start_msg_timestamp.unwrap_or(item.timestamp);
+                self.times.rx_start = Some(VciTime::of(us, item));
+            }
+        }
+        true
+    }
+}
+
+/// Whether `error` is the worker or its library refusing an indication ComParam, which leaves
+/// the link without it, rather than the connection to the worker failing; the agent's link
+/// draws the line the same way (`crates/agent/src/link.rs`). A D-PDU worker reports a library's
+/// refusal as an internal error, and a library may answer a name it does not know with an
+/// error rather than with no id. An indication set or not changes no traffic, so a refusal
+/// that may have been applied in part is harmless.
+fn refuses_indication(error: &HandleError) -> bool {
+    match error {
+        HandleError::Setup(_) | HandleError::WorkerRefused { .. } => true,
+        HandleError::Rpc { code, .. } => !matches!(
+            code,
+            tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown
+        ),
+        _ => false,
+    }
+}
+
+/// RxFlag bits of a result item's fourth byte (as the agent's communication log reads them): a
+/// transmitted message, a start-of-message indication and a transmit indication.
+const RX_TX_MSG_TYPE: u8 = 0x01;
+const RX_START_OF_MESSAGE: u8 = 0x02;
+const RX_TX_INDICATION: u8 = 0x08;
+
+/// The CAN identifiers a link's unbound indications are matched by: the request identifier a
+/// transmit indication names, and the response identifier a start-of-message indication names.
+#[derive(Debug, Clone, Copy)]
+struct Identifiers {
+    request: u32,
+    response: u32,
+}
+
+/// A VCI time an event item gave, with the clock the item names (ADR-353): `None` when it names
+/// none, and the time is then compared with no other (design 8.11 "On one clock").
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct VciTime {
+    pub us: u32,
+    pub clock: Option<TimestampClock>,
+}
+
+impl VciTime {
+    fn of(us: u32, item: &EventItem) -> Self {
+        Self::on(us, item.timestamp_clock)
+    }
+
+    /// `us` on the clock an item's `timestamp_clock` field names.
+    fn on(us: u32, clock: i32) -> Self {
+        let clock = TimestampClock::try_from(clock)
+            .ok()
+            .filter(|clock| *clock != TimestampClock::Unspecified);
+        Self { us, clock }
+    }
+
+    /// The microseconds from `self` to `later`, on one clock and forward only: none across
+    /// clocks, without a clock, or when `later` reads earlier (a wrap or a reset; the 32-bit
+    /// times are not unwrapped).
+    pub fn until(self, later: VciTime) -> Option<u32> {
+        match (self.clock, later.clock) {
+            (Some(clock), Some(other)) if clock == other && later.us >= self.us => {
+                Some(later.us - self.us)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// The VCI times of one send-receive (design 8.11 "Timing judged"): the transmit done, and the
+/// response's start and end, each as an event item gave it; and whether a response pending to
+/// the request was passed on, after which the limit in force is no longer P2 (design 8.11
+/// "Limit in force").
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VciTimes {
+    pub tx_done: Option<VciTime>,
+    pub rx_start: Option<VciTime>,
+    pub rx_end: Option<VciTime>,
+    pub pending_seen: bool,
+}
+
+/// A final response with the VCI times of its exchange.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Timed {
+    pub response: Vec<u8>,
+    pub times: VciTimes,
+    /// Whether the worker said the link passes on every response pending (ADR-355): without
+    /// that, a pending the VCI absorbed leaves no trace (design 8.11 "Possible pending").
+    pub forwards_pendings: bool,
 }
 
 /// How waiting for a primitive ended.
@@ -791,6 +986,11 @@ impl Expectation {
             [] => Vec::new(),
         };
         Self { sid, positive }
+    }
+
+    /// Whether `response` is a response pending (0x78) to the request's service.
+    fn is_pending(&self, response: &[u8]) -> bool {
+        matches!(response, [0x7F, sid, 0x78, ..] if *sid == self.sid)
     }
 
     /// Whether `response` is a final answer: a positive response that begins as expected, or a
@@ -1658,6 +1858,20 @@ impl GuardedHandle {
             .map(LinkTimings::ceiling)
     }
 
+    /// The timing margin the profile gives its VCI (`timing_margin_us`, design 8.11 "Timing
+    /// margin"), if it gives one.
+    pub fn timing_margin(&self) -> Option<Duration> {
+        self.shared
+            .vci
+            .timing_margin_us
+            .map(|us| Duration::from_micros(u64::from(us)))
+    }
+
+    /// The baud rate of the profile's link that `cll` serves.
+    pub fn baud_rate(&self, cll: ComLogicalLinkHandle) -> Result<u32, HandleError> {
+        self.profile_link(cll).map(|(link, _)| link.baud_rate)
+    }
+
     /// The ids the harness has learned from the worker's answers.
     pub fn learned(&self) -> Learned {
         self.shared.lock().learned.clone()
@@ -1688,7 +1902,7 @@ impl GuardedHandle {
             .ok_or_else(|| {
                 HandleError::Setup("the worker has no resource for the link".to_owned())
             })?;
-        let cll = self
+        let created = self
             .create_com_logical_link(CreateComLogicalLinkRequest {
                 module_handle: Some(module),
                 resource: Some(create_com_logical_link_request::Resource::ResourceId(
@@ -1703,9 +1917,14 @@ impl GuardedHandle {
                     )
                 }),
             })
-            .await?
+            .await?;
+        let forwards = created.pending_forwarding == PendingForwarding::All as i32;
+        let cll = created
             .cll_handle
             .ok_or_else(|| HandleError::Setup("no logical link handle".to_owned()))?;
+        if forwards {
+            self.shared.lock().forwards_pendings.insert(cll.cll_handle);
+        }
 
         self.shared.lock().timings.insert(
             cll.cll_handle,
@@ -1721,6 +1940,13 @@ impl GuardedHandle {
                 param_item: Some(value.item(id, param_class)),
             })
             .await?;
+        }
+        // The indications the agent's link turns on, which give the VCI times of an exchange
+        // (`send_receive_timed`, ADR-356). A raw link of T0 has no exchanges to time.
+        if class != Class::T0 {
+            for name in INDICATIONS {
+                self.set_indication(cll, name).await?;
+            }
         }
         let mut params = Vec::new();
         for (name, value) in table {
@@ -1742,6 +1968,35 @@ impl GuardedHandle {
         })
         .await?;
         Ok(cll)
+    }
+
+    /// Turns the indication ComParam `name` on. A library may refuse it, or not know it: the link
+    /// then goes without the indication, as the agent's does.
+    async fn set_indication(
+        &mut self,
+        cll: ComLogicalLinkHandle,
+        name: &str,
+    ) -> Result<(), HandleError> {
+        let id = match self.param_id(name).await {
+            Ok(id) => id,
+            Err(error) if refuses_indication(&error) => return Ok(()),
+            Err(error) => return Err(error),
+        };
+        match self
+            .set_com_param(SetComParamRequest {
+                cll_handle: Some(cll),
+                param_item: Some(ParamItem {
+                    id: Some(param_item::Id::ParamId(id)),
+                    com_param_class: PduParamClass::PduPcCom as i32,
+                    param_data: Some(param_item::ParamData::Unum32(1)),
+                }),
+            })
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(error) if refuses_indication(&error) => Ok(()),
+            Err(error) => Err(error),
+        }
     }
 
     /// The id the worker gives a ComParam, learned on the way.
@@ -2673,6 +2928,20 @@ impl GuardedHandle {
         cll: ComLogicalLinkHandle,
         request: &[u8],
     ) -> Result<Vec<u8>, HandleError> {
+        self.send_receive_timed(cll, request)
+            .await
+            .map(|timed| timed.response)
+    }
+
+    /// [`GuardedHandle::send_receive`], with the VCI times of the exchange: its transmit done and
+    /// its response's start and end, as the link's events gave them (design 8.11 "Timing
+    /// judged"). A time the worker or the library does not give is absent: a library that
+    /// refused the indications the handle turns on leaves only the response's end.
+    pub async fn send_receive_timed(
+        &mut self,
+        cll: ComLogicalLinkHandle,
+        request: &[u8],
+    ) -> Result<Timed, HandleError> {
         // The events are read from before the request goes out.
         self.shared
             .ensure_events(&mut self.client.clone(), cll)
@@ -2684,12 +2953,32 @@ impl GuardedHandle {
             .ok_or_else(|| {
                 HandleError::Setup("StartComPrimitive returned no primitive handle".to_owned())
             })?;
-        let response = self
+        let ids = self.profile_link(cll).ok().map(|(link, _)| Identifiers {
+            request: link.request_id,
+            response: link.response_id,
+        });
+        let (response, times) = self
             .shared
-            .await_result(&mut self.client.clone(), cll, cop, request, None)
+            .await_primitive_timed(
+                &mut self.client.clone(),
+                cll,
+                cop,
+                Some(Expectation::of(request)),
+                None,
+                ids,
+            )
             .await?;
         self.shared.observe_session(cll, request, &response);
-        Ok(response)
+        let forwards_pendings = self
+            .shared
+            .lock()
+            .forwards_pendings
+            .contains(&cll.cll_handle);
+        Ok(Timed {
+            response,
+            times,
+            forwards_pendings,
+        })
     }
 
     passthrough! {
@@ -3055,6 +3344,250 @@ mod tests {
                 )
                 .is_none()
         );
+    }
+
+    /// An item at `us` on `clock`, bound to `cop` or unbound.
+    fn timed_event(
+        cop: Option<ComPrimitiveHandle>,
+        us: u32,
+        clock: TimestampClock,
+        result: ResultData,
+    ) -> EventItem {
+        EventItem {
+            timestamp: us,
+            timestamp_clock: clock as i32,
+            ..event(cop, event_item::Data::ResultData(result))
+        }
+    }
+
+    /// An indication with RxFlag bits `flags`, carrying CAN identifier `id` in its header.
+    fn indication(flags: u8, id: u32) -> ResultData {
+        ResultData {
+            rx_flag: vec![0, 0, 0, flags],
+            extra_info: Some(vci_service_interface::ExtraInfo {
+                header_bytes: id.to_be_bytes().to_vec(),
+                footer_bytes: vec![],
+            }),
+            ..ResultData::default()
+        }
+    }
+
+    fn device(us: u32) -> Option<VciTime> {
+        Some(VciTime {
+            us,
+            clock: Some(TimestampClock::Device),
+        })
+    }
+
+    const IDS: Identifiers = Identifiers {
+        request: 0x7E0,
+        response: 0x7E8,
+    };
+
+    #[test]
+    fn unbound_indications_of_the_link_s_identifiers_time_the_exchange() {
+        // The shape `j2534-0404-service` gives: a TxDone and a start of message with no
+        // primitive, each naming its identifier in the header, then the bound response.
+        let expected = Expectation::of(&[0x3E, 0x00]);
+        let mut progress = Progress {
+            ids: Some(IDS),
+            ..Progress::default()
+        };
+        let mut on = |item| progress.on_item(item, COP, Some(&expected));
+        let device_clock = TimestampClock::Device;
+        // Another identifier's indications are not this exchange's.
+        assert!(on(timed_event(None, 10, device_clock, indication(0x08, 0x7E1))).is_none());
+        assert!(on(timed_event(None, 20, device_clock, indication(0x02, 0x7E9))).is_none());
+        assert!(
+            on(timed_event(
+                None,
+                1_000,
+                device_clock,
+                indication(0x08, 0x7E0)
+            ))
+            .is_none()
+        );
+        assert!(
+            on(timed_event(
+                None,
+                4_000,
+                device_clock,
+                indication(0x02, 0x7E8)
+            ))
+            .is_none()
+        );
+        // A start of message carrying the transmitted-message bit is a loopback, not a start.
+        assert!(
+            on(timed_event(
+                None,
+                4_500,
+                device_clock,
+                indication(0x03, 0x7E8)
+            ))
+            .is_none()
+        );
+        let response = ResultData {
+            data_bytes: vec![0x7E, 0x00],
+            ..ResultData::default()
+        };
+        assert!(on(timed_event(Some(COP), 5_000, device_clock, response)).is_none());
+        // An indication after the response is another exchange's.
+        assert!(
+            on(timed_event(
+                None,
+                9_000,
+                device_clock,
+                indication(0x08, 0x7E0)
+            ))
+            .is_none()
+        );
+        let done = on(event(
+            Some(COP),
+            event_item::Data::CopStatus(PduComPrimitiveStatus::PduCopstFinished as i32),
+        ));
+        assert!(matches!(done, Some(Outcome::Ended(Ok(r))) if r == [0x7E, 0x00]));
+        assert_eq!(
+            progress.times,
+            VciTimes {
+                tx_done: device(1_000),
+                rx_start: device(4_000),
+                rx_end: device(5_000),
+                pending_seen: false,
+            }
+        );
+        // Without the link's identifiers no unbound indication is taken.
+        let mut blind = Progress::default();
+        assert!(
+            blind
+                .on_item(
+                    timed_event(None, 1_000, device_clock, indication(0x08, 0x7E0)),
+                    COP,
+                    Some(&expected)
+                )
+                .is_none()
+        );
+        assert_eq!(blind.times, VciTimes::default());
+    }
+
+    #[test]
+    fn a_response_s_own_times_and_bound_indications_time_the_exchange() {
+        // The shape a D-PDU library may give: an indication bound to the primitive, and the
+        // response carrying its request's transmit and its own start (ISO 22900-2 (2022)
+        // 10.1.4.11.4).
+        let expected = Expectation::of(&[0x3E, 0x00]);
+        let mut progress = Progress::default();
+        let on = |p: &mut Progress, item| p.on_item(item, COP, Some(&expected));
+        let device_clock = TimestampClock::Device;
+        // A bound transmit indication carries the request's bytes; it is never the response.
+        let bound = ResultData {
+            data_bytes: vec![0x7E, 0x00],
+            ..indication(0x08, 0)
+        };
+        assert!(
+            on(
+                &mut progress,
+                timed_event(Some(COP), 700, device_clock, bound)
+            )
+            .is_none()
+        );
+        assert_eq!(progress.times.tx_done, device(700));
+        assert!(progress.response.is_none());
+        let response = ResultData {
+            data_bytes: vec![0x7E, 0x00],
+            tx_msg_done_timestamp: Some(1_000),
+            start_msg_timestamp: Some(4_000),
+            ..ResultData::default()
+        };
+        assert!(
+            on(
+                &mut progress,
+                timed_event(Some(COP), 5_000, device_clock, response)
+            )
+            .is_none()
+        );
+        assert_eq!(
+            progress.times,
+            VciTimes {
+                tx_done: device(1_000),
+                rx_start: device(4_000),
+                rx_end: device(5_000),
+                pending_seen: false,
+            }
+        );
+        // An item that names no clock gives times compared with no other.
+        let mut unclocked = Progress::default();
+        let response = ResultData {
+            data_bytes: vec![0x7E, 0x00],
+            tx_msg_done_timestamp: Some(1_000),
+            ..ResultData::default()
+        };
+        unclocked.on_item(
+            timed_event(Some(COP), 5_000, TimestampClock::Unspecified, response),
+            COP,
+            Some(&expected),
+        );
+        let (tx, end) = (
+            unclocked.times.tx_done.unwrap(),
+            unclocked.times.rx_end.unwrap(),
+        );
+        assert_eq!(tx.clock, None);
+        assert_eq!(tx.until(end), None);
+    }
+
+    #[test]
+    fn a_pending_to_the_request_is_noted_and_is_not_the_response() {
+        let expected = Expectation::of(&[0x10, 0x01]);
+        let mut progress = Progress::default();
+        let on = |p: &mut Progress, data: Vec<u8>| {
+            p.on_item(
+                event(
+                    Some(COP),
+                    event_item::Data::ResultData(ResultData {
+                        data_bytes: data,
+                        ..ResultData::default()
+                    }),
+                ),
+                COP,
+                Some(&expected),
+            )
+        };
+        // Another service's pending is not this request's.
+        assert!(on(&mut progress, vec![0x7F, 0x22, 0x78]).is_none());
+        assert!(!progress.times.pending_seen);
+        assert!(on(&mut progress, vec![0x7F, 0x10, 0x78]).is_none());
+        assert!(progress.times.pending_seen);
+        assert!(progress.response.is_none());
+    }
+
+    #[test]
+    fn a_refused_indication_is_any_answer_of_the_worker_but_a_lost_connection() {
+        let rpc = |code| HandleError::Rpc {
+            call: "SetComParam",
+            code,
+            message: String::new(),
+        };
+        // A D-PDU worker reports the library's refusal as an internal error.
+        assert!(refuses_indication(&rpc(tonic::Code::Internal)));
+        assert!(refuses_indication(&HandleError::Setup(
+            "the worker does not know ComParam CP_StartMsgIndEnable".to_owned()
+        )));
+        assert!(refuses_indication(&HandleError::WorkerRefused {
+            call: "SetComParam",
+            code: tonic::Code::InvalidArgument,
+            message: String::new(),
+        }));
+        // A connection that failed says nothing of the library, and ends the opening.
+        for code in [
+            tonic::Code::Unavailable,
+            tonic::Code::Cancelled,
+            tonic::Code::Unknown,
+        ] {
+            assert!(!refuses_indication(&rpc(code)), "{code:?}");
+        }
+        assert!(!refuses_indication(&HandleError::Timeout {
+            call: "SetComParam",
+            timeout: Duration::from_secs(1),
+        }));
     }
 
     #[test]

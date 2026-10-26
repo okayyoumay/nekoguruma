@@ -65,6 +65,8 @@ their clock (ADR-353).
 - On a forwarding link no possible-pending row keeps a silence `undetermined` any more, so the
   host now tells its own deadline from the worker's receive timeout: an exchange its deadline
   ended is `vci_did_not_end` (design 8.11), `undetermined`, since the limit in force may not
-  have run out; a pending then silence is `vehicle` only when the VCI ended the wait.
+  have run out; a pending then silence is `vehicle` only when the VCI ended the wait. The
+  agent-deadline exchange of ADR-354 item 3 is therefore `vci_did_not_end` too, which keeps it
+  out of the rows of a pending seen as that item requires.
 - A worker restart reopens the link, so a different worker binary behind the same job takes
   effect from its own answer.

@@ -2625,10 +2625,12 @@ mod tests {
         assert_eq!(unattached[0]["identifier"], 0x7E9);
     }
 
-    /// The agent's own deadline is not the VCI ending the wait: the response may still be
-    /// arriving, so the outcome stays `no_response` while the start still is an answer. The
-    /// start is no bound answer, so H2 stays open (ADR-354); the pending rows are checked on a
-    /// forwarding link in `a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer`.
+    /// Only an exchange the VCI ended converts a start into `response_incomplete`. The agent's
+    /// own deadline (`vci_did_not_end`, `host::deadline_end`) keeps its outcome, since the
+    /// response may still be arriving, and so does a primitive that ended with no response and
+    /// no receive timeout; the start still is an answer there. The start is no bound answer, so
+    /// H2 stays open (ADR-354); the pending rows are checked on a forwarding link in
+    /// `a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer`.
     #[test]
     fn a_start_of_message_does_not_make_an_agent_deadline_a_response_incomplete() {
         let (entries, unattached) = run_exchanges(vec![(
@@ -2650,10 +2652,25 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("(H2)"), "{reason}");
+
+        let (entries, unattached) = run_exchanges(vec![(
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::VciDidNotEnd,
+            ),
+            vec![start_of_message(0x7E8)],
+        )]);
+        assert!(unattached.is_empty());
+        assert_eq!(entries[0]["outcome"]["result"], "vci_did_not_end");
+        assert_eq!(entries[0]["sent"], "confirmed");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+        assert_eq!(entries[0]["classification"], "undetermined");
     }
 
     /// The rows of a pending seen need a pending (ADR-354): on a link that forwards pendings,
-    /// with a judged window, a start alone ended by the agent's deadline is no pending answer.
+    /// with a judged window, a start alone ended with no response and no receive timeout is no
+    /// pending answer.
     /// A request whose positive response is suppressed still has an answer of the ECU in the
     /// start, so it does not take the rows for no answer of the ECU.
     #[test]

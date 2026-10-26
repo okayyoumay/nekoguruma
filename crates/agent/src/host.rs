@@ -649,7 +649,9 @@ impl<C: WorkerApi> WorkerHost<C> {
             }
         };
         let waited = tokio::time::timeout_at(deadline, wait).await;
-        let agent_deadline = waited.is_err();
+        // A receive timeout the worker already reported ended the VCI's wait, even when the
+        // primitive's end had not been read before the deadline.
+        let agent_deadline = waited.is_err() && progress.rx_timeout.is_none();
         let result = waited
             .map_err(|_| HostError::NoResponse)
             .and_then(|outcome| outcome);

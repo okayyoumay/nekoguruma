@@ -1724,13 +1724,13 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
             (Undetermined, reason)
         }
-        // The agent's own deadline, not the VCI, ended a wait the ECU had extended with a
-        // pending: the limit in force may not have run out, and a long transfer or a slow
-        // worker can outlast the agent (design 8.11 `vci_did_not_end`).
+        // A primitive the worker ended after a pending without a receive timeout (finished or
+        // cancelled with no response): no limit is shown to have run out, so the silence is not
+        // the ECU's. The agent's own deadline is `vci_did_not_end` (`host::deadline_end`).
         End::NoResponse if pending_answer && !evidence.vci_ended => (
             Undetermined,
             to_owned(
-                "The ECU answered with a pending, and the agent stopped waiting before the VCI ended the exchange, so the limit in force may not have run out; a long transfer or a slow ECU can outlast the agent's deadline.",
+                "The ECU answered with a pending, and the primitive ended with no response and no receive timeout from the VCI, so it is not shown that the limit in force ran out.",
             ),
         ),
         End::NoResponse if pending_answer && !any_link_error => {
@@ -2082,13 +2082,13 @@ mod tests {
         assert_eq!(entry.sent, Sent::Confirmed);
         assert_eq!(entry.sent_evidence, SentEvidence::Answer);
         assert!(entry.link_history.this_exchange);
-        // The agent's own deadline ended the wait, not the VCI: the limit in force may not have
-        // run out, so the silence is not the ECU's.
-        let mut agent_deadline = evidence.clone();
-        agent_deadline.vci_ended = false;
-        let verdict = verdict_of(&agent_deadline);
+        // A primitive that ended with no receive timeout shows no limit ran out, so the silence
+        // is not the ECU's.
+        let mut ended_without_timeout = evidence.clone();
+        ended_without_timeout.vci_ended = false;
+        let verdict = verdict_of(&ended_without_timeout);
         assert_eq!(verdict.0, Classification::Undetermined);
-        assert!(verdict.1.contains("agent stopped waiting"), "{}", verdict.1);
+        assert!(verdict.1.contains("no receive timeout"), "{}", verdict.1);
         // A link error during the exchange makes it undetermined and names both.
         evidence.link_errors = vec![LinkErrorKind::Receive];
         let verdict = verdict_of(&evidence);

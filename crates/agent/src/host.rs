@@ -829,6 +829,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             unbound: std::mem::take(&mut progress.unbound),
             pendings: std::mem::take(&mut progress.pendings),
             rejected: std::mem::take(&mut progress.rejected),
+            last_rejected: progress.last_rejected,
             events_lost: progress.events_lost.take(),
             agent_deadline,
             response_times: progress.response_times,
@@ -973,13 +974,14 @@ fn deadline_end(end: End, agent_deadline: bool) -> End {
 }
 
 /// The end an exchange's entry gives when its primitive ended with no answer and its last
-/// result was a rejected one of positive form (ADR-359): the response the worker took but the
+/// result, with no pending or answer after it, was a rejected one of positive form (ADR-359): the response the worker took but the
 /// agent cannot use, `positive_unusable` (design 8.11 `outcome`). An exchange the agent's
 /// deadline or the VCI's receive timeout ended keeps its end.
 fn unanswered_end(end: End, sent: &Sent) -> End {
     match (end, sent.rejected.last()) {
         (End::NoResponse, Some(last))
-            if sent.rx_timeout.is_none()
+            if sent.last_rejected
+                && sent.rx_timeout.is_none()
                 && !sent.agent_deadline
                 && last.reason == RejectedReason::WrongEcho =>
         {
@@ -1184,6 +1186,8 @@ struct Sent {
     pendings: Vec<PendingRead>,
     /// See `Progress::rejected`.
     rejected: Vec<RejectedRead>,
+    /// See `Progress::last_rejected`.
+    last_rejected: bool,
     /// See `Progress::events_lost`.
     events_lost: Option<Option<AgentNow>>,
     /// The agent's own deadline ended the wait, not the worker: the VCI had not ended the
@@ -1210,6 +1214,7 @@ impl Sent {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            last_rejected: false,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -1668,6 +1673,8 @@ struct Progress {
     /// The results bound to the primitive that do not answer the request, in order (design 8.11
     /// `rejected`, ADR-359).
     rejected: Vec<RejectedRead>,
+    /// The last result of the primitive was a rejected one: no pending or answer came after it.
+    last_rejected: bool,
     /// The worker reported lost events: `Some` with the agent's clocks when the host read it, if
     /// it has a log.
     events_lost: Option<Option<AgentNow>>,
@@ -1693,6 +1700,7 @@ impl Progress {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            last_rejected: false,
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
@@ -1714,6 +1722,7 @@ impl Progress {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            last_rejected: false,
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
@@ -1792,6 +1801,11 @@ impl Progress {
                 },
                 read: None,
             });
+        }
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && !is_indication(result)
+        {
+            self.last_rejected = !self.answers(&result.data_bytes);
         }
         // A response pending the worker passed on is kept for the log (design 8.11 `pending`),
         // with the item's time and clock as the worker gave them (ADR-353).
@@ -2343,6 +2357,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            last_rejected: false,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -2431,6 +2446,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            last_rejected: false,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -3065,6 +3081,7 @@ mod tests {
         };
         let sent = |reason, agent_deadline| Sent {
             rejected: vec![rejected(reason)],
+            last_rejected: true,
             agent_deadline,
             ..Sent::not_started(Err(HostError::NoResponse))
         };
@@ -3082,6 +3099,15 @@ mod tests {
         assert!(matches!(
             unanswered_end(End::VciDidNotEnd, &sent(RejectedReason::WrongEcho, true)),
             End::VciDidNotEnd
+        ));
+        // A pending or an answer after the rejected result: it was not the primitive's end.
+        let followed = Sent {
+            last_rejected: false,
+            ..sent(RejectedReason::WrongEcho, false)
+        };
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &followed),
+            End::NoResponse
         ));
         let none = Sent::not_started(Err(HostError::NoResponse));
         assert!(matches!(
@@ -3124,6 +3150,15 @@ mod tests {
             ]
         );
         assert_eq!(progress.response, Some(vec![0x62, 0xF1, 0x90, 0x41]));
+        assert!(!progress.last_rejected, "the answer came last");
+        let mut pending_after = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        pending_after.on_event(event(Some(COP), result(&[0x62, 0xF1])), COP);
+        assert!(pending_after.last_rejected);
+        pending_after.on_event(event(Some(COP), result(&[0x7F, 0x22, 0x78])), COP);
+        assert!(
+            !pending_after.last_rejected,
+            "a pending came after the rejected result"
+        );
         let logged = rejected_of(
             &[RejectedRead {
                 identifier: None,
@@ -3283,6 +3318,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            last_rejected: false,
             events_lost: None,
             agent_deadline: false,
             response_times: progress.response_times,
@@ -3340,6 +3376,7 @@ mod tests {
                 unbound: Vec::new(),
                 pendings: Vec::new(),
                 rejected: Vec::new(),
+                last_rejected: false,
                 events_lost: None,
                 agent_deadline: false,
                 response_times: VciTimes::default(),

@@ -1038,11 +1038,9 @@ impl Evidence {
     /// response, or else the pending a pending seen stands for (the negative response with code
     /// 0x78 for this request's SID).
     fn answer_head(&self) -> Option<Vec<u8>> {
-        // A rejected result the worker ended the primitive with answers nothing (ADR-359).
-        if self.end_rejected {
-            return None;
-        }
-        if let Some(response) = self.final_response() {
+        // A rejected result the worker ended the primitive with answers nothing (ADR-359); a
+        // pending before it is still an answer of the ECU.
+        if let (false, Some(response)) = (self.end_rejected, self.final_response()) {
             return Some(response.to_vec());
         }
         if self.pending.is_empty() {
@@ -2226,6 +2224,24 @@ mod tests {
         )));
         assert_eq!(next.answered, 0);
         assert_eq!(next.owed_matching, 1);
+    }
+
+    /// ADR-359: a pending before a rejected end is still an answer of the ECU.
+    #[test]
+    fn a_pending_before_a_rejected_end_is_still_an_answer() {
+        let mut cut = forwarding(evidence(
+            &READ_F186,
+            End::PositiveUnusable(vec![0x62, 0xF1]),
+        ));
+        cut.end_rejected = true;
+        cut.pending = vec![Pending {
+            vci_us: Some(1),
+            clock: Some(Clock::Device),
+            agent_us: 2,
+            since_previous_ms: None,
+        }];
+        assert_eq!(cut.answer_head(), Some(vec![0x7F, 0x22, 0x78]));
+        assert!(cut.bound_answer());
     }
 
     #[test]

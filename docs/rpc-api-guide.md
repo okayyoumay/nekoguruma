@@ -1696,6 +1696,24 @@ analog for those either. The exception is `StartComPrimitive`: its
 `INVALID_ARGUMENT` refusals carry an `ErrorDetail` with
 `PDU_ERR_INVALID_PARAMETERS` and their refusal reason (above).
 
+### Reading a Worker's Answer
+
+A client reads a failed RPC from its `ErrorDetail` and the status code classes below, never from
+which worker answered (design principle 6): the outer code of the same condition differs between
+the workers. `iso22900-service` gives every failed library call `INTERNAL` with the library's
+return code in `pdu_error`, while `j2534-0404-service` gives `PDU_ERR_INVALID_HANDLE` as
+`NOT_FOUND` (above). So `INTERNAL` from a D-PDU worker is the library's own answer, not a crashed
+worker. The rows are checked in order; the first that matches is the reading.
+
+| The answer | Reading | The agent's use |
+|---|---|---|
+| The client's own deadline for the call passed (no answer) | The worker does not answer: neither a refusal nor a success | `HostError::WorkerUnresponsive` |
+| Code `UNAVAILABLE`, `CANCELLED` or `UNKNOWN` | The connection to the worker failed: the call may not have reached the library, so this is no answer of the library's | Never read as a refusal (`agent::link`'s `refused`; the guarded handle's `refuses_indication` in `ngr-hw-checks` keeps its own copy) |
+| Code `FAILED_PRECONDITION` with `error_event_data.error_event` `PDU_ERR_EVT_LOST_COMM_TO_VCI` | The VCI is lost; the link is offline and the worker ended its primitives. A `StartComPrimitive` answered so was not sent (ADR-294) | `HostError::VciLost` |
+| `ErrorDetail.pdu_error` `PDU_ERR_INVALID_HANDLE`, whatever the code | The worker knows no object with the handle given (ISO 22900-2:2022 D.3). For a `CancelComPrimitive`, the primitive had already ended, which counts as cancelled | The host's stray-primitive cancel (`names_invalid_handle`); the guarded handle's `cancel_maybe_ended` |
+| A `StartComPrimitive` whose `ErrorDetail.refusal` is set | Refused before anything was sent, for the reason named (ADR-350) | The entry is `not_sent` |
+| Any other failure (`INTERNAL` included) | The worker or the library answered and did not do what was asked. For an optional setting, such as an indication ComParam, that is the library refusing it; for a required step, a failure of that step. Whether the request reached the bus is unknown unless a row above says so | An optional setting is left off; a required step's failure is `HostError::Rpc` |
+
 ---
 
 ## Typical Usage Sequence

@@ -978,6 +978,9 @@ impl CommLog {
                 inner.links.len() - 1
             }
         };
+        // The transmit indication's VCI time and clock, when one attaches: the start of the
+        // first pending's interval.
+        let mut transmit_vci = None;
         if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
             && evidence.transmit_evidence.is_none()
             && !inner.links[at].1.may_own_tx_indication()
@@ -985,7 +988,11 @@ impl CommLog {
                 .iter()
                 .position(|item| item.is_tx_indication_for(tx_id))
         {
-            let read = unbound.remove(own).read;
+            let indication = unbound.remove(own);
+            let read = indication.read;
+            transmit_vci = indication
+                .clock
+                .map(|clock| (u64::from(indication.vci_us), clock));
             evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
             // The agent's time of the transmit confirmation is when the host read it, on the
             // entry's agent epoch.
@@ -1021,6 +1028,7 @@ impl CommLog {
                 evidence.end = exchange::End::ResponseIncomplete;
             }
         }
+        exchange::pending_intervals(&mut evidence.pending, transmit_vci);
         for item in &unbound {
             let event = Event::Unattached(UnattachedEntry::of(item));
             inner.append_with(|seq, line| {

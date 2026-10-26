@@ -95,32 +95,23 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
         timing.not_judged_reason = Some(reason);
         timing.window_by_ms = None;
     };
-    // The pendings seen, in microseconds from the transmit; `None` when one is not on the
-    // transmit's clock and epoch, which leaves the limit after it unknown.
-    let Some(pendings) = times
-        .pendings
-        .iter()
-        .map(|at| since(*at))
-        .collect::<Option<Vec<i64>>>()
-    else {
-        not_judged(&mut timing, NotJudgedReason::OtherClock);
-        return timing;
-    };
-    let in_force = limit_in_force(p2, p2_star, completion, &pendings, absorbing);
-    let within = if pendings.is_empty() {
-        Window::WithinP2
-    } else {
-        Window::WithinP2Star
-    };
     let set = |timing: &mut Timing, window: Window, by_us: Option<i64>| {
         timing.window = window;
         timing.window_by_ms = by_us.map(ms);
         timing.not_judged_reason = None;
     };
+    // The pendings seen, in microseconds from the transmit, up to the first that is not on the
+    // transmit's clock and epoch: the limit in force is known only up to that one.
+    let known: Vec<i64> = times.pendings.iter().map_while(|at| since(*at)).collect();
     let start = since(times.start);
     let end = since(times.end);
     let timeout = since(times.timeout);
-    if [start, end, timeout].into_iter().flatten().any(|us| us < 0) {
+    if [start, end, timeout]
+        .into_iter()
+        .flatten()
+        .chain(known.iter().copied())
+        .any(|us| us < 0)
+    {
         not_judged(&mut timing, NotJudgedReason::BeforeTransmit);
         return timing;
     }
@@ -128,8 +119,8 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
     // end: one past that limit plus the margin and its frame's transfer makes the exchange late,
     // whatever follows (design 8.11 "Limit in force").
     if let Some(pending_transfer) = transfer(PENDING_BYTES) {
-        for (place, &at) in pendings.iter().enumerate() {
-            let before = limit_in_force(p2, p2_star, completion, &pendings[..place], absorbing);
+        for (place, &at) in known.iter().enumerate() {
+            let before = limit_in_force(p2, p2_star, completion, &known[..place], absorbing);
             if let Some(latest) = before.latest
                 && at > latest + margin + pending_transfer
             {
@@ -143,6 +134,18 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             }
         }
     }
+    // A pending not on the transmit's clock and epoch leaves the limit after it unknown.
+    if known.len() < times.pendings.len() {
+        not_judged(&mut timing, NotJudgedReason::OtherClock);
+        return timing;
+    }
+    let pendings = known;
+    let in_force = limit_in_force(p2, p2_star, completion, &pendings, absorbing);
+    let within = if pendings.is_empty() {
+        Window::WithinP2
+    } else {
+        Window::WithinP2Star
+    };
     // A receive timeout after a response began is the transport's consecutive-frame timer,
     // not the limit in force, so it is judged only when no response may have begun.
     let timeout = timeout.filter(|_| !times.response_may_have_begun);
@@ -436,6 +439,8 @@ mod tests {
             (Window::Late, Some(2.001), None)
         );
         assert_eq!(judge(LIMITS, false, end_of(3, 52_321)).late_pending, None);
+        // Six bytes are still one frame.
+        assert_eq!(judged(false, end_of(6, 52_321)).0, Window::Late);
     }
 
     #[test]
@@ -509,6 +514,27 @@ mod tests {
             (timing.window, timing.late_pending),
             (Window::Late, Some(0))
         );
+        // The first late pending is the one named.
+        let both = [at(52_321), at(5_060_000)];
+        assert_eq!(judge(LIMITS, false, times(&both)).late_pending, Some(0));
+        // One on another clock after a late one leaves the late one judged, and the limits
+        // after it unknown.
+        let then_other = [at(52_321), on(1, 5)];
+        assert_eq!(
+            judge(LIMITS, false, times(&then_other)).late_pending,
+            Some(0)
+        );
+        let on_time_then_other = [at(10_000), on(1, 5)];
+        assert_eq!(
+            judged(false, times(&on_time_then_other)).2,
+            Some(NotJudgedReason::OtherClock)
+        );
+        // A pending before the transmit judges nothing.
+        let before = [at(-10_000), at(4_995_000)];
+        assert_eq!(
+            judged(false, times(&before)).2,
+            Some(NotJudgedReason::BeforeTransmit)
+        );
         // No bound for the link's frames: the pendings are not judged.
         let unbounded = Limits {
             single_frame: None,
@@ -531,13 +557,19 @@ mod tests {
         // Unseen pendings may have come before it: the latest limit is the completion limit
         // from P2.
         let passed_on = [at(25_052_320)];
-        assert_ne!(judge(LIMITS, true, times(&passed_on)).late_pending, Some(0));
+        assert_eq!(judge(LIMITS, true, times(&passed_on)).late_pending, None);
         let late = [at(25_052_321)];
         let timing = judge(LIMITS, true, times(&late));
         assert_eq!(
             (timing.window, timing.window_by_ms, timing.late_pending),
             (Window::Late, Some(2.001), Some(0))
         );
+        // With no completion limit nothing bounds the limit before it.
+        let unbounded = Limits {
+            completion_us: None,
+            ..LIMITS
+        };
+        assert_eq!(judge(unbounded, true, times(&late)).late_pending, None);
     }
 
     #[test]

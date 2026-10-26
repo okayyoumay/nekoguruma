@@ -45,7 +45,11 @@ and how long one frame can take on the link. Neither is in a ComParam the log re
    (ADR-362 item 3). A pending past it, by the rule of item 3, makes the window `late`. The
    window names the pending in `late_pending` (its place in `pending`, from 0), and this decides
    the window whatever follows: a response, a timeout or a loss. The first late pending is the
-   one named.
+   one named. A pending is judged only while every pending before it is on the transmit's
+   clock and epoch, since its limit depends on them; one that is not leaves the window
+   `not_judged` with `other_clock` unless an earlier pending was already late. A pending before
+   the transmit makes the window `not_judged` with `before_transmit`, as a start, end or
+   timeout before it does.
 5. **The late-pending row classifies.** Any outcome after such a pending is `system`, at the
    row's place in design 8.11's table (after the `not_sent` rows). The reason names the
    pending, by how much it was late, and the outcome that followed. The entry's text does not
@@ -58,6 +62,10 @@ and how long one frame can take on the link. Neither is in a ComParam the log re
 - The rule of item 1 leaves a seven-byte single frame unjudged by its end. Taking the link's
   addressing format from its ComParams would judge it too, but the agent opens no link with
   another format today, and the gain is one byte.
+- A pending is taken as three bytes, the length of a UDS response pending; the log does not
+  record a pending's length. The agent's pending pattern is the code after the marker and the
+  echoed SID, and a pending with bytes after the code, which UDS does not define, would be
+  judged with one frame's transfer even past six bytes.
 - The 160-bit bound is for classic CAN. A CAN FD link would need its own bound, defined with
   that link.
 - `vci_did_not_end`'s `system` row, which compares a device clock reading with the limits,

@@ -388,7 +388,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   worker's receive timeout, ends an exchange with no response, the entry's outcome is
   `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
   have run out, with or without a pending; a pending then silence is `vehicle` only when the
-  VCI ended the wait.
+  VCI ended the wait. A primitive whose end the host did not read may still hold the link: its
+  own deadline, lost events or a failed event stream ended the wait, though not a lost VCI,
+  whose primitives the worker cancels. The host cancels such a primitive before the link's next
+  request (`WorkerHost::stray`, design 8.11 "Settlement"). A worker that refuses the cancel has
+  no such primitive any more. Any other failure leaves the link held, so the request is not
+  started. An item the cancelled primitive leaves is logged `unattached` with `primitive`
+  `earlier`.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs
@@ -1128,7 +1134,8 @@ restart's own checks read the same sources and still treat any non-integer readi
 ## The worker client
 
 The runner, the host and the link set-up call the worker through the trait `agent::client::WorkerApi`
-(ADR-334): one method per RPC they use, with the generated gRPC client's signatures, and
+(ADR-334): one method per RPC they use (`CancelComPrimitive` among them, which the host sends
+for a primitive it stopped waiting for), with the generated gRPC client's signatures, and
 `held_module()`. `ngr-agent` uses `worker_host::client::WorkerClient`, which implements the trait by
 delegating, so a production call is unchanged. A client that holds the worker's module itself
 (`held_module()` is `Some`) is used by the hardware harness's guarded client

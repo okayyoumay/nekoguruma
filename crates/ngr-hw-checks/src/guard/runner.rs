@@ -33,13 +33,14 @@ use agent::client::{Reply, WorkerApi};
 use tokio::sync::Mutex as AsyncMutex;
 use tonic::Streaming;
 use vci_service_interface::{
-    ComLogicalLinkResponse, ComPrimitiveResponse, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    ErrorDetail, ErrorEventData, EventNotification, GetModuleIdsRequest, GetObjectIdRequest,
-    GetResourceIdsRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest,
-    ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse, ObjectIdResponse, PduError,
-    PduErrorEvent, ResourceIdsResponse, Response, SetComParamRequest, SetUniqueRespIdTableRequest,
-    StartComPrimitiveRequest, SubscribeEventRequest, VersionResponse, status_with_error_detail,
+    CancelComPrimitiveRequest, ComLogicalLinkResponse, ComPrimitiveResponse,
+    ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
+    DisconnectComLogicalLinkRequest, ErrorDetail, ErrorEventData, EventNotification,
+    GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest, GetVersionRequest,
+    IoCtlRequest, IoCtlResponse, ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle,
+    ModuleIdsResponse, ObjectIdResponse, PduError, PduErrorEvent, ResourceIdsResponse, Response,
+    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest,
+    SubscribeEventRequest, VersionResponse, status_with_error_detail,
 };
 
 use super::{GuardedHandle, HandleError, HandleOptions, Request, Trace};
@@ -176,6 +177,7 @@ impl WorkerApi for GuardedClient {
         set_com_param(SetComParamRequest) -> Response = |h, r| h.set_com_param(r);
         set_unique_resp_id_table(SetUniqueRespIdTableRequest) -> Response = |h, r| h.set_table_completed(r);
         start_com_primitive(StartComPrimitiveRequest) -> ComPrimitiveResponse = |h, r| h.start_com_primitive(r);
+        cancel_com_primitive(CancelComPrimitiveRequest) -> Response = |h, r| h.cancel_com_primitive(r);
         subscribe_event(SubscribeEventRequest) -> Streaming<EventNotification> = |h, r| h.subscribe_event(r);
         io_ctl(IoCtlRequest) -> IoCtlResponse = |h, r| h.io_ctl(r);
     }

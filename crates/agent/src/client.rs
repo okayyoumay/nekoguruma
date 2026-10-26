@@ -17,13 +17,13 @@ use std::future::Future;
 use tonic::Streaming;
 use vci_service_interface::vci_service_client::VciServiceClient;
 use vci_service_interface::{
-    ComLogicalLinkResponse, ComPrimitiveResponse, ConnectComLogicalLinkRequest,
-    CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest,
-    EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
-    GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest, ModuleDisconnectRequest,
-    ModuleHandle, ModuleIdsResponse, ObjectIdResponse, ResourceIdsResponse, Response,
-    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest,
-    SubscribeEventRequest, VersionResponse,
+    CancelComPrimitiveRequest, ComLogicalLinkResponse, ComPrimitiveResponse,
+    ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
+    DisconnectComLogicalLinkRequest, EventNotification, GetModuleIdsRequest, GetObjectIdRequest,
+    GetResourceIdsRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest,
+    ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse, ObjectIdResponse,
+    ResourceIdsResponse, Response, SetComParamRequest, SetUniqueRespIdTableRequest,
+    StartComPrimitiveRequest, SubscribeEventRequest, VersionResponse,
 };
 use worker_host::client::WorkerClient;
 
@@ -79,6 +79,7 @@ worker_api! {
     set_com_param(SetComParamRequest) -> Response;
     set_unique_resp_id_table(SetUniqueRespIdTableRequest) -> Response;
     start_com_primitive(StartComPrimitiveRequest) -> ComPrimitiveResponse;
+    cancel_com_primitive(CancelComPrimitiveRequest) -> Response;
     subscribe_event(SubscribeEventRequest) -> Streaming<EventNotification>;
     io_ctl(IoCtlRequest) -> IoCtlResponse;
 }

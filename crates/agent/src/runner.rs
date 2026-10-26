@@ -14350,16 +14350,13 @@ def main():
         /// What the link's events give after each start, and when.
         on_start: Option<(Duration, StartEvent)>,
         /// The sender of the link's event stream, once subscribed.
-        events: Arc<
-            Mutex<
-                Option<
-                    tokio::sync::mpsc::UnboundedSender<
-                        Result<vci_service_interface::EventNotification, tonic::Status>,
-                    >,
-                >,
-            >,
-        >,
+        events: Arc<Mutex<Option<EventSender>>>,
     }
+
+    /// The sender of a [`FakeWorker`]'s event stream.
+    type EventSender = tokio::sync::mpsc::UnboundedSender<
+        Result<vci_service_interface::EventNotification, tonic::Status>,
+    >;
 
     /// An event a [`FakeWorker`] gives after a start.
     #[derive(Clone, Copy)]

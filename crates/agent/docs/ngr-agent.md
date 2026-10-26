@@ -388,7 +388,16 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   interval from that transmit done or the previous pending
   (`exchange::pending_intervals`), only between two VCI times on one clock and only forward (a
   raw time below the one before, a wrap or a reset, gives none, since the log does not unwrap the
-  32-bit VCI times yet); otherwise none. When the agent's own deadline, not the
+  32-bit VCI times yet); otherwise none. A result bound to the primitive that does not answer
+  the request (`Progress::answers`), and is no indication, transmitted message or break by its
+  RxFlag, goes in the entry's `rejected` with its response identifier (the header's, else the
+  link's), bytes, times and reason (`wrong_echo` or `pattern_mismatch`, ADR-359); it counts for
+  neither the classification nor `link_history`, except that a primitive that ended with no answer
+  after a rejected result of positive form gives that response as the entry's outcome,
+  `positive_unusable` (`unanswered_end`, `Evidence::end_rejected`), redacted as a rejected result
+  and counted for no answer in `link_history`; the job still gets no answer. Lost events end the wait at the worker's first
+  report, which the entry records in `events_lost` with the agent time it was read. When the
+  agent's own deadline, not the
   worker's receive timeout, ends an exchange with no response, the entry's outcome is
   `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
   have run out, with or without a pending; a pending then silence is `vehicle` only when the

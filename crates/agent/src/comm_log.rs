@@ -382,10 +382,10 @@ impl UnattachedItem {
 }
 
 /// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
-const RX_FLAG_TX_MSG_TYPE: u8 = 0x01;
-const RX_FLAG_START_OF_MESSAGE: u8 = 0x02;
-const RX_FLAG_BREAK: u8 = 0x04;
-const RX_FLAG_TX_INDICATION: u8 = 0x08;
+pub(crate) const RX_FLAG_TX_MSG_TYPE: u8 = 0x01;
+pub(crate) const RX_FLAG_START_OF_MESSAGE: u8 = 0x02;
+pub(crate) const RX_FLAG_BREAK: u8 = 0x04;
+pub(crate) const RX_FLAG_TX_INDICATION: u8 = 0x08;
 
 /// The longest response a single classic CAN frame can carry, under normal addressing (ISO
 /// 15765-2:2024 9.6.2: one byte of protocol information): a longer response spans frames

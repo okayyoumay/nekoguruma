@@ -23,7 +23,7 @@ use std::collections::HashMap;
 use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
 use serde::Serialize;
 
-use super::redaction::{Direction, LoggedMessage, redact};
+use super::redaction::{Direction, LoggedMessage, redact, redact_unanswering};
 use crate::host::positive_prefix;
 
 /// The `event` of an exchange entry.
@@ -671,6 +671,52 @@ fn negative_code(response: &[u8]) -> Option<u8> {
     }
 }
 
+/// A result bound to the exchange's primitive that the host did not take as its answer (design
+/// 8.11 `rejected`, ADR-359), raw; the entry carries its bytes through `redact_unanswering`. It counts for
+/// neither the classification nor `link_history`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Rejected {
+    pub rx_id: u32,
+    pub bytes: Vec<u8>,
+    pub vci_us: Option<u64>,
+    pub clock: Option<Clock>,
+    pub agent_us: u64,
+    pub reason: RejectedReason,
+}
+
+/// Why a result bound to the primitive was not the exchange's answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum RejectedReason {
+    /// A response that is not negative and does not begin as the request's positive response
+    /// does (its SID or its echo).
+    WrongEcho,
+    /// A negative response that is not a complete negative response to the request's SID.
+    PatternMismatch,
+}
+
+/// A [`Rejected`] result as the entry gives it.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub(crate) struct RejectedItem {
+    pub rx_id: u32,
+    pub response: LoggedMessage,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vci_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<Clock>,
+    pub agent_us: u64,
+    pub reason: RejectedReason,
+}
+
+/// The worker's report that the link's events were lost during the exchange (design 8.11
+/// `events_lost`, ADR-359): when the host read it and how many such notifications it read. The
+/// host stops waiting at the first, so it gives one; the exchange's outcome is `unknown`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct EventsLost {
+    pub agent_us: u64,
+    pub notifications: u32,
+}
+
 /// One answer of a request that collects every answer, or the further answers of one meant for
 /// one ECU (design 8.11, `answers`). No producer gives them yet; the answers rows are not
 /// implemented, so an entry that has one is classified by the last row.
@@ -909,6 +955,14 @@ pub(crate) struct Evidence {
     /// Link errors on other links of the same physical channel: evidence only (H3).
     pub channel_link_errors: Vec<LinkErrorKind>,
     pub answers: Vec<AnswerItem>,
+    /// The results bound to the primitive that it did not take as its answer.
+    pub rejected: Vec<Rejected>,
+    /// The worker's report of lost events, when it ended the exchange.
+    pub events_lost: Option<EventsLost>,
+    /// The end is a rejected result the worker took as the primitive's end (`positive_unusable`,
+    /// ADR-359 item 3): it is no answer of the request, so the link's history does not count it,
+    /// and its bytes are redacted as a rejected result's are.
+    pub end_rejected: bool,
     pub supply_voltage: Option<SupplyVoltage>,
     pub detail: Detail,
 }
@@ -958,6 +1012,9 @@ impl Evidence {
             link_errors_before_answer: false,
             channel_link_errors: Vec::new(),
             answers: Vec::new(),
+            rejected: Vec::new(),
+            events_lost: None,
+            end_rejected: false,
             supply_voltage: None,
             detail: Detail::default(),
         }
@@ -981,7 +1038,9 @@ impl Evidence {
     /// response, or else the pending a pending seen stands for (the negative response with code
     /// 0x78 for this request's SID).
     fn answer_head(&self) -> Option<Vec<u8>> {
-        if let Some(response) = self.final_response() {
+        // A rejected result the worker ended the primitive with answers nothing (ADR-359); a
+        // pending before it is still an answer of the ECU.
+        if let (false, Some(response)) = (self.end_rejected, self.final_response()) {
             return Some(response.to_vec());
         }
         if self.pending.is_empty() {
@@ -1319,6 +1378,10 @@ pub(crate) struct ExchangeEntry {
     pub outcome: Outcome,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pub answers: Vec<AnswerItem>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub rejected: Vec<RejectedItem>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub events_lost: Option<EventsLost>,
     pub pending: Vec<Pending>,
     pub pending_visibility: PendingVisibility,
     pub timing: Timing,
@@ -1356,7 +1419,7 @@ impl ExchangeEntry {
             this_exchange: history.this_exchange,
             bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
-            final_response: evidence.final_response().is_some(),
+            final_response: evidence.final_response().is_some() && !evidence.end_rejected,
             positive: matches!(evidence.end, End::Positive(_)),
             unusable: matches!(evidence.end, End::PositiveUnusable(_)),
             suppressed: evidence.suppressed,
@@ -1390,8 +1453,28 @@ impl ExchangeEntry {
             sent,
             sent_evidence,
             caused_by: evidence.caused_by,
-            outcome: Outcome::of(&evidence.end),
+            outcome: match &evidence.end {
+                End::PositiveUnusable(bytes) if evidence.end_rejected => {
+                    Outcome::PositiveUnusable {
+                        response: redact_unanswering(bytes),
+                    }
+                }
+                end => Outcome::of(end),
+            },
             answers: evidence.answers,
+            rejected: evidence
+                .rejected
+                .into_iter()
+                .map(|rejected| RejectedItem {
+                    rx_id: rejected.rx_id,
+                    response: redact_unanswering(&rejected.bytes),
+                    vci_us: rejected.vci_us,
+                    clock: rejected.clock,
+                    agent_us: rejected.agent_us,
+                    reason: rejected.reason,
+                })
+                .collect(),
+            events_lost: evidence.events_lost,
             pending: evidence.pending,
             pending_visibility: evidence.pending_visibility,
             timing: evidence.timing,
@@ -2059,6 +2142,106 @@ mod tests {
         assert_eq!(json["outcome"]["nrc_name"], "conditionsNotCorrect");
         assert_eq!(json["outcome"]["nrc_kind"], "ecu_state");
         assert_eq!(json["request"]["service"], "RoutineControl");
+    }
+
+    /// ADR-359: the entry lists the rejected results, redacted as unanswering responses, and
+    /// the lost events; neither changes its classification.
+    #[test]
+    fn an_entry_lists_its_rejected_results_and_lost_events() {
+        let plain = forwarding(evidence(&READ_F186, End::NoResponse));
+        let mut with = plain.clone();
+        with.rejected = vec![
+            Rejected {
+                rx_id: 0x7E8,
+                bytes: vec![0x62, 0xF1],
+                vci_us: Some(5),
+                clock: Some(Clock::Device),
+                agent_us: 9,
+                reason: RejectedReason::WrongEcho,
+            },
+            Rejected {
+                rx_id: 0x7E8,
+                bytes: vec![0x67, 0x02, 0xAA, 0xBB],
+                vci_us: None,
+                clock: None,
+                agent_us: 10,
+                reason: RejectedReason::WrongEcho,
+            },
+        ];
+        with.events_lost = Some(EventsLost {
+            agent_us: 11,
+            notifications: 1,
+        });
+        assert_eq!(
+            verdict(&with).classification,
+            verdict(&plain).classification
+        );
+        let json =
+            serde_json::to_value(ExchangeEntry::build(1, with, LinkHistory::empty())).unwrap();
+        assert_eq!(
+            json["rejected"],
+            serde_json::json!([
+                {"rx_id": 0x7E8, "response": {"clear": "62f1"}, "vci_us": 5, "clock": "device",
+                 "agent_us": 9, "reason": "wrong_echo"},
+                {"rx_id": 0x7E8, "response": {"clear": "6702", "data": {"kind": "secret", "len": 2}},
+                 "agent_us": 10, "reason": "wrong_echo"},
+            ])
+        );
+        assert_eq!(
+            json["events_lost"],
+            serde_json::json!({"agent_us": 11, "notifications": 1})
+        );
+        let none =
+            serde_json::to_value(ExchangeEntry::build(1, plain, LinkHistory::empty())).unwrap();
+        assert!(
+            none.get("rejected").is_none() && none.get("events_lost").is_none(),
+            "{none}"
+        );
+    }
+
+    /// ADR-359 item 3: an end the worker took from a rejected result is `positive_unusable`,
+    /// redacted as a rejected result is, and it counts for no answer in the link's history: the
+    /// request stays owed.
+    #[test]
+    fn an_end_taken_from_a_rejected_result_is_no_answer_of_the_link() {
+        let mut state = LinkState::default();
+        let mut cut = forwarding(evidence(
+            &[0x27, 0x01],
+            End::PositiveUnusable(vec![0x67, 0x02, 0xAA, 0xBB]),
+        ));
+        cut.end_rejected = true;
+        let entry = log(&mut state, 1, cut);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["outcome"]["result"], "positive_unusable");
+        assert_eq!(
+            json["outcome"]["response"],
+            serde_json::json!({"clear": "6702", "data": {"kind": "secret", "len": 2}})
+        );
+        assert_eq!(json["link_history"]["this_exchange"], false);
+        let next = state.history_for(&forwarding(evidence(
+            &[0x27, 0x01],
+            End::Positive(vec![0x67, 0x01, 0x11]),
+        )));
+        assert_eq!(next.answered, 0);
+        assert_eq!(next.owed_matching, 1);
+    }
+
+    /// ADR-359: a pending before a rejected end is still an answer of the ECU.
+    #[test]
+    fn a_pending_before_a_rejected_end_is_still_an_answer() {
+        let mut cut = forwarding(evidence(
+            &READ_F186,
+            End::PositiveUnusable(vec![0x62, 0xF1]),
+        ));
+        cut.end_rejected = true;
+        cut.pending = vec![Pending {
+            vci_us: Some(1),
+            clock: Some(Clock::Device),
+            agent_us: 2,
+            since_previous_ms: None,
+        }];
+        assert_eq!(cut.answer_head(), Some(vec![0x7F, 0x22, 0x78]));
+        assert!(cut.bound_answer());
     }
 
     #[test]

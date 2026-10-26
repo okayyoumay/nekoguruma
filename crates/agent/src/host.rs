@@ -18,9 +18,9 @@ use vci_service_interface::{
 };
 
 use crate::comm_log::exchange::{
-    AgentTimes, At, Clock, ClockReading, Detail, End, Evidence, Expected, LinkErrorKind, Origin,
-    Pending, PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause,
-    VciTime, VciTimes,
+    AgentTimes, At, Clock, ClockReading, Detail, End, EventsLost, Evidence, Expected,
+    LinkErrorKind, Origin, Pending, PendingVisibility, RefusalCause, Rejected, RejectedReason,
+    SectionAttrs, SourcePos, Target, UnknownCause, VciTime, VciTimes,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
@@ -635,6 +635,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         if let Some((request, expected, negative, sid)) = logged {
             let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
             let end = deadline_end(end, sent.agent_deadline);
+            let end = unanswered_end(end, &sent);
+            let end_rejected = matches!(end, End::PositiveUnusable(_)) && sent.result.is_err();
             let (link_errors, error_at) = events_seen(&sent, &mut detail);
             // A response's times only for an exchange that ended with that response: one read
             // before the agent's deadline, lost events or a lost VCI ended the wait is not the
@@ -653,8 +655,17 @@ impl<C: WorkerApi> WorkerHost<C> {
             let before_answer = errors_before_answer(&sent);
             let vci_ended = sent.rx_timeout.is_some();
             let pending = pendings_of(&sent.pendings);
+            let rx_id = self.link_ids.map_or(0, |(_, rx_id)| rx_id);
+            let rejected = rejected_of(&sent.rejected, rx_id);
+            let events_lost = sent.events_lost.flatten().map(|read| EventsLost {
+                agent_us: read.monotonic_us,
+                notifications: 1,
+            });
             self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.pending = pending;
+                evidence.rejected = rejected;
+                evidence.events_lost = events_lost;
+                evidence.end_rejected = end_rejected;
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
                 evidence.link_errors.extend(link_errors);
@@ -753,15 +764,30 @@ impl<C: WorkerApi> WorkerHost<C> {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
-                let (kept, kept_pendings) = (progress.unbound.len(), progress.pendings.len());
+                let (kept, kept_pendings, kept_rejected) = (
+                    progress.unbound.len(),
+                    progress.pendings.len(),
+                    progress.rejected.len(),
+                );
                 let done = progress.on_notification(notification.event_data, cop);
-                if progress.unbound.len() > kept || progress.pendings.len() > kept_pendings {
+                let lost = matches!(done, Some(Err(HostError::EventsLost)));
+                if progress.unbound.len() > kept
+                    || progress.pendings.len() > kept_pendings
+                    || progress.rejected.len() > kept_rejected
+                    || lost
+                {
                     let read = log.filter(|log| log.is_open()).map(|log| log.now());
                     for unbound in &mut progress.unbound[kept..] {
                         unbound.read = read;
                     }
                     for pending in &mut progress.pendings[kept_pendings..] {
                         pending.read = read;
+                    }
+                    for rejected in &mut progress.rejected[kept_rejected..] {
+                        rejected.read = read;
+                    }
+                    if lost {
+                        progress.events_lost = Some(read);
                     }
                 }
                 if let Some(done) = done {
@@ -802,6 +828,9 @@ impl<C: WorkerApi> WorkerHost<C> {
             vci_lost: progress.vci_lost.take(),
             unbound: std::mem::take(&mut progress.unbound),
             pendings: std::mem::take(&mut progress.pendings),
+            rejected: std::mem::take(&mut progress.rejected),
+            last_rejected: progress.last_rejected,
+            events_lost: progress.events_lost.take(),
             agent_deadline,
             response_times: progress.response_times,
             deadline_reading,
@@ -944,6 +973,24 @@ fn deadline_end(end: End, agent_deadline: bool) -> End {
     }
 }
 
+/// The end an exchange's entry gives when its primitive ended with no answer and its last
+/// result, with no pending or answer after it, was a rejected one of positive form (ADR-359): the response the worker took but the
+/// agent cannot use, `positive_unusable` (design 8.11 `outcome`). An exchange the agent's
+/// deadline or the VCI's receive timeout ended keeps its end.
+fn unanswered_end(end: End, sent: &Sent) -> End {
+    match (end, sent.rejected.last()) {
+        (End::NoResponse, Some(last))
+            if sent.last_rejected
+                && sent.rx_timeout.is_none()
+                && !sent.agent_deadline
+                && last.reason == RejectedReason::WrongEcho =>
+        {
+            End::PositiveUnusable(last.bytes.clone())
+        }
+        (end, _) => end,
+    }
+}
+
 /// An exchange's `pending_visibility` on a link whose worker said `forwards_pendings`: forwarded
 /// only when it said the link forwards every pending (ADR-355).
 fn pending_visibility(forwards_pendings: Option<bool>) -> PendingVisibility {
@@ -952,6 +999,24 @@ fn pending_visibility(forwards_pendings: Option<bool>) -> PendingVisibility {
     } else {
         PendingVisibility::AbsorbedByVci
     }
+}
+
+/// The communication log's form of the rejected results: each read with a log, its response
+/// identifier the header's, or the link's when the worker split none off.
+fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
+    rejected
+        .iter()
+        .filter_map(|rejected| {
+            Some(Rejected {
+                rx_id: rejected.identifier.unwrap_or(rx_id),
+                bytes: rejected.bytes.clone(),
+                vci_us: Some(rejected.vci_us),
+                clock: rejected.clock,
+                agent_us: rejected.read?.monotonic_us,
+                reason: rejected.reason,
+            })
+        })
+        .collect()
 }
 
 /// The communication log's form of the pendings bound to the primitive (design 8.11 `pending`):
@@ -982,11 +1047,7 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
             let data = match &item.data {
                 Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
                     rx_flag: result.rx_flag.clone(),
-                    identifier: result
-                        .extra_info
-                        .as_ref()
-                        .and_then(|extra| <[u8; 4]>::try_from(extra.header_bytes.as_slice()).ok())
-                        .map(u32::from_be_bytes),
+                    identifier: header_identifier(result),
                     bytes: result.data_bytes.clone(),
                 },
                 Some(event_item::Data::ErrorData(error)) => UnattachedData::Error {
@@ -1006,6 +1067,33 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
             })
         })
         .collect()
+}
+
+/// A result's CAN identifier from its header (four bytes, most significant first), where the
+/// worker split one off.
+fn header_identifier(result: &vci_service_interface::ResultData) -> Option<u32> {
+    result
+        .extra_info
+        .as_ref()
+        .and_then(|extra| <[u8; 4]>::try_from(extra.header_bytes.as_slice()).ok())
+        .map(u32::from_be_bytes)
+}
+
+/// Whether a result is an indication or a copy of a message the link sent, not a message the
+/// ECU sent (RxFlag byte 3, ISO 22900-2:2022 D.2.2): transmit and start-of-message indications,
+/// a transmitted message and a break.
+fn is_indication(result: &vci_service_interface::ResultData) -> bool {
+    use crate::comm_log::{
+        RX_FLAG_BREAK, RX_FLAG_START_OF_MESSAGE, RX_FLAG_TX_INDICATION, RX_FLAG_TX_MSG_TYPE,
+    };
+    result.rx_flag.get(3).is_some_and(|flags| {
+        flags
+            & (RX_FLAG_TX_MSG_TYPE
+                | RX_FLAG_START_OF_MESSAGE
+                | RX_FLAG_BREAK
+                | RX_FLAG_TX_INDICATION)
+            != 0
+    })
 }
 
 /// A primitive the host stopped waiting for before it ended ([`WorkerHost::settle_at_end`]).
@@ -1096,6 +1184,12 @@ struct Sent {
     unbound: Vec<Unbound>,
     /// The response pendings the worker passed on, bound to the primitive, in order.
     pendings: Vec<PendingRead>,
+    /// See `Progress::rejected`.
+    rejected: Vec<RejectedRead>,
+    /// See `Progress::last_rejected`.
+    last_rejected: bool,
+    /// See `Progress::events_lost`.
+    events_lost: Option<Option<AgentNow>>,
     /// The agent's own deadline ended the wait, not the worker: the VCI had not ended the
     /// exchange (design 8.11 `vci_did_not_end`).
     agent_deadline: bool,
@@ -1119,6 +1213,9 @@ impl Sent {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            rejected: Vec::new(),
+            last_rejected: false,
+            events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
             deadline_reading: None,
@@ -1132,6 +1229,19 @@ impl Sent {
 struct PendingRead {
     vci_us: u64,
     clock: Option<Clock>,
+    read: Option<AgentNow>,
+}
+
+/// A result bound to the primitive that does not answer its request (design 8.11 `rejected`,
+/// ADR-359): its response identifier when the worker split one off, its bytes, its VCI time and
+/// clock, why it was not taken, and the agent's clocks when the host read it, if it has a log.
+#[derive(Debug)]
+struct RejectedRead {
+    identifier: Option<u32>,
+    bytes: Vec<u8>,
+    vci_us: u64,
+    clock: Option<Clock>,
+    reason: RejectedReason,
     read: Option<AgentNow>,
 }
 
@@ -1560,6 +1670,14 @@ struct Progress {
     unbound: Vec<Unbound>,
     /// The response pendings bound to the primitive, in order, for the communication log.
     pendings: Vec<PendingRead>,
+    /// The results bound to the primitive that do not answer the request, in order (design 8.11
+    /// `rejected`, ADR-359).
+    rejected: Vec<RejectedRead>,
+    /// The last result of the primitive was a rejected one: no pending or answer came after it.
+    last_rejected: bool,
+    /// The worker reported lost events: `Some` with the agent's clocks when the host read it, if
+    /// it has a log.
+    events_lost: Option<Option<AgentNow>>,
     /// The VCI times the final response's item gave, for the communication log.
     response_times: VciTimes,
     /// The primitive's end (finished or cancelled) was read.
@@ -1581,6 +1699,9 @@ impl Progress {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            rejected: Vec::new(),
+            last_rejected: false,
+            events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
         })
@@ -1600,6 +1721,9 @@ impl Progress {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            rejected: Vec::new(),
+            last_rejected: false,
+            events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
         }
@@ -1657,6 +1781,31 @@ impl Progress {
                 self.unbound.push(Unbound { item, read: None });
             }
             return None;
+        }
+        // A result of the primitive that does not answer the request, and is no indication or
+        // copy of a transmitted message, is kept for the log as rejected (design 8.11 `rejected`,
+        // ADR-359).
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && !self.answers(&result.data_bytes)
+            && !is_indication(result)
+        {
+            self.rejected.push(RejectedRead {
+                identifier: header_identifier(result),
+                bytes: result.data_bytes.clone(),
+                vci_us: u64::from(item.timestamp),
+                clock: clock_of(&item),
+                reason: if result.data_bytes.first() == Some(&self.negative.marker) {
+                    RejectedReason::PatternMismatch
+                } else {
+                    RejectedReason::WrongEcho
+                },
+                read: None,
+            });
+        }
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && !is_indication(result)
+        {
+            self.last_rejected = !self.answers(&result.data_bytes);
         }
         // A response pending the worker passed on is kept for the log (design 8.11 `pending`),
         // with the item's time and clock as the worker gave them (ADR-353).
@@ -2207,6 +2356,9 @@ mod tests {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            rejected: Vec::new(),
+            last_rejected: false,
+            events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
             deadline_reading: None,
@@ -2293,6 +2445,9 @@ mod tests {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            rejected: Vec::new(),
+            last_rejected: false,
+            events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
             deadline_reading: None,
@@ -2911,6 +3066,118 @@ mod tests {
         assert_eq!(detail.host_error, Some("LinkHeld"));
     }
 
+    /// ADR-359: a primitive that ended with no answer after a rejected result of positive form
+    /// ends as that response, `positive_unusable`; a negative one, or an end the agent's
+    /// deadline or the VCI's receive timeout gave, keeps its end.
+    #[test]
+    fn a_primitive_ended_on_a_rejected_positive_result_is_positive_unusable() {
+        let rejected = |reason| RejectedRead {
+            identifier: None,
+            bytes: vec![0x62, 0xF1],
+            vci_us: 0,
+            clock: None,
+            reason,
+            read: None,
+        };
+        let sent = |reason, agent_deadline| Sent {
+            rejected: vec![rejected(reason)],
+            last_rejected: true,
+            agent_deadline,
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &sent(RejectedReason::WrongEcho, false)),
+            End::PositiveUnusable(bytes) if bytes == [0x62, 0xF1]
+        ));
+        assert!(matches!(
+            unanswered_end(
+                End::NoResponse,
+                &sent(RejectedReason::PatternMismatch, false)
+            ),
+            End::NoResponse
+        ));
+        assert!(matches!(
+            unanswered_end(End::VciDidNotEnd, &sent(RejectedReason::WrongEcho, true)),
+            End::VciDidNotEnd
+        ));
+        // A pending or an answer after the rejected result: it was not the primitive's end.
+        let followed = Sent {
+            last_rejected: false,
+            ..sent(RejectedReason::WrongEcho, false)
+        };
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &followed),
+            End::NoResponse
+        ));
+        let none = Sent::not_started(Err(HostError::NoResponse));
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &none),
+            End::NoResponse
+        ));
+    }
+
+    /// ADR-359: a result of the primitive that does not answer the request is rejected, with its
+    /// reason; an indication, a result of no primitive and the answer are not.
+    #[test]
+    fn a_result_of_the_primitive_that_does_not_answer_is_rejected() {
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let tx_indication = event_item::Data::ResultData(vci_service_interface::ResultData {
+            rx_flag: vec![0, 0, 0, 0x08],
+            data_bytes: vec![0x22, 0xF1, 0x90],
+            ..Default::default()
+        });
+        for item in [
+            event(Some(COP), result(&[0x62, 0xF1])),
+            event(Some(COP), result(&[0x7F, 0x31, 0x22])),
+            event(Some(COP), tx_indication),
+            event(None, result(&[0x62, 0xF1, 0x91])),
+            event(Some(COP), result(&[0x62, 0xF1, 0x90, 0x41])),
+        ] {
+            assert!(progress.on_event(item, COP).is_none());
+        }
+        // The cut positive response and another service's refusal; not the indication, a result
+        // of no primitive or the answer.
+        let rejected: Vec<_> = progress
+            .rejected
+            .iter()
+            .map(|rejected| (rejected.bytes.clone(), rejected.reason))
+            .collect();
+        assert_eq!(
+            rejected,
+            [
+                (vec![0x62, 0xF1], RejectedReason::WrongEcho),
+                (vec![0x7F, 0x31, 0x22], RejectedReason::PatternMismatch),
+            ]
+        );
+        assert_eq!(progress.response, Some(vec![0x62, 0xF1, 0x90, 0x41]));
+        assert!(!progress.last_rejected, "the answer came last");
+        let mut pending_after = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        pending_after.on_event(event(Some(COP), result(&[0x62, 0xF1])), COP);
+        assert!(pending_after.last_rejected);
+        pending_after.on_event(event(Some(COP), result(&[0x7F, 0x22, 0x78])), COP);
+        assert!(
+            !pending_after.last_rejected,
+            "a pending came after the rejected result"
+        );
+        let logged = rejected_of(
+            &[RejectedRead {
+                identifier: None,
+                bytes: vec![0x62],
+                vci_us: 5,
+                clock: Some(Clock::Device),
+                reason: RejectedReason::WrongEcho,
+                read: Some(AgentNow {
+                    epoch: 0,
+                    monotonic_us: 9,
+                    wall_unix_ms: 0,
+                }),
+            }],
+            0x7E8,
+        );
+        assert_eq!(logged[0].rx_id, 0x7E8);
+        assert_eq!(logged[0].agent_us, 9);
+    }
+
     /// ADR-358: at job end a stray primitive has ended on its own finished or cancelled status,
     /// or on a lost VCI of no primitive or of it.
     #[test]
@@ -3050,6 +3317,9 @@ mod tests {
             vci_lost: None,
             unbound: Vec::new(),
             pendings: Vec::new(),
+            rejected: Vec::new(),
+            last_rejected: false,
+            events_lost: None,
             agent_deadline: false,
             response_times: progress.response_times,
             deadline_reading: None,
@@ -3105,6 +3375,9 @@ mod tests {
                 vci_lost: None,
                 unbound: Vec::new(),
                 pendings: Vec::new(),
+                rejected: Vec::new(),
+                last_rejected: false,
+                events_lost: None,
                 agent_deadline: false,
                 response_times: VciTimes::default(),
                 deadline_reading: None,

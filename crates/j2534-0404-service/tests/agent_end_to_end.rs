@@ -560,6 +560,67 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
         "{entry}"
     );
 
+    // A response that does not answer its request (ADR-359): the ECU cuts its answer to the VIN
+    // read to `62 F1`, which the worker passes on as the primitive's result and the host does
+    // not take. The read gets no answer, the entry lists the response under `rejected`, and its
+    // outcome is that response, `positive_unusable` (design 8.11 `outcome`).
+    std::fs::write(
+        control_dir.join("004.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 241, 144], "fault": {"truncate_response": {"len": 2}}}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("004.tmp"), control_dir.join("004.json"))
+        .expect("the control file should be renamed");
+    let setup = CommLogSetup {
+        dir: comm_log_dir.to_owned(),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e74".to_owned()),
+            generation: 1,
+        },
+    };
+    let vin_read = Program {
+        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        constants: vec![vec![0xF1, 0x90]],
+        ..program()
+    };
+    let job = document_job(&vin_read).with_comm_log(setup.clone());
+    let JobRun {
+        result: state,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(false),
+    )
+    .await;
+    assert!(
+        matches!(state, Err(agent::JobError::Host { .. })),
+        "the read gets no answer: {state:?}"
+    );
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let entry: serde_json::Value = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+        .find(|line| line["event"] == "exchange")
+        .unwrap_or_else(|| panic!("an exchange entry in {text}"));
+    let rejected = entry["rejected"]
+        .as_array()
+        .unwrap_or_else(|| panic!("{entry}"));
+    assert_eq!(rejected.len(), 1, "{entry}");
+    assert_eq!(rejected[0]["response"]["clear"], "62f1", "{entry}");
+    assert_eq!(rejected[0]["reason"], "wrong_echo", "{entry}");
+    assert_eq!(rejected[0]["rx_id"], 0x7E8, "{entry}");
+    assert!(rejected[0]["agent_us"].is_u64(), "{entry}");
+    assert_eq!(entry["outcome"]["result"], "positive_unusable", "{entry}");
+    assert_eq!(entry["classification"], "undetermined", "{entry}");
+
     worker
         .stop(Duration::from_secs(5))
         .await

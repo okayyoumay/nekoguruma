@@ -113,6 +113,23 @@ pub(crate) fn redact(direction: Direction, message: &[u8]) -> LoggedMessage {
     }
 }
 
+/// A response that did not answer its request (`rejected`, ADR-359) as the log carries it: as
+/// [`redact`] does, except that a SecurityAccess positive response keeps only its service and
+/// sub-function whatever that sub-function is. Its sub-function need not be the request's, so it
+/// cannot show the response carries no seed.
+pub(crate) fn redact_unanswering(message: &[u8]) -> LoggedMessage {
+    match message {
+        [SID_SECURITY_ACCESS_POSITIVE, _, tail @ ..] => LoggedMessage {
+            clear: to_hex(&message[..2]),
+            data: Some(Redacted::Secret {
+                len: tail.len(),
+                all_zero: None,
+            }),
+        },
+        _ => redact(Direction::Response, message),
+    }
+}
+
 /// What a SecurityAccess sub-function's level is (ISO 14229-1:2026 9.4.2.2).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum SecurityLevel {
@@ -150,6 +167,22 @@ mod tests {
     fn clear_of(direction: Direction, message: &[u8]) -> (String, Option<Redacted>) {
         let logged = redact(direction, message);
         (logged.clear, logged.data)
+    }
+
+    /// ADR-359: a SecurityAccess response that did not answer its request keeps no more than
+    /// its service and sub-function, even one whose sub-function names a key level.
+    #[test]
+    fn an_unanswering_security_access_response_is_its_length_only() {
+        let logged = redact_unanswering(&[0x67, 0x02, 0xAA, 0xBB, 0xCC, 0xDD]);
+        assert_eq!(logged.clear, "6702");
+        assert_eq!(
+            logged.data,
+            Some(Redacted::Secret {
+                len: 4,
+                all_zero: None
+            })
+        );
+        assert_eq!(redact_unanswering(&[0x62, 0xF1]).clear, "62f1");
     }
 
     #[test]

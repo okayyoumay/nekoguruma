@@ -62,5 +62,8 @@ their clock (ADR-353).
   because the evidence differs, not because the agent tells the workers apart.
 - A D-PDU library that does deliver every pending gives no way to say so yet: a VCI profile
   override (design 9.3) is a separate item.
+- With pendings now listed, a pending then silence is `vehicle` only when the VCI ended the
+  wait; one the agent's own deadline ended is `undetermined`, since the limit in force may not
+  have run out (design 8.11 `vci_did_not_end`, which the host does not tell apart yet).
 - A worker restart reopens the link, so a different worker binary behind the same job takes
   effect from its own answer.

@@ -461,6 +461,15 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     .expect("the control file should be writable");
     std::fs::rename(control_dir.join("001.tmp"), control_dir.join("001.json"))
         .expect("the control file should be renamed");
+    // And it answers the VIN read with one response pending before the response, which the
+    // worker passes on and the log lists (design 8.11 `pending`, ADR-355).
+    std::fs::write(
+        control_dir.join("002.tmp"),
+        r#"{"command": "inject_fault", "request": [34, 241, 144], "fault": {"response_pending": {"count": 1, "interval_ms": 10}}}"#,
+    )
+    .expect("the control file should be writable");
+    std::fs::rename(control_dir.join("002.tmp"), control_dir.join("002.json"))
+        .expect("the control file should be renamed");
     let setup = CommLogSetup {
         dir: comm_log_dir.to_owned(),
         key: agent::journal::JobKey {
@@ -676,6 +685,12 @@ fn assert_comm_log(setup: &CommLogSetup) {
     // The worker forwards every pending, so none can have been absorbed (H4, ADR-355), and a
     // positive response confirmed on the bus leaves nothing open.
     assert_eq!(vin["classification"], "none", "{vin}");
+    // Its pending is listed, with the VCI time on the device clock and the agent's read time.
+    let pending = vin["pending"].as_array().expect("a pending list");
+    assert_eq!(pending.len(), 1, "{vin}");
+    assert!(pending[0]["vci_us"].is_u64(), "{vin}");
+    assert_eq!(pending[0]["clock"], "device", "{vin}");
+    assert!(pending[0]["agent_us"].is_u64(), "{vin}");
     assert_eq!(vin["link_history"]["this_exchange"], true, "{vin}");
 
     // The ECU's negative response, with its code named.

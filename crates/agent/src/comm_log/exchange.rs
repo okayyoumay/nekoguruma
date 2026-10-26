@@ -799,8 +799,8 @@ pub(crate) struct Evidence {
     pub end: End,
     /// The exchange whose response caused a `not_sent` refusal (`EarlierResponse`).
     pub caused_by: Option<u64>,
-    /// The pendings the agent saw. On a link that absorbs them the list is empty and proves
-    /// nothing.
+    /// The pendings the agent saw, bound to the exchange's primitive. On a link whose VCI may
+    /// absorb them (`pending_visibility` `absorbed_by_vci`) an empty list proves nothing.
     pub pending: Vec<Pending>,
     pub timing: Timing,
     pub times: Times,
@@ -1724,6 +1724,15 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             }
             (Undetermined, reason)
         }
+        // The agent's own deadline, not the VCI, ended a wait the ECU had extended with a
+        // pending: the limit in force may not have run out, and a long transfer or a slow
+        // worker can outlast the agent (design 8.11 `vci_did_not_end`).
+        End::NoResponse if pending_answer && !evidence.vci_ended => (
+            Undetermined,
+            to_owned(
+                "The ECU answered with a pending, and the agent stopped waiting before the VCI ended the exchange, so the limit in force may not have run out; a long transfer or a slow ECU can outlast the agent's deadline.",
+            ),
+        ),
         End::NoResponse if pending_answer && !any_link_error => {
             if history.owed_matching == 0 {
                 (
@@ -2065,6 +2074,7 @@ mod tests {
     fn a_pending_then_silence_is_vehicle_and_confirms_the_send() {
         let mut evidence = forwarding(evidence(&READ_F186, End::NoResponse));
         evidence.pending = vec![pending()];
+        evidence.vci_ended = true;
         let entry = ExchangeEntry::build(3, evidence.clone(), {
             LinkState::default().history_for(&evidence)
         });
@@ -2072,6 +2082,13 @@ mod tests {
         assert_eq!(entry.sent, Sent::Confirmed);
         assert_eq!(entry.sent_evidence, SentEvidence::Answer);
         assert!(entry.link_history.this_exchange);
+        // The agent's own deadline ended the wait, not the VCI: the limit in force may not have
+        // run out, so the silence is not the ECU's.
+        let mut agent_deadline = evidence.clone();
+        agent_deadline.vci_ended = false;
+        let verdict = verdict_of(&agent_deadline);
+        assert_eq!(verdict.0, Classification::Undetermined);
+        assert!(verdict.1.contains("agent stopped waiting"), "{}", verdict.1);
         // A link error during the exchange makes it undetermined and names both.
         evidence.link_errors = vec![LinkErrorKind::Receive];
         let verdict = verdict_of(&evidence);
@@ -3144,6 +3161,7 @@ mod tests {
         // another link of its channel.
         let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
         silent.pending = vec![pending()];
+        silent.vci_ended = true;
         assert_eq!(verdict_of(&silent).0, Classification::Vehicle);
         silent.channel_link_errors = vec![LinkErrorKind::Receive];
         let (class, reason) = verdict_of(&silent);

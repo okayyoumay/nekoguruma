@@ -345,6 +345,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-353](ADR-353-event-items-name-the-clock-of-their-time.md) | Event Items Name the Clock of Their Time | Accepted | `vci-service-interface` (`EventItem.timestamp_clock`), `j2534-0404-service` and `iso22900-service` event items, `agent` communication log; design 8.11 "On one clock", design principle 6, ADR-120 |
 | [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`, `crates/agent/docs/ngr-agent.md`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`, "Settlement" `late_item`; ADR-346 item 6 |
 | [ADR-355](ADR-355-a-link-says-whether-it-forwards-every-pending.md) | A Link Says Whether It Forwards Every Pending | Accepted | `vci-service-interface` (`ComLogicalLinkResponse.pending_forwarding`), `j2534-0404-service` and `iso22900-service` `CreateComLogicalLink`, `agent` link and communication log; design 8.11 `link_opened`, `pending`, H4; design principle 6, ADR-346 item 3 |
+| [ADR-356](ADR-356-the-t2-timing-check-judges-the-latency-the-vci-measured.md) | The T2 Timing Check Judges the Latency the VCI Measured | Accepted | `ngr-hw-checks` guarded handle (`send_receive_timed`, the link's indications), profile (`timing_margin_us`) and T2 timing check, `crates/ngr-hw-checks/docs/hardware-profile.md`; design 13.5, design 8.11 "Timing margin", "Timing judged", "On one clock"; ADR-275, ADR-333, ADR-353 |
 
 ## Status Legend
 
@@ -700,6 +701,7 @@ the predecessor repository these ADRs came from.
 - ADR-334
 - ADR-343
 - ADR-349
+- ADR-356
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

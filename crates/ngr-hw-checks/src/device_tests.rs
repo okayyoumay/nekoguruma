@@ -9,6 +9,7 @@ fn j2534() -> Vci {
         pname: Some("Vendor VCI 1".into()),
         firmware_version: "1.2.3".into(),
         library_version: "4.5".into(),
+        timing_margin_us: None,
     }
 }
 
@@ -21,6 +22,7 @@ fn dpdu() -> Vci {
         pname: None,
         firmware_version: "2.1.0".into(),
         library_version: "3.0.7".into(),
+        timing_margin_us: None,
     }
 }
 

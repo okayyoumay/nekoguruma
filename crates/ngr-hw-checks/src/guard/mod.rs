@@ -51,7 +51,9 @@ mod runner;
 pub mod socketcan;
 mod uds;
 
-pub use handle::{Decision, GuardedHandle, HandleError, HandleOptions, Trace};
+pub use handle::{
+    Decision, GuardedHandle, HandleError, HandleOptions, Timed, Trace, VciTime, VciTimes,
+};
 pub use runner::GuardedClient;
 pub use socketcan::GuardedSocketCan;
 

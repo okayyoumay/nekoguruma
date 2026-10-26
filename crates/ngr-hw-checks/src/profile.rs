@@ -101,6 +101,11 @@ pub struct Vci {
     pub firmware_version: String,
     /// The library version the device reports.
     pub library_version: String,
+    /// The VCI's timing margin in microseconds (design 8.11 "Timing margin"): the T2 timing
+    /// check judges the latency the VCI measured against the ECU's P2 only beyond it, and
+    /// without it judges nothing (ADR-356).
+    #[serde(default)]
+    pub timing_margin_us: Option<u32>,
 }
 
 impl Vci {

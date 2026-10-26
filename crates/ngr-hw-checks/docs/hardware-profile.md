@@ -63,6 +63,7 @@ does not take. A T3 profile can add nothing.
 | `module` | D-PDU API: the device name or serial number the library reports (see "The module match"). J2534: a description only, not compared with the device |
 | `label`, `pname` | J2534 only, and required there, not empty, and the label is not `j2534-0404` (the worker's default entry): the label and the device name of the configured `modules` entry (ADR-281) |
 | `firmware_version`, `library_version` | What the device reports, compared after opening (see "The module match"); a D-PDU API profile writes each as `major.minor.revision`, each part 0 to 255 with no leading zero |
+| `timing_margin_us` | Optional: the VCI's timing margin in microseconds (design 8.11 "Timing margin"), the key the agent reads too. The T2 timing check judges the latency the VCI measured only beyond it, and without it judges nothing (see "The T2 timing check", ADR-356) |
 
 `[link]`, the values an IR `Protocol` declaration carries:
 
@@ -533,14 +534,27 @@ profile's link, and CI runs it against `sim-vci` behind `j2534-0404-service`
   TesterPresent with its response not suppressed (9.7), `checks::t2_timing::SAMPLES` requests in
   all. Both are on the T2 and T3 read-only list, so the guard passes them.
 - **What it records.** The reported P2 and P2* beside `sim-ecu`'s defaults
-  (`DEFAULT_P2_SERVER_MAX_MS`, `DEFAULT_P2_STAR_SERVER_MAX_MS`), each marked when it differs, and
-  the agent's round trip of each request. The round trips start before the RPC and include the
-  worker and the event path, so they are reported and never judged against P2 (design 8.11
-  "Timing judged").
+  (`DEFAULT_P2_SERVER_MAX_MS`, `DEFAULT_P2_STAR_SERVER_MAX_MS`), each marked when it differs, the
+  agent's round trip of each request, and the latency the VCI measured for each (ADR-356). The
+  round trips start before the RPC and include the worker and the event path, so they are
+  reported and never judged against P2 (design 8.11 "Timing judged").
+- **The VCI's latency.** The guarded handle turns the transmit and start-of-message indications
+  on for the link (a library may refuse either) and `GuardedHandle::send_receive_timed` returns
+  each request's transmit done, response start and response end with the clock each item names.
+  The latency runs from the transmit done to the response's start, or without one on that clock
+  to its end, named `vci_tx_done_to_rx_start` or `vci_tx_done_to_rx_end` (design 8.11
+  `measured_by`). Two times on different clocks, a time with no clock, or a later time that reads
+  earlier (the 32-bit values are not unwrapped) give no latency. With `timing_margin_us` in
+  `[vci]` each latency is judged against the reported P2 plus the margin: a start both ways, an
+  end one way only, so an end past the limit proves a response of at most six bytes (one frame
+  under every addressing format) late only past one frame's transfer at the link's baud rate,
+  and never proves a longer one late. Without the key the latency is recorded and nothing
+  judged. Against `sim-vci` the latency runs to the response's end, since `sim-vci` gives no
+  start of message for a single frame.
 - **Result.** It passes when the ECU answers every request with its positive response; the
-  report's message holds the comparison. A reported value that differs from `sim-ecu`'s is not a
-  failure. A negative or malformed response, a request the ECU does not answer, and a link that
-  does not open fail it.
+  report's message holds the comparison and each latency with its verdict. A reported value
+  that differs from `sim-ecu`'s, and a late response, are not failures. A negative or malformed
+  response, a request the ECU does not answer, and a link that does not open fail it.
 
 ## Teardown
 

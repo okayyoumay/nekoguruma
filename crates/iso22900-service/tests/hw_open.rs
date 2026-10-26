@@ -41,6 +41,7 @@ fn vci(module: &str, firmware: &str, library: &str) -> Vci {
         pname: None,
         firmware_version: firmware.to_owned(),
         library_version: library.to_owned(),
+        timing_margin_us: None,
     }
 }
 

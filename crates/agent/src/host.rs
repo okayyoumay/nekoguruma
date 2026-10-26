@@ -438,6 +438,9 @@ pub struct WorkerHost<C: WorkerApi> {
     /// a failed event stream), which may still hold the link: it is cancelled before the link's
     /// next request (design 8.11 "Settlement").
     stray: Option<ComPrimitiveHandle>,
+    /// How long [`WorkerHost::settle_at_end`] keeps the link open for such a primitive
+    /// (`LinkConfig::job_end_wait`, ADR-358).
+    job_end_wait: Duration,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -458,6 +461,66 @@ impl<C: WorkerApi> WorkerHost<C> {
             own: None,
             download_seq: None,
             stray: None,
+            job_end_wait: crate::link::JOB_END_WAIT_MAX,
+        }
+    }
+
+    /// Sets how long the host waits at job end for a primitive past its deadline
+    /// ([`WorkerHost::settle_at_end`]): the link's `LinkConfig::job_end_wait`.
+    pub(crate) fn set_job_end_wait(&mut self, wait: Duration) {
+        self.job_end_wait = wait;
+    }
+
+    /// At job end, settles a primitive the host stopped waiting for (design 8.11 "Settlement",
+    /// ADR-358): keeps the link open until the primitive ends or the job-end wait passes, then
+    /// cancels it if it has not ended, so the link is not closed under a running primitive. A
+    /// lost VCI ends it too, since the worker then cancels the link's primitives; an event
+    /// stream that fails or ends leaves its end unknown, so it is cancelled. A failed cancel is
+    /// logged and does not change the job's result. What the primitive gives meanwhile is not
+    /// logged yet (`primitive_ended`).
+    pub(crate) fn settle_at_end(&mut self) {
+        let Some(stray) = self.stray.take() else {
+            return;
+        };
+        let handle = self.handle.clone();
+        let wait = self.job_end_wait;
+        let events = &mut self.link.events;
+        let ended = handle.block_on(async {
+            tokio::time::timeout(wait, async {
+                loop {
+                    match events.message().await {
+                        Ok(Some(notification)) => {
+                            if let Some(event_notification::EventData::Item(item)) =
+                                notification.event_data
+                                && ends_primitive(&item, stray)
+                            {
+                                return true;
+                            }
+                        }
+                        Ok(None) | Err(_) => return false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false)
+        });
+        if ended {
+            return;
+        }
+        let cancelled = handle.block_on(unary(
+            self.timings.unary,
+            "CancelComPrimitive",
+            self.client.cancel_com_primitive(CancelComPrimitiveRequest {
+                cop_handle: Some(stray),
+            }),
+        ));
+        match cancelled.map_err(lost_vci_between_primitives) {
+            Ok(_) | Err(HostError::VciLost) => {}
+            Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => {}
+            Err(error) => tracing::warn!(
+                error = %crate::oplog::LogSafe::log_text(&error),
+                "could not cancel a primitive past its deadline at job end"
+            ),
         }
     }
 
@@ -931,6 +994,23 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
             })
         })
         .collect()
+}
+
+/// Whether `item` shows that the primitive `cop` has ended: its own finished or cancelled
+/// status, or a lost VCI, whose primitives the worker cancels (ADR-289).
+fn ends_primitive(item: &EventItem, cop: ComPrimitiveHandle) -> bool {
+    match &item.data {
+        Some(event_item::Data::CopStatus(status)) => {
+            item.cop_handle == Some(cop)
+                && (*status == PduComPrimitiveStatus::PduCopstFinished as i32
+                    || *status == PduComPrimitiveStatus::PduCopstCancelled as i32)
+        }
+        Some(event_item::Data::ErrorData(data)) => {
+            item.cop_handle.is_none_or(|handle| handle == cop)
+                && data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
+        }
+        _ => false,
+    }
 }
 
 /// The clock the worker says an item's time is on (design 8.11 "On one clock", ADR-353), or none
@@ -2810,6 +2890,40 @@ mod tests {
 
     /// Design 8.11 "Settlement": only a primitive whose end was read counts as ended, so one
     /// the host stopped waiting for is cancelled before the next request.
+    #[test]
+    fn a_stray_primitive_ends_on_its_own_end_or_a_lost_vci() {
+        let other = ComPrimitiveHandle {
+            cop_handle: COP.cop_handle + 1,
+            ..COP
+        };
+        let error = |code: PduErrorEvent| {
+            event_item::Data::ErrorData(ErrorData {
+                error_event: code as i32,
+                ..ErrorData::default()
+            })
+        };
+        for end in [
+            PduComPrimitiveStatus::PduCopstFinished,
+            PduComPrimitiveStatus::PduCopstCancelled,
+        ] {
+            assert!(ends_primitive(&event(Some(COP), status(end)), COP));
+            assert!(!ends_primitive(&event(Some(other), status(end)), COP));
+        }
+        assert!(!ends_primitive(
+            &event(Some(COP), status(PduComPrimitiveStatus::PduCopstExecuting)),
+            COP
+        ));
+        assert!(!ends_primitive(&event(Some(COP), result(&[0x62])), COP));
+        let lost = error(PduErrorEvent::PduErrEvtLostCommToVci);
+        assert!(ends_primitive(&event(None, lost.clone()), COP));
+        assert!(ends_primitive(&event(Some(COP), lost.clone()), COP));
+        assert!(!ends_primitive(&event(Some(other), lost), COP));
+        assert!(!ends_primitive(
+            &event(Some(COP), error(PduErrorEvent::PduErrEvtRxTimeout)),
+            COP
+        ));
+    }
+
     #[test]
     fn a_primitive_counts_as_ended_only_when_its_end_was_read() {
         let mut finished = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();

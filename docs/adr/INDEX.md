@@ -347,6 +347,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-355](ADR-355-a-link-says-whether-it-forwards-every-pending.md) | A Link Says Whether It Forwards Every Pending | Accepted | `vci-service-interface` (`ComLogicalLinkResponse.pending_forwarding`), `j2534-0404-service` and `iso22900-service` `CreateComLogicalLink`, `agent` link and communication log; design 8.11 `link_opened`, `pending`, H4; design principle 6, ADR-346 item 3 |
 | [ADR-356](ADR-356-the-t2-timing-check-judges-the-latency-the-vci-measured.md) | The T2 Timing Check Judges the Latency the VCI Measured | Accepted | `ngr-hw-checks` guarded handle (`send_receive_timed`, the link's indications), profile (`timing_margin_us`) and T2 timing check, `crates/ngr-hw-checks/docs/hardware-profile.md`; design 13.5, design 8.11 "Timing margin", "Timing judged", "On one clock"; ADR-275, ADR-333, ADR-353 |
 | [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
+| [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 
 ## Status Legend
 
@@ -758,6 +759,7 @@ the predecessor repository these ADRs came from.
 - ADR-342
 - ADR-344
 - ADR-345
+- ADR-358
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1); `Op::FlashBlock` appended, a block of a declared flash segment read through `DiagHost::artifact_bytes`, by ADR-336 item 11; `Op::ReadInput` appended, a runtime input read through `DiagHost::runtime_input`, by ADR-338; `Op::HmiRequestFromStack` appended, a form whose run-time parameters come from the stack, and item 7's constant of `HmiRequest` and `RecordInput` read as an encoded `HmiTemplate`, by ADR-340)

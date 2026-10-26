@@ -1244,6 +1244,7 @@ fn run_job<C: WorkerApi>(
     host.set_artifact(artifact);
     host.set_comm_log(comm_log);
     host.set_link_ids(config.tx_id, config.rx_id);
+    host.set_job_end_wait(config.job_end_wait());
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -1279,6 +1280,10 @@ fn run_job<C: WorkerApi>(
         ),
     }))
     .unwrap_or(Err(JobError::Panicked));
+    // A primitive past its deadline is waited for, or cancelled, before the link closes.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| host.settle_at_end())).is_err() {
+        tracing::warn!("settling a primitive past its deadline at job end panicked");
+    }
     // The event stream goes before the link is closed.
     drop(host);
     open_link.close();
@@ -14895,6 +14900,62 @@ def main():
         assert_eq!(reading["clock"], "device");
         assert!(reading["round_trip_us"].is_u64(), "{reading}");
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Design 8.11 "Settlement", ADR-358: at job end the host keeps the link open for a
+    /// primitive past its deadline for the job-end wait, then cancels it by its handle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_past_the_deadline_is_waited_for_then_cancelled_at_job_end() {
+        use diag_ir::DiagHost;
+        let (mut client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_millis(50),
+        };
+        let wait = Duration::from_millis(200);
+        let waited = tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_job_end_wait(wait);
+            let read = host.service_request(0x22, &[0xF1, 0x90]);
+            assert!(matches!(read, Err(HostError::NoResponse)), "{read:?}");
+            let at = std::time::Instant::now();
+            host.settle_at_end();
+            at.elapsed()
+        })
+        .await
+        .unwrap();
+        assert!(waited >= wait, "{waited:?}");
+        assert_eq!(
+            fake.primitive_calls(),
+            ["StartComPrimitive", "CancelComPrimitive"]
+        );
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+    }
+
+    /// A job with no primitive past its deadline sends no cancel at its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_job_end_with_no_primitive_in_flight_cancels_nothing() {
+        let (mut client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_millis(50),
+        };
+        tokio::task::spawn_blocking(move || {
+            WorkerHost::new(handle, client, link, timings).settle_at_end();
+        })
+        .await
+        .unwrap();
+        assert!(fake.primitive_calls().is_empty());
     }
 
     /// A cancel the worker answers with an invalid handle finds the primitive ended, so the

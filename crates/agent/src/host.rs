@@ -13,14 +13,14 @@ use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle,
-    ErrorData, EventItem, ExpectedResponseData, PduComPrimitiveStatus, PduErrorEvent,
-    StartComPrimitiveRequest, TimestampClock, event_item, event_notification,
+    ErrorData, EventItem, ExpectedResponseData, GetTimestampRequest, PduComPrimitiveStatus,
+    PduErrorEvent, StartComPrimitiveRequest, TimestampClock, event_item, event_notification,
 };
 
 use crate::comm_log::exchange::{
-    AgentTimes, At, Clock, Detail, End, Evidence, Expected, LinkErrorKind, Origin, Pending,
-    PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause, VciTime,
-    VciTimes,
+    AgentTimes, At, Clock, ClockReading, Detail, End, Evidence, Expected, LinkErrorKind, Origin,
+    Pending, PendingVisibility, RefusalCause, SectionAttrs, SourcePos, Target, UnknownCause,
+    VciTime, VciTimes,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
@@ -578,6 +578,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             };
             let vci = VciTimes {
                 error: error_at,
+                deadline: sent.deadline_reading,
                 ..response_times
             };
             let unbound = unattached_items(&sent.unbound);
@@ -695,6 +696,14 @@ impl<C: WorkerApi> WorkerHost<C> {
         // A receive timeout the worker already reported ended the VCI's wait, even when the
         // primitive's end had not been read before the deadline.
         let agent_deadline = waited.is_err() && progress.rx_timeout.is_none();
+        // Design 8.11 "Settlement": the VCI's clock when the agent stopped waiting shows how far
+        // the VCI's own limits had run. It is read after the deadline, so it costs one more
+        // unary call's budget at most.
+        let deadline_reading = if agent_deadline {
+            self.read_clock().await
+        } else {
+            None
+        };
         // A primitive whose end was not read may still run; after a lost VCI the worker
         // cancelled it.
         if !progress.ended && progress.vci_lost.is_none() {
@@ -714,6 +723,35 @@ impl<C: WorkerApi> WorkerHost<C> {
             pendings: std::mem::take(&mut progress.pendings),
             agent_deadline,
             response_times: progress.response_times,
+            deadline_reading,
+        }
+    }
+
+    /// Reads the VCI's clock (`GetTimestamp` of the link's module), with the clock the worker
+    /// says it is on and the round trip of the read; `None` when the read fails.
+    async fn read_clock(&mut self) -> Option<ClockReading> {
+        let asked = tokio::time::Instant::now();
+        let read = unary(
+            self.timings.unary,
+            "GetTimestamp",
+            self.client.get_timestamp(GetTimestampRequest {
+                module_handle: Some(self.link.module_handle),
+            }),
+        )
+        .await;
+        let round_trip = asked.elapsed();
+        match read {
+            Ok(reading) => Some(ClockReading {
+                time: VciTime::new(
+                    u64::from(reading.timestamp),
+                    clock_named(reading.timestamp_clock),
+                ),
+                round_trip_us: u64::try_from(round_trip.as_micros()).unwrap_or(u64::MAX),
+            }),
+            Err(error) => {
+                tracing::debug!(?error, "reading the VCI's clock at the deadline failed");
+                None
+            }
         }
     }
 
@@ -893,7 +931,12 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
 /// when it does not say. The agent takes it from the item alone, never from which worker or API
 /// gave it (design principle 6).
 fn clock_of(item: &EventItem) -> Option<Clock> {
-    match TimestampClock::try_from(item.timestamp_clock) {
+    clock_named(item.timestamp_clock)
+}
+
+/// The clock a worker's `TimestampClock` value names, or none when it names none.
+fn clock_named(clock: i32) -> Option<Clock> {
+    match TimestampClock::try_from(clock) {
         Ok(TimestampClock::Device) => Some(Clock::Device),
         Ok(TimestampClock::Worker) => Some(Clock::Worker),
         Ok(TimestampClock::Unspecified) | Err(_) => None,
@@ -950,6 +993,9 @@ struct Sent {
     /// The VCI times the final response's item gave: its end, and the transmit done and start
     /// it may carry.
     response_times: VciTimes,
+    /// The reading of the VCI's clock taken when the agent's deadline ended the wait, if the
+    /// read succeeded.
+    deadline_reading: Option<ClockReading>,
 }
 
 impl Sent {
@@ -966,6 +1012,7 @@ impl Sent {
             pendings: Vec::new(),
             agent_deadline: false,
             response_times: VciTimes::default(),
+            deadline_reading: None,
         }
     }
 }
@@ -1530,6 +1577,7 @@ impl Progress {
                     rx_start: result.start_msg_timestamp.map(on_its_clock),
                     rx_end: Some(at),
                     error: None,
+                    deadline: None,
                 };
                 self.response = Some(result.data_bytes);
                 self.errors_before_response = Some(self.errors.len());
@@ -2052,6 +2100,7 @@ mod tests {
             pendings: Vec::new(),
             agent_deadline: false,
             response_times: VciTimes::default(),
+            deadline_reading: None,
         };
         let detail_of = |sent: &Sent| {
             let (_, mut detail) =
@@ -2137,6 +2186,7 @@ mod tests {
             pendings: Vec::new(),
             agent_deadline: false,
             response_times: VciTimes::default(),
+            deadline_reading: None,
         };
         let given = |sent: Sent| {
             let (_, mut detail) =
@@ -2816,6 +2866,7 @@ mod tests {
                 rx_start: on(600, Some(Clock::Device)),
                 rx_end: on(900, Some(Clock::Device)),
                 error: None,
+                deadline: None,
             }
         );
         // A receive timeout, the event a silent exchange names, has its own item's time and
@@ -2856,6 +2907,7 @@ mod tests {
             pendings: Vec::new(),
             agent_deadline: false,
             response_times: progress.response_times,
+            deadline_reading: None,
         };
         let read = [0x22, 0xF1, 0x90];
         let named = |sent: &Sent| {
@@ -2910,6 +2962,7 @@ mod tests {
                 pendings: Vec::new(),
                 agent_deadline: false,
                 response_times: VciTimes::default(),
+                deadline_reading: None,
             }
         };
         let before = sent_of(vec![fault(), answer(), finished()]);

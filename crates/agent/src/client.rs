@@ -20,10 +20,11 @@ use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkResponse, ComPrimitiveResponse,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
     DisconnectComLogicalLinkRequest, EventNotification, GetModuleIdsRequest, GetObjectIdRequest,
-    GetResourceIdsRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest,
-    ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse, ObjectIdResponse,
-    ResourceIdsResponse, Response, SetComParamRequest, SetUniqueRespIdTableRequest,
-    StartComPrimitiveRequest, SubscribeEventRequest, VersionResponse,
+    GetResourceIdsRequest, GetTimestampRequest, GetVersionRequest, IoCtlRequest, IoCtlResponse,
+    ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ModuleIdsResponse,
+    ObjectIdResponse, ResourceIdsResponse, Response, SetComParamRequest,
+    SetUniqueRespIdTableRequest, StartComPrimitiveRequest, SubscribeEventRequest,
+    TimestampResponse, VersionResponse,
 };
 use worker_host::client::WorkerClient;
 
@@ -70,6 +71,7 @@ worker_api! {
     module_connect(ModuleConnectRequest) -> Response;
     module_disconnect(ModuleDisconnectRequest) -> Response;
     get_version(GetVersionRequest) -> VersionResponse;
+    get_timestamp(GetTimestampRequest) -> TimestampResponse;
     get_resource_ids(GetResourceIdsRequest) -> ResourceIdsResponse;
     get_object_id(GetObjectIdRequest) -> ObjectIdResponse;
     create_com_logical_link(CreateComLogicalLinkRequest) -> ComLogicalLinkResponse;

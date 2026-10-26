@@ -333,6 +333,20 @@ pub(crate) struct VciTimes {
     /// else the last link error the primitive reported or else its receive timeout.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<VciTime>,
+    /// The reading of the VCI's clock the host took when the agent's deadline passed
+    /// (`vci_did_not_end`, design 8.11 "Settlement"), with its round trip.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline: Option<ClockReading>,
+}
+
+/// A reading of the VCI's clock (`GetTimestamp`): the time, with the clock the worker says it is
+/// on (ADR-353), and the agent's monotonic time from the request to the answer, which bounds
+/// when the clock was read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub(crate) struct ClockReading {
+    #[serde(flatten)]
+    pub time: VciTime,
+    pub round_trip_us: u64,
 }
 
 impl VciTimes {
@@ -3138,6 +3152,10 @@ mod tests {
                 rx_start: Some(VciTime::new(2, Some(Clock::Device))),
                 rx_end: None,
                 error: Some(VciTime::new(4, Some(Clock::Worker))),
+                deadline: Some(ClockReading {
+                    time: VciTime::new(9, Some(Clock::Device)),
+                    round_trip_us: 700,
+                }),
             }),
         })
         .unwrap();
@@ -3148,6 +3166,7 @@ mod tests {
                 "tx_done": { "us": 1, "clock": "device", "epoch": 0 },
                 "rx_start": { "us": 2, "clock": "device", "epoch": 0 },
                 "error": { "us": 4, "clock": "worker", "epoch": 0 },
+                "deadline": { "us": 9, "clock": "device", "epoch": 0, "round_trip_us": 700 },
             })
         );
         // A time whose item named no clock has none.

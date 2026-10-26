@@ -36,11 +36,12 @@ use vci_service_interface::{
     CancelComPrimitiveRequest, ComLogicalLinkResponse, ComPrimitiveResponse,
     ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest, DestroyComLogicalLinkRequest,
     DisconnectComLogicalLinkRequest, ErrorDetail, ErrorEventData, EventNotification,
-    GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest, GetVersionRequest,
-    IoCtlRequest, IoCtlResponse, ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle,
-    ModuleIdsResponse, ObjectIdResponse, PduError, PduErrorEvent, ResourceIdsResponse, Response,
-    SetComParamRequest, SetUniqueRespIdTableRequest, StartComPrimitiveRequest,
-    SubscribeEventRequest, VersionResponse, status_with_error_detail,
+    GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest, GetTimestampRequest,
+    GetVersionRequest, IoCtlRequest, IoCtlResponse, ModuleConnectRequest, ModuleDisconnectRequest,
+    ModuleHandle, ModuleIdsResponse, ObjectIdResponse, PduError, PduErrorEvent,
+    ResourceIdsResponse, Response, SetComParamRequest, SetUniqueRespIdTableRequest,
+    StartComPrimitiveRequest, SubscribeEventRequest, TimestampResponse, VersionResponse,
+    status_with_error_detail,
 };
 
 use super::{GuardedHandle, HandleError, HandleOptions, Request, Trace};
@@ -168,6 +169,7 @@ impl WorkerApi for GuardedClient {
     through! {
         get_module_ids(GetModuleIdsRequest) -> ModuleIdsResponse = |h, r| h.get_module_ids(r);
         get_version(GetVersionRequest) -> VersionResponse = |h, r| h.get_version(r);
+        get_timestamp(GetTimestampRequest) -> TimestampResponse = |h, r| h.get_timestamp(r);
         get_resource_ids(GetResourceIdsRequest) -> ResourceIdsResponse = |h, r| h.get_resource_ids(r);
         get_object_id(GetObjectIdRequest) -> ObjectIdResponse = |h, r| h.get_object_id(r);
         create_com_logical_link(CreateComLogicalLinkRequest) -> ComLogicalLinkResponse = |h, r| h.create_com_logical_link(r);

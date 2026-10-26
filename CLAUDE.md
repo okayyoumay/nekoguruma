@@ -235,8 +235,9 @@ the attribute fails the build once the code is used and gets removed.
    fix or answer every finding, and re-request until a round is clean or its fixes need no
    re-review under the skill's re-request rule (ADR-251). A PR that changes only the backlog
    files gets no automated review (same ADR). If Codex cannot review (not set up, usage limit
-   reached, or a stalled review), the skill switches that PR to GitHub Copilot code review for
-   the rest of the PR (ADR-312); if Copilot is not available either, or the owner's Copilot
+   reached, or a review that stalls or errors again after one re-request on the same commit,
+   ADR-360), the skill switches that PR to GitHub Copilot code review for the rest of the PR
+   (ADR-312); if Copilot is not available either, or the owner's Copilot
    budget is used up, it falls back to an `edge-case-hunter` pass over the whole diff and tells
    the maintainer. On a specification pull request (every changed file outside `work/` is
    Markdown, and one is an ADR or the design document), the loop pauses after the eighth round with findings when more than half of the

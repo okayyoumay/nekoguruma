@@ -462,9 +462,8 @@ struct LinkOpened<'a> {
     transmit_confirmation: Vec<&'static str>,
     /// Whether response times can be judged on the link: not without a transmit time.
     response_times_judged: bool,
-    /// Whether the worker passes each response pending on: not known to the agent yet, since
-    /// it depends on the worker (the J2534 worker forwards them, a D-PDU library may absorb
-    /// them), so `null` rather than a guess.
+    /// Whether the worker passes on every response pending the link sees, as the worker's
+    /// answer to `CreateComLogicalLink` says (ADR-355); `null` when the worker does not say.
     forwards_pendings: Option<bool>,
     timing_margin: TimingMargin,
 }
@@ -1052,6 +1051,7 @@ impl CommLog {
         config: &crate::link::LinkConfig,
         valued_by_document: &[&str],
         indications: crate::link::Indications,
+        forwards_pendings: Option<bool>,
     ) -> Option<u64> {
         let mut comparams: Vec<ComParamInForce<'_>> = crate::link::own_comparams(config)
             .into_iter()
@@ -1112,7 +1112,7 @@ impl CommLog {
                 Vec::new()
             },
             response_times_judged: false,
-            forwards_pendings: None,
+            forwards_pendings,
             timing_margin: TimingMargin {
                 ms: None,
                 source: "none",
@@ -1745,6 +1745,7 @@ mod tests {
                     transmit,
                     start_of_message: true,
                 },
+                None,
             )
             .unwrap();
             log.end("ok");
@@ -1754,6 +1755,38 @@ mod tests {
                 .find(|line| line["event"] == "link_opened")
                 .unwrap();
             assert_eq!(opened["transmit_confirmation"], expected, "{transmit}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// `forwards_pendings` is what the worker said when the link was created (ADR-355), and
+    /// `null` when it did not say.
+    #[test]
+    fn forwards_pendings_records_what_the_worker_said() {
+        for (said, expected) in [
+            (Some(true), serde_json::json!(true)),
+            (Some(false), serde_json::json!(false)),
+            (None, serde_json::Value::Null),
+        ] {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications::default(),
+                said,
+            )
+            .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            let opened = lines
+                .iter()
+                .find(|line| line["event"] == "link_opened")
+                .unwrap();
+            assert_eq!(opened["forwards_pendings"], expected, "{said:?}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }
@@ -2592,10 +2625,12 @@ mod tests {
         assert_eq!(unattached[0]["identifier"], 0x7E9);
     }
 
-    /// The agent's own deadline is not the VCI ending the wait: the response may still be
-    /// arriving, so the outcome stays `no_response` while the start still is an answer. The
-    /// start is no bound answer, so H2 stays open (ADR-354); the pending rows are checked on a
-    /// forwarding link in `a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer`.
+    /// Only an exchange the VCI ended converts a start into `response_incomplete`. The agent's
+    /// own deadline (`vci_did_not_end`, `host::deadline_end`) keeps its outcome, since the
+    /// response may still be arriving, and so does a primitive that ended with no response and
+    /// no receive timeout; the start still is an answer there. The start is no bound answer, so
+    /// H2 stays open (ADR-354); the pending rows are checked on a forwarding link in
+    /// `a_start_alone_takes_neither_the_pending_rows_nor_the_rows_without_an_answer`.
     #[test]
     fn a_start_of_message_does_not_make_an_agent_deadline_a_response_incomplete() {
         let (entries, unattached) = run_exchanges(vec![(
@@ -2617,10 +2652,25 @@ mod tests {
             "{reason}"
         );
         assert!(reason.contains("(H2)"), "{reason}");
+
+        let (entries, unattached) = run_exchanges(vec![(
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::VciDidNotEnd,
+            ),
+            vec![start_of_message(0x7E8)],
+        )]);
+        assert!(unattached.is_empty());
+        assert_eq!(entries[0]["outcome"]["result"], "vci_did_not_end");
+        assert_eq!(entries[0]["sent"], "confirmed");
+        assert_eq!(entries[0]["sent_evidence"], "answer");
+        assert_eq!(entries[0]["classification"], "undetermined");
     }
 
     /// The rows of a pending seen need a pending (ADR-354): on a link that forwards pendings,
-    /// with a judged window, a start alone ended by the agent's deadline is no pending answer.
+    /// with a judged window, a start alone ended with no response and no receive timeout is no
+    /// pending answer.
     /// A request whose positive response is suppressed still has an answer of the ECU in the
     /// start, so it does not take the rows for no answer of the ECU.
     #[test]

@@ -2463,6 +2463,9 @@ impl J2534Service {
                     module_handle: DEFAULT_MODULE_HANDLE,
                     cll_handle,
                 }),
+                // ADR-355: this service runs the response-pending handling
+                // itself and passes each 0x78 on, bound to its primitive.
+                pending_forwarding: vci_service_interface::PendingForwarding::All as i32,
             },
         ))
     }

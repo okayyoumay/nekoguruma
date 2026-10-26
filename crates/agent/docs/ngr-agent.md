@@ -354,9 +354,20 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   their entries carry `accepted`, and a library that refuses one opens the link without it.
   `transmit_confirmation` names `transmit_indication` when the library accepted
   `CP_TransmitIndEnable` (the link turns no loopback on). The event gives response times not
-  judged and no timing margin (`source` `none`), since no indication is used as evidence yet,
-  and `forwards_pendings` `null`, since whether pendings are forwarded depends on the worker and
-  the agent does not know it yet.
+  judged and no timing margin (`source` `none`), since no indication is used as evidence yet.
+  `forwards_pendings` is what the worker answered to `CreateComLogicalLink`
+  (`Link::forwards_pendings`, ADR-355): `true` for the J2534 worker, `false` for the D-PDU
+  worker, `null` from a worker that does not say. The agent takes it from that answer alone, and
+  each exchange on the link has `pending_visibility` `forwarded` only when it is `true`, since
+  the link has the API handle 0x78 alone (`send_receive`'s supported pending codes); otherwise
+  `absorbed_by_vci`. The host keeps each pending bound to the primitive for the exchange's
+  `pending` list, with its VCI time and clock as the worker gave them and the agent's time when
+  the host read it, so a forwarded link's empty list means no pending came; the entry gives no
+  interval from the transmit or the previous pending. When the agent's own deadline, not the
+  worker's receive timeout, ends an exchange with no response, the entry's outcome is
+  `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
+  have run out, with or without a pending; a pending then silence is `vehicle` only when the
+  VCI ended the wait.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs
@@ -382,8 +393,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   begun again. An exchange the VCI ended with no response (the worker reported a receive timeout
   for the primitive) ends as `response_incomplete`, classified `undetermined`, with H2 among
   its readings unless a pending in the exchange or a matched answer excludes it; one the agent's
-  own deadline ended keeps `no_response`, since the response may still be arriving (design 8.11
-  `vci_did_not_end`).
+  own deadline ended is `vci_did_not_end`, since the response may still be arriving (design 8.11).
   The log writes no time for the start yet: its VCI time needs per-clock epochs (ADR-353), and
   the agent's entry has no field for it. Every other item is an `unattached` event, written in
   the order read and before the exchange's entry: an item bound to an earlier primitive, a
@@ -446,7 +456,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   answer no owed request could own, and a confirmed send with no response is `vehicle` from an
   ECU that has answered requests matched this way with no link error, `undetermined` otherwise
   (on a link whose VCI absorbs pendings, the possible-pending row below comes first); without a transmit time the timing is `not_judged`, so on a link
-  whose VCI absorbs pendings every response is `undetermined` (a pending may have come first);
+  whose VCI absorbs pendings a response with no pending seen is `undetermined` (a pending may
+  have come first), while one after a pending seen takes its own row;
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
   later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched

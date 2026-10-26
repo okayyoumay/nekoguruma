@@ -233,6 +233,11 @@ async fn create_default_cll(client: &mut VciServiceClient<Channel>) -> ComLogica
         .expect("create_com_logical_link should succeed")
         .into_inner();
 
+    // ADR-355: the library handles a response pending itself and need not deliver it.
+    assert_eq!(
+        cll_response.pending_forwarding,
+        vci_service_interface::PendingForwarding::NotAll as i32
+    );
     let cll_handle = cll_response
         .cll_handle
         .expect("cll_handle should be present");

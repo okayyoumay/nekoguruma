@@ -10,9 +10,9 @@ use vci_service_interface::{
     DestroyComLogicalLinkRequest, DisconnectComLogicalLinkRequest, EcuUniqueRespData,
     EventNotification, GetModuleIdsRequest, GetObjectIdRequest, GetResourceIdsRequest,
     ModuleConnectRequest, ModuleDisconnectRequest, ModuleHandle, ObjectType, ParamItem,
-    PduParamClass, PinData, ResourceData, SetComParamRequest, SetUniqueRespIdTableRequest,
-    SubscribeEventRequest, UniqueRespIdTableItem, VersionData, create_com_logical_link_request,
-    param_item, pin_data, resource_data, subscribe_event_request,
+    PduParamClass, PendingForwarding, PinData, ResourceData, SetComParamRequest,
+    SetUniqueRespIdTableRequest, SubscribeEventRequest, UniqueRespIdTableItem, VersionData,
+    create_com_logical_link_request, param_item, pin_data, resource_data, subscribe_event_request,
 };
 
 use crate::host::{HostError, unary};
@@ -283,6 +283,10 @@ pub struct Link {
     /// The module's version data, for the communication log's `vci_connected` (design 8.11);
     /// `None` when the worker did not give it.
     pub(crate) version: Option<VersionData>,
+    /// Whether the worker passes on every response pending the link sees, as its answer to
+    /// `CreateComLogicalLink` says (ADR-355); `None` when it does not say. The agent takes it
+    /// from the worker's answer alone (design principle 6).
+    pub(crate) forwards_pendings: Option<bool>,
 }
 
 /// Which indications the link has on: those of [`INDICATION_COMPARAMS`] the library accepted
@@ -441,23 +445,24 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
     let version = vci_version(client, deadline, module_handle).await;
     let permission = vci_permission(version.as_ref());
 
-    let cll_handle = match create_link(client, config, deadline, module_handle).await {
-        Ok(cll_handle) => cll_handle,
-        Err(error) => {
-            // A module the client holds is not disconnected here, so that proves nothing: the
-            // failed create left nothing behind only when the worker refused it. A create that
-            // timed out or failed otherwise may have made a link nobody holds a handle for
-            // (ADR-258).
-            let cleaned_up = if client.held_module().is_some() {
-                nothing_created(&error)
-            } else {
-                disconnect_module(client, module_handle, deadline)
-                    .await
-                    .is_ok()
-            };
-            return Err(OpenFailure { error, cleaned_up });
-        }
-    };
+    let (cll_handle, forwards_pendings) =
+        match create_link(client, config, deadline, module_handle).await {
+            Ok(created) => created,
+            Err(error) => {
+                // A module the client holds is not disconnected here, so that proves nothing: the
+                // failed create left nothing behind only when the worker refused it. A create that
+                // timed out or failed otherwise may have made a link nobody holds a handle for
+                // (ADR-258).
+                let cleaned_up = if client.held_module().is_some() {
+                    nothing_created(&error)
+                } else {
+                    disconnect_module(client, module_handle, deadline)
+                        .await
+                        .is_ok()
+                };
+                return Err(OpenFailure { error, cleaned_up });
+            }
+        };
     match set_up_link(client, config, deadline, cll_handle).await {
         Ok((events, indications)) => Ok(Link {
             module_handle,
@@ -467,6 +472,7 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
             application_layer: config.application_layer(),
             indications,
             version,
+            forwards_pendings,
         }),
         Err(error) => {
             let cleaned_up = teardown(client, module_handle, cll_handle, deadline)
@@ -634,7 +640,7 @@ async fn create_link<C: WorkerApi>(
     config: &LinkConfig,
     deadline: Duration,
     module_handle: ModuleHandle,
-) -> Result<ComLogicalLinkHandle, HostError> {
+) -> Result<(ComLogicalLinkHandle, Option<bool>), HostError> {
     let resource_id = unary(
         deadline,
         "GetResourceIds",
@@ -649,7 +655,7 @@ async fn create_link<C: WorkerApi>(
     .and_then(|data| data.resource_id_array.into_iter().next())
     .ok_or(HostError::Setup(NO_RESOURCE))?;
 
-    unary(
+    let created = unary(
         deadline,
         "CreateComLogicalLink",
         client.create_com_logical_link(CreateComLogicalLinkRequest {
@@ -660,9 +666,21 @@ async fn create_link<C: WorkerApi>(
             cll_create_flag: None,
         }),
     )
-    .await?
-    .cll_handle
-    .ok_or(HostError::Setup("no logical link handle"))
+    .await?;
+    let cll_handle = created
+        .cll_handle
+        .ok_or(HostError::Setup("no logical link handle"))?;
+    Ok((cll_handle, forwards_pendings(created.pending_forwarding)))
+}
+
+/// Whether the worker said the link forwards every pending (ADR-355): what it says, and only
+/// that; an unspecified or unknown value is not a guess.
+fn forwards_pendings(pending_forwarding: i32) -> Option<bool> {
+    match PendingForwarding::try_from(pending_forwarding) {
+        Ok(PendingForwarding::All) => Some(true),
+        Ok(PendingForwarding::NotAll) => Some(false),
+        Ok(PendingForwarding::Unspecified) | Err(_) => None,
+    }
 }
 
 async fn set_up_link<C: WorkerApi>(
@@ -827,6 +845,7 @@ pub async fn close<C: WorkerApi>(
         application_layer: _,
         indications: _,
         version: _,
+        forwards_pendings: _,
     } = link;
     drop(events);
     teardown(client, module_handle, cll_handle, deadline).await
@@ -900,6 +919,22 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// ADR-355: the worker's answer, and only it, says whether the link forwards every pending;
+    /// an unspecified or unknown value is unknown.
+    #[test]
+    fn forwards_pendings_is_what_the_worker_answered() {
+        assert_eq!(forwards_pendings(PendingForwarding::All as i32), Some(true));
+        assert_eq!(
+            forwards_pendings(PendingForwarding::NotAll as i32),
+            Some(false)
+        );
+        assert_eq!(
+            forwards_pendings(PendingForwarding::Unspecified as i32),
+            None
+        );
+        assert_eq!(forwards_pendings(7), None);
+    }
 
     /// Only a refusal or a missing resource proves a failed create left no link: a create that
     /// answered without a handle, or a timeout, may have created one the runner cannot name.

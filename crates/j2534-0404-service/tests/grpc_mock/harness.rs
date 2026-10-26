@@ -1959,7 +1959,7 @@ pub(crate) async fn create_cll(
     protocol_id: u32,
     _cll_tag: u64,
 ) -> ComLogicalLinkHandle {
-    client
+    let created = client
         .create_com_logical_link(CreateComLogicalLinkRequest {
             module_handle: Some(ModuleHandle {
                 module_handle: MOCK_MODULE_HANDLE,
@@ -1971,9 +1971,13 @@ pub(crate) async fn create_cll(
         })
         .await
         .expect("create_com_logical_link should succeed")
-        .into_inner()
-        .cll_handle
-        .expect("cll_handle should be present")
+        .into_inner();
+    // ADR-355: this service passes on every response pending, on every link.
+    assert_eq!(
+        created.pending_forwarding,
+        vci_service_interface::PendingForwarding::All as i32
+    );
+    created.cll_handle.expect("cll_handle should be present")
 }
 
 /// Sets a single `PDU_PC_COM`-class Unum32 ComParam on `cll_handle`.

@@ -53,8 +53,8 @@ in the agent; that was removed, and the events gave `vci_us` with no clock.
 - The agent can compare VCI times of items from any worker without knowing which worker it is,
   as the settlement of design 8.11 ("Settlement", "Timing judged") will need when it aligns VCI
   times per clock.
-- The agent writes no exchange VCI times yet (`times.vci`, the pendings' `vci_us`); when it
-  does, they take their clock from their items the same way. On a J2534 link one exchange's times
+- The agent writes no exchange VCI times in `times.vci` yet; when it does, they take their clock
+  from their items the same way, as the pendings' `vci_us` already do (ADR-355). On a J2534 link one exchange's times
   can be on both clocks (a transmit indication's on `device`, an error's on `worker`), so the
   log's `VciTimes`, which holds one clock for all of an exchange's VCI times, must hold a clock
   per time or per group before it is written.

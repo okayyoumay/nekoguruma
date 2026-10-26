@@ -122,6 +122,8 @@ Handles in the proto API map directly to `iso22900` Rust handle types:
 
 Handle conversion is in `service/handles.rs`. Invalid or missing handles return `PDU_ERR_INVALID_HANDLE`.
 
+`CreateComLogicalLink` answers `pending_forwarding` `PENDING_FORWARDING_NOT_ALL` for every link (ADR-355): the D-PDU library handles a response pending itself (`CP_RC78Handling`) and need not deliver it, so the service cannot promise that a client sees every pending.
+
 ---
 
 ## ComParam Conversion

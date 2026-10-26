@@ -1220,6 +1220,7 @@ fn run_job<C: WorkerApi>(
             config,
             &valued_by_document,
             link.indications,
+            link.forwards_pendings,
         );
     }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
@@ -14435,6 +14436,8 @@ def main():
                         module_handle: 1,
                         cll_handle: 1,
                     }),
+                    pending_forwarding: vci_service_interface::PendingForwarding::Unspecified
+                        as i32,
                 },
             ))
         }
@@ -15474,6 +15477,7 @@ def main():
             serde_json::json!(["transmit_indication"])
         );
         assert_eq!(opened["response_times_judged"], false);
+        // The mock worker does not say whether it forwards pendings (ADR-355).
         assert!(opened["forwards_pendings"].is_null());
         assert_eq!(opened["timing_margin"]["source"], "none");
         assert_eq!(lines[4]["outcome"], "ok");

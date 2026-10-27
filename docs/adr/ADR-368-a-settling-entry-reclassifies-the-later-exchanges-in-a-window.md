@@ -48,9 +48,11 @@ retention (2026-10-27): the last 16 exchanges per link.
    later exchange in the window:
    - **A first answer** counts one more answered exchange. It also counts one more since the
      last link error, unless a link error came between the two exchanges.
-   - **A matched answer it did not hold before** counts for a later exchange with the same
-     match, unless the link's matched answers ended between the two exchanges (a link error,
-     a reopened link, an accepted or unusable reset).
+   - **A matched answer its entry did not count** (`Kept::matched`; a pending an owed request
+     could own was not one) counts for a later exchange with the same match, unless the link's
+     matched answers ended between the two exchanges (a link error, a reopened link, an
+     accepted or unusable reset). An answer freed this way keeps its order against its own
+     exchange's link errors: one that came after it, or in no known order, still ends it.
    - **A final response** ends the earlier exchange as an owed request the later answers could
      belong to.
 

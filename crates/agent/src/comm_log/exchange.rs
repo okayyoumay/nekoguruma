@@ -1280,6 +1280,8 @@ pub(crate) struct Kept {
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
     pub clears: Clears,
+    /// Its entry's answer counted as a matched answer ([`ExchangeEntry::matched_answer`]).
+    pub matched: bool,
 }
 
 /// How often the matched answers, and the answers since a link error, of a link have ended
@@ -1712,7 +1714,13 @@ impl LinkState {
                         newly_answered: false,
                         newly_matched: now_matched,
                         final_response: alone,
-                        clears: self.window[at].after,
+                        // A link error after the answer, or in no known order with it, ended
+                        // its matched answer, as `record` applies it: the answer comes before.
+                        clears: if entry.error_after_answer() {
+                            self.window[at].clears
+                        } else {
+                            self.window[at].after
+                        },
                     });
                 }
                 let logged = &mut self.window[at];
@@ -1867,7 +1875,7 @@ impl ExchangeEntry {
             newly_answered: effect.this_exchange
                 && before.answer_head().is_none()
                 && !before.response_started,
-            newly_matched: self.matched_answer() && !before.bound_answer(),
+            newly_matched: self.matched_answer() && !kept.matched,
             final_response: effect.final_response,
             clears: kept.clears,
         }
@@ -1882,7 +1890,7 @@ impl ExchangeEntry {
     }
 
     /// Whether its answer is a matched answer, as [`LinkState::record`] counts it.
-    fn matched_answer(&self) -> bool {
+    pub(crate) fn matched_answer(&self) -> bool {
         let effect = &self.effect;
         let unsure_restart = effect.restarts_ecu && effect.unusable;
         effect.this_exchange
@@ -1890,6 +1898,12 @@ impl ExchangeEntry {
             && !self.accepting()
             && !unsure_restart
             && effect.owners.is_empty()
+    }
+
+    /// Whether a link error it saw came after its answer, or in no known order with it, so it
+    /// ended that answer's matched answer ([`LinkState::record`]).
+    fn error_after_answer(&self) -> bool {
+        self.effect.link_error.is_some() && !self.effect.answer_after_error
     }
 
     /// Whether its answer is placed with it alone, so it is owed nothing, as
@@ -2756,6 +2770,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             clears: state.clears(),
+            matched: entry.matched_answer(),
         };
         (entry, kept)
     }
@@ -2801,6 +2816,41 @@ mod tests {
         assert!(
             state.owed.iter().any(|owed| owed.seq == 2),
             "a pending places nothing alone"
+        );
+
+        // That exchange's own final response, unique to it, is a matched answer at last: its
+        // pending never counted, so a silent read logged after it is `vehicle`.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut pending_only = forwarding(read([0xF1, 0x87], End::NoResponse));
+        pending_only.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        pending_only.pending = vec![pending()];
+        let (_, kept_second) = log_kept(&mut state, 2, pending_only);
+        assert!(!kept_second.matched);
+        let own = final_answer(&state, 2, &kept_second, &[0x62, 0xF1, 0x87, 0x41]);
+        assert!(own.newly_matched);
+        state.reclassify_after(&own);
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (after, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(after.classification, Classification::Vehicle);
+
+        // A freed answer its own exchange saw a link error after keeps that order: the error
+        // ended it, so it is no matched answer for the silent read after it.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut errored = confirmed(End::Positive(answer.to_vec()));
+        errored.link_errors = vec![LinkErrorKind::Receive];
+        log_kept(&mut state, 2, errored);
+        log_kept(&mut state, 3, confirmed(End::NoResponse));
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.seq != 3 || logged.classification != Classification::Vehicle),
+            "{:?}",
+            state.window
         );
 
         // A later answer an ambiguous response may have been is not cleared by its history.
@@ -3491,6 +3541,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             clears: Clears::default(),
+            matched: false,
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response);
@@ -3582,6 +3633,7 @@ mod tests {
                 limits: None,
                 start_unattached: false,
                 clears: Clears::default(),
+                matched: false,
             },
         );
         assert!(state.settle_owed(1).is_some());

@@ -1576,6 +1576,7 @@ impl CommLog {
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             clears,
+            matched: false,
         };
         let mut entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         if may_own_unattached && entry.classification < exchange::Classification::Undetermined {
@@ -1603,6 +1604,7 @@ impl CommLog {
                     classification: entry.classification,
                     sent: entry.sent,
                     clears,
+                    matched: entry.matched_answer(),
                     ..kept
                 },
             );

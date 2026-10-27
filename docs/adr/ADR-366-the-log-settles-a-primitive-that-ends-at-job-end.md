@@ -86,5 +86,6 @@ the exchanges the VCI ended.
   the time the host wrote the entry.
 - The rejected results of the primitive and a rejected result that ends it
   (`positive_unusable`, ADR-359) are not carried into the entry.
-- A start-of-message indication the primitive gives at job end is not taken as its response's
-  start, as for a bound indication during an exchange.
+- A start-of-message indication bound to the primitive at job end is not taken as its
+  response's start, as for a bound indication during an exchange; one of no primitive is
+  (item 3).

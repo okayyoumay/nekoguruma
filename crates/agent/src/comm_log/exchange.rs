@@ -18,7 +18,7 @@
 //! `text` and `reason` are built from the domain enums only, never from an internal name (a
 //! host error, a gRPC status, an error event); those go to [`Detail`].
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
 use serde::Serialize;
@@ -1277,6 +1277,82 @@ pub(crate) struct Kept {
     /// A start-of-message with the response's identifier was read during the exchange and not
     /// attached (another exchange could own it): the response may have begun.
     pub start_unattached: bool,
+    /// The link's clears just after its entry was taken in, which tell whether an answer it gets
+    /// later counts for a later exchange ([`LinkState::reclassify_after`]).
+    pub clears: Clears,
+    /// Its entry's answer counted as a matched answer ([`ExchangeEntry::matched_answer`]).
+    pub matched: bool,
+}
+
+/// How often the matched answers, and the answers since a link error, of a link have ended
+/// (design 8.11 "Matched answer"): an earlier exchange's answer counts for a later exchange only
+/// while no such end came between them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Clears {
+    matched: u64,
+    errors: u64,
+}
+
+/// How many logged exchanges per link the log keeps the evidence of, so a settling entry can
+/// reclassify the later exchanges whose evidence it changes (design 8.11 "Settlement"; the
+/// maintainer's retention decision, ADR-368).
+pub(crate) const WINDOW: usize = 16;
+
+/// A logged exchange in its link's window ([`WINDOW`]): its evidence and the history it was
+/// classified with, and its standing classification.
+#[derive(Debug, Clone)]
+struct Logged {
+    seq: u64,
+    evidence: Evidence,
+    history: LinkHistory,
+    origin: Origin,
+    request: Request,
+    classification: Classification,
+    reason: String,
+    /// The link's clears when its history was taken.
+    clears: Clears,
+    /// The link's clears just after its entry was taken in.
+    after: Clears,
+    /// The least classification it keeps whatever its history gives, with the reason: an
+    /// ambiguous response read during it may have been its own (design 8.11 `late_response`).
+    floor: Option<(Classification, String)>,
+    /// A settling entry of its own changed its evidence or set its classification: the history
+    /// alone no longer gives it, so it is not reclassified from the history.
+    settled: bool,
+}
+
+/// An answer a settling entry adds to an earlier exchange, as the later exchanges on its link see
+/// it ([`LinkState::reclassify_after`]).
+#[derive(Debug, Clone)]
+pub(crate) struct SettledAnswer {
+    /// The earlier exchange.
+    pub seq: u64,
+    key: MatchKey,
+    /// It got its first answer of the ECU: one more exchange on the link has answered.
+    newly_answered: bool,
+    /// The answer is a matched answer it did not hold before.
+    newly_matched: bool,
+    /// It is a final response, which ends the earlier exchange as an owed request.
+    final_response: bool,
+    clears: Clears,
+}
+
+impl SettledAnswer {
+    /// A link error in no known order with the answer ended its matched answer.
+    pub(crate) fn no_matched_answer(&mut self) {
+        self.newly_matched = false;
+    }
+}
+
+/// A later exchange a settling entry reclassified, with its new classification and reason.
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Reclassified {
+    pub seq: u64,
+    pub link: u32,
+    pub origin: Origin,
+    pub request: Request,
+    pub classification: Classification,
+    pub reason: String,
 }
 
 /// The evidence of one link that later exchanges on it use (design 8.11 "Matched answer",
@@ -1297,6 +1373,12 @@ pub(crate) struct LinkState {
     unknown_sends: u32,
     /// What is kept of each owed exchange, by `seq` ([`LinkState::keep`]).
     kept: HashMap<u64, Kept>,
+    clears: Clears,
+    /// The last [`WINDOW`] logged exchanges, oldest first, emptied by an accepted ECUReset or
+    /// session change.
+    window: VecDeque<Logged>,
+    /// The largest `seq` that left the window.
+    left_window: Option<u64>,
 }
 
 impl LinkState {
@@ -1336,6 +1418,7 @@ impl LinkState {
     /// ("Owed request": a response already on its way can still arrive).
     pub(crate) fn reopened(&mut self) {
         self.matched.clear();
+        self.clears.matched += 1;
         // The worker gives an indication only to an open link, so one sent before the link was
         // opened again cannot arrive on it.
         self.unknown_sends = 0;
@@ -1431,6 +1514,8 @@ impl LinkState {
     pub(crate) fn channel_link_error(&mut self, seq: u64, kind: LinkErrorKind) {
         self.matched.clear();
         self.answered_since_error = 0;
+        self.clears.matched += 1;
+        self.clears.errors += 1;
         self.last_link_error = Some((seq, kind));
     }
 
@@ -1484,9 +1569,17 @@ impl LinkState {
             self.kept
                 .retain(|seq, _| owed.iter().any(|owed| owed.seq == *seq));
             self.matched.clear();
+            self.clears.matched += 1;
             self.last_reset = Some(entry.seq);
+            // No answer from before it counts for the exchanges after it, and the requests
+            // before it are owed no more, so nothing settles the window's exchanges again.
+            if let Some(last) = self.window.back() {
+                self.left_window = Some(last.seq);
+            }
+            self.window.clear();
         } else if unsure_restart {
             self.matched.clear();
+            self.clears.matched += 1;
         }
         if effect.sent == Sent::Unknown {
             self.unknown_sends += 1;
@@ -1500,6 +1593,262 @@ impl LinkState {
                 sid,
                 expected: effect.expected.clone(),
             });
+        }
+    }
+
+    /// The link's clears now.
+    pub(crate) fn clears(&self) -> Clears {
+        self.clears
+    }
+
+    /// Takes `entry`, logged from `evidence` with the history it was classified with and taken
+    /// in by [`LinkState::record`], into the window; `clears` are the link's clears when its
+    /// history was taken. The oldest exchange leaves a full window.
+    pub(crate) fn log(&mut self, entry: &ExchangeEntry, evidence: Evidence, clears: Clears) {
+        if self.window.len() == WINDOW
+            && let Some(oldest) = self.window.pop_front()
+        {
+            self.left_window = Some(oldest.seq);
+        }
+        self.window.push_back(Logged {
+            seq: entry.seq,
+            history: entry.link_history.clone(),
+            origin: evidence.origin,
+            request: Request::of(&evidence),
+            evidence,
+            classification: entry.classification,
+            reason: entry.reason.clone(),
+            clears,
+            after: self.clears,
+            floor: None,
+            settled: false,
+        });
+    }
+
+    /// Exchange `seq` keeps at least `classification` whatever its history gives, for `reason`,
+    /// which its reason then ends with.
+    pub(crate) fn floor(&mut self, seq: u64, classification: Classification, reason: &str) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            logged.floor = Some((classification, reason.to_owned()));
+        }
+    }
+
+    /// Exchange `seq`'s standing classification is now `classification`, which a settling entry
+    /// of its own gave it.
+    ///
+    /// `evidence` is its evidence with what the entry added. A final response settles its
+    /// classification for good. Any other end leaves it owed, so it is still reclassified from
+    /// its history, keeping at least the classification its settling entry gave it.
+    pub(crate) fn settled(
+        &mut self,
+        seq: u64,
+        classification: Classification,
+        reason: &str,
+        evidence: Evidence,
+        final_response: bool,
+    ) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            logged.classification = classification;
+            logged.reason = reason.to_owned();
+            logged.evidence = evidence;
+            if final_response {
+                logged.settled = true;
+            } else {
+                logged.floor = Some((classification, String::new()));
+            }
+        }
+        // What the entry added gives the exchange an answer, and owners from the owed requests
+        // logged before it, as its history would have had them, so its answer is freed once
+        // none of them can own it.
+        if let Some(at) = self.window.iter().position(|logged| logged.seq == seq) {
+            let fresh = self.history_for(&self.window[at].evidence);
+            let history = &mut self.window[at].history;
+            history.this_exchange = fresh.this_exchange;
+            history.owners = fresh
+                .owners
+                .into_iter()
+                .filter(|owner| *owner < seq)
+                .collect();
+            history.owed_matching = history.owners.len() as u32;
+        }
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.classification = classification;
+        }
+    }
+
+    /// Exchange `seq` is now at least `floor`, with `reason`, which an ambiguous response gave it;
+    /// it stays owed and is still reclassified from its history, keeping that floor, whose
+    /// reason then ends with `suffix`.
+    pub(crate) fn raise(&mut self, seq: u64, floor: Classification, reason: &str, suffix: &str) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            if logged.classification < floor {
+                logged.classification = floor;
+                logged.reason = reason.to_owned();
+            }
+            logged.floor = Some((floor, suffix.to_owned()));
+        }
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.classification = kept.classification.max(floor);
+        }
+    }
+
+    /// Reclassifies the later exchanges in the window with `answer`, which a settling entry adds
+    /// to an earlier exchange (design 8.11 "Settlement"):
+    /// - one more answered exchange, and one since the last link error when none came between
+    ///   them;
+    /// - a matched answer for each with the same match, when none of the link's matched answers
+    ///   ended between them;
+    /// - a final response ends the earlier exchange as an owed request their answers could
+    ///   belong to.
+    ///
+    /// Gives each whose classification or reason this changes, in `seq` order, and the largest
+    /// `seq` of a later exchange that had left the window, which is not reclassified.
+    pub(crate) fn reclassify_after(
+        &mut self,
+        answer: &SettledAnswer,
+    ) -> (Vec<Reclassified>, Option<u64>) {
+        let mut changed: Vec<Reclassified> = Vec::new();
+        let mut answers = vec![answer.clone()];
+        while let Some(answer) = answers.pop() {
+            self.take_answer(&answer);
+            for at in 0..self.window.len() {
+                let logged = &self.window[at];
+                if logged.seq <= answer.seq {
+                    continue;
+                }
+                // One a final response settled keeps its classification, but its answer is
+                // still freed for the exchanges after it.
+                let settled = logged.settled;
+                let mut history = logged.history.clone();
+                if answer.newly_answered {
+                    history.answered += 1;
+                    if logged.clears.errors == answer.clears.errors {
+                        history.answered_since_error += 1;
+                    }
+                }
+                if answer.newly_matched
+                    && logged.clears.matched == answer.clears.matched
+                    && MatchKey::of(&logged.evidence) == answer.key
+                {
+                    history.answered_same_match += 1;
+                }
+                if answer.final_response {
+                    history.owners.retain(|owner| *owner != answer.seq);
+                    history.owed_matching = history.owners.len() as u32;
+                }
+                if history == logged.history {
+                    continue;
+                }
+                let old = ExchangeEntry::build(
+                    logged.seq,
+                    logged.evidence.clone(),
+                    logged.history.clone(),
+                );
+                let mut entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
+                let seq = logged.seq;
+                // The floor first: `record` sees the classification the entry was written with.
+                if let Some((floor, reason)) = &logged.floor
+                    && entry.classification < *floor
+                {
+                    entry.classification = *floor;
+                    entry.reason.push_str(reason);
+                }
+                // An answer no owed request can own any more is a matched answer for the
+                // exchanges after it, a pending too, as `record` would have counted it; a final
+                // response is placed with its exchange alone, which is then owed no more and no
+                // owner of theirs (design 8.11 "Matched answer", "Owed request").
+                let now_matched = entry.matched_answer() && !old.matched_answer();
+                if now_matched && let Some(kept) = self.kept.get_mut(&seq) {
+                    // Counted once: its final response later is no new matched answer.
+                    kept.matched = true;
+                }
+                // An answer no owed request can own confirms its send (`sent_of`): it can own a
+                // late transmit indication no more.
+                if !settled && old.sent == Sent::Unknown && entry.sent == Sent::Confirmed {
+                    self.unknown_sends = self.unknown_sends.saturating_sub(1);
+                    if let Some(kept) = self.kept.get_mut(&seq) {
+                        kept.sent = Sent::Confirmed;
+                    }
+                }
+                let alone = !settled
+                    && entry.placed_alone()
+                    && self.owed.iter().any(|owed| owed.seq == seq);
+                if alone {
+                    self.owed.retain(|owed| owed.seq != seq);
+                    if self
+                        .kept
+                        .remove(&seq)
+                        .is_some_and(|kept| kept.sent == Sent::Unknown)
+                    {
+                        self.unknown_sends = self.unknown_sends.saturating_sub(1);
+                    }
+                }
+                if alone || now_matched {
+                    answers.push(SettledAnswer {
+                        seq,
+                        key: entry.effect.key.clone(),
+                        newly_answered: false,
+                        newly_matched: now_matched,
+                        final_response: alone,
+                        // A link error after the answer, or in no known order with it, ended
+                        // its matched answer, as `record` applies it: the answer comes before.
+                        clears: if entry.error_after_answer() {
+                            self.window[at].clears
+                        } else {
+                            self.window[at].after
+                        },
+                    });
+                }
+                let logged = &mut self.window[at];
+                logged.history = entry.link_history.clone();
+                if settled
+                    || (entry.classification == logged.classification
+                        && entry.reason == logged.reason)
+                {
+                    continue;
+                }
+                logged.classification = entry.classification;
+                logged.reason.clone_from(&entry.reason);
+                let reclassified = Reclassified {
+                    seq,
+                    link: logged.evidence.link,
+                    origin: logged.origin,
+                    request: logged.request.clone(),
+                    classification: entry.classification,
+                    reason: entry.reason,
+                };
+                if let Some(kept) = self.kept.get_mut(&seq) {
+                    kept.classification = reclassified.classification;
+                }
+                changed.retain(|earlier| earlier.seq != seq);
+                changed.push(reclassified);
+            }
+        }
+        changed.sort_by_key(|later| later.seq);
+        let not_reclassified = self.left_window.filter(|left| *left > answer.seq);
+        (changed, not_reclassified)
+    }
+
+    /// Takes `answer` into the link's counts, for the exchanges logged after it, as
+    /// [`LinkState::record`] would have counted it: one more answered exchange, one more since the
+    /// last link error unless one came since, and a matched answer unless the matched answers
+    /// ended since.
+    fn take_answer(&mut self, answer: &SettledAnswer) {
+        if answer.newly_answered {
+            self.answered += 1;
+            if answer.clears.errors == self.clears.errors {
+                self.answered_since_error += 1;
+            }
+        }
+        if answer.newly_matched && answer.clears.matched == self.clears.matched {
+            *self.matched.entry(answer.key.clone()).or_insert(0) += 1;
+        }
+        // Counted once: an exchange still owed after it (a pending its primitive's end added)
+        // brings no new matched answer with its final response.
+        if answer.newly_matched
+            && let Some(kept) = self.kept.get_mut(&answer.seq)
+        {
+            kept.matched = true;
         }
     }
 
@@ -1592,6 +1941,55 @@ impl ExchangeEntry {
     /// ends the matched answers of the channel's other targets too ([`LinkState::record`]).
     pub(crate) fn link_error(&self) -> Option<LinkErrorKind> {
         self.effect.link_error
+    }
+
+    /// The answer this entry, a settling entry's view of the earlier exchange `kept` with its new
+    /// evidence, adds for the later exchanges on its link ([`LinkState::reclassify_after`]),
+    /// counted as [`LinkState::record`] counts an exchange's answer.
+    pub(crate) fn settled_answer(&self, kept: &Kept) -> SettledAnswer {
+        let effect = &self.effect;
+        let before = &kept.evidence;
+        SettledAnswer {
+            seq: self.seq,
+            key: effect.key.clone(),
+            newly_answered: effect.this_exchange
+                && before.answer_head().is_none()
+                && !before.response_started,
+            newly_matched: self.matched_answer() && !kept.matched,
+            final_response: effect.final_response,
+            clears: kept.clears,
+        }
+    }
+
+    /// Whether it accepts an ECUReset or a session change, as [`LinkState::record`] reads it.
+    fn accepting(&self) -> bool {
+        let effect = &self.effect;
+        effect.restarts_ecu
+            && ((effect.positive && effect.final_response)
+                || (effect.suppressed && self.classification == Classification::None))
+    }
+
+    /// Whether its answer is a matched answer, as [`LinkState::record`] counts it.
+    pub(crate) fn matched_answer(&self) -> bool {
+        let effect = &self.effect;
+        let unsure_restart = effect.restarts_ecu && effect.unusable;
+        effect.this_exchange
+            && effect.bound_answer
+            && !self.accepting()
+            && !unsure_restart
+            && effect.owners.is_empty()
+    }
+
+    /// Whether a link error it saw came after its answer, or in no known order with it, so it
+    /// ended that answer's matched answer ([`LinkState::record`]).
+    fn error_after_answer(&self) -> bool {
+        self.effect.link_error.is_some() && !self.effect.answer_after_error
+    }
+
+    /// Whether its answer is placed with it alone, so it is owed nothing, as
+    /// [`LinkState::record`] reads it.
+    fn placed_alone(&self) -> bool {
+        self.effect.owners.is_empty() && (self.effect.final_response || self.accepting())
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -2435,6 +2833,311 @@ mod tests {
 
     const READ_F186: [u8; 3] = [0x22, 0xF1, 0x86];
 
+    /// Logs `evidence` as line `seq` on `state`, as the log does, into its window too; what the
+    /// log keeps of it, as a settling entry finds it.
+    fn log_kept(state: &mut LinkState, seq: u64, evidence: Evidence) -> (ExchangeEntry, Kept) {
+        let clears = state.clears();
+        let entry = log(state, seq, evidence.clone());
+        state.log(&entry, evidence.clone(), clears);
+        let kept = Kept {
+            origin: evidence.origin,
+            request: Request::of(&evidence),
+            evidence,
+            classification: entry.classification,
+            sent: entry.sent,
+            transmit: None,
+            pendings: Vec::new(),
+            limits: None,
+            start_unattached: false,
+            clears: state.clears(),
+            matched: entry.matched_answer(),
+        };
+        (entry, kept)
+    }
+
+    /// The answer a settling entry adds when exchange `seq`, kept as `kept`, gets `response`.
+    fn final_answer(state: &LinkState, seq: u64, kept: &Kept, response: &[u8]) -> SettledAnswer {
+        let answered = kept.answered(response);
+        let history = state.history_settling(&answered, seq);
+        ExchangeEntry::build(seq, answered, history).settled_answer(kept)
+    }
+
+    /// Design 8.11 "Settlement": a pending of a later exchange that the earlier owed request
+    /// could own becomes a matched answer once that request has its response, for the exchanges
+    /// after it, though its exchange stays owed; and a floor an ambiguous response set stands.
+    #[test]
+    fn a_settled_answer_reaches_on_through_the_answers_it_makes_unambiguous() {
+        let confirmed = |end| {
+            let mut evidence = forwarding(evidence(&READ_F186, end));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let answer: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        // A read of another identifier that got a pending, which the first could own, then
+        // none; and a silent read of that identifier.
+        let mut pending_only = forwarding(read([0xF1, 0x87], End::NoResponse));
+        pending_only.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        pending_only.pending = vec![pending()];
+        let (second, _) = log_kept(&mut state, 2, pending_only);
+        assert_eq!(second.link_history.owed_matching, 1);
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (third, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(third.classification, Classification::Undetermined);
+        let (changed, _) = state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        let third = changed.iter().find(|later| later.seq == 3);
+        assert_eq!(
+            third.map(|later| later.classification),
+            Some(Classification::Vehicle),
+            "{changed:?}"
+        );
+        assert!(
+            state.owed.iter().any(|owed| owed.seq == 2),
+            "a pending places nothing alone"
+        );
+
+        // That exchange's own final response, unique to it, is a matched answer at last: its
+        // pending never counted, so a silent read logged after it is `vehicle`.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut pending_only = forwarding(read([0xF1, 0x87], End::NoResponse));
+        pending_only.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        pending_only.pending = vec![pending()];
+        let (_, kept_second) = log_kept(&mut state, 2, pending_only);
+        assert!(!kept_second.matched);
+        let own = final_answer(&state, 2, &kept_second, &[0x62, 0xF1, 0x87, 0x41]);
+        assert!(own.newly_matched);
+        state.reclassify_after(&own);
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (after, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(after.classification, Classification::Vehicle);
+
+        // A freed answer its own exchange saw a link error after keeps that order: the error
+        // ended it, so it is no matched answer for the silent read after it.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut errored = confirmed(End::Positive(answer.to_vec()));
+        errored.link_errors = vec![LinkErrorKind::Receive];
+        log_kept(&mut state, 2, errored);
+        log_kept(&mut state, 3, confirmed(End::NoResponse));
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.seq != 3 || logged.classification != Classification::Vehicle),
+            "{:?}",
+            state.window
+        );
+
+        // A pending made a matched answer this way counts once: its exchange's final response
+        // later is no new matched answer.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        state.keep(1, kept.clone());
+        let mut pending_only = forwarding(read([0xF1, 0x87], End::NoResponse));
+        pending_only.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        pending_only.pending = vec![pending()];
+        let (_, kept_second) = log_kept(&mut state, 2, pending_only);
+        state.keep(2, kept_second);
+        state.settle_owed(1);
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        let kept_second = state.kept(2).cloned().expect("a pending leaves it owed");
+        assert!(kept_second.matched);
+        let own = final_answer(&state, 2, &kept_second, &[0x62, 0xF1, 0x87, 0x41]);
+        assert!(!own.newly_matched);
+
+        // An owed exchange an ambiguous response raised is still freed by its owner's answer:
+        // owed no more, and still at least `undetermined`.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut negative = forwarding(read([0xF1, 0x87], End::Negative(vec![0x7F, 0x22, 0x31])));
+        negative.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log_kept(&mut state, 2, negative);
+        assert!(state.owed.iter().any(|owed| owed.seq == 2));
+        state.raise(2, Classification::Undetermined, "raised", " raised");
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            !state.owed.iter().any(|owed| owed.seq == 2),
+            "{:?}",
+            state.owed
+        );
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.seq != 2
+                    || logged.classification >= Classification::Undetermined)
+        );
+
+        // A pending a non-final settlement added, which the earlier owed request could own, is
+        // in the window's history: once that request has its response, it is a matched answer.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut waited = forwarding(read([0xF1, 0x87], End::VciDidNotEnd));
+        waited.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log_kept(&mut state, 2, waited.clone());
+        let mut ended = waited;
+        ended.end = End::NoResponse;
+        ended.pending = vec![pending()];
+        state.settled(2, Classification::Undetermined, "ended", ended, false);
+        assert_eq!(
+            state
+                .window
+                .iter()
+                .find(|logged| logged.seq == 2)
+                .map(|logged| logged.history.owners.clone()),
+            Some(vec![1])
+        );
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (after, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(after.classification, Classification::Vehicle);
+
+        // A freed answer confirms its exchange's send: that exchange can own a late transmit
+        // indication no more.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let unconfirmed = forwarding(read([0xF1, 0x87], End::Negative(vec![0x7F, 0x22, 0x31])));
+        let (second, _) = log_kept(&mut state, 2, unconfirmed);
+        assert_eq!(second.sent, Sent::Unknown);
+        assert_eq!(state.unknown_sends, 1);
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert_eq!(state.unknown_sends, 0);
+
+        // An exchange a final response settled keeps its classification, but its answer is
+        // freed once its owner has its response.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut waited = forwarding(read([0xF1, 0x87], End::VciDidNotEnd));
+        waited.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log_kept(&mut state, 2, waited.clone());
+        let mut ended = waited;
+        ended.end = End::Negative(vec![0x7F, 0x22, 0x31]);
+        state.settle_owed(2);
+        state.settled(2, Classification::System, "ended", ended, true);
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.seq != 2 || logged.classification == Classification::System)
+        );
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (after, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(after.classification, Classification::Vehicle);
+
+        // A later answer an ambiguous response may have been is not cleared by its history.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        log_kept(&mut state, 2, confirmed(End::Positive(answer.to_vec())));
+        state.floor(2, Classification::Undetermined, " floor");
+        let (changed, _) = state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            changed
+                .iter()
+                .all(|later| later.classification == Classification::Undetermined),
+            "{changed:?}"
+        );
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.classification >= Classification::Undetermined)
+        );
+    }
+
+    /// Design 8.11 "Settlement": a final response a settling entry adds to an earlier exchange
+    /// ends it as an owed request for the later exchanges in the window, and a matched answer
+    /// it adds counts for those with the same match unless a link error came between them; each
+    /// is reclassified. The window ends at an accepted session change, and an exchange that left
+    /// it is named, not reclassified.
+    #[test]
+    fn a_settled_answer_reclassifies_the_later_exchanges_in_the_window() {
+        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let answer: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let mut answered = forwarding(evidence(&READ_F186, End::Positive(answer.to_vec())));
+        answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        // A later answer the earlier owed request could own is `undetermined`; once that
+        // request has its own response, the later one is its own rows' again.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        let (later, _) = log_kept(&mut state, 2, answered.clone());
+        assert_eq!(later.classification, Classification::Undetermined);
+        let (changed, past) = state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert_eq!(past, None);
+        let [reclassified] = &changed[..] else {
+            panic!("{changed:?}");
+        };
+        assert_eq!(reclassified.seq, 2);
+        assert_eq!(reclassified.classification, Classification::None);
+        // The same answer again changes nothing: the window already has it.
+        assert!(
+            state
+                .reclassify_after(&final_answer(&state, 1, &kept, answer))
+                .0
+                .is_empty()
+        );
+
+        // A matched answer the earlier exchange gets counts for a later silent exchange with
+        // the same match: it is now `vehicle`.
+        let matched = |kept: &Kept| SettledAnswer {
+            seq: 1,
+            key: MatchKey::of(&silent),
+            newly_answered: true,
+            newly_matched: true,
+            final_response: true,
+            clears: kept.clears,
+        };
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        let (later, _) = log_kept(&mut state, 2, silent.clone());
+        assert_eq!(later.classification, Classification::Undetermined);
+        let (changed, _) = state.reclassify_after(&matched(&kept));
+        assert_eq!(changed.len(), 1, "{changed:?}");
+        assert_eq!(changed[0].classification, Classification::Vehicle);
+
+        // A link error between them ends the matched answers: the later exchange keeps its row.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        state.channel_link_error(2, LinkErrorKind::Receive);
+        log_kept(&mut state, 3, silent.clone());
+        let (changed, _) = state.reclassify_after(&matched(&kept));
+        assert!(changed.is_empty(), "{changed:?}");
+
+        // An accepted session change empties the window; one more than the window's size
+        // pushes the oldest out. Either way the exchanges that left it are named.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        log_kept(&mut state, 2, silent.clone());
+        log_kept(
+            &mut state,
+            3,
+            evidence(&[0x10, 0x03], End::Positive(vec![0x50, 0x03])),
+        );
+        assert!(state.window.iter().all(|logged| logged.seq == 3));
+        assert_eq!(
+            state.reclassify_after(&final_answer(&state, 1, &kept, answer)),
+            (Vec::new(), Some(2))
+        );
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        for seq in 2..=u64::try_from(WINDOW).unwrap() + 2 {
+            log_kept(&mut state, seq, silent.clone());
+        }
+        assert_eq!(state.window.len(), WINDOW);
+        let (changed, past) = state.reclassify_after(&matched(&kept));
+        assert_eq!(past, Some(2));
+        assert_eq!(changed.len(), WINDOW, "{changed:?}");
+        assert_eq!(changed[0].seq, 3);
+    }
+
     fn read(did: [u8; 2], end: End) -> Evidence {
         evidence(&[0x22, did[0], did[1]], end)
     }
@@ -3016,6 +3719,8 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
+            clears: Clears::default(),
+            matched: false,
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response);
@@ -3106,6 +3811,8 @@ mod tests {
                 pendings: Vec::new(),
                 limits: None,
                 start_unattached: false,
+                clears: Clears::default(),
+                matched: false,
             },
         );
         assert!(state.settle_owed(1).is_some());

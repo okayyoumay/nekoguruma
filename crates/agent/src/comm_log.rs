@@ -1905,11 +1905,12 @@ impl CommLog {
         let link = evidence.link;
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
         let times = evidence.times.vci;
+        let unended = (!final_response).then(|| evidence.clone());
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
         let (classification, reason) = exchange::settle_primitive_ended(&entry, observed);
         // The answers its end adds count for the later exchanges on the link.
         let state = &mut inner.links[at].1;
-        state.settled(seq, classification, &reason);
+        state.settled(seq, classification, &reason, unended);
         let (later, not_reclassified) = state.reclassify_after(&entry.settled_answer(&kept));
         let refers_to = std::iter::once(seq)
             .chain(later.iter().map(|later| later.seq))
@@ -2180,6 +2181,11 @@ impl CommLog {
     }
 }
 
+/// What an owed exchange's reason adds when a response delivered after it ended, logged
+/// `unattached`, may be its own or another exchange's.
+const AMBIGUOUS_OWNER: &str =
+    " A response delivered after it ended may be its own or another exchange's: undetermined.";
+
 /// What an exchange's reason adds when a response read during it, logged `unattached`, may be
 /// its own or an earlier exchange's.
 const MAY_OWN_UNATTACHED: &str = " A response read during this exchange, logged unattached, may be this exchange's or an earlier one's: undetermined.";
@@ -2272,7 +2278,7 @@ impl Inner {
             exchange::settle_late_response(&kept, &answered, window, &history);
         // The answer it adds counts for the later exchanges on the link.
         let answer = exchange::ExchangeEntry::build(owner, answered, history).settled_answer(&kept);
-        state.settled(owner, classification, &reason);
+        state.settled(owner, classification, &reason, None);
         let (later, not_reclassified) = state.reclassify_after(&answer);
         let top = later
             .iter()
@@ -2334,7 +2340,12 @@ impl Inner {
             } else {
                 "A response was delivered after the exchange ended that it or another exchange could own, so whether the ECU answered this request is not decided: undetermined.".to_owned()
             };
-            state.settled(*owner, classification, &reason);
+            state.raise(
+                *owner,
+                exchange::Classification::Undetermined,
+                &reason,
+                AMBIGUOUS_OWNER,
+            );
             exchanges.push(Settled {
                 seq: *owner,
                 link: kept.evidence.link,

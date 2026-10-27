@@ -89,10 +89,16 @@ retention (2026-10-27): the last 16 exchanges per link.
    exchange in flight awaits the same response. The exchange in flight is then at least
    `undetermined` in its own entry, written after the settling entry. Its window entry keeps
    that floor, so a later reclassification from its history does not lower it.
-5. **An exchange settled by its own entry** is not reclassified from its history afterwards.
-   This covers the owner of a `late_response` or `primitive_ended`, and an owner an ambiguous
-   response raised. Its classification then rests on evidence its history alone does not
-   give.
+5. **An exchange a settling entry settled.**
+   - Given a final response by a `late_response` or `primitive_ended`, it is not reclassified
+     from its history afterwards: its classification rests on evidence its history alone does
+     not give, and it is owed no more.
+   - Given any other end by a `primitive_ended`, it stays owed. It is still reclassified, from
+     its evidence with that end, keeping at least the classification the entry gave it.
+   - Raised by an ambiguous response, it stays owed. It is still reclassified, keeping at
+     least `undetermined`, so a later answer of its owner still frees its answer.
+
+   An answer counts as a matched answer once (`Kept::matched`), however it became one.
 
 ## Consequences
 

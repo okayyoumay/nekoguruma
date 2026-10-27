@@ -1360,6 +1360,20 @@ impl CommLog {
                     response_may_have_begun,
                 },
             );
+            // The VCI's own limits past by the reading at the agent's deadline, on a link
+            // whose start-of-message indications are on and showed no response under way.
+            if matches!(evidence.end, exchange::End::VciDidNotEnd) && !response_may_have_begun {
+                evidence.vci_limits_past_by_us = vci.deadline.and_then(|reading| {
+                    timing::past_vci_limits(
+                        *limits,
+                        evidence.absorbing(),
+                        transmit,
+                        &pendings,
+                        reading.time.placed(),
+                        reading.round_trip_us,
+                    )
+                });
+            }
         }
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
         for (item, placed) in unbound.iter().zip(unbound_placed) {
@@ -3628,6 +3642,90 @@ mod tests {
             multi_frame["timing"]["not_judged_reason"], "end_after_limit",
             "{multi_frame}"
         );
+    }
+
+    /// Design 8.11 `vci_did_not_end`: an exchange the agent's deadline ended is `system` once the
+    /// VCI's device clock, read at that deadline less its round trip, is past the VCI's own
+    /// limits by more than a single frame's transfer with no response started; otherwise it stays
+    /// `undetermined`.
+    #[test]
+    fn the_vci_s_own_limits_past_at_the_deadline_are_system() {
+        let opened = |start_of_message| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            // P2 1 s; the agent's 2 ms margin; one frame 320 µs.
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message,
+                },
+                Some(true),
+            )
+            .unwrap();
+            (dir, setup, log)
+        };
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let waited = |reading_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::VciDidNotEnd,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
+            evidence.times.agent.before_us = 10_000;
+            evidence.times.agent.end_us = 10_000 + reading_us + 2_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(10_500)),
+                deadline: Some(exchange::ClockReading {
+                    time: device(10_500 + reading_us),
+                    round_trip_us: 700,
+                }),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let classified = |start_of_message, reading_us, started: Vec<UnattachedItem>| {
+            let (_dir, setup, log) = opened(start_of_message);
+            log.exchange_with(waited(reading_us), started).unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            let entry = lines
+                .iter()
+                .find(|line| line["event"] == "exchange")
+                .unwrap()
+                .clone();
+            entry
+        };
+        // Past by 1 µs: 1 s + 2 ms + 320 µs + 700 µs of round trip, plus 1.
+        let past = classified(true, 1_003_021, Vec::new());
+        assert_eq!(past["outcome"]["result"], "vci_did_not_end", "{past}");
+        assert_eq!(past["classification"], "system", "{past}");
+        // At the bound, or with no start-of-message indications on the link, or after a
+        // response started: undetermined.
+        let at_bound = classified(true, 1_003_020, Vec::new());
+        assert_eq!(at_bound["classification"], "undetermined", "{at_bound}");
+        let no_indications = classified(false, 9_000_000, Vec::new());
+        assert_eq!(
+            no_indications["classification"], "undetermined",
+            "{no_indications}"
+        );
+        let start = UnattachedItem {
+            vci_us: 900_000,
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 900_500,
+                wall_unix_ms: 0,
+            }),
+            ..start_of_message(0x7E8)
+        };
+        let started = classified(true, 9_000_000, vec![start]);
+        assert_eq!(started["classification"], "undetermined", "{started}");
     }
 
     /// A start-of-message indication for `identifier`, read during the exchange.

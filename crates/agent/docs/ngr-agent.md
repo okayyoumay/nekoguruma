@@ -401,7 +401,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   worker's receive timeout, ends an exchange with no response, the entry's outcome is
   `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
   have run out, with or without a pending; a pending then silence is `vehicle` only when the
-  VCI ended the wait. At that deadline the host reads the VCI's clock for an exchange whose entry
+  VCI ended the wait. It is `system` when the send was confirmed, the link's start-of-message
+  indications are on and showed no response under way, and the reading at the deadline below,
+  less its round trip, is on the device clock and epoch of the transmit and past the latest
+  limit in force plus the margin by more than a single frame's transfer
+  (`comm_log::timing::past_vci_limits`, `LinkConfig::single_frame`): the VCI did not end the
+  exchange within its own timing. At that deadline the host reads the VCI's clock for an exchange whose entry
   it writes (`GetTimestamp` of the link's module, one more unary call's budget at most), and the entry's `times.vci.deadline`
   gives the reading with the clock the worker names in `TimestampResponse.timestamp_clock` and
   the read's round trip (`round_trip_us`); a read that fails gives none. A primitive whose end the host did not read may still hold the link: its

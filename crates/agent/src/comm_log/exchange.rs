@@ -1023,6 +1023,10 @@ pub(crate) struct Evidence {
     /// primitive. An exchange the agent's own deadline ended did not (design 8.11
     /// `vci_did_not_end`).
     pub vci_ended: bool,
+    /// For an exchange the agent's deadline ended, how far the VCI's device clock, read at that
+    /// deadline, was past the VCI's own limits with no response under way
+    /// (`timing::past_vci_limits`); `None` when that is not shown.
+    pub vci_limits_past_by_us: Option<i64>,
     /// A flow-control frame from the ECU was seen (`partial`).
     pub flow_control: bool,
     /// Link errors the exchange's own link reported during it, other than its outcome.
@@ -1087,6 +1091,7 @@ impl Evidence {
             transmit_evidence: None,
             response_started: false,
             vci_ended: false,
+            vci_limits_past_by_us: None,
             flow_control: false,
             link_errors: Vec::new(),
             link_errors_before_answer: false,
@@ -1869,9 +1874,19 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 cause.phrase()
             ),
         ),
-        // Not implemented: `vci_did_not_end` with the VCI's own limits past (`system`). Needs the
-        // device clock reading at the agent's deadline, the start-of-message indications and
-        // the limits in force.
+        // The VCI's own limits past after a confirmed send, by its device clock at the agent's
+        // deadline, with no response under way.
+        End::VciDidNotEnd
+            if sent == Sent::Confirmed && evidence.vci_limits_past_by_us.is_some() =>
+        {
+            (
+                System,
+                format!(
+                    "The VCI did not end the exchange within its own timing: its clock, read when the agent stopped waiting, was {:.1} ms past the limit in force, the margin and the longest single-frame transfer, and no response had started.",
+                    evidence.vci_limits_past_by_us.unwrap_or_default() as f64 / 1000.0
+                ),
+            )
+        }
         End::VciDidNotEnd => (
             Undetermined,
             to_owned(
@@ -2752,6 +2767,28 @@ mod tests {
         assert_eq!(entry.classification, Classification::Undetermined);
         assert_eq!(entry.sent, Sent::Unknown);
         assert!(entry.reason.contains("detail is not available"));
+    }
+
+    #[test]
+    fn the_vci_s_own_limits_past_make_the_deadline_system() {
+        let mut past = evidence(&READ_F186, End::VciDidNotEnd);
+        past.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        past.vci_limits_past_by_us = Some(12_500);
+        let verdict = verdict(&past);
+        assert_eq!(verdict.classification, Classification::System);
+        assert!(
+            verdict.reason.contains("12.5 ms past the limit"),
+            "{}",
+            verdict.reason
+        );
+        // Not shown past: undetermined, as before.
+        let mut not_shown = past.clone();
+        not_shown.vci_limits_past_by_us = None;
+        assert_eq!(verdict_of(&not_shown).0, Classification::Undetermined);
+        // A send not confirmed: the VCI may not have started its timing.
+        let mut unconfirmed = past.clone();
+        unconfirmed.transmit_evidence = None;
+        assert_eq!(verdict_of(&unconfirmed).0, Classification::Undetermined);
     }
 
     #[test]

@@ -199,6 +199,56 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
     timing
 }
 
+/// How far the VCI's device clock, read at the agent's deadline, was past the VCI's own limits
+/// (design 8.11 `vci_did_not_end`): the reading less its round trip, from the transmit, past
+/// the latest limit in force plus the margin plus the longest transfer of a single-frame
+/// response, which would have given no start-of-message indication. `None` when it is not past,
+/// or cannot be shown: the reading or the transmit is not on the device clock (on a J2534 link
+/// the reading is the worker's, ADR-120), they are on different epochs, a pending is not on
+/// their clock and epoch or came before the transmit, nothing bounds the limit, or the link's
+/// protocol has no single-frame bound.
+pub(crate) fn past_vci_limits(
+    limits: Limits,
+    absorbing: bool,
+    transmit: At,
+    pendings: &[At],
+    reading: At,
+    round_trip_us: u64,
+) -> Option<i64> {
+    let (Clock::Device, transmit) = transmit? else {
+        return None;
+    };
+    let (Clock::Device, reading) = reading? else {
+        return None;
+    };
+    if reading.epoch != transmit.epoch {
+        return None;
+    }
+    let pendings = pendings
+        .iter()
+        .map(|at| {
+            let (own, at) = (*at)?;
+            (own == Clock::Device && at.epoch == transmit.epoch)
+                .then_some(at.unwrapped - transmit.unwrapped)
+        })
+        .collect::<Option<Vec<i64>>>()?;
+    if pendings.iter().any(|&us| us < 0) {
+        return None;
+    }
+    let transfer = to_i64(limits.single_frame?.transfer_us);
+    let latest = limit_in_force(
+        to_i64(limits.p2_us),
+        to_i64(limits.p2_star_us),
+        limits.completion_us.map(to_i64),
+        &pendings,
+        absorbing,
+    )
+    .latest?;
+    let elapsed = reading.unwrapped - to_i64(round_trip_us) - transmit.unwrapped;
+    let by = elapsed - (latest + to_i64(limits.margin_us) + transfer);
+    (by > 0).then_some(by)
+}
+
 /// The limit in force, in microseconds from the transmit (design 8.11 "Limit in force").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct InForce {
@@ -570,6 +620,56 @@ mod tests {
             ..LIMITS
         };
         assert_eq!(judge(unbounded, true, times(&late)).late_pending, None);
+    }
+
+    #[test]
+    fn the_vci_s_own_limits_are_past_by_the_reading_less_its_round_trip() {
+        let past = |limits, absorbing, pendings: &[At], reading: At, round_trip_us| {
+            past_vci_limits(
+                limits,
+                absorbing,
+                transmit(),
+                pendings,
+                reading,
+                round_trip_us,
+            )
+        };
+        // P2 50 ms, the margin 2 ms and one frame's 320 µs: past by 1 µs, less a 1 ms round
+        // trip.
+        assert_eq!(past(LIMITS, false, &[], at(53_321), 1_000), Some(1));
+        assert_eq!(past(LIMITS, false, &[], at(53_320), 1_000), None);
+        // After a pending, from the limit it sets.
+        assert_eq!(
+            past(LIMITS, false, &[at(10_000)], at(5_012_321), 0),
+            Some(1)
+        );
+        // A pending not on the clock, or before the transmit, leaves the limit unknown.
+        assert_eq!(past(LIMITS, false, &[on(1, 5)], at(9_000_000), 0), None);
+        assert_eq!(past(LIMITS, false, &[at(-1)], at(9_000_000), 0), None);
+        // A reading on another epoch, or on the worker's clock (J2534, ADR-120).
+        assert_eq!(past(LIMITS, false, &[], on(1, 9_000_000), 0), None);
+        let worker = Some((
+            Clock::Worker,
+            Placed {
+                epoch: 0,
+                unwrapped: 10_000_000,
+            },
+        ));
+        assert_eq!(past(LIMITS, false, &[], worker, 0), None);
+        // On an absorbing link, past the latest limit only: P2 plus the completion limit.
+        assert_eq!(past(LIMITS, true, &[], at(1_000_000), 0), None);
+        assert_eq!(past(LIMITS, true, &[], at(25_052_321), 0), Some(1));
+        let unbounded = Limits {
+            completion_us: None,
+            ..LIMITS
+        };
+        assert_eq!(past(unbounded, true, &[], at(99_000_000), 0), None);
+        // No single-frame bound for the link's protocol.
+        let no_frame = Limits {
+            single_frame: None,
+            ..LIMITS
+        };
+        assert_eq!(past(no_frame, false, &[], at(9_000_000), 0), None);
     }
 
     #[test]

@@ -14373,6 +14373,9 @@ def main():
         TimeOut,
         /// The same receive timeout, and the finished status 1 s after it.
         TimeOutThenFinishLater,
+        /// A transmit indication bound to the primitive with VCI time 10 ms, then the receive
+        /// timeout and the finished status.
+        TransmitThenTimeOut,
         /// A receive error with VCI time 20 ms and extra error information, and the finished
         /// status 150 ms after it.
         FailThenFinishLater,
@@ -14637,7 +14640,28 @@ def main():
                             ..Default::default()
                         }));
                     }
-                    if let StartEvent::TimeOut | StartEvent::TimeOutThenFinishLater = event
+                    if let StartEvent::TransmitThenTimeOut = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 10_000,
+                                data: Some(vci_service_interface::event_item::Data::ResultData(
+                                    vci_service_interface::ResultData {
+                                        rx_flag: vec![0, 0, 0, 0x08],
+                                        data_bytes: vec![0x22, 0xF1, 0x90],
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }));
+                    }
+                    if let StartEvent::TimeOut
+                    | StartEvent::TimeOutThenFinishLater
+                    | StartEvent::TransmitThenTimeOut = event
                         && let Some(sender) = &sender
                     {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14692,6 +14716,7 @@ def main():
                         | StartEvent::RespondThenFinishLater
                         | StartEvent::TimeOut
                         | StartEvent::TimeOutThenFinishLater
+                        | StartEvent::TransmitThenTimeOut
                         | StartEvent::FailThenFinishLater => {
                             EventData::Item(vci_service_interface::EventItem {
                                 cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
@@ -15087,6 +15112,66 @@ def main():
         })
         .await
         .unwrap()
+    }
+
+    /// Design 8.11 `sent_evidence`: a transmit indication bound to the request's primitive
+    /// confirms the send, with its time, in the exchange's entry and, read at job end, in the
+    /// `primitive_ended` entry (ADR-366).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_transmit_indication_bound_to_the_primitive_confirms_the_send() {
+        // Read before the deadline, the exchange ends with it; read after, at job end.
+        for (delay, event) in ["exchange", "primitive_ended"]
+            .into_iter()
+            .zip([Duration::from_millis(10), Duration::from_millis(150)])
+            .map(|(event, delay)| (delay, event))
+        {
+            let dir = journal_dir("bound-transmit");
+            let (mut client, _fake) = fake_worker_starting_with(
+                CancelAnswer::Done,
+                Some((delay, StartEvent::TransmitThenTimeOut)),
+            )
+            .await;
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: Duration::from_millis(50),
+            };
+            tokio::task::spawn_blocking(move || {
+                use diag_ir::DiagHost;
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                host.set_comm_log(Some(log));
+                host.set_link_ids(0x7E0, 0x7E8);
+                host.own_reads(Some(OwnRead::Identification));
+                host.set_job_end_wait(Duration::from_millis(500));
+                let result = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                host.settle_at_end();
+            })
+            .await
+            .unwrap();
+            let lines = comm_log_lines(&dir);
+            let entry = lines
+                .iter()
+                .find(|line| line["event"] == event)
+                .expect("the entry is written");
+            assert_eq!(entry["sent"], "confirmed", "{entry}");
+            assert_eq!(entry["sent_evidence"], "tx_indication", "{entry}");
+            // An exchange entry has its VCI times under `times`, a settling entry its end's.
+            let vci = if event == "exchange" {
+                &entry["times"]["vci"]
+            } else {
+                &entry["vci"]
+            };
+            assert_eq!(vci["tx_done"]["us"], 10_000, "{entry}");
+            assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): a primitive past the agent's

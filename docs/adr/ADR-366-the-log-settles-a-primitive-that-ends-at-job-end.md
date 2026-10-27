@@ -53,6 +53,9 @@ the exchanges the VCI ended.
    - Timing is judged against the kept transmit and limits, with the new pendings' intervals.
      A final response ends the exchange as an owed request. The exchange is never counted as an
      owed request its own answer could belong to.
+   - A transmit or start-of-message indication of no primitive read at job end is the
+     exchange's when no other exchange on the link could own it, as during the exchange: it
+     confirms the send, or shows the response began.
    - A receive timeout after a response began gives `response_incomplete`, as for an
      exchange.
    - The entry carries `refers_to`, `link`, `sent`, `sent_evidence`, `outcome`, `answers`,

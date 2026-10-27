@@ -485,6 +485,9 @@ pub(crate) struct PrimitiveEnded {
     pub vci_ended: bool,
     /// The link errors it reported at job end beside its end.
     pub link_errors: Vec<exchange::LinkErrorKind>,
+    /// The transmit and start-of-message indications of no primitive read at job end, which
+    /// may be its exchange's.
+    pub indications: Vec<UnattachedItem>,
 }
 
 /// A `primitive_ended` settling entry (design 8.11 "Settlement", ADR-366): the primitive's end,
@@ -1604,6 +1607,32 @@ impl CommLog {
         evidence.vci_ended = ended.vci_ended;
         evidence.link_errors.extend(ended.link_errors);
         evidence.vci_limits_past_by_us = None;
+        // An indication of no primitive read at job end is the exchange's, as it would have
+        // been during it, when no other exchange on the link could own it (design 8.11 "Link
+        // settings for the log").
+        let state = &inner.links[at].1;
+        let rx_id = evidence.rx_id;
+        if !state.may_own_start_indication_besides(rx_id, seq)
+            && ended
+                .indications
+                .iter()
+                .any(|item| item.is_start_indication_for(rx_id))
+        {
+            evidence.response_started = true;
+        }
+        let late_transmit = match evidence.target {
+            exchange::Target::Endpoint { tx_id, .. }
+                if evidence.transmit_evidence.is_none()
+                    && !state.may_own_tx_indication_besides(kept.sent) =>
+            {
+                ended
+                    .indications
+                    .iter()
+                    .find(|item| item.is_tx_indication_for(tx_id))
+                    .cloned()
+            }
+            _ => None,
+        };
         // A response that began and did not complete, as an exchange's end gives it.
         if evidence.vci_ended
             && evidence.response_started
@@ -1629,6 +1658,16 @@ impl CommLog {
                 _ => inner.place_unread(time.clock, time.us, now)?,
             };
             *time = time.at(placed);
+        }
+        if let Some(indication) = late_transmit {
+            let placed = inner.place_unread(indication.clock, u64::from(indication.vci_us), now)?;
+            vci.tx_done = Some(
+                exchange::VciTime::new(u64::from(indication.vci_us), indication.clock).at(placed),
+            )
+            .into_iter()
+            .chain(vci.tx_done)
+            .reduce(exchange::VciTime::prefer);
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
         }
         let mut pendings = kept.pendings.clone();
         let mut placed_all: Vec<Option<clocks::Placed>> = kept
@@ -4403,6 +4442,7 @@ mod tests {
             },
             vci_ended: false,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         // A response within P2: the job gave up on an exchange that ended in time.
         let (seq, entry) = settled(response(500_000));
@@ -4437,6 +4477,7 @@ mod tests {
             },
             vci_ended: true,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         let (_, entry) = settled(timeout);
         let entry = entry.unwrap();
@@ -4452,6 +4493,7 @@ mod tests {
             vci: exchange::VciTimes::default(),
             vci_ended: false,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         let (_, entry) = settled(lost);
         assert_eq!(entry.unwrap()["classification"], "undetermined");
@@ -4479,6 +4521,7 @@ mod tests {
             },
             vci_ended: false,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         let (_, entry) = settled(pending_then_error);
         let entry = entry.unwrap();
@@ -4501,6 +4544,7 @@ mod tests {
             vci: exchange::VciTimes::default(),
             vci_ended: false,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         let (_, entry) = settled(faulted.clone());
         assert_eq!(entry.unwrap()["classification"], "undetermined");
@@ -4515,12 +4559,81 @@ mod tests {
             vci: exchange::VciTimes::default(),
             vci_ended: false,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         let (_, entry) = settled(cancelled);
         let entry = entry.unwrap();
         assert_eq!(entry["cancelled_by_agent"], true, "{entry}");
         assert!(entry.get("outcome").is_none(), "{entry}");
         assert_eq!(entry["classification"], "undetermined", "{entry}");
+    }
+
+    /// Design 8.11 `primitive_ended`: a transmit or start-of-message indication of no primitive
+    /// read at job end is the exchange's, as during it, when no other exchange could own it.
+    #[test]
+    fn indications_read_at_job_end_settle_with_the_primitive_s_end() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        // No transmit indication during the exchange: `sent` `unknown`.
+        let mut waited = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::VciDidNotEnd,
+        );
+        waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.times.agent.before_us = 10_000;
+        waited.times.agent.end_us = 9_000_000;
+        let seq = log.exchange_with(waited, Vec::new()).unwrap();
+        let transmit = UnattachedItem {
+            vci_us: 10_500,
+            ..tx_done(0x7E0)
+        };
+        let start = UnattachedItem {
+            vci_us: 600_000,
+            ..start_of_message(0x7E8)
+        };
+        let ended = PrimitiveEnded {
+            end: Some(exchange::End::NoResponse),
+            detail: exchange::Detail::default(),
+            pending: Vec::new(),
+            vci: exchange::VciTimes {
+                rx_timeout: Some(device(1_700_000)),
+                error: Some(device(1_700_000)),
+                ..exchange::VciTimes::default()
+            },
+            vci_ended: true,
+            link_errors: Vec::new(),
+            indications: vec![transmit, start],
+        };
+        log.primitive_ended(seq, ended).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let exchange = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .unwrap();
+        assert_eq!(exchange["sent"], "unknown", "{exchange}");
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .unwrap();
+        assert_eq!(entry["sent"], "confirmed", "{entry}");
+        assert_eq!(entry["sent_evidence"], "tx_indication", "{entry}");
+        assert_eq!(entry["outcome"]["result"], "response_incomplete", "{entry}");
     }
 
     /// No `primitive_ended` entry for an exchange the log keeps nothing of.
@@ -4537,6 +4650,7 @@ mod tests {
             vci: exchange::VciTimes::default(),
             vci_ended: false,
             link_errors: Vec::new(),
+            indications: Vec::new(),
         };
         assert_eq!(log.primitive_ended(42, ended), None);
         log.end("ok");

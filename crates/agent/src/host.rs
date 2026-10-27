@@ -510,10 +510,19 @@ impl<C: WorkerApi> WorkerHost<C> {
                                     notification.event_data,
                                     Some(event_notification::EventData::Lost(_))
                                 );
+                                // An indication of no primitive may be the exchange's
+                                // (`Progress::on_event` keeps it as unbound).
                                 let ours = matches!(
                                     &notification.event_data,
                                     Some(event_notification::EventData::Item(item))
-                                        if item.cop_handle == Some(cop) || ends_primitive(item, cop)
+                                        if item.cop_handle == Some(cop)
+                                            || ends_primitive(item, cop)
+                                            || (item.cop_handle.is_none()
+                                                && matches!(
+                                                    &item.data,
+                                                    Some(event_item::Data::ResultData(result))
+                                                        if is_indication(result)
+                                                ))
                                 );
                                 if (lost || ours)
                                     && let Some(result) =
@@ -580,6 +589,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 vci: VciTimes::default(),
                 vci_ended: false,
                 link_errors: Vec::new(),
+                indications: unattached_items(&progress.unbound),
             },
             JobEndEnd::Ended(result) => {
                 let (end, detail) = sent_end(
@@ -632,6 +642,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     vci,
                     vci_ended: progress.rx_timeout.is_some(),
                     link_errors,
+                    indications: unattached_items(&progress.unbound),
                 }
             }
             JobEndEnd::Cancelled => crate::comm_log::PrimitiveEnded {
@@ -641,6 +652,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 vci: VciTimes::default(),
                 vci_ended: false,
                 link_errors: Vec::new(),
+                indications: unattached_items(&progress.unbound),
             },
         };
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

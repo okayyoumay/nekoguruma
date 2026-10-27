@@ -1382,6 +1382,18 @@ impl LinkState {
         self.kept.get(&seq)
     }
 
+    /// [`LinkState::may_own_tx_indication`], leaving out one exchange whose `sent` was `sent`.
+    pub(crate) fn may_own_tx_indication_besides(&self, sent: Sent) -> bool {
+        self.unknown_sends > u32::from(sent == Sent::Unknown)
+    }
+
+    /// [`LinkState::may_own_start_indication`], leaving out the owed exchange `seq`.
+    pub(crate) fn may_own_start_indication_besides(&self, rx_id: u32, seq: u64) -> bool {
+        self.owed
+            .iter()
+            .any(|owed| owed.rx_id == rx_id && owed.seq != seq)
+    }
+
     /// Drops what is kept of exchange `seq`, which nothing will settle.
     pub(crate) fn release_kept(&mut self, seq: u64) {
         self.kept.remove(&seq);

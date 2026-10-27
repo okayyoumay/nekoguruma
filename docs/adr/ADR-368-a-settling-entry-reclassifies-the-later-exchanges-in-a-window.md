@@ -1,7 +1,7 @@
 # ADR-368: A Settling Entry Reclassifies the Later Exchanges in a Window
 
 **Date:** 2026-10-27
-**Status:** Accepted
+**Status:** Accepted (Consequences' open late acceptance of a reset closed by ADR-369)
 **Affects:** `agent` communication log (`comm_log.rs` `exchange_with`, `late_response_owner`,
 `LateOwner`, `Inner::late_response`, `Inner::late_response_unowned`, `CommLog::primitive_ended`,
 `LateResponseEntry`, `PrimitiveEndedEntry`; `comm_log/exchange.rs` `LinkState::log`,

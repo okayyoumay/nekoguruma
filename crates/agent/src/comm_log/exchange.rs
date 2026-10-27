@@ -382,7 +382,8 @@ pub(crate) struct VciTimes {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<VciTime>,
     /// The reading of the VCI's clock the host took when the agent's deadline passed
-    /// (`vci_did_not_end`, design 8.11 "Settlement"), with its round trip.
+    /// (`vci_did_not_end`, design 8.11 "Settlement"), with the time from the deadline to the
+    /// read's answer.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub deadline: Option<ClockReading>,
     /// The VCI's receive timeout that ended the exchange, which `timing` judges; `error` gives
@@ -396,8 +397,8 @@ pub(crate) struct VciTimes {
 }
 
 /// A reading of the VCI's clock (`GetTimestamp`): the time, with the clock the worker says it is
-/// on (ADR-353), and the agent's monotonic time from the request to the answer, which bounds
-/// when the clock was read.
+/// on (ADR-353), and the agent's monotonic time from the agent's deadline to the answer, which
+/// bounds when after the deadline the clock was read.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub(crate) struct ClockReading {
     #[serde(flatten)]
@@ -1023,6 +1024,8 @@ pub(crate) struct Evidence {
     /// primitive. An exchange the agent's own deadline ended did not (design 8.11
     /// `vci_did_not_end`).
     pub vci_ended: bool,
+    /// A start-of-message indication bound to the exchange's primitive was read.
+    pub bound_start: bool,
     /// For an exchange the agent's deadline ended, how far the VCI's device clock, read at that
     /// deadline, was past the VCI's own limits with no response under way
     /// (`timing::past_vci_limits`); `None` when that is not shown.
@@ -1091,6 +1094,7 @@ impl Evidence {
             transmit_evidence: None,
             response_started: false,
             vci_ended: false,
+            bound_start: false,
             vci_limits_past_by_us: None,
             flow_control: false,
             link_errors: Vec::new(),
@@ -1882,7 +1886,7 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             (
                 System,
                 format!(
-                    "The VCI did not end the exchange within its own timing: its clock, read when the agent stopped waiting, was {:.1} ms past the limit in force, the margin and the longest single-frame transfer, and no response had started.",
+                    "The VCI did not end the exchange within its own timing: its clock, read when the agent stopped waiting, was {:.1} ms past the latest limit in force, the margin and the longest single-frame transfer, and no final response had started.",
                     evidence.vci_limits_past_by_us.unwrap_or_default() as f64 / 1000.0
                 ),
             )
@@ -2777,7 +2781,7 @@ mod tests {
         let verdict = verdict(&past);
         assert_eq!(verdict.classification, Classification::System);
         assert!(
-            verdict.reason.contains("12.5 ms past the limit"),
+            verdict.reason.contains("12.5 ms past the latest limit"),
             "{}",
             verdict.reason
         );

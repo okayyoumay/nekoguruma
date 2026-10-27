@@ -55,7 +55,8 @@ the exchanges the VCI ended.
      owed request its own answer could belong to.
    - A transmit or start-of-message indication of no primitive read at job end is the
      exchange's when no other exchange on the link could own it, as during the exchange: it
-     confirms the send, or shows the response began.
+     confirms the send, or shows the response began. The latest start is the response's start
+     time when the response spans frames and no pending came after it, as for an exchange.
    - A receive timeout after a response began gives `response_incomplete`, as for an
      exchange.
    - The entry carries `refers_to`, `link`, `sent`, `sent_evidence`, `outcome`, `answers`,
@@ -72,7 +73,8 @@ the exchanges the VCI ended.
    - The `vci_did_not_end` entry's `system` row rests on the VCI's own clock past its limits
      with no response under way. An end that shows no response under way at that reading (a
      link error, a lost VCI, a timeout) does not refute it, so `system` stands; a final response
-     is `system` anyway.
+     is `system` anyway. A start-of-message read at job end from at or before that reading, or
+     one whose order with it is unknown, refutes it, and the end takes its own row.
 5. **The agent's cancel settles nothing.** The entry has `cancelled_by_agent` true and no
    `outcome` or `timing`. The exchange keeps its classification.
 

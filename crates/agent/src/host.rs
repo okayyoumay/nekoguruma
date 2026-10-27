@@ -505,10 +505,19 @@ impl<C: WorkerApi> WorkerHost<C> {
                     loop {
                         match events.message().await {
                             Ok(Some(notification)) => {
-                                if let Some(event_notification::EventData::Item(item)) =
-                                    notification.event_data
-                                    && (item.cop_handle == Some(cop) || ends_primitive(&item, cop))
-                                    && let Some(result) = progress.on_event(item, cop)
+                                // A lost-events notice ends the wait as it does an exchange's.
+                                let lost = matches!(
+                                    notification.event_data,
+                                    Some(event_notification::EventData::Lost(_))
+                                );
+                                let ours = matches!(
+                                    &notification.event_data,
+                                    Some(event_notification::EventData::Item(item))
+                                        if item.cop_handle == Some(cop) || ends_primitive(item, cop)
+                                );
+                                if (lost || ours)
+                                    && let Some(result) =
+                                        progress.on_notification(notification.event_data, cop)
                                 {
                                     return Some(Some(result));
                                 }
@@ -522,6 +531,10 @@ impl<C: WorkerApi> WorkerHost<C> {
             })
         };
         match &ended {
+            // Lost events leave the primitive's end unknown, and it may still run.
+            Some(Some(result @ Err(HostError::EventsLost))) => {
+                self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(result));
+            }
             Some(Some(result)) => {
                 self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(result));
                 return;
@@ -566,6 +579,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 pending: Vec::new(),
                 vci: VciTimes::default(),
                 vci_ended: false,
+                link_errors: Vec::new(),
             },
             JobEndEnd::Ended(result) => {
                 let (end, detail) = sent_end(
@@ -601,12 +615,23 @@ impl<C: WorkerApi> WorkerHost<C> {
                         since_previous_ms: None,
                     })
                     .collect();
+                // Every link error read at job end beside the one that ended it, so the
+                // classification takes the most severe (design 8.11 "Link error").
+                let read_late = progress
+                    .errors
+                    .get(stray.errors.len()..)
+                    .unwrap_or_default();
+                let link_errors = also_seen(result, read_late)
+                    .iter()
+                    .map(|seen| link_error_kind(seen.event))
+                    .collect();
                 crate::comm_log::PrimitiveEnded {
                     end: Some(end),
                     detail,
                     pending,
                     vci,
                     vci_ended: progress.rx_timeout.is_some(),
+                    link_errors,
                 }
             }
             JobEndEnd::Cancelled => crate::comm_log::PrimitiveEnded {
@@ -615,6 +640,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 pending: Vec::new(),
                 vci: VciTimes::default(),
                 vci_ended: false,
+                link_errors: Vec::new(),
             },
         };
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {

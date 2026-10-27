@@ -483,6 +483,8 @@ pub(crate) struct PrimitiveEnded {
     pub vci: exchange::VciTimes,
     /// The VCI ended it with a receive timeout.
     pub vci_ended: bool,
+    /// The link errors it reported at job end beside its end.
+    pub link_errors: Vec<exchange::LinkErrorKind>,
 }
 
 /// A `primitive_ended` settling entry (design 8.11 "Settlement", ADR-366): the primitive's end,
@@ -1600,6 +1602,7 @@ impl CommLog {
         evidence.end = end;
         evidence.detail = ended.detail;
         evidence.vci_ended = ended.vci_ended;
+        evidence.link_errors.extend(ended.link_errors);
         evidence.vci_limits_past_by_us = None;
         // A response that began and did not complete, as an exchange's end gives it.
         if evidence.vci_ended
@@ -4399,6 +4402,7 @@ mod tests {
                 ..exchange::VciTimes::default()
             },
             vci_ended: false,
+            link_errors: Vec::new(),
         };
         // A response within P2: the job gave up on an exchange that ended in time.
         let (seq, entry) = settled(response(500_000));
@@ -4432,6 +4436,7 @@ mod tests {
                 ..exchange::VciTimes::default()
             },
             vci_ended: true,
+            link_errors: Vec::new(),
         };
         let (_, entry) = settled(timeout);
         let entry = entry.unwrap();
@@ -4446,6 +4451,7 @@ mod tests {
             pending: Vec::new(),
             vci: exchange::VciTimes::default(),
             vci_ended: false,
+            link_errors: Vec::new(),
         };
         let (_, entry) = settled(lost);
         assert_eq!(entry.unwrap()["classification"], "undetermined");
@@ -4472,6 +4478,7 @@ mod tests {
                 ..exchange::VciTimes::default()
             },
             vci_ended: false,
+            link_errors: Vec::new(),
         };
         let (_, entry) = settled(pending_then_error);
         let entry = entry.unwrap();
@@ -4486,6 +4493,20 @@ mod tests {
             entry["pending"][0]["since_previous_ms"].is_number(),
             "{entry}"
         );
+        // A VCI fault reported at job end beside the end: the most severe takes it.
+        let mut faulted = PrimitiveEnded {
+            end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+            detail: exchange::Detail::default(),
+            pending: Vec::new(),
+            vci: exchange::VciTimes::default(),
+            vci_ended: false,
+            link_errors: Vec::new(),
+        };
+        let (_, entry) = settled(faulted.clone());
+        assert_eq!(entry.unwrap()["classification"], "undetermined");
+        faulted.link_errors = vec![exchange::LinkErrorKind::VciHardwareFault];
+        let (_, entry) = settled(faulted);
+        assert_eq!(entry.unwrap()["classification"], "system");
         // The agent's cancel settles nothing: the exchange keeps its classification.
         let cancelled = PrimitiveEnded {
             end: None,
@@ -4493,6 +4514,7 @@ mod tests {
             pending: Vec::new(),
             vci: exchange::VciTimes::default(),
             vci_ended: false,
+            link_errors: Vec::new(),
         };
         let (_, entry) = settled(cancelled);
         let entry = entry.unwrap();
@@ -4514,6 +4536,7 @@ mod tests {
             pending: Vec::new(),
             vci: exchange::VciTimes::default(),
             vci_ended: false,
+            link_errors: Vec::new(),
         };
         assert_eq!(log.primitive_ended(42, ended), None);
         log.end("ok");

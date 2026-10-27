@@ -15040,10 +15040,12 @@ def main():
     async fn a_primitive_that_ends_at_job_end_is_logged_as_primitive_ended() {
         // A response after the deadline, one read before it with its finished status after it,
         // and none (the agent cancels the primitive).
-        for (on_start, cancelled) in [
+        // Lost events at job end leave the end unknown, and the primitive is cancelled too.
+        for (on_start, cancelled, result) in [
             (
                 Some((Duration::from_millis(150), StartEvent::Respond)),
                 false,
+                Some("positive"),
             ),
             (
                 Some((
@@ -15051,11 +15053,17 @@ def main():
                     StartEvent::RespondThenFinishLater,
                 )),
                 false,
+                Some("positive"),
             ),
-            (None, true),
+            (
+                Some((Duration::from_millis(150), StartEvent::Lose)),
+                false,
+                Some("unknown"),
+            ),
+            (None, true, None),
         ] {
             let dir = journal_dir("primitive-ended");
-            let (mut client, _fake) = fake_worker_starting_with(CancelAnswer::Done, on_start).await;
+            let (mut client, fake) = fake_worker_starting_with(CancelAnswer::Done, on_start).await;
             let log =
                 crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
             let config = LinkConfig::iso15765(0x7E0, 0x7E8);
@@ -15096,9 +15104,12 @@ def main():
                 "{ended}"
             );
             assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
-            if !cancelled {
-                assert_eq!(ended["outcome"]["result"], "positive", "{ended}");
+            if let Some(result) = result {
+                assert_eq!(ended["outcome"]["result"], result, "{ended}");
                 assert_eq!(ended["classification"], "system", "{ended}");
+            }
+            if result == Some("unknown") {
+                assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
             }
             std::fs::remove_dir_all(&dir).unwrap();
         }

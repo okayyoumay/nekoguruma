@@ -38,8 +38,10 @@ the exchanges the VCI ended.
    for that answer that starts from what the wait had read. The first end it reaches is the
    primitive's end: a response, a receive timeout, a failure, a lost VCI or the finished
    status. The end, with its VCI times and the pendings it passed on, goes to
-   `CommLog::primitive_ended`. An event stream that fails or ends gives the `unknown` end
-   (`events_ended`). When the job-end wait passes, or an earlier cancel failed, the host
+   `CommLog::primitive_ended`, with every link error read at job end beside the one that
+   ended it, so the classification takes the most severe. A lost-events notice gives the
+   `unknown` end (`events_lost`), and the primitive, which may still run, is then cancelled;
+   an event stream that fails or ends gives the `unknown` end (`events_ended`). When the job-end wait passes, or an earlier cancel failed, the host
    cancels the primitive and records the agent's cancel only when the cancel succeeds; a
    handle the worker no longer knows, or a cancel that fails, leaves the end unknown and writes
    nothing.

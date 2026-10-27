@@ -1504,6 +1504,10 @@ impl CommLog {
             })?;
         }
         let history = inner.links[at].1.history_for(&evidence);
+        let rx_id = evidence.rx_id;
+        let start_unattached = unbound
+            .iter()
+            .any(|item| item.is_start_indication_for(rx_id));
         let kept = exchange::Kept {
             evidence: evidence.clone(),
             origin: evidence.origin,
@@ -1516,6 +1520,7 @@ impl CommLog {
                 .map(|(pendings, _)| pendings.clone())
                 .unwrap_or_default(),
             limits: judged_from.map(|(_, limits)| limits),
+            start_unattached,
         };
         let entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
@@ -1748,15 +1753,16 @@ impl CommLog {
                     .reduce(exchange::VciTime::prefer);
             }
         }
-        let transmit = kept
-            .transmit
-            .or_else(|| vci.tx_done.and_then(|time| time.placed()));
+        // The transmit done the response's item carries, on its clock, over the indication's
+        // the exchange had attached, as for an exchange (`VciTime::prefer`).
+        let transmit = vci.tx_done.and_then(|time| time.placed()).or(kept.transmit);
         exchange::pending_intervals(&mut evidence.pending, &placed_all, transmit);
         if let Some(limits) = kept.limits {
             // A start with the response's identifier that another exchange could own still
             // means this response may have begun, as for an exchange.
             let response_may_have_begun = evidence.response_started
                 || !limits.start_indications
+                || kept.start_unattached
                 || ended
                     .indications
                     .iter()
@@ -4991,6 +4997,33 @@ mod tests {
         assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
         assert_ne!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
         assert_ne!(entry["classification"], "system", "{entry}");
+        // So does one read during the exchange, which the exchange kept unattached.
+        let entry = settled(
+            true,
+            true,
+            vec![start(600_000)],
+            timeout(10_500 + 1_000_000, Vec::new()),
+        );
+        assert_ne!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert_ne!(entry["classification"], "system", "{entry}");
+        // The transmit done the response carries is the transmit, over the indication the
+        // exchange had attached: 994.5 ms from it is within P2, 1004.5 ms from the indication
+        // would not be.
+        let response = PrimitiveEnded {
+            end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
+            detail: exchange::Detail::default(),
+            pending: Vec::new(),
+            vci: exchange::VciTimes {
+                tx_done: Some(device(20_500)),
+                rx_end: Some(device(1_015_000)),
+                ..exchange::VciTimes::default()
+            },
+            vci_ended: false,
+            link_errors: Vec::new(),
+            indications: Vec::new(),
+        };
+        let entry = settled(false, true, Vec::new(), response);
+        assert_eq!(entry["timing"]["window"], "within_p2", "{entry}");
     }
 
     /// No `primitive_ended` entry for an exchange the log keeps nothing of.

@@ -1274,6 +1274,9 @@ pub(crate) struct Kept {
     pub pendings: Vec<super::timing::At>,
     /// The link's limits, when `link_opened` recorded them.
     pub limits: Option<super::timing::Limits>,
+    /// A start-of-message with the response's identifier was read during the exchange and not
+    /// attached (another exchange could own it): the response may have begun.
+    pub start_unattached: bool,
 }
 
 /// The evidence of one link that later exchanges on it use (design 8.11 "Matched answer",
@@ -3012,6 +3015,7 @@ mod tests {
             transmit: None,
             pendings: Vec::new(),
             limits: None,
+            start_unattached: false,
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response);
@@ -3101,6 +3105,7 @@ mod tests {
                 transmit: None,
                 pendings: Vec::new(),
                 limits: None,
+                start_unattached: false,
             },
         );
         assert!(state.settle_owed(1).is_some());

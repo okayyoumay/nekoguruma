@@ -60,11 +60,14 @@ the exchanges the VCI ended.
    - A transmit or start-of-message indication of no primitive read at job end is the
      exchange's when no other exchange on the link could own it, as during the exchange: it
      confirms the send, or shows the response began. A transmit done the response's own item
-     carries confirms the send when no indication did. The latest start (one read at job end,
-     else the one the exchange had attached) is the response's start time when the response
-     spans frames and no pending, kept or new, came after it, as for an exchange. A start with
-     the response's identifier that another exchange could own still means the response may
-     have begun, as it does when judging an exchange's timing.
+     carries confirms the send when no indication did, and, on its clock, is the transmit the
+     timing is judged from, over the indication the exchange had attached. The latest start
+     (one read at job end, else the one the exchange had attached) is the response's start
+     time when the response spans frames and no pending, kept or new, came after it, as for
+     an exchange. A start with the response's identifier that another exchange could own, read
+     during the exchange or at job end, still means the response may have begun, as it does
+     when judging an exchange's timing; the log keeps that the exchange read one
+     (`Kept::start_unattached`).
    - A receive timeout after a response began gives `response_incomplete`, as for an
      exchange.
    - The entry carries `refers_to`, `link`, `sent`, `sent_evidence`, `outcome`, `answers`,

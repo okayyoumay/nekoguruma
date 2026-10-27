@@ -33,7 +33,7 @@ const EVENT: &str = "exchange";
 const SID_SESSION_CONTROL: u8 = 0x10;
 const SID_ECU_RESET: u8 = 0x11;
 const SID_NEGATIVE: u8 = 0x7F;
-const NRC_PENDING: u8 = 0x78;
+pub(crate) const NRC_PENDING: u8 = 0x78;
 
 /// Who sent the request (design 8.11, `origin`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -984,7 +984,7 @@ impl Expected {
     }
 
     /// Whether `answer` could be a response the worker would accept for this request.
-    fn matches(&self, answer: &[u8]) -> bool {
+    pub(crate) fn matches(&self, answer: &[u8]) -> bool {
         let starts = |pattern: &[u8]| !pattern.is_empty() && answer.starts_with(pattern);
         starts(&self.positive_prefix) || starts(&self.negative_pattern)
     }
@@ -1259,6 +1259,23 @@ fn restarts_ecu(request: &[u8]) -> bool {
     matches!(request, [SID_SESSION_CONTROL, ..] | [SID_ECU_RESET, ..])
 }
 
+/// What the log keeps of an owed exchange so a settling entry can classify it again (design
+/// 8.11 "Settlement", ADR-365): its evidence, its entry's origin, request and classification,
+/// and the VCI times and limits its timing was judged from.
+#[derive(Debug, Clone)]
+pub(crate) struct Kept {
+    pub evidence: Evidence,
+    pub origin: Origin,
+    pub request: Request,
+    pub classification: Classification,
+    /// The entry's `sent`.
+    pub sent: Sent,
+    pub transmit: super::timing::At,
+    pub pendings: Vec<super::timing::At>,
+    /// The link's limits, when `link_opened` recorded them.
+    pub limits: Option<super::timing::Limits>,
+}
+
 /// The evidence of one link that later exchanges on it use (design 8.11 "Matched answer",
 /// "Owed request"). A link that is opened again, a worker restart or a VCI reconnect starts the
 /// matched answers over ([`LinkState::reopened`]) and keeps the owed requests, since a response
@@ -1275,6 +1292,8 @@ pub(crate) struct LinkState {
     /// How many logged exchanges on the link ended with `sent` `unknown`: each could still own a
     /// transmit indication that comes late (design 8.11 `sent_evidence`).
     unknown_sends: u32,
+    /// What is kept of each owed exchange, by `seq` ([`LinkState::keep`]).
+    kept: HashMap<u64, Kept>,
 }
 
 impl LinkState {
@@ -1338,6 +1357,43 @@ impl LinkState {
         self.owed.iter().any(|owed| owed.rx_id == rx_id)
     }
 
+    /// The owed requests a response `response` with response identifier `rx_id` could belong
+    /// to (design 8.11 "Owed request", `late_response`), by `seq`; with no identifier, every
+    /// owed request it matches.
+    pub(crate) fn late_response_owners(&self, rx_id: Option<u32>, response: &[u8]) -> Vec<u64> {
+        self.owed
+            .iter()
+            .filter(|owed| {
+                rx_id.is_none_or(|id| id == owed.rx_id) && owed.expected.matches(response)
+            })
+            .map(|owed| owed.seq)
+            .collect()
+    }
+
+    /// Keeps what a settling entry needs of exchange `seq`, while it is owed.
+    pub(crate) fn keep(&mut self, seq: u64, kept: Kept) {
+        if self.owed.iter().any(|owed| owed.seq == seq) {
+            self.kept.insert(seq, kept);
+        }
+    }
+
+    /// What is kept of owed exchange `seq`.
+    pub(crate) fn kept(&self, seq: u64) -> Option<&Kept> {
+        self.kept.get(&seq)
+    }
+
+    /// Exchange `seq` got its final response: it is owed no more, and what was kept of it is
+    /// given back.
+    pub(crate) fn settle_owed(&mut self, seq: u64) -> Option<Kept> {
+        self.owed.retain(|owed| owed.seq != seq);
+        let kept = self.kept.remove(&seq)?;
+        // The answer confirms its send: it can own a late transmit indication no more.
+        if kept.sent == Sent::Unknown {
+            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+        }
+        Some(kept)
+    }
+
     /// A link error came on the physical channel this link shares, logged as line `seq` (design
     /// 8.11 "Link error", "Matched answer"): the matched answers and the count since the error
     /// end, the owed requests stay. The log calls it on every target's state on that channel,
@@ -1395,6 +1451,9 @@ impl LinkState {
                 None => self.owed.clear(),
                 Some(&earliest) => self.owed.retain(|owed| owed.seq >= earliest),
             }
+            let owed = &self.owed;
+            self.kept
+                .retain(|seq, _| owed.iter().any(|owed| owed.seq == *seq));
             self.matched.clear();
             self.last_reset = Some(entry.seq);
         } else if unsure_restart {
@@ -1437,6 +1496,19 @@ pub(crate) struct Request {
     pub service: Option<&'static str>,
     pub bytes: LoggedMessage,
     pub suppressed: bool,
+}
+
+impl Request {
+    /// The `request` group of the exchange `evidence` gives.
+    pub(crate) fn of(evidence: &Evidence) -> Self {
+        let sid = evidence.sid();
+        Self {
+            sid: sid.map(|sid| format!("{sid:#04x}")),
+            service: sid.and_then(service_name),
+            bytes: redact(Direction::Request, &evidence.request),
+            suppressed: evidence.suppressed,
+        }
+    }
 }
 
 /// What [`classify`] gives: the classification with its reason, and the entry's text.
@@ -1526,6 +1598,7 @@ impl ExchangeEntry {
                 && evidence.channel_link_errors.is_empty()
                 && evidence.final_response().is_some(),
         };
+        let request = Request::of(&evidence);
         Self {
             event: EVENT,
             seq,
@@ -1533,12 +1606,7 @@ impl ExchangeEntry {
             link: evidence.link,
             origin: evidence.origin,
             at: evidence.at,
-            request: Request {
-                sid: sid.map(|sid| format!("{sid:#04x}")),
-                service: sid.and_then(service_name),
-                bytes: redact(Direction::Request, &evidence.request),
-                suppressed: evidence.suppressed,
-            },
+            request,
             sent,
             sent_evidence,
             caused_by: evidence.caused_by,
@@ -1737,6 +1805,89 @@ pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
         reason,
         text: text(evidence, history),
     }
+}
+
+impl Kept {
+    /// The exchange's evidence with `response` as its end, judged by the rows that do not turn
+    /// on timing: its window is taken as within the limit.
+    pub(crate) fn answered(&self, response: &[u8]) -> Evidence {
+        let mut answered = self.evidence.clone();
+        let negative = &self.evidence.expected.negative_pattern;
+        answered.end = if !negative.is_empty() && response.starts_with(negative) {
+            End::Negative(response.to_vec())
+        } else {
+            End::Positive(response.to_vec())
+        };
+        answered.timing.window = Window::WithinP2;
+        answered.timing.window_by_ms = None;
+        answered.timing.not_judged_reason = None;
+        answered.timing.late_pending = None;
+        answered.vci_limits_past_by_us = None;
+        answered
+    }
+}
+
+/// The classification and reason a `late_response` gives the exchange it settles (design 8.11
+/// "Settlement", ADR-365): the response, which came after the VCI ended that exchange, judged
+/// by `window` against its limit in force. `answered` is [`Kept::answered`], and `history` the
+/// link's history for it as of the settling entry.
+pub(crate) fn settle_late_response(
+    kept: &Kept,
+    answered: &Evidence,
+    window: super::timing::LateWindow,
+    history: &LinkHistory,
+) -> (Classification, String) {
+    use super::timing::LateWindow;
+    use Classification::{System, Undetermined, Vehicle};
+    let base = classify(answered, history);
+    let (classification, mut reason) = match window {
+        LateWindow::InTime { at_us } => (
+            System,
+            format!(
+                "The ECU's response came {:.1} ms after the transmit, within the limit in force less the margin, and was delivered after the exchange had ended: the system missed a response that came in time.",
+                at_us as f64 / 1000.0
+            ),
+        ),
+        LateWindow::Late { by_us } => {
+            let late = format!(
+                "The ECU responded at least {:.1} ms after the limit in force.",
+                by_us as f64 / 1000.0
+            );
+            if base.classification >= Undetermined {
+                (base.classification, format!("{late} {}", base.reason))
+            } else if kept.evidence.timing.window == Window::TimeoutAtLimit {
+                (
+                    Vehicle,
+                    format!("{late} The VCI had ended its wait at the limit."),
+                )
+            } else {
+                // The VCI's timeout was not judged at the limit (on a link without
+                // start-of-message indications it is not judged at all): it may have ended its
+                // wait early, before the response began.
+                (
+                    Undetermined,
+                    format!(
+                        "{late} Whether the VCI ended its wait at the limit, or before, is not shown."
+                    ),
+                )
+            }
+        }
+        LateWindow::Open => (
+            base.classification.max(Undetermined),
+            format!(
+                "A response was delivered after the exchange ended, and its time does not show whether the ECU answered within the limit in force. With it as the exchange's response: {}",
+                base.reason
+            ),
+        ),
+    };
+    // A fault of the system the exchange's entry observed stands (design 8.11 "Settlement").
+    if kept.classification == System && classification != System {
+        reason.push_str(
+            " The exchange's own entry had observed a fault of the system, which stands.",
+        );
+        return (System, reason);
+    }
+    (classification, reason)
 }
 
 fn severity_word(classification: Classification) -> &'static str {
@@ -2771,6 +2922,93 @@ mod tests {
         assert_eq!(entry.classification, Classification::Undetermined);
         assert_eq!(entry.sent, Sent::Unknown);
         assert!(entry.reason.contains("detail is not available"));
+    }
+
+    #[test]
+    fn a_late_response_settles_by_its_window() {
+        use super::super::timing::LateWindow;
+        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        silent.vci_ended = true;
+        silent.timing.window = Window::TimeoutAtLimit;
+        let kept = |classification| Kept {
+            evidence: silent.clone(),
+            origin: silent.origin,
+            request: Request::of(&silent),
+            classification,
+            sent: Sent::Confirmed,
+            transmit: None,
+            pendings: Vec::new(),
+            limits: None,
+        };
+        let settle = |kept: &Kept, response: &[u8], window| {
+            let answered = kept.answered(response);
+            settle_late_response(kept, &answered, window, &LinkHistory::empty())
+        };
+        let positive = [0x62, 0xF1, 0x86, 0x01];
+        let vehicle = kept(Classification::Vehicle);
+        assert_eq!(
+            settle(&vehicle, &positive, LateWindow::InTime { at_us: 40_000 }).0,
+            Classification::System
+        );
+        let (class, reason) = settle(&vehicle, &positive, LateWindow::Late { by_us: 12_500 });
+        assert_eq!(class, Classification::Vehicle);
+        assert!(reason.contains("12.5 ms after the limit"), "{reason}");
+        assert_eq!(
+            settle(&vehicle, &positive, LateWindow::Open).0,
+            Classification::Undetermined
+        );
+        // Late after a timeout that was not judged at the limit: the VCI may have ended its
+        // wait early.
+        let mut unjudged = vehicle.clone();
+        unjudged.evidence.timing.window = Window::NotJudged;
+        assert_eq!(
+            settle(&unjudged, &positive, LateWindow::Late { by_us: 1 }).0,
+            Classification::Undetermined
+        );
+        // Late, but its outcome's own row is not `vehicle`: an invalid key stays undetermined.
+        assert_eq!(
+            settle(&vehicle, &[0x7F, 0x22, 0x35], LateWindow::Late { by_us: 1 }).0,
+            Classification::Undetermined
+        );
+        // A fault of the system the entry observed stands.
+        let (class, reason) = settle(
+            &kept(Classification::System),
+            &positive,
+            LateWindow::Late { by_us: 1 },
+        );
+        assert_eq!(class, Classification::System);
+        assert!(reason.contains("stands"), "{reason}");
+    }
+
+    #[test]
+    fn a_settled_send_owns_no_late_transmit_indication() {
+        // A request with no transmit evidence and no answer: `sent` `unknown`, owed.
+        let mut state = LinkState::default();
+        let silent = evidence(&READ_F186, End::NoResponse);
+        let entry = log(&mut state, 1, silent.clone());
+        assert_eq!(entry.sent, Sent::Unknown);
+        assert!(state.may_own_tx_indication());
+        state.keep(
+            1,
+            Kept {
+                evidence: silent.clone(),
+                origin: silent.origin,
+                request: Request::of(&silent),
+                classification: entry.classification,
+                sent: entry.sent,
+                transmit: None,
+                pendings: Vec::new(),
+                limits: None,
+            },
+        );
+        assert!(state.settle_owed(1).is_some());
+        assert!(!state.may_own_tx_indication());
+        assert!(
+            state
+                .late_response_owners(None, &[0x62, 0xF1, 0x86])
+                .is_empty()
+        );
     }
 
     #[test]

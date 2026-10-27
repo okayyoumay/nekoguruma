@@ -199,6 +199,76 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
     timing
 }
 
+/// How a response the worker delivered after its exchange ended stands against that exchange's
+/// limit in force (design 8.11 `late_response`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateWindow {
+    /// It ended, and so began, before the earliest limit less the margin, this long after the
+    /// transmit: the ECU answered in time and the system missed it.
+    InTime { at_us: i64 },
+    /// It began after the latest limit plus the margin, by at least this much: it came as one
+    /// frame, and its end less that frame's longest transfer is past that limit.
+    Late { by_us: i64 },
+    /// Neither is shown: its time is between, it may span frames, or it cannot be judged on one
+    /// clock with the transmit.
+    Open,
+}
+
+/// Judges a late response's time `at`, which is its end, of `len` bytes, against the limit in
+/// force of the exchange whose transmit was `transmit` and whose pendings were `pendings`.
+pub(crate) fn judge_late(
+    limits: Limits,
+    absorbing: bool,
+    transmit: At,
+    pendings: &[At],
+    at: At,
+    len: usize,
+) -> LateWindow {
+    let (Some((clock, transmit)), Some((own, at))) = (transmit, at) else {
+        return LateWindow::Open;
+    };
+    if own != clock || at.epoch != transmit.epoch {
+        return LateWindow::Open;
+    }
+    let Some(pendings) = pendings
+        .iter()
+        .map(|pending| {
+            let (own, pending) = (*pending)?;
+            (own == clock && pending.epoch == transmit.epoch)
+                .then_some(pending.unwrapped - transmit.unwrapped)
+        })
+        .collect::<Option<Vec<i64>>>()
+    else {
+        return LateWindow::Open;
+    };
+    let at = at.unwrapped - transmit.unwrapped;
+    // A final response comes after the transmit and after every pending of its exchange.
+    if at < 0 || pendings.iter().any(|&us| us < 0 || us > at) {
+        return LateWindow::Open;
+    }
+    let margin = to_i64(limits.margin_us);
+    let in_force = limit_in_force(
+        to_i64(limits.p2_us),
+        to_i64(limits.p2_star_us),
+        limits.completion_us.map(to_i64),
+        &pendings,
+        absorbing,
+    );
+    if at <= in_force.earliest - margin {
+        return LateWindow::InTime { at_us: at };
+    }
+    let transfer = limits
+        .single_frame
+        .filter(|frame| len <= frame.max_bytes)
+        .map(|frame| to_i64(frame.transfer_us));
+    match (transfer, in_force.latest) {
+        (Some(transfer), Some(latest)) if at - transfer > latest + margin => LateWindow::Late {
+            by_us: at - transfer - latest,
+        },
+        _ => LateWindow::Open,
+    }
+}
+
 /// How far the VCI's device clock, read at the agent's deadline, was past the VCI's own limits
 /// (design 8.11 `vci_did_not_end`): the reading less its round trip, from the transmit, past
 /// the latest limit in force plus the margin plus the longest transfer of a single-frame
@@ -620,6 +690,57 @@ mod tests {
             ..LIMITS
         };
         assert_eq!(judge(unbounded, true, times(&late)).late_pending, None);
+    }
+
+    #[test]
+    fn a_late_response_is_in_time_late_or_open() {
+        let late = |limits, absorbing, pendings: &[At], at_us, len| {
+            judge_late(limits, absorbing, transmit(), pendings, at(at_us), len)
+        };
+        // P2 50 ms, the margin 2 ms, one frame 320 µs.
+        assert_eq!(
+            late(LIMITS, false, &[], 48_000, 3),
+            LateWindow::InTime { at_us: 48_000 }
+        );
+        assert_eq!(late(LIMITS, false, &[], 48_001, 3), LateWindow::Open);
+        assert_eq!(late(LIMITS, false, &[], 52_320, 3), LateWindow::Open);
+        assert_eq!(
+            late(LIMITS, false, &[], 52_321, 3),
+            LateWindow::Late { by_us: 2_001 }
+        );
+        // A response that may span frames is never shown late by its end.
+        assert_eq!(late(LIMITS, false, &[], 9_000_000, 7), LateWindow::Open);
+        // After a pending, against the limit it sets.
+        assert_eq!(
+            late(LIMITS, false, &[at(10_000)], 4_000_000, 3),
+            LateWindow::InTime { at_us: 4_000_000 }
+        );
+        // On an absorbing link, in time only before the earliest limit and late only past the
+        // latest.
+        assert_eq!(
+            late(LIMITS, true, &[], 48_000, 3),
+            LateWindow::InTime { at_us: 48_000 }
+        );
+        assert_eq!(late(LIMITS, true, &[], 9_000_000, 3), LateWindow::Open);
+        assert_eq!(
+            late(LIMITS, true, &[], 25_052_321, 3),
+            LateWindow::Late { by_us: 2_001 }
+        );
+        // Not on one clock and epoch with the transmit, or before it.
+        assert_eq!(
+            judge_late(LIMITS, false, transmit(), &[], on(1, 5), 3),
+            LateWindow::Open
+        );
+        assert_eq!(
+            late(LIMITS, false, &[on(1, 5)], 9_000_000, 3),
+            LateWindow::Open
+        );
+        assert_eq!(late(LIMITS, false, &[], -1, 3), LateWindow::Open);
+        // Before a pending of the exchange: no final response of it.
+        assert_eq!(
+            late(LIMITS, false, &[at(30_000)], 20_000, 3),
+            LateWindow::Open
+        );
     }
 
     #[test]

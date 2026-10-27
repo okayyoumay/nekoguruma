@@ -455,7 +455,16 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   its readings unless a pending in the exchange or a matched answer excludes it; one the agent's
   own deadline ended is `vci_did_not_end`, since the response may still be arriving (design 8.11).
   The log writes no time for the start yet: its VCI time needs per-clock epochs (ADR-353), and
-  the agent's entry has no field for it. Every other item is an `unattached` event, written in
+  the agent's entry has no field for it. A received message that exactly one owed exchange the
+  VCI ended could own (by its response identifier and match), that the exchange in flight does
+  not also await and that is not a pending, is a `late_response` settling entry instead,
+  written in the same place: it refers to that exchange, which is owed no more, and classifies
+  it again by the response's end against that exchange's limit in force
+  (`comm_log::timing::judge_late`, `exchange::settle_late_response`, ADR-365). The log keeps
+  each owed exchange the VCI ended, with its evidence, limits and VCI times, for this
+  (`exchange::Kept`); a late response after a timeout not judged at the limit is at most
+  `undetermined`, since the VCI may have ended its wait early. Every other
+  item is an `unattached` event, written in
   the order read and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header
   is not a plain 4-byte CAN identifier (extended or mixed addressing), which therefore never

@@ -1560,9 +1560,9 @@ impl CommLog {
     }
 
     /// Writes the `primitive_ended` settling entry of the exchange logged as `seq`, whose
-    /// primitive the agent stopped waiting for, from how it ended at job end (design 8.11
-    /// "Settlement", ADR-366). The entry's `seq`; `None` when the log keeps no such exchange,
-    /// or once the log has failed.
+    /// primitive the agent stopped waiting for, from how it ended at job end or before the
+    /// link's next request (design 8.11 "Settlement", ADR-366). The entry's `seq`; `None` when
+    /// the log keeps no such exchange, or once the log has failed.
     pub(crate) fn primitive_ended(&self, seq: u64, ended: PrimitiveEnded) -> Option<u64> {
         let mut inner = self.lock();
         let now = {
@@ -1597,10 +1597,10 @@ impl CommLog {
                     origin: kept.origin,
                     request: kept.request.clone(),
                     classification: kept.classification,
-                    reason: "The agent cancelled the primitive at job end before it ended; this settles nothing, and the exchange keeps its classification.".to_owned(),
+                    reason: "The agent cancelled the primitive before it ended; this settles nothing, and the exchange keeps its classification.".to_owned(),
                 }],
                 text: format!(
-                    "The agent cancelled the primitive of the exchange logged as {seq} at job end."
+                    "The agent cancelled the primitive of the exchange logged as {seq}."
                 ),
                 classification: kept.classification,
             }));

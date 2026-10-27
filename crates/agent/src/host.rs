@@ -436,7 +436,8 @@ pub struct WorkerHost<C: WorkerApi> {
     download_seq: Option<u64>,
     /// A primitive the host stopped waiting for before it ended (its own deadline, lost events,
     /// a failed event stream), which may still hold the link: it is cancelled before the link's
-    /// next request (design 8.11 "Settlement").
+    /// next request, whose wait reads its end if it had one (design 8.11 "Settlement",
+    /// ADR-367).
     stray: Option<Stray>,
     /// How long [`WorkerHost::settle_at_end`] keeps the link open for such a primitive
     /// (`LinkConfig::job_end_wait`, ADR-358).
@@ -491,11 +492,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let events = &mut self.link.events;
         // Its items are read as its exchange's were, so its end is the one the exchange would
         // have had (design 8.11 `primitive_ended`).
-        let mut progress = Progress::expecting(stray.expectation.clone());
-        progress.response.clone_from(&stray.response);
-        progress.response_times = stray.response_times;
-        progress.error = stray.error;
-        progress.errors.clone_from(&stray.errors);
+        let mut progress = stray.progress();
         // `Some(None)` when the event stream failed or ended, `None` when the wait passed.
         let ended = if stray.cancel_failed {
             None
@@ -542,10 +539,10 @@ impl<C: WorkerApi> WorkerHost<C> {
         match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
             Some(Some(result @ Err(HostError::EventsLost))) => {
-                self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(result));
+                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
             }
             Some(Some(result)) => {
-                self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(result));
+                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
                 return;
             }
             // The stream failed or ended before it did: its end is unknown, with every item read
@@ -553,13 +550,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             Some(None) => self.log_primitive_end(
                 &stray,
                 &progress,
-                JobEndEnd::Ended(&Err(HostError::EventStreamEnded)),
+                StrayEnd::Ended(&Err(HostError::EventStreamEnded)),
             ),
             // The wait passed after the primitive's end was read, before its finished status:
             // that end settles it, and the primitive is still cancelled.
             None => {
                 if let Some(result) = progress.end_read() {
-                    self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(&result));
+                    self.log_primitive_end(&stray, &progress, StrayEnd::Ended(&result));
                 }
             }
         }
@@ -574,7 +571,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             // Only a cancel the worker carried out is the agent's: one whose handle had ended,
             // or that failed, leaves the end unknown and the exchange as it was.
             Ok(_) if ended.is_none() && progress.end_read().is_none() => {
-                self.log_primitive_end(&stray, &progress, JobEndEnd::Cancelled)
+                self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled)
             }
             Ok(_) => {}
             Err(HostError::VciLost) => {}
@@ -586,15 +583,58 @@ impl<C: WorkerApi> WorkerHost<C> {
         }
     }
 
+    /// Writes the `primitive_ended` entry of a primitive cancelled before the link's next request
+    /// (design 8.11 "Settlement"), once that request's wait is over: the end read during it,
+    /// an unknown end when the event stream failed or ended, else the end read before its
+    /// deadline, else the agent's cancel when the worker carried it out. A primitive that had
+    /// ended (its handle invalid) or that a lost VCI ended, with no end read, keeps its
+    /// exchange's classification. What the log kept for the exchange is then released, since
+    /// nothing else settles it. Returns the results and errors read for it that no entry
+    /// carries (its end was not read), which stay the exchange in flight's `unattached` items
+    /// of an earlier primitive, as before.
+    fn settle_cancelled(&self, settling: Settling, stream_failed: bool) -> Vec<Unbound> {
+        let Settling {
+            stray,
+            progress,
+            carried_out,
+            end,
+            items,
+        } = settling;
+        let end = match end {
+            Some(end) => Some(end),
+            None if stream_failed => Some(SettlingEnd::Ended(Err(HostError::EventStreamEnded))),
+            None => match progress.end_read() {
+                Some(result) => Some(SettlingEnd::Ended(result)),
+                None if carried_out => Some(SettlingEnd::Cancelled),
+                None => None,
+            },
+        };
+        let left = match &end {
+            Some(SettlingEnd::Ended(result)) => {
+                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                Vec::new()
+            }
+            Some(SettlingEnd::Cancelled) => {
+                self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled);
+                items
+            }
+            None => items,
+        };
+        if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
+            log.release_kept(seq);
+        }
+        left
+    }
+
     /// Writes the `primitive_ended` entry of `stray`'s exchange, when its entry was written: its
     /// end as `progress` read it, or the agent's cancel when `ended` is `None` (design 8.11
     /// "Settlement", ADR-366).
-    fn log_primitive_end(&self, stray: &Stray, progress: &Progress, ended: JobEndEnd<'_>) {
+    fn log_primitive_end(&self, stray: &Stray, progress: &Progress, ended: StrayEnd<'_>) {
         let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) else {
             return;
         };
         let primitive = match ended {
-            JobEndEnd::Ended(result) => {
+            StrayEnd::Ended(result) => {
                 let (end, mut detail) = sent_end(
                     &stray.request,
                     result,
@@ -656,7 +696,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     tx_indication: progress.bound_tx,
                 }
             }
-            JobEndEnd::Cancelled => crate::comm_log::PrimitiveEnded {
+            StrayEnd::Cancelled => crate::comm_log::PrimitiveEnded {
                 end: None,
                 detail: Detail::default(),
                 pending: Vec::new(),
@@ -873,6 +913,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         // cancel succeeds, when the worker names its handle invalid (it had ended), or when the
         // VCI was lost (the worker cancelled it). Any other answer leaves the link held, so the
         // request is not started and the next one tries the cancel again.
+        let mut settling = None;
         if let Some(stray) = self.stray.take() {
             let cancelled = unary(
                 self.timings.unary,
@@ -883,9 +924,10 @@ impl<C: WorkerApi> WorkerHost<C> {
             )
             .await
             .map_err(lost_vci_between_primitives);
-            match cancelled {
-                Ok(_) | Err(HostError::VciLost) => {}
-                Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => {}
+            let carried_out = match cancelled {
+                Ok(_) => true,
+                Err(HostError::VciLost) => false,
+                Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => false,
                 Err(_) => {
                     self.stray = Some(Stray {
                         cancel_failed: true,
@@ -893,10 +935,18 @@ impl<C: WorkerApi> WorkerHost<C> {
                     });
                     return Sent::not_started(Err(HostError::LinkHeld));
                 }
-            }
-            // Its end is not read at job end, so what the log kept for it is not needed.
-            if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
-                log.release_kept(seq);
+            };
+            // An end it reached before the cancel, still on the event stream, is read during
+            // this exchange (design 8.11 "Settlement"); only an exchange whose entry was
+            // written has one to settle.
+            if stray.seq.is_some() && self.comm_log.is_some() {
+                settling = Some(Settling {
+                    progress: stray.progress(),
+                    stray,
+                    carried_out,
+                    end: None,
+                    items: Vec::new(),
+                });
             }
         }
         // One deadline from the request to the end of the primitive.
@@ -920,12 +970,23 @@ impl<C: WorkerApi> WorkerHost<C> {
         });
         let cop = match started {
             Ok(cop) => cop,
-            Err(error) => return Sent::not_started(Err(error)),
+            Err(error) => {
+                if let Some(settling) = settling {
+                    // No wait read anything for it.
+                    self.settle_cancelled(settling, false);
+                }
+                return Sent::not_started(Err(error));
+            }
         };
+        // A handle the library gave again names the new primitive's items, not the old one's.
+        if let Some(reused) = settling.take_if(|settling| settling.stray.cop == cop) {
+            self.settle_cancelled(reused, false);
+        }
 
         let events = &mut self.link.events;
         let log = self.comm_log.as_ref();
         let progress = &mut progress;
+        let settling_ref = &mut settling;
         let wait = async {
             loop {
                 let notification = events
@@ -936,6 +997,18 @@ impl<C: WorkerApi> WorkerHost<C> {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
+                // The cancelled primitive's own items go to its end; lost events and a lost
+                // VCI end this exchange too.
+                if let Some(settling) = settling_ref
+                    .as_mut()
+                    .filter(|settling| settling.takes(&notification.event_data))
+                {
+                    let read = log.filter(|log| log.is_open()).map(|log| log.now());
+                    settling.read(notification.event_data.clone(), read);
+                    if !shared_end(&notification.event_data) {
+                        continue;
+                    }
+                }
                 let (kept, kept_pendings, kept_rejected, kept_response) = (
                     progress.unbound.len(),
                     progress.pendings.len(),
@@ -975,6 +1048,18 @@ impl<C: WorkerApi> WorkerHost<C> {
             }
         };
         let waited = tokio::time::timeout_at(deadline, wait).await;
+        if let Some(settling) = settling {
+            let stream_failed = matches!(
+                &waited,
+                Ok(Err(HostError::EventStreamEnded
+                    | HostError::Rpc {
+                        rpc: "SubscribeEvent",
+                        ..
+                    }))
+            );
+            let left = self.settle_cancelled(settling, stream_failed);
+            progress.unbound.extend(left);
+        }
         // A receive timeout the worker already reported ended the VCI's wait, even when the
         // primitive's end had not been read before the deadline.
         let agent_deadline = waited.is_err() && progress.rx_timeout.is_none();
@@ -1333,8 +1418,111 @@ struct Stray {
     errors: Vec<ErrorSeen>,
 }
 
-/// How a stray primitive's wait at job end ended ([`WorkerHost::settle_at_end`]).
-enum JobEndEnd<'a> {
+impl Stray {
+    /// A wait for its end that goes on from what its exchange's wait had read, so its end is the
+    /// one the exchange would have had (design 8.11 `primitive_ended`).
+    fn progress(&self) -> Progress {
+        let mut progress = Progress::expecting(self.expectation.clone());
+        progress.response.clone_from(&self.response);
+        progress.response_times = self.response_times;
+        progress.error = self.error;
+        progress.errors.clone_from(&self.errors);
+        progress
+    }
+}
+
+/// A stray primitive the host cancelled before the link's next request, whose end may still be
+/// read during that request's exchange (design 8.11 "Settlement"): it may have ended before the
+/// cancel, with its items still on the event stream.
+struct Settling {
+    stray: Stray,
+    progress: Progress,
+    /// The worker carried out the cancel: the primitive was still running.
+    carried_out: bool,
+    /// Its end, once read.
+    end: Option<SettlingEnd>,
+    /// Its results and error events read, with when the host read them: the exchange in
+    /// flight's `unattached` items when no end of it is written.
+    items: Vec<Unbound>,
+}
+
+/// How a [`Settling`] primitive ended.
+enum SettlingEnd {
+    /// It ended, as its exchange's wait would have read it.
+    Ended(Result<Vec<u8>, HostError>),
+    /// The agent's cancel ended it.
+    Cancelled,
+}
+
+impl Settling {
+    /// Whether `data` is for its end: its own items, lost events, and a lost VCI of no
+    /// primitive, until its end is read. An indication of no primitive stays with the exchange
+    /// in flight, which may own it.
+    fn takes(&self, data: &Option<event_notification::EventData>) -> bool {
+        self.end.is_none()
+            && match data {
+                Some(event_notification::EventData::Lost(_)) => true,
+                Some(event_notification::EventData::Item(item)) => {
+                    item.cop_handle == Some(self.stray.cop) || ends_primitive(item, self.stray.cop)
+                }
+                None => false,
+            }
+    }
+
+    /// Reads one of its notifications, read by the host at `read`. Its cancelled status ends
+    /// it with the end read before, as the job end's cancel does, else, when the worker carried
+    /// out the agent's cancel, as that cancel; any other end, and a cancelled status the agent's
+    /// cancel did not give, is the one its exchange's wait would have read.
+    fn read(&mut self, data: Option<event_notification::EventData>, read: Option<AgentNow>) {
+        if let Some(event_notification::EventData::Item(item)) = &data
+            && item.cop_handle == Some(self.stray.cop)
+            && matches!(
+                item.data,
+                Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_))
+            )
+        {
+            self.items.push(Unbound {
+                item: item.clone(),
+                read,
+            });
+        }
+        let cancelled = matches!(
+            &data,
+            Some(event_notification::EventData::Item(EventItem {
+                data: Some(event_item::Data::CopStatus(status)),
+                ..
+            })) if *status == PduComPrimitiveStatus::PduCopstCancelled as i32
+        );
+        let read_before = self.progress.end_read();
+        if let Some(result) = self.progress.on_notification(data, self.stray.cop) {
+            self.end = Some(match (cancelled, read_before) {
+                (true, Some(result)) => SettlingEnd::Ended(result),
+                (true, None) if self.carried_out => SettlingEnd::Cancelled,
+                _ => SettlingEnd::Ended(result),
+            });
+        }
+    }
+}
+
+/// Whether `data` ends the exchange in flight as well as a [`Settling`] primitive: lost events,
+/// or a lost VCI of no primitive.
+fn shared_end(data: &Option<event_notification::EventData>) -> bool {
+    match data {
+        Some(event_notification::EventData::Lost(_)) => true,
+        Some(event_notification::EventData::Item(item)) => {
+            item.cop_handle.is_none()
+                && matches!(
+                    &item.data,
+                    Some(event_item::Data::ErrorData(data))
+                        if data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
+                )
+        }
+        None => false,
+    }
+}
+
+/// How a stray primitive ended, for its `primitive_ended` entry.
+enum StrayEnd<'a> {
     /// It ended, as its exchange's wait would have read it.
     Ended(&'a Result<Vec<u8>, HostError>),
     /// The agent cancelled it.
@@ -3489,6 +3677,130 @@ mod tests {
         );
         assert_eq!(logged[0].rx_id, 0x7E8);
         assert_eq!(logged[0].agent_us, 9);
+    }
+
+    /// Design 8.11 "Settlement": a primitive cancelled before the link's next request takes its
+    /// own items, lost events and a lost VCI of no primitive, not an indication of no primitive,
+    /// which the exchange in flight may own. Its finished status ends it with what was read,
+    /// and its cancelled status with the end read before it, else as the agent's cancel.
+    #[test]
+    fn a_primitive_cancelled_before_the_next_request_ends_on_its_own_items() {
+        let carrying = |carried_out| {
+            let progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+            let stray = Stray {
+                cop: COP,
+                deadline: tokio::time::Instant::now(),
+                cancel_failed: false,
+                request: vec![0x22, 0xF1, 0x90],
+                expectation: crate::send_receive::Expectation {
+                    sid: progress.sid,
+                    positive: progress.positive_prefix.clone(),
+                    negative: progress.negative.clone(),
+                },
+                seq: Some(1),
+                response: None,
+                response_times: VciTimes::default(),
+                error: None,
+                errors: Vec::new(),
+            };
+            Settling {
+                progress: stray.progress(),
+                stray,
+                carried_out,
+                end: None,
+                items: Vec::new(),
+            }
+        };
+        let settling = || carrying(true);
+        let item = |cop, data| Some(event_notification::EventData::Item(event(cop, data)));
+        let other = ComPrimitiveHandle {
+            cop_handle: COP.cop_handle + 1,
+            ..COP
+        };
+        let start = event_item::Data::ResultData(vci_service_interface::ResultData {
+            rx_flag: vec![0, 0, 0, 0x02],
+            ..Default::default()
+        });
+        let lost_vci = event_item::Data::ErrorData(ErrorData {
+            error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+            ..ErrorData::default()
+        });
+        let taker = settling();
+        assert!(taker.takes(&item(Some(COP), result(&[0x62, 0xF1, 0x90]))));
+        assert!(!taker.takes(&item(Some(other), result(&[0x62, 0xF1, 0x90]))));
+        assert!(!taker.takes(&item(None, start)));
+        assert!(taker.takes(&item(None, lost_vci.clone())));
+        assert!(shared_end(&item(None, lost_vci)));
+        let lost = Some(event_notification::EventData::Lost(Default::default()));
+        assert!(taker.takes(&lost) && shared_end(&lost));
+        assert!(!shared_end(&item(Some(COP), result(&[0x62, 0xF1, 0x90]))));
+
+        let finished = status(PduComPrimitiveStatus::PduCopstFinished);
+        let cancelled = status(PduComPrimitiveStatus::PduCopstCancelled);
+        // A response, then the finished or the cancelled status: the response ends it.
+        for end in [finished.clone(), cancelled.clone()] {
+            let mut responded = settling();
+            responded.read(item(Some(COP), result(&[0x62, 0xF1, 0x90, 0x41])), None);
+            assert!(responded.end.is_none(), "a response alone does not end it");
+            responded.read(item(Some(COP), end), None);
+            assert!(
+                matches!(&responded.end, Some(SettlingEnd::Ended(Ok(bytes))) if bytes == &[0x62, 0xF1, 0x90, 0x41]),
+            );
+            assert!(
+                !responded.takes(&item(Some(COP), result(&[0x62]))),
+                "it has ended"
+            );
+        }
+        // The cancelled status alone is the agent's cancel; the finished status alone, no
+        // response.
+        let mut cancel = settling();
+        cancel.read(item(Some(COP), cancelled.clone()), None);
+        assert!(matches!(cancel.end, Some(SettlingEnd::Cancelled)));
+        // A cancelled status the agent's cancel did not give (the handle had ended) is no
+        // cancel of the agent's: it ends the primitive as its exchange's wait would have.
+        let mut not_ours = carrying(false);
+        not_ours.read(item(Some(COP), cancelled), None);
+        assert!(matches!(
+            not_ours.end,
+            Some(SettlingEnd::Ended(Err(HostError::NoResponse)))
+        ));
+        // Its own results and errors are kept, for the exchange in flight when no end of it
+        // is written; its status and a lost VCI of no primitive are not.
+        let mut kept = settling();
+        kept.read(item(Some(COP), result(&[0x62, 0xF1, 0x91])), None);
+        kept.read(
+            item(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtRxError as i32,
+                    ..ErrorData::default()
+                }),
+            ),
+            None,
+        );
+        kept.read(
+            item(
+                None,
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+                    ..ErrorData::default()
+                }),
+            ),
+            None,
+        );
+        assert_eq!(kept.items.len(), 2);
+        let mut silent = settling();
+        silent.read(item(Some(COP), finished), None);
+        assert!(matches!(
+            silent.end,
+            Some(SettlingEnd::Ended(Err(HostError::NoResponse)))
+        ));
+        let mut gone = settling();
+        gone.read(lost, None);
+        assert!(matches!(
+            gone.end,
+            Some(SettlingEnd::Ended(Err(HostError::EventsLost)))
+        ));
     }
 
     /// ADR-358: at job end a stray primitive has ended on its own finished or cancelled status,

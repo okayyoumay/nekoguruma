@@ -14365,6 +14365,8 @@ def main():
         Finish,
         /// A lost-events notification.
         Lose,
+        /// A positive response to `22 F1 90` with VCI time 600 ms, then the finished status.
+        Respond,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14603,19 +14605,44 @@ def main():
                 tokio::spawn(async move {
                     tokio::time::sleep(after).await;
                     use vci_service_interface::event_notification::EventData;
-                    let data = match event {
-                        StartEvent::Finish => EventData::Item(vci_service_interface::EventItem {
-                            cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
-                                module_handle: 1,
-                                cll_handle: 1,
-                                cop_handle,
-                            }),
-                            data: Some(vci_service_interface::event_item::Data::CopStatus(
-                                vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
-                                    as i32,
-                            )),
+                    let handle = vci_service_interface::ComPrimitiveHandle {
+                        module_handle: 1,
+                        cll_handle: 1,
+                        cop_handle,
+                    };
+                    if let StartEvent::Respond = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 600_000,
+                                data: Some(vci_service_interface::event_item::Data::ResultData(
+                                    vci_service_interface::ResultData {
+                                        data_bytes: vec![0x62, 0xF1, 0x90, 0x41],
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
                             ..Default::default()
-                        }),
+                        }));
+                    }
+                    let data = match event {
+                        StartEvent::Finish | StartEvent::Respond => {
+                            EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
+                                    module_handle: 1,
+                                    cll_handle: 1,
+                                    cop_handle,
+                                }),
+                                data: Some(vci_service_interface::event_item::Data::CopStatus(
+                                    vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
+                                        as i32,
+                                )),
+                                ..Default::default()
+                            })
+                        }
                         StartEvent::Lose => EventData::Lost(Default::default()),
                     };
                     if let Some(sender) = sender {
@@ -14997,6 +15024,67 @@ def main():
         })
         .await
         .unwrap()
+    }
+
+    /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): a primitive past the agent's
+    /// deadline that responds within the job-end wait settles its exchange, and one cancelled at
+    /// job end is recorded as cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_that_ends_at_job_end_is_logged_as_primitive_ended() {
+        for (on_start, cancelled) in [
+            (
+                Some((Duration::from_millis(150), StartEvent::Respond)),
+                false,
+            ),
+            (None, true),
+        ] {
+            let dir = journal_dir("primitive-ended");
+            let (mut client, _fake) = fake_worker_starting_with(CancelAnswer::Done, on_start).await;
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: Duration::from_millis(50),
+            };
+            tokio::task::spawn_blocking(move || {
+                use diag_ir::DiagHost;
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                host.set_comm_log(Some(log));
+                host.set_link_ids(0x7E0, 0x7E8);
+                host.own_reads(Some(OwnRead::Identification));
+                host.set_job_end_wait(Duration::from_millis(500));
+                let result = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                host.settle_at_end();
+            })
+            .await
+            .unwrap();
+            let lines = comm_log_lines(&dir);
+            let exchange = lines
+                .iter()
+                .find(|line| line["event"] == "exchange")
+                .expect("the read has an entry");
+            assert_eq!(exchange["outcome"]["result"], "vci_did_not_end");
+            let ended = lines
+                .iter()
+                .find(|line| line["event"] == "primitive_ended")
+                .expect("the primitive's end is logged");
+            assert_eq!(
+                ended["refers_to"],
+                serde_json::json!([exchange["seq"]]),
+                "{ended}"
+            );
+            assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
+            if !cancelled {
+                assert_eq!(ended["outcome"]["result"], "positive", "{ended}");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Design 8.11 "Settlement", ADR-358: at job end the host keeps the link open for a

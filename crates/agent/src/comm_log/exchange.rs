@@ -1890,6 +1890,29 @@ pub(crate) fn settle_late_response(
     (classification, reason)
 }
 
+/// The classification and reason a `primitive_ended` gives the exchange it settles (design 8.11
+/// "Settlement", ADR-366): `entry`, built from the exchange's evidence with the primitive's end,
+/// as if the agent had waited for it, except that an end within the limit in force is `system`,
+/// since the job gave up on an exchange that ended in time. A lost VCI and a failure of the
+/// system keep their own rows.
+pub(crate) fn settle_primitive_ended(entry: &ExchangeEntry) -> (Classification, String) {
+    let in_time = matches!(
+        entry.timing.window,
+        Window::WithinP2 | Window::WithinP2Star | Window::TimeoutAtLimit
+    );
+    let own_row = matches!(entry.outcome, Outcome::VciLost | Outcome::Unknown { .. });
+    if in_time && !own_row {
+        return (
+            Classification::System,
+            format!(
+                "The exchange ended within the limit in force after the agent had stopped waiting for it: the job gave up on an exchange that ended in time. {}",
+                entry.text
+            ),
+        );
+    }
+    (entry.classification, entry.reason.clone())
+}
+
 fn severity_word(classification: Classification) -> &'static str {
     match classification {
         Classification::None => "none",

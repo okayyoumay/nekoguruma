@@ -479,8 +479,8 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// VCI ends it too, since the worker then cancels the link's primitives; an event stream
     /// that fails or ends leaves its end unknown, so it is cancelled at once, and so is one whose
     /// cancel before a request already failed (the worker may not answer). A failed cancel is
-    /// logged and does not change the job's result. What the primitive gives meanwhile is not
-    /// logged yet (`primitive_ended`).
+    /// logged and does not change the job's result. The primitive's end, or the agent's cancel,
+    /// is written as its exchange's `primitive_ended` entry ([`WorkerHost::log_primitive_end`]).
     pub(crate) fn settle_at_end(&mut self) {
         let Some(stray) = self.stray.take() else {
             return;
@@ -489,27 +489,35 @@ impl<C: WorkerApi> WorkerHost<C> {
         let until = stray.deadline.max(tokio::time::Instant::now()) + self.job_end_wait;
         let cop = stray.cop;
         let events = &mut self.link.events;
-        let ended = !stray.cancel_failed
-            && handle.block_on(async {
+        // Its items are read as its exchange's were, so its end is the one the exchange would
+        // have had (design 8.11 `primitive_ended`).
+        let mut progress = Progress::expecting(stray.expectation.clone());
+        let ended = if stray.cancel_failed {
+            None
+        } else {
+            handle.block_on(async {
                 tokio::time::timeout_at(until, async {
                     loop {
                         match events.message().await {
                             Ok(Some(notification)) => {
                                 if let Some(event_notification::EventData::Item(item)) =
                                     notification.event_data
-                                    && ends_primitive(&item, cop)
+                                    && (item.cop_handle == Some(cop) || ends_primitive(&item, cop))
+                                    && let Some(result) = progress.on_event(item, cop)
                                 {
-                                    return true;
+                                    return Some(result);
                                 }
                             }
-                            Ok(None) | Err(_) => return false,
+                            Ok(None) | Err(_) => return None,
                         }
                     }
                 })
                 .await
-                .unwrap_or(false)
-            });
-        if ended {
+                .unwrap_or(None)
+            })
+        };
+        self.log_primitive_end(&stray, &progress, ended.as_ref());
+        if ended.is_some() {
             return;
         }
         let cancelled = handle.block_on(unary(
@@ -526,6 +534,77 @@ impl<C: WorkerApi> WorkerHost<C> {
                 error = %crate::oplog::LogSafe::log_text(&error),
                 "could not cancel a primitive past its deadline at job end"
             ),
+        }
+    }
+
+    /// Writes the `primitive_ended` entry of `stray`'s exchange, when its entry was written: its
+    /// end as `progress` read it, or the agent's cancel when `ended` is `None` (design 8.11
+    /// "Settlement", ADR-366).
+    fn log_primitive_end(
+        &self,
+        stray: &Stray,
+        progress: &Progress,
+        ended: Option<&Result<Vec<u8>, HostError>>,
+    ) {
+        let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) else {
+            return;
+        };
+        let primitive = match ended {
+            Some(result) => {
+                let (end, detail) = sent_end(
+                    &stray.request,
+                    result,
+                    &progress.negative,
+                    progress.sid,
+                    true,
+                );
+                let error = match result {
+                    Err(HostError::VciLost) => progress.vci_lost.as_ref(),
+                    _ => progress.errors.last(),
+                };
+                let response_times = if result.is_ok() {
+                    progress.response_times
+                } else {
+                    VciTimes::default()
+                };
+                let vci = VciTimes {
+                    error: error.and_then(|seen| seen.at),
+                    rx_timeout: progress.rx_timeout.as_ref().and_then(|timeout| timeout.at),
+                    ..response_times
+                };
+                let now = log.now();
+                let pending = progress
+                    .pendings
+                    .iter()
+                    .map(|pending| Pending {
+                        vci_us: Some(pending.vci_us),
+                        clock: pending.clock,
+                        epoch: None,
+                        agent_us: now.monotonic_us,
+                        since_previous_ms: None,
+                    })
+                    .collect();
+                crate::comm_log::PrimitiveEnded {
+                    end: Some(end),
+                    detail,
+                    pending,
+                    vci,
+                    vci_ended: progress.rx_timeout.is_some(),
+                }
+            }
+            None => crate::comm_log::PrimitiveEnded {
+                end: None,
+                detail: Detail::default(),
+                pending: Vec::new(),
+                vci: VciTimes::default(),
+                vci_ended: false,
+            },
+        };
+        let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.primitive_ended(seq, primitive)
+        }));
+        if logged.is_err() {
+            tracing::warn!("writing a primitive_ended entry panicked");
         }
     }
 
@@ -662,7 +741,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                 agent_us: read.monotonic_us,
                 notifications: 1,
             });
-            self.log(&request, before, end, detail, unbound, |evidence| {
+            let started = sent.started;
+            let seq = self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.pending = pending;
                 evidence.rejected = rejected;
                 evidence.events_lost = events_lost;
@@ -674,6 +754,13 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.link_errors_before_answer = before_answer;
                 evidence.times.vci = (!vci.is_empty()).then_some(vci);
             });
+            // The primitive left running belongs to this entry, which its end settles.
+            if let Some(stray) = &mut self.stray
+                && started
+                && stray.seq.is_none()
+            {
+                stray.seq = seq;
+            }
         }
         sent.result
     }
@@ -686,6 +773,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         mut progress: Progress,
         logged: bool,
     ) -> Sent {
+        let request_bytes = request.clone();
         let start = StartComPrimitiveRequest {
             cop_tag: None,
             cll_handle: Some(self.link.cll_handle),
@@ -823,6 +911,13 @@ impl<C: WorkerApi> WorkerHost<C> {
                 cop,
                 deadline,
                 cancel_failed: false,
+                request: request_bytes,
+                expectation: crate::send_receive::Expectation {
+                    sid: progress.sid,
+                    positive: progress.positive_prefix.clone(),
+                    negative: progress.negative.clone(),
+                },
+                seq: None,
             });
         }
         let result = waited
@@ -911,11 +1006,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         detail: Detail,
         unbound: Vec<UnattachedItem>,
         complete: impl FnOnce(&mut Evidence),
-    ) {
+    ) -> Option<u64> {
         let (Some(before), Some(log), Some(origin), Some((tx_id, rx_id))) =
             (before, &self.comm_log, self.origin(), self.link_ids)
         else {
-            return;
+            return None;
         };
         let target = Target::Endpoint {
             link: LOG_LINK,
@@ -951,6 +1046,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         if request.first() == Some(&SID_REQUEST_DOWNLOAD) {
             self.download_seq = seq;
         }
+        seq
     }
 
     /// Writes the entry of a request the agent refused before sending it, for `error`
@@ -1119,7 +1215,7 @@ fn is_start_indication(result: &vci_service_interface::ResultData) -> bool {
 }
 
 /// A primitive the host stopped waiting for before it ended ([`WorkerHost::settle_at_end`]).
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 struct Stray {
     cop: ComPrimitiveHandle,
     /// The agent's own deadline for it, past every limit in force.
@@ -1127,6 +1223,11 @@ struct Stray {
     /// Its cancel before a request failed: the worker may not answer, so the job end does not
     /// wait for it again.
     cancel_failed: bool,
+    /// Its request, and the answer it waits for, so its end can be read as its exchange's.
+    request: Vec<u8>,
+    expectation: crate::send_receive::Expectation,
+    /// The `seq` of its exchange's entry, when one was written (design 8.11 `primitive_ended`).
+    seq: Option<u64>,
 }
 
 /// Whether `item` shows that the primitive `cop` has ended: its own finished or cancelled

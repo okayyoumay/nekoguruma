@@ -1948,8 +1948,8 @@ pub(crate) fn settle_primitive_ended(
         return (
             Classification::System,
             format!(
-                "The exchange ended after the agent had stopped waiting for it, with a response or at the limit in force: the job gave up on an exchange that ended. {}",
-                entry.text
+                "The exchange ended after the agent had stopped waiting for it, with a response or at the limit in force: the job gave up on an exchange that ended. As if the agent had waited: {}",
+                entry.reason
             ),
         );
     }

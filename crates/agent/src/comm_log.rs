@@ -4566,6 +4566,19 @@ mod tests {
             "{entry}"
         );
         assert_eq!(entry["exchanges"][0]["request"]["sid"], "0x22", "{entry}");
+        // A link error read beside the response stays in the reason.
+        let mut with_error = response(500_000);
+        with_error.link_errors = vec![exchange::LinkErrorKind::Receive];
+        let (_, entry) = settled(with_error);
+        let entry = entry.unwrap();
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert!(
+            entry["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("receive error"),
+            "{entry}"
+        );
         // A single-frame response past P2 plus the margin and its transfer: the late row.
         let (_, entry) = settled(response(1_002_321));
         let entry = entry.unwrap();

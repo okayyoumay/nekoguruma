@@ -45,10 +45,12 @@ the exchanges the VCI ended.
    primitive reported: the one that ended it may have been read before the deadline. A
    lost-events notice gives the `unknown` end (`events_lost`), and the primitive, which may
    still run, is then cancelled; an event stream that fails or ends gives the `unknown` end
-   (`events_ended`). When the job-end wait passes, or an earlier cancel failed, the host
-   cancels the primitive and records the agent's cancel only when the cancel succeeds; a
-   handle the worker no longer knows, or a cancel that fails, leaves the end unknown and writes
-   nothing.
+   (`events_ended`). When the job-end wait passes after the primitive's end was read (a
+   final response, or the VCI's receive timeout) but before its finished status, that end
+   settles it, and the primitive is still cancelled. When the job-end wait passes otherwise,
+   or an earlier cancel failed, the host cancels the primitive and records the agent's cancel
+   only when the cancel succeeds; a handle the worker no longer knows, or a cancel that fails,
+   leaves the end unknown and writes nothing.
 3. **The entry gives the end as an exchange entry gives its end.**
    - The log builds the exchange's evidence again with that end and with the new pendings
      after the kept ones, placed before the end's times.
@@ -75,7 +77,8 @@ the exchanges the VCI ended.
      and `exchanges` with the exchange's origin, request, classification and reason.
 4. **The classification.**
    - The end takes the exchange rows' classification.
-   - A final response is `system` whatever its time: within the limit in force the job gave up
+   - A final response is `system` whatever its time (its reason keeps the exchange rows'
+     reason, with the link errors read beside it): within the limit in force the job gave up
      on an exchange that ended in time, and after it the late row is `system` too, so a time
      that cannot be judged changes nothing.
    - A receive timeout at the limit (`timeout_at_limit`) that ends the exchange (no response, or

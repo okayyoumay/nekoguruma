@@ -14371,6 +14371,8 @@ def main():
         RespondThenFinishLater,
         /// A receive timeout with VCI time 1 s, then the finished status.
         TimeOut,
+        /// The same receive timeout, and the finished status 1 s after it.
+        TimeOutThenFinishLater,
         /// A receive error with VCI time 20 ms and extra error information, and the finished
         /// status 150 ms after it.
         FailThenFinishLater,
@@ -14635,7 +14637,7 @@ def main():
                             ..Default::default()
                         }));
                     }
-                    if let StartEvent::TimeOut = event
+                    if let StartEvent::TimeOut | StartEvent::TimeOutThenFinishLater = event
                         && let Some(sender) = &sender
                     {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14676,6 +14678,9 @@ def main():
                             ..Default::default()
                         }));
                     }
+                    if let StartEvent::TimeOutThenFinishLater = event {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
                     if let StartEvent::RespondThenFinishLater | StartEvent::FailThenFinishLater =
                         event
                     {
@@ -14686,6 +14691,7 @@ def main():
                         | StartEvent::Respond
                         | StartEvent::RespondThenFinishLater
                         | StartEvent::TimeOut
+                        | StartEvent::TimeOutThenFinishLater
                         | StartEvent::FailThenFinishLater => {
                             EventData::Item(vci_service_interface::EventItem {
                                 cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
@@ -15091,8 +15097,9 @@ def main():
         // A response after the deadline, one read before it with its finished status after it,
         // and none (the agent cancels the primitive).
         // Lost events at job end leave the end unknown, and the primitive is cancelled too.
-        // A receive timeout after the deadline ends it with no response; an error read before
-        // the deadline ends it with its finished status after.
+        // A receive timeout after the deadline ends it with no response, also when its finished
+        // status comes after the job-end wait (the primitive is then cancelled, and the timeout
+        // settles it); an error read before the deadline ends it with its finished status after.
         for (on_start, cancelled, result) in [
             (
                 Some((Duration::from_millis(150), StartEvent::Respond)),
@@ -15114,6 +15121,14 @@ def main():
             ),
             (
                 Some((Duration::from_millis(150), StartEvent::TimeOut)),
+                false,
+                Some("no_response"),
+            ),
+            (
+                Some((
+                    Duration::from_millis(150),
+                    StartEvent::TimeOutThenFinishLater,
+                )),
                 false,
                 Some("no_response"),
             ),
@@ -15166,6 +15181,14 @@ def main():
                 "{ended}"
             );
             assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line["event"] == "primitive_ended")
+                    .count(),
+                1,
+                "{lines:?}"
+            );
             if let Some(result) = result {
                 assert_eq!(ended["outcome"]["result"], result, "{ended}");
             }

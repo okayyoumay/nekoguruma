@@ -555,7 +555,13 @@ impl<C: WorkerApi> WorkerHost<C> {
                 &progress,
                 JobEndEnd::Ended(&Err(HostError::EventStreamEnded)),
             ),
-            None => {}
+            // The wait passed after the primitive's end was read, before its finished status:
+            // that end settles it, and the primitive is still cancelled.
+            None => {
+                if let Some(result) = progress.end_read() {
+                    self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(&result));
+                }
+            }
         }
         let cancelled = handle.block_on(unary(
             self.timings.unary,
@@ -567,7 +573,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         match cancelled.map_err(lost_vci_between_primitives) {
             // Only a cancel the worker carried out is the agent's: one whose handle had ended,
             // or that failed, leaves the end unknown and the exchange as it was.
-            Ok(_) if ended.is_none() => {
+            Ok(_) if ended.is_none() && progress.end_read().is_none() => {
                 self.log_primitive_end(&stray, &progress, JobEndEnd::Cancelled)
             }
             Ok(_) => {}
@@ -1914,6 +1920,20 @@ struct Progress {
 }
 
 impl Progress {
+    /// The end the primitive's finished status would give, when what was read already decides
+    /// it: a final response, or the VCI's receive timeout (with the error read beside it, as the
+    /// finished status gives it).
+    fn end_read(&self) -> Option<Result<Vec<u8>, HostError>> {
+        match (&self.response, self.error) {
+            (Some(response), _) => Some(Ok(response.clone())),
+            (None, Some(code)) if self.rx_timeout.is_some() => {
+                Some(Err(HostError::PrimitiveFailed(code)))
+            }
+            (None, None) if self.rx_timeout.is_some() => Some(Err(HostError::NoResponse)),
+            _ => None,
+        }
+    }
+
     fn for_request(request: &[u8]) -> Result<Self, HostError> {
         let sid = *request.first().ok_or(HostError::BadService(0))?;
         Ok(Self {

@@ -488,6 +488,9 @@ pub(crate) struct PrimitiveEnded {
     /// The transmit and start-of-message indications of no primitive read at job end, which
     /// may be its exchange's.
     pub indications: Vec<UnattachedItem>,
+    /// The time of a transmit indication bound to the primitive read at job end, which confirms
+    /// its send (design 8.11 `sent_evidence` `tx_indication`).
+    pub tx_indication: Option<exchange::VciTime>,
 }
 
 /// A `primitive_ended` settling entry (design 8.11 "Settlement", ADR-366): the primitive's end,
@@ -1630,9 +1633,15 @@ impl CommLog {
         if late_start.is_some() {
             evidence.response_started = true;
         }
+        // A transmit indication bound to the primitive is the exchange's own; one of no
+        // primitive is taken only without it.
+        let bound_transmit = ended
+            .tx_indication
+            .filter(|_| evidence.transmit_evidence.is_none());
         let late_transmit = match evidence.target {
             exchange::Target::Endpoint { tx_id, .. }
                 if evidence.transmit_evidence.is_none()
+                    && bound_transmit.is_none()
                     && !state.may_own_tx_indication_besides(kept.sent) =>
             {
                 ended
@@ -1684,6 +1693,14 @@ impl CommLog {
                 _ => inner.place_unread(time.clock, time.us, now)?,
             };
             *time = time.at(placed);
+        }
+        if let Some(time) = bound_transmit {
+            let placed = inner.place_unread(time.clock, time.us, now)?;
+            vci.tx_done = Some(time.at(placed))
+                .into_iter()
+                .chain(vci.tx_done)
+                .reduce(exchange::VciTime::prefer);
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
         }
         if let Some(indication) = late_transmit {
             let placed = inner.place_unread(indication.clock, u64::from(indication.vci_us), now)?;
@@ -4539,6 +4556,7 @@ mod tests {
             (seq, entry)
         };
         let response = |end_us: u64| PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -4586,6 +4604,7 @@ mod tests {
         assert_eq!(entry["classification"], "system", "{entry}");
         // A receive timeout at P2: in time, so `system`.
         let timeout = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::NoResponse),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -4604,6 +4623,7 @@ mod tests {
         assert_eq!(entry["classification"], "system", "{entry}");
         // A lost VCI keeps its own row.
         let lost = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::VciLost {
                 refused_after_loss: false,
             }),
@@ -4634,6 +4654,7 @@ mod tests {
         assert_eq!(entry["classification"], "system", "{entry}");
         // A pending, then a link error: no owed request of its own.
         let pending_then_error = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
             detail: exchange::Detail::default(),
             pending: vec![exchange::Pending {
@@ -4666,6 +4687,7 @@ mod tests {
         );
         // A VCI fault reported at job end beside the end: the most severe takes it.
         let mut faulted = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -4681,6 +4703,7 @@ mod tests {
         assert_eq!(entry.unwrap()["classification"], "system");
         // The agent's cancel settles nothing: the exchange keeps its classification.
         let cancelled = PrimitiveEnded {
+            tx_indication: None,
             end: None,
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -4735,6 +4758,7 @@ mod tests {
             ..start_of_message(0x7E8)
         };
         let ended = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::NoResponse),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -4818,6 +4842,7 @@ mod tests {
             };
             let seq = log.exchange_with(waited, vec![transmit]).unwrap();
             let ended = PrimitiveEnded {
+                tx_indication: None,
                 end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
                 detail: exchange::Detail::default(),
                 pending,
@@ -4944,6 +4969,7 @@ mod tests {
             ..start_of_message(0x7E8)
         };
         let timeout = |vci_us, indications| PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::NoResponse),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -4984,6 +5010,7 @@ mod tests {
         );
         // The transmit done the response's item carries confirms the send.
         let response = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -5023,6 +5050,7 @@ mod tests {
         // exchange had attached: 994.5 ms from it is within P2, 1004.5 ms from the indication
         // would not be.
         let response = PrimitiveEnded {
+            tx_indication: None,
             end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
             detail: exchange::Detail::default(),
             pending: Vec::new(),
@@ -5047,6 +5075,7 @@ mod tests {
         let log = CommLog::open(&setup).unwrap();
         log.begin(&facts(), RunKind::First);
         let ended = PrimitiveEnded {
+            tx_indication: None,
             end: None,
             detail: exchange::Detail::default(),
             pending: Vec::new(),

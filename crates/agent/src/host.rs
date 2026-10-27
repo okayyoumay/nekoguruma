@@ -20,7 +20,7 @@ use vci_service_interface::{
 use crate::comm_log::exchange::{
     AgentTimes, At, Clock, ClockReading, Detail, End, EventsLost, Evidence, Expected,
     LinkErrorKind, Origin, Pending, PendingVisibility, RefusalCause, Rejected, RejectedReason,
-    SectionAttrs, SourcePos, Target, UnknownCause, VciTime, VciTimes,
+    SectionAttrs, SourcePos, Target, TransmitEvidence, UnknownCause, VciTime, VciTimes,
 };
 use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
@@ -653,6 +653,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     vci_ended: progress.rx_timeout.is_some(),
                     link_errors,
                     indications: unattached_items(&progress.unbound),
+                    tx_indication: progress.bound_tx,
                 }
             }
             JobEndEnd::Cancelled => crate::comm_log::PrimitiveEnded {
@@ -663,6 +664,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 vci_ended: false,
                 link_errors: Vec::new(),
                 indications: unattached_items(&progress.unbound),
+                tx_indication: None,
             },
         };
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -790,12 +792,20 @@ impl<C: WorkerApi> WorkerHost<C> {
             } else {
                 VciTimes::default()
             };
+            // A transmit indication bound to the primitive confirms the send, with its time
+            // (design 8.11 `sent_evidence`), over the transmit done the response carries.
             let vci = VciTimes {
                 error: error_at,
                 deadline: sent.deadline_reading,
                 rx_timeout: sent.rx_timeout.as_ref().and_then(|timeout| timeout.at),
+                tx_done: sent
+                    .bound_tx
+                    .into_iter()
+                    .chain(response_times.tx_done)
+                    .reduce(VciTime::prefer),
                 ..response_times
             };
+            let bound_tx = sent.bound_tx.is_some();
             let unbound = unattached_items(&sent.unbound);
             let before_answer = errors_before_answer(&sent);
             let vci_ended = sent.rx_timeout.is_some();
@@ -815,6 +825,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
                 evidence.bound_start = sent.bound_start;
+                if bound_tx {
+                    evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+                }
                 evidence.link_errors.extend(link_errors);
                 evidence.link_errors_before_answer = before_answer;
                 evidence.times.vci = (!vci.is_empty()).then_some(vci);
@@ -1008,6 +1021,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             rejected: std::mem::take(&mut progress.rejected),
             last_rejected: progress.last_rejected,
             bound_start: progress.bound_start,
+            bound_tx: progress.bound_tx,
             events_lost: progress.events_lost.take(),
             agent_deadline,
             response_times: progress.response_times,
@@ -1287,6 +1301,15 @@ fn is_start_indication(result: &vci_service_interface::ResultData) -> bool {
     })
 }
 
+/// Whether a result is a transmit indication: RxFlag `TX_INDICATION` (ISO 22900-2:2022 D.2.2).
+fn is_tx_indication(result: &vci_service_interface::ResultData) -> bool {
+    use crate::comm_log::RX_FLAG_TX_INDICATION;
+    result
+        .rx_flag
+        .get(3)
+        .is_some_and(|flags| flags & RX_FLAG_TX_INDICATION != 0)
+}
+
 /// A primitive the host stopped waiting for before it ended ([`WorkerHost::settle_at_end`]).
 #[derive(Debug, Clone)]
 struct Stray {
@@ -1401,6 +1424,8 @@ struct Sent {
     last_rejected: bool,
     /// See `Progress::bound_start`.
     bound_start: bool,
+    /// See `Progress::bound_tx`.
+    bound_tx: Option<VciTime>,
     /// See `Progress::events_lost`.
     events_lost: Option<Option<AgentNow>>,
     /// The agent's own deadline ended the wait, not the worker: the VCI had not ended the
@@ -1429,6 +1454,7 @@ impl Sent {
             rejected: Vec::new(),
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -1910,6 +1936,9 @@ struct Progress {
     /// A start-of-message indication bound to the primitive was read: a response may be under
     /// way (design 8.11 `vci_did_not_end`).
     bound_start: bool,
+    /// The time of a transmit indication bound to the primitive, the latest read: it confirms
+    /// the send (design 8.11 `sent_evidence` `tx_indication`).
+    bound_tx: Option<VciTime>,
     /// The worker reported lost events: `Some` with the agent's clocks when the host read it, if
     /// it has a log.
     events_lost: Option<Option<AgentNow>>,
@@ -1951,6 +1980,7 @@ impl Progress {
             rejected: Vec::new(),
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
@@ -1974,6 +2004,7 @@ impl Progress {
             rejected: Vec::new(),
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
@@ -2062,6 +2093,11 @@ impl Progress {
             && is_start_indication(result)
         {
             self.bound_start = true;
+        }
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && is_tx_indication(result)
+        {
+            self.bound_tx = Some(vci_time(&item));
         }
         // A response pending the worker passed on is kept for the log (design 8.11 `pending`),
         // with the item's time and clock as the worker gave them (ADR-353).
@@ -2617,6 +2653,7 @@ mod tests {
             rejected: Vec::new(),
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -2707,6 +2744,7 @@ mod tests {
             rejected: Vec::new(),
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -3364,6 +3402,7 @@ mod tests {
         let followed = Sent {
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             ..sent(RejectedReason::WrongEcho, false)
         };
         assert!(matches!(
@@ -3415,6 +3454,8 @@ mod tests {
         // The transmit indication bound to the primitive is no start of a response; a
         // start-of-message indication bound to it is (design 8.11 `vci_did_not_end`).
         assert!(!progress.bound_start);
+        // It confirms the send, with its time (design 8.11 `sent_evidence`).
+        assert!(progress.bound_tx.is_some());
         let mut started = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
         let start = event_item::Data::ResultData(vci_service_interface::ResultData {
             rx_flag: vec![0, 0, 0, 0x02],
@@ -3594,6 +3635,7 @@ mod tests {
             rejected: Vec::new(),
             last_rejected: false,
             bound_start: false,
+            bound_tx: None,
             events_lost: None,
             agent_deadline: false,
             response_times: progress.response_times,
@@ -3653,6 +3695,7 @@ mod tests {
                 rejected: Vec::new(),
                 last_rejected: false,
                 bound_start: false,
+                bound_tx: None,
                 events_lost: None,
                 agent_deadline: false,
                 response_times: VciTimes::default(),

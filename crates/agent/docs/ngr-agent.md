@@ -441,6 +441,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   identifier (from the item's header) is the exchange's send evidence (`sent_evidence`
   `tx_indication`), unless an ended exchange on the link could still own it: one with `sent`
   `unknown`, which a late TxDone may belong to (design 8.11 `sent_evidence`, ADR-346 item 4).
+  A transmit indication bound to the request's primitive is the exchange's own: it confirms the
+  send and gives the transmit time whatever other exchange could own an unbound one, in the
+  exchange's entry and, read at job end, in its `primitive_ended` entry (`Progress::bound_tx`).
   Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
   a time on the job's one link, and the link starts no communication, so the API sends no
   tester present of its own (ISO 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1 run it only on a link

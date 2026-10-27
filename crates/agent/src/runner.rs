@@ -14988,9 +14988,19 @@ def main():
 
     /// [`reads_past_the_deadline`], writing their entries to `comm_log` as the identity reads'.
     async fn reads_past_the_deadline_logged(
+        client: WorkerClient,
+        requests: usize,
+        comm_log: Option<crate::comm_log::CommLog>,
+    ) -> Vec<Result<Vec<u8>, HostError>> {
+        reads_logged_within(client, requests, comm_log, Duration::from_millis(50)).await
+    }
+
+    /// [`reads_past_the_deadline_logged`] with the agent's deadline `send_recv` for each read.
+    async fn reads_logged_within(
         mut client: WorkerClient,
         requests: usize,
         comm_log: Option<crate::comm_log::CommLog>,
+        send_recv: Duration,
     ) -> Vec<Result<Vec<u8>, HostError>> {
         use diag_ir::DiagHost;
         let config = LinkConfig::iso15765(0x7E0, 0x7E8);
@@ -15000,7 +15010,7 @@ def main():
         let handle = tokio::runtime::Handle::current();
         let timings = Timings {
             unary: Duration::from_secs(5),
-            send_recv: Duration::from_millis(50),
+            send_recv,
         };
         tokio::task::spawn_blocking(move || {
             let mut host = WorkerHost::new(handle, client, link, timings);
@@ -15562,7 +15572,10 @@ def main():
         )
         .await;
         let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
-        let results = reads_past_the_deadline_logged(client, 1, Some(log)).await;
+        // The agent's deadline lies far past the loss (ADR-149: a margin per round trip, not a
+        // few milliseconds), so a slow runner still reads the loss before the deadline ends the
+        // wait; the loss ends the read at once.
+        let results = reads_logged_within(client, 1, Some(log), Duration::from_secs(5)).await;
         assert!(
             matches!(results[0], Err(HostError::EventsLost)),
             "{results:?}"

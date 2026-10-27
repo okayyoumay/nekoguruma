@@ -22,37 +22,52 @@ the exchanges the VCI ended.
 ## Decision
 
 1. **The log also keeps an exchange the agent's deadline ended**, with what ADR-365 keeps for
-   one the VCI ended. A late response still settles only an exchange the VCI ended.
+   one the VCI ended. A late response still settles only an exchange the VCI ended. When the
+   host cancels such a primitive before the link's next request, its end is never read, so the
+   log drops what it kept (`CommLog::release_kept`).
 2. **The host reads the primitive's end as its exchange would have.** The stray primitive
    remembers:
    - its request;
    - the answer it waits for;
-   - its entry's `seq`.
+   - its entry's `seq`, only when the agent's deadline ended the wait (a receive timeout read
+     before the deadline makes no `vci_did_not_end` entry, so nothing is settled);
+   - what the wait had read of its end before the deadline: a final response with its times,
+     and the error events.
 
-   At job end the host feeds the primitive's own items, and a lost VCI, through a fresh
-   `Progress` for that answer. The first end it reaches is the primitive's end: a response, a
-   receive timeout, a failure, a lost VCI or the finished status. The end, with its VCI times
-   and the pendings it passed on, goes to `CommLog::primitive_ended`. When the job-end wait
-   passes, the event stream ends, or an earlier cancel failed, the host records the agent's
-   cancel instead.
+   At job end the host feeds the primitive's own items, and a lost VCI, through a `Progress`
+   for that answer that starts from what the wait had read. The first end it reaches is the
+   primitive's end: a response, a receive timeout, a failure, a lost VCI or the finished
+   status. The end, with its VCI times and the pendings it passed on, goes to
+   `CommLog::primitive_ended`. An event stream that fails or ends gives the `unknown` end
+   (`events_ended`). When the job-end wait passes, or an earlier cancel failed, the host
+   cancels the primitive and records the agent's cancel only when the cancel succeeds; a
+   handle the worker no longer knows, or a cancel that fails, leaves the end unknown and writes
+   nothing.
 3. **The entry gives the end as an exchange entry gives its end.**
    - The log builds the exchange's evidence again with that end and with the new pendings
      after the kept ones.
    - The end's VCI times are placed nearest their clock's latest time, since the host reads
      them at job end.
-   - Timing is judged against the kept transmit and limits. A final response ends the exchange
-     as an owed request.
-   - The entry carries `refers_to`, `link`, `sent`, `sent_evidence`, `outcome`, `pending`,
-     `timing`, `detail`, `text` and `classification`, and `exchanges` with the exchange's
-     origin, request, classification and reason.
+   - Timing is judged against the kept transmit and limits, with the new pendings' intervals.
+     A final response ends the exchange as an owed request. The exchange is never counted as an
+     owed request its own answer could belong to.
+   - A receive timeout after a response began gives `response_incomplete`, as for an
+     exchange.
+   - The entry carries `refers_to`, `link`, `sent`, `sent_evidence`, `outcome`, `answers`,
+     `pending`, `timing`, the end's VCI times (`vci`), `detail`, `text` and `classification`,
+     and `exchanges` with the exchange's origin, request, classification and reason.
 4. **The classification.**
    - The end takes the exchange rows' classification.
-   - A window of `within_p2`, `within_p2_star` or `timeout_at_limit` makes it `system`: the job
-     gave up on an exchange that ended in time.
-   - A lost VCI or a failure of the system keeps its own row.
-   - The `vci_did_not_end` entry's classification is not carried over. Its `system` row
-     (ADR-364's single-frame bound) inferred that no response was under way, and the
-     primitive's end replaces that inference.
+   - A final response is `system` whatever its time: within the limit in force the job gave up
+     on an exchange that ended in time, and after it the late row is `system` too, so a time
+     that cannot be judged changes nothing.
+   - A receive timeout at the limit (`timeout_at_limit`) is `system` for the same reason.
+   - Any other end keeps its row: a lost VCI, a failure of the system, a link error, a timeout
+     early or late.
+   - The `vci_did_not_end` entry's `system` row rests on the VCI's own clock past its limits
+     with no response under way. An end that shows no response under way at that reading (a
+     link error, a lost VCI, a timeout) does not refute it, so `system` stands; a final response
+     is `system` anyway.
 5. **The agent's cancel settles nothing.** The entry has `cancelled_by_agent` true and no
    `outcome` or `timing`. The exchange keeps its classification.
 
@@ -62,5 +77,7 @@ the exchanges the VCI ended.
   `unattached`; that path is left to its own backlog item.
 - The host takes no read time for the end's items at job end, so a pending's agent time is
   the time the host wrote the entry.
+- The rejected results of the primitive and a rejected result that ends it
+  (`positive_unusable`, ADR-359) are not carried into the entry.
 - A start-of-message indication the primitive gives at job end is not taken as its response's
   start, as for a bound indication during an exchange.

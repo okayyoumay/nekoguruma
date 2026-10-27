@@ -14367,6 +14367,8 @@ def main():
         Lose,
         /// A positive response to `22 F1 90` with VCI time 600 ms, then the finished status.
         Respond,
+        /// The same response, and the finished status 150 ms after it.
+        RespondThenFinishLater,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14610,7 +14612,7 @@ def main():
                         cll_handle: 1,
                         cop_handle,
                     };
-                    if let StartEvent::Respond = event
+                    if let StartEvent::Respond | StartEvent::RespondThenFinishLater = event
                         && let Some(sender) = &sender
                     {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14628,8 +14630,13 @@ def main():
                             ..Default::default()
                         }));
                     }
+                    if let StartEvent::RespondThenFinishLater = event {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
                     let data = match event {
-                        StartEvent::Finish | StartEvent::Respond => {
+                        StartEvent::Finish
+                        | StartEvent::Respond
+                        | StartEvent::RespondThenFinishLater => {
                             EventData::Item(vci_service_interface::EventItem {
                                 cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
                                     module_handle: 1,
@@ -15031,9 +15038,18 @@ def main():
     /// job end is recorded as cancelled.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_primitive_that_ends_at_job_end_is_logged_as_primitive_ended() {
+        // A response after the deadline, one read before it with its finished status after it,
+        // and none (the agent cancels the primitive).
         for (on_start, cancelled) in [
             (
                 Some((Duration::from_millis(150), StartEvent::Respond)),
+                false,
+            ),
+            (
+                Some((
+                    Duration::from_millis(10),
+                    StartEvent::RespondThenFinishLater,
+                )),
                 false,
             ),
             (None, true),
@@ -15082,6 +15098,7 @@ def main():
             assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
             if !cancelled {
                 assert_eq!(ended["outcome"]["result"], "positive", "{ended}");
+                assert_eq!(ended["classification"], "system", "{ended}");
             }
             std::fs::remove_dir_all(&dir).unwrap();
         }

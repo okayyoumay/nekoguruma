@@ -193,7 +193,7 @@ enum Event<'a> {
     Identity(Identity),
     Unattached(UnattachedEntry<'a>),
     LateResponse(LateResponseEntry<'a>),
-    PrimitiveEnded(PrimitiveEndedEntry),
+    PrimitiveEnded(Box<PrimitiveEndedEntry>),
     ClockEpoch(clocks::ClockEpoch),
 }
 
@@ -499,6 +499,11 @@ struct PrimitiveEndedEntry {
     sent_evidence: Option<exchange::SentEvidence>,
     #[serde(skip_serializing_if = "Option::is_none")]
     outcome: Option<exchange::Outcome>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    answers: Vec<exchange::AnswerItem>,
+    /// The VCI times of the end, which `timing` was judged from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    vci: Option<exchange::VciTimes>,
     #[serde(skip_serializing_if = "Vec::is_empty")]
     pending: Vec<exchange::Pending>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1532,6 +1537,15 @@ impl CommLog {
         Some(seq)
     }
 
+    /// Drops what the log kept of the exchange logged as `seq`, which nothing will settle: its
+    /// primitive was cancelled before the link's next request.
+    pub(crate) fn release_kept(&self, seq: u64) {
+        let mut inner = self.lock();
+        for (_, state) in &mut inner.links {
+            state.release_kept(seq);
+        }
+    }
+
     /// Writes the `primitive_ended` settling entry of the exchange logged as `seq`, whose
     /// primitive the agent stopped waiting for, from how it ended at job end (design 8.11
     /// "Settlement", ADR-366). The entry's `seq`; `None` when the log keeps no such exchange,
@@ -1552,13 +1566,15 @@ impl CommLog {
             .position(|(_, state)| state.kept(seq).is_some())?;
         let kept = inner.links[at].1.kept(seq)?.clone();
         let Some(end) = ended.end else {
-            let event = Event::PrimitiveEnded(PrimitiveEndedEntry {
+            let event = Event::PrimitiveEnded(Box::new(PrimitiveEndedEntry {
                 refers_to: vec![seq],
                 link: kept.evidence.link,
                 cancelled_by_agent: true,
                 sent: None,
                 sent_evidence: None,
                 outcome: None,
+                answers: Vec::new(),
+                vci: None,
                 pending: Vec::new(),
                 timing: None,
                 detail: ended.detail,
@@ -1574,41 +1590,61 @@ impl CommLog {
                     "The agent cancelled the primitive of the exchange logged as {seq} at job end."
                 ),
                 classification: kept.classification,
-            });
+            }));
             return inner.append_with(|seq, line| {
                 serde_json::to_writer(line, &Line { seq, event: &event })
             });
         };
+        let observed = kept.evidence.vci_limits_past_by_us.is_some();
         let mut evidence = kept.evidence.clone();
         evidence.end = end;
         evidence.detail = ended.detail;
         evidence.vci_ended = ended.vci_ended;
         evidence.vci_limits_past_by_us = None;
+        // A response that began and did not complete, as an exchange's end gives it.
+        if evidence.vci_ended
+            && evidence.response_started
+            && matches!(evidence.end, exchange::End::NoResponse)
+        {
+            evidence.end = exchange::End::ResponseIncomplete;
+        }
         // The end's times, read at job end, are placed nearest their clock's latest time.
         let mut vci = ended.vci;
-        for time in [
-            &mut vci.tx_done,
-            &mut vci.rx_start,
-            &mut vci.rx_end,
-            &mut vci.rx_timeout,
-            &mut vci.error,
-        ]
-        .into_iter()
-        .flatten()
+        for time in [&mut vci.rx_end, &mut vci.rx_timeout, &mut vci.error]
+            .into_iter()
+            .flatten()
         {
             *time = time.at(inner.place_unread(time.clock, time.us, now)?);
         }
+        // The transmit done and start the response's item carries come at or before its end.
+        let anchor = vci.rx_end.and_then(|end| end.placed());
+        for time in [&mut vci.tx_done, &mut vci.rx_start].into_iter().flatten() {
+            let placed = match anchor {
+                Some((clock, anchor)) if time.clock == Some(clock) => {
+                    Some(clocks::before(anchor, time.us))
+                }
+                _ => inner.place_unread(time.clock, time.us, now)?,
+            };
+            *time = time.at(placed);
+        }
         let mut pendings = kept.pendings.clone();
+        let mut placed_all: Vec<Option<clocks::Placed>> = kept
+            .pendings
+            .iter()
+            .map(|at| at.map(|(_, placed)| placed))
+            .collect();
         for mut pending in ended.pending {
             let placed =
                 inner.place_unread(pending.clock, pending.vci_us.unwrap_or_default(), now)?;
             pending.epoch = placed.map(|placed| placed.epoch);
             pendings.push(pending.clock.zip(placed));
+            placed_all.push(placed);
             evidence.pending.push(pending);
         }
         let transmit = kept
             .transmit
             .or_else(|| vci.tx_done.and_then(|time| time.placed()));
+        exchange::pending_intervals(&mut evidence.pending, &placed_all, transmit);
         if let Some(limits) = kept.limits {
             let response_may_have_begun = evidence.response_started || !limits.start_indications;
             evidence.timing = timing::judge(
@@ -1630,11 +1666,13 @@ impl CommLog {
         if final_response {
             state.settle_owed(seq);
         }
-        let history = state.history_for(&evidence);
+        let history = state.history_settling(&evidence, seq);
         let link = evidence.link;
+        evidence.times.vci = (!vci.is_empty()).then_some(vci);
+        let times = evidence.times.vci;
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
-        let (classification, reason) = exchange::settle_primitive_ended(&entry);
-        let event = Event::PrimitiveEnded(PrimitiveEndedEntry {
+        let (classification, reason) = exchange::settle_primitive_ended(&entry, observed);
+        let event = Event::PrimitiveEnded(Box::new(PrimitiveEndedEntry {
             refers_to: vec![seq],
             link,
             cancelled_by_agent: false,
@@ -1645,6 +1683,8 @@ impl CommLog {
                 entry.text
             ),
             outcome: Some(entry.outcome),
+            answers: entry.answers,
+            vci: times,
             pending: entry.pending,
             timing: Some(entry.timing),
             detail: entry.detail,
@@ -1657,7 +1697,7 @@ impl CommLog {
                 reason,
             }],
             classification,
-        });
+        }));
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -4372,7 +4412,7 @@ mod tests {
             entry["exchanges"][0]["reason"]
                 .as_str()
                 .unwrap()
-                .contains("ended in time"),
+                .contains("gave up"),
             "{entry}"
         );
         assert_eq!(entry["exchanges"][0]["request"]["sid"], "0x22", "{entry}");
@@ -4409,6 +4449,43 @@ mod tests {
         };
         let (_, entry) = settled(lost);
         assert_eq!(entry.unwrap()["classification"], "undetermined");
+        // A response whose time cannot be judged: `system` too, since late it would be.
+        let mut unclocked = response(500_000);
+        unclocked.vci.rx_end = Some(exchange::VciTime::new(510_500, None));
+        let (_, entry) = settled(unclocked);
+        let entry = entry.unwrap();
+        assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
+        assert_eq!(entry["classification"], "system", "{entry}");
+        // A pending, then a link error: no owed request of its own.
+        let pending_then_error = PrimitiveEnded {
+            end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+            detail: exchange::Detail::default(),
+            pending: vec![exchange::Pending {
+                vci_us: Some(10_500 + 400_000),
+                clock: Some(exchange::Clock::Device),
+                epoch: None,
+                agent_us: 0,
+                since_previous_ms: None,
+            }],
+            vci: exchange::VciTimes {
+                error: Some(device(10_500 + 900_000)),
+                ..exchange::VciTimes::default()
+            },
+            vci_ended: false,
+        };
+        let (_, entry) = settled(pending_then_error);
+        let entry = entry.unwrap();
+        assert!(
+            !entry["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("earlier request"),
+            "{entry}"
+        );
+        assert!(
+            entry["pending"][0]["since_previous_ms"].is_number(),
+            "{entry}"
+        );
         // The agent's cancel settles nothing: the exchange keeps its classification.
         let cancelled = PrimitiveEnded {
             end: None,

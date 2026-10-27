@@ -492,6 +492,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         // Its items are read as its exchange's were, so its end is the one the exchange would
         // have had (design 8.11 `primitive_ended`).
         let mut progress = Progress::expecting(stray.expectation.clone());
+        progress.response.clone_from(&stray.response);
+        progress.response_times = stray.response_times;
+        progress.error = stray.error;
+        progress.errors.clone_from(&stray.errors);
+        // `Some(None)` when the event stream failed or ended, `None` when the wait passed.
         let ended = if stray.cancel_failed {
             None
         } else {
@@ -505,10 +510,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                                     && (item.cop_handle == Some(cop) || ends_primitive(&item, cop))
                                     && let Some(result) = progress.on_event(item, cop)
                                 {
-                                    return Some(result);
+                                    return Some(Some(result));
                                 }
                             }
-                            Ok(None) | Err(_) => return None,
+                            Ok(None) | Err(_) => return Some(None),
                         }
                     }
                 })
@@ -516,9 +521,13 @@ impl<C: WorkerApi> WorkerHost<C> {
                 .unwrap_or(None)
             })
         };
-        self.log_primitive_end(&stray, &progress, ended.as_ref());
-        if ended.is_some() {
-            return;
+        match &ended {
+            Some(Some(result)) => {
+                self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(result));
+                return;
+            }
+            Some(None) => self.log_primitive_end(&stray, &progress, JobEndEnd::StreamEnded),
+            None => {}
         }
         let cancelled = handle.block_on(unary(
             self.timings.unary,
@@ -528,7 +537,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             }),
         ));
         match cancelled.map_err(lost_vci_between_primitives) {
-            Ok(_) | Err(HostError::VciLost) => {}
+            // Only a cancel the worker carried out is the agent's: one whose handle had ended,
+            // or that failed, leaves the end unknown and the exchange as it was.
+            Ok(_) if ended.is_none() => {
+                self.log_primitive_end(&stray, &progress, JobEndEnd::Cancelled)
+            }
+            Ok(_) => {}
+            Err(HostError::VciLost) => {}
             Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => {}
             Err(error) => tracing::warn!(
                 error = %crate::oplog::LogSafe::log_text(&error),
@@ -540,17 +555,19 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// Writes the `primitive_ended` entry of `stray`'s exchange, when its entry was written: its
     /// end as `progress` read it, or the agent's cancel when `ended` is `None` (design 8.11
     /// "Settlement", ADR-366).
-    fn log_primitive_end(
-        &self,
-        stray: &Stray,
-        progress: &Progress,
-        ended: Option<&Result<Vec<u8>, HostError>>,
-    ) {
+    fn log_primitive_end(&self, stray: &Stray, progress: &Progress, ended: JobEndEnd<'_>) {
         let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) else {
             return;
         };
         let primitive = match ended {
-            Some(result) => {
+            JobEndEnd::StreamEnded => crate::comm_log::PrimitiveEnded {
+                end: Some(End::Unknown(UnknownCause::EventsEnded)),
+                detail: Detail::default(),
+                pending: Vec::new(),
+                vci: VciTimes::default(),
+                vci_ended: false,
+            },
+            JobEndEnd::Ended(result) => {
                 let (end, detail) = sent_end(
                     &stray.request,
                     result,
@@ -592,7 +609,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     vci_ended: progress.rx_timeout.is_some(),
                 }
             }
-            None => crate::comm_log::PrimitiveEnded {
+            JobEndEnd::Cancelled => crate::comm_log::PrimitiveEnded {
                 end: None,
                 detail: Detail::default(),
                 pending: Vec::new(),
@@ -741,7 +758,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 agent_us: read.monotonic_us,
                 notifications: 1,
             });
-            let started = sent.started;
+            let agent_deadline = sent.agent_deadline;
             let seq = self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.pending = pending;
                 evidence.rejected = rejected;
@@ -756,7 +773,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             });
             // The primitive left running belongs to this entry, which its end settles.
             if let Some(stray) = &mut self.stray
-                && started
+                && agent_deadline
                 && stray.seq.is_none()
             {
                 stray.seq = seq;
@@ -815,6 +832,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                     });
                     return Sent::not_started(Err(HostError::LinkHeld));
                 }
+            }
+            // Its end is not read at job end, so what the log kept for it is not needed.
+            if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
+                log.release_kept(seq);
             }
         }
         // One deadline from the request to the end of the primitive.
@@ -918,6 +939,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                     negative: progress.negative.clone(),
                 },
                 seq: None,
+                response: progress.response.clone(),
+                response_times: progress.response_times,
+                error: progress.error,
+                errors: progress.errors.clone(),
             });
         }
         let result = waited
@@ -1226,8 +1251,25 @@ struct Stray {
     /// Its request, and the answer it waits for, so its end can be read as its exchange's.
     request: Vec<u8>,
     expectation: crate::send_receive::Expectation,
-    /// The `seq` of its exchange's entry, when one was written (design 8.11 `primitive_ended`).
+    /// The `seq` of its exchange's entry, when one was written (design 8.11 `primitive_ended`):
+    /// only for an exchange the agent's deadline ended.
     seq: Option<u64>,
+    /// What the wait had read of its end before the deadline: a final response and its times,
+    /// and the error events, so its end at job end is read on from there.
+    response: Option<Vec<u8>>,
+    response_times: VciTimes,
+    error: Option<i32>,
+    errors: Vec<ErrorSeen>,
+}
+
+/// How a stray primitive's wait at job end ended ([`WorkerHost::settle_at_end`]).
+enum JobEndEnd<'a> {
+    /// It ended, as its exchange's wait would have read it.
+    Ended(&'a Result<Vec<u8>, HostError>),
+    /// The event stream failed or ended before it did.
+    StreamEnded,
+    /// The agent cancelled it.
+    Cancelled,
 }
 
 /// Whether `item` shows that the primitive `cop` has ended: its own finished or cancelled

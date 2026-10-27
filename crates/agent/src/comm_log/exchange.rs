@@ -1382,6 +1382,20 @@ impl LinkState {
         self.kept.get(&seq)
     }
 
+    /// Drops what is kept of exchange `seq`, which nothing will settle.
+    pub(crate) fn release_kept(&mut self, seq: u64) {
+        self.kept.remove(&seq);
+    }
+
+    /// The history of `evidence`, an exchange's evidence that a settling entry for exchange
+    /// `seq` gives: the exchange is not an owed request its own answer could belong to.
+    pub(crate) fn history_settling(&self, evidence: &Evidence, seq: u64) -> LinkHistory {
+        let mut history = self.history_for(evidence);
+        history.owners.retain(|owner| *owner != seq);
+        history.owed_matching = history.owners.len() as u32;
+        history
+    }
+
     /// Exchange `seq` got its final response: it is owed no more, and what was kept of it is
     /// given back.
     pub(crate) fn settle_owed(&mut self, seq: u64) -> Option<Kept> {
@@ -1895,18 +1909,34 @@ pub(crate) fn settle_late_response(
 /// as if the agent had waited for it, except that an end within the limit in force is `system`,
 /// since the job gave up on an exchange that ended in time. A lost VCI and a failure of the
 /// system keep their own rows.
-pub(crate) fn settle_primitive_ended(entry: &ExchangeEntry) -> (Classification, String) {
-    let in_time = matches!(
-        entry.timing.window,
-        Window::WithinP2 | Window::WithinP2Star | Window::TimeoutAtLimit
+///
+/// A final response is `system` whatever its time: within the limit the job gave up on it, and
+/// after it the late row is `system` too. `observed` is the earlier entry's `system` that
+/// rested on the VCI's own clock past its limits, which an end that shows no response under way
+/// at that reading does not refute.
+pub(crate) fn settle_primitive_ended(
+    entry: &ExchangeEntry,
+    observed: bool,
+) -> (Classification, String) {
+    let final_response = matches!(
+        entry.outcome,
+        Outcome::Positive { .. } | Outcome::PositiveUnusable { .. } | Outcome::Negative { .. }
     );
-    let own_row = matches!(entry.outcome, Outcome::VciLost | Outcome::Unknown { .. });
-    if in_time && !own_row {
+    if final_response || entry.timing.window == Window::TimeoutAtLimit {
         return (
             Classification::System,
             format!(
-                "The exchange ended within the limit in force after the agent had stopped waiting for it: the job gave up on an exchange that ended in time. {}",
+                "The exchange ended after the agent had stopped waiting for it, with a response or at the limit in force: the job gave up on an exchange that ended. {}",
                 entry.text
+            ),
+        );
+    }
+    if observed && entry.classification != Classification::System {
+        return (
+            Classification::System,
+            format!(
+                "{} The VCI's clock, read when the agent stopped waiting, had shown it past its own limits with no response under way, which this end does not refute.",
+                entry.reason
             ),
         );
     }
@@ -3002,6 +3032,35 @@ mod tests {
         );
         assert_eq!(class, Classification::System);
         assert!(reason.contains("stands"), "{reason}");
+    }
+
+    #[test]
+    fn a_primitive_end_keeps_an_observed_fault() {
+        // A link error after the VCI's clock showed its own limits past: the end does not
+        // refute that, so `system` stands.
+        let entry = ExchangeEntry::build(
+            1,
+            evidence(&READ_F186, End::LinkError(LinkErrorKind::Receive)),
+            LinkHistory::empty(),
+        );
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert_eq!(
+            settle_primitive_ended(&entry, false).0,
+            Classification::Undetermined
+        );
+        let (class, reason) = settle_primitive_ended(&entry, true);
+        assert_eq!(class, Classification::System);
+        assert!(reason.contains("does not refute"), "{reason}");
+        // A final response is `system` whatever its time.
+        let positive = ExchangeEntry::build(
+            1,
+            forwarding(evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]))),
+            LinkHistory::empty(),
+        );
+        assert_eq!(
+            settle_primitive_ended(&positive, false).0,
+            Classification::System
+        );
     }
 
     #[test]

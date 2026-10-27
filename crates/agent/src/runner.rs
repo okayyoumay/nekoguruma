@@ -15317,17 +15317,35 @@ def main():
     /// its exchange as it was.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_primitive_that_ends_before_the_next_request_is_logged_as_primitive_ended() {
-        // A response after the deadline, queued before the next request; no end, the cancel
-        // carried out; no end, the handle had ended.
-        for (on_start, cancel, cancelled) in [
+        // A response after the deadline, queued before the next request; a response before
+        // it with its finished status after; lost events, which end the next exchange too;
+        // no end, the cancel carried out; no end, the handle had ended.
+        for (on_start, cancel, cancelled, outcome) in [
             (
                 Some((Duration::from_millis(150), StartEvent::Respond)),
                 CancelAnswer::InvalidHandle,
                 Some(false),
+                Some("positive"),
             ),
-            (None, CancelAnswer::Done, Some(true)),
-            (None, CancelAnswer::InvalidHandle, None),
+            (
+                Some((
+                    Duration::from_millis(10),
+                    StartEvent::RespondThenFinishLater,
+                )),
+                CancelAnswer::InvalidHandle,
+                Some(false),
+                Some("positive"),
+            ),
+            (
+                Some((Duration::from_millis(150), StartEvent::Lose)),
+                CancelAnswer::Done,
+                Some(false),
+                Some("unknown"),
+            ),
+            (None, CancelAnswer::Done, Some(true), None),
+            (None, CancelAnswer::InvalidHandle, None, None),
         ] {
+            let lost = matches!(on_start, Some((_, StartEvent::Lose)));
             let dir = journal_dir("primitive-ended-next");
             let (mut client, fake) = fake_worker_starting_with(cancel, on_start).await;
             let log =
@@ -15353,7 +15371,11 @@ def main():
                 // The first primitive's end, if any, is on the stream before the next request.
                 std::thread::sleep(Duration::from_millis(300));
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
-                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                if lost {
+                    assert!(matches!(second, Err(HostError::EventsLost)), "{second:?}");
+                } else {
+                    assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                }
                 host.settle_at_end();
             })
             .await
@@ -15386,8 +15408,10 @@ def main():
                 "{lines:?}"
             );
             assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
-            if !cancelled {
-                assert_eq!(ended["outcome"]["result"], "positive", "{ended}");
+            if let Some(outcome) = outcome {
+                assert_eq!(ended["outcome"]["result"], outcome, "{ended}");
+            }
+            if outcome == Some("positive") {
                 assert_eq!(ended["classification"], "system", "{ended}");
             }
             assert!(

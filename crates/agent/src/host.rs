@@ -589,13 +589,16 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// deadline, else the agent's cancel when the worker carried it out. A primitive that had
     /// ended (its handle invalid) or that a lost VCI ended, with no end read, keeps its
     /// exchange's classification. What the log kept for the exchange is then released, since
-    /// nothing else settles it.
-    fn settle_cancelled(&self, settling: Settling, stream_failed: bool) {
+    /// nothing else settles it. Returns the results and errors read for it that no entry
+    /// carries (its end was not read), which stay the exchange in flight's `unattached` items
+    /// of an earlier primitive, as before.
+    fn settle_cancelled(&self, settling: Settling, stream_failed: bool) -> Vec<Unbound> {
         let Settling {
             stray,
             progress,
             carried_out,
             end,
+            items,
         } = settling;
         let end = match end {
             Some(end) => Some(end),
@@ -606,18 +609,21 @@ impl<C: WorkerApi> WorkerHost<C> {
                 None => None,
             },
         };
-        match &end {
+        let left = match &end {
             Some(SettlingEnd::Ended(result)) => {
                 self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                Vec::new()
             }
             Some(SettlingEnd::Cancelled) => {
                 self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled);
+                items
             }
-            None => {}
-        }
+            None => items,
+        };
         if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
             log.release_kept(seq);
         }
+        left
     }
 
     /// Writes the `primitive_ended` entry of `stray`'s exchange, when its entry was written: its
@@ -939,6 +945,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     stray,
                     carried_out,
                     end: None,
+                    items: Vec::new(),
                 });
             }
         }
@@ -965,6 +972,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             Ok(cop) => cop,
             Err(error) => {
                 if let Some(settling) = settling {
+                    // No wait read anything for it.
                     self.settle_cancelled(settling, false);
                 }
                 return Sent::not_started(Err(error));
@@ -995,7 +1003,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                     .as_mut()
                     .filter(|settling| settling.takes(&notification.event_data))
                 {
-                    settling.read(notification.event_data.clone());
+                    let read = log.filter(|log| log.is_open()).map(|log| log.now());
+                    settling.read(notification.event_data.clone(), read);
                     if !shared_end(&notification.event_data) {
                         continue;
                     }
@@ -1048,7 +1057,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                         ..
                     }))
             );
-            self.settle_cancelled(settling, stream_failed);
+            let left = self.settle_cancelled(settling, stream_failed);
+            progress.unbound.extend(left);
         }
         // A receive timeout the worker already reported ended the VCI's wait, even when the
         // primitive's end had not been read before the deadline.
@@ -1431,6 +1441,9 @@ struct Settling {
     carried_out: bool,
     /// Its end, once read.
     end: Option<SettlingEnd>,
+    /// Its results and error events read, with when the host read them: the exchange in
+    /// flight's `unattached` items when no end of it is written.
+    items: Vec<Unbound>,
 }
 
 /// How a [`Settling`] primitive ended.
@@ -1456,10 +1469,23 @@ impl Settling {
             }
     }
 
-    /// Reads one of its notifications. Its cancelled status ends it with the end read before,
-    /// as at job end, else as the agent's cancel; any other end is the one its exchange's wait
-    /// would have read.
-    fn read(&mut self, data: Option<event_notification::EventData>) {
+    /// Reads one of its notifications, read by the host at `read`. Its cancelled status ends
+    /// it with the end read before, as the job end's cancel does, else, when the worker carried
+    /// out the agent's cancel, as that cancel; any other end, and a cancelled status the agent's
+    /// cancel did not give, is the one its exchange's wait would have read.
+    fn read(&mut self, data: Option<event_notification::EventData>, read: Option<AgentNow>) {
+        if let Some(event_notification::EventData::Item(item)) = &data
+            && item.cop_handle == Some(self.stray.cop)
+            && matches!(
+                item.data,
+                Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_))
+            )
+        {
+            self.items.push(Unbound {
+                item: item.clone(),
+                read,
+            });
+        }
         let cancelled = matches!(
             &data,
             Some(event_notification::EventData::Item(EventItem {
@@ -1471,8 +1497,8 @@ impl Settling {
         if let Some(result) = self.progress.on_notification(data, self.stray.cop) {
             self.end = Some(match (cancelled, read_before) {
                 (true, Some(result)) => SettlingEnd::Ended(result),
-                (true, None) => SettlingEnd::Cancelled,
-                (false, _) => SettlingEnd::Ended(result),
+                (true, None) if self.carried_out => SettlingEnd::Cancelled,
+                _ => SettlingEnd::Ended(result),
             });
         }
     }
@@ -3659,7 +3685,7 @@ mod tests {
     /// and its cancelled status with the end read before it, else as the agent's cancel.
     #[test]
     fn a_primitive_cancelled_before_the_next_request_ends_on_its_own_items() {
-        let settling = || {
+        let carrying = |carried_out| {
             let progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
             let stray = Stray {
                 cop: COP,
@@ -3680,10 +3706,12 @@ mod tests {
             Settling {
                 progress: stray.progress(),
                 stray,
-                carried_out: true,
+                carried_out,
                 end: None,
+                items: Vec::new(),
             }
         };
+        let settling = || carrying(true);
         let item = |cop, data| Some(event_notification::EventData::Item(event(cop, data)));
         let other = ComPrimitiveHandle {
             cop_handle: COP.cop_handle + 1,
@@ -3712,9 +3740,9 @@ mod tests {
         // A response, then the finished or the cancelled status: the response ends it.
         for end in [finished.clone(), cancelled.clone()] {
             let mut responded = settling();
-            responded.read(item(Some(COP), result(&[0x62, 0xF1, 0x90, 0x41])));
+            responded.read(item(Some(COP), result(&[0x62, 0xF1, 0x90, 0x41])), None);
             assert!(responded.end.is_none(), "a response alone does not end it");
-            responded.read(item(Some(COP), end));
+            responded.read(item(Some(COP), end), None);
             assert!(
                 matches!(&responded.end, Some(SettlingEnd::Ended(Ok(bytes))) if bytes == &[0x62, 0xF1, 0x90, 0x41]),
             );
@@ -3726,16 +3754,49 @@ mod tests {
         // The cancelled status alone is the agent's cancel; the finished status alone, no
         // response.
         let mut cancel = settling();
-        cancel.read(item(Some(COP), cancelled));
+        cancel.read(item(Some(COP), cancelled.clone()), None);
         assert!(matches!(cancel.end, Some(SettlingEnd::Cancelled)));
+        // A cancelled status the agent's cancel did not give (the handle had ended) is no
+        // cancel of the agent's: it ends the primitive as its exchange's wait would have.
+        let mut not_ours = carrying(false);
+        not_ours.read(item(Some(COP), cancelled), None);
+        assert!(matches!(
+            not_ours.end,
+            Some(SettlingEnd::Ended(Err(HostError::NoResponse)))
+        ));
+        // Its own results and errors are kept, for the exchange in flight when no end of it
+        // is written; its status and a lost VCI of no primitive are not.
+        let mut kept = settling();
+        kept.read(item(Some(COP), result(&[0x62, 0xF1, 0x91])), None);
+        kept.read(
+            item(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtRxError as i32,
+                    ..ErrorData::default()
+                }),
+            ),
+            None,
+        );
+        kept.read(
+            item(
+                None,
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+                    ..ErrorData::default()
+                }),
+            ),
+            None,
+        );
+        assert_eq!(kept.items.len(), 2);
         let mut silent = settling();
-        silent.read(item(Some(COP), finished));
+        silent.read(item(Some(COP), finished), None);
         assert!(matches!(
             silent.end,
             Some(SettlingEnd::Ended(Err(HostError::NoResponse)))
         ));
         let mut gone = settling();
-        gone.read(lost);
+        gone.read(lost, None);
         assert!(matches!(
             gone.end,
             Some(SettlingEnd::Ended(Err(HostError::EventsLost)))

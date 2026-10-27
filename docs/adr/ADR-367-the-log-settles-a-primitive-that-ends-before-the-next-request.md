@@ -34,7 +34,9 @@ that request, and that a cancellation before it is recorded too.
    `exchange::settle_primitive_ended`):
    - its finished status, a lost VCI or lost events end it as its exchange's wait would have;
    - its cancelled status ends it with the end read before it (a final response or a receive
-     timeout), as the job-end wait does; with none, it is the agent's cancel;
+     timeout), as a wait that passes before the job end's cancel does. With none, it is the
+     agent's cancel when the worker carried that cancel out; otherwise the status ends it as
+     its exchange's wait would have read it, since the agent's cancel did not give it;
    - when the next exchange's wait ends first:
      - an event stream that failed or ended gives the `unknown` end;
      - else the end read so far settles it;
@@ -45,7 +47,9 @@ that request, and that a cancellation before it is recorded too.
 3. **When the entry is written.** It is written when the next exchange's wait is over, before
    that exchange's entry. A request whose primitive does not start writes it at once.
    Afterwards the log releases what it kept for the exchange. Later items of the primitive
-   are logged `unattached` with `primitive` `earlier`, as before.
+   are logged `unattached` with `primitive` `earlier`, as before. So are its results and
+   errors read during the wait when no end of it is written, or only the agent's cancel, so
+   none is lost.
 4. **A handle given again.** When the library gives the next primitive the cancelled one's
    handle, the items cannot be told apart. The cancelled primitive is then settled at once,
    with what was read before its deadline, and its items are taken as the new primitive's.
@@ -58,4 +62,6 @@ that request, and that a cancellation before it is recorded too.
   8.11 lists it. Like a cancel at job end, it settles nothing.
 - The end is read only within the next exchange's wait. An end that arrives after that wait,
   or after the cancelled status, is still written `unattached`.
-- The primitive's items get no read time, as at job end (ADR-366 Consequences).
+- An end that is written carries what the job end's entry carries. As there (ADR-366
+  Consequences), its rejected results and a start-of-message bound to it are not carried, and
+  its pendings get the time the host wrote the entry as their agent time.

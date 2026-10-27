@@ -2496,14 +2496,43 @@ mod tests {
 
     static NEXT_DIR: AtomicU64 = AtomicU64::new(0);
 
+    /// A directory of the test's own, which no earlier process used: a log found in one would
+    /// be continued (`CommLog::open`), and a process ID is reused once its process has ended.
     fn dir() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
+        let started = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        loop {
+            let dir = std::env::temp_dir().join(format!(
+                "ngr-comm-log-{}-{started}-{}",
+                std::process::id(),
+                NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            ));
+            match std::fs::create_dir(&dir) {
+                Ok(()) => return dir,
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+                Err(error) => panic!("{}: {error}", dir.display()),
+            }
+        }
+    }
+
+    /// The test directory is new and empty, also when an earlier process left one behind
+    /// under the same process ID.
+    #[test]
+    fn a_test_directory_is_new_and_empty() {
+        let stale = std::env::temp_dir().join(format!(
             "ngr-comm-log-{}-{}",
             std::process::id(),
-            NEXT_DIR.fetch_add(1, Ordering::Relaxed)
+            NEXT_DIR.load(Ordering::Relaxed)
         ));
-        std::fs::create_dir_all(&dir).unwrap();
-        dir
+        std::fs::create_dir_all(&stale).unwrap();
+        std::fs::write(stale.join("left-behind"), b"").unwrap();
+        let fresh = dir();
+        assert_ne!(fresh, stale);
+        assert!(std::fs::read_dir(&fresh).unwrap().next().is_none());
+        std::fs::remove_dir_all(&stale).unwrap();
+        std::fs::remove_dir_all(&fresh).unwrap();
     }
 
     fn setup(dir: &std::path::Path) -> CommLogSetup {

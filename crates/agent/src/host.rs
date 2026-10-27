@@ -4088,6 +4088,43 @@ mod tests {
         assert!(progress.unbound.is_empty());
     }
 
+    /// Design 8.11 "Link error": the log's form of an unbound error event names the kind of
+    /// link error it is, except for a receive timeout, an outcome, and a lost VCI.
+    #[test]
+    fn an_unbound_error_names_its_link_error_kind_unless_it_is_none() {
+        let error = |code: PduErrorEvent| Unbound {
+            item: event(
+                None,
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: code as i32,
+                    ..ErrorData::default()
+                }),
+            ),
+            read: None,
+        };
+        let kinds: Vec<_> = unattached_items(&[
+            error(PduErrorEvent::PduErrEvtRxError),
+            error(PduErrorEvent::PduErrEvtVciHardwareFault),
+            error(PduErrorEvent::PduErrEvtRxTimeout),
+            error(PduErrorEvent::PduErrEvtLostCommToVci),
+        ])
+        .into_iter()
+        .map(|item| match item.data {
+            UnattachedData::Error { link_error, .. } => link_error,
+            UnattachedData::Result { .. } => panic!("an error"),
+        })
+        .collect();
+        assert_eq!(
+            kinds,
+            [
+                Some(LinkErrorKind::Receive),
+                Some(LinkErrorKind::VciHardwareFault),
+                None,
+                None
+            ]
+        );
+    }
+
     /// The log's form of the unbound items takes a result's CAN identifier from its four header
     /// bytes, and none from a header of another length.
     #[test]

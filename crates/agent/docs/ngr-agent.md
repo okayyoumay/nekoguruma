@@ -485,7 +485,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   owed no more. A response two or more exchanges could own stays `unattached`, followed by a
   `late_response` that chooses no owner and raises each owed one that could own it to at least
   `undetermined`; the exchange in flight that could own it is at least `undetermined` too. Every other
-  item is an `unattached` event, written in
+  item is an `unattached` event, except a link error of no primitive read during the exchange
+  (not a receive timeout or a lost VCI) whose VCI time is not before the exchange's earliest one,
+  or cannot be set against it: that is a link error of the exchange itself. The others are
+  `unattached` events, written in
   the order read and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header
   is not a plain 4-byte CAN identifier (extended or mixed addressing), which therefore never

@@ -192,6 +192,7 @@ enum Event<'a> {
     LinkOpened(LinkOpened<'a>),
     Identity(Identity),
     Unattached(UnattachedEntry<'a>),
+    LateResponse(LateResponseEntry<'a>),
     ClockEpoch(clocks::ClockEpoch),
 }
 
@@ -452,6 +453,44 @@ struct UnattachedEntry<'a> {
     extra_error_info: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     extra_error_info_name: Option<&'a str>,
+}
+
+/// A `late_response` settling entry (design 8.11 "Settlement", ADR-365): the response, as an
+/// `unattached` event would give it, the exchange it settles, and that exchange's new
+/// classification.
+#[derive(Serialize)]
+struct LateResponseEntry<'a> {
+    refers_to: Vec<u64>,
+    #[serde(flatten)]
+    response: UnattachedEntry<'a>,
+    exchanges: Vec<Settled>,
+    text: String,
+    classification: exchange::Classification,
+}
+
+/// An exchange a settling entry settles, with what it carries so it can be read without the
+/// earlier entry.
+#[derive(Serialize)]
+struct Settled {
+    seq: u64,
+    link: u32,
+    origin: exchange::Origin,
+    request: exchange::Request,
+    classification: exchange::Classification,
+    reason: String,
+}
+
+/// Whether a result item is a message another node sent, not an indication, a copy of a sent
+/// message or a break (RxFlag byte 3).
+fn is_received(rx_flag: &[u8]) -> bool {
+    rx_flag.get(3).is_none_or(|flags| {
+        flags
+            & (RX_FLAG_TX_MSG_TYPE
+                | RX_FLAG_START_OF_MESSAGE
+                | RX_FLAG_BREAK
+                | RX_FLAG_TX_INDICATION)
+            == 0
+    })
 }
 
 /// When the host read an item, on the agent's clock.
@@ -1348,6 +1387,7 @@ impl CommLog {
         exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
         // The times judged against the limits of the link `link_opened` recorded (design 8.11
         // "Timing judged"); evidence on a link the log did not open keeps the timing it gives.
+        let mut judged_from: Option<(Vec<timing::At>, timing::Limits)> = None;
         if let Some((_, limits)) = inner.limits.iter().find(|(of, _)| *of == evidence.link) {
             let pendings: Vec<_> = evidence
                 .pending
@@ -1399,18 +1439,42 @@ impl CommLog {
                     )
                 });
             }
+            judged_from = Some((pendings, *limits));
         }
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
         for (item, placed) in unbound.iter().zip(unbound_placed) {
+            if let Some(owner) = late_response_owner(&inner.links[at].1, item, &evidence) {
+                inner.late_response(at, owner, item, placed)?;
+                continue;
+            }
             let event = Event::Unattached(UnattachedEntry::of(item, placed));
             inner.append_with(|seq, line| {
                 serde_json::to_writer(line, &Line { seq, event: &event })
             })?;
         }
         let history = inner.links[at].1.history_for(&evidence);
+        let kept = exchange::Kept {
+            evidence: evidence.clone(),
+            origin: evidence.origin,
+            request: exchange::Request::of(&evidence),
+            classification: exchange::Classification::None,
+            transmit,
+            pendings: judged_from
+                .as_ref()
+                .map(|(pendings, _)| pendings.clone())
+                .unwrap_or_default(),
+            limits: judged_from.map(|(_, limits)| limits),
+        };
         let entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
         inner.links[at].1.record(&entry);
+        inner.links[at].1.keep(
+            seq,
+            exchange::Kept {
+                classification: entry.classification,
+                ..kept
+            },
+        );
         if let Some(kind) = entry.link_error() {
             for (other, (_, state)) in inner.links.iter_mut().enumerate() {
                 if other != at {
@@ -1646,7 +1710,92 @@ impl CommLog {
     }
 }
 
+/// The owed exchange on `state`'s link that `item`, read during the exchange of `evidence`, is a
+/// late response of (design 8.11 `late_response`): a message another node sent, not a pending,
+/// that exactly one owed exchange the VCI ended could own, and that the exchange in flight does
+/// not also await.
+fn late_response_owner(
+    state: &exchange::LinkState,
+    item: &UnattachedItem,
+    evidence: &exchange::Evidence,
+) -> Option<u64> {
+    let UnattachedData::Result {
+        rx_flag,
+        identifier,
+        bytes,
+    } = &item.data
+    else {
+        return None;
+    };
+    if bytes.is_empty() || !is_received(rx_flag) {
+        return None;
+    }
+    let in_flight =
+        identifier.is_none_or(|id| id == evidence.rx_id) && evidence.expected.matches(bytes);
+    let [owner] = state.late_response_owners(*identifier, bytes)[..] else {
+        return None;
+    };
+    let kept = state.kept(owner)?;
+    // A pending is a late item, not a late response.
+    let negative = &kept.evidence.expected.negative_pattern;
+    let pending = !negative.is_empty()
+        && bytes.starts_with(negative)
+        && bytes.get(negative.len()) == Some(&exchange::NRC_PENDING);
+    (!in_flight && !pending && kept.evidence.vci_ended).then_some(owner)
+}
+
 impl Inner {
+    /// Writes the `late_response` settling entry of `item`, a response of the owed exchange
+    /// `owner` on link `at`, which it settles (design 8.11 "Settlement", ADR-365).
+    fn late_response(
+        &mut self,
+        at: usize,
+        owner: u64,
+        item: &UnattachedItem,
+        placed: Option<clocks::Placed>,
+    ) -> Option<()> {
+        let UnattachedData::Result { bytes, .. } = &item.data else {
+            return Some(());
+        };
+        let state = &mut self.links[at].1;
+        let Some(kept) = state.settle_owed(owner) else {
+            return Some(());
+        };
+        let answered = kept.answered(bytes);
+        let history = state.history_for(&answered);
+        let time = item.clock.zip(placed);
+        let window = kept.limits.map_or(timing::LateWindow::Open, |limits| {
+            timing::judge_late(
+                limits,
+                kept.evidence.absorbing(),
+                kept.transmit,
+                &kept.pendings,
+                time,
+                bytes.len(),
+            )
+        });
+        let (classification, reason) =
+            exchange::settle_late_response(&kept, &answered, window, &history);
+        let event = Event::LateResponse(LateResponseEntry {
+            refers_to: vec![owner],
+            response: UnattachedEntry::of(item, placed),
+            exchanges: vec![Settled {
+                seq: owner,
+                link: kept.evidence.link,
+                origin: kept.origin,
+                request: kept.request.clone(),
+                classification,
+                reason,
+            }],
+            text: format!(
+                "The ECU's response to the exchange logged as {owner} came after the VCI had ended that exchange."
+            ),
+            classification,
+        });
+        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+            .map(|_| ())
+    }
+
     fn clock(&self) -> AgentClock {
         AgentClock {
             epoch: self.epoch,
@@ -3785,6 +3934,161 @@ mod tests {
         }];
         let rejected = classified(true, rejected, Vec::new());
         assert_eq!(rejected["classification"], "undetermined", "{rejected}");
+    }
+
+    /// Design 8.11 "Settlement", `late_response` (ADR-365): a response that comes after the VCI
+    /// ended its exchange settles that exchange when it is the one owed request that could own
+    /// it, judged by its time against that exchange's limit in force; otherwise it stays
+    /// `unattached`.
+    #[test]
+    fn a_late_response_settles_the_one_exchange_that_could_own_it() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        // A request sent at `at_us` (VCI and agent time alike), its transmit indication read
+        // 100 µs later, and the VCI's receive timeout at P2 (1 s) after it.
+        let silent = |request: &[u8], at_us: u64| {
+            let mut evidence = evidence(endpoint(0x7E0), request, exchange::End::NoResponse);
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                rx_timeout: Some(device(at_us + 1_000_000)),
+                error: Some(device(at_us + 1_000_000)),
+                ..exchange::VciTimes::default()
+            });
+            let transmit = UnattachedItem {
+                vci_us: u32::try_from(at_us).unwrap(),
+                read: read(at_us + 100),
+                ..tx_done(0x7E0)
+            };
+            (evidence, transmit)
+        };
+        let response = |bytes: &[u8], vci_us: u64| UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            vci_us: u32::try_from(vci_us).unwrap(),
+            clock: Some(exchange::Clock::Device),
+            read: read(vci_us + 100),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: bytes.to_vec(),
+            },
+        };
+        // The exchanges run: (request, the late items read during it), each 3 s after the one
+        // before, from 10 ms; the log's lines that are not the header's.
+        // A request, with the late responses (bytes, VCI time) read during its exchange.
+        type Exchange<'a> = (&'a [u8], Vec<(&'a [u8], u64)>);
+        let run = |exchanges: Vec<Exchange<'_>>| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+                Some(true),
+            )
+            .unwrap();
+            for (index, (request, late)) in exchanges.into_iter().enumerate() {
+                let at_us = 10_000 + 3_000_000 * index as u64;
+                let (evidence, transmit) = silent(request, at_us);
+                let mut items = vec![transmit];
+                items.extend(
+                    late.into_iter()
+                        .map(|(bytes, vci_us)| response(bytes, vci_us)),
+                );
+                log.exchange_with(evidence, items).unwrap();
+            }
+            log.end("ok");
+            lines(&setup)
+        };
+        let of = |lines: &[serde_json::Value], event: &str| -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .filter(|line| line["event"] == event)
+                .cloned()
+                .collect()
+        };
+        let read_f190: &[u8] = &[0x22, 0xF1, 0x90];
+        let read_f191: &[u8] = &[0x22, 0xF1, 0x91];
+        let answer: &[u8] = &[0x62, 0xF1, 0x90, 0x41];
+        // Within P2 less the margin (998 ms after the transmit at 10 ms): `system`.
+        let lines = run(vec![
+            (read_f190, Vec::new()),
+            (read_f191, vec![(answer, 10_000 + 998_000)]),
+        ]);
+        let settled = of(&lines, "late_response");
+        assert_eq!(settled.len(), 1, "{lines:?}");
+        let first_seq = of(&lines, "exchange")[0]["seq"].clone();
+        assert_eq!(settled[0]["refers_to"], serde_json::json!([first_seq]));
+        assert_eq!(settled[0]["classification"], "system", "{}", settled[0]);
+        assert_eq!(settled[0]["exchanges"][0]["seq"], first_seq);
+        assert_eq!(
+            settled[0]["exchanges"][0]["request"]["sid"], "0x22",
+            "{}",
+            settled[0]
+        );
+        assert!(of(&lines, "unattached").is_empty(), "{lines:?}");
+        // One frame past P2 plus the margin and its 320 µs: `vehicle`. Between: `undetermined`.
+        for (vci_us, classification) in [
+            (10_000 + 1_002_321, "vehicle"),
+            (10_000 + 1_002_320, "undetermined"),
+            (10_000 + 999_000, "undetermined"),
+        ] {
+            let lines = run(vec![
+                (read_f190, Vec::new()),
+                (read_f191, vec![(answer, vci_us)]),
+            ]);
+            let settled = of(&lines, "late_response");
+            assert_eq!(
+                settled[0]["classification"], classification,
+                "{vci_us}: {}",
+                settled[0]
+            );
+        }
+        // Two owed requests that could own it, or the exchange in flight awaiting the same
+        // response: `unattached`, settling nothing.
+        for exchanges in [
+            vec![
+                (read_f190, Vec::new()),
+                (read_f190, Vec::new()),
+                (read_f191, vec![(answer, 6_500_000)]),
+            ],
+            vec![
+                (read_f190, Vec::new()),
+                (read_f190, vec![(answer, 2_500_000)]),
+            ],
+        ] {
+            let lines = run(exchanges);
+            assert!(of(&lines, "late_response").is_empty(), "{lines:?}");
+            assert_eq!(of(&lines, "unattached").len(), 1, "{lines:?}");
+        }
+        // A late pending is no late response.
+        let lines = run(vec![
+            (read_f190, Vec::new()),
+            (read_f191, vec![(&[0x7F, 0x22, 0x78], 500_000)]),
+        ]);
+        assert!(of(&lines, "late_response").is_empty(), "{lines:?}");
+        // A settled exchange is owed no more: a second response settles nothing.
+        let lines = run(vec![
+            (read_f190, Vec::new()),
+            (read_f191, vec![(answer, 500_000), (answer, 600_000)]),
+        ]);
+        assert_eq!(of(&lines, "late_response").len(), 1, "{lines:?}");
+        assert_eq!(of(&lines, "unattached").len(), 1, "{lines:?}");
     }
 
     /// A start-of-message indication for `identifier`, read during the exchange.

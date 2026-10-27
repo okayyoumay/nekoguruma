@@ -669,6 +669,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.end_rejected = end_rejected;
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
+                evidence.bound_start = sent.bound_start;
                 evidence.link_errors.extend(link_errors);
                 evidence.link_errors_before_answer = before_answer;
                 evidence.times.vci = (!vci.is_empty()).then_some(vci);
@@ -811,7 +812,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         // the VCI's own limits had run. It is read after the deadline, so it costs one more
         // unary call's budget at most, so only an exchange whose entry is written takes it.
         let deadline_reading = if agent_deadline && logged {
-            self.read_clock().await
+            self.read_clock(deadline).await
         } else {
             None
         };
@@ -838,6 +839,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             pendings: std::mem::take(&mut progress.pendings),
             rejected: std::mem::take(&mut progress.rejected),
             last_rejected: progress.last_rejected,
+            bound_start: progress.bound_start,
             events_lost: progress.events_lost.take(),
             agent_deadline,
             response_times: progress.response_times,
@@ -846,9 +848,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 
     /// Reads the VCI's clock (`GetTimestamp` of the link's module), with the clock the worker
-    /// says it is on and the round trip of the read; `None` when the read fails.
-    async fn read_clock(&mut self) -> Option<ClockReading> {
-        let asked = tokio::time::Instant::now();
+    /// says it is on and the time from `since`, the agent's deadline, to the read's answer, which
+    /// bounds when after it the clock was read; `None` when the read fails.
+    async fn read_clock(&mut self, since: tokio::time::Instant) -> Option<ClockReading> {
         let read = unary(
             self.timings.unary,
             "GetTimestamp",
@@ -857,7 +859,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             }),
         )
         .await;
-        let round_trip = asked.elapsed();
+        let round_trip = since.elapsed();
         match read {
             Ok(reading) => Some(ClockReading {
                 time: VciTime::new(
@@ -1106,6 +1108,16 @@ fn is_indication(result: &vci_service_interface::ResultData) -> bool {
     })
 }
 
+/// Whether a result is a start-of-message indication: RxFlag `START_OF_MESSAGE`, and neither a
+/// transmit indication nor a transmitted message (ISO 22900-2:2022 D.2.2).
+fn is_start_indication(result: &vci_service_interface::ResultData) -> bool {
+    use crate::comm_log::{RX_FLAG_START_OF_MESSAGE, RX_FLAG_TX_INDICATION, RX_FLAG_TX_MSG_TYPE};
+    result.rx_flag.get(3).is_some_and(|flags| {
+        flags & RX_FLAG_START_OF_MESSAGE != 0
+            && flags & (RX_FLAG_TX_INDICATION | RX_FLAG_TX_MSG_TYPE) == 0
+    })
+}
+
 /// A primitive the host stopped waiting for before it ended ([`WorkerHost::settle_at_end`]).
 #[derive(Debug, Clone, Copy)]
 struct Stray {
@@ -1198,6 +1210,8 @@ struct Sent {
     rejected: Vec<RejectedRead>,
     /// See `Progress::last_rejected`.
     last_rejected: bool,
+    /// See `Progress::bound_start`.
+    bound_start: bool,
     /// See `Progress::events_lost`.
     events_lost: Option<Option<AgentNow>>,
     /// The agent's own deadline ended the wait, not the worker: the VCI had not ended the
@@ -1225,6 +1239,7 @@ impl Sent {
             pendings: Vec::new(),
             rejected: Vec::new(),
             last_rejected: false,
+            bound_start: false,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -1685,6 +1700,9 @@ struct Progress {
     rejected: Vec<RejectedRead>,
     /// The last result of the primitive was a rejected one: no pending or answer came after it.
     last_rejected: bool,
+    /// A start-of-message indication bound to the primitive was read: a response may be under
+    /// way (design 8.11 `vci_did_not_end`).
+    bound_start: bool,
     /// The worker reported lost events: `Some` with the agent's clocks when the host read it, if
     /// it has a log.
     events_lost: Option<Option<AgentNow>>,
@@ -1711,6 +1729,7 @@ impl Progress {
             pendings: Vec::new(),
             rejected: Vec::new(),
             last_rejected: false,
+            bound_start: false,
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
@@ -1733,6 +1752,7 @@ impl Progress {
             pendings: Vec::new(),
             rejected: Vec::new(),
             last_rejected: false,
+            bound_start: false,
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
@@ -1816,6 +1836,11 @@ impl Progress {
             && !is_indication(result)
         {
             self.last_rejected = !self.answers(&result.data_bytes);
+        }
+        if let Some(event_item::Data::ResultData(result)) = &item.data
+            && is_start_indication(result)
+        {
+            self.bound_start = true;
         }
         // A response pending the worker passed on is kept for the log (design 8.11 `pending`),
         // with the item's time and clock as the worker gave them (ADR-353).
@@ -2370,6 +2395,7 @@ mod tests {
             pendings: Vec::new(),
             rejected: Vec::new(),
             last_rejected: false,
+            bound_start: false,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -2459,6 +2485,7 @@ mod tests {
             pendings: Vec::new(),
             rejected: Vec::new(),
             last_rejected: false,
+            bound_start: false,
             events_lost: None,
             agent_deadline: false,
             response_times: VciTimes::default(),
@@ -3115,6 +3142,7 @@ mod tests {
         // A pending or an answer after the rejected result: it was not the primitive's end.
         let followed = Sent {
             last_rejected: false,
+            bound_start: false,
             ..sent(RejectedReason::WrongEcho, false)
         };
         assert!(matches!(
@@ -3163,6 +3191,17 @@ mod tests {
         );
         assert_eq!(progress.response, Some(vec![0x62, 0xF1, 0x90, 0x41]));
         assert!(!progress.last_rejected, "the answer came last");
+        // The transmit indication bound to the primitive is no start of a response; a
+        // start-of-message indication bound to it is (design 8.11 `vci_did_not_end`).
+        assert!(!progress.bound_start);
+        let mut started = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let start = event_item::Data::ResultData(vci_service_interface::ResultData {
+            rx_flag: vec![0, 0, 0, 0x02],
+            ..Default::default()
+        });
+        assert!(started.on_event(event(Some(COP), start), COP).is_none());
+        assert!(started.bound_start);
+        assert!(started.rejected.is_empty(), "an indication is not rejected");
         let mut pending_after = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
         pending_after.on_event(event(Some(COP), result(&[0x62, 0xF1])), COP);
         assert!(pending_after.last_rejected);
@@ -3333,6 +3372,7 @@ mod tests {
             pendings: Vec::new(),
             rejected: Vec::new(),
             last_rejected: false,
+            bound_start: false,
             events_lost: None,
             agent_deadline: false,
             response_times: progress.response_times,
@@ -3391,6 +3431,7 @@ mod tests {
                 pendings: Vec::new(),
                 rejected: Vec::new(),
                 last_rejected: false,
+                bound_start: false,
                 events_lost: None,
                 agent_deadline: false,
                 response_times: VciTimes::default(),

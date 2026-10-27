@@ -1682,8 +1682,10 @@ impl CommLog {
         let mut evidence = kept.evidence.clone();
         // A link error read with the end, or that ended it, has no known order against an
         // answer read with it: it ends that answer's matched answer, as `record` applies it.
-        let error_with_end =
-            !ended.link_errors.is_empty() || matches!(end, exchange::End::LinkError(_));
+        let error_with_end = match &end {
+            exchange::End::LinkError(kind) => Some(*kind),
+            _ => ended.link_errors.first().copied(),
+        };
         evidence.end = end;
         evidence.detail = ended.detail;
         evidence.vci_ended = ended.vci_ended;
@@ -1909,14 +1911,20 @@ impl CommLog {
         let link = evidence.link;
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
         let times = evidence.times.vci;
-        let unended = (!final_response).then(|| evidence.clone());
+        let settled_evidence = evidence.clone();
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
         let (classification, reason) = exchange::settle_primitive_ended(&entry, observed);
         // The answers its end adds count for the later exchanges on the link.
         let state = &mut inner.links[at].1;
-        state.settled(seq, classification, &reason, unended);
+        state.settled(
+            seq,
+            classification,
+            &reason,
+            settled_evidence,
+            final_response,
+        );
         let mut answer = entry.settled_answer(&kept);
-        if error_with_end {
+        if error_with_end.is_some() {
             answer.no_matched_answer();
         }
         let (later, not_reclassified) = state.reclassify_after(&answer);
@@ -1961,7 +1969,17 @@ impl CommLog {
             not_reclassified_through: not_reclassified,
             classification: top,
         }));
-        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+        let written = inner
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        // A link error read with the end came on the channel all the run's targets share, after
+        // their entries: it ends their matched answers as one an exchange saw does (design 8.11
+        // "Link error").
+        if let Some(kind) = error_with_end {
+            for (_, state) in &mut inner.links {
+                state.channel_link_error(written, kind);
+            }
+        }
+        Some(written)
     }
 
     /// Writes the `link_opened` event of the link `config` opened, as link `link` (design 8.11
@@ -2285,8 +2303,9 @@ impl Inner {
         let (classification, reason) =
             exchange::settle_late_response(&kept, &answered, window, &history);
         // The answer it adds counts for the later exchanges on the link.
+        let answered_evidence = answered.clone();
         let answer = exchange::ExchangeEntry::build(owner, answered, history).settled_answer(&kept);
-        state.settled(owner, classification, &reason, None);
+        state.settled(owner, classification, &reason, answered_evidence, true);
         let (later, not_reclassified) = state.reclassify_after(&answer);
         let top = later
             .iter()
@@ -4932,9 +4951,10 @@ mod tests {
     /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): the end of a primitive the agent
     /// stopped waiting for settles its exchange as if the agent had waited for it, except that
     /// an end within the limit in force is `system`; the agent's cancel settles nothing.
-    /// Design 8.11 "Matched answer": a pending a `primitive_ended` adds with a link error in no
-    /// known order with it is no matched answer for the exchanges after it, as `record` applies
-    /// an error after an answer.
+    /// Design 8.11 "Matched answer", "Link error": a pending a `primitive_ended` adds with a
+    /// link error in no known order with it is no matched answer for the exchanges after it, and
+    /// that error ends the matched answers from before it, as `record` applies an error after an
+    /// answer.
     #[test]
     fn a_pending_ended_by_a_link_error_counts_as_no_matched_answer() {
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
@@ -4962,9 +4982,19 @@ mod tests {
             }),
             ..tx_done(0x7E0)
         };
-        let mut waited = evidence(
+        // An answered read of F190 first: a matched answer the link error then ends.
+        let mut answered = evidence(
             endpoint(0x7E0),
             &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+        );
+        answered.pending_visibility = exchange::PendingVisibility::Forwarded;
+        answered.times.agent.before_us = 5_000;
+        answered.times.agent.end_us = 8_000;
+        log.exchange_with(answered, vec![transmit(5_000)]).unwrap();
+        let mut waited = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x87],
             exchange::End::VciDidNotEnd,
         );
         waited.pending_visibility = exchange::PendingVisibility::Forwarded;
@@ -5006,11 +5036,23 @@ mod tests {
         let later = log
             .exchange_with(silent, vec![transmit(9_100_000)])
             .unwrap();
+        let mut same = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x87],
+            exchange::End::NoResponse,
+        );
+        same.pending_visibility = exchange::PendingVisibility::Forwarded;
+        same.vci_ended = true;
+        same.times.agent.before_us = 12_100_000;
+        same.times.agent.end_us = 13_101_000;
+        let same = log.exchange_with(same, vec![transmit(12_100_000)]).unwrap();
         log.end("ok");
         let lines = lines(&setup);
-        let later = lines.iter().find(|line| line["seq"] == later).unwrap();
-        assert_eq!(later["link_history"]["answered_same_match"], 0, "{later}");
-        assert_ne!(later["classification"], "vehicle", "{later}");
+        for seq in [later, same] {
+            let later = lines.iter().find(|line| line["seq"] == seq).unwrap();
+            assert_eq!(later["link_history"]["answered_same_match"], 0, "{later}");
+            assert_ne!(later["classification"], "vehicle", "{later}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

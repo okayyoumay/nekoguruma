@@ -92,13 +92,19 @@ retention (2026-10-27): the last 16 exchanges per link.
 5. **An exchange a settling entry settled.**
    - Given a final response by a `late_response` or `primitive_ended`, it is not reclassified
      from its history afterwards: its classification rests on evidence its history alone does
-     not give, and it is owed no more.
+     not give, and it is owed no more. Its window entry takes that evidence and its owners, so
+     its answer is still freed for the exchanges after it once none of them can own it.
    - Given any other end by a `primitive_ended`, it stays owed. It is still reclassified, from
      its evidence with that end, keeping at least the classification the entry gave it.
    - Raised by an ambiguous response, it stays owed. It is still reclassified, keeping at
      least `undetermined`, so a later answer of its owner still frees its answer.
 
-   An answer counts as a matched answer once (`Kept::matched`), however it became one.
+   An answer counts as a matched answer once (`Kept::matched`), however it became one. One that
+   no owed request can own any more also confirms its exchange's send, as `sent_of` reads it, so
+   that exchange can own a late transmit indication no more.
+6. **A link error a `primitive_ended` carries** (its end, or one read beside it) has no known
+   order with an answer read with it. That answer is no matched answer, and the error ends the
+   matched answers of every target on the channel, as an error an exchange saw does.
 
 ## Consequences
 
@@ -113,6 +119,8 @@ retention (2026-10-27): the last 16 exchanges per link.
 - A late positive response to an ECUReset or a session change is not taken as accepting it:
   it is no matched answer, but the owed requests and matched answers from before it stay.
   Whether a late acceptance ends them is left open.
+- An ambiguous late response adds nothing to the link's answered counts, since none of its
+  possible owners is chosen.
 - On the agent's link a `primitive_ended` is written before the link's next exchange, so it
   finds no later exchange in the window yet; it reclassifies the same way once one can.
 - A `late_response` judges the settled exchange against the link's history as of the settling

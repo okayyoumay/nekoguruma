@@ -1636,32 +1636,31 @@ impl LinkState {
     /// Exchange `seq`'s standing classification is now `classification`, which a settling entry
     /// of its own gave it.
     ///
-    /// A final response settles it for good. Any other end (`unended`: its evidence with that
-    /// end) leaves it owed, so it is still reclassified from its history, with that evidence and
-    /// at least the classification its settling entry gave it.
+    /// `evidence` is its evidence with what the entry added. A final response settles its
+    /// classification for good. Any other end leaves it owed, so it is still reclassified from
+    /// its history, keeping at least the classification its settling entry gave it.
     pub(crate) fn settled(
         &mut self,
         seq: u64,
         classification: Classification,
         reason: &str,
-        unended: Option<Evidence>,
+        evidence: Evidence,
+        final_response: bool,
     ) {
         if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
             logged.classification = classification;
             logged.reason = reason.to_owned();
-            match unended {
-                Some(evidence) => {
-                    logged.evidence = evidence;
-                    logged.floor = Some((classification, String::new()));
-                }
-                None => logged.settled = true,
+            logged.evidence = evidence;
+            if final_response {
+                logged.settled = true;
+            } else {
+                logged.floor = Some((classification, String::new()));
             }
         }
-        // What the end added (a pending) gives the exchange an answer, and owners from the
-        // owed requests logged before it, as its history would have had them.
-        if let Some(at) = self.window.iter().position(|logged| logged.seq == seq)
-            && !self.window[at].settled
-        {
+        // What the entry added gives the exchange an answer, and owners from the owed requests
+        // logged before it, as its history would have had them, so its answer is freed once
+        // none of them can own it.
+        if let Some(at) = self.window.iter().position(|logged| logged.seq == seq) {
             let fresh = self.history_for(&self.window[at].evidence);
             let history = &mut self.window[at].history;
             history.this_exchange = fresh.this_exchange;
@@ -1714,9 +1713,12 @@ impl LinkState {
             self.take_answer(&answer);
             for at in 0..self.window.len() {
                 let logged = &self.window[at];
-                if logged.seq <= answer.seq || logged.settled {
+                if logged.seq <= answer.seq {
                     continue;
                 }
+                // One a final response settled keeps its classification, but its answer is
+                // still freed for the exchanges after it.
+                let settled = logged.settled;
                 let mut history = logged.history.clone();
                 if answer.newly_answered {
                     history.answered += 1;
@@ -1737,24 +1739,40 @@ impl LinkState {
                 if history == logged.history {
                     continue;
                 }
-                let was_matched = ExchangeEntry::build(
+                let old = ExchangeEntry::build(
                     logged.seq,
                     logged.evidence.clone(),
                     logged.history.clone(),
-                )
-                .matched_answer();
+                );
                 let mut entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
                 let seq = logged.seq;
+                // The floor first: `record` sees the classification the entry was written with.
+                if let Some((floor, reason)) = &logged.floor
+                    && entry.classification < *floor
+                {
+                    entry.classification = *floor;
+                    entry.reason.push_str(reason);
+                }
                 // An answer no owed request can own any more is a matched answer for the
                 // exchanges after it, a pending too, as `record` would have counted it; a final
                 // response is placed with its exchange alone, which is then owed no more and no
                 // owner of theirs (design 8.11 "Matched answer", "Owed request").
-                let now_matched = entry.matched_answer() && !was_matched;
+                let now_matched = entry.matched_answer() && !old.matched_answer();
                 if now_matched && let Some(kept) = self.kept.get_mut(&seq) {
                     // Counted once: its final response later is no new matched answer.
                     kept.matched = true;
                 }
-                let alone = entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
+                // An answer no owed request can own confirms its send (`sent_of`): it can own a
+                // late transmit indication no more.
+                if !settled && old.sent == Sent::Unknown && entry.sent == Sent::Confirmed {
+                    self.unknown_sends = self.unknown_sends.saturating_sub(1);
+                    if let Some(kept) = self.kept.get_mut(&seq) {
+                        kept.sent = Sent::Confirmed;
+                    }
+                }
+                let alone = !settled
+                    && entry.placed_alone()
+                    && self.owed.iter().any(|owed| owed.seq == seq);
                 if alone {
                     self.owed.retain(|owed| owed.seq != seq);
                     if self
@@ -1783,13 +1801,10 @@ impl LinkState {
                 }
                 let logged = &mut self.window[at];
                 logged.history = entry.link_history.clone();
-                if let Some((floor, reason)) = &logged.floor
-                    && entry.classification < *floor
+                if settled
+                    || (entry.classification == logged.classification
+                        && entry.reason == logged.reason)
                 {
-                    entry.classification = *floor;
-                    entry.reason.push_str(reason);
-                }
-                if entry.classification == logged.classification && entry.reason == logged.reason {
                     continue;
                 }
                 logged.classification = entry.classification;
@@ -2968,7 +2983,7 @@ mod tests {
         let mut ended = waited;
         ended.end = End::NoResponse;
         ended.pending = vec![pending()];
-        state.settled(2, Classification::Undetermined, "ended", Some(ended));
+        state.settled(2, Classification::Undetermined, "ended", ended, false);
         assert_eq!(
             state
                 .window
@@ -2978,6 +2993,40 @@ mod tests {
             Some(vec![1])
         );
         state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (after, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(after.classification, Classification::Vehicle);
+
+        // A freed answer confirms its exchange's send: that exchange can own a late transmit
+        // indication no more.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let unconfirmed = forwarding(read([0xF1, 0x87], End::Negative(vec![0x7F, 0x22, 0x31])));
+        let (second, _) = log_kept(&mut state, 2, unconfirmed);
+        assert_eq!(second.sent, Sent::Unknown);
+        assert_eq!(state.unknown_sends, 1);
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert_eq!(state.unknown_sends, 0);
+
+        // An exchange a final response settled keeps its classification, but its answer is
+        // freed once its owner has its response.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut waited = forwarding(read([0xF1, 0x87], End::VciDidNotEnd));
+        waited.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log_kept(&mut state, 2, waited.clone());
+        let mut ended = waited;
+        ended.end = End::Negative(vec![0x7F, 0x22, 0x31]);
+        state.settle_owed(2);
+        state.settled(2, Classification::System, "ended", ended, true);
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.seq != 2 || logged.classification == Classification::System)
+        );
         let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let (after, _) = log_kept(&mut state, 3, silent);

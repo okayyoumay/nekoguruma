@@ -1680,6 +1680,10 @@ impl CommLog {
         };
         let mut observed = kept.evidence.vci_limits_past_by_us.is_some();
         let mut evidence = kept.evidence.clone();
+        // A link error read with the end, or that ended it, has no known order against an
+        // answer read with it: it ends that answer's matched answer, as `record` applies it.
+        let error_with_end =
+            !ended.link_errors.is_empty() || matches!(end, exchange::End::LinkError(_));
         evidence.end = end;
         evidence.detail = ended.detail;
         evidence.vci_ended = ended.vci_ended;
@@ -1911,7 +1915,11 @@ impl CommLog {
         // The answers its end adds count for the later exchanges on the link.
         let state = &mut inner.links[at].1;
         state.settled(seq, classification, &reason, unended);
-        let (later, not_reclassified) = state.reclassify_after(&entry.settled_answer(&kept));
+        let mut answer = entry.settled_answer(&kept);
+        if error_with_end {
+            answer.no_matched_answer();
+        }
+        let (later, not_reclassified) = state.reclassify_after(&answer);
         let refers_to = std::iter::once(seq)
             .chain(later.iter().map(|later| later.seq))
             .collect();
@@ -4924,6 +4932,88 @@ mod tests {
     /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): the end of a primitive the agent
     /// stopped waiting for settles its exchange as if the agent had waited for it, except that
     /// an end within the limit in force is `system`; the agent's cancel settles nothing.
+    /// Design 8.11 "Matched answer": a pending a `primitive_ended` adds with a link error in no
+    /// known order with it is no matched answer for the exchanges after it, as `record` applies
+    /// an error after an answer.
+    #[test]
+    fn a_pending_ended_by_a_link_error_counts_as_no_matched_answer() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: at_us + 100,
+                wall_unix_ms: 0,
+            }),
+            ..tx_done(0x7E0)
+        };
+        let mut waited = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::VciDidNotEnd,
+        );
+        waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.times.agent.before_us = 10_000;
+        waited.times.agent.end_us = 9_000_000;
+        let seq = log.exchange_with(waited, vec![transmit(10_000)]).unwrap();
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                tx_indication: None,
+                end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+                detail: exchange::Detail::default(),
+                pending: vec![exchange::Pending {
+                    vci_us: Some(410_000),
+                    clock: Some(exchange::Clock::Device),
+                    epoch: None,
+                    agent_us: 0,
+                    since_previous_ms: None,
+                }],
+                vci: exchange::VciTimes {
+                    error: Some(device(910_000)),
+                    ..exchange::VciTimes::default()
+                },
+                vci_ended: false,
+                link_errors: Vec::new(),
+                indications: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut silent = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        silent.pending_visibility = exchange::PendingVisibility::Forwarded;
+        silent.vci_ended = true;
+        silent.times.agent.before_us = 9_100_000;
+        silent.times.agent.end_us = 10_101_000;
+        let later = log
+            .exchange_with(silent, vec![transmit(9_100_000)])
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let later = lines.iter().find(|line| line["seq"] == later).unwrap();
+        assert_eq!(later["link_history"]["answered_same_match"], 0, "{later}");
+        assert_ne!(later["classification"], "vehicle", "{later}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     #[test]
     fn a_primitive_that_ends_at_job_end_settles_its_exchange() {
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));

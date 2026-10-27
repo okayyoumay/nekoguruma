@@ -1337,6 +1337,13 @@ pub(crate) struct SettledAnswer {
     clears: Clears,
 }
 
+impl SettledAnswer {
+    /// A link error in no known order with the answer ended its matched answer.
+    pub(crate) fn no_matched_answer(&mut self) {
+        self.newly_matched = false;
+    }
+}
+
 /// A later exchange a settling entry reclassified, with its new classification and reason.
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct Reclassified {
@@ -1649,6 +1656,21 @@ impl LinkState {
                 }
                 None => logged.settled = true,
             }
+        }
+        // What the end added (a pending) gives the exchange an answer, and owners from the
+        // owed requests logged before it, as its history would have had them.
+        if let Some(at) = self.window.iter().position(|logged| logged.seq == seq)
+            && !self.window[at].settled
+        {
+            let fresh = self.history_for(&self.window[at].evidence);
+            let history = &mut self.window[at].history;
+            history.this_exchange = fresh.this_exchange;
+            history.owners = fresh
+                .owners
+                .into_iter()
+                .filter(|owner| *owner < seq)
+                .collect();
+            history.owed_matching = history.owners.len() as u32;
         }
         if let Some(kept) = self.kept.get_mut(&seq) {
             kept.classification = classification;
@@ -2935,6 +2957,31 @@ mod tests {
                 .all(|logged| logged.seq != 2
                     || logged.classification >= Classification::Undetermined)
         );
+
+        // A pending a non-final settlement added, which the earlier owed request could own, is
+        // in the window's history: once that request has its response, it is a matched answer.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let mut waited = forwarding(read([0xF1, 0x87], End::VciDidNotEnd));
+        waited.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log_kept(&mut state, 2, waited.clone());
+        let mut ended = waited;
+        ended.end = End::NoResponse;
+        ended.pending = vec![pending()];
+        state.settled(2, Classification::Undetermined, "ended", Some(ended));
+        assert_eq!(
+            state
+                .window
+                .iter()
+                .find(|logged| logged.seq == 2)
+                .map(|logged| logged.history.owners.clone()),
+            Some(vec![1])
+        );
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (after, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(after.classification, Classification::Vehicle);
 
         // A later answer an ambiguous response may have been is not cleared by its history.
         let mut state = LinkState::default();

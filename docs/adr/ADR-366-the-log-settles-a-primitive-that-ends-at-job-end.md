@@ -41,10 +41,11 @@ the exchanges the VCI ended.
    `CommLog::primitive_ended`, with every link error read at job end beside the one that
    ended it, so the classification takes the most severe. The entry names the event an
    exchange's entry would name (the one that ended it, else the last link error, else the
-   receive timeout), with its extra error information and its time. A lost-events notice
-   gives the `unknown` end (`events_lost`), and the primitive, which may still run, is then
-   cancelled; an event stream that fails or ends gives the `unknown` end (`events_ended`).
-   When the job-end wait passes, or an earlier cancel failed, the host
+   receive timeout), with its extra error information and its time, from every error the
+   primitive reported: the one that ended it may have been read before the deadline. A
+   lost-events notice gives the `unknown` end (`events_lost`), and the primitive, which may
+   still run, is then cancelled; an event stream that fails or ends gives the `unknown` end
+   (`events_ended`). When the job-end wait passes, or an earlier cancel failed, the host
    cancels the primitive and records the agent's cancel only when the cancel succeeds; a
    handle the worker no longer knows, or a cancel that fails, leaves the end unknown and writes
    nothing.
@@ -74,14 +75,17 @@ the exchanges the VCI ended.
    - A final response is `system` whatever its time: within the limit in force the job gave up
      on an exchange that ended in time, and after it the late row is `system` too, so a time
      that cannot be judged changes nothing.
-   - A receive timeout at the limit (`timeout_at_limit`) is `system` for the same reason.
+   - A receive timeout at the limit (`timeout_at_limit`) that ends the exchange (no response, or
+     an incomplete one) is `system` for the same reason. A lost VCI or a link error read after
+     it ends the exchange and keeps its own row.
    - Any other end keeps its row: a lost VCI, a failure of the system, a link error, a timeout
      early or late.
    - The `vci_did_not_end` entry's `system` row rests on the VCI's own clock past its limits
      with no response under way. An end that shows no response under way at that reading (a
      link error, a lost VCI, a timeout) does not refute it, so `system` stands; a final response
-     is `system` anyway. A start-of-message read at job end from at or before that reading, or
-     one whose order with it is unknown, refutes it, and the end takes its own row. So does a
+     is `system` anyway. A start-of-message read at job end that may be the response's (whichever
+     exchange could own it, or naming no identifier) from at or before that reading, or one whose
+     order with it is unknown, refutes it, and the end takes its own row. So does a
      pending read at job end that moves the limit in force past the reading: the log checks
      the VCI's limits against the reading again with every pending not shown to come after it.
 5. **The agent's cancel settles nothing.** The entry has `cancelled_by_agent` true and no

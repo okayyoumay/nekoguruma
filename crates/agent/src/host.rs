@@ -596,20 +596,27 @@ impl<C: WorkerApi> WorkerHost<C> {
                     progress.sid,
                     true,
                 );
-                // Every link error read at job end beside the one that ended it, so the
-                // classification takes the most severe (design 8.11 "Link error"); the event
-                // named, its extra error information and its time, as for an exchange.
-                let read_late = progress
-                    .errors
-                    .get(stray.errors.len()..)
-                    .unwrap_or_default();
-                let (link_errors, error_at) = named_events(
+                // The event named, its extra error information and its time, as for an
+                // exchange, from every error the primitive reported: the one that ended it may
+                // have been read before the deadline.
+                let (_, error_at) = named_events(
                     result,
-                    read_late,
+                    &progress.errors,
                     progress.vci_lost.as_ref(),
                     progress.rx_timeout.as_ref(),
                     &mut detail,
                 );
+                // Every link error read at job end beside the one that ended it, so the
+                // classification takes the most severe (design 8.11 "Link error"); the
+                // exchange's evidence has those read before.
+                let read_late = progress
+                    .errors
+                    .get(stray.errors.len()..)
+                    .unwrap_or_default();
+                let link_errors = also_seen(result, read_late)
+                    .iter()
+                    .map(|seen| link_error_kind(seen.event))
+                    .collect();
                 let response_times = if result.is_ok() {
                     progress.response_times
                 } else {

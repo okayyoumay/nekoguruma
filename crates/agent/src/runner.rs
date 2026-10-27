@@ -14371,6 +14371,9 @@ def main():
         RespondThenFinishLater,
         /// A receive timeout with VCI time 1 s, then the finished status.
         TimeOut,
+        /// A receive error with VCI time 20 ms and extra error information, and the finished
+        /// status 150 ms after it.
+        FailThenFinishLater,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14652,14 +14655,38 @@ def main():
                             ..Default::default()
                         }));
                     }
-                    if let StartEvent::RespondThenFinishLater = event {
+                    if let StartEvent::FailThenFinishLater = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 20_000,
+                                data: Some(vci_service_interface::event_item::Data::ErrorData(
+                                    vci_service_interface::ErrorData {
+                                        error_event:
+                                            vci_service_interface::PduErrorEvent::PduErrEvtRxError
+                                                as i32,
+                                        extra_error_info: Some(0x1234),
+                                        extra_error_info_name: Some("ERR_CODE".to_owned()),
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }));
+                    }
+                    if let StartEvent::RespondThenFinishLater | StartEvent::FailThenFinishLater =
+                        event
+                    {
                         tokio::time::sleep(Duration::from_millis(150)).await;
                     }
                     let data = match event {
                         StartEvent::Finish
                         | StartEvent::Respond
                         | StartEvent::RespondThenFinishLater
-                        | StartEvent::TimeOut => {
+                        | StartEvent::TimeOut
+                        | StartEvent::FailThenFinishLater => {
                             EventData::Item(vci_service_interface::EventItem {
                                 cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
                                     module_handle: 1,
@@ -15064,7 +15091,8 @@ def main():
         // A response after the deadline, one read before it with its finished status after it,
         // and none (the agent cancels the primitive).
         // Lost events at job end leave the end unknown, and the primitive is cancelled too.
-        // A receive timeout after the deadline ends it with no response.
+        // A receive timeout after the deadline ends it with no response; an error read before
+        // the deadline ends it with its finished status after.
         for (on_start, cancelled, result) in [
             (
                 Some((Duration::from_millis(150), StartEvent::Respond)),
@@ -15088,6 +15116,11 @@ def main():
                 Some((Duration::from_millis(150), StartEvent::TimeOut)),
                 false,
                 Some("no_response"),
+            ),
+            (
+                Some((Duration::from_millis(10), StartEvent::FailThenFinishLater)),
+                false,
+                Some("link_error"),
             ),
             (None, true, None),
         ] {
@@ -15144,6 +15177,20 @@ def main():
                     "{ended}"
                 );
                 assert_eq!(ended["vci"]["error"]["us"], 1_000_000, "{ended}");
+                assert_eq!(ended["classification"], "undetermined", "{ended}");
+            } else if result == Some("link_error") {
+                // The error read before the deadline ends the primitive at job end: it is
+                // named, with its extra error information and its time.
+                assert_eq!(
+                    ended["detail"]["error_event"], "PDU_ERR_EVT_RX_ERROR",
+                    "{ended}"
+                );
+                assert_eq!(ended["detail"]["extra_error_info"], 0x1234, "{ended}");
+                assert_eq!(
+                    ended["detail"]["extra_error_info_name"], "ERR_CODE",
+                    "{ended}"
+                );
+                assert_eq!(ended["vci"]["error"]["us"], 20_000, "{ended}");
                 assert_eq!(ended["classification"], "undetermined", "{ended}");
             } else if result.is_some() {
                 assert_eq!(ended["classification"], "system", "{ended}");

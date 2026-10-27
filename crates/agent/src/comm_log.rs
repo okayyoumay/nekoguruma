@@ -1698,26 +1698,32 @@ impl CommLog {
         // The reading at the deadline, which the kept `system` rests on.
         let reading = kept.evidence.times.vci.and_then(|vci| vci.deadline);
         let reading_at = reading.and_then(|reading| reading.time.placed());
+        // The `system` the reading at the deadline gave rested on no response under way then:
+        // a start read at job end that may be the response's (whichever exchange owns it, or
+        // naming no identifier) at or before that reading, or one whose order with it is
+        // unknown, refutes it (design 8.11 "Settlement").
+        let after_reading = |time: exchange::VciTime| match (time.placed(), reading_at) {
+            (Some((clock, start)), Some((own, reading))) => {
+                clock == own && start.epoch == reading.epoch && start.unwrapped > reading.unwrapped
+            }
+            _ => false,
+        };
+        for item in ended
+            .indications
+            .iter()
+            .filter(|item| item.may_be_start_indication_for(rx_id))
+        {
+            let placed = inner.place_unread(item.clock, u64::from(item.vci_us), now)?;
+            if !after_reading(exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed))
+            {
+                observed = false;
+            }
+        }
         // The latest start: one read at job end, else the one the exchange had attached.
         let latest_start = match late_start {
             Some(start) => {
                 let placed = inner.place_unread(start.clock, u64::from(start.vci_us), now)?;
-                let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock).at(placed);
-                // The `system` the reading at the deadline gave rested on no response under
-                // way then: a start at or before that reading, or one whose order with it is
-                // unknown, refutes it (design 8.11 "Settlement").
-                let after_reading = match (time.placed(), reading_at) {
-                    (Some((clock, start)), Some((own, reading))) => {
-                        clock == own
-                            && start.epoch == reading.epoch
-                            && start.unwrapped > reading.unwrapped
-                    }
-                    _ => false,
-                };
-                if !after_reading {
-                    observed = false;
-                }
-                Some(time)
+                Some(exchange::VciTime::new(u64::from(start.vci_us), start.clock).at(placed))
             }
             None => kept.evidence.times.vci.and_then(|vci| vci.rx_start),
         };
@@ -4589,8 +4595,17 @@ mod tests {
             link_errors: Vec::new(),
             indications: Vec::new(),
         };
-        let (_, entry) = settled(lost);
+        let (_, entry) = settled(lost.clone());
         assert_eq!(entry.unwrap()["classification"], "undetermined");
+        // Also after a receive timeout at P2: the loss ended it, so the timeout gives no
+        // `system`.
+        let mut lost_after_timeout = lost;
+        lost_after_timeout.vci.rx_timeout = Some(device(10_500 + 1_000_000));
+        let (_, entry) = settled(lost_after_timeout);
+        let entry = entry.unwrap();
+        assert_eq!(entry["outcome"]["result"], "vci_lost", "{entry}");
+        assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
         // A response whose time cannot be judged: `system` too, since late it would be.
         let mut unclocked = response(500_000);
         unclocked.vci.rx_end = Some(exchange::VciTime::new(510_500, None));
@@ -4825,6 +4840,16 @@ mod tests {
         assert_eq!(refuted["classification"], "undetermined", "{refuted}");
         let after = settled(vec![start(5_200_000)], Vec::new());
         assert_eq!(after["classification"], "system", "{after}");
+        // Every start that may be the response's refutes it, not only the latest: an earlier
+        // one a later start replaces, and one that names no identifier.
+        let replaced = settled(vec![start(1_000_000), start(5_200_000)], Vec::new());
+        assert_eq!(replaced["classification"], "undetermined", "{replaced}");
+        let mut unnamed = start(1_000_000);
+        if let UnattachedData::Result { identifier, .. } = &mut unnamed.data {
+            *identifier = None;
+        }
+        let unnamed = settled(vec![unnamed], Vec::new());
+        assert_eq!(unnamed["classification"], "undetermined", "{unnamed}");
         // A pending within P2 from before the reading moves the limit past it (P2* from
         // 0.5 s): no longer past, so the end takes its own row. One after the reading changes
         // nothing.

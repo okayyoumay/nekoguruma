@@ -1934,7 +1934,14 @@ pub(crate) fn settle_primitive_ended(
         entry.outcome,
         Outcome::Positive { .. } | Outcome::PositiveUnusable { .. } | Outcome::Negative { .. }
     );
-    if final_response || entry.timing.window == Window::TimeoutAtLimit {
+    // A receive timeout at the limit is `system` only when it ended the exchange: a lost VCI or
+    // a link error read after it keeps its own row.
+    let timeout_at_limit = entry.timing.window == Window::TimeoutAtLimit
+        && matches!(
+            entry.outcome,
+            Outcome::NoResponse | Outcome::ResponseIncomplete
+        );
+    if final_response || timeout_at_limit {
         return (
             Classification::System,
             format!(

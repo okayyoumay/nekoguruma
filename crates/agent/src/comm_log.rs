@@ -3695,12 +3695,11 @@ mod tests {
             log.exchange_with(waited(reading_us), started).unwrap();
             log.end("ok");
             let lines = lines(&setup);
-            let entry = lines
+            lines
                 .iter()
                 .find(|line| line["event"] == "exchange")
                 .unwrap()
-                .clone();
-            entry
+                .clone()
         };
         // Past by 1 µs: 1 s + 2 ms + 320 µs + 700 µs of round trip, plus 1.
         let past = classified(true, 1_003_021, Vec::new());

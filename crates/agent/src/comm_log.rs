@@ -1580,13 +1580,19 @@ impl CommLog {
         let mut entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         if may_own_unattached && entry.classification < exchange::Classification::Undetermined {
             entry.classification = exchange::Classification::Undetermined;
-            entry.reason.push_str(
-                " A response read during this exchange, logged unattached, may be this exchange's or an earlier one's: undetermined.",
-            );
+            entry.reason.push_str(MAY_OWN_UNATTACHED);
         }
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
         inner.links[at].1.record(&entry);
         inner.links[at].1.log(&entry, kept.evidence.clone(), clears);
+        // A reclassification from its history alone does not clear that.
+        if may_own_unattached {
+            inner.links[at].1.floor(
+                seq,
+                exchange::Classification::Undetermined,
+                MAY_OWN_UNATTACHED,
+            );
+        }
         let clears = inner.links[at].1.clears();
         // Only an exchange the VCI ended can be settled by a late response (ADR-365), and one
         // the agent's deadline ended by its primitive's end (ADR-366).
@@ -2171,6 +2177,10 @@ impl CommLog {
         }
     }
 }
+
+/// What an exchange's reason adds when a response read during it, logged `unattached`, may be
+/// its own or an earlier exchange's.
+const MAY_OWN_UNATTACHED: &str = " A response read during this exchange, logged unattached, may be this exchange's or an earlier one's: undetermined.";
 
 /// Who could own `item`, read during the exchange of `evidence`, as a late response (design 8.11
 /// `late_response`).

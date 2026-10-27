@@ -1311,6 +1311,9 @@ struct Logged {
     clears: Clears,
     /// The link's clears just after its entry was taken in.
     after: Clears,
+    /// The least classification it keeps whatever its history gives, with the reason: an
+    /// ambiguous response read during it may have been its own (design 8.11 `late_response`).
+    floor: Option<(Classification, String)>,
     /// A settling entry of its own changed its evidence or set its classification: the history
     /// alone no longer gives it, so it is not reclassified from the history.
     settled: bool,
@@ -1608,8 +1611,17 @@ impl LinkState {
             reason: entry.reason.clone(),
             clears,
             after: self.clears,
+            floor: None,
             settled: false,
         });
+    }
+
+    /// Exchange `seq` keeps at least `classification` whatever its history gives, for `reason`,
+    /// which its reason then ends with.
+    pub(crate) fn floor(&mut self, seq: u64, classification: Classification, reason: &str) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            logged.floor = Some((classification, reason.to_owned()));
+        }
     }
 
     /// Exchange `seq`'s standing classification is now `classification`, which a settling entry
@@ -1669,13 +1681,21 @@ impl LinkState {
                 if history == logged.history {
                     continue;
                 }
-                let was_matched = logged.history.owners.is_empty();
-                let entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
+                let was_matched = ExchangeEntry::build(
+                    logged.seq,
+                    logged.evidence.clone(),
+                    logged.history.clone(),
+                )
+                .matched_answer();
+                let mut entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
                 let seq = logged.seq;
-                // An answer no owed request can own now is placed with its exchange alone: that
-                // exchange is owed no more, and its answer is a matched answer for the ones
-                // after it, as `record` would have counted it (design 8.11 "Owed request").
-                if entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq) {
+                // An answer no owed request can own any more is a matched answer for the
+                // exchanges after it, a pending too, as `record` would have counted it; a final
+                // response is placed with its exchange alone, which is then owed no more and no
+                // owner of theirs (design 8.11 "Matched answer", "Owed request").
+                let now_matched = entry.matched_answer() && !was_matched;
+                let alone = entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
+                if alone {
                     self.owed.retain(|owed| owed.seq != seq);
                     if self
                         .kept
@@ -1684,17 +1704,25 @@ impl LinkState {
                     {
                         self.unknown_sends = self.unknown_sends.saturating_sub(1);
                     }
+                }
+                if alone || now_matched {
                     answers.push(SettledAnswer {
                         seq,
                         key: entry.effect.key.clone(),
                         newly_answered: false,
-                        newly_matched: entry.matched_answer() && !was_matched,
-                        final_response: true,
+                        newly_matched: now_matched,
+                        final_response: alone,
                         clears: self.window[at].after,
                     });
                 }
                 let logged = &mut self.window[at];
                 logged.history = entry.link_history.clone();
+                if let Some((floor, reason)) = &logged.floor
+                    && entry.classification < *floor
+                {
+                    entry.classification = *floor;
+                    entry.reason.push_str(reason);
+                }
                 if entry.classification == logged.classification && entry.reason == logged.reason {
                     continue;
                 }
@@ -2737,6 +2765,62 @@ mod tests {
         let answered = kept.answered(response);
         let history = state.history_settling(&answered, seq);
         ExchangeEntry::build(seq, answered, history).settled_answer(kept)
+    }
+
+    /// Design 8.11 "Settlement": a pending of a later exchange that the earlier owed request
+    /// could own becomes a matched answer once that request has its response, for the exchanges
+    /// after it, though its exchange stays owed; and a floor an ambiguous response set stands.
+    #[test]
+    fn a_settled_answer_reaches_on_through_the_answers_it_makes_unambiguous() {
+        let confirmed = |end| {
+            let mut evidence = forwarding(evidence(&READ_F186, end));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let answer: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        // A read of another identifier that got a pending, which the first could own, then
+        // none; and a silent read of that identifier.
+        let mut pending_only = forwarding(read([0xF1, 0x87], End::NoResponse));
+        pending_only.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        pending_only.pending = vec![pending()];
+        let (second, _) = log_kept(&mut state, 2, pending_only);
+        assert_eq!(second.link_history.owed_matching, 1);
+        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (third, _) = log_kept(&mut state, 3, silent);
+        assert_eq!(third.classification, Classification::Undetermined);
+        let (changed, _) = state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        let third = changed.iter().find(|later| later.seq == 3);
+        assert_eq!(
+            third.map(|later| later.classification),
+            Some(Classification::Vehicle),
+            "{changed:?}"
+        );
+        assert!(
+            state.owed.iter().any(|owed| owed.seq == 2),
+            "a pending places nothing alone"
+        );
+
+        // A later answer an ambiguous response may have been is not cleared by its history.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        log_kept(&mut state, 2, confirmed(End::Positive(answer.to_vec())));
+        state.floor(2, Classification::Undetermined, " floor");
+        let (changed, _) = state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert!(
+            changed
+                .iter()
+                .all(|later| later.classification == Classification::Undetermined),
+            "{changed:?}"
+        );
+        assert!(
+            state
+                .window
+                .iter()
+                .all(|logged| logged.classification >= Classification::Undetermined)
+        );
     }
 
     /// Design 8.11 "Settlement": a final response a settling entry adds to an earlier exchange

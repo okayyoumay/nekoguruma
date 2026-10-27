@@ -60,10 +60,13 @@ retention (2026-10-27): the last 16 exchanges per link.
    The answer also counts for the exchanges logged after the settling entry, as `record`
    would have counted it in time: in the link's answered counts, and as a matched answer
    unless the matched answers ended since. A later exchange whose answer no owed request can
-   own any more is placed with it alone, as `record` places one (design 8.11 "Owed request"):
-   - it is owed no more, and what the log kept of it is released;
-   - its answer is a matched answer for the exchanges after it, in the window and logged later;
-   - its final response ends it as an owed request for them in turn.
+   own any more is counted as `record` counts one (design 8.11 "Matched answer", "Owed
+   request"):
+   - its answer, a pending too, is a matched answer for the exchanges after it, in the window
+     and logged later;
+   - a final response places it alone: it is owed no more, what the log kept of it is
+     released, and it is no owner of theirs any more. An exchange with only a pending stays
+     owed.
 3. **The settling entry names them.**
    - `refers_to` lists the settled exchange, then each reclassified one, in `seq` order.
    - `exchanges` gives each its new classification, with a reason that names the exchange whose
@@ -82,7 +85,8 @@ retention (2026-10-27): the last 16 exchanges per link.
 
    A response is ambiguous when two or more owed exchanges could own it, or one could and the
    exchange in flight awaits the same response. The exchange in flight is then at least
-   `undetermined` in its own entry, written after the settling entry.
+   `undetermined` in its own entry, written after the settling entry. Its window entry keeps
+   that floor, so a later reclassification from its history does not lower it.
 5. **An exchange settled by its own entry** is not reclassified from its history afterwards.
    This covers the owner of a `late_response` or `primitive_ended`, and an owner an ambiguous
    response raised. Its classification then rests on evidence its history alone does not

@@ -15310,6 +15310,96 @@ def main():
         }
     }
 
+    /// Design 8.11 "Settlement", `primitive_ended`: a primitive past the agent's deadline whose
+    /// end is read during the link's next exchange settles its exchange there, as at job end,
+    /// and its items are not logged `unattached`; one whose cancel the worker carried out, with
+    /// no end read, is recorded as cancelled, and one whose handle had ended, with none, keeps
+    /// its exchange as it was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_that_ends_before_the_next_request_is_logged_as_primitive_ended() {
+        // A response after the deadline, queued before the next request; no end, the cancel
+        // carried out; no end, the handle had ended.
+        for (on_start, cancel, cancelled) in [
+            (
+                Some((Duration::from_millis(150), StartEvent::Respond)),
+                CancelAnswer::InvalidHandle,
+                Some(false),
+            ),
+            (None, CancelAnswer::Done, Some(true)),
+            (None, CancelAnswer::InvalidHandle, None),
+        ] {
+            let dir = journal_dir("primitive-ended-next");
+            let (mut client, fake) = fake_worker_starting_with(cancel, on_start).await;
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: Duration::from_millis(50),
+            };
+            tokio::task::spawn_blocking(move || {
+                use diag_ir::DiagHost;
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                host.set_comm_log(Some(log));
+                host.set_link_ids(0x7E0, 0x7E8);
+                host.own_reads(Some(OwnRead::Identification));
+                host.set_job_end_wait(Duration::from_millis(500));
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::NoResponse)), "{first:?}");
+                // The first primitive's end, if any, is on the stream before the next request.
+                std::thread::sleep(Duration::from_millis(300));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                host.settle_at_end();
+            })
+            .await
+            .unwrap();
+            assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+            let lines = comm_log_lines(&dir);
+            let exchanges: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"] == "exchange")
+                .collect();
+            assert_eq!(exchanges.len(), 2, "{lines:?}");
+            let first = exchanges[0]["seq"].clone();
+            let ended: Vec<_> = lines
+                .iter()
+                .filter(|line| {
+                    line["event"] == "primitive_ended"
+                        && line["refers_to"] == serde_json::json!([first])
+                })
+                .collect();
+            let Some(cancelled) = cancelled else {
+                assert!(ended.is_empty(), "{lines:?}");
+                std::fs::remove_dir_all(&dir).unwrap();
+                continue;
+            };
+            assert_eq!(ended.len(), 1, "{lines:?}");
+            let ended = ended[0];
+            // Written during the next exchange, before its entry.
+            assert!(
+                ended["seq"].as_u64() < exchanges[1]["seq"].as_u64(),
+                "{lines:?}"
+            );
+            assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
+            if !cancelled {
+                assert_eq!(ended["outcome"]["result"], "positive", "{ended}");
+                assert_eq!(ended["classification"], "system", "{ended}");
+            }
+            assert!(
+                !lines
+                    .iter()
+                    .any(|line| line["event"] == "unattached" && line["primitive"] == "earlier"),
+                "{lines:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
     /// Design 8.11 "Settlement", ADR-358: at job end the host keeps the link open for a
     /// primitive past its deadline for the job-end wait, then cancels it by its handle.
     #[tokio::test(flavor = "multi_thread")]

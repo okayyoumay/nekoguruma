@@ -355,7 +355,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-363](ADR-363-an-ecu-definition-declares-the-identifier-a-vehicle-definition-names.md) | An ECU Definition Declares the Identifier a Vehicle Definition Names | Accepted | `diag-ir` (`EcuDocument.definition_id`, schema 20), `diag-frontend` (`definition.csv`); design 8.8.2; ADR-326, ADR-307 |
 | [ADR-364](ADR-364-the-log-proves-a-single-frame-response-late-by-its-end.md) | The Log Proves a Single-Frame Response Late by Its End | Accepted | `agent` communication log (`comm_log::timing`, the late-pending row), `link.rs` (`LinkConfig::single_frame`); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-358, ADR-362 |
 | [ADR-365](ADR-365-the-log-keeps-owed-exchanges-to-settle-them-with-a-late-response.md) | The Log Keeps Owed Exchanges to Settle Them with a Late Response | Accepted (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366) | `agent` communication log (`late_response`, `Kept`, `comm_log::timing::judge_late`); design 8.11 "Settlement", "Owed request", `late_response`; ADR-346, ADR-361, ADR-364 |
-| [ADR-366](ADR-366-the-log-settles-a-primitive-that-ends-at-job-end.md) | The Log Settles a Primitive That Ends at Job End | Accepted | `agent` host (`settle_at_end`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-365 |
+| [ADR-366](ADR-366-the-log-settles-a-primitive-that-ends-at-job-end.md) | The Log Settles a Primitive That Ends at Job End | Accepted (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367) | | [ADR-367](ADR-367-the-log-settles-a-primitive-that-ends-before-the-next-request.md) | The Log Settles a Primitive That Ends Before the Next Request | Accepted | `agent` host (`settle_cancelled`, `Settling`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-366 |
+`agent` host (`settle_at_end`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-365 |
 
 ## Status Legend
 
@@ -726,7 +727,8 @@ the predecessor repository these ADRs came from.
 - ADR-362 (Decision item 4 narrowed by ADR-364)
 - ADR-364
 - ADR-365 (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366)
-- ADR-366
+- ADR-366 (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367)
+- ADR-367
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

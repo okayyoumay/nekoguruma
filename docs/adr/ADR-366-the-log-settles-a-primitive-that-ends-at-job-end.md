@@ -1,7 +1,7 @@
 # ADR-366: The Log Settles a Primitive That Ends at Job End
 
 **Date:** 2026-10-27
-**Status:** Accepted
+**Status:** Accepted (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367)
 **Affects:** `agent` host (`WorkerHost::settle_at_end`, `log_primitive_end`, `Stray`) and
 communication log (`CommLog::primitive_ended`, `PrimitiveEnded`, `PrimitiveEndedEntry`,
 `exchange::settle_primitive_ended`); design 8.11 ("Settlement", `primitive_ended`); ADR-346,

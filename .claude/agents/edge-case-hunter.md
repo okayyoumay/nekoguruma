@@ -4,7 +4,8 @@ description: >
   Verification pass on a completed change: hunts edge cases the
   implementation missed (boundary values, error paths, concurrency and
   ordering hazards, protocol corner cases in UDS / J2534 / D-PDU API,
-  interruption and resume, ABI width differences, missing test coverage).
+  interruption and resume, ABI width differences, missing test coverage,
+  and steps a new path leaves out of an existing path it rebuilds).
   Runs at high reasoning effort and every spawn starts cold. Invoke after
   implementation, before commit, when the diff touches protocol semantics,
   concurrency or state machines, FFI or `*-sys` crates, ABI handling,
@@ -47,6 +48,16 @@ Working rules:
     package trusted without validation.
   - **Test coverage**: behaviour changed without a test that would fail if
     the change were reverted.
+- **Parity check**, when the change adds a path that builds what an existing
+  path already builds (a second settlement, encoder or conversion producing
+  the same entry or output). The caller names the existing path; find it
+  yourself if it does not. First list every step the existing path takes:
+  each field it fills, each preference and fallback between sources, each
+  error or event it names, each state it reads, keeps or releases. Then
+  check each step against the new path, and report every step the new path
+  leaves out or does differently, unless a design section or ADR says the
+  two should differ. Do this before the other categories, and do not stop
+  at the first gap.
 - Before calling a case unreachable or two paths equivalent, construct a
   concrete input that would exercise it and derive its outcome from the rule
   that governs it, not from a proxy.
@@ -60,4 +71,6 @@ Report (about 50 lines at most), most severe first:
 - For each finding: severity (blocking / should fix / minor), `path:line`,
   the concrete failing scenario (inputs or state -> wrong result), and the
   missing test if any.
+- After a parity check, one line counting the existing path's steps checked
+  and naming any that match by a rule rather than by the code.
 - Then one line listing categories checked with nothing found.

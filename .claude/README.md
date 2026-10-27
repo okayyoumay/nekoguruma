@@ -22,7 +22,7 @@ capability unless the user asks for one.
 | `doc-sync-checker` | sonnet (medium) | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
 | `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
 | `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |
-| `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, missing tests |
+| `edge-case-hunter` | opus (high) | Bash + read-only | Verification pass before commit: boundaries, error paths, concurrency, protocol corner cases, interruption/resume, parity with a path the change rebuilds, missing tests |
 | `design-advisor` | fable (xhigh) | Bash (git read) + read-only | Escalation for decisions that are expensive to get wrong |
 
 Each tier is used for what it does best, following the official model descriptions
@@ -82,6 +82,9 @@ delegated (the final commit and push) or a single targeted read to check an agen
   (job state transitions, VM resume, worker lifecycle), FFI and `*-sys` crates, ABI handling,
   signatures and trust boundaries (`shared-crypto`, token handling), or more than one crate.
   Mechanical single-crate changes skip it.
+  When the diff adds a path that builds what an existing path already builds (a second
+  settlement, encoder or conversion producing the same entry or output), name the existing path
+  in the brief and ask for the agent's parity check.
 - **`design-advisor`** when a wrong decision is expensive to reverse: interpreting ISO 22900 /
   J2534 / UDS requirements, concurrency or state-machine design across crates, trust-boundary
   and signature design, a choice that needs an ADR, or a bug that survived a `code-scout` +

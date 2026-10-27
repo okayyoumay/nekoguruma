@@ -480,9 +480,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   a `primitive_ended` adds, reclassifies the later exchanges among the last 16 logged on the link
   (`exchange::LinkState::reclassify_after`, emptied by an accepted ECUReset or session change):
   each whose classification or reason changes is named in the same entry, and one that has left
-  the window is not (`not_reclassified_through`, ADR-368). A response two or more exchanges could
-  own stays `unattached`, followed by a `late_response` that chooses no owner and raises each
-  owed one that could own it to at least `undetermined`. Every other
+  the window is not (`not_reclassified_through`, ADR-368). The answer also counts for the
+  exchanges logged later, and a later exchange whose answer no owed request can own any more is
+  owed no more. A response two or more exchanges could own stays `unattached`, followed by a
+  `late_response` that chooses no owner and raises each owed one that could own it to at least
+  `undetermined`; the exchange in flight that could own it is at least `undetermined` too. Every other
   item is an `unattached` event, written in
   the order read and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header

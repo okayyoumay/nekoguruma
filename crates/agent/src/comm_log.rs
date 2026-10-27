@@ -1536,6 +1536,9 @@ impl CommLog {
             judged_from = Some((pendings, *limits));
         }
         evidence.times.vci = (!vci.is_empty()).then_some(vci);
+        // A response read during the exchange that it or an earlier exchange could own leaves
+        // its own classification at least `undetermined` (design 8.11 `late_response`).
+        let mut may_own_unattached = false;
         for (item, placed) in unbound.iter().zip(unbound_placed) {
             let owner = late_response_owner(&inner.links[at].1, item, &evidence);
             if let Some(LateOwner::One(owner)) = owner {
@@ -1546,8 +1549,11 @@ impl CommLog {
             let unattached = inner.append_with(|seq, line| {
                 serde_json::to_writer(line, &Line { seq, event: &event })
             })?;
-            if let Some(LateOwner::Several(owners)) = owner {
-                inner.late_response_unowned(at, &owners, item, placed, unattached)?;
+            if let Some(LateOwner::Several(owners, in_flight)) = owner {
+                may_own_unattached |= in_flight;
+                if !owners.is_empty() {
+                    inner.late_response_unowned(at, &owners, item, placed, unattached)?;
+                }
             }
         }
         let history = inner.links[at].1.history_for(&evidence);
@@ -1571,7 +1577,13 @@ impl CommLog {
             start_unattached,
             clears,
         };
-        let entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
+        let mut entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
+        if may_own_unattached && entry.classification < exchange::Classification::Undetermined {
+            entry.classification = exchange::Classification::Undetermined;
+            entry.reason.push_str(
+                " A response read during this exchange, logged unattached, may be this exchange's or an earlier one's: undetermined.",
+            );
+        }
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
         inner.links[at].1.record(&entry);
         inner.links[at].1.log(&entry, kept.evidence.clone(), clears);
@@ -2166,10 +2178,10 @@ impl CommLog {
 enum LateOwner {
     /// The one owed exchange the VCI ended that could own it.
     One(u64),
-    /// Two or more could (owed exchanges the log keeps, or one of them and the exchange in
-    /// flight, which awaits the same response): the owed ones it keeps, each at least
-    /// `undetermined`.
-    Several(Vec<u64>),
+    /// Two or more could (owed exchanges, or one of them and the exchange in flight, which
+    /// awaits the same response): the owed ones the log keeps, and whether the exchange in
+    /// flight is one of them; each is at least `undetermined`.
+    Several(Vec<u64>, bool),
 }
 
 /// [`LateOwner`] of `item`: a message another node sent, not a pending, that an owed exchange
@@ -2211,7 +2223,7 @@ fn late_response_owner(
         .into_iter()
         .filter(|owner| state.kept(*owner).is_some_and(|kept| !pending(kept)))
         .collect();
-    (!kept.is_empty()).then_some(LateOwner::Several(kept))
+    (!kept.is_empty() || in_flight).then_some(LateOwner::Several(kept, in_flight))
 }
 
 impl Inner {
@@ -4675,6 +4687,12 @@ mod tests {
             for exchange in settled[0]["exchanges"].as_array().unwrap() {
                 assert_eq!(exchange["classification"], "undetermined", "{exchange}");
             }
+            // The exchange in flight that could own it is at least `undetermined` too.
+            assert_eq!(
+                exchanges.last().unwrap()["classification"],
+                "undetermined",
+                "{lines:?}"
+            );
         }
         // A late pending is no late response.
         let lines = run(vec![
@@ -4803,6 +4821,25 @@ mod tests {
             vec![transmit(6_010_000), late],
         )
         .unwrap();
+        // The second is owed no more, now that its answer is its alone: a positive response to
+        // F191, which only it of the owed requests could own, has no owner. And the first's
+        // answer counts for the exchanges after it: a silent F190 read, its send confirmed, is
+        // `vehicle`.
+        let mut again = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x91],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x91, 0x41]),
+        );
+        again.pending_visibility = exchange::PendingVisibility::Forwarded;
+        again.times.agent.before_us = 9_010_000;
+        again.times.agent.end_us = 9_050_000;
+        let fourth = log.exchange_with(again, vec![transmit(9_010_000)]).unwrap();
+        let fifth = log
+            .exchange_with(
+                silent(&[0x22, 0xF1, 0x90], 12_010_000),
+                vec![transmit(12_010_000)],
+            )
+            .unwrap();
         log.end("ok");
         let lines = lines(&setup);
         let of = |seq: u64| {
@@ -4818,6 +4855,19 @@ mod tests {
             "{}",
             of(second)
         );
+        assert_eq!(
+            of(fourth)["link_history"]["owed_matching"],
+            0,
+            "{}",
+            of(fourth)
+        );
+        assert_eq!(
+            of(fifth)["link_history"]["answered_same_match"],
+            1,
+            "{}",
+            of(fifth)
+        );
+        assert_eq!(of(fifth)["classification"], "vehicle", "{}", of(fifth));
         let settled: Vec<_> = lines
             .iter()
             .filter(|line| line["event"] == "late_response")

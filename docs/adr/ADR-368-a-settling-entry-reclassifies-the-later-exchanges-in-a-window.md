@@ -56,6 +56,14 @@ retention (2026-10-27): the last 16 exchanges per link.
 
    The later exchange is classified again from its own evidence with that history. Only one
    whose classification or reason changes is reclassified.
+
+   The answer also counts for the exchanges logged after the settling entry, as `record`
+   would have counted it in time: in the link's answered counts, and as a matched answer
+   unless the matched answers ended since. A later exchange whose answer no owed request can
+   own any more is placed with it alone, as `record` places one (design 8.11 "Owed request"):
+   - it is owed no more, and what the log kept of it is released;
+   - its answer is a matched answer for the exchanges after it, in the window and logged later;
+   - its final response ends it as an owed request for them in turn.
 3. **The settling entry names them.**
    - `refers_to` lists the settled exchange, then each reclassified one, in `seq` order.
    - `exchanges` gives each its new classification, with a reason that names the exchange whose
@@ -73,7 +81,8 @@ retention (2026-10-27): the last 16 exchanges per link.
    - each becomes at least `undetermined`, and stays owed.
 
    A response is ambiguous when two or more owed exchanges could own it, or one could and the
-   exchange in flight awaits the same response.
+   exchange in flight awaits the same response. The exchange in flight is then at least
+   `undetermined` in its own entry, written after the settling entry.
 5. **An exchange settled by its own entry** is not reclassified from its history afterwards.
    This covers the owner of a `late_response` or `primitive_ended`, and an owner an ambiguous
    response raised. Its classification then rests on evidence its history alone does not
@@ -87,8 +96,13 @@ retention (2026-10-27): the last 16 exchanges per link.
 - A matched answer rarely counts for a later exchange in practice. A later exchange with the
   same match is usually itself owed, so the answer could be its own and is no matched answer
   (`LinkState::record`). The final response ending an owed request is the common case.
-- The exchange in flight, as a possible owner of an ambiguous response, is classified by its
-  own entry; the settling entry refers only to the ended owners.
+- The settling entry of an ambiguous response refers only to the ended owners the log keeps.
+  An owed exchange it does not keep, such as one that ended with a link error, is not named.
+- A late positive response to an ECUReset or a session change is not taken as accepting it:
+  it is no matched answer, but the owed requests and matched answers from before it stay.
+  Whether a late acceptance ends them is left open.
+- On the agent's link a `primitive_ended` is written before the link's next exchange, so it
+  finds no later exchange in the window yet; it reclassifies the same way once one can.
 - A `late_response` judges the settled exchange against the link's history as of the settling
   entry (ADR-365 item 4), while the later exchanges keep the history of their own time.
 - A `late_item` that adds an answer will reclassify the later exchanges the same way when it is

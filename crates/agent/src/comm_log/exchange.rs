@@ -1309,6 +1309,8 @@ struct Logged {
     reason: String,
     /// The link's clears when its history was taken.
     clears: Clears,
+    /// The link's clears just after its entry was taken in.
+    after: Clears,
     /// A settling entry of its own changed its evidence or set its classification: the history
     /// alone no longer gives it, so it is not reclassified from the history.
     settled: bool,
@@ -1605,6 +1607,7 @@ impl LinkState {
             classification: entry.classification,
             reason: entry.reason.clone(),
             clears,
+            after: self.clears,
             settled: false,
         });
     }
@@ -1637,53 +1640,100 @@ impl LinkState {
         &mut self,
         answer: &SettledAnswer,
     ) -> (Vec<Reclassified>, Option<u64>) {
-        let mut changed = Vec::new();
-        for logged in self
-            .window
-            .iter_mut()
-            .filter(|logged| logged.seq > answer.seq && !logged.settled)
-        {
-            let mut history = logged.history.clone();
-            if answer.newly_answered {
-                history.answered += 1;
-                if logged.clears.errors == answer.clears.errors {
-                    history.answered_since_error += 1;
+        let mut changed: Vec<Reclassified> = Vec::new();
+        let mut answers = vec![answer.clone()];
+        while let Some(answer) = answers.pop() {
+            self.take_answer(&answer);
+            for at in 0..self.window.len() {
+                let logged = &self.window[at];
+                if logged.seq <= answer.seq || logged.settled {
+                    continue;
                 }
+                let mut history = logged.history.clone();
+                if answer.newly_answered {
+                    history.answered += 1;
+                    if logged.clears.errors == answer.clears.errors {
+                        history.answered_since_error += 1;
+                    }
+                }
+                if answer.newly_matched
+                    && logged.clears.matched == answer.clears.matched
+                    && MatchKey::of(&logged.evidence) == answer.key
+                {
+                    history.answered_same_match += 1;
+                }
+                if answer.final_response {
+                    history.owners.retain(|owner| *owner != answer.seq);
+                    history.owed_matching = history.owners.len() as u32;
+                }
+                if history == logged.history {
+                    continue;
+                }
+                let was_matched = logged.history.owners.is_empty();
+                let entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
+                let seq = logged.seq;
+                // An answer no owed request can own now is placed with its exchange alone: that
+                // exchange is owed no more, and its answer is a matched answer for the ones
+                // after it, as `record` would have counted it (design 8.11 "Owed request").
+                if entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq) {
+                    self.owed.retain(|owed| owed.seq != seq);
+                    if self
+                        .kept
+                        .remove(&seq)
+                        .is_some_and(|kept| kept.sent == Sent::Unknown)
+                    {
+                        self.unknown_sends = self.unknown_sends.saturating_sub(1);
+                    }
+                    answers.push(SettledAnswer {
+                        seq,
+                        key: entry.effect.key.clone(),
+                        newly_answered: false,
+                        newly_matched: entry.matched_answer() && !was_matched,
+                        final_response: true,
+                        clears: self.window[at].after,
+                    });
+                }
+                let logged = &mut self.window[at];
+                logged.history = entry.link_history.clone();
+                if entry.classification == logged.classification && entry.reason == logged.reason {
+                    continue;
+                }
+                logged.classification = entry.classification;
+                logged.reason.clone_from(&entry.reason);
+                let reclassified = Reclassified {
+                    seq,
+                    link: logged.evidence.link,
+                    origin: logged.origin,
+                    request: logged.request.clone(),
+                    classification: entry.classification,
+                    reason: entry.reason,
+                };
+                if let Some(kept) = self.kept.get_mut(&seq) {
+                    kept.classification = reclassified.classification;
+                }
+                changed.retain(|earlier| earlier.seq != seq);
+                changed.push(reclassified);
             }
-            if answer.newly_matched
-                && logged.clears.matched == answer.clears.matched
-                && MatchKey::of(&logged.evidence) == answer.key
-            {
-                history.answered_same_match += 1;
-            }
-            if answer.final_response {
-                history.owners.retain(|owner| *owner != answer.seq);
-                history.owed_matching = history.owners.len() as u32;
-            }
-            if history == logged.history {
-                continue;
-            }
-            let entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
-            logged.history = entry.link_history.clone();
-            if entry.classification == logged.classification && entry.reason == logged.reason {
-                continue;
-            }
-            logged.classification = entry.classification;
-            logged.reason.clone_from(&entry.reason);
-            if let Some(kept) = self.kept.get_mut(&logged.seq) {
-                kept.classification = entry.classification;
-            }
-            changed.push(Reclassified {
-                seq: logged.seq,
-                link: logged.evidence.link,
-                origin: logged.origin,
-                request: logged.request.clone(),
-                classification: entry.classification,
-                reason: entry.reason,
-            });
         }
+        changed.sort_by_key(|later| later.seq);
         let not_reclassified = self.left_window.filter(|left| *left > answer.seq);
         (changed, not_reclassified)
+    }
+
+    /// Takes `answer` into the link's counts, for the exchanges logged after it, as
+    /// [`LinkState::record`] would have counted it: one more answered exchange, one more since the
+    /// last link error unless one came since, and a matched answer unless the matched answers
+    /// ended since.
+    fn take_answer(&mut self, answer: &SettledAnswer) {
+        if answer.newly_answered {
+            self.answered += 1;
+            if answer.clears.errors == self.clears.errors {
+                self.answered_since_error += 1;
+            }
+        }
+        if answer.newly_matched && answer.clears.matched == self.clears.matched {
+            *self.matched.entry(answer.key.clone()).or_insert(0) += 1;
+        }
     }
 
     /// The `seq` and kind of the last link error recorded.
@@ -1782,12 +1832,6 @@ impl ExchangeEntry {
     /// counted as [`LinkState::record`] counts an exchange's answer.
     pub(crate) fn settled_answer(&self, kept: &Kept) -> SettledAnswer {
         let effect = &self.effect;
-        let accepting = effect.restarts_ecu
-            && ((effect.positive && effect.final_response)
-                || (effect.suppressed && self.classification == Classification::None));
-        let unsure_restart = effect.restarts_ecu && effect.unusable;
-        let matched =
-            effect.bound_answer && !accepting && !unsure_restart && effect.owners.is_empty();
         let before = &kept.evidence;
         SettledAnswer {
             seq: self.seq,
@@ -1795,10 +1839,35 @@ impl ExchangeEntry {
             newly_answered: effect.this_exchange
                 && before.answer_head().is_none()
                 && !before.response_started,
-            newly_matched: matched && !before.bound_answer(),
+            newly_matched: self.matched_answer() && !before.bound_answer(),
             final_response: effect.final_response,
             clears: kept.clears,
         }
+    }
+
+    /// Whether it accepts an ECUReset or a session change, as [`LinkState::record`] reads it.
+    fn accepting(&self) -> bool {
+        let effect = &self.effect;
+        effect.restarts_ecu
+            && ((effect.positive && effect.final_response)
+                || (effect.suppressed && self.classification == Classification::None))
+    }
+
+    /// Whether its answer is a matched answer, as [`LinkState::record`] counts it.
+    fn matched_answer(&self) -> bool {
+        let effect = &self.effect;
+        let unsure_restart = effect.restarts_ecu && effect.unusable;
+        effect.this_exchange
+            && effect.bound_answer
+            && !self.accepting()
+            && !unsure_restart
+            && effect.owners.is_empty()
+    }
+
+    /// Whether its answer is placed with it alone, so it is owed nothing, as
+    /// [`LinkState::record`] reads it.
+    fn placed_alone(&self) -> bool {
+        self.effect.owners.is_empty() && (self.effect.final_response || self.accepting())
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -2727,12 +2796,7 @@ mod tests {
         state.channel_link_error(2, LinkErrorKind::Receive);
         log_kept(&mut state, 3, silent.clone());
         let (changed, _) = state.reclassify_after(&matched(&kept));
-        assert!(
-            changed
-                .iter()
-                .all(|later| later.classification != Classification::Vehicle),
-            "{changed:?}"
-        );
+        assert!(changed.is_empty(), "{changed:?}");
 
         // An accepted session change empties the window; one more than the window's size
         // pushes the oldest out. Either way the exchanges that left it are named.

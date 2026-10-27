@@ -1458,6 +1458,7 @@ impl CommLog {
             origin: evidence.origin,
             request: exchange::Request::of(&evidence),
             classification: exchange::Classification::None,
+            sent: exchange::Sent::Unknown,
             transmit,
             pendings: judged_from
                 .as_ref()
@@ -1468,13 +1469,17 @@ impl CommLog {
         let entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
         inner.links[at].1.record(&entry);
-        inner.links[at].1.keep(
-            seq,
-            exchange::Kept {
-                classification: entry.classification,
-                ..kept
-            },
-        );
+        // Only an exchange the VCI ended can be settled by a late response (ADR-365).
+        if kept.evidence.vci_ended {
+            inner.links[at].1.keep(
+                seq,
+                exchange::Kept {
+                    classification: entry.classification,
+                    sent: entry.sent,
+                    ..kept
+                },
+            );
+        }
         if let Some(kind) = entry.link_error() {
             for (other, (_, state)) in inner.links.iter_mut().enumerate() {
                 if other != at {
@@ -1788,7 +1793,7 @@ impl Inner {
                 reason,
             }],
             text: format!(
-                "The ECU's response to the exchange logged as {owner} came after the VCI had ended that exchange."
+                "The ECU's response to the exchange logged as {owner} was delivered after that exchange had ended."
             ),
             classification,
         });
@@ -4088,6 +4093,38 @@ mod tests {
             (read_f191, vec![(answer, 500_000), (answer, 600_000)]),
         ]);
         assert_eq!(of(&lines, "late_response").len(), 1, "{lines:?}");
+        assert_eq!(of(&lines, "unattached").len(), 1, "{lines:?}");
+        // A response that names no identifier is matched against every owed request; the
+        // exchange's own entry is followed by a settling entry with the response's fields.
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let (first, transmit) = silent(read_f190, 10_000);
+        log.exchange_with(first, vec![transmit]).unwrap();
+        let (second, transmit) = silent(read_f191, 3_010_000);
+        let mut unnamed = response(answer, 500_000);
+        if let UnattachedData::Result { identifier, .. } = &mut unnamed.data {
+            *identifier = None;
+        }
+        log.exchange_with(second, vec![transmit, unnamed]).unwrap();
+        // An exchange the agent's deadline ended is settled by `primitive_ended`, not here.
+        let (mut third, transmit) = silent(read_f190, 6_010_000);
+        third.vci_ended = false;
+        third.end = exchange::End::VciDidNotEnd;
+        log.exchange_with(third, vec![transmit]).unwrap();
+        let (fourth, transmit) = silent(read_f191, 9_010_000);
+        log.exchange_with(fourth, vec![transmit, response(answer, 6_500_000)])
+            .unwrap();
+        log.end("ok");
+        let lines = self::lines(&setup);
+        let settled = of(&lines, "late_response");
+        assert_eq!(settled.len(), 1, "{lines:?}");
+        assert_eq!(settled[0]["item"], "received", "{}", settled[0]);
+        assert_eq!(settled[0]["primitive"], "earlier", "{}", settled[0]);
+        assert!(settled[0].get("identifier").is_none(), "{}", settled[0]);
+        assert!(settled[0]["message"].is_object(), "{}", settled[0]);
+        assert_eq!(settled[0]["epoch"], 0, "{}", settled[0]);
         assert_eq!(of(&lines, "unattached").len(), 1, "{lines:?}");
     }
 

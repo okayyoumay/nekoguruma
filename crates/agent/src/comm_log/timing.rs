@@ -242,7 +242,8 @@ pub(crate) fn judge_late(
         return LateWindow::Open;
     };
     let at = at.unwrapped - transmit.unwrapped;
-    if at < 0 || pendings.iter().any(|&us| us < 0) {
+    // A final response comes after the transmit and after every pending of its exchange.
+    if at < 0 || pendings.iter().any(|&us| us < 0 || us > at) {
         return LateWindow::Open;
     }
     let margin = to_i64(limits.margin_us);
@@ -735,6 +736,11 @@ mod tests {
             LateWindow::Open
         );
         assert_eq!(late(LIMITS, false, &[], -1, 3), LateWindow::Open);
+        // Before a pending of the exchange: no final response of it.
+        assert_eq!(
+            late(LIMITS, false, &[at(30_000)], 20_000, 3),
+            LateWindow::Open
+        );
     }
 
     #[test]

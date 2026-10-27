@@ -24,15 +24,18 @@ and match.
 
 ## Decision
 
-1. **The log keeps each owed exchange.** For each exchange it logs, it keeps:
+1. **The log keeps each owed exchange the VCI ended.** For each such exchange it logs, it keeps:
    - the evidence;
-   - its entry's origin, request and classification;
+   - its entry's origin, request, `sent` and classification;
    - its placed transmit and pending times;
    - the link's limits.
 
    This is kept only while the exchange is owed (`LinkState::keep`). It is dropped when the
    exchange is settled, or when an accepted ECUReset or session change ends the owed requests.
-   The log already bounds the owed list by the job, and the kept evidence has the same bound.
+   An exchange the agent's deadline ended is not kept, since no late response settles it.
+   The kept evidence is bounded by the owed list, which the job bounds.
+   A settled exchange whose `sent` was `unknown` is confirmed by its answer, so it no longer
+   counts among the sends a late transmit indication could belong to.
 2. **A late response needs exactly one owner.** An unbound result item is a late response when
    all of these hold:
    - it is a message another node sent: no indication, loopback or break flag, and bytes;
@@ -50,7 +53,8 @@ and match.
    - **Late:** past the latest limit plus the margin, by more than a single frame's transfer,
      shows it began late. This needs a response of one frame (ADR-364). The amount is the end
      less that transfer less the limit.
-   - **Open:** anything else, including a time not on the transmit's clock and epoch.
+   - **Open:** anything else, including a time not on the transmit's clock and epoch, or one
+     before a pending of the exchange.
 
    The limits are those of the kept exchange, from its own pendings. On an absorbing link they
    are bounded as ADR-362 bounds them.
@@ -59,7 +63,10 @@ and match.
    - **Late:** `vehicle`, unless the rows that do not turn on timing give the exchange
      `system` or `undetermined` with this response as its end. Those rows are applied with the
      window taken as within the limit, and with the link's history as of the settling entry
-     (for example, a code such as 0x35).
+     (for example, a code such as 0x35). `vehicle` also needs the exchange's receive timeout
+     judged at the limit (`timeout_at_limit`). A timeout that was not judged, as on a link
+     without start-of-message indications (ADR-362), may have ended the wait early, before the
+     response began, so it is `undetermined`.
    - **Open:** `undetermined`, or a more severe classification those rows give.
 
    When the exchange's own entry was `system`, `system` stands, since the faults such an
@@ -84,5 +91,9 @@ and match.
   Both are left to the item that reclassifies later exchanges.
 - A response that two owners could own stays `unattached`. The design also asks that each of
   those owners becomes at least `undetermined`; that is left to the same item.
-- `primitive_ended`, `vci_loss_settled` and `late_item` use the same form of settling entry and
-  the same kept evidence.
+- `primitive_ended`, `vci_loss_settled` and `late_item` use the same form of settling entry. The
+  log keeps evidence only for the exchanges a late response can settle, so a settling entry for
+  other exchanges keeps what it needs itself.
+- A kept exchange holds a full copy of its evidence. A long run of unanswered requests, such as
+  a TesterPresent with its positive response suppressed every 2 s, keeps one copy per request
+  until an accepted reset or session change.

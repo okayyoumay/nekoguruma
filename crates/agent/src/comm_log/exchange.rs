@@ -1268,6 +1268,8 @@ pub(crate) struct Kept {
     pub origin: Origin,
     pub request: Request,
     pub classification: Classification,
+    /// The entry's `sent`.
+    pub sent: Sent,
     pub transmit: super::timing::At,
     pub pendings: Vec<super::timing::At>,
     /// The link's limits, when `link_opened` recorded them.
@@ -1384,7 +1386,12 @@ impl LinkState {
     /// given back.
     pub(crate) fn settle_owed(&mut self, seq: u64) -> Option<Kept> {
         self.owed.retain(|owed| owed.seq != seq);
-        self.kept.remove(&seq)
+        let kept = self.kept.remove(&seq)?;
+        // The answer confirms its send: it can own a late transmit indication no more.
+        if kept.sent == Sent::Unknown {
+            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+        }
+        Some(kept)
     }
 
     /// A link error came on the physical channel this link shares, logged as line `seq` (design
@@ -1837,23 +1844,40 @@ pub(crate) fn settle_late_response(
         LateWindow::InTime { at_us } => (
             System,
             format!(
-                "The ECU's response came {:.1} ms after the transmit, within the limit in force less the margin, after the VCI had ended the exchange: the system missed a response that came in time.",
+                "The ECU's response came {:.1} ms after the transmit, within the limit in force less the margin, and was delivered after the exchange had ended: the system missed a response that came in time.",
                 at_us as f64 / 1000.0
             ),
         ),
-        LateWindow::Late { .. } if base.classification >= Undetermined => {
-            (base.classification, base.reason)
-        }
-        LateWindow::Late { by_us } => (
-            Vehicle,
-            format!(
-                "The ECU responded at least {:.1} ms after the limit in force, and the VCI had ended its wait in time.",
+        LateWindow::Late { by_us } => {
+            let late = format!(
+                "The ECU responded at least {:.1} ms after the limit in force.",
                 by_us as f64 / 1000.0
-            ),
-        ),
+            );
+            if base.classification >= Undetermined {
+                (base.classification, format!("{late} {}", base.reason))
+            } else if kept.evidence.timing.window == Window::TimeoutAtLimit {
+                (
+                    Vehicle,
+                    format!("{late} The VCI had ended its wait at the limit."),
+                )
+            } else {
+                // The VCI's timeout was not judged at the limit (on a link without
+                // start-of-message indications it is not judged at all): it may have ended its
+                // wait early, before the response began.
+                (
+                    Undetermined,
+                    format!(
+                        "{late} Whether the VCI ended its wait at the limit, or before, is not shown."
+                    ),
+                )
+            }
+        }
         LateWindow::Open => (
             base.classification.max(Undetermined),
-            "A response came after the VCI ended the exchange, and its time does not show whether the ECU answered within the limit in force.".to_owned(),
+            format!(
+                "A response was delivered after the exchange ended, and its time does not show whether the ECU answered within the limit in force. With it as the exchange's response: {}",
+                base.reason
+            ),
         ),
     };
     // A fault of the system the exchange's entry observed stands (design 8.11 "Settlement").
@@ -2906,11 +2930,13 @@ mod tests {
         let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         silent.vci_ended = true;
+        silent.timing.window = Window::TimeoutAtLimit;
         let kept = |classification| Kept {
             evidence: silent.clone(),
             origin: silent.origin,
             request: Request::of(&silent),
             classification,
+            sent: Sent::Confirmed,
             transmit: None,
             pendings: Vec::new(),
             limits: None,
@@ -2932,6 +2958,14 @@ mod tests {
             settle(&vehicle, &positive, LateWindow::Open).0,
             Classification::Undetermined
         );
+        // Late after a timeout that was not judged at the limit: the VCI may have ended its
+        // wait early.
+        let mut unjudged = vehicle.clone();
+        unjudged.evidence.timing.window = Window::NotJudged;
+        assert_eq!(
+            settle(&unjudged, &positive, LateWindow::Late { by_us: 1 }).0,
+            Classification::Undetermined
+        );
         // Late, but its outcome's own row is not `vehicle`: an invalid key stays undetermined.
         assert_eq!(
             settle(&vehicle, &[0x7F, 0x22, 0x35], LateWindow::Late { by_us: 1 }).0,
@@ -2945,6 +2979,36 @@ mod tests {
         );
         assert_eq!(class, Classification::System);
         assert!(reason.contains("stands"), "{reason}");
+    }
+
+    #[test]
+    fn a_settled_send_owns_no_late_transmit_indication() {
+        // A request with no transmit evidence and no answer: `sent` `unknown`, owed.
+        let mut state = LinkState::default();
+        let silent = evidence(&READ_F186, End::NoResponse);
+        let entry = log(&mut state, 1, silent.clone());
+        assert_eq!(entry.sent, Sent::Unknown);
+        assert!(state.may_own_tx_indication());
+        state.keep(
+            1,
+            Kept {
+                evidence: silent.clone(),
+                origin: silent.origin,
+                request: Request::of(&silent),
+                classification: entry.classification,
+                sent: entry.sent,
+                transmit: None,
+                pendings: Vec::new(),
+                limits: None,
+            },
+        );
+        assert!(state.settle_owed(1).is_some());
+        assert!(!state.may_own_tx_indication());
+        assert!(
+            state
+                .late_response_owners(None, &[0x62, 0xF1, 0x86])
+                .is_empty()
+        );
     }
 
     #[test]

@@ -3010,7 +3010,8 @@ mod tests {
     }
 
     /// The settling entry's view of exchange `seq`, kept as `kept`, that gets `response` late,
-    /// applied as the log applies it: settled, then the end of the evidence before it.
+    /// applied as the log applies it: settled, then the end of the evidence before it, then the
+    /// answer itself.
     fn settle_late(
         state: &mut LinkState,
         seq: u64,
@@ -3022,10 +3023,9 @@ mod tests {
         let history = state.history_settling(&answered, seq);
         let entry = ExchangeEntry::build(seq, answered.clone(), history);
         state.settled(seq, entry.classification, &entry.reason, answered, true);
-        let (changed, through) = match entry.late_restart() {
-            Some((accepting, earliest)) => state.reset_after(seq, earliest, accepting),
-            None => (Vec::new(), None),
-        };
+        let answer = entry.settled_answer(kept);
+        let (changed, through) =
+            super::super::settle_later(state, seq, entry.late_restart(), &answer);
         (entry, changed, through)
     }
 
@@ -3117,11 +3117,77 @@ mod tests {
         let seqs: Vec<u64> = state.window.iter().map(|logged| logged.seq).collect();
         assert_eq!(seqs, vec![3, 4, 5, 6, 7]);
         assert_eq!(state.left_window, Some(2));
-        // The answered counts stand: the answers were given.
+        // The answered counts stand, and the late answer adds one: the answers were given.
         assert_eq!(
             window_history(&state, 7).answered,
-            seventh.link_history.answered
+            seventh.link_history.answered + 1
         );
+    }
+
+    /// ADR-369: what the reset shifts and frees keeps the evidence after it. A matched answer
+    /// logged after it still counts; an owed exchange after it whose answer comes later still
+    /// counts for the exchanges after that one; and an exchange the reset places alone is no
+    /// owner of a later answer.
+    #[test]
+    fn a_late_acceptance_keeps_the_evidence_after_it() {
+        let confirmed = |request: &[u8], end| {
+            let mut evidence = forwarding(evidence(request, end));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let f186 = || End::Positive(vec![0x62, 0xF1, 0x86, 0x41]);
+        let accept: &[u8] = &[0x50, 0x03, 0x00, 0x32, 0x01, 0xF4];
+
+        // A matched answer after the reset.
+        let mut state = LinkState::default();
+        let (_, reset) = log_kept(&mut state, 1, confirmed(&[0x10, 0x03], End::NoResponse));
+        state.keep(1, reset.clone());
+        log_kept(&mut state, 2, confirmed(&READ_F186, f186()));
+        log_kept(&mut state, 3, confirmed(&READ_F186, End::NoResponse));
+        assert_eq!(window_history(&state, 3).answered_same_match, 1);
+        settle_late(&mut state, 1, &reset, accept);
+        assert_eq!(window_history(&state, 3).answered_same_match, 1);
+        assert_eq!(
+            state
+                .history_for(&read([0xF1, 0x86], End::NoResponse))
+                .answered_same_match,
+            1
+        );
+
+        // An owed exchange after the reset, answered after the late acceptance: a matched
+        // answer for the exchanges to come.
+        let mut state = LinkState::default();
+        let (_, reset) = log_kept(&mut state, 1, confirmed(&[0x10, 0x03], End::NoResponse));
+        state.keep(1, reset.clone());
+        let (_, owed) = log_kept(&mut state, 2, confirmed(&READ_F186, End::NoResponse));
+        state.keep(2, owed);
+        settle_late(&mut state, 1, &reset, accept);
+        let owed = state.kept(2).cloned().expect("still owed");
+        settle_late(&mut state, 2, &owed, &[0x62, 0xF1, 0x86, 0x41]);
+        assert_eq!(
+            state
+                .history_for(&read([0xF1, 0x86], End::NoResponse))
+                .answered_same_match,
+            1
+        );
+
+        // An exchange the reset places alone is no owner of the answer after it.
+        let mut state = LinkState::default();
+        log_kept(
+            &mut state,
+            1,
+            confirmed(&[0x22, 0xF1, 0x89], End::NoResponse),
+        );
+        let (_, reset) = log_kept(&mut state, 2, confirmed(&[0x10, 0x03], End::NoResponse));
+        state.keep(2, reset.clone());
+        let f189 = || End::Positive(vec![0x62, 0xF1, 0x89, 0x41]);
+        log_kept(&mut state, 3, confirmed(&[0x22, 0xF1, 0x89], f189()));
+        log_kept(&mut state, 4, confirmed(&[0x22, 0xF1, 0x89], f189()));
+        assert_eq!(window_history(&state, 4).owners, vec![1, 3]);
+        settle_late(&mut state, 2, &reset, accept);
+        assert!(window_history(&state, 3).owners.is_empty());
+        assert!(window_history(&state, 4).owners.is_empty());
+        assert!(!state.owed.iter().any(|owed| owed.seq == 3 || owed.seq == 4));
     }
 
     /// ADR-369: an unusable positive response to an ECUReset, read late, ends the matched

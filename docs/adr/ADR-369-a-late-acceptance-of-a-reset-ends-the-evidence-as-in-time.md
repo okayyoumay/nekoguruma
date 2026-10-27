@@ -86,3 +86,13 @@ The maintainer decided (2026-10-27):
   rule could have given `vehicle`.
 - An exchange in flight when the late answer is read takes the new state, since the log writes
   the settling entry before that exchange's history is taken.
+- No settling entry carries an unusable answer to a reset today. A positive response to 0x10 or
+  0x11 that the worker rejects in time (a wrong echo) fails the request's expected responses
+  when read late, so it is `unattached`. The host gives `positive_unusable` at a primitive's end
+  for other services only. Item 1 keeps the in-time rule for when one does.
+- What was decided before the late acceptance about a response more than one exchange could
+  own stays. A floor raised by an ambiguous response, when one of its possible owners is an owed
+  request the acceptance ends, is not lowered: the log keeps no such response to read again.
+- A `primitive_ended` whose final response could also belong to an earlier owed request still
+  ends its own exchange as owed (ADR-366), which `record` would not have done in time; the
+  reset itself takes the earlier request as its earliest.

@@ -573,8 +573,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   answers and the owed requests, and an unusable answer to either ends only the matched
   answers. Read late, in a `late_response` or a `primitive_ended`, either answer ends them as of
   its exchange's entry (`exchange::LinkState::reset_after`, ADR-369): the later exchanges in the
-  window are reclassified on their matched answers counted again from the window, without the
-  owed requests from before it as owners. A link error ends the matched answers too, but a final response that came after
+  window are reclassified on their matched answers counted again from the window and, after an
+  acceptance, without the owed requests from before it as owners. A link error ends the matched answers too, but a final response that came after
   every link error of its exchange, in the order the host read the link's items, counts as an answer
   since the error (VCI times are not compared); an error after it, or from another link of the
   channel, ends it. A reopened link, a worker

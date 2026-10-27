@@ -351,8 +351,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
 | [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 5), `CLAUDE.md`; ADR-312 |
 | [ADR-361](ADR-361-the-log-unwraps-each-vci-clock-within-a-window-of-the-agent-s-clock.md) | The Log Unwraps Each VCI Clock Within a Window of the Agent's Clock | Accepted | `agent` communication log (`VciClocks`, `clock_epoch`, `pending_intervals`, the reopen scan); design 8.11 "Timing judged", `clock_epoch`; ADR-353, ADR-357 |
-| [ADR-362](ADR-362-the-log-judges-a-receive-timeout-only-before-a-response-began.md) | The Log Judges a Receive Timeout Only Before a Response Began | Accepted | `agent` communication log (`comm_log::timing`, `link_opened`, the timeout and late rows); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-361 |
+| [ADR-362](ADR-362-the-log-judges-a-receive-timeout-only-before-a-response-began.md) | The Log Judges a Receive Timeout Only Before a Response Began | Accepted (Decision item 4 narrowed by ADR-364) | `agent` communication log (`comm_log::timing`, `link_opened`, the timeout and late rows); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-361 |
 | [ADR-363](ADR-363-an-ecu-definition-declares-the-identifier-a-vehicle-definition-names.md) | An ECU Definition Declares the Identifier a Vehicle Definition Names | Accepted | `diag-ir` (`EcuDocument.definition_id`, schema 20), `diag-frontend` (`definition.csv`); design 8.8.2; ADR-326, ADR-307 |
+| [ADR-364](ADR-364-the-log-proves-a-single-frame-response-late-by-its-end.md) | The Log Proves a Single-Frame Response Late by Its End | Accepted | `agent` communication log (`comm_log::timing`, the late-pending row), `link.rs` (`LinkConfig::single_frame`); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-358, ADR-362 |
 
 ## Status Legend
 
@@ -720,7 +721,8 @@ the predecessor repository these ADRs came from.
 - ADR-353
 - ADR-357
 - ADR-361
-- ADR-362
+- ADR-362 (Decision item 4 narrowed by ADR-364)
+- ADR-364
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

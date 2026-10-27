@@ -23,7 +23,20 @@ use crate::policy::{ApplicationLayer, Permission};
 /// wait allows for ([`LinkConfig::job_end_wait`]).
 pub const JOB_END_RESPONSE_BYTES: u64 = 4_095;
 /// An upper bound of one classic CAN frame's bits on the bus, stuffing included.
-pub const JOB_END_FRAME_BITS: u64 = 160;
+pub const CAN_FRAME_BITS: u64 = 160;
+/// The longest message one classic CAN frame carries as a single frame whatever the addressing
+/// format: seven bytes only with normal addressing, six with extended or mixed (ISO
+/// 15765-2:2024 9.6.2.1).
+pub const CAN_SINGLE_FRAME_BYTES: usize = 6;
+/// A message a link sends as one frame ([`LinkConfig::single_frame`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SingleFrame {
+    /// The longest message one frame surely carries.
+    pub max_bytes: usize,
+    /// The longest that frame's transfer takes, in microseconds.
+    pub transfer_us: u64,
+}
+
 /// The `CP_Cr` the job-end wait takes when the link leaves it to the library: the timeout
 /// ISO 15765-2:2024 9.8.1 gives the receiver's wait for the next consecutive frame, 1 s.
 pub const JOB_END_DEFAULT_CR_US: u64 = 1_000_000;
@@ -152,12 +165,25 @@ impl LinkConfig {
         (self.protocol_short_name == PROTOCOL_UDS_ON_CAN).then_some(ApplicationLayer::Uds)
     }
 
+    /// The longest message the link surely sends as one frame, and the longest that frame's
+    /// transfer takes at the baud rate (design 8.11 "Timing judged", ADR-364): on UDS on CAN,
+    /// [`CAN_SINGLE_FRAME_BYTES`] in one frame of at most [`CAN_FRAME_BITS`]. `None` on any
+    /// other protocol, which [`LinkConfig::validate`] refuses.
+    pub fn single_frame(&self) -> Option<SingleFrame> {
+        (self.protocol_short_name == PROTOCOL_UDS_ON_CAN && self.baud_rate != 0).then(|| {
+            SingleFrame {
+                max_bytes: CAN_SINGLE_FRAME_BYTES,
+                transfer_us: (CAN_FRAME_BITS * 1_000_000).div_ceil(u64::from(self.baud_rate)),
+            }
+        })
+    }
+
     /// How long the agent keeps the link open at job end for a primitive past its deadline
     /// before it cancels it (design 8.11 "Settlement", ADR-358): the link's worst case for a
     /// response already under way, one wait for a consecutive frame (`CP_Cr`) plus the transfer
     /// of the longest response a classic ISO-TP message carries, received at the separation
     /// time the tester's flow control requests (`CP_STmin`, ISO 15765-2:2024 9.6.5, 9.8.1), each
-    /// frame taking at most [`JOB_END_FRAME_BITS`] at the baud rate; at most
+    /// frame taking at most [`CAN_FRAME_BITS`] at the baud rate; at most
     /// [`JOB_END_WAIT_MAX`]. A `CP_Cr` the link leaves to the library, or declares 0, counts as
     /// [`JOB_END_DEFAULT_CR_US`], an unset `CP_STmin` as none. By the agent's deadline every
     /// limit in force has passed, so none is added; an ECU that sends slower than `CP_STmin`
@@ -176,7 +202,7 @@ impl LinkConfig {
         let st_min_us = param("CP_STmin").unwrap_or(0);
         // A first frame carries 6 bytes and each consecutive frame 7.
         let frames = 1 + (JOB_END_RESPONSE_BYTES - 6).div_ceil(7);
-        let frame_us = (JOB_END_FRAME_BITS * 1_000_000).div_ceil(u64::from(self.baud_rate.max(1)));
+        let frame_us = (CAN_FRAME_BITS * 1_000_000).div_ceil(u64::from(self.baud_rate.max(1)));
         let wait = Duration::from_micros(cr_us + frames * (frame_us + st_min_us));
         wait.min(JOB_END_WAIT_MAX)
     }
@@ -959,6 +985,27 @@ mod tests {
 
     use super::*;
     use crate::JobDocument;
+
+    /// ADR-364: on UDS on CAN a message of up to six bytes is one frame of at most 160 bits;
+    /// another protocol has no bound.
+    #[test]
+    fn a_single_frame_is_bounded_on_uds_on_can_only() {
+        let mut config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(
+            config.single_frame(),
+            Some(SingleFrame {
+                max_bytes: 6,
+                transfer_us: 320,
+            })
+        );
+        config.baud_rate = 125_000;
+        assert_eq!(
+            config.single_frame().map(|frame| frame.transfer_us),
+            Some(1_280)
+        );
+        config.protocol_short_name = "ISO_14230_3_on_ISO_14230_2".to_owned();
+        assert_eq!(config.single_frame(), None);
+    }
 
     /// ADR-358: the job-end wait is one `CP_Cr` wait plus a 4095-byte response at `CP_STmin`,
     /// a frame taking at most 160 bits, capped at 10 s; unset ComParams count as 1 s and none.

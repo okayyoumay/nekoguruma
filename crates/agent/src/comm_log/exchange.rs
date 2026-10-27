@@ -255,6 +255,10 @@ pub(crate) struct Timing {
     /// Why the window is `not_judged`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub not_judged_reason: Option<NotJudgedReason>,
+    /// The forwarded pending a `late` window names, by its place in `pending` from 0, when that
+    /// pending came after the limit in force before it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_pending: Option<usize>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub p2_ms: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -277,6 +281,7 @@ impl Timing {
             window: Window::NotJudged,
             window_by_ms: None,
             not_judged_reason: Some(NotJudgedReason::NoTransmitTime),
+            late_pending: None,
             p2_ms: None,
             p2_star_ms: None,
             completion_ms: None,
@@ -655,6 +660,18 @@ pub(crate) enum End {
         refused_after_loss: bool,
     },
     Unknown(UnknownCause),
+}
+
+impl End {
+    /// The response the exchange ended with, if any.
+    pub(crate) fn response(&self) -> Option<&[u8]> {
+        match self {
+            Self::Positive(response)
+            | Self::PositiveUnusable(response)
+            | Self::Negative(response) => Some(response),
+            _ => None,
+        }
+    }
 }
 
 /// The entry's `outcome`.
@@ -1601,11 +1618,33 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
         (Sent::NotSent, _) => "Not sent",
         (Sent::Unknown, _) => "It is not known whether the request reached the bus",
     };
-    let mut outcome = match &evidence.end {
+    let mut outcome = outcome_phrase(evidence);
+    if evidence.pending_seen() {
+        outcome.push_str(&format!(
+            ", after {} response-pending message(s) (0x78)",
+            evidence.pending.len()
+        ));
+        if let Some(place) = evidence.timing.late_pending {
+            outcome.push_str(&format!(
+                ", pending {} of them {} ms after the limit in force before it",
+                place + 1,
+                by_ms(&evidence.timing)
+            ));
+        }
+    }
+    format!("{sent_phrase}; {outcome}.")
+}
+
+/// How the exchange ended, as the entry's text and a late pending's reason name it.
+fn outcome_phrase(evidence: &Evidence) -> String {
+    match &evidence.end {
         End::Positive(_) => {
             let timing = match evidence.timing.window {
                 Window::NotJudged => " (its time is not judged)".to_owned(),
-                Window::Late => format!(" {} ms after the limit in force", by_ms(&evidence.timing)),
+                // A late pending's window names the pending, not the final response.
+                Window::Late if evidence.timing.late_pending.is_none() => {
+                    format!(" {} ms after the limit in force", by_ms(&evidence.timing))
+                }
                 _ => String::new(),
             };
             format!("the ECU responded positively{timing}")
@@ -1641,7 +1680,7 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
             "the agent stopped waiting before the VCI ended the exchange".to_owned()
         }
         End::LinkError(kind) => format!("the link reported {}", kind.phrase()),
-        End::NotSent(_) => unreachable!("returned above"),
+        End::NotSent(cause) => format!("not sent: {}", cause.phrase(evidence.caused_by)),
         End::VciLost {
             refused_after_loss: true,
         } => "the VCI had been lost before the request, so the link refused it".to_owned(),
@@ -1649,14 +1688,7 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
             "the connection to the VCI was lost while waiting for the response".to_owned()
         }
         End::Unknown(cause) => format!("the diagnostic system failed: {}", cause.phrase()),
-    };
-    if evidence.pending_seen() {
-        outcome.push_str(&format!(
-            ", after {} response-pending message(s) (0x78)",
-            evidence.pending.len()
-        ));
     }
-    format!("{sent_phrase}; {outcome}.")
 }
 
 /// The entry's classification, reason and text: the first row of design 8.11's table that
@@ -1802,9 +1834,16 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                 cause.phrase(evidence.caused_by)
             ),
         ),
-        // Not implemented, and standing here: any outcome after a forwarded pending past the
-        // limit in force before it (`system`). The log judges no pending against its limit yet,
-        // so a window `late` is a final response's.
+        // Any outcome after a forwarded pending past the limit in force before it.
+        _ if evidence.timing.late_pending.is_some() => (
+            System,
+            format!(
+                "The ECU sent response pending {} (0x78) {} ms after the limit in force before it, and the VCI did not end its wait at that limit; then {}.",
+                evidence.timing.late_pending.unwrap_or_default() + 1,
+                by_ms(&evidence.timing),
+                outcome_phrase(evidence)
+            ),
+        ),
         End::VciLost { refused_after_loss } => {
             let mut reason = if *refused_after_loss {
                 to_owned(
@@ -2744,6 +2783,37 @@ mod tests {
             End::PositiveUnusable(vec![0x62, 0xF1]),
         ));
         assert_eq!(verdict_of(&evidence).0, Classification::Undetermined);
+    }
+
+    #[test]
+    fn any_outcome_after_a_late_forwarded_pending_is_system() {
+        for end in [
+            End::Positive(vec![0x62, 0xF1, 0x86]),
+            End::NoResponse,
+            End::VciLost {
+                refused_after_loss: false,
+            },
+        ] {
+            let mut late = forwarding(evidence(&READ_F186, end.clone()));
+            late.pending = vec![pending()];
+            late.timing.window = Window::Late;
+            late.timing.window_by_ms = Some(3.0);
+            late.timing.late_pending = Some(0);
+            let verdict = verdict(&late);
+            let (class, reason, text) = (verdict.classification, verdict.reason, verdict.text);
+            assert_eq!(class, Classification::System, "{end:?}: {reason}");
+            assert!(
+                reason.contains("response pending 1 (0x78) 3.0 ms after the limit in force"),
+                "{reason}"
+            );
+            assert!(reason.contains("did not end its wait"), "{reason}");
+            // The outcome that followed is named, and the final response is not called late.
+            assert!(text.contains("pending 1 of them 3.0 ms after"), "{text}");
+            if matches!(end, End::Positive(_)) {
+                assert!(reason.ends_with("responded positively."), "{reason}");
+                assert!(!text.contains("positively 3.0 ms"), "{text}");
+            }
+        }
     }
 
     #[test]

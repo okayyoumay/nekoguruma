@@ -1334,6 +1334,11 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
                     event: error_event_name(error.error_event),
                     extra_error_info: error.extra_error_info,
                     extra_error_info_name: error.extra_error_info_name.clone(),
+                    // A receive timeout is an outcome, and a lost VCI ends the link: neither is
+                    // a link error (design 8.11 "Link error").
+                    link_error: (error.error_event != PduErrorEvent::PduErrEvtRxTimeout as i32
+                        && error.error_event != PduErrorEvent::PduErrEvtLostCommToVci as i32)
+                        .then(|| link_error_kind(error.error_event)),
                 },
                 _ => return None,
             };

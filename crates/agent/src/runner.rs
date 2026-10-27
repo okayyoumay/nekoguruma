@@ -14365,6 +14365,17 @@ def main():
         Finish,
         /// A lost-events notification.
         Lose,
+        /// A positive response to `22 F1 90` with VCI time 600 ms, then the finished status.
+        Respond,
+        /// The same response, and the finished status 150 ms after it.
+        RespondThenFinishLater,
+        /// A receive timeout with VCI time 1 s, then the finished status.
+        TimeOut,
+        /// The same receive timeout, and the finished status 1 s after it.
+        TimeOutThenFinishLater,
+        /// A receive error with VCI time 20 ms and extra error information, and the finished
+        /// status 150 ms after it.
+        FailThenFinishLater,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14603,19 +14614,98 @@ def main():
                 tokio::spawn(async move {
                     tokio::time::sleep(after).await;
                     use vci_service_interface::event_notification::EventData;
-                    let data = match event {
-                        StartEvent::Finish => EventData::Item(vci_service_interface::EventItem {
-                            cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
-                                module_handle: 1,
-                                cll_handle: 1,
-                                cop_handle,
-                            }),
-                            data: Some(vci_service_interface::event_item::Data::CopStatus(
-                                vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
-                                    as i32,
-                            )),
+                    let handle = vci_service_interface::ComPrimitiveHandle {
+                        module_handle: 1,
+                        cll_handle: 1,
+                        cop_handle,
+                    };
+                    if let StartEvent::Respond | StartEvent::RespondThenFinishLater = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 600_000,
+                                data: Some(vci_service_interface::event_item::Data::ResultData(
+                                    vci_service_interface::ResultData {
+                                        data_bytes: vec![0x62, 0xF1, 0x90, 0x41],
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
                             ..Default::default()
-                        }),
+                        }));
+                    }
+                    if let StartEvent::TimeOut | StartEvent::TimeOutThenFinishLater = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 1_000_000,
+                                data: Some(vci_service_interface::event_item::Data::ErrorData(
+                                    vci_service_interface::ErrorData {
+                                        error_event:
+                                            vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout
+                                                as i32,
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }));
+                    }
+                    if let StartEvent::FailThenFinishLater = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 20_000,
+                                data: Some(vci_service_interface::event_item::Data::ErrorData(
+                                    vci_service_interface::ErrorData {
+                                        error_event:
+                                            vci_service_interface::PduErrorEvent::PduErrEvtRxError
+                                                as i32,
+                                        extra_error_info: Some(0x1234),
+                                        extra_error_info_name: Some("ERR_CODE".to_owned()),
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }));
+                    }
+                    if let StartEvent::TimeOutThenFinishLater = event {
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                    }
+                    if let StartEvent::RespondThenFinishLater | StartEvent::FailThenFinishLater =
+                        event
+                    {
+                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    }
+                    let data = match event {
+                        StartEvent::Finish
+                        | StartEvent::Respond
+                        | StartEvent::RespondThenFinishLater
+                        | StartEvent::TimeOut
+                        | StartEvent::TimeOutThenFinishLater
+                        | StartEvent::FailThenFinishLater => {
+                            EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
+                                    module_handle: 1,
+                                    cll_handle: 1,
+                                    cop_handle,
+                                }),
+                                data: Some(vci_service_interface::event_item::Data::CopStatus(
+                                    vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
+                                        as i32,
+                                )),
+                                ..Default::default()
+                            })
+                        }
                         StartEvent::Lose => EventData::Lost(Default::default()),
                     };
                     if let Some(sender) = sender {
@@ -14997,6 +15087,142 @@ def main():
         })
         .await
         .unwrap()
+    }
+
+    /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): a primitive past the agent's
+    /// deadline that responds within the job-end wait settles its exchange, and one cancelled at
+    /// job end is recorded as cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_that_ends_at_job_end_is_logged_as_primitive_ended() {
+        // A response after the deadline, one read before it with its finished status after it,
+        // and none (the agent cancels the primitive).
+        // Lost events at job end leave the end unknown, and the primitive is cancelled too.
+        // A receive timeout after the deadline ends it with no response, also when its finished
+        // status comes after the job-end wait (the primitive is then cancelled, and the timeout
+        // settles it); an error read before the deadline ends it with its finished status after.
+        for (on_start, cancelled, result) in [
+            (
+                Some((Duration::from_millis(150), StartEvent::Respond)),
+                false,
+                Some("positive"),
+            ),
+            (
+                Some((
+                    Duration::from_millis(10),
+                    StartEvent::RespondThenFinishLater,
+                )),
+                false,
+                Some("positive"),
+            ),
+            (
+                Some((Duration::from_millis(150), StartEvent::Lose)),
+                false,
+                Some("unknown"),
+            ),
+            (
+                Some((Duration::from_millis(150), StartEvent::TimeOut)),
+                false,
+                Some("no_response"),
+            ),
+            (
+                Some((
+                    Duration::from_millis(150),
+                    StartEvent::TimeOutThenFinishLater,
+                )),
+                false,
+                Some("no_response"),
+            ),
+            (
+                Some((Duration::from_millis(10), StartEvent::FailThenFinishLater)),
+                false,
+                Some("link_error"),
+            ),
+            (None, true, None),
+        ] {
+            let dir = journal_dir("primitive-ended");
+            let (mut client, fake) = fake_worker_starting_with(CancelAnswer::Done, on_start).await;
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: Duration::from_millis(50),
+            };
+            tokio::task::spawn_blocking(move || {
+                use diag_ir::DiagHost;
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                host.set_comm_log(Some(log));
+                host.set_link_ids(0x7E0, 0x7E8);
+                host.own_reads(Some(OwnRead::Identification));
+                host.set_job_end_wait(Duration::from_millis(500));
+                let result = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                host.settle_at_end();
+            })
+            .await
+            .unwrap();
+            let lines = comm_log_lines(&dir);
+            let exchange = lines
+                .iter()
+                .find(|line| line["event"] == "exchange")
+                .expect("the read has an entry");
+            assert_eq!(exchange["outcome"]["result"], "vci_did_not_end");
+            let ended = lines
+                .iter()
+                .find(|line| line["event"] == "primitive_ended")
+                .expect("the primitive's end is logged");
+            assert_eq!(
+                ended["refers_to"],
+                serde_json::json!([exchange["seq"]]),
+                "{ended}"
+            );
+            assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
+            assert_eq!(
+                lines
+                    .iter()
+                    .filter(|line| line["event"] == "primitive_ended")
+                    .count(),
+                1,
+                "{lines:?}"
+            );
+            if let Some(result) = result {
+                assert_eq!(ended["outcome"]["result"], result, "{ended}");
+            }
+            if result == Some("no_response") {
+                // The receive timeout is named, with its time, as for an exchange; not judged
+                // (no transmit time), it keeps its row.
+                assert_eq!(
+                    ended["detail"]["error_event"], "PDU_ERR_EVT_RX_TIMEOUT",
+                    "{ended}"
+                );
+                assert_eq!(ended["vci"]["error"]["us"], 1_000_000, "{ended}");
+                assert_eq!(ended["classification"], "undetermined", "{ended}");
+            } else if result == Some("link_error") {
+                // The error read before the deadline ends the primitive at job end: it is
+                // named, with its extra error information and its time.
+                assert_eq!(
+                    ended["detail"]["error_event"], "PDU_ERR_EVT_RX_ERROR",
+                    "{ended}"
+                );
+                assert_eq!(ended["detail"]["extra_error_info"], 0x1234, "{ended}");
+                assert_eq!(
+                    ended["detail"]["extra_error_info_name"], "ERR_CODE",
+                    "{ended}"
+                );
+                assert_eq!(ended["vci"]["error"]["us"], 20_000, "{ended}");
+                assert_eq!(ended["classification"], "undetermined", "{ended}");
+            } else if result.is_some() {
+                assert_eq!(ended["classification"], "system", "{ended}");
+            }
+            if result == Some("unknown") {
+                assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
     }
 
     /// Design 8.11 "Settlement", ADR-358: at job end the host keeps the link open for a

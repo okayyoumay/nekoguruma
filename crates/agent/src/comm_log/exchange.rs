@@ -1274,6 +1274,9 @@ pub(crate) struct Kept {
     pub pendings: Vec<super::timing::At>,
     /// The link's limits, when `link_opened` recorded them.
     pub limits: Option<super::timing::Limits>,
+    /// A start-of-message with the response's identifier was read during the exchange and not
+    /// attached (another exchange could own it): the response may have begun.
+    pub start_unattached: bool,
 }
 
 /// The evidence of one link that later exchanges on it use (design 8.11 "Matched answer",
@@ -1380,6 +1383,32 @@ impl LinkState {
     /// What is kept of owed exchange `seq`.
     pub(crate) fn kept(&self, seq: u64) -> Option<&Kept> {
         self.kept.get(&seq)
+    }
+
+    /// [`LinkState::may_own_tx_indication`], leaving out one exchange whose `sent` was `sent`.
+    pub(crate) fn may_own_tx_indication_besides(&self, sent: Sent) -> bool {
+        self.unknown_sends > u32::from(sent == Sent::Unknown)
+    }
+
+    /// [`LinkState::may_own_start_indication`], leaving out the owed exchange `seq`.
+    pub(crate) fn may_own_start_indication_besides(&self, rx_id: u32, seq: u64) -> bool {
+        self.owed
+            .iter()
+            .any(|owed| owed.rx_id == rx_id && owed.seq != seq)
+    }
+
+    /// Drops what is kept of exchange `seq`, which nothing will settle.
+    pub(crate) fn release_kept(&mut self, seq: u64) {
+        self.kept.remove(&seq);
+    }
+
+    /// The history of `evidence`, an exchange's evidence that a settling entry for exchange
+    /// `seq` gives: the exchange is not an owed request its own answer could belong to.
+    pub(crate) fn history_settling(&self, evidence: &Evidence, seq: u64) -> LinkHistory {
+        let mut history = self.history_for(evidence);
+        history.owners.retain(|owner| *owner != seq);
+        history.owed_matching = history.owners.len() as u32;
+        history
     }
 
     /// Exchange `seq` got its final response: it is owed no more, and what was kept of it is
@@ -1888,6 +1917,52 @@ pub(crate) fn settle_late_response(
         return (System, reason);
     }
     (classification, reason)
+}
+
+/// The classification and reason a `primitive_ended` gives the exchange it settles (design 8.11
+/// "Settlement", ADR-366): `entry`, built from the exchange's evidence with the primitive's end,
+/// as if the agent had waited for it, except that an end within the limit in force is `system`,
+/// since the job gave up on an exchange that ended in time. A lost VCI and a failure of the
+/// system keep their own rows.
+///
+/// A final response is `system` whatever its time: within the limit the job gave up on it, and
+/// after it the late row is `system` too. `observed` is the earlier entry's `system` that
+/// rested on the VCI's own clock past its limits, which an end that shows no response under way
+/// at that reading does not refute.
+pub(crate) fn settle_primitive_ended(
+    entry: &ExchangeEntry,
+    observed: bool,
+) -> (Classification, String) {
+    let final_response = matches!(
+        entry.outcome,
+        Outcome::Positive { .. } | Outcome::PositiveUnusable { .. } | Outcome::Negative { .. }
+    );
+    // A receive timeout at the limit is `system` only when it ended the exchange: a lost VCI or
+    // a link error read after it keeps its own row.
+    let timeout_at_limit = entry.timing.window == Window::TimeoutAtLimit
+        && matches!(
+            entry.outcome,
+            Outcome::NoResponse | Outcome::ResponseIncomplete
+        );
+    if final_response || timeout_at_limit {
+        return (
+            Classification::System,
+            format!(
+                "The exchange ended after the agent had stopped waiting for it, with a response or at the limit in force: the job gave up on an exchange that ended. As if the agent had waited: {}",
+                entry.reason
+            ),
+        );
+    }
+    if observed && entry.classification != Classification::System {
+        return (
+            Classification::System,
+            format!(
+                "{} The VCI's clock, read when the agent stopped waiting, had shown it past its own limits with no response under way, which this end does not refute.",
+                entry.reason
+            ),
+        );
+    }
+    (entry.classification, entry.reason.clone())
 }
 
 fn severity_word(classification: Classification) -> &'static str {
@@ -2940,6 +3015,7 @@ mod tests {
             transmit: None,
             pendings: Vec::new(),
             limits: None,
+            start_unattached: false,
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response);
@@ -2982,6 +3058,35 @@ mod tests {
     }
 
     #[test]
+    fn a_primitive_end_keeps_an_observed_fault() {
+        // A link error after the VCI's clock showed its own limits past: the end does not
+        // refute that, so `system` stands.
+        let entry = ExchangeEntry::build(
+            1,
+            evidence(&READ_F186, End::LinkError(LinkErrorKind::Receive)),
+            LinkHistory::empty(),
+        );
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert_eq!(
+            settle_primitive_ended(&entry, false).0,
+            Classification::Undetermined
+        );
+        let (class, reason) = settle_primitive_ended(&entry, true);
+        assert_eq!(class, Classification::System);
+        assert!(reason.contains("does not refute"), "{reason}");
+        // A final response is `system` whatever its time.
+        let positive = ExchangeEntry::build(
+            1,
+            forwarding(evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]))),
+            LinkHistory::empty(),
+        );
+        assert_eq!(
+            settle_primitive_ended(&positive, false).0,
+            Classification::System
+        );
+    }
+
+    #[test]
     fn a_settled_send_owns_no_late_transmit_indication() {
         // A request with no transmit evidence and no answer: `sent` `unknown`, owed.
         let mut state = LinkState::default();
@@ -3000,6 +3105,7 @@ mod tests {
                 transmit: None,
                 pendings: Vec::new(),
                 limits: None,
+                start_unattached: false,
             },
         );
         assert!(state.settle_owed(1).is_some());

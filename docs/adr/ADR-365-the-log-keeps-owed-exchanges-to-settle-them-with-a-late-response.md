@@ -1,7 +1,7 @@
 # ADR-365: The Log Keeps Owed Exchanges to Settle Them with a Late Response
 
 **Date:** 2026-10-27
-**Status:** Accepted
+**Status:** Accepted (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366: the log keeps it for its primitive's end)
 **Affects:** `agent` communication log (`comm_log.rs` `exchange_with`, `late_response_owner`,
 `Inner::late_response`, `LateResponseEntry`; `comm_log/exchange.rs` `Kept`, `LinkState::keep`,
 `late_response_owners`, `settle_owed`, `settle_late_response`; `comm_log/timing.rs`

@@ -427,7 +427,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   deadline for it (`LinkConfig::job_end_wait`, ADR-358: one `CP_Cr` wait, 1 s when unset or 0,
   plus a 4095-byte response at `CP_STmin`, capped at 10 s), then cancels it; one whose cancel
   before a request already failed, or whose event stream fails, is cancelled at once; a failed cancel is logged and leaves
-  the job's result as it was. What the primitive gives meanwhile is not logged yet.
+  the job's result as it was. The host reads what the primitive gives meanwhile as its exchange
+  would have (a fresh `Progress` for its request's answer), and the log writes the end, or the
+  agent's cancel, as a `primitive_ended` settling entry of the exchange
+  (`WorkerHost::log_primitive_end`, `CommLog::primitive_ended`, ADR-366): it gives the end as an
+  exchange entry does, classified by the exchange rows as if the agent had waited, except that a
+  final response or a receive timeout at the limit is `system`; a cancel by the agent, written
+  only when the cancel succeeds, settles nothing, and a failed event stream is `unknown`.
   The worker host reads every item of the link while a primitive runs and hands the result and
   error items of no primitive (a transmit indication, a link error) or of an earlier primitive
   to the log with the exchange during which it read them, for an exchange it logs

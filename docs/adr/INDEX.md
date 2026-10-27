@@ -357,7 +357,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-365](ADR-365-the-log-keeps-owed-exchanges-to-settle-them-with-a-late-response.md) | The Log Keeps Owed Exchanges to Settle Them with a Late Response | Accepted (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366; item 1's retention widened, and item 2's ambiguous response and item 5's single element revised, by ADR-368) | `agent` communication log (`late_response`, `Kept`, `comm_log::timing::judge_late`); design 8.11 "Settlement", "Owed request", `late_response`; ADR-346, ADR-361, ADR-364 |
 | [ADR-366](ADR-366-the-log-settles-a-primitive-that-ends-at-job-end.md) | The Log Settles a Primitive That Ends at Job End | Accepted (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367) | `agent` host (`settle_at_end`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-365 |
 | [ADR-367](ADR-367-the-log-settles-a-primitive-that-ends-before-the-next-request.md) | The Log Settles a Primitive That Ends Before the Next Request | Accepted | `agent` host (`settle_cancelled`, `Settling`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-366 |
-| [ADR-368](ADR-368-a-settling-entry-reclassifies-the-later-exchanges-in-a-window.md) | A Settling Entry Reclassifies the Later Exchanges in a Window | Accepted | `agent` communication log (`reclassify_after`, window of 16 exchanges per link, ambiguous `late_response`); design 8.11 "Settlement"; ADR-346, ADR-365, ADR-366 |
+| [ADR-368](ADR-368-a-settling-entry-reclassifies-the-later-exchanges-in-a-window.md) | A Settling Entry Reclassifies the Later Exchanges in a Window | Accepted (Consequences' open late acceptance of a reset closed by ADR-369) | `agent` communication log (`reclassify_after`, window of 16 exchanges per link, ambiguous `late_response`); design 8.11 "Settlement"; ADR-346, ADR-365, ADR-366 |
+| [ADR-369](ADR-369-a-late-acceptance-of-a-reset-ends-the-evidence-as-in-time.md) | A Late Acceptance of a Reset Ends the Evidence as in Time | Accepted | `agent` communication log (`reset_after`, `late_restart`, `late_response`, `primitive_ended`); design 8.11 "Matched answer", "Owed request", "Settlement"; ADR-346, ADR-365, ADR-366, ADR-368 |
 
 ## Status Legend
 
@@ -730,7 +731,8 @@ the predecessor repository these ADRs came from.
 - ADR-365 (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366; item 1's retention widened, and item 2's ambiguous response and item 5's single element revised, by ADR-368)
 - ADR-366 (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367)
 - ADR-367
-- ADR-368
+- ADR-368 (Consequences' open late acceptance of a reset closed by ADR-369)
+- ADR-369
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

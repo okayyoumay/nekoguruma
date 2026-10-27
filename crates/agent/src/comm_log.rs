@@ -577,6 +577,43 @@ fn not_reclassified_text(through: Option<u64>) -> String {
     })
 }
 
+/// Reclassifies the later exchanges on a link whose earlier exchange `seq` a settling entry
+/// gave `answer`: first, when that answer accepts its ECUReset or session change or is an
+/// unusable positive response to one (`restart`, [`exchange::ExchangeEntry::late_restart`]), the
+/// end of the evidence from before it, as in time; then the answer itself. Gives each later
+/// exchange changed, in `seq` order, and the largest `seq` of one past the window.
+fn settle_later(
+    state: &mut exchange::LinkState,
+    seq: u64,
+    restart: Option<(bool, u64)>,
+    answer: &exchange::SettledAnswer,
+) -> (Vec<exchange::Reclassified>, Option<u64>) {
+    let (mut changed, through) = restart.map_or((Vec::new(), None), |(accepting, earliest)| {
+        state.reset_after(seq, earliest, accepting)
+    });
+    let (answered, answered_through) = state.reclassify_after(answer);
+    for later in answered {
+        changed.retain(|earlier| earlier.seq != later.seq);
+        changed.push(later);
+    }
+    changed.sort_by_key(|later| later.seq);
+    (changed, through.max(answered_through))
+}
+
+/// The text a settling entry adds when the answer it adds ends the evidence from before its
+/// exchange ([`settle_later`]).
+fn restart_text(restart: Option<(bool, u64)>) -> &'static str {
+    match restart {
+        Some((true, _)) => {
+            " The response accepts that exchange's session change or ECUReset: the matched answers and the owed requests from before it end, as they would have in time."
+        }
+        Some((false, _)) => {
+            " The response to that exchange's session change or ECUReset is positive but unusable: the matched answers from before it end, as they would have in time."
+        }
+        None => "",
+    }
+}
+
 /// Whether a result item is a message another node sent, not an indication, a copy of a sent
 /// message or a break (RxFlag byte 3).
 fn is_received(rx_flag: &[u8]) -> bool {
@@ -2013,7 +2050,8 @@ impl CommLog {
         if error_with_end.is_some() {
             answer.no_matched_answer();
         }
-        let (later, not_reclassified) = state.reclassify_after(&answer);
+        let restart = entry.late_restart();
+        let (later, not_reclassified) = settle_later(state, seq, restart, &answer);
         let refers_to = std::iter::once(seq)
             .chain(later.iter().map(|later| later.seq))
             .collect();
@@ -2028,8 +2066,9 @@ impl CommLog {
             sent: Some(entry.sent),
             sent_evidence: Some(entry.sent_evidence),
             text: format!(
-                "The primitive of the exchange logged as {seq} ended after the agent had stopped waiting for it. {}{}",
+                "The primitive of the exchange logged as {seq} ended after the agent had stopped waiting for it. {}{}{}",
                 entry.text,
+                restart_text(restart),
                 not_reclassified_text(not_reclassified)
             ),
             outcome: Some(entry.outcome),
@@ -2390,9 +2429,11 @@ impl Inner {
             exchange::settle_late_response(&kept, &answered, window, &history);
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
-        let answer = exchange::ExchangeEntry::build(owner, answered, history).settled_answer(&kept);
+        let entry = exchange::ExchangeEntry::build(owner, answered, history);
+        let answer = entry.settled_answer(&kept);
+        let restart = entry.late_restart();
         state.settled(owner, classification, &reason, answered_evidence, true);
-        let (later, not_reclassified) = state.reclassify_after(&answer);
+        let (later, not_reclassified) = settle_later(state, owner, restart, &answer);
         let top = later
             .iter()
             .map(|later| later.classification)
@@ -2419,7 +2460,8 @@ impl Inner {
             .collect(),
             not_reclassified_through: not_reclassified,
             text: format!(
-                "The ECU's response to the exchange logged as {owner} was delivered after that exchange had ended.{}",
+                "The ECU's response to the exchange logged as {owner} was delivered after that exchange had ended.{}{}",
+                restart_text(restart),
                 not_reclassified_text(not_reclassified)
             ),
             classification: top,
@@ -5016,6 +5058,141 @@ mod tests {
         assert_eq!(
             exchanges(&lines)[0]["classification"],
             "undetermined",
+            "{lines:?}"
+        );
+    }
+
+    /// ADR-369: a late response that accepts a timed-out session change ends the evidence from
+    /// before it as it would have in time. The silent read after the session change loses the
+    /// matched answer from before it, in the same entry, and so does the exchange in flight.
+    #[test]
+    fn a_late_acceptance_of_a_session_change_reclassifies_the_exchanges_after_it() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |request: &[u8], at_us: u64| {
+            let mut evidence = evidence(endpoint(0x7E0), request, exchange::End::NoResponse);
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                rx_timeout: Some(device(at_us + 1_000_000)),
+                error: Some(device(at_us + 1_000_000)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let run = |accepting: bool| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+                Some(true),
+            )
+            .unwrap();
+            // A matched answer for F190, then a session change the ECU does not answer in time,
+            // then a silent F190 read: `vehicle` on that matched answer.
+            let mut answered = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+            );
+            answered.pending_visibility = exchange::PendingVisibility::Forwarded;
+            answered.times.agent.before_us = 10_000;
+            answered.times.agent.end_us = 50_000;
+            log.exchange_with(answered, vec![transmit(10_000)]).unwrap();
+            log.exchange_with(silent(&[0x10, 0x03], 1_010_000), vec![transmit(1_010_000)])
+                .unwrap();
+            log.exchange_with(
+                silent(&[0x22, 0xF1, 0x90], 3_010_000),
+                vec![transmit(3_010_000)],
+            )
+            .unwrap();
+            // The session change's answer, read during a fourth exchange: its acceptance, or a
+            // negative response, which ends nothing.
+            let bytes = if accepting {
+                vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4]
+            } else {
+                vec![0x7F, 0x10, 0x22]
+            };
+            let late = UnattachedItem {
+                link: 1,
+                earlier_primitive: true,
+                vci_us: 2_500_000,
+                clock: Some(exchange::Clock::Device),
+                read: read(6_010_500),
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, 0],
+                    identifier: Some(0x7E8),
+                    bytes,
+                },
+            };
+            log.exchange_with(
+                silent(&[0x22, 0xF1, 0x90], 6_010_000),
+                vec![transmit(6_010_000), late],
+            )
+            .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            lines
+        };
+        let find = |lines: &[serde_json::Value], event: &str| -> Vec<serde_json::Value> {
+            lines
+                .iter()
+                .filter(|line| line["event"] == event)
+                .cloned()
+                .collect()
+        };
+        let lines = run(true);
+        let [settling] = &find(&lines, "late_response")[..] else {
+            panic!("{lines:?}");
+        };
+        let exchanges = find(&lines, "exchange");
+        let (change, third, fourth) = (&exchanges[1], &exchanges[2], &exchanges[3]);
+        assert_eq!(third["classification"], "vehicle", "{third}");
+        assert_eq!(
+            settling["refers_to"],
+            serde_json::json!([change["seq"], third["seq"]]),
+            "{settling}"
+        );
+        assert_eq!(
+            settling["exchanges"][1]["classification"], "undetermined",
+            "{settling}"
+        );
+        assert!(
+            settling["text"]
+                .as_str()
+                .is_some_and(|text| text.contains("accepts that exchange's session change")),
+            "{settling}"
+        );
+        assert_eq!(fourth["link_history"]["answered_same_match"], 0, "{fourth}");
+        assert_eq!(fourth["classification"], "undetermined", "{fourth}");
+        // A negative response to it ends nothing: the exchange in flight keeps the matched
+        // answer.
+        let lines = run(false);
+        let exchanges = find(&lines, "exchange");
+        assert_eq!(
+            exchanges[3]["link_history"]["answered_same_match"], 1,
             "{lines:?}"
         );
     }

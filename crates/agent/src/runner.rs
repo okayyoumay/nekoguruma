@@ -14369,6 +14369,8 @@ def main():
         Respond,
         /// The same response, and the finished status 150 ms after it.
         RespondThenFinishLater,
+        /// A receive timeout with VCI time 1 s, then the finished status.
+        TimeOut,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14630,13 +14632,34 @@ def main():
                             ..Default::default()
                         }));
                     }
+                    if let StartEvent::TimeOut = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: Some(handle),
+                                timestamp: 1_000_000,
+                                data: Some(vci_service_interface::event_item::Data::ErrorData(
+                                    vci_service_interface::ErrorData {
+                                        error_event:
+                                            vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout
+                                                as i32,
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }));
+                    }
                     if let StartEvent::RespondThenFinishLater = event {
                         tokio::time::sleep(Duration::from_millis(150)).await;
                     }
                     let data = match event {
                         StartEvent::Finish
                         | StartEvent::Respond
-                        | StartEvent::RespondThenFinishLater => {
+                        | StartEvent::RespondThenFinishLater
+                        | StartEvent::TimeOut => {
                             EventData::Item(vci_service_interface::EventItem {
                                 cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
                                     module_handle: 1,
@@ -15041,6 +15064,7 @@ def main():
         // A response after the deadline, one read before it with its finished status after it,
         // and none (the agent cancels the primitive).
         // Lost events at job end leave the end unknown, and the primitive is cancelled too.
+        // A receive timeout after the deadline ends it with no response.
         for (on_start, cancelled, result) in [
             (
                 Some((Duration::from_millis(150), StartEvent::Respond)),
@@ -15059,6 +15083,11 @@ def main():
                 Some((Duration::from_millis(150), StartEvent::Lose)),
                 false,
                 Some("unknown"),
+            ),
+            (
+                Some((Duration::from_millis(150), StartEvent::TimeOut)),
+                false,
+                Some("no_response"),
             ),
             (None, true, None),
         ] {
@@ -15106,6 +15135,17 @@ def main():
             assert_eq!(ended["cancelled_by_agent"], cancelled, "{ended}");
             if let Some(result) = result {
                 assert_eq!(ended["outcome"]["result"], result, "{ended}");
+            }
+            if result == Some("no_response") {
+                // The receive timeout is named, with its time, as for an exchange; not judged
+                // (no transmit time), it keeps its row.
+                assert_eq!(
+                    ended["detail"]["error_event"], "PDU_ERR_EVT_RX_TIMEOUT",
+                    "{ended}"
+                );
+                assert_eq!(ended["vci"]["error"]["us"], 1_000_000, "{ended}");
+                assert_eq!(ended["classification"], "undetermined", "{ended}");
+            } else if result.is_some() {
                 assert_eq!(ended["classification"], "system", "{ended}");
             }
             if result == Some("unknown") {

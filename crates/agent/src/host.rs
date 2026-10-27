@@ -589,24 +589,34 @@ impl<C: WorkerApi> WorkerHost<C> {
         };
         let primitive = match ended {
             JobEndEnd::Ended(result) => {
-                let (end, detail) = sent_end(
+                let (end, mut detail) = sent_end(
                     &stray.request,
                     result,
                     &progress.negative,
                     progress.sid,
                     true,
                 );
-                let error = match result {
-                    Err(HostError::VciLost) => progress.vci_lost.as_ref(),
-                    _ => progress.errors.last(),
-                };
+                // Every link error read at job end beside the one that ended it, so the
+                // classification takes the most severe (design 8.11 "Link error"); the event
+                // named, its extra error information and its time, as for an exchange.
+                let read_late = progress
+                    .errors
+                    .get(stray.errors.len()..)
+                    .unwrap_or_default();
+                let (link_errors, error_at) = named_events(
+                    result,
+                    read_late,
+                    progress.vci_lost.as_ref(),
+                    progress.rx_timeout.as_ref(),
+                    &mut detail,
+                );
                 let response_times = if result.is_ok() {
                     progress.response_times
                 } else {
                     VciTimes::default()
                 };
                 let vci = VciTimes {
-                    error: error.and_then(|seen| seen.at),
+                    error: error_at,
                     rx_timeout: progress.rx_timeout.as_ref().and_then(|timeout| timeout.at),
                     ..response_times
                 };
@@ -621,16 +631,6 @@ impl<C: WorkerApi> WorkerHost<C> {
                         agent_us: now.monotonic_us,
                         since_previous_ms: None,
                     })
-                    .collect();
-                // Every link error read at job end beside the one that ended it, so the
-                // classification takes the most severe (design 8.11 "Link error").
-                let read_late = progress
-                    .errors
-                    .get(stray.errors.len()..)
-                    .unwrap_or_default();
-                let link_errors = also_seen(result, read_late)
-                    .iter()
-                    .map(|seen| link_error_kind(seen.event))
                     .collect();
                 crate::comm_log::PrimitiveEnded {
                     end: Some(end),
@@ -1481,17 +1481,35 @@ fn errors_before_answer(sent: &Sent) -> bool {
 /// but is no link error. The named event's extra error information goes in too, its code and its
 /// name as the worker gave them (ADR-351): the agent does not interpret either.
 fn events_seen(sent: &Sent, detail: &mut Detail) -> (Vec<LinkErrorKind>, Option<VciTime>) {
-    let seen = also_seen(&sent.result, &sent.error_events);
+    named_events(
+        &sent.result,
+        &sent.error_events,
+        sent.vci_lost.as_ref(),
+        sent.rx_timeout.as_ref(),
+        detail,
+    )
+}
+
+/// `events_seen` over an end's parts: `result`, the error events read beside it, the lost VCI
+/// and the receive timeout.
+fn named_events(
+    result: &Result<Vec<u8>, HostError>,
+    error_events: &[ErrorSeen],
+    vci_lost: Option<&ErrorSeen>,
+    rx_timeout: Option<&ErrorSeen>,
+    detail: &mut Detail,
+) -> (Vec<LinkErrorKind>, Option<VciTime>) {
+    let seen = also_seen(result, error_events);
     // The event `sent_end` named, when it named one: the one that ended the exchange.
-    let named = match &sent.result {
-        Err(HostError::PrimitiveFailed(_)) => sent.error_events.last(),
-        Err(HostError::VciLost) => sent.vci_lost.as_ref(),
+    let named = match result {
+        Err(HostError::PrimitiveFailed(_)) => error_events.last(),
+        Err(HostError::VciLost) => vci_lost,
         _ => None,
     };
     let named = if detail.error_event.is_some() {
         named
     } else {
-        let named = seen.last().or(sent.rx_timeout.as_ref());
+        let named = seen.last().or(rx_timeout);
         detail.error_event = named.map(|seen| error_event_name(seen.event));
         named
     };

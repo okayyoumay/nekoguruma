@@ -1645,8 +1645,24 @@ impl CommLog {
         {
             evidence.end = exchange::End::ResponseIncomplete;
         }
+        // The pendings, read before the end, are placed first, after the kept ones.
+        let mut pendings = kept.pendings.clone();
+        let mut placed_all: Vec<Option<clocks::Placed>> = kept
+            .pendings
+            .iter()
+            .map(|at| at.map(|(_, placed)| placed))
+            .collect();
+        for mut pending in ended.pending {
+            let placed =
+                inner.place_unread(pending.clock, pending.vci_us.unwrap_or_default(), now)?;
+            pending.epoch = placed.map(|placed| placed.epoch);
+            pendings.push(pending.clock.zip(placed));
+            placed_all.push(placed);
+            evidence.pending.push(pending);
+        }
         // The end's times, read at job end, are placed nearest their clock's latest time.
         let mut vci = ended.vci;
+        let response_tx_done = vci.tx_done.is_some();
         for time in [&mut vci.rx_end, &mut vci.rx_timeout, &mut vci.error]
             .into_iter()
             .flatten()
@@ -1674,36 +1690,44 @@ impl CommLog {
             .reduce(exchange::VciTime::prefer);
             evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
         }
-        if let Some(start) = late_start {
-            let placed = inner.place_unread(start.clock, u64::from(start.vci_us), now)?;
-            let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock).at(placed);
-            // The `system` the reading at the deadline gave rested on no response under way
-            // then: a start at or before that reading, or one whose order with it is unknown,
-            // refutes it (design 8.11 "Settlement").
-            let reading = kept
-                .evidence
-                .times
-                .vci
-                .and_then(|vci| vci.deadline)
-                .and_then(|reading| reading.time.placed());
-            let after_reading = match (time.placed(), reading) {
-                (Some((clock, start)), Some((own, reading))) => {
-                    clock == own
-                        && start.epoch == reading.epoch
-                        && start.unwrapped > reading.unwrapped
+        // A transmit done the response's own item carries confirms the send when no indication
+        // did, as for an exchange (design 8.11 `sent_evidence` `tx_done_time`).
+        if response_tx_done && evidence.transmit_evidence.is_none() {
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxDoneTime);
+        }
+        // The reading at the deadline, which the kept `system` rests on.
+        let reading = kept.evidence.times.vci.and_then(|vci| vci.deadline);
+        let reading_at = reading.and_then(|reading| reading.time.placed());
+        // The latest start: one read at job end, else the one the exchange had attached.
+        let latest_start = match late_start {
+            Some(start) => {
+                let placed = inner.place_unread(start.clock, u64::from(start.vci_us), now)?;
+                let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock).at(placed);
+                // The `system` the reading at the deadline gave rested on no response under
+                // way then: a start at or before that reading, or one whose order with it is
+                // unknown, refutes it (design 8.11 "Settlement").
+                let after_reading = match (time.placed(), reading_at) {
+                    (Some((clock, start)), Some((own, reading))) => {
+                        clock == own
+                            && start.epoch == reading.epoch
+                            && start.unwrapped > reading.unwrapped
+                    }
+                    _ => false,
+                };
+                if !after_reading {
+                    observed = false;
                 }
-                _ => false,
-            };
-            if !after_reading {
-                observed = false;
+                Some(time)
             }
-            // The latest start is the response's when it came after the last pending and the
-            // response spans frames, as for an exchange.
-            let last_pending = kept.pendings.last().copied().flatten();
-            let after_pending = match (last_pending, time.placed()) {
-                (None, _) if kept.pendings.is_empty() => true,
-                (Some((clock, at)), Some((own, start))) => {
-                    clock == own && at.epoch == start.epoch && start.unwrapped >= at.unwrapped
+            None => kept.evidence.times.vci.and_then(|vci| vci.rx_start),
+        };
+        // The latest start is the response's when it came after the last pending, the job
+        // end's included, and the response spans frames, as for an exchange.
+        if let Some(time) = latest_start {
+            let after_pending = match (pendings.last(), time.placed()) {
+                (None, _) => true,
+                (Some(Some((clock, at))), Some((own, start))) => {
+                    *clock == own && at.epoch == start.epoch && start.unwrapped >= at.unwrapped
                 }
                 _ => false,
             };
@@ -1711,33 +1735,26 @@ impl CommLog {
                 .end
                 .response()
                 .is_none_or(|response| response.len() > SINGLE_FRAME_MAX);
-            if after_pending && spans_frames && ended.pending.is_empty() {
+            if after_pending && spans_frames {
                 vci.rx_start = Some(time)
                     .into_iter()
                     .chain(vci.rx_start)
                     .reduce(exchange::VciTime::prefer);
             }
         }
-        let mut pendings = kept.pendings.clone();
-        let mut placed_all: Vec<Option<clocks::Placed>> = kept
-            .pendings
-            .iter()
-            .map(|at| at.map(|(_, placed)| placed))
-            .collect();
-        for mut pending in ended.pending {
-            let placed =
-                inner.place_unread(pending.clock, pending.vci_us.unwrap_or_default(), now)?;
-            pending.epoch = placed.map(|placed| placed.epoch);
-            pendings.push(pending.clock.zip(placed));
-            placed_all.push(placed);
-            evidence.pending.push(pending);
-        }
         let transmit = kept
             .transmit
             .or_else(|| vci.tx_done.and_then(|time| time.placed()));
         exchange::pending_intervals(&mut evidence.pending, &placed_all, transmit);
         if let Some(limits) = kept.limits {
-            let response_may_have_begun = evidence.response_started || !limits.start_indications;
+            // A start with the response's identifier that another exchange could own still
+            // means this response may have begun, as for an exchange.
+            let response_may_have_begun = evidence.response_started
+                || !limits.start_indications
+                || ended
+                    .indications
+                    .iter()
+                    .any(|item| item.is_start_indication_for(rx_id));
             evidence.timing = timing::judge(
                 limits,
                 evidence.absorbing(),
@@ -1751,6 +1768,34 @@ impl CommLog {
                     response_may_have_begun,
                 },
             );
+            // A pending read at job end from at or before the reading, or one whose order with
+            // it is unknown, may extend the limit past it: the kept `system` stands only while
+            // the VCI's limits are still past by the reading with every such pending.
+            if observed {
+                let at_reading: Vec<_> = pendings
+                    .iter()
+                    .copied()
+                    .filter(|pending| match (pending, reading_at) {
+                        (Some((clock, at)), Some((own, reading))) => {
+                            !(*clock == own
+                                && at.epoch == reading.epoch
+                                && at.unwrapped > reading.unwrapped)
+                        }
+                        _ => true,
+                    })
+                    .collect();
+                observed = reading.is_some_and(|reading| {
+                    timing::past_vci_limits(
+                        limits,
+                        evidence.absorbing(),
+                        transmit,
+                        &at_reading,
+                        reading_at,
+                        reading.round_trip_us,
+                    )
+                    .is_some()
+                });
+            }
         }
         let final_response = evidence.end.response().is_some();
         let state = &mut inner.links[at].1;
@@ -4696,7 +4741,7 @@ mod tests {
     #[test]
     fn a_start_before_the_deadline_reading_refutes_the_inferred_system() {
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
-        let settled = |start_us: u32| {
+        let settled = |indications: Vec<UnattachedItem>, pending: Vec<exchange::Pending>| {
             let dir = dir();
             let setup = setup(&dir);
             let log = CommLog::open(&setup).unwrap();
@@ -4738,21 +4783,17 @@ mod tests {
                 ..tx_done(0x7E0)
             };
             let seq = log.exchange_with(waited, vec![transmit]).unwrap();
-            let start = UnattachedItem {
-                vci_us: start_us,
-                ..start_of_message(0x7E8)
-            };
             let ended = PrimitiveEnded {
                 end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
                 detail: exchange::Detail::default(),
-                pending: Vec::new(),
+                pending,
                 vci: exchange::VciTimes {
                     error: Some(device(5_500_000)),
                     ..exchange::VciTimes::default()
                 },
                 vci_ended: false,
                 link_errors: Vec::new(),
-                indications: vec![start],
+                indications,
             };
             log.primitive_ended(seq, ended).unwrap();
             log.end("ok");
@@ -4769,10 +4810,162 @@ mod tests {
                 .unwrap()
                 .clone()
         };
-        let refuted = settled(1_000_000);
+        let start = |vci_us| UnattachedItem {
+            vci_us,
+            ..start_of_message(0x7E8)
+        };
+        let pending = |vci_us| exchange::Pending {
+            vci_us: Some(vci_us),
+            clock: Some(exchange::Clock::Device),
+            epoch: None,
+            agent_us: 0,
+            since_previous_ms: None,
+        };
+        let refuted = settled(vec![start(1_000_000)], Vec::new());
         assert_eq!(refuted["classification"], "undetermined", "{refuted}");
-        let after = settled(5_200_000);
+        let after = settled(vec![start(5_200_000)], Vec::new());
         assert_eq!(after["classification"], "system", "{after}");
+        // A pending within P2 from before the reading moves the limit past it (P2* from
+        // 0.5 s): no longer past, so the end takes its own row. One after the reading changes
+        // nothing.
+        let refuted = settled(Vec::new(), vec![pending(500_000)]);
+        assert_eq!(refuted["classification"], "undetermined", "{refuted}");
+        let after = settled(Vec::new(), vec![pending(5_200_000)]);
+        assert_eq!(after["classification"], "system", "{after}");
+    }
+
+    /// Design 8.11 `primitive_ended` (ADR-366 item 3): what the host reads at job end completes
+    /// what the exchange had read, as the exchange's own evidence would have: the start it had
+    /// attached, a start after a pending read at job end, the transmit done the response
+    /// carries, and a start another exchange could own, which still means the response may
+    /// have begun.
+    #[test]
+    fn job_end_evidence_completes_what_the_exchange_read() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        // `owed`: an earlier exchange still owed its response; `transmit`: the request's
+        // transmit indication at 10.5 ms, read during the exchange, with `during`.
+        let settled =
+            |owed: bool, transmit: bool, during: Vec<UnattachedItem>, ended: PrimitiveEnded| {
+                let dir = dir();
+                let setup = setup(&dir);
+                let log = CommLog::open(&setup).unwrap();
+                log.begin(&facts(), RunKind::First);
+                log.link_opened(
+                    1,
+                    &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                    &[],
+                    crate::link::Indications {
+                        transmit: true,
+                        start_of_message: true,
+                    },
+                    Some(true),
+                )
+                .unwrap();
+                if owed {
+                    log.exchange_with(vci_ended(exchange::End::NoResponse), vec![tx_done(0x7E0)])
+                        .unwrap();
+                }
+                let mut waited = evidence(
+                    endpoint(0x7E0),
+                    &[0x22, 0xF1, 0x90],
+                    exchange::End::VciDidNotEnd,
+                );
+                waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+                waited.times.agent.before_us = 10_000;
+                waited.times.agent.end_us = 9_000_000;
+                let mut items = Vec::new();
+                if transmit {
+                    items.push(UnattachedItem {
+                        vci_us: 10_500,
+                        read: Some(AgentNow {
+                            epoch: 0,
+                            monotonic_us: 10_600,
+                            wall_unix_ms: 0,
+                        }),
+                        ..tx_done(0x7E0)
+                    });
+                }
+                items.extend(during);
+                let seq = log.exchange_with(waited, items).unwrap();
+                log.primitive_ended(seq, ended).unwrap();
+                log.end("ok");
+                lines(&setup)
+                    .iter()
+                    .find(|line| line["event"] == "primitive_ended")
+                    .unwrap()
+                    .clone()
+            };
+        let start = |vci_us| UnattachedItem {
+            vci_us,
+            ..start_of_message(0x7E8)
+        };
+        let timeout = |vci_us, indications| PrimitiveEnded {
+            end: Some(exchange::End::NoResponse),
+            detail: exchange::Detail::default(),
+            pending: Vec::new(),
+            vci: exchange::VciTimes {
+                rx_timeout: Some(device(vci_us)),
+                error: Some(device(vci_us)),
+                ..exchange::VciTimes::default()
+            },
+            vci_ended: true,
+            link_errors: Vec::new(),
+            indications,
+        };
+        // The start the exchange had attached is the response's start.
+        let entry = settled(
+            false,
+            true,
+            vec![start(600_000)],
+            timeout(1_700_000, Vec::new()),
+        );
+        assert_eq!(entry["outcome"]["result"], "response_incomplete", "{entry}");
+        assert_eq!(
+            entry["timing"]["measured_by"], "vci_tx_done_to_rx_start",
+            "{entry}"
+        );
+        // A pending read at job end, then a start after it: the start is the response's.
+        let mut after_pending = timeout(1_700_000, vec![start(600_000)]);
+        after_pending.pending = vec![exchange::Pending {
+            vci_us: Some(300_000),
+            clock: Some(exchange::Clock::Device),
+            epoch: None,
+            agent_us: 0,
+            since_previous_ms: None,
+        }];
+        let entry = settled(false, true, Vec::new(), after_pending);
+        assert_eq!(
+            entry["timing"]["measured_by"], "vci_tx_done_to_rx_start",
+            "{entry}"
+        );
+        // The transmit done the response's item carries confirms the send.
+        let response = PrimitiveEnded {
+            end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
+            detail: exchange::Detail::default(),
+            pending: Vec::new(),
+            vci: exchange::VciTimes {
+                tx_done: Some(device(10_500)),
+                rx_end: Some(device(510_500)),
+                ..exchange::VciTimes::default()
+            },
+            vci_ended: false,
+            link_errors: Vec::new(),
+            indications: Vec::new(),
+        };
+        let entry = settled(false, false, Vec::new(), response);
+        assert_eq!(entry["sent"], "confirmed", "{entry}");
+        assert_eq!(entry["sent_evidence"], "tx_done_time", "{entry}");
+        // A start an owed request could own stays unattached, but the response may have
+        // begun: a receive timeout at P2 is not one at the limit.
+        let entry = settled(
+            true,
+            true,
+            Vec::new(),
+            timeout(10_500 + 1_000_000, vec![start(600_000)]),
+        );
+        assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
+        assert_ne!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert_ne!(entry["classification"], "system", "{entry}");
     }
 
     /// No `primitive_ended` entry for an exchange the log keeps nothing of.

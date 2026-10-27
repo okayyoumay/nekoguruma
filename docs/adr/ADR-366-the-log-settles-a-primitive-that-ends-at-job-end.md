@@ -39,15 +39,18 @@ the exchanges the VCI ended.
    primitive's end: a response, a receive timeout, a failure, a lost VCI or the finished
    status. The end, with its VCI times and the pendings it passed on, goes to
    `CommLog::primitive_ended`, with every link error read at job end beside the one that
-   ended it, so the classification takes the most severe. A lost-events notice gives the
-   `unknown` end (`events_lost`), and the primitive, which may still run, is then cancelled;
-   an event stream that fails or ends gives the `unknown` end (`events_ended`). When the job-end wait passes, or an earlier cancel failed, the host
+   ended it, so the classification takes the most severe. The entry names the event an
+   exchange's entry would name (the one that ended it, else the last link error, else the
+   receive timeout), with its extra error information and its time. A lost-events notice
+   gives the `unknown` end (`events_lost`), and the primitive, which may still run, is then
+   cancelled; an event stream that fails or ends gives the `unknown` end (`events_ended`).
+   When the job-end wait passes, or an earlier cancel failed, the host
    cancels the primitive and records the agent's cancel only when the cancel succeeds; a
    handle the worker no longer knows, or a cancel that fails, leaves the end unknown and writes
    nothing.
 3. **The entry gives the end as an exchange entry gives its end.**
    - The log builds the exchange's evidence again with that end and with the new pendings
-     after the kept ones.
+     after the kept ones, placed before the end's times.
    - The end's VCI times are placed nearest their clock's latest time, since the host reads
      them at job end.
    - Timing is judged against the kept transmit and limits, with the new pendings' intervals.
@@ -55,8 +58,12 @@ the exchanges the VCI ended.
      owed request its own answer could belong to.
    - A transmit or start-of-message indication of no primitive read at job end is the
      exchange's when no other exchange on the link could own it, as during the exchange: it
-     confirms the send, or shows the response began. The latest start is the response's start
-     time when the response spans frames and no pending came after it, as for an exchange.
+     confirms the send, or shows the response began. A transmit done the response's own item
+     carries confirms the send when no indication did. The latest start (one read at job end,
+     else the one the exchange had attached) is the response's start time when the response
+     spans frames and no pending, kept or new, came after it, as for an exchange. A start with
+     the response's identifier that another exchange could own still means the response may
+     have begun, as it does when judging an exchange's timing.
    - A receive timeout after a response began gives `response_incomplete`, as for an
      exchange.
    - The entry carries `refers_to`, `link`, `sent`, `sent_evidence`, `outcome`, `answers`,
@@ -74,7 +81,9 @@ the exchanges the VCI ended.
      with no response under way. An end that shows no response under way at that reading (a
      link error, a lost VCI, a timeout) does not refute it, so `system` stands; a final response
      is `system` anyway. A start-of-message read at job end from at or before that reading, or
-     one whose order with it is unknown, refutes it, and the end takes its own row.
+     one whose order with it is unknown, refutes it, and the end takes its own row. So does a
+     pending read at job end that moves the limit in force past the reading: the log checks
+     the VCI's limits against the reading again with every pending not shown to come after it.
 5. **The agent's cancel settles nothing.** The entry has `cancelled_by_agent` true and no
    `outcome` or `timing`. The exchange keeps its classification.
 

@@ -354,7 +354,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-362](ADR-362-the-log-judges-a-receive-timeout-only-before-a-response-began.md) | The Log Judges a Receive Timeout Only Before a Response Began | Accepted (Decision item 4 narrowed by ADR-364) | `agent` communication log (`comm_log::timing`, `link_opened`, the timeout and late rows); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-361 |
 | [ADR-363](ADR-363-an-ecu-definition-declares-the-identifier-a-vehicle-definition-names.md) | An ECU Definition Declares the Identifier a Vehicle Definition Names | Accepted | `diag-ir` (`EcuDocument.definition_id`, schema 20), `diag-frontend` (`definition.csv`); design 8.8.2; ADR-326, ADR-307 |
 | [ADR-364](ADR-364-the-log-proves-a-single-frame-response-late-by-its-end.md) | The Log Proves a Single-Frame Response Late by Its End | Accepted | `agent` communication log (`comm_log::timing`, the late-pending row), `link.rs` (`LinkConfig::single_frame`); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-358, ADR-362 |
-| [ADR-365](ADR-365-the-log-keeps-owed-exchanges-to-settle-them-with-a-late-response.md) | The Log Keeps Owed Exchanges to Settle Them with a Late Response | Accepted | `agent` communication log (`late_response`, `Kept`, `comm_log::timing::judge_late`); design 8.11 "Settlement", "Owed request", `late_response`; ADR-346, ADR-361, ADR-364 |
+| [ADR-365](ADR-365-the-log-keeps-owed-exchanges-to-settle-them-with-a-late-response.md) | The Log Keeps Owed Exchanges to Settle Them with a Late Response | Accepted (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366) | `agent` communication log (`late_response`, `Kept`, `comm_log::timing::judge_late`); design 8.11 "Settlement", "Owed request", `late_response`; ADR-346, ADR-361, ADR-364 |
 | [ADR-366](ADR-366-the-log-settles-a-primitive-that-ends-at-job-end.md) | The Log Settles a Primitive That Ends at Job End | Accepted | `agent` host (`settle_at_end`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-365 |
 
 ## Status Legend
@@ -725,7 +725,7 @@ the predecessor repository these ADRs came from.
 - ADR-361
 - ADR-362 (Decision item 4 narrowed by ADR-364)
 - ADR-364
-- ADR-365
+- ADR-365 (Decision item 1's exclusion of an exchange the agent's deadline ended superseded by ADR-366)
 - ADR-366
 
 ### Write Jobs & Resume

@@ -548,7 +548,13 @@ impl<C: WorkerApi> WorkerHost<C> {
                 self.log_primitive_end(&stray, &progress, JobEndEnd::Ended(result));
                 return;
             }
-            Some(None) => self.log_primitive_end(&stray, &progress, JobEndEnd::StreamEnded),
+            // The stream failed or ended before it did: its end is unknown, with every item read
+            // before that carried as for any other end.
+            Some(None) => self.log_primitive_end(
+                &stray,
+                &progress,
+                JobEndEnd::Ended(&Err(HostError::EventStreamEnded)),
+            ),
             None => {}
         }
         let cancelled = handle.block_on(unary(
@@ -582,15 +588,6 @@ impl<C: WorkerApi> WorkerHost<C> {
             return;
         };
         let primitive = match ended {
-            JobEndEnd::StreamEnded => crate::comm_log::PrimitiveEnded {
-                end: Some(End::Unknown(UnknownCause::EventsEnded)),
-                detail: Detail::default(),
-                pending: Vec::new(),
-                vci: VciTimes::default(),
-                vci_ended: false,
-                link_errors: Vec::new(),
-                indications: unattached_items(&progress.unbound),
-            },
             JobEndEnd::Ended(result) => {
                 let (end, detail) = sent_end(
                     &stray.request,
@@ -1304,8 +1301,6 @@ struct Stray {
 enum JobEndEnd<'a> {
     /// It ended, as its exchange's wait would have read it.
     Ended(&'a Result<Vec<u8>, HostError>),
-    /// The event stream failed or ended before it did.
-    StreamEnded,
     /// The agent cancelled it.
     Cancelled,
 }

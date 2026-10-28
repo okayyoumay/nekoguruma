@@ -56,8 +56,11 @@ Working rules:
   error or event it names, each state it reads, keeps or releases. Then
   check each step against the new path, and report every step the new path
   leaves out or does differently, unless a design section or ADR says the
-  two should differ. Do this before the other categories, and do not stop
-  at the first gap.
+  two should differ. Also check the paths that later read or rebuild what
+  the new path stores (a reclassification, a resume, a cache refresh): what
+  the new path decided must survive them, unless the design says it need
+  not. Do this before the other categories, and do not stop at the first
+  gap.
 - Before calling a case unreachable or two paths equivalent, construct a
   concrete input that would exercise it and derive its outcome from the rule
   that governs it, not from a proxy.

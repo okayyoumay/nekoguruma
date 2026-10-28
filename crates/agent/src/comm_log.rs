@@ -337,7 +337,8 @@ pub(crate) struct UnattachedItem {
     pub earlier_primitive: bool,
     /// The `seq` of the exchange whose primitive it is bound to, when the host knows it: the
     /// stray primitive it tracks (design 8.11 "Settlement"). A link error of such an item goes
-    /// to that exchange, whatever its time (ADR-372).
+    /// to that exchange, whatever its time, while the log holds it (in the window or kept);
+    /// otherwise it is placed by its time (ADR-372).
     pub owner: Option<u64>,
     /// The item's VCI time, raw (`EventItem.timestamp`).
     pub vci_us: u32,

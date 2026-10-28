@@ -15266,6 +15266,14 @@ def main():
         assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
         assert_eq!(late["primitive"], "earlier", "{late}");
         assert_eq!(late["error_event"], "PDU_ERR_EVT_RX_ERROR", "{late}");
+        // A fault seen in the exchange on its own link, though its time is on no clock.
+        assert!(
+            late["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("A link error also came during the exchange"),
+            "{late}"
+        );
         assert!(
             late["text"]
                 .as_str()

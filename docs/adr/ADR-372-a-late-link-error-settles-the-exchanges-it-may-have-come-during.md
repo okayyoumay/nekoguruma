@@ -32,7 +32,8 @@ for a late reset.
 
 1. **Which items.** An unbound link error of no primitive that the exchange in flight does not
    take: its time comes before that exchange's span, or the exchange was refused. Also one of an
-   earlier primitive, by its time; it keeps `primitive` `earlier`. One the exchange in flight
+   earlier primitive, by its time, except one of the stray primitive cancelled before the
+   request, which goes to its exchange (Consequences); it keeps `primitive` `earlier`. One the exchange in flight
    takes because its time cannot be set against that exchange's (on no clock, or on a clock and
    epoch none of the exchange's own times are on) is also taken as a possible error of the
    exchanges before it (item 4).
@@ -90,9 +91,11 @@ for a late reset.
 - An error bound to the stray primitive the host tracks, cancelled before the link's next
   request, goes to that primitive's exchange whatever its time: the host passes the exchange's
   `seq` with it (`UnattachedItem.owner`), and the log takes it as a fault seen in that exchange
-  on its own link (the maintainer's decision, 2026-10-27); this came in a later change than the
-  rest of this ADR. At job end the host still does not pass link errors of no primitive to the
-  log. That work is left to a later change.
+  on its own link (the maintainer's decision, 2026-10-27), while it still holds that exchange in
+  its window or kept beyond it; one whose exchange has left both is placed by its time. This
+  came in a later change than the rest of this ADR. At job end the host still does not pass the
+  link errors of no primitive, or of an earlier primitive, to the log. That work is left to a
+  later change.
 - An exchange with no VCI time on the error's clock is taken as after it, so it may lose matched
   answers from before an error that came after it. A target whose exchanges share no clock with
   the error is taken the same way. Both err towards `undetermined`.

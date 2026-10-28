@@ -500,6 +500,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         let mut bound_errors: Vec<Unbound> = Vec::new();
         // Every read of the link's items, which stands for the link errors read after it.
         let mut reads: Vec<(u32, AgentNow)> = Vec::new();
+        // When the primitive's end was read: an error read before it was read while it ran.
+        let mut end_read_at: Option<AgentNow> = None;
         // `Some(None)` when the event stream failed or ended, `None` when the wait passed.
         let ended = if stray.cancel_failed {
             None
@@ -567,6 +569,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                                 for unbound in &mut progress.unbound[kept..] {
                                     unbound.read = read;
                                 }
+                                if end_read_at.is_none() && progress.end_read().is_some() {
+                                    end_read_at = read;
+                                }
                                 if let Some(result) = done {
                                     return Some(Some(result));
                                 }
@@ -591,7 +596,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             }
             Some(Some(result)) => {
                 let written = self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
-                self.log_late_errors(&progress, &bound_errors, written, &reads, stray.seq);
+                self.log_late_errors(
+                    &progress,
+                    &bound_errors,
+                    written,
+                    &reads,
+                    stray.seq.map(|seq| (seq, end_read_at)),
+                );
                 return;
             }
             // The stream failed or ended before it did: its end is unknown, with every item read
@@ -629,7 +640,13 @@ impl<C: WorkerApi> WorkerHost<C> {
                 "could not cancel a primitive past its deadline at job end"
             ),
         }
-        self.log_late_errors(&progress, &bound_errors, end_written, &reads, stray.seq);
+        self.log_late_errors(
+            &progress,
+            &bound_errors,
+            end_written,
+            &reads,
+            stray.seq.map(|seq| (seq, end_read_at)),
+        );
     }
 
     /// Places the times of the link errors read at job end that the log takes afterwards
@@ -661,7 +678,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         bound_errors: &[Unbound],
         end_written: bool,
         reads: &[(u32, AgentNow)],
-        in_flight: Option<u64>,
+        in_flight: Option<(u64, Option<AgentNow>)>,
     ) {
         let Some(log) = &self.comm_log else {
             return;

@@ -64,7 +64,7 @@ GetModuleIds → (pick a ModuleHandle with PDU_MODST_AVAIL) → ModuleConnect
 
 | RPC | Request | Response | Description |
 |-----|---------|----------|-------------|
-| `GetVersion` | `GetVersionRequest` | `VersionResponse` | Read firmware/hardware/API version strings from the module |
+| `GetVersion` | `GetVersionRequest` | `VersionResponse` | Read firmware/hardware/API version strings from the module. `hw_serial_number` is 0 when the worker has no serial number to give (the J2534 worker never has one); the agent's communication log reads 0 as none (ADR-373) |
 | `GetTimestamp` | `GetTimestampRequest` | `TimestampResponse` | Read the module's clock (microseconds, `UNUM32`, wraps at 2^32), with the clock the reading is on (`timestamp_clock`) |
 
 **Clock source differs by service:** `iso22900-service` passes the vendor DLL's native `PDUGetTimestamp` hardware clock straight through. `j2534-0404-service` has no equivalent J2534 v04.04 IOCTL to read, so it synthesizes a monotonic microsecond clock (`events::module_timestamp_us()`, shared with its `GetStatus`/error-event timestamps — see ADR-120), zeroed at process start and rebased to (approximately) zero again on `PDU_IOCTL_RESET` (`events::reset_module_clock()`, ADR-120 amendment). Both satisfy ISO 22900-2 §9.1.6.1's unit and boot/reset-relative semantics, but the two services never share the same clock values.

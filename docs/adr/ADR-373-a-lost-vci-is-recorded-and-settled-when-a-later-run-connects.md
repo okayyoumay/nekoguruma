@@ -85,9 +85,11 @@ record alone.
   show that yet.
 - On a J2534 link the settlement does not wait for a device-timestamped frame. Design 8.11 lets
   a hardware profile state that the VCI's frame clock is its own and restarts at power-up, but
-  the profile has no such field yet, so a J2534 loss settles at the reconnect as `unknown`. When
-  it gains one, the J2534 worker would give its reading on the `device` clock for such a VCI,
-  and the agent's rule stays as it is.
+  the profile has no such field yet, so a J2534 loss settles at the reconnect as `unknown`. A
+  J2534 worker cannot read the device clock on request (its `GetTimestamp` is on its own
+  clock), so settling such a loss later needs the log to wait for the first device-timestamped
+  frame after the reconnect instead of settling at `vci_connected`: that is follow-up work in
+  the log, beside the profile field.
 - A loss record and its settlement are small lines. A loss that causes many refusals writes its
   record once per refusal, growing with each one. A run that loses its VCI ends quickly, so few
   are expected.

@@ -3682,16 +3682,18 @@ impl Inner {
             .collect();
         exchanges.sort_by_key(|exchange| exchange.seq);
         // The loss's own, or the most severe of the exchanges' (design 8.11 "Settlement").
+        let own = match power_kept {
+            PowerKept::Yes => exchange::Classification::System,
+            PowerKept::No | PowerKept::Unknown => exchange::Classification::Undetermined,
+        };
         let classification = exchanges
             .iter()
             .map(|exchange| exchange.classification)
-            .fold(
-                match power_kept {
-                    PowerKept::Yes => exchange::Classification::System,
-                    PowerKept::No | PowerKept::Unknown => exchange::Classification::Undetermined,
-                },
-                exchange::Classification::max,
-            );
+            .fold(own, exchange::Classification::max);
+        let mut reason = reason;
+        if classification > own {
+            reason.push_str(" An exchange the loss ended already shows a fault on the system's side, which the entry takes as its own.");
+        }
         let text = match power_kept {
             PowerKept::Yes => {
                 "The VCI reconnected and its time base carried on across the loss, so it kept its power: the PC's connection to the VCI was lost, not the vehicle's supply."
@@ -8997,6 +8999,10 @@ mod tests {
         );
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert_eq!(entry["classification"], "system", "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("system's side"),
+            "{entry}"
+        );
         assert_eq!(entry["clock"]["reading"]["clock"], "worker", "{entry}");
         assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
         // Only L1, settled: nothing to settle.
@@ -9232,7 +9238,8 @@ mod tests {
     /// The comparison of `vci_loss_settled` where one agent epoch measures the gap: a log whose
     /// record names the agent epoch the reconnecting run is in. A clock that carried on on the
     /// same VCI shows the power kept, and the exchanges are `system`; a restart shows it lost;
-    /// another serial number, a J2534 VCI or no reading leave it unknown.
+    /// another serial number, none, a reading on the worker's clock or no reading leave it
+    /// unknown. The API the job was told changes nothing.
     #[test]
     fn a_loss_settles_by_the_comparison_when_one_agent_epoch_measures_the_gap() {
         let record = |serial: u32| {
@@ -9245,7 +9252,10 @@ mod tests {
                  {{\"seq\":2,\"event\":\"job_end\"}}\n"
             )
         };
-        let settle = |serial_after: u32, facts: RunFacts, reading_us: Option<u64>| {
+        let settle_with = |serial_after: u32,
+                           facts: RunFacts,
+                           clock: exchange::Clock,
+                           reading_us: Option<u64>| {
             let sink = Recording::default();
             let log = CommLog::over(Box::new(sink.clone()), record(77).as_bytes());
             assert!(log.loss_to_settle());
@@ -9258,7 +9268,7 @@ mod tests {
                     ..read
                 };
                 ConnectReading {
-                    time: exchange::VciTime::new(us, Some(exchange::Clock::Device)),
+                    time: exchange::VciTime::new(us, Some(clock)),
                     read,
                 }
             });
@@ -9271,6 +9281,12 @@ mod tests {
                 .find(|line| line["event"] == "vci_loss_settled")
                 .unwrap();
             settled
+        };
+        let settle = |serial_after, facts, reading_us| {
+            settle_with(serial_after, facts, exchange::Clock::Device, reading_us)
+        };
+        let settle_on = |serial_after, clock, reading_us| {
+            settle_with(serial_after, dpdu_facts(), clock, reading_us)
         };
         // Carried on: the last time plus the gap, within 2 ms plus 100 ppm of it.
         let carried = 1_835_511_040 + 31_209_200 + 3_000;
@@ -9313,6 +9329,15 @@ mod tests {
         };
         let entry = settle(77, j2534, Some(carried));
         assert_eq!(entry["power_kept"], true, "{entry}");
+        // A reading on the worker's clock is recorded but compared with nothing.
+        let entry = settle_on(77, exchange::Clock::Worker, Some(carried));
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert_eq!(entry["clock"]["reading"]["clock"], "worker", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("own clock"),
+            "{entry}"
+        );
         // No reading after the reconnect.
         let entry = settle(77, dpdu_facts(), None);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");

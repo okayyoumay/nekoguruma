@@ -507,7 +507,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   of no primitive while it waits for the stray primitive, and hands them to the log after its
   `primitive_ended` (`CommLog::late_link_errors`), with the primitive's own errors when no end
   of it is written; their times go on their clocks before that entry places its end's
-  (`CommLog::place_job_end_reads`), and the log places them in the order the host read them, and every read at job
+  (`CommLog::place_job_end_reads`), whose placements their `late_item`s take, and every read at job
   end stands for the link errors read after it, as an exchange's own reads do; one that cannot
   be placed may have come during the stray primitive's exchange, which was still running. An unbound transmit
   indication, loopback echo or start-of-message indication that the one ended exchange which

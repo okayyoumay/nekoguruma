@@ -1279,6 +1279,10 @@ struct Inner {
     unsettled: Option<VciLoss>,
     /// The serial number of the run's VCI, from `vci_connected`, when the API gave one.
     serial_number: Option<u32>,
+    /// The placements of the job end's error times, made before the stray primitive's end
+    /// (`CommLog::place_job_end_reads`), which `CommLog::late_link_errors` takes instead of
+    /// placing the same times again on a clock that has run on since.
+    job_end_placed: Vec<(UnattachedItem, Option<clocks::Placed>)>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -1392,6 +1396,7 @@ impl CommLog {
             loss: None,
             unsettled: scan.unsettled,
             serial_number: None,
+            job_end_placed: Vec::new(),
         })))
     }
 
@@ -2199,13 +2204,15 @@ impl CommLog {
     /// each opens. `None` once the log has failed.
     pub(crate) fn place_job_end_reads(&self, items: &[UnattachedItem]) -> Option<()> {
         let mut inner = self.lock();
+        inner.job_end_placed.clear();
         let mut read: Vec<(&UnattachedItem, AgentNow)> = items
             .iter()
             .filter_map(|item| Some((item, item.read?)))
             .collect();
         read.sort_by_key(|(_, read)| (read.epoch, read.monotonic_us));
         for (item, at) in read {
-            inner.place_read(item.clock, u64::from(item.vci_us), Some(at))?;
+            let placed = inner.place_read(item.clock, u64::from(item.vci_us), Some(at))?;
+            inner.job_end_placed.push((item.clone(), placed));
         }
         Some(())
     }
@@ -2251,7 +2258,15 @@ impl CommLog {
             else {
                 continue;
             };
-            let placed = inner.place_read(item.clock, u64::from(item.vci_us), item.read)?;
+            let pre_placed = inner
+                .job_end_placed
+                .iter()
+                .find(|(placed_item, _)| placed_item == item)
+                .map(|(_, placed)| *placed);
+            let placed = match pre_placed {
+                Some(placed) => placed,
+                None => inner.place_read(item.clock, u64::from(item.vci_us), item.read)?,
+            };
             let since = inner.read_since(item, &reads);
             if !inner.late_link_error(item, placed, kind, since, in_flight)? {
                 let event = Event::Unattached(UnattachedEntry::of(item, placed));
@@ -2261,6 +2276,7 @@ impl CommLog {
             }
         }
         inner.note_reads(&reads);
+        inner.job_end_placed.clear();
         Some(())
     }
 
@@ -8019,7 +8035,9 @@ mod tests {
 
     /// ADR-361 at job end: the times of the errors the host read are placed before the stray
     /// primitive's end, whose times carry no read time of their own, so a response read after an
-    /// error with an earlier time opens no epoch of its own on a clock the exchange had none on.
+    /// error with an earlier time opens no epoch of its own on a clock the exchange had none on;
+    /// and their `late_item`s take those placements, so an earlier error is not placed again
+    /// once the clock has run past it.
     #[test]
     fn job_end_error_times_are_placed_before_the_primitive_s_end() {
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
@@ -8050,15 +8068,19 @@ mod tests {
                     Vec::new(),
                 )
                 .unwrap();
-            // At job end: an error at 1 s, read first, then the response at 1.5 s.
+            // At job end: errors at 1 s and 1.05 s, read in that order 50 ms apart, then the
+            // response at 1.5 s.
             let read = log.now();
-            let error = UnattachedItem {
+            let error = |vci_us, after_us| UnattachedItem {
                 link: 1,
                 earlier_primitive: false,
                 owner: None,
-                vci_us: 1_000_000,
+                vci_us,
                 clock: Some(exchange::Clock::Device),
-                read: Some(read),
+                read: Some(AgentNow {
+                    monotonic_us: read.monotonic_us + after_us,
+                    ..read
+                }),
                 data: UnattachedData::Error {
                     event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
                     extra_error_info: None,
@@ -8066,9 +8088,9 @@ mod tests {
                     link_error: Some(exchange::LinkErrorKind::Frame),
                 },
             };
+            let errors = [error(1_000_000, 0), error(1_050_000, 50_000)];
             if placed_first {
-                log.place_job_end_reads(std::slice::from_ref(&error))
-                    .unwrap();
+                log.place_job_end_reads(&errors).unwrap();
             }
             log.primitive_ended(
                 seq,
@@ -8087,7 +8109,7 @@ mod tests {
                 },
             )
             .unwrap();
-            log.late_link_errors(&[error], &[], Some(seq)).unwrap();
+            log.late_link_errors(&errors, &[], Some(seq)).unwrap();
             log.end("ok");
             let lines = lines(&setup);
             assert_consecutive(&lines);
@@ -8100,7 +8122,7 @@ mod tests {
                 .map(|line| line["reason"].clone())
                 .collect()
         };
-        // Placed first: one epoch, which both times share.
+        // Placed first, and not placed again: one epoch, which every time shares.
         let lines = run(true);
         assert_eq!(reasons(&lines), [serde_json::json!("first")], "{lines:#?}");
         // The response's time first would open a second epoch for the error: what the order

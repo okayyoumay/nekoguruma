@@ -487,7 +487,15 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `undetermined`; the exchange in flight that could own it is at least `undetermined` too. Every other
   item is an `unattached` event, except a link error of no primitive read during the exchange
   (not a receive timeout or a lost VCI) whose VCI time is not before the exchange's earliest one,
-  or cannot be set against it: that is a link error of the exchange itself. An unbound transmit
+  or cannot be set against it: that is a link error of the exchange itself. Any other link error,
+  of no primitive or of an earlier one, is a `late_item` (ADR-372). Within an earlier exchange
+  (by its VCI time on one clock and epoch), that exchange takes it: its own fault on its own
+  link, H3 on another. Between exchanges, it settles the exchanges after it alone. Either way,
+  the matched answers and the answers since an error from before it end for every target, and
+  the later exchanges are reclassified. Before the window, no window exchange is reclassified.
+  One that cannot be placed on one clock with the exchanges is a possible link error (H3) during
+  each exchange written since the link's items were last read before it; with none, it stays
+  `unattached`. An unbound transmit
   indication, loopback echo or start-of-message indication that the one ended exchange which
   could own it (one whose `sent` is still `unknown`, or an owed request awaiting a response on
   that identifier) owns, and not the exchange in flight, is a `late_item` settling entry

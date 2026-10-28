@@ -579,7 +579,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             }
             Some(Some(result)) => {
                 let written = self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
-                self.log_late_errors(&progress, &bound_errors, written, &reads);
+                self.log_late_errors(&progress, &bound_errors, written, &reads, stray.seq);
                 return;
             }
             // The stream failed or ended before it did: its end is unknown, with every item read
@@ -617,7 +617,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 "could not cancel a primitive past its deadline at job end"
             ),
         }
-        self.log_late_errors(&progress, &bound_errors, end_written, &reads);
+        self.log_late_errors(&progress, &bound_errors, end_written, &reads, stray.seq);
     }
 
     /// Hands the communication log the link errors read at job end that no entry carries
@@ -629,6 +629,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         bound_errors: &[Unbound],
         end_written: bool,
         reads: &[(u32, AgentNow)],
+        in_flight: Option<u64>,
     ) {
         let Some(log) = &self.comm_log else {
             return;
@@ -653,7 +654,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             return;
         }
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            log.late_link_errors(&items, reads)
+            log.late_link_errors(&items, reads, in_flight)
         }));
         if logged.is_err() {
             tracing::warn!("writing a job end's late link errors panicked");

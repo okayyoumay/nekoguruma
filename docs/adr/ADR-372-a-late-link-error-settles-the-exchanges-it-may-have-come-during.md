@@ -93,7 +93,10 @@ for a late reset.
   on its own link (the maintainer's decision, 2026-10-27). At job end, the host also reads the
   link errors of no primitive while it waits for the stray primitive, and passes them to the log
   after the primitive's `primitive_ended` (`CommLog::late_link_errors`), with the primitive's own
-  when no end of it is written. Both came in a later change than the rest of this ADR.
+  when no end of it is written. They are placed in the order the host read them, every read at
+  job end stands for the errors read after it (item 4), and one that cannot be placed may have
+  come during the primitive's exchange, which was still running, as the exchange in flight
+  takes such an error. Both came in a later change than the rest of this ADR.
 - An exchange with no VCI time on the error's clock is taken as after it, so it may lose matched
   answers from before an error that came after it. A target whose exchanges share no clock with
   the error is taken the same way. Both err towards `undetermined`.

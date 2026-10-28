@@ -1990,7 +1990,13 @@ impl CommLog {
                 continue;
             };
             let since = inner.read_since(&unbound[at_item], &batch_reads);
-            if inner.late_link_error(&unbound[at_item], unbound_placed[at_item], kind, since)? {
+            if inner.late_link_error(
+                &unbound[at_item],
+                unbound_placed[at_item],
+                kind,
+                since,
+                None,
+            )? {
                 unbound.remove(at_item);
                 unbound_placed.remove(at_item);
             } else {
@@ -1999,7 +2005,7 @@ impl CommLog {
         }
         for (item, kind) in own_unplaced {
             let since = inner.read_since(&item, &batch_reads);
-            inner.late_link_error(&item, None, kind, since)?;
+            inner.late_link_error(&item, None, kind, since, None)?;
         }
         inner.note_reads(&batch_reads);
         // The transmit done starts the first pending's interval.
@@ -2191,16 +2197,34 @@ impl CommLog {
     /// as one an exchange reads (design 8.11 `late_item`, ADR-372), and one that settles none is
     /// `unattached`. They are placed in the order the host read them, and `reads` are every
     /// read of the link's items at job end (`link`, when), which stand for the link errors read
-    /// after them as an exchange's own reads do. Items that are no link error are passed over.
-    /// `None` once the log has failed.
+    /// after them as an exchange's own reads do. `in_flight` is the exchange of the primitive
+    /// the host waited for, still running while they were read: one that cannot be placed may
+    /// have come during it, as the exchange in flight takes such an error. Items that are no
+    /// link error are passed over. `None` once the log has failed.
     pub(crate) fn late_link_errors(
         &self,
         items: &[UnattachedItem],
         reads: &[(u32, AgentNow)],
+        in_flight: Option<u64>,
     ) -> Option<()> {
         let mut inner = self.lock();
         let mut items: Vec<&UnattachedItem> = items.iter().collect();
-        items.sort_by_key(|item| item.read.map(|read| (read.epoch, read.monotonic_us)));
+        // In read order, an item with no read time last, as an exchange places its own.
+        items.sort_by_key(|item| {
+            (
+                item.read.is_none(),
+                item.read.map(|read| (read.epoch, read.monotonic_us)),
+            )
+        });
+        let reads: Vec<(u32, AgentNow)> = reads
+            .iter()
+            .copied()
+            .chain(
+                items
+                    .iter()
+                    .filter_map(|item| Some((item.link, item.read?))),
+            )
+            .collect();
         for item in items {
             let UnattachedData::Error {
                 link_error: Some(kind),
@@ -2210,15 +2234,15 @@ impl CommLog {
                 continue;
             };
             let placed = inner.place_read(item.clock, u64::from(item.vci_us), item.read)?;
-            let since = inner.read_since(item, reads);
-            if !inner.late_link_error(item, placed, kind, since)? {
+            let since = inner.read_since(item, &reads);
+            if !inner.late_link_error(item, placed, kind, since, in_flight)? {
                 let event = Event::Unattached(UnattachedEntry::of(item, placed));
                 inner.append_with(|seq, line| {
                     serde_json::to_writer(line, &Line { seq, event: &event })
                 })?;
             }
         }
-        inner.note_reads(reads);
+        inner.note_reads(&reads);
         Some(())
     }
 
@@ -3350,9 +3374,6 @@ impl Inner {
             .map(|_| ())
     }
 
-    /// Writes the `late_item` settling entry of `item`, an indication two or more exchanges
-    /// could own, logged `unattached` as line `unattached`: each owed exchange of `owners` on
-    /// link `at` is at least `undetermined` (design 8.11 `late_item`, ADR-370).
     /// The agent epoch and time the host last read an item of `item`'s link before `item`:
     /// another item of `reads`, read with it, or one an earlier exchange read.
     fn read_since(&self, item: &UnattachedItem, reads: &[(u32, AgentNow)]) -> (u32, Option<u64>) {
@@ -3411,6 +3432,7 @@ impl Inner {
         placed: Option<clocks::Placed>,
         kind: exchange::LinkErrorKind,
         since: (u32, Option<u64>),
+        in_flight: Option<u64>,
     ) -> Option<bool> {
         let written = self.next_seq;
         let mut during: Vec<(exchange::Reclassified, bool)> = Vec::new();
@@ -3447,8 +3469,15 @@ impl Inner {
                 Some(exchange::ErrorPoint::NotPlaced) => (Vec::new(), state.window_last()),
                 None => {
                     // Before the first exchange it may have come during; with none, after the
-                    // last.
-                    let owners = state.written_since(since.0, since.1);
+                    // last. The exchange whose primitive was still running when it was read may
+                    // have seen it.
+                    let mut owners = state.written_since(since.0, since.1);
+                    if let Some(running) = in_flight.filter(|running| state.holds(*running))
+                        && !owners.contains(&running)
+                    {
+                        owners.push(running);
+                        owners.sort_unstable();
+                    }
                     let after = match owners.first() {
                         Some(first) => Some(first - 1),
                         None => state.window_last(),
@@ -3499,7 +3528,7 @@ impl Inner {
             .collect();
         text.push_str(&match (at, owned.as_slice()) {
             _ if owner.is_some() => format!(
-                "A link error of the primitive of the exchange logged as {} was read after that exchange's entry; it is that exchange's own, and is placed by its time for the other targets.",
+                "A link error of the primitive of the exchange logged as {} was read after that exchange's entry; it is that exchange's own, and the other targets take it as any late link error.",
                 owner.unwrap_or_default()
             ),
             (Some(_), []) => {
@@ -3542,6 +3571,9 @@ impl Inner {
             .map(|_| true)
     }
 
+    /// Writes the `late_item` settling entry of `item`, an indication two or more exchanges
+    /// could own, logged `unattached` as line `unattached`: each owed exchange of `owners` on
+    /// link `at` is at least `undetermined` (design 8.11 `late_item`, ADR-370).
     fn late_item_unowned(
         &mut self,
         at: usize,
@@ -7857,8 +7889,6 @@ mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Runs `exchanges` on one log with link 1 opened (its limits and indications recorded),
-    /// each with the unbound items read during it, and gives every line written.
     /// ADR-372 at job end (`CommLog::late_link_errors`): the errors are placed in the order the
     /// host read them, so one read later with a later time opens no epoch for the one read
     /// before it; and a read at job end before an error with no clock stands for it, as an
@@ -7885,7 +7915,7 @@ mod tests {
                 link_error: Some(exchange::LinkErrorKind::Frame),
             },
         };
-        let run = |items: Vec<UnattachedItem>, reads: Vec<(u32, AgentNow)>| {
+        let run = |items: Vec<UnattachedItem>, reads: Vec<(u32, AgentNow)>, running: bool| {
             let dir = dir();
             let setup = setup(&dir);
             let log = CommLog::open(&setup).unwrap();
@@ -7915,8 +7945,9 @@ mod tests {
                 response_read_us: Some(1_200_100),
                 ..exchange::VciTimes::default()
             });
-            log.exchange_with(answered, Vec::new()).unwrap();
-            log.late_link_errors(&items, &reads).unwrap();
+            let seq = log.exchange_with(answered, Vec::new()).unwrap();
+            log.late_link_errors(&items, &reads, running.then_some(seq))
+                .unwrap();
             log.end("ok");
             let lines = lines(&setup);
             assert_consecutive(&lines);
@@ -7931,6 +7962,7 @@ mod tests {
                 error(2_000_000, Some(exchange::Clock::Device), 2_000_100),
             ],
             Vec::new(),
+            false,
         );
         let epochs: Vec<_> = of_event(&lines, "clock_epoch")
             .into_iter()
@@ -7938,15 +7970,37 @@ mod tests {
             .collect();
         assert_eq!(epochs, [serde_json::json!("first")], "{lines:#?}");
         // One on no clock, read at 3 s: the exchange may have seen it.
-        let lines = run(vec![error(0, None, 3_000_000)], Vec::new());
+        let lines = run(vec![error(0, None, 3_000_000)], Vec::new(), false);
         assert_eq!(of_event(&lines, "late_item").len(), 1, "{lines:#?}");
         // With a read of the link at job end before it, after the exchange's entry: the
         // exchange is not named, and it stays unattached.
-        let lines = run(vec![error(0, None, 3_000_000)], vec![(1, at(2_500_000))]);
+        let lines = run(
+            vec![error(0, None, 3_000_000)],
+            vec![(1, at(2_500_000))],
+            false,
+        );
         assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
         assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+        // Unless its primitive was the one still running when the error was read: as the
+        // exchange in flight, it may have seen it.
+        let lines = run(
+            vec![error(0, None, 3_000_000)],
+            vec![(1, at(2_500_000))],
+            true,
+        );
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:#?}");
+        };
+        let exchange = &of_event(&lines, "exchange")[0];
+        assert_eq!(
+            late["refers_to"],
+            serde_json::json!([exchange["seq"]]),
+            "{late}"
+        );
     }
 
+    /// Runs `exchanges` on one log with link 1 opened (its limits and indications recorded),
+    /// each with the unbound items read during it, and gives every line written.
     fn run_on_opened_link(
         exchanges: Vec<(exchange::Evidence, Vec<UnattachedItem>)>,
     ) -> Vec<serde_json::Value> {

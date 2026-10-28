@@ -14398,6 +14398,9 @@ def main():
         /// A link error of no primitive (a protocol error with VCI time 300 ms), then the
         /// response and the finished status of [`StartEvent::Respond`].
         LinkErrorThenRespond,
+        /// The receive error of [`StartEvent::FailThenFinishLater`], and no finished status: the
+        /// primitive runs until the agent cancels it.
+        FailNeverFinish,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14722,7 +14725,7 @@ def main():
                             ..Default::default()
                         }));
                     }
-                    if let StartEvent::FailThenFinishLater = event
+                    if let StartEvent::FailThenFinishLater | StartEvent::FailNeverFinish = event
                         && let Some(sender) = &sender
                     {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14743,6 +14746,9 @@ def main():
                             ..Default::default()
                         }));
                     }
+                    if let StartEvent::FailNeverFinish = event {
+                        return;
+                    }
                     if let StartEvent::TimeOutThenFinishLater = event {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
@@ -14753,6 +14759,7 @@ def main():
                     }
                     let data = match event {
                         StartEvent::Finish
+                        | StartEvent::FailNeverFinish
                         | StartEvent::Respond
                         | StartEvent::LinkErrorThenRespond
                         | StartEvent::RespondThenFinishLater
@@ -15227,8 +15234,8 @@ def main():
     }
 
     /// Runs `requests` reads (`send_recv` each) on a fake worker whose primitives each give a
-    /// bound receive error `after` their start and their finished status 150 ms later, then
-    /// settles the job's end with a wait of `wait`; returns the log's lines.
+    /// bound receive error `after` their start and never finish, then settles the job's end
+    /// with a wait of `wait`; returns the log's lines.
     async fn bound_errors_run(
         requests: usize,
         send_recv: Duration,
@@ -15238,7 +15245,7 @@ def main():
         let dir = journal_dir("stray-bound-error");
         let (mut client, _fake) = fake_worker_starting_with(
             CancelAnswer::Done,
-            Some((after, StartEvent::FailThenFinishLater)),
+            Some((after, StartEvent::FailNeverFinish)),
         )
         .await;
         let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
@@ -15299,13 +15306,14 @@ def main():
     /// that primitive's exchange whatever its time.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_cancelled_primitive_s_error_read_during_the_next_request_is_its_exchange_s() {
-        // The first primitive's error comes during the second request's wait (100 to 200 ms),
-        // its finished status after it.
+        // The first primitive's error comes at 450 ms, during the second request's wait (from
+        // 300 to 600 ms and more); the job end's wait for the second is too short to read its
+        // own.
         let lines = bound_errors_run(
             2,
-            Duration::from_millis(100),
-            Duration::from_millis(150),
-            Duration::from_millis(500),
+            Duration::from_millis(300),
+            Duration::from_millis(450),
+            Duration::from_millis(50),
         )
         .await;
         let ended = lines
@@ -15320,13 +15328,12 @@ def main():
     /// job-end wait while no end of it is, goes to its exchange once the agent cancels it.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_primitive_s_error_read_at_job_end_before_its_cancel_is_its_exchange_s() {
-        // The error comes at 100 ms, within the wait that ends at 150 ms; the finished status
-        // after it.
+        // The error comes at 200 ms, within the wait from the deadline at 50 ms to 650 ms.
         let lines = bound_errors_run(
             1,
             Duration::from_millis(50),
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Duration::from_millis(200),
+            Duration::from_millis(600),
         )
         .await;
         let ended = lines

@@ -134,7 +134,8 @@ pub enum CommLogIncomplete {
     /// The log was reopened without a clean close, or with a torn last line, so lines not yet
     /// flushed by the earlier run may be missing.
     UncleanReopen,
-    /// The opening lines or the `job_end` could not be made durable.
+    /// The opening lines, a lost VCI's record (`vci_loss`) or the `job_end` could not be made
+    /// durable.
     CloseFailed(io::ErrorKind),
 }
 
@@ -704,8 +705,6 @@ fn settle_later(
     (changed, through.max(answered_through))
 }
 
-/// The text a settling entry adds when the answer it adds ends the evidence from before its
-/// exchange ([`settle_later`]).
 /// A lost VCI's record (`vci_loss`, design 8.11 "Settlement", ADR-373): only what its
 /// settlement needs, since the agent does not reconnect within a run and the run that reconnects
 /// reads this record alone from the log. Written at the loss, and again, whole, after every
@@ -731,6 +730,15 @@ struct VciLoss {
 struct LossExchange {
     seq: u64,
     classification: exchange::Classification,
+}
+
+/// An exchange `vci_loss_settled` settles: its `seq` and classification with the reason. The
+/// record keeps no link, origin or request, which the exchange's own entry gives (ADR-373).
+#[derive(Serialize)]
+struct LossSettled {
+    seq: u64,
+    classification: exchange::Classification,
+    reason: String,
 }
 
 /// A clock's last time before the loss: raw, with its epoch and when the host read it.
@@ -802,7 +810,7 @@ struct VciLossSettledEntry {
     /// The `seq` of the loss's first record.
     loss: u64,
     refers_to: Vec<u64>,
-    exchanges: Vec<LossExchange>,
+    exchanges: Vec<LossSettled>,
     clock: LossClock,
     /// The serial numbers before and after match; `null` when the API gave none on either.
     serial_match: Option<bool>,
@@ -869,6 +877,8 @@ fn power_kept(
     }
 }
 
+/// The text a settling entry adds when the answer it adds ends the evidence from before its
+/// exchange ([`settle_later`]).
 fn restart_text(restart: Option<(bool, u64)>) -> &'static str {
     match restart {
         Some((true, _)) => {
@@ -3640,18 +3650,21 @@ impl Inner {
                 agent_epoch: loss.agent_epoch,
             });
         // The VCI's own clock on both sides of the loss.
-        let reading = placed.filter(|reading| reading.clock == exchange::Clock::Device);
-        let readings = last.is_some() && reading.is_some();
+        let reading = placed;
+        let device = reading
+            .as_ref()
+            .filter(|reading| reading.clock == exchange::Clock::Device);
+        let readings = last.is_some() && device.is_some();
         let gap = last
             .as_ref()
-            .zip(reading.as_ref())
+            .zip(device)
             .filter(|(last, reading)| last.agent_epoch == reading.agent_epoch)
             .map(|(last, reading)| reading.read_us.saturating_sub(last.read_us));
         let (drift_ppm, drift_from) = self.margins.drift_bound();
         let (clock_margin_us, clock_margin_from) = self.margins.clock_margin();
         let fit = last
             .as_ref()
-            .zip(reading.as_ref())
+            .zip(device)
             .zip(gap)
             .map(|((last, reading), gap)| {
                 clocks::loss_fit(last.us, reading.us, gap, drift_ppm, clock_margin_us)
@@ -3662,23 +3675,36 @@ impl Inner {
             .map(|(before, after)| before == after);
         let (power_kept, reason) =
             power_kept(self.vci.map(|vci| vci.api), readings, fit, serial_match);
-        let classification = match power_kept {
-            PowerKept::Yes => exchange::Classification::System,
-            PowerKept::No | PowerKept::Unknown => exchange::Classification::Undetermined,
-        };
-        let exchanges: Vec<LossExchange> = loss
+        let mut exchanges: Vec<LossSettled> = loss
             .ended
             .iter()
             .chain(&loss.refused)
-            .map(|exchange| LossExchange {
-                seq: exchange.seq,
-                classification: if power_kept == PowerKept::Yes {
-                    exchange::Classification::System
-                } else {
-                    exchange.classification
+            .map(|exchange| match power_kept {
+                PowerKept::Yes => LossSettled {
+                    seq: exchange.seq,
+                    classification: exchange::Classification::System,
+                    reason: reason.clone(),
+                },
+                // What the loss leaves open keeps the exchange as it was.
+                PowerKept::No | PowerKept::Unknown => LossSettled {
+                    seq: exchange.seq,
+                    classification: exchange.classification,
+                    reason: format!("{reason} The exchange keeps its classification."),
                 },
             })
             .collect();
+        exchanges.sort_by_key(|exchange| exchange.seq);
+        // The loss's own, or the most severe of the exchanges' (design 8.11 "Settlement").
+        let classification = exchanges
+            .iter()
+            .map(|exchange| exchange.classification)
+            .fold(
+                match power_kept {
+                    PowerKept::Yes => exchange::Classification::System,
+                    PowerKept::No | PowerKept::Unknown => exchange::Classification::Undetermined,
+                },
+                exchange::Classification::max,
+            );
         let text = match power_kept {
             PowerKept::Yes => {
                 "The VCI reconnected and its time base carried on across the loss, so it kept its power: the PC's connection to the VCI was lost, not the vehicle's supply."
@@ -8909,6 +8935,161 @@ mod tests {
         assert_eq!(taken_events(&sink), ["header", "job_start"]);
     }
 
+    /// The `seq` and classification of each exchange a `vci_loss_settled` settles.
+    fn settled_exchanges(entry: &serde_json::Value) -> Vec<(u64, &str)> {
+        entry["exchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|exchange| {
+                (
+                    exchange["seq"].as_u64().unwrap(),
+                    exchange["classification"].as_str().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The `vci_loss_settled` a run writes over `existing` when its VCI connects with `reading`.
+    fn settled_over(existing: &str, reading: Option<exchange::VciTime>) -> serde_json::Value {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), existing.as_bytes());
+        assert!(log.loss_to_settle(), "{existing}");
+        log.begin(&dpdu_facts(), RunKind::Resume);
+        let reading = reading.map(|time| ConnectReading {
+            time,
+            read: log.now(),
+        });
+        log.vci_connected(Some(&serial(77)), reading).unwrap();
+        let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
+        taken
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|line| line["event"] == "vci_loss_settled")
+            .unwrap()
+    }
+
+    /// A record line of loss `loss` at `seq` that ended the exchanges `ended`.
+    fn loss_line(seq: u64, loss: u64, ended: &[(u64, &str)]) -> String {
+        let ended: Vec<serde_json::Value> = ended
+            .iter()
+            .map(|(seq, classification)| serde_json::json!({"seq": seq, "classification": classification}))
+            .collect();
+        format!(
+            "{}\n",
+            serde_json::json!({"seq": seq, "event": "vci_loss", "loss": loss, "agent_epoch": 0, "ended": ended, "refused": [], "clocks": []})
+        )
+    }
+
+    /// The scan settles the last record no `vci_loss_settled` names: a settlement of another loss
+    /// leaves it, an unreadable record is passed over, and an earlier loss a later one followed
+    /// is not settled. The entry's classification is the most severe of the loss's and its
+    /// exchanges', and the exchanges come in `seq` order; a reading on the worker's clock is
+    /// recorded but compared with nothing.
+    #[test]
+    fn the_last_unsettled_record_is_settled_with_its_most_severe_exchange() {
+        let header = "{\"seq\":0,\"event\":\"header\"}\n";
+        // L1 at 2, settled at 3; L2 at 5, whose later record at 7 does not read.
+        let log = format!(
+            "{header}{}{}{}{}{}{}{}",
+            loss_line(2, 2, &[(1, "undetermined")]),
+            "{\"seq\":3,\"event\":\"vci_loss_settled\",\"loss\":2}\n",
+            "{\"seq\":4,\"event\":\"vci_loss_settled\",\"loss\":99}\n",
+            loss_line(5, 5, &[(4, "system"), (1, "undetermined")]),
+            "{\"seq\":6,\"event\":\"exchange\"}\n",
+            "{\"seq\":7,\"event\":\"vci_loss\",\"loss\":5,\"ended\":\"damaged\"}\n",
+            "{\"seq\":8,\"event\":\"job_end\"}\n",
+        );
+        let worker = exchange::VciTime::new(5, Some(exchange::Clock::Worker));
+        let entry = settled_over(&log, Some(worker));
+        assert_eq!(entry["loss"], 5, "{entry}");
+        assert_eq!(entry["refers_to"], serde_json::json!([1, 4]), "{entry}");
+        assert_eq!(
+            settled_exchanges(&entry),
+            [(1, "undetermined"), (4, "system")]
+        );
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert_eq!(entry["clock"]["reading"]["clock"], "worker", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        // Only L1, settled: nothing to settle.
+        let settled = format!(
+            "{header}{}{}",
+            loss_line(2, 2, &[(1, "undetermined")]),
+            "{\"seq\":3,\"event\":\"vci_loss_settled\",\"loss\":2}\n"
+        );
+        let log = CommLog::over(Box::new(Recording::default()), settled.as_bytes());
+        assert!(!log.loss_to_settle());
+        // L1 then L2 unsettled: only L2, the last.
+        let both = format!(
+            "{header}{}{}",
+            loss_line(2, 2, &[(1, "undetermined")]),
+            loss_line(4, 4, &[(3, "undetermined")])
+        );
+        let entry = settled_over(&both, None);
+        assert_eq!(entry["loss"], 4, "{entry}");
+        assert_eq!(entry["refers_to"], serde_json::json!([3]), "{entry}");
+    }
+
+    /// A primitive the loss ended after the agent stopped waiting for it is an exchange the loss
+    /// ended, recorded as its `primitive_ended` classifies it.
+    #[test]
+    fn a_primitive_the_loss_ended_is_recorded_with_its_settlement() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&dpdu_facts(), RunKind::First);
+        let seq = log
+            .exchange_with(
+                evidence(
+                    endpoint(0x7E0),
+                    &[0x22, 0xF1, 0x90],
+                    exchange::End::VciDidNotEnd,
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                tx_indication: None,
+                end: Some(exchange::End::VciLost {
+                    refused_after_loss: false,
+                }),
+                detail: exchange::Detail::default(),
+                pending: Vec::new(),
+                vci: exchange::VciTimes::default(),
+                vci_ended: false,
+                link_errors: Vec::new(),
+                indications: Vec::new(),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        drop(log);
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let ended = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .unwrap();
+        let record = lines
+            .iter()
+            .find(|line| line["event"] == "vci_loss")
+            .unwrap();
+        assert_eq!(
+            record["seq"],
+            ended["seq"].as_u64().unwrap() + 1,
+            "{record}"
+        );
+        assert_eq!(
+            record["ended"],
+            serde_json::json!([{"seq": seq, "classification": ended["exchanges"][0]["classification"]}]),
+            "{record}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     fn dpdu_facts() -> RunFacts {
         RunFacts {
             vci: Some(VciFacts {
@@ -9043,11 +9224,15 @@ mod tests {
             "{settled}"
         );
         assert_eq!(
-            settled["exchanges"],
-            serde_json::json!([
-                {"seq": ended, "classification": "undetermined"},
-                {"seq": refused, "classification": "undetermined"}
-            ])
+            settled_exchanges(settled),
+            [(ended, "undetermined"), (refused, "undetermined")]
+        );
+        assert!(
+            settled["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .ends_with("The exchange keeps its classification."),
+            "{settled}"
         );
 
         // Settled once: a later run finds nothing to settle.
@@ -9105,10 +9290,7 @@ mod tests {
         let entry = settle(77, dpdu_facts(), Some(carried));
         assert_eq!(entry["power_kept"], true, "{entry}");
         assert_eq!(entry["classification"], "system", "{entry}");
-        assert_eq!(
-            entry["exchanges"],
-            serde_json::json!([{"seq": 0, "classification": "system"}])
-        );
+        assert_eq!(settled_exchanges(&entry), [(0, "system")]);
         assert_eq!(entry["clock"]["agent_gap_us"], 31_209_200);
         assert_eq!(entry["clock"]["expected_us"], 1_835_511_040u64 + 31_209_200);
         assert_eq!(entry["clock"]["tolerance_us"], 2_000 + 3_120);
@@ -9122,10 +9304,7 @@ mod tests {
         let entry = settle(77, dpdu_facts(), Some(20_000_000));
         assert_eq!(entry["power_kept"], false, "{entry}");
         assert_eq!(entry["classification"], "undetermined");
-        assert_eq!(
-            entry["exchanges"],
-            serde_json::json!([{"seq": 0, "classification": "undetermined"}])
-        );
+        assert_eq!(settled_exchanges(&entry), [(0, "undetermined")]);
         // Another VCI's clock that fits: unknown.
         let entry = settle(78, dpdu_facts(), Some(carried));
         assert_eq!(entry["serial_match"], false);

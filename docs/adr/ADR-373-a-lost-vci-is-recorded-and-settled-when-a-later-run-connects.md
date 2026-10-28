@@ -58,6 +58,12 @@ record alone.
    - The power is kept only when the reading fits a clock that carried on and not one that
      restarted, and the serial numbers match. The exchanges are then `system`.
 
+   Each exchange the entry lists gives its `seq`, classification and reason. Unlike the other
+   settling entries, it does not restate the link, origin and request: the record holds only
+   what the settlement needs, and the exchange's own entry in the same log gives them. The
+   entry's classification is the most severe of the loss's own and the exchanges', and the
+   exchanges keep theirs unless the power was kept.
+
    Otherwise the loss stays `undetermined`, and the entry says why:
    - a restart (`power_kept` `false`);
    - a reading that fits both or neither, a serial number that does not match or is missing, no

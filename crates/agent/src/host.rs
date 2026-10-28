@@ -1547,7 +1547,6 @@ fn clock_of(item: &EventItem) -> Option<Clock> {
     clock_named(item.timestamp_clock)
 }
 
-/// The clock a worker's `TimestampClock` value names, or none when it names none.
 /// Reads the VCI's clock (`GetTimestamp` of `module_handle`), with the clock the worker says it
 /// is on; `None` when the read fails.
 pub(crate) async fn read_vci_clock<C: WorkerApi>(
@@ -1575,6 +1574,7 @@ pub(crate) async fn read_vci_clock<C: WorkerApi>(
     }
 }
 
+/// The clock a worker's `TimestampClock` value names, or none when it names none.
 fn clock_named(clock: i32) -> Option<Clock> {
     match TimestampClock::try_from(clock) {
         Ok(TimestampClock::Device) => Some(Clock::Device),

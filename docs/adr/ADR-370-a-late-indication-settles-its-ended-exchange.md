@@ -6,7 +6,7 @@
 `Inner::late_item_unowned`, `LateItemEntry`, `UnattachedItem::late_indication`,
 `before_starts`, `late_indication_owners`; `comm_log/exchange.rs`
 `LinkState::late_transmit_owners`, `LinkState::late_start_owners`, `LinkState::update_kept`,
-`LinkState::floor_of`, `Kept::start_in_time`, `settle_late_response`); design 8.11
+`LinkState::floor_of`, `Kept::late_start`, `settle_late_response`); design 8.11
 ("Settlement", `late_item`); ADR-346, ADR-365, ADR-367, ADR-368
 
 ## Context
@@ -69,7 +69,7 @@ again (2026-10-28):
    - A start-of-message indication starts E's response. An E the VCI ended with no response is
      `response_incomplete`. Its start is judged against E's limit in force like a late response
      (`judge_late`). A start before the limit less the margin is kept with E
-     (`Kept::start_in_time`), and E is at least `undetermined` until the response completes. A
+     (`Kept::late_start`), and E is at least `undetermined` until the response completes. A
      late response that completes it is `system`, since the system missed a response that
      started in time.
    - E's timing is judged again with what the item adds, as its own entry would have judged it:
@@ -84,6 +84,13 @@ again (2026-10-28):
      aborted and began again, and the in-time judgement is that of the start that stands.
    - A start in time makes a later late response `system` only when that response spans frames:
      one that fits one frame came after a transfer the ECU aborted.
+   - A start after the limit plus the margin is kept too (`Kept::late_start`): the ECU started
+     late, and any later late response that completes it is judged as a late response, since
+     it is past the limit too, whatever its length. Its `vehicle` row needs the VCI to have
+     ended its wait at the limit. E's timing judged before the first such start showed that
+     (`LateStart::Late { at_limit }`), and a start that comes after the timeout does not refute
+     it, though judging E's timing again with the response begun drops the timeout; a later
+     start that replaces it keeps that record.
    - The start counts as an answer for the later exchanges (`reclassify_after`), but not as a
      matched answer (ADR-354).
    - The entry gives the item as `unattached` gives it, with E's `sent`, `sent_evidence` and
@@ -108,8 +115,6 @@ again (2026-10-28):
   so an earlier exchange's late indication read during it stays ambiguous.
 - An exchange in flight gets the `undetermined` floor for an ambiguous indication only when the
   indication could change it, as item 5 says.
-- A late start after the limit plus the margin is not recorded yet, so a response that later
-  completes it is judged on its own time; it is an open item.
 - The `late_item` lines come before the exchange's other items, so the log's lines are not in
   the order the host read the items.
 - An indication read at job end keeps the ADR-366 path, which gives it only to the stray

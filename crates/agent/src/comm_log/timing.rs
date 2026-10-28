@@ -224,6 +224,38 @@ pub(crate) fn judge_late(
     at: At,
     len: usize,
 ) -> LateWindow {
+    // Only a response that fits one frame is shown late by its end: less that frame's longest
+    // transfer, it began past the limit.
+    let transfer = limits
+        .single_frame
+        .filter(|frame| len <= frame.max_bytes)
+        .map(|frame| to_i64(frame.transfer_us));
+    judge_late_at(limits, absorbing, transmit, pendings, at, transfer)
+}
+
+/// Judges the time `at` a late start-of-message indication shows its response beginning,
+/// against the limit in force as [`judge_late`] judges a response's end (design 8.11
+/// "Settlement" `late_item`): a start is the beginning itself, so no transfer comes off it.
+pub(crate) fn judge_late_start(
+    limits: Limits,
+    absorbing: bool,
+    transmit: At,
+    pendings: &[At],
+    at: At,
+) -> LateWindow {
+    judge_late_at(limits, absorbing, transmit, pendings, at, Some(0))
+}
+
+/// [`judge_late`] for a time `at` that began its response `transfer` before it, when that is
+/// bounded.
+fn judge_late_at(
+    limits: Limits,
+    absorbing: bool,
+    transmit: At,
+    pendings: &[At],
+    at: At,
+    transfer: Option<i64>,
+) -> LateWindow {
     let (Some((clock, transmit)), Some((own, at))) = (transmit, at) else {
         return LateWindow::Open;
     };
@@ -257,10 +289,6 @@ pub(crate) fn judge_late(
     if at <= in_force.earliest - margin {
         return LateWindow::InTime { at_us: at };
     }
-    let transfer = limits
-        .single_frame
-        .filter(|frame| len <= frame.max_bytes)
-        .map(|frame| to_i64(frame.transfer_us));
     match (transfer, in_force.latest) {
         (Some(transfer), Some(latest)) if at - transfer > latest + margin => LateWindow::Late {
             by_us: at - transfer - latest,
@@ -736,6 +764,17 @@ mod tests {
             LateWindow::Open
         );
         assert_eq!(late(LIMITS, false, &[], -1, 3), LateWindow::Open);
+        // A start is its response's beginning: late as soon as it is past the limit plus the
+        // margin, with no frame's transfer off it, and on a link with no single-frame bound too.
+        let start = |limits, at_us| judge_late_start(limits, false, transmit(), &[], at(at_us));
+        assert_eq!(start(LIMITS, 52_000), LateWindow::Open);
+        assert_eq!(start(LIMITS, 52_001), LateWindow::Late { by_us: 2_001 });
+        let unbounded = Limits {
+            single_frame: None,
+            ..LIMITS
+        };
+        assert_eq!(start(unbounded, 52_001), LateWindow::Late { by_us: 2_001 });
+        assert_eq!(start(LIMITS, 48_000), LateWindow::InTime { at_us: 48_000 });
         // Before a pending of the exchange: no final response of it.
         assert_eq!(
             late(LIMITS, false, &[at(30_000)], 20_000, 3),

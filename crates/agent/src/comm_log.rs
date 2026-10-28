@@ -1833,7 +1833,7 @@ impl CommLog {
                 .unwrap_or_default(),
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
-            start_in_time: None,
+            late_start: None,
             floor: None,
             clears,
             matched: false,
@@ -2735,7 +2735,7 @@ impl Inner {
         let mut evidence = kept.evidence.clone();
         let mut vci = evidence.times.vci.unwrap_or_default();
         let time = exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed);
-        let mut start_in_time = None;
+        let mut late_start = None;
         let what = match kind {
             LateIndication::Transmit(transmit) => {
                 evidence.transmit_evidence = Some(transmit);
@@ -2805,22 +2805,36 @@ impl Inner {
                 },
             );
             // A start is judged like a late response by its time, against the limit in force:
-            // it has no length of its own, so only one before the limit less the margin shows.
-            // The latest start judged: one that replaces an earlier start in time and is not in
-            // time itself ends that judgement.
+            // before the limit less the margin, or after the limit plus the margin (design 8.11
+            // "Settlement"). The latest start is judged: one that replaces an earlier start
+            // ends that one's judgement.
             if kind == LateIndication::Start
                 && matches!(evidence.end, exchange::End::ResponseIncomplete)
                 && let Some(start) = vci.rx_start
-                && let timing::LateWindow::InTime { at_us } = timing::judge_late(
+            {
+                late_start = match timing::judge_late_start(
                     limits,
                     evidence.absorbing(),
                     transmit,
                     &kept.pendings,
                     start.placed(),
-                    0,
-                )
-            {
-                start_in_time = Some(at_us);
+                ) {
+                    timing::LateWindow::InTime { at_us } => {
+                        Some(exchange::LateStart::InTime { at_us })
+                    }
+                    timing::LateWindow::Late { by_us } => Some(exchange::LateStart::Late {
+                        by_us,
+                        // A start after the timeout does not refute it: an earlier late start
+                        // that recorded it keeps it, since judging the timing again with the
+                        // response begun dropped the timeout.
+                        at_limit: kept.evidence.timing.window == exchange::Window::TimeoutAtLimit
+                            || matches!(
+                                kept.late_start,
+                                Some(exchange::LateStart::Late { at_limit: true, .. })
+                            ),
+                    }),
+                    timing::LateWindow::Open => None,
+                };
             }
         }
         evidence.times.vci = Some(vci);
@@ -2828,16 +2842,28 @@ impl Inner {
         let entry = exchange::ExchangeEntry::build(owner, evidence.clone(), history);
         let mut classification = entry.classification;
         let mut reason = entry.reason.clone();
-        let start_in_time = match kind {
-            LateIndication::Start => Some(start_in_time),
+        let late_start = match kind {
+            LateIndication::Start => Some(late_start),
             LateIndication::Transmit(_) => None,
         };
-        if let Some(at_us) = start_in_time.unwrap_or(kept.start_in_time) {
-            classification = classification.max(exchange::Classification::Undetermined);
-            reason.push_str(&format!(
-                " The response started {:.1} ms after the transmit, within the limit in force less the margin: once it completes, the system missed a response that started in time.",
-                at_us as f64 / 1000.0
-            ));
+        // While the response does not complete, `undetermined` stands (design 8.11
+        // "Settlement").
+        match late_start.unwrap_or(kept.late_start) {
+            Some(exchange::LateStart::InTime { at_us }) => {
+                classification = classification.max(exchange::Classification::Undetermined);
+                reason.push_str(&format!(
+                    " The response started {:.1} ms after the transmit, within the limit in force less the margin: once it completes, the system missed a response that started in time.",
+                    at_us as f64 / 1000.0
+                ));
+            }
+            Some(exchange::LateStart::Late { by_us, .. }) => {
+                classification = classification.max(exchange::Classification::Undetermined);
+                reason.push_str(&format!(
+                    " The response started at least {:.1} ms after the limit in force plus the margin: the ECU started late, and once the response completes it is judged as a late response.",
+                    by_us as f64 / 1000.0
+                ));
+            }
+            None => {}
         }
         // A floor an ambiguous item set stands. A `system` the exchange's own entry gave rested
         // on its timing, which is judged again here: the log keeps no exchange whose `system`
@@ -2850,7 +2876,7 @@ impl Inner {
             reason.push_str(&suffix);
         }
         state.settled_from_evidence(owner, classification, &reason, evidence.clone());
-        state.update_kept(owner, evidence, entry.sent, transmit, start_in_time);
+        state.update_kept(owner, evidence, entry.sent, transmit, late_start);
         let answer = entry.settled_answer(&kept);
         let (later, not_reclassified) = settle_later(state, owner, None, &answer);
         let top = later
@@ -6850,6 +6876,137 @@ mod tests {
         };
         assert_ne!(
             completed["exchanges"][0]["classification"], "system",
+            "{completed}"
+        );
+    }
+
+    /// Design 8.11 "Settlement" `late_item`: a late start-of-message indication after the limit
+    /// plus the margin of an exchange whose VCI ended its wait at the limit records that the ECU
+    /// started late; the exchange is `undetermined` while the response does not complete, and
+    /// `vehicle` once a late response completes it.
+    #[test]
+    fn a_late_start_after_the_limit_makes_the_completed_response_vehicle() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence
+        };
+        // The VCI ended its wait at P2 (1 s) after the transmit.
+        let mut timed_out = silent(0x90, 10_000);
+        timed_out.times.vci = Some(exchange::VciTimes {
+            rx_timeout: Some(device(1_010_000)),
+            error: Some(device(1_010_000)),
+            ..exchange::VciTimes::default()
+        });
+        let own_transmit = |did: u8, at_us: u64| {
+            let mut evidence = silent(did, at_us);
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let start = UnattachedItem {
+            vci_us: 1_500_000,
+            read: read(3_010_500),
+            ..start_of_message(0x7E8)
+        };
+        let response = UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            vci_us: 6_000_000,
+            clock: Some(exchange::Clock::Device),
+            read: read(6_010_500),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: [0x62, 0xF1, 0x90].into_iter().chain([0x41; 9]).collect(),
+            },
+        };
+        let run = |starts: Vec<UnattachedItem>, response: UnattachedItem| {
+            run_on_opened_link(vec![
+                (timed_out.clone(), vec![transmit(10_000)]),
+                (own_transmit(0x91, 3_010_000), starts),
+                (own_transmit(0x92, 6_010_000), vec![response]),
+            ])
+        };
+        let with_bytes = |bytes: Vec<u8>| UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes,
+            },
+            ..response.clone()
+        };
+        // The ECU began again, later still: the VCI ended its wait at the limit all the same.
+        // And a response of seven bytes, which may fit one frame, completing a late start, is
+        // late as well.
+        let again = UnattachedItem {
+            vci_us: 1_700_000,
+            read: read(3_010_600),
+            ..start_of_message(0x7E8)
+        };
+        for (starts, response) in [
+            (vec![start.clone(), again], response.clone()),
+            (
+                vec![start.clone()],
+                with_bytes(vec![0x62, 0xF1, 0x90, 0x41, 0x42, 0x43, 0x44]),
+            ),
+        ] {
+            let lines = run(starts, response);
+            let [completed] = &of_event(&lines, "late_response")[..] else {
+                panic!("{lines:?}");
+            };
+            assert_eq!(
+                completed["exchanges"][0]["classification"], "vehicle",
+                "{completed}"
+            );
+        }
+        let lines = run(vec![start], response);
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(
+            exchanges[0]["timing"]["window"], "timeout_at_limit",
+            "{lines:?}"
+        );
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(late["outcome"]["result"], "response_incomplete", "{late}");
+        assert_eq!(
+            late["exchanges"][0]["classification"], "undetermined",
+            "{late}"
+        );
+        assert!(
+            late["exchanges"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("the ECU started late")),
+            "{late}"
+        );
+        let [completed] = &of_event(&lines, "late_response")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(
+            completed["exchanges"][0]["classification"], "vehicle",
             "{completed}"
         );
     }

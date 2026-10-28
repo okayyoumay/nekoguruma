@@ -1277,10 +1277,10 @@ pub(crate) struct Kept {
     /// A start-of-message with the response's identifier was read during the exchange and not
     /// attached (another exchange could own it): the response may have begun.
     pub start_unattached: bool,
-    /// A start-of-message indication read after its entry showed its response beginning this
-    /// long after the transmit, before the limit in force less the margin (a `late_item`,
-    /// ADR-370): once the response completes, the system missed a response that started in time.
-    pub start_in_time: Option<i64>,
+    /// When the latest start-of-message indication read after its entry showed its response
+    /// beginning, judged against the limit in force (a `late_item`, ADR-370, design 8.11
+    /// "Settlement"): it decides a late response that completes that response.
+    pub late_start: Option<LateStart>,
     /// The least classification an ambiguous item read during or after it gave it, with the
     /// reason its reason then ends with: kept with the owed exchange too, so it stands after the
     /// exchange leaves the window (ADR-370).
@@ -1290,6 +1290,20 @@ pub(crate) struct Kept {
     pub clears: Clears,
     /// Its entry's answer counted as a matched answer ([`ExchangeEntry::matched_answer`]).
     pub matched: bool,
+}
+
+/// When a start-of-message indication read after an exchange's entry showed its response
+/// beginning, against the exchange's limit in force (design 8.11 "Settlement" `late_item`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LateStart {
+    /// This long after the transmit, before the limit less the margin: once the response
+    /// completes, the system missed a response that started in time.
+    InTime { at_us: i64 },
+    /// At least this long after the limit plus the margin: the ECU started late, and the
+    /// response that completes it is judged as a late one. `at_limit`: the exchange's timing,
+    /// judged before the start was read, showed the VCI ending its wait at the limit, which a
+    /// start after it does not refute.
+    Late { by_us: i64, at_limit: bool },
 }
 
 /// How often the matched answers, and the answers since a link error, of a link have ended
@@ -1536,7 +1550,7 @@ impl LinkState {
     }
 
     /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its
-    /// transmit done, and, for a start, the time its latest start came in time, if it did: an indication that confirms the send
+    /// transmit done, and, for a start, how its latest start was judged: an indication that confirms the send
     /// can own a late transmit indication no more.
     pub(crate) fn update_kept(
         &mut self,
@@ -1544,7 +1558,7 @@ impl LinkState {
         evidence: Evidence,
         sent: Sent,
         transmit: super::timing::At,
-        start_in_time: Option<Option<i64>>,
+        late_start: Option<Option<LateStart>>,
     ) {
         let Some(kept) = self.kept.get_mut(&seq) else {
             return;
@@ -1553,8 +1567,8 @@ impl LinkState {
         kept.evidence = evidence;
         kept.sent = sent;
         kept.transmit = transmit;
-        if let Some(start_in_time) = start_in_time {
-            kept.start_in_time = start_in_time;
+        if let Some(late_start) = late_start {
+            kept.late_start = late_start;
         }
         if confirmed {
             self.unknown_sends = self.unknown_sends.saturating_sub(1);
@@ -2519,20 +2533,29 @@ pub(crate) fn settle_late_response(
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
     let base = classify(answered, history);
-    // A start of the response read late before the limit less the margin (ADR-370): the
-    // response started in time, so the system missed it.
-    // Only a response that spans frames has a start of its own: one that fits one frame came
-    // after a transfer the ECU aborted.
+    // A start of the response read late (ADR-370): one before the limit less the margin means
+    // the response started in time, so the system missed it, but only for a response that
+    // spans frames, since one that fits one frame came after a transfer the ECU aborted; one
+    // after the limit plus the margin means the ECU started late, which any response completing
+    // after it is judged as (design 8.11 "Settlement").
     let spans_frames = answered
         .end
         .response()
         .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
-    let window = match (window, kept.start_in_time.filter(|_| spans_frames)) {
-        (LateWindow::Late { .. } | LateWindow::Open, Some(at_us)) => {
+    let window = match (window, kept.late_start) {
+        (LateWindow::Late { .. } | LateWindow::Open, Some(LateStart::InTime { at_us }))
+            if spans_frames =>
+        {
             return started_in_time(at_us);
         }
+        (LateWindow::Open, Some(LateStart::Late { by_us, .. })) => LateWindow::Late { by_us },
         (window, _) => window,
     };
+    let at_limit = kept.evidence.timing.window == Window::TimeoutAtLimit
+        || matches!(
+            kept.late_start,
+            Some(LateStart::Late { at_limit: true, .. })
+        );
     let (classification, mut reason) = match window {
         LateWindow::InTime { at_us } => (
             System,
@@ -2548,7 +2571,7 @@ pub(crate) fn settle_late_response(
             );
             if base.classification >= Undetermined {
                 (base.classification, format!("{late} {}", base.reason))
-            } else if kept.evidence.timing.window == Window::TimeoutAtLimit {
+            } else if at_limit {
                 (
                     Vehicle,
                     format!("{late} The VCI had ended its wait at the limit."),
@@ -3127,7 +3150,7 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
-            start_in_time: None,
+            late_start: None,
             floor: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
@@ -4303,7 +4326,7 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
-            start_in_time: None,
+            late_start: None,
             floor: None,
             clears: Clears::default(),
             matched: false,
@@ -4397,7 +4420,7 @@ mod tests {
                 pendings: Vec::new(),
                 limits: None,
                 start_unattached: false,
-                start_in_time: None,
+                late_start: None,
                 floor: None,
                 clears: Clears::default(),
                 matched: false,

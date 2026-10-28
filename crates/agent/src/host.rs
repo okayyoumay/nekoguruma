@@ -579,8 +579,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                 .unwrap_or(None)
             })
         };
-        // The errors' times go on their clocks first, in the order they were read.
-        self.place_late_errors(&progress, &bound_errors);
+        // The times of the errors the log takes afterwards go on their clocks first, in the order
+        // they were read; the primitive's own go with its end when one is written.
+        let end_due = stray.seq.is_some() && (ended.is_some() || progress.end_read().is_some());
+        self.place_late_errors(&progress, &bound_errors, end_due);
         // Whether an end of it was written, which carries its own errors.
         let end_written = match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
@@ -630,18 +632,15 @@ impl<C: WorkerApi> WorkerHost<C> {
         self.log_late_errors(&progress, &bound_errors, end_written, &reads, stray.seq);
     }
 
-    /// Places the times of the error events read at job end, of no primitive and of the stray
-    /// primitive, on their clocks in the order they were read, before the stray's end is
-    /// written (`CommLog::place_job_end_reads`).
-    fn place_late_errors(&self, progress: &Progress, bound_errors: &[Unbound]) {
+    /// Places the times of the link errors read at job end that the log takes afterwards
+    /// ([`late_errors`], with `end_due` whether the stray's end will carry its own), on their
+    /// clocks in the order they were read, before the stray's end is written
+    /// (`CommLog::place_job_end_reads`). The end's own times stay nearest their clock's latest.
+    fn place_late_errors(&self, progress: &Progress, bound_errors: &[Unbound], end_due: bool) {
         let Some(log) = &self.comm_log else {
             return;
         };
-        let items: Vec<UnattachedItem> = unattached_items(&progress.unbound)
-            .into_iter()
-            .filter(|item| matches!(item.data, UnattachedData::Error { .. }))
-            .chain(unattached_items(bound_errors))
-            .collect();
+        let items = late_errors(progress, bound_errors, end_due);
         if items.is_empty() {
             return;
         }
@@ -667,22 +666,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let Some(log) = &self.comm_log else {
             return;
         };
-        let mut items: Vec<UnattachedItem> = unattached_items(&progress.unbound)
-            .into_iter()
-            .filter(|item| {
-                !item.earlier_primitive
-                    && matches!(
-                        item.data,
-                        UnattachedData::Error {
-                            link_error: Some(_),
-                            ..
-                        }
-                    )
-            })
-            .collect();
-        if !end_written {
-            items.extend(unattached_items(bound_errors));
-        }
+        let items = late_errors(progress, bound_errors, end_written);
         if items.is_empty() {
             return;
         }
@@ -1675,6 +1659,32 @@ fn ends_primitive(item: &EventItem, cop: ComPrimitiveHandle) -> bool {
 /// gave it (design principle 6).
 fn clock_of(item: &EventItem) -> Option<Clock> {
     clock_named(item.timestamp_clock)
+}
+
+/// The link errors read at job end that the communication log takes as `late_item`s: those of
+/// no primitive, and the stray primitive's own unless its end carries them (`end_written`).
+fn late_errors(
+    progress: &Progress,
+    bound_errors: &[Unbound],
+    end_written: bool,
+) -> Vec<UnattachedItem> {
+    let mut items: Vec<UnattachedItem> = unattached_items(&progress.unbound)
+        .into_iter()
+        .filter(|item| {
+            !item.earlier_primitive
+                && matches!(
+                    item.data,
+                    UnattachedData::Error {
+                        link_error: Some(_),
+                        ..
+                    }
+                )
+        })
+        .collect();
+    if !end_written {
+        items.extend(unattached_items(bound_errors));
+    }
+    items
 }
 
 /// Reads the VCI's clock (`GetTimestamp` of `module_handle`), with the clock the worker says it

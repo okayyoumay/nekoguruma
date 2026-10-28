@@ -1277,6 +1277,14 @@ pub(crate) struct Kept {
     /// A start-of-message with the response's identifier was read during the exchange and not
     /// attached (another exchange could own it): the response may have begun.
     pub start_unattached: bool,
+    /// A start-of-message indication read after its entry showed its response beginning this
+    /// long after the transmit, before the limit in force less the margin (a `late_item`,
+    /// ADR-370): once the response completes, the system missed a response that started in time.
+    pub start_in_time: Option<i64>,
+    /// The least classification an ambiguous item read during or after it gave it, with the
+    /// reason its reason then ends with: kept with the owed exchange too, so it stands after the
+    /// exchange leaves the window (ADR-370).
+    pub floor: Option<(Classification, String)>,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
     pub clears: Clears,
@@ -1485,6 +1493,84 @@ impl LinkState {
             .any(|owed| owed.rx_id == rx_id && owed.seq != seq)
     }
 
+    /// The kept exchanges an unbound transmit indication or loopback echo for request
+    /// identifier `tx_id` could belong to (design 8.11 `late_item`): those whose `sent` is still
+    /// `unknown`, by `seq`; and whether they are every exchange on the link that could, which
+    /// they are not when an exchange the log keeps nothing of ended with `sent` `unknown`.
+    pub(crate) fn late_transmit_owners(&self, tx_id: u32) -> (Vec<u64>, bool) {
+        let mut owners: Vec<u64> = self
+            .kept
+            .iter()
+            .filter(|(_, kept)| {
+                kept.sent == Sent::Unknown
+                    && matches!(kept.evidence.target, Target::Endpoint { tx_id: id, .. } if id == tx_id)
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        owners.sort_unstable();
+        let unknown_kept = self
+            .kept
+            .values()
+            .filter(|kept| kept.sent == Sent::Unknown)
+            .count();
+        (owners, self.unknown_sends as usize == unknown_kept)
+    }
+
+    /// The kept exchanges an unbound start-of-message indication for response identifier
+    /// `rx_id` could belong to (design 8.11 `late_item`): the owed requests that expect a
+    /// response on it, by `seq`; and whether the log keeps every one of them.
+    pub(crate) fn late_start_owners(&self, rx_id: u32) -> (Vec<u64>, bool) {
+        let owed: Vec<u64> = self
+            .owed
+            .iter()
+            .filter(|owed| owed.rx_id == rx_id)
+            .map(|owed| owed.seq)
+            .collect();
+        let kept: Vec<u64> = owed
+            .iter()
+            .copied()
+            .filter(|seq| self.kept.contains_key(seq))
+            .collect();
+        let all = kept.len() == owed.len();
+        (kept, all)
+    }
+
+    /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its
+    /// transmit done, and, for a start, the time its latest start came in time, if it did: an indication that confirms the send
+    /// can own a late transmit indication no more.
+    pub(crate) fn update_kept(
+        &mut self,
+        seq: u64,
+        evidence: Evidence,
+        sent: Sent,
+        transmit: super::timing::At,
+        start_in_time: Option<Option<i64>>,
+    ) {
+        let Some(kept) = self.kept.get_mut(&seq) else {
+            return;
+        };
+        let confirmed = kept.sent == Sent::Unknown && sent != Sent::Unknown;
+        kept.evidence = evidence;
+        kept.sent = sent;
+        kept.transmit = transmit;
+        if let Some(start_in_time) = start_in_time {
+            kept.start_in_time = start_in_time;
+        }
+        if confirmed {
+            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+        }
+    }
+
+    /// The floor exchange `seq` keeps whatever its history gives, with the reason its reason then
+    /// ends with: its window entry's, or, once it has left the window, the one kept with it.
+    pub(crate) fn floor_of(&self, seq: u64) -> Option<(Classification, String)> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .and_then(|logged| logged.floor.clone())
+            .or_else(|| self.kept.get(&seq).and_then(|kept| kept.floor.clone()))
+    }
+
     /// Drops what is kept of exchange `seq`, which nothing will settle.
     pub(crate) fn release_kept(&mut self, seq: u64) {
         self.kept.remove(&seq);
@@ -1643,6 +1729,9 @@ impl LinkState {
         if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
             logged.floor = Some((classification, reason.to_owned()));
         }
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.floor = Some((classification, reason.to_owned()));
+        }
     }
 
     /// Exchange `seq`'s standing classification is now `classification`, which a settling entry
@@ -1660,14 +1749,29 @@ impl LinkState {
         final_response: bool,
     ) {
         if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
-            logged.classification = classification;
-            logged.reason = reason.to_owned();
-            logged.evidence = evidence;
             if final_response {
                 logged.settled = true;
             } else {
                 logged.floor = Some((classification, String::new()));
             }
+        }
+        self.settled_from_evidence(seq, classification, reason, evidence);
+    }
+
+    /// [`LinkState::settled`] for a settling entry whose classification its evidence alone gives
+    /// (a `late_item`, ADR-370): it sets no floor, so a later item that refutes what it inferred
+    /// (a start after a timeout it judged early) can lower it; a floor already set stands.
+    pub(crate) fn settled_from_evidence(
+        &mut self,
+        seq: u64,
+        classification: Classification,
+        reason: &str,
+        evidence: Evidence,
+    ) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            logged.classification = classification;
+            logged.reason = reason.to_owned();
+            logged.evidence = evidence;
         }
         // What the entry added gives the exchange an answer, and owners from the owed requests
         // logged before it, as its history would have had them, so its answer is freed once
@@ -1701,6 +1805,7 @@ impl LinkState {
         }
         if let Some(kept) = self.kept.get_mut(&seq) {
             kept.classification = kept.classification.max(floor);
+            kept.floor = Some((floor, suffix.to_owned()));
         }
     }
 
@@ -2414,6 +2519,20 @@ pub(crate) fn settle_late_response(
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
     let base = classify(answered, history);
+    // A start of the response read late before the limit less the margin (ADR-370): the
+    // response started in time, so the system missed it.
+    // Only a response that spans frames has a start of its own: one that fits one frame came
+    // after a transfer the ECU aborted.
+    let spans_frames = answered
+        .end
+        .response()
+        .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
+    let window = match (window, kept.start_in_time.filter(|_| spans_frames)) {
+        (LateWindow::Late { .. } | LateWindow::Open, Some(at_us)) => {
+            return started_in_time(at_us);
+        }
+        (window, _) => window,
+    };
     let (classification, mut reason) = match window {
         LateWindow::InTime { at_us } => (
             System,
@@ -2462,6 +2581,18 @@ pub(crate) fn settle_late_response(
         return (System, reason);
     }
     (classification, reason)
+}
+
+/// What [`settle_late_response`] gives an exchange whose response a late start showed beginning
+/// `at_us` after the transmit, within the limit in force less the margin.
+fn started_in_time(at_us: i64) -> (Classification, String) {
+    (
+        Classification::System,
+        format!(
+            "The ECU's response started {:.1} ms after the transmit, within the limit in force less the margin, and was delivered after the exchange had ended: the system missed a response that started in time.",
+            at_us as f64 / 1000.0
+        ),
+    )
 }
 
 /// The classification and reason a `primitive_ended` gives the exchange it settles (design 8.11
@@ -2996,6 +3127,8 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
+            start_in_time: None,
+            floor: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
         };
@@ -4170,6 +4303,8 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
+            start_in_time: None,
+            floor: None,
             clears: Clears::default(),
             matched: false,
         };
@@ -4262,6 +4397,8 @@ mod tests {
                 pendings: Vec::new(),
                 limits: None,
                 start_unattached: false,
+                start_in_time: None,
+                floor: None,
                 clears: Clears::default(),
                 matched: false,
             },

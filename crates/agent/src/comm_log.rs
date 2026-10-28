@@ -432,10 +432,28 @@ impl UnattachedItem {
             LateIndication::Transmit(exchange::TransmitEvidence::Loopback)
         } else if flags & RX_FLAG_START_OF_MESSAGE != 0 {
             LateIndication::Start
+        } else if is_received(rx_flag) && self.pending_bytes().is_some() {
+            LateIndication::Pending
         } else {
             return None;
         };
         Some((kind, *identifier))
+    }
+
+    /// The bytes of this item when it is a received negative response with the response pending
+    /// code (`7F`, a service identifier, 0x78), which a worker forwards: a late item, not a late
+    /// response (design 8.11 `late_item`).
+    fn pending_bytes(&self) -> Option<&[u8]> {
+        match &self.data {
+            UnattachedData::Result { bytes, .. }
+                if bytes.len() >= 3
+                    && bytes[0] == exchange::SID_NEGATIVE
+                    && bytes[2] == exchange::NRC_PENDING =>
+            {
+                Some(bytes)
+            }
+            _ => None,
+        }
     }
 }
 
@@ -446,6 +464,8 @@ enum LateIndication {
     Transmit(exchange::TransmitEvidence),
     /// Its response began.
     Start,
+    /// The ECU answered with a pending, forwarded by the worker and bound to no primitive.
+    Pending,
 }
 
 /// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
@@ -1503,10 +1523,17 @@ impl CommLog {
             _ => None,
         };
         let in_flight_rx = awaits.then_some(evidence.rx_id);
+        let in_flight_expected = evidence.expected.clone();
         let in_flight = |item: &UnattachedItem, placed, kind, id| {
             let uses = match kind {
                 LateIndication::Transmit(_) => in_flight_tx == Some(id),
                 LateIndication::Start => in_flight_rx == Some(id),
+                LateIndication::Pending => {
+                    in_flight_rx == Some(id)
+                        && item
+                            .pending_bytes()
+                            .is_some_and(|bytes| in_flight_expected.pending(bytes))
+                }
             };
             uses && !before_starts(&own_starts, item.clock, placed)
         };
@@ -1516,7 +1543,8 @@ impl CommLog {
                 index += 1;
                 continue;
             };
-            let (owners, all) = late_indication_owners(&inner.links[at].1, kind, id);
+            let (owners, all) =
+                late_indication_owners(&inner.links[at].1, &unbound[index], kind, id);
             if in_flight(&unbound[index], unbound_placed[index], kind, id)
                 || !all
                 || owners.len() != 1
@@ -1801,12 +1829,14 @@ impl CommLog {
                 }
             }
             if let Some((kind, id)) = item.late_indication() {
-                let (owners, all) = late_indication_owners(&inner.links[at].1, kind, id);
+                let (owners, all) = late_indication_owners(&inner.links[at].1, item, kind, id);
                 let in_flight = in_flight(item, placed, kind, id);
                 if owners.len() + usize::from(in_flight) + usize::from(!all) >= 2 {
                     match kind {
                         LateIndication::Transmit(_) => may_own_transmit |= in_flight,
-                        LateIndication::Start => may_own_start |= in_flight,
+                        LateIndication::Start | LateIndication::Pending => {
+                            may_own_start |= in_flight
+                        }
                     }
                     if !owners.is_empty() {
                         inner.late_item_unowned(at, &owners, item, placed, unattached)?;
@@ -2519,12 +2549,16 @@ fn before_starts(
 /// whether they are every ended exchange on the link that could (design 8.11 `late_item`).
 fn late_indication_owners(
     state: &exchange::LinkState,
+    item: &UnattachedItem,
     kind: LateIndication,
     id: u32,
 ) -> (Vec<u64>, bool) {
     match kind {
         LateIndication::Transmit(_) => state.late_transmit_owners(id),
         LateIndication::Start => state.late_start_owners(id),
+        LateIndication::Pending => item.pending_bytes().map_or((Vec::new(), true), |bytes| {
+            state.late_pending_owners(id, bytes)
+        }),
     }
 }
 
@@ -2555,7 +2589,8 @@ fn late_response_owner(
     else {
         return None;
     };
-    if bytes.is_empty() || !is_received(rx_flag) {
+    // A pending is a late item (`late_item`), not a late response.
+    if bytes.is_empty() || !is_received(rx_flag) || item.pending_bytes().is_some() {
         return None;
     }
     let in_flight =
@@ -2777,13 +2812,33 @@ impl Inner {
                 }
                 "Its response began."
             }
+            LateIndication::Pending => {
+                // Its answer, placed as the exchange's other pendings are, read when the host
+                // read it.
+                let agent_us = item
+                    .read
+                    .filter(|read| read.epoch == evidence.times.agent.epoch)
+                    .map_or(evidence.times.agent.end_us, |read| read.monotonic_us);
+                evidence.pending.push(exchange::Pending {
+                    vci_us: Some(u64::from(item.vci_us)),
+                    clock: item.clock,
+                    agent_us,
+                    epoch: placed.map(|placed| placed.epoch),
+                    since_previous_ms: None,
+                });
+                "The ECU answered it with a pending."
+            }
         };
+        // The pendings the timing is judged with: a pending the item adds comes last.
+        let mut pendings = kept.pendings.clone();
+        if kind == LateIndication::Pending {
+            pendings.push(item.clock.zip(placed));
+        }
         // The timing judged again with what the item adds, as the exchange's entry would have
         // judged it: a timeout judged on no response having begun is refuted by a start, and a
         // transmit done places the response's times (design 8.11 "Settlement").
         let transmit = vci.tx_done.and_then(|time| time.placed()).or(kept.transmit);
-        let pending_placed: Vec<_> = kept
-            .pendings
+        let pending_placed: Vec<_> = pendings
             .iter()
             .map(|pending| pending.map(|(_, placed)| placed))
             .collect();
@@ -2796,7 +2851,7 @@ impl Inner {
                 evidence.absorbing(),
                 timing::Times {
                     transmit,
-                    pendings: &kept.pendings,
+                    pendings: &pendings,
                     start: vci.rx_start.and_then(|time| time.placed()),
                     end: vci.rx_end.and_then(|time| time.placed()),
                     end_len: evidence.end.response().map(<[u8]>::len),
@@ -2837,14 +2892,51 @@ impl Inner {
                 };
             }
         }
+        // A forwarded pending that came after the VCI ended the exchange is judged like a late
+        // response, against the limit in force before it, and the late-pending row does not
+        // apply to it; on a link whose VCI absorbs pendings it is not judged (design 8.11
+        // "Settlement" `late_item`, ADR-371).
+        let pending_window =
+            (kind == LateIndication::Pending).then(|| match (kept.limits, item.pending_bytes()) {
+                (Some(limits), Some(bytes)) if !kept.evidence.absorbing() => timing::judge_late(
+                    limits,
+                    false,
+                    transmit,
+                    &kept.pendings,
+                    item.clock.zip(placed),
+                    bytes.len(),
+                ),
+                _ => timing::LateWindow::Open,
+            });
         evidence.times.vci = Some(vci);
         let history = state.history_settling(&evidence, owner);
         let entry = exchange::ExchangeEntry::build(owner, evidence.clone(), history);
         let mut classification = entry.classification;
         let mut reason = entry.reason.clone();
+        match pending_window {
+            Some(timing::LateWindow::InTime { at_us }) => {
+                classification = exchange::Classification::System;
+                reason = format!(
+                    "The ECU answered with a pending {:.1} ms after the transmit, within the limit in force less the margin, and it reached the agent after the exchange had ended: the system missed an answer that came in time.",
+                    at_us as f64 / 1000.0
+                );
+            }
+            Some(timing::LateWindow::Late { by_us }) => {
+                classification = exchange::Classification::Vehicle;
+                reason = format!(
+                    "The ECU answered with a pending at least {:.1} ms after the limit in force plus the margin: the VCI ended its wait in time.",
+                    by_us as f64 / 1000.0
+                );
+            }
+            Some(timing::LateWindow::Open) => {
+                classification = exchange::Classification::Undetermined;
+                reason = "The ECU answered with a pending after the exchange had ended, and its time does not show whether it came within the limit in force.".to_owned();
+            }
+            None => {}
+        }
         let late_start = match kind {
             LateIndication::Start => Some(late_start),
-            LateIndication::Transmit(_) => None,
+            LateIndication::Transmit(_) | LateIndication::Pending => None,
         };
         // While the response does not complete, `undetermined` stands (design 8.11
         // "Settlement").
@@ -2877,6 +2969,9 @@ impl Inner {
         }
         state.settled_from_evidence(owner, classification, &reason, evidence.clone());
         state.update_kept(owner, evidence, entry.sent, transmit, late_start);
+        if kind == LateIndication::Pending {
+            state.add_kept_pending(owner, item.clock.zip(placed));
+        }
         let answer = entry.settled_answer(&kept);
         let (later, not_reclassified) = settle_later(state, owner, None, &answer);
         let top = later
@@ -7009,6 +7104,146 @@ mod tests {
             completed["exchanges"][0]["classification"], "vehicle",
             "{completed}"
         );
+    }
+
+    /// ADR-371: a forwarded pending bound to no primitive, read during a later exchange before
+    /// that exchange's own transmit done, is the late answer of the one owed exchange whose
+    /// negative pattern it carries. It is judged against that exchange's limit in force before
+    /// it: within the limit less the margin `system`, after the limit plus the margin
+    /// `vehicle`, otherwise `undetermined`, and on a link whose VCI absorbs pendings it is not
+    /// judged. The exchange stays owed, and the pending extends its limit for a later late
+    /// response.
+    #[test]
+    fn a_late_forwarded_pending_settles_its_ended_exchange() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |request: &[u8], at_us: u64, visibility| {
+            let mut evidence = evidence(endpoint(0x7E0), request, exchange::End::NoResponse);
+            evidence.pending_visibility = visibility;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence
+        };
+        let forwarded = exchange::PendingVisibility::Forwarded;
+        // A later exchange of another service, whose response carries its own transmit done.
+        let routine = |tx: Option<u64>| {
+            let mut evidence = silent(&[0x31, 0x01, 0x02, 0x03], 3_010_000, forwarded);
+            evidence.times.vci = tx.map(|us| exchange::VciTimes {
+                tx_done: Some(device(us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let received = |bytes: Vec<u8>, vci_us: u32, read_us| UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: read(read_us),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes,
+            },
+        };
+        let pending = |vci_us| received(vec![0x7F, 0x22, 0x78], vci_us, 3_010_500);
+        let run = |visibility, vci_us, more: Vec<(exchange::Evidence, Vec<UnattachedItem>)>| {
+            let mut exchanges = vec![
+                (
+                    silent(&[0x22, 0xF1, 0x90], 10_000, visibility),
+                    vec![transmit(10_000)],
+                ),
+                (routine(Some(3_010_000)), vec![pending(vci_us)]),
+            ];
+            exchanges.extend(more);
+            run_on_opened_link(exchanges)
+        };
+        for (visibility, vci_us, expected) in [
+            (forwarded, 500_000, "system"),
+            (forwarded, 1_500_000, "vehicle"),
+            (
+                exchange::PendingVisibility::AbsorbedByVci,
+                500_000,
+                "undetermined",
+            ),
+        ] {
+            let lines = run(visibility, vci_us, Vec::new());
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:?}");
+            let exchanges = of_event(&lines, "exchange");
+            let [late] = &of_event(&lines, "late_item")[..] else {
+                panic!("{lines:?}");
+            };
+            assert_eq!(late["refers_to"][0], exchanges[0]["seq"], "{late}");
+            assert_eq!(late["exchanges"][0]["classification"], expected, "{late}");
+        }
+        // The pending extends the limit: a response 3 s after it is within P2*, so the system
+        // missed a response that came in time.
+        let response = received(vec![0x62, 0xF1, 0x90, 0x41], 3_500_000, 6_010_500);
+        let lines = run(
+            forwarded,
+            500_000,
+            vec![(
+                silent(&[0x31, 0x01, 0x02, 0x04], 6_010_000, forwarded),
+                vec![response],
+            )],
+        );
+        let [completed] = &of_event(&lines, "late_response")[..] else {
+            panic!("{lines:?}");
+        };
+        assert!(
+            completed["exchanges"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("within the limit in force less the margin")),
+            "{completed}"
+        );
+        // Two owed reads it could belong to: neither is chosen, each is at least undetermined.
+        let lines = run_on_opened_link(vec![
+            (
+                silent(&[0x22, 0xF1, 0x90], 10_000, forwarded),
+                vec![transmit(10_000)],
+            ),
+            (
+                silent(&[0x22, 0xF1, 0x91], 1_510_000, forwarded),
+                vec![transmit(1_510_000)],
+            ),
+            (routine(Some(3_010_000)), vec![pending(2_000_000)]),
+        ]);
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:?}");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(
+            late["refers_to"].as_array().map(Vec::len),
+            Some(2),
+            "{late}"
+        );
+        // An exchange in flight that awaits the same pattern and has no transmit done of its
+        // own could own it too.
+        let lines = run_on_opened_link(vec![
+            (
+                silent(&[0x22, 0xF1, 0x90], 10_000, forwarded),
+                vec![transmit(10_000)],
+            ),
+            (
+                silent(&[0x22, 0xF1, 0x92], 3_010_000, forwarded),
+                vec![pending(500_000)],
+            ),
+        ]);
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:?}");
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges[1]["classification"], "undetermined", "{lines:?}");
     }
 
     /// ADR-370: a late transmit indication places the ended exchange's transmit, so its timing is

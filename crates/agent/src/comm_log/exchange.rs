@@ -32,7 +32,7 @@ const EVENT: &str = "exchange";
 
 const SID_SESSION_CONTROL: u8 = 0x10;
 const SID_ECU_RESET: u8 = 0x11;
-const SID_NEGATIVE: u8 = 0x7F;
+pub(crate) const SID_NEGATIVE: u8 = 0x7F;
 pub(crate) const NRC_PENDING: u8 = 0x78;
 
 /// Who sent the request (design 8.11, `origin`).
@@ -967,6 +967,13 @@ pub(crate) struct Expected {
 }
 
 impl Expected {
+    /// Whether `bytes` is a pending (NRC 0x78) carrying this negative pattern.
+    pub(crate) fn pending(&self, bytes: &[u8]) -> bool {
+        !self.negative_pattern.is_empty()
+            && bytes.starts_with(&self.negative_pattern)
+            && bytes.get(self.negative_pattern.len()) == Some(&NRC_PENDING)
+    }
+
     /// UDS's rule for `request`: the positive response's prefix as the worker is given it (the
     /// host's own rule: a data identifier or a sub-function echoed, without its suppress bit),
     /// and `7F` with the SID.
@@ -1547,6 +1554,34 @@ impl LinkState {
             .collect();
         let all = kept.len() == owed.len();
         (kept, all)
+    }
+
+    /// The kept exchanges a forwarded pending `pending` with response identifier `rx_id`, bound to
+    /// no primitive, could belong to (design 8.11 `late_item`): the owed requests that expect a
+    /// response on it whose negative pattern it carries, by `seq`; and whether the log keeps
+    /// every one of them.
+    pub(crate) fn late_pending_owners(&self, rx_id: u32, pending: &[u8]) -> (Vec<u64>, bool) {
+        let owed: Vec<u64> = self
+            .owed
+            .iter()
+            .filter(|owed| owed.rx_id == rx_id && owed.expected.pending(pending))
+            .map(|owed| owed.seq)
+            .collect();
+        let kept: Vec<u64> = owed
+            .iter()
+            .copied()
+            .filter(|seq| self.kept.contains_key(seq))
+            .collect();
+        let all = kept.len() == owed.len();
+        (kept, all)
+    }
+
+    /// Owed exchange `seq` got the pending at `at`, which a `late_item` gave it: the limit in
+    /// force for a later late response runs from it.
+    pub(crate) fn add_kept_pending(&mut self, seq: u64, at: super::timing::At) {
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.pendings.push(at);
+        }
     }
 
     /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its

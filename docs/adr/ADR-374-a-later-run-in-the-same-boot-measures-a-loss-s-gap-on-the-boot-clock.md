@@ -38,7 +38,9 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    two further reads of the agent's clock, and it keeps each growth of the offset with the agent
    time it was seen at. A read whose two agent readings lie further apart than the reads'
    jitter (50 µs: the thread was preempted between them) is taken again, at most three times,
-   or left out, so that a scheduling delay is not taken for a suspend. A time's boot time is its
+   so that a scheduling delay is not taken for a suspend. When every try is delayed, the log
+   marks the sample as missing: a time read from then to the next sample has no boot time, since
+   a suspend may have come since the last one. A time's boot time is its
    agent time plus the offset in force when it was read, so a suspend between the read and the
    time's placement, or before the loss is noted, does not skew it. A record without a device
    time, or written on a system without a boot clock, has no `boot`.

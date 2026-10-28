@@ -1313,11 +1313,15 @@ struct Inner {
     /// log has read on: the agent's time of the reading and the offset, one entry for each time
     /// the offset grew, as it does across a suspend (the agent's clock stops during one, the boot
     /// clock does not). A time's boot time is then taken with the offset when it was read, so
-    /// that a suspend afterwards does not skew it (ADR-374).
-    boot_offsets: Vec<(u64, u64)>,
+    /// that a suspend afterwards does not skew it (ADR-374). `None` marks a sample that could
+    /// not be taken: a time from then until the next sample has no boot time.
+    boot_offsets: Vec<(u64, Option<u64>)>,
     /// For tests: the boot clock reads this plus the agent's monotonic time.
     #[cfg(test)]
     boot_offset_us: Option<u64>,
+    /// For tests: this many tries of a boot clock sample come out delayed.
+    #[cfg(test)]
+    delayed_tries: usize,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -1404,7 +1408,7 @@ impl CommLog {
         // A log goes on after an earlier run once it holds a header; otherwise a header is
         // written after whatever the file holds, marked incomplete.
         let reopened = scan.header;
-        Self(Arc::new(Mutex::new(Inner {
+        let mut inner = Inner {
             sink,
             next_seq: scan.next_seq,
             failed: None,
@@ -1435,7 +1439,12 @@ impl CommLog {
             boot_offsets: Vec::new(),
             #[cfg(test)]
             boot_offset_us: None,
-        })))
+            #[cfg(test)]
+            delayed_tries: 0,
+        };
+        // The offset between the clocks when the agent's clock began.
+        inner.sample_boot_at(0);
+        Self(Arc::new(Mutex::new(inner)))
     }
 
     /// A log over `sink` that continues a file `scan` describes, for tests.
@@ -1452,7 +1461,15 @@ impl CommLog {
         inner.boot_id = boot.map(|(id, _)| id.to_owned());
         inner.boot_offset_us = boot.map(|(_, offset)| offset);
         inner.boot_offsets.clear();
-        inner.sample_boot();
+        // As though the boot clock had read so since the log began.
+        inner.sample_boot_at(0);
+    }
+
+    /// Makes the next `tries` tries of a boot clock sample come out delayed, as when the
+    /// thread is preempted between the reads.
+    #[cfg(test)]
+    fn delay_samples(&self, tries: usize) {
+        self.lock().delayed_tries = tries;
     }
 
     /// Makes the boot clock run on `us` past the agent's, as across a suspend of the machine.
@@ -1486,7 +1503,7 @@ impl CommLog {
                 // The log begins here: the header reads 0.
                 inner.origin = Instant::now();
                 inner.boot_offsets.clear();
-                inner.sample_boot();
+                inner.sample_boot_at(0);
                 let clock = AgentClock {
                     monotonic_us: 0,
                     ..inner.clock()
@@ -3882,9 +3899,8 @@ impl Inner {
             .boot_offsets
             .iter()
             .rev()
-            .find(|(at, _)| *at <= monotonic_us)
-            .or(self.boot_offsets.first())?;
-        monotonic_us.checked_add(*offset)
+            .find(|(at, _)| *at <= monotonic_us)?;
+        monotonic_us.checked_add((*offset)?)
     }
 
     /// Takes the offset between the boot clock and the agent's clock now.
@@ -3906,6 +3922,13 @@ impl Inner {
             let before = self.monotonic_us();
             let boot_us = self.boot_now_us(before);
             let after = self.monotonic_us();
+            #[cfg(test)]
+            let after = if self.delayed_tries > 0 {
+                self.delayed_tries -= 1;
+                after + JITTER_US + 1
+            } else {
+                after
+            };
             match boot_us {
                 None => Some(None),
                 Some(boot_us) => {
@@ -3913,12 +3936,22 @@ impl Inner {
                 }
             }
         });
-        let Some(Some(offset)) = offset else {
-            return;
-        };
         let last = self.boot_offsets.last().map(|(_, last)| *last);
-        if last.is_none_or(|last| offset > last + JITTER_US) {
-            self.boot_offsets.push((agent_now_us, offset));
+        match offset {
+            // No boot clock.
+            Some(None) => {}
+            Some(Some(offset)) => {
+                if last.is_none_or(|last| last.is_none_or(|last| offset > last + JITTER_US)) {
+                    self.boot_offsets.push((agent_now_us, Some(offset)));
+                }
+            }
+            // Every try was delayed: until the next sample, a time's offset is unknown, since a
+            // suspend may have come since the last one.
+            None => {
+                if last.is_none_or(|last| last.is_some()) {
+                    self.boot_offsets.push((agent_now_us, None));
+                }
+            }
         }
     }
 
@@ -9651,6 +9684,31 @@ mod tests {
         assert_eq!(
             log.round_trip_us(asked, answered),
             answered.monotonic_us - asked.monotonic_us
+        );
+    }
+
+    /// A sample that every try takes delayed is left out, and a time read then has no boot time:
+    /// a suspend may have come since the last sample, so neither neighbour's offset is its own.
+    #[test]
+    fn a_time_read_when_no_sample_could_be_taken_has_no_boot_time() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let before = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        log.delay_samples(3);
+        let during = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let after = log.now();
+        let mut inner = log.lock();
+        assert_eq!(inner.boot_at(during.monotonic_us), None);
+        assert_eq!(
+            inner.boot_at(before.monotonic_us),
+            Some(1_000_000 + before.monotonic_us)
+        );
+        assert_eq!(
+            inner.boot_at(after.monotonic_us),
+            Some(6_000_000 + after.monotonic_us)
         );
     }
 

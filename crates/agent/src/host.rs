@@ -587,7 +587,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         // The times of the errors the log takes afterwards go on their clocks first, in the order
         // they were read; the primitive's own go with its end when one is written.
         let end_due = stray.seq.is_some() && (ended.is_some() || progress.end_read().is_some());
-        self.place_late_errors(&progress, &bound_errors, end_due);
+        self.place_late_errors(&progress, &bound_errors, end_due, stray.seq);
         // Whether an end of it was written, which carries its own errors.
         let end_written = match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
@@ -653,7 +653,13 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// ([`late_errors`], with `end_due` whether the stray's end will carry its own), on their
     /// clocks in the order they were read, before the stray's end is written
     /// (`CommLog::place_job_end_reads`). The end's own times stay nearest their clock's latest.
-    fn place_late_errors(&self, progress: &Progress, bound_errors: &[Unbound], end_due: bool) {
+    fn place_late_errors(
+        &self,
+        progress: &Progress,
+        bound_errors: &[Unbound],
+        end_due: bool,
+        in_flight: Option<u64>,
+    ) {
         let Some(log) = &self.comm_log else {
             return;
         };
@@ -662,7 +668,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             return;
         }
         let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            log.place_job_end_reads(&items)
+            log.place_job_end_reads(&items, in_flight)
         }));
         if placed.is_err() {
             tracing::warn!("placing a job end's error times panicked");

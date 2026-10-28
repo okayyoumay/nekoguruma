@@ -1283,6 +1283,10 @@ struct Inner {
     /// (`CommLog::place_job_end_reads`), which `CommLog::late_link_errors` takes instead of
     /// placing the same times again on a clock that has run on since.
     job_end_placed: Vec<(UnattachedItem, Option<clocks::Placed>)>,
+    /// The times that started the stray primitive's exchange, taken before its
+    /// `primitive_ended` replaces its evidence's times with its end's: what a job end's error is
+    /// set against, as for the exchange in flight.
+    job_end_starts: Option<(u64, Vec<(exchange::Clock, clocks::Placed)>)>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -1397,6 +1401,7 @@ impl CommLog {
             unsettled: scan.unsettled,
             serial_number: None,
             job_end_placed: Vec::new(),
+            job_end_starts: None,
         })))
     }
 
@@ -2202,9 +2207,22 @@ impl CommLog {
     /// no read time of their own: a later time placed first would make an earlier one read before
     /// it look like a step back (design 8.11 `clock_epoch`, ADR-361). Writes the `clock_epoch`
     /// each opens. `None` once the log has failed.
-    pub(crate) fn place_job_end_reads(&self, items: &[UnattachedItem]) -> Option<()> {
+    pub(crate) fn place_job_end_reads(
+        &self,
+        items: &[UnattachedItem],
+        in_flight: Option<u64>,
+    ) -> Option<()> {
         let mut inner = self.lock();
         inner.job_end_placed.clear();
+        inner.job_end_starts = in_flight.map(|seq| {
+            let starts = inner
+                .links
+                .iter()
+                .find(|(_, state)| state.holds(seq))
+                .map(|(_, state)| state.starts_of(seq))
+                .unwrap_or_default();
+            (seq, starts)
+        });
         let mut read: Vec<(&UnattachedItem, AgentNow)> = items
             .iter()
             .filter_map(|item| Some((item, item.read?)))
@@ -2270,24 +2288,31 @@ impl CommLog {
             let since = inner.read_since(item, &reads);
             // Read while the primitive still ran, before its end was read: its exchange stands
             // in for the exchange in flight (design 8.11 "Link error").
-            let running = in_flight.and_then(|(seq, end_read)| {
-                let before_end = match (end_read, item.read) {
-                    (None, _) => true,
-                    (Some(end), Some(read)) => {
-                        read.epoch == end.epoch && read.monotonic_us < end.monotonic_us
-                    }
-                    (Some(_), None) => false,
-                };
-                before_end.then_some(seq)
-            });
+            // An error bound to the stray goes to it by `owner`, placed as it was.
+            let running = in_flight
+                .filter(|_| item.owner.is_none())
+                .and_then(|(seq, end_read)| {
+                    let before_end = match (end_read, item.read) {
+                        (None, _) => true,
+                        (Some(end), Some(read)) => {
+                            read.epoch == end.epoch && read.monotonic_us < end.monotonic_us
+                        }
+                        (Some(_), None) => false,
+                    };
+                    before_end.then_some(seq)
+                });
             let (placed, took) = match running {
                 Some(seq) => {
-                    let starts = inner
-                        .links
-                        .iter()
-                        .find(|(_, state)| state.holds(seq))
-                        .map(|(_, state)| state.starts_of(seq))
-                        .unwrap_or_default();
+                    // Its starts as they were before its end was written.
+                    let starts = match &inner.job_end_starts {
+                        Some((of, starts)) if *of == seq => starts.clone(),
+                        _ => inner
+                            .links
+                            .iter()
+                            .find(|(_, state)| state.holds(seq))
+                            .map(|(_, state)| state.starts_of(seq))
+                            .unwrap_or_default(),
+                    };
                     let on_its_clock = |placed: clocks::Placed| {
                         starts
                             .iter()
@@ -2317,6 +2342,7 @@ impl CommLog {
         }
         inner.note_reads(&reads);
         inner.job_end_placed.clear();
+        inner.job_end_starts = None;
         Some(())
     }
 
@@ -8138,7 +8164,7 @@ mod tests {
             };
             let errors = [error(1_000_000, 0), error(1_050_000, 50_000)];
             if placed_first {
-                log.place_job_end_reads(&errors).unwrap();
+                log.place_job_end_reads(&errors, Some(seq)).unwrap();
             }
             log.primitive_ended(
                 seq,
@@ -8258,6 +8284,27 @@ mod tests {
                 },
             };
             let end_read = end_after.map(|after| at(2_100_000 + after));
+            // As the host does: the error's time first, then the stray's end (a receive
+            // timeout, which carries no start of its own), then the late item.
+            log.place_job_end_reads(std::slice::from_ref(&error), Some(second))
+                .unwrap();
+            log.primitive_ended(
+                second,
+                PrimitiveEnded {
+                    tx_indication: None,
+                    end: Some(exchange::End::NoResponse),
+                    detail: exchange::Detail::default(),
+                    pending: Vec::new(),
+                    vci: exchange::VciTimes {
+                        rx_timeout: Some(device(3_100_000)),
+                        ..exchange::VciTimes::default()
+                    },
+                    vci_ended: true,
+                    link_errors: Vec::new(),
+                    indications: Vec::new(),
+                },
+            )
+            .unwrap();
             log.late_link_errors(&[error], &[], Some((second, end_read)))
                 .unwrap();
             log.end("ok");

@@ -535,14 +535,22 @@ impl<C: WorkerApi> WorkerHost<C> {
                                                     Some(event_item::Data::ErrorData(_))
                                                 ))
                                 );
-                                if !(lost || ours) {
-                                    continue;
-                                }
+                                // Every item of the link read stands for the link errors
+                                // read after it, whether or not it is the primitive's
+                                // (ADR-372 item 4).
                                 let read = log
                                     .as_ref()
                                     .filter(|log| log.is_open())
                                     .map(|log| log.now());
-                                reads.extend(read.map(|read| (LOG_LINK, read)));
+                                if matches!(
+                                    &notification.event_data,
+                                    Some(event_notification::EventData::Item(_))
+                                ) {
+                                    reads.extend(read.map(|read| (LOG_LINK, read)));
+                                }
+                                if !(lost || ours) {
+                                    continue;
+                                }
                                 if let Some(event_notification::EventData::Item(item)) =
                                     &notification.event_data
                                     && item.cop_handle == Some(cop)

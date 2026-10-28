@@ -31,9 +31,10 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    for a loss and its settlement, so an exchange's times cost nothing more.
 
 2. **The record.** The first `vci_loss` record of a loss keeps `boot`: the boot id and the time
-   on the boot clock at which the device clock's last time was read. That time is derived when
-   the record is first written, from the boot clock then and the agent time elapsed since the
-   read, so a suspend after the loss does not skew it. A record without a device time, or
+   on the boot clock at which the device clock's last time was read. That time is taken when the
+   log places the device time, from the boot clock then and the agent time elapsed since the
+   read, so a suspend between the read and the loss does not skew it: the agent's monotonic
+   clock stops during a suspend, the boot clock does not. A record without a device time, or
    written on a system without a boot clock, has no `boot`.
 
 3. **The gap.** The settlement measures the gap on the boot clock when the record's boot id is
@@ -41,7 +42,8 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    when both reads lie in one agent epoch; otherwise not at all. The reading's boot time is
    derived the same way as the record's. `vci_loss_settled` records which clock measured the
    gap (`gap_from`, `boot` or `agent`), the gap (`gap_us`, which replaces `agent_gap_us`),
-   whether the boots match (`boot_match`, `null` when either side has no boot id), and each
+   whether the boots match (`boot_match`, `null` when the record has no `boot` or the
+   reconnecting run has no boot id), and each
    read's boot time (`boot_us`), so a reader can redo it. A different boot leaves the loss
    `undetermined`, as a gap across agent epochs did.
 
@@ -61,5 +63,8 @@ come from the same boot of the machine, since such a clock starts over at a rebo
   work. So is allowing for the read delay of the clock's last time before the loss (its read
   time is when the host read its largest raw time, which a batch read can delay), which the
   tolerance does not yet take in.
+- The comparison assumes both runs see one boot clock. On Linux a time namespace (a container
+  restored onto another host's boot, for example) can offset `CLOCK_BOOTTIME` while the boot id
+  stays the host's, and the comparison does not hold there.
 - The boot id is a random identifier of one boot of the machine. It names no person and no
   vehicle, and it lives in the job's own log beside the times it relates.

@@ -1309,6 +1309,10 @@ struct Inner {
     serial_number: Option<u32>,
     /// The machine's boot, when the system identifies it, which a loss's settlement compares.
     boot_id: Option<String>,
+    /// When the device clock's latest time was read, on the agent's clock and on the boot
+    /// clock, the boot time taken as the time was placed, so that a suspend before a loss is
+    /// noted does not skew it (ADR-374).
+    device_read_boot: Option<(u64, u64)>,
     /// For tests: the boot clock reads this plus the agent's monotonic time.
     #[cfg(test)]
     boot_offset_us: Option<u64>,
@@ -1426,6 +1430,7 @@ impl CommLog {
             unsettled: scan.unsettled,
             serial_number: None,
             boot_id: boot::id(),
+            device_read_boot: None,
             #[cfg(test)]
             boot_offset_us: None,
         })))
@@ -3651,16 +3656,17 @@ impl Inner {
                 boot: None,
             },
         };
-        // Taken at the loss, close to the read, so that a suspend afterwards does not skew it.
+        // The boot time taken when the device clock's last time was placed.
         if fresh {
             loss.boot = loss
                 .clocks
                 .iter()
                 .find(|last| last.clock == exchange::Clock::Device)
                 .and_then(|last| {
-                    Some(LossBoot {
+                    let (read_us, boot_us) = self.device_read_boot?;
+                    (read_us == last.time.read_us).then_some(LossBoot {
                         id: self.boot_id.clone()?,
-                        us: self.boot_at(last.time.read_us)?,
+                        us: boot_us,
                     })
                 });
         }
@@ -3895,6 +3901,16 @@ impl Inner {
         let (placed, opened) =
             self.clocks
                 .read(clock, raw, read.monotonic_us, read.epoch, tolerance);
+        if clock == exchange::Clock::Device
+            && self
+                .clocks
+                .last(clock)
+                .is_some_and(|last| last.us == raw && last.read_us == read.monotonic_us)
+        {
+            self.device_read_boot = self
+                .boot_at(read.monotonic_us)
+                .map(|boot_us| (read.monotonic_us, boot_us));
+        }
         if let Some(opened) = opened {
             self.append_with(|seq, line| {
                 serde_json::to_writer(
@@ -9299,6 +9315,9 @@ mod tests {
             ..exchange::VciTimes::default()
         });
         log.exchange_with(answered, Vec::new()).unwrap();
+        // The machine suspends before the loss is noted: the boot clock runs on, the agent's
+        // does not, and the record keeps the boot time taken when the last time was placed.
+        log.boot_as(Some(("boot-1", 9_000_000_000)));
         let lost = |refused_after_loss| {
             evidence(
                 endpoint(0x7E0),
@@ -9533,6 +9552,59 @@ mod tests {
         let entry = settle(77, dpdu_facts(), None);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert!(entry["clock"]["reading"].is_null());
+    }
+
+    /// On Linux the log takes the real boot id and boot clock: a run that reconnects in the
+    /// same boot measures the gap on the boot clock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_later_run_on_linux_measures_the_gap_on_the_real_boot_clock() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&dpdu_facts(), RunKind::First);
+        log.vci_connected(Some(&serial(77)), None).unwrap();
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+        );
+        answered.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(1_835_511_040)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange_with(answered, Vec::new()).unwrap();
+        log.exchange_with(
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::VciLost {
+                    refused_after_loss: false,
+                },
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        log.end("Host");
+        drop(log);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&dpdu_facts(), RunKind::Resume);
+        let reading = ConnectReading {
+            time: device(1_835_511_040),
+            read: log.now(),
+            round_trip_us: 0,
+        };
+        log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
+        log.end("ok");
+        drop(log);
+        let lines = lines(&setup);
+        let settled = &of_event(&lines, "vci_loss_settled")[0];
+        let clock = &settled["clock"];
+        assert_eq!(clock["boot_match"], true, "{settled}");
+        assert_eq!(clock["gap_from"], "boot", "{settled}");
+        assert!(clock["gap_us"].as_u64().unwrap() < 60_000_000, "{settled}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// A later run in the same boot measures the gap on the boot clock, across agent epochs

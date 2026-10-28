@@ -2812,13 +2812,12 @@ impl Inner {
                 && matches!(evidence.end, exchange::End::ResponseIncomplete)
                 && let Some(start) = vci.rx_start
             {
-                late_start = match timing::judge_late(
+                late_start = match timing::judge_late_start(
                     limits,
                     evidence.absorbing(),
                     transmit,
                     &kept.pendings,
                     start.placed(),
-                    0,
                 ) {
                     timing::LateWindow::InTime { at_us } => {
                         Some(exchange::LateStart::InTime { at_us })

@@ -32,6 +32,17 @@ The maintainer decided (2026-10-28):
 - each possible owner of an ambiguous indication is raised to at least `undetermined`;
 - a new ADR records it.
 
+A pre-review pass then showed two consequences of the first reading, and the maintainer decided
+again (2026-10-28):
+
+- only the exchange in flight's own transmit done bounds it, since a response item can carry a
+  start with no transmit done, and the exchange's own transmit indication comes before that
+  start;
+- the exchange in flight is raised only when the indication could change it. On J2534 a
+  transmit indication has no primitive and the exchange in flight usually has no transmit done
+  of its own, so otherwise one exchange ending with its send unknown would lower every later
+  exchange on the link.
+
 ## Decision
 
 1. **Which items.** An unbound transmit indication or loopback echo, by its request identifier,
@@ -40,11 +51,11 @@ The maintainer decided (2026-10-28):
    `primitive_ended`, and items after its end stay `unattached`. An indication with no identifier
    names no exchange.
 2. **In flight.** X was in flight with the identifier unless the item's VCI time comes before
-   X's earliest own VCI time, on one clock and epoch. X's own times are its transmit done or the
-   start of its response, bound to its primitive or carried by its response. Its unbound
-   indications are not counted: they are what is being attributed. An item at or after that
-   time, or one that cannot be set against it, may be X's. A refused X awaits nothing and uses no
-   identifier.
+   X's own transmit done, on one clock and epoch. That transmit done is bound to X's primitive or
+   carried by its response. Nothing X sent or received comes before it: neither the start of
+   X's response nor X's own transmit indication. X's unbound indications are not counted, since
+   they are what is being attributed. An item at or after that time, or one that cannot be set
+   against it, may be X's. A refused X awaits nothing and uses no identifier.
 3. **Possible owners.** For a transmit indication or loopback echo, the kept exchanges on the
    link with that request identifier whose `sent` is still `unknown`. For a start-of-message
    indication, the owed requests that await a response on that identifier. The owners are
@@ -61,9 +72,14 @@ The maintainer decided (2026-10-28):
      (`Kept::start_in_time`), and E is at least `undetermined` until the response completes. A
      late response that completes it is `system`, since the system missed a response that
      started in time.
-   - E is classified again from its new evidence. The floor an ambiguous item set stands, and so
-     does a fault of the system its own entry observed. E stays owed, since an indication is no
-     final response.
+   - E's timing is judged again with what the item adds, as its own entry would have judged it:
+     a transmit done places its times (and is kept for a later late response), and a start
+     refutes a timeout judged on no response having begun. E is classified again from its new
+     evidence; the floor an ambiguous item set stands. A `system` E's own entry gave rested on
+     its timing, so it is judged again too. E stays owed, since an indication is no final
+     response.
+   - A start in time makes a later late response `system` only when that response spans frames:
+     one that fits one frame came after a transfer the ECU aborted.
    - The start counts as an answer for the later exchanges (`reclassify_after`), but not as a
      matched answer (ADR-354).
    - The entry gives the item as `unattached` gives it, with E's `sent`, `sent_evidence` and
@@ -71,8 +87,12 @@ The maintainer decided (2026-10-28):
      as ADR-368 does.
 5. **Two or more possible owners.** Ended owners, X, or an exchange the log keeps nothing of. The
    item stays `unattached`. A `late_item` names that line in `unattached` and raises each kept
-   owner to at least `undetermined` as a floor, and those exchanges stay owed. X, when it is one
-   of the owners, is at least `undetermined` in its own entry, with that floor in the window.
+   owner to at least `undetermined` as a floor, and those exchanges stay owed. An owner already
+   raised for an ambiguous item, and no lower now, is not named again, and no line is written
+   when none is left. X, when it is one of the owners, is at least `undetermined` in its own
+   entry, with that floor in the window, but only when the item could change X: a transmit
+   indication or loopback echo while X's `sent` stays `unknown`, a start while X has no answer
+   of its own. Both reasons are kept when X may also own an ambiguous response.
 
 ## Consequences
 
@@ -80,7 +100,11 @@ The maintainer decided (2026-10-28):
 - On J2534 a transmit indication is unbound, and an exchange's transmit done often comes only
   from that indication. Such an exchange has no own time to set an earlier indication against,
   so an earlier exchange's late indication read during it stays ambiguous.
-- An exchange in flight now gets the `undetermined` floor for an ambiguous indication, as it
-  already did for an ambiguous response.
+- An exchange in flight gets the `undetermined` floor for an ambiguous indication only when the
+  indication could change it, as item 5 says.
+- A late start after the limit plus the margin is not recorded yet, so a response that later
+  completes it is judged on its own time; it is an open item.
+- The `late_item` lines come before the exchange's other items, so the log's lines are not in
+  the order the host read the items.
 - An indication read at job end keeps the ADR-366 path, which gives it only to the stray
   primitive's exchange.

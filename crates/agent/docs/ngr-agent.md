@@ -492,13 +492,16 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   could own it (one whose `sent` is still `unknown`, or an owed request awaiting a response on
   that identifier) owns, and not the exchange in flight, is a `late_item` settling entry
   (ADR-370): the exchange in flight was not yet in flight with the identifier when the item's
-  VCI time comes before its own earliest VCI time (`before_starts`). It restates that
-  exchange's `sent` and outcome and reclassifies it and the later exchanges
-  (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept
-  (`Kept::start_in_time`), so a late response completing it is `system`. One that two
-  exchanges could own stays `unattached`, followed by a `late_item` that raises each owed one to
-  at least `undetermined`, and the exchange in flight that could own it is at least
-  `undetermined` too. The others are
+  VCI time comes before its own transmit done (`before_starts`). It is written before the
+  exchange's own items, and restates that
+  exchange's `sent` and outcome, judges its timing again, and reclassifies it and the later
+  exchanges (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept
+  (`Kept::start_in_time`), so a late response that completes it, spanning frames, is `system`.
+  One that two exchanges could own stays `unattached`, followed by a `late_item` that raises each
+  owed one to at least `undetermined` (once: an owed one already raised is not named again), and
+  the exchange in flight that could own it is at least `undetermined` too when the item could
+  change it: a transmit indication while its send stays unknown, a start while it has no answer
+  of its own. The others are
   `unattached` events, written in
   the order read and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header

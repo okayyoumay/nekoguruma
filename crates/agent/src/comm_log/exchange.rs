@@ -1531,14 +1531,15 @@ impl LinkState {
         (kept, all)
     }
 
-    /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, and
-    /// the time its response started in time, if it did: an indication that confirms the send
+    /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its
+    /// transmit done, and the time its response started in time, if it did: an indication that confirms the send
     /// can own a late transmit indication no more.
     pub(crate) fn update_kept(
         &mut self,
         seq: u64,
         evidence: Evidence,
         sent: Sent,
+        transmit: super::timing::At,
         start_in_time: Option<i64>,
     ) {
         let Some(kept) = self.kept.get_mut(&seq) else {
@@ -1547,6 +1548,7 @@ impl LinkState {
         let confirmed = kept.sent == Sent::Unknown && sent != Sent::Unknown;
         kept.evidence = evidence;
         kept.sent = sent;
+        kept.transmit = transmit;
         if start_in_time.is_some() {
             kept.start_in_time = start_in_time;
         }
@@ -2495,7 +2497,13 @@ pub(crate) fn settle_late_response(
     let base = classify(answered, history);
     // A start of the response read late before the limit less the margin (ADR-370): the
     // response started in time, so the system missed it.
-    let window = match (window, kept.start_in_time) {
+    // Only a response that spans frames has a start of its own: one that fits one frame came
+    // after a transfer the ECU aborted.
+    let spans_frames = answered
+        .end
+        .response()
+        .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
+    let window = match (window, kept.start_in_time.filter(|_| spans_frames)) {
         (LateWindow::Late { .. } | LateWindow::Open, Some(at_us)) => {
             return started_in_time(at_us);
         }

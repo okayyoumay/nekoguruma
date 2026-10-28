@@ -14395,6 +14395,9 @@ def main():
         /// A receive error with VCI time 20 ms and extra error information, and the finished
         /// status 150 ms after it.
         FailThenFinishLater,
+        /// The receive error of [`StartEvent::FailThenFinishLater`], and no finished status: the
+        /// primitive runs until the agent cancels it.
+        FailNeverFinish,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14697,7 +14700,7 @@ def main():
                             ..Default::default()
                         }));
                     }
-                    if let StartEvent::FailThenFinishLater = event
+                    if let StartEvent::FailThenFinishLater | StartEvent::FailNeverFinish = event
                         && let Some(sender) = &sender
                     {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14718,6 +14721,9 @@ def main():
                             ..Default::default()
                         }));
                     }
+                    if let StartEvent::FailNeverFinish = event {
+                        return;
+                    }
                     if let StartEvent::TimeOutThenFinishLater = event {
                         tokio::time::sleep(Duration::from_secs(1)).await;
                     }
@@ -14728,6 +14734,7 @@ def main():
                     }
                     let data = match event {
                         StartEvent::Finish
+                        | StartEvent::FailNeverFinish
                         | StartEvent::Respond
                         | StartEvent::RespondThenFinishLater
                         | StartEvent::TimeOut
@@ -15198,6 +15205,105 @@ def main():
             assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// Runs `requests` reads (`send_recv` each) on a fake worker whose primitives each give a
+    /// bound receive error `after` their start and never finish, then settles the job's end
+    /// with a wait of `wait`; returns the log's lines.
+    async fn bound_errors_run(
+        requests: usize,
+        send_recv: Duration,
+        after: Duration,
+        wait: Duration,
+    ) -> Vec<serde_json::Value> {
+        let dir = journal_dir("stray-bound-error");
+        let (mut client, _fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((after, StartEvent::FailNeverFinish)),
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv,
+        };
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(wait);
+            for _ in 0..requests {
+                let result = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            }
+            host.settle_at_end();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// Asserts that `lines` hold a `late_item` that gives the error of the exchange logged first
+    /// to that exchange, as the error of its own primitive (ADR-372).
+    fn assert_bound_to_first(lines: &[serde_json::Value]) {
+        let first = &lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .expect("an exchange entry")["seq"];
+        let late = lines
+            .iter()
+            .find(|line| line["event"] == "late_item")
+            .unwrap_or_else(|| panic!("a late_item in {lines:#?}"));
+        assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+        assert_eq!(late["primitive"], "earlier", "{late}");
+        assert_eq!(late["error_event"], "PDU_ERR_EVT_RX_ERROR", "{late}");
+        // A fault seen in the exchange on its own link, though its time is on no clock.
+        assert!(
+            late["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("A link error also came during the exchange"),
+            "{late}"
+        );
+        assert!(
+            late["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("primitive of the exchange logged as {first}")),
+            "{late}"
+        );
+    }
+
+    /// ADR-372: an error bound to the primitive the host cancelled before the next request,
+    /// read during that request's wait after the cancel and with no end of the primitive, goes to
+    /// that primitive's exchange whatever its time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_primitive_s_error_read_during_the_next_request_is_its_exchange_s() {
+        // The first primitive's error comes at 450 ms, during the second request's wait (from
+        // 300 to 600 ms and more); the job end's wait for the second is too short to read its
+        // own.
+        let lines = bound_errors_run(
+            2,
+            Duration::from_millis(300),
+            Duration::from_millis(450),
+            Duration::from_millis(50),
+        )
+        .await;
+        let ended = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .expect("the first primitive's end");
+        assert_eq!(ended["cancelled_by_agent"], true, "{ended}");
+        assert_bound_to_first(&lines);
     }
 
     /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): a primitive past the agent's

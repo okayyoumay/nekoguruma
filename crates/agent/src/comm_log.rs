@@ -335,6 +335,11 @@ pub(crate) struct UnattachedItem {
     pub link: u32,
     /// Whether it named an earlier primitive; `false` for an item of no primitive.
     pub earlier_primitive: bool,
+    /// The `seq` of the exchange whose primitive it is bound to, when the host knows it: the
+    /// stray primitive it tracks (design 8.11 "Settlement"). A link error of such an item goes
+    /// to that exchange, whatever its time, while the log holds it (in the window or kept);
+    /// otherwise it is placed by its time (ADR-372).
+    pub owner: Option<u64>,
     /// The item's VCI time, raw (`EventItem.timestamp`).
     pub vci_us: u32,
     /// The clock the worker says `vci_us` is on (`EventItem.timestamp_clock`, ADR-353); `None`
@@ -3359,6 +3364,10 @@ impl Inner {
     /// `since`, the agent epoch and time the link's items were last read before it, and ends the
     /// matched answers from before the first of them.
     ///
+    /// One bound to a primitive whose exchange the host names (`item.owner`) goes to that
+    /// exchange, on the link state that holds it, as a fault seen in it on its own link, whatever
+    /// its time; the other targets take it as any late link error.
+    ///
     /// Gives whether it wrote a line: one that cannot be placed and that no exchange could have
     /// come during writes none.
     fn late_link_error(
@@ -3383,10 +3392,17 @@ impl Inner {
                 .iter()
                 .any(|(_, state)| state.place_error(*at) != exchange::ErrorPoint::NotPlaced)
         });
+        let owner = item
+            .owner
+            .filter(|owner| self.links.iter().any(|(_, state)| state.holds(*owner)));
         let points: Vec<(Vec<u64>, Option<u64>)> = self
             .links
             .iter()
             .map(|(_, state)| match at.map(|at| state.place_error(at)) {
+                _ if owner.is_some_and(|owner| state.holds(owner)) => {
+                    let owner = owner.unwrap_or_default();
+                    (vec![owner], Some(owner))
+                }
                 Some(exchange::ErrorPoint::Within(seq)) => (vec![seq], Some(seq)),
                 Some(exchange::ErrorPoint::After(seq)) => (Vec::new(), Some(seq)),
                 Some(exchange::ErrorPoint::BeforeWindow { within }) => {
@@ -3410,8 +3426,9 @@ impl Inner {
             return Some(false);
         }
         for ((_, state), (owners, after)) in self.links.iter_mut().zip(points) {
-            for owner in owners {
-                during.extend(state.error_in(owner, kind, item.link, at.is_some()));
+            for during_seq in owners {
+                let own = owner == Some(during_seq);
+                during.extend(state.error_in(during_seq, kind, item.link, at.is_some() || own));
             }
             let (changed, through) = state.error_after(after, written, kind);
             later.extend(changed);
@@ -3446,6 +3463,10 @@ impl Inner {
             .map(|(owner, _)| owner.seq.to_string())
             .collect();
         text.push_str(&match (at, owned.as_slice()) {
+            _ if owner.is_some() => format!(
+                "A link error of the primitive of the exchange logged as {} was read after that exchange's entry; it is that exchange's own, and the other targets take it as any late link error.",
+                owner.unwrap_or_default()
+            ),
             (Some(_), []) => {
                 "A link error was read after the exchanges before it had ended; its time falls between exchanges, so it ends the matched answers from before it.".to_owned()
             }
@@ -4264,6 +4285,7 @@ mod tests {
         let result = |earlier_primitive, rx_flag: &[u8], bytes: &[u8]| UnattachedItem {
             link: 1,
             earlier_primitive,
+            owner: None,
             vci_us: 42,
             // The worker's clock where a J2534 library's would be the device's: the log takes
             // it from the item.
@@ -4285,6 +4307,7 @@ mod tests {
             UnattachedItem {
                 link: 1,
                 earlier_primitive: true,
+                owner: None,
                 vci_us: 43,
                 clock: None,
                 read: None,
@@ -4415,6 +4438,7 @@ mod tests {
         log.unattached(&UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us: 7,
             clock: None,
             read: None,
@@ -5008,6 +5032,7 @@ mod tests {
         UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us: 5,
             clock: Some(exchange::Clock::Device),
             read: None,
@@ -5045,6 +5070,7 @@ mod tests {
         // unattached; this exchange's own confirms it, at the time the host read it.
         let earlier = UnattachedItem {
             earlier_primitive: true,
+            owner: None,
             ..tx_done(0x7E0)
         };
         let own = UnattachedItem {
@@ -5957,6 +5983,7 @@ mod tests {
         let response = |bytes: &[u8], vci_us: u64| UnattachedItem {
             link: 1,
             earlier_primitive: true,
+            owner: None,
             vci_us: u32::try_from(vci_us).unwrap(),
             clock: Some(exchange::Clock::Device),
             read: read(vci_us + 100),
@@ -6194,6 +6221,7 @@ mod tests {
             let error = UnattachedItem {
                 link: 1,
                 earlier_primitive: false,
+                owner: None,
                 vci_us: u32::try_from(error_us).unwrap(),
                 clock: Some(exchange::Clock::Device),
                 read: read(read_us),
@@ -6359,6 +6387,7 @@ mod tests {
         let error = |vci_us: u32, clock| UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us,
             clock,
             read: read(4_000_500),
@@ -6372,6 +6401,7 @@ mod tests {
         let response = UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us: 5_000_000,
             clock: Some(exchange::Clock::Device),
             read: read(5_000_500),
@@ -6435,6 +6465,36 @@ mod tests {
             "{late}"
         );
         assert_eq!(of_event(&lines, "late_response").len(), 1, "{lines:?}");
+        // The same time, bound to the answered read's primitive, which the host names: the
+        // answered read's own fault whatever its time, and the silent read after it loses its
+        // matched answer.
+        let bound = UnattachedItem {
+            earlier_primitive: true,
+            owner: first.as_u64(),
+            ..error(1_500_000, Some(exchange::Clock::Device))
+        };
+        let lines = run(Some(bound));
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(
+            late["refers_to"],
+            serde_json::json!([first, second]),
+            "{late}"
+        );
+        assert_eq!(late["exchanges"][0]["seq"], *first, "{late}");
+        assert_eq!(
+            late["exchanges"][0]["classification"], "undetermined",
+            "{late}"
+        );
+        assert_eq!(late["primitive"], "earlier", "{late}");
+        assert!(
+            late["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("primitive of the exchange logged as {first}")),
+            "{late}"
+        );
         // On no clock: the exchange during which it is read takes it, and the silent read,
         // written since the link's items were last read (its transmit indication), may have
         // seen it; the answered read, written before that read, is not named.
@@ -6495,6 +6555,7 @@ mod tests {
         let error_of = |kind, clock, read_us| UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us: 7,
             clock,
             read: read(read_us),
@@ -6626,6 +6687,7 @@ mod tests {
             vec![UnattachedItem {
                 link: 1,
                 earlier_primitive: false,
+                owner: None,
                 vci_us: 1_999_500,
                 clock: Some(exchange::Clock::Device),
                 read: read(7_000_500),
@@ -6734,6 +6796,7 @@ mod tests {
             let late = UnattachedItem {
                 link: 1,
                 earlier_primitive: true,
+                owner: None,
                 vci_us: 2_500_000,
                 clock: Some(exchange::Clock::Device),
                 read: read(6_010_500),
@@ -6860,6 +6923,7 @@ mod tests {
         let late = UnattachedItem {
             link: 1,
             earlier_primitive: true,
+            owner: None,
             vci_us: 500_000,
             clock: Some(exchange::Clock::Device),
             read: read(6_010_500),
@@ -7673,6 +7737,7 @@ mod tests {
         // indication stay unattached; the one for the response identifier attaches.
         let earlier = UnattachedItem {
             earlier_primitive: true,
+            owner: None,
             ..start_of_message(0x7E8)
         };
         log.exchange_with(
@@ -7940,6 +8005,7 @@ mod tests {
         let response = |bytes: Vec<u8>| UnattachedItem {
             link: 1,
             earlier_primitive: true,
+            owner: None,
             vci_us: 6_000_000,
             clock: Some(exchange::Clock::Device),
             read: read(6_010_500),
@@ -8071,6 +8137,7 @@ mod tests {
         let response = UnattachedItem {
             link: 1,
             earlier_primitive: true,
+            owner: None,
             vci_us: 6_000_000,
             clock: Some(exchange::Clock::Device),
             read: read(6_010_500),
@@ -8191,6 +8258,7 @@ mod tests {
         let received = |bytes: Vec<u8>, vci_us: u32, read_us| UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us,
             clock: Some(exchange::Clock::Device),
             read: read(read_us),
@@ -8393,6 +8461,7 @@ mod tests {
         let received = |bytes: Vec<u8>, vci_us: u32, read_us| UnattachedItem {
             link: 1,
             earlier_primitive: false,
+            owner: None,
             vci_us,
             clock: Some(exchange::Clock::Device),
             read: read(read_us),

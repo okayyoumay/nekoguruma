@@ -193,6 +193,7 @@ enum Event<'a> {
     Identity(Identity),
     Unattached(UnattachedEntry<'a>),
     LateResponse(LateResponseEntry<'a>),
+    LateItem(LateItemEntry<'a>),
     PrimitiveEnded(Box<PrimitiveEndedEntry>),
     ClockEpoch(clocks::ClockEpoch),
 }
@@ -407,6 +408,46 @@ impl UnattachedItem {
     }
 }
 
+impl UnattachedItem {
+    /// The late indication this is (design 8.11 `late_item`, ADR-370), with the identifier it
+    /// carries: an unbound transmit indication or loopback echo, by its request identifier, or
+    /// an unbound start-of-message indication, by its response identifier. One bound to an
+    /// earlier primitive is that primitive's (ADR-367), and one with no identifier names no
+    /// exchange.
+    fn late_indication(&self) -> Option<(LateIndication, u32)> {
+        let UnattachedData::Result {
+            rx_flag,
+            identifier: Some(identifier),
+            ..
+        } = &self.data
+        else {
+            return None;
+        };
+        let flags = *rx_flag.get(3)?;
+        let kind = if self.earlier_primitive {
+            return None;
+        } else if flags & RX_FLAG_TX_INDICATION != 0 {
+            LateIndication::Transmit(exchange::TransmitEvidence::TxIndication)
+        } else if flags & RX_FLAG_TX_MSG_TYPE != 0 {
+            LateIndication::Transmit(exchange::TransmitEvidence::Loopback)
+        } else if flags & RX_FLAG_START_OF_MESSAGE != 0 {
+            LateIndication::Start
+        } else {
+            return None;
+        };
+        Some((kind, *identifier))
+    }
+}
+
+/// What a late indication shows of the exchange it settles (design 8.11 `late_item`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum LateIndication {
+    /// Its request went out, as this evidence shows.
+    Transmit(exchange::TransmitEvidence),
+    /// Its response began.
+    Start,
+}
+
 /// RxFlag byte 3's bits (ISO 22900-2:2022 D.2.2, Table D.5), which say what a result item is.
 pub(crate) const RX_FLAG_TX_MSG_TYPE: u8 = 0x01;
 pub(crate) const RX_FLAG_START_OF_MESSAGE: u8 = 0x02;
@@ -474,6 +515,32 @@ struct LateResponseEntry<'a> {
     exchanges: Vec<Settled>,
     /// The latest later exchange that had left the window ([`exchange::WINDOW`]) and is not
     /// reclassified.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    not_reclassified_through: Option<u64>,
+    text: String,
+    classification: exchange::Classification,
+}
+
+/// A `late_item` settling entry for an indication (design 8.11 "Settlement", ADR-370): the item,
+/// as an `unattached` event would give it, the exchange it settles with that exchange's `sent`
+/// and outcome restated, and the later exchanges its answer reclassifies.
+#[derive(Serialize)]
+struct LateItemEntry<'a> {
+    refers_to: Vec<u64>,
+    #[serde(flatten)]
+    item: UnattachedEntry<'a>,
+    /// Two or more exchanges could own the item, so it is the `unattached` event logged as this
+    /// `seq`, and no exchange is chosen as its owner.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    unattached: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sent: Option<exchange::Sent>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    sent_evidence: Option<exchange::SentEvidence>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    outcome: Option<exchange::Outcome>,
+    exchanges: Vec<Settled>,
+    /// As in `late_response`.
     #[serde(skip_serializing_if = "Option::is_none")]
     not_reclassified_through: Option<u64>,
     text: String,
@@ -1412,6 +1479,54 @@ impl CommLog {
             }
         }
         inner.exchange_began_us = None;
+        // An unbound indication the one ended exchange that could own it, and not this one,
+        // owns is that exchange's, read late (design 8.11 `late_item`, ADR-370). This exchange
+        // was in flight with the identifier unless the indication's VCI time comes before its
+        // earliest own VCI time (its transmit done or the start of its response, bound to it),
+        // on one clock and epoch (the maintainer's decision, 2026-10-28). Settled first, so this
+        // exchange then takes its own indications as it would have.
+        let own_starts: Vec<(exchange::Clock, clocks::Placed)> = [vci.tx_done, vci.rx_start]
+            .into_iter()
+            .flatten()
+            .filter_map(|time| time.placed())
+            .collect();
+        let awaits = !matches!(
+            evidence.end,
+            exchange::End::NotSent(_)
+                | exchange::End::VciLost {
+                    refused_after_loss: true
+                }
+        );
+        let in_flight_tx = match evidence.target {
+            exchange::Target::Endpoint { tx_id, .. } if awaits => Some(tx_id),
+            _ => None,
+        };
+        let in_flight_rx = awaits.then_some(evidence.rx_id);
+        let in_flight = |item: &UnattachedItem, placed, kind, id| {
+            let uses = match kind {
+                LateIndication::Transmit(_) => in_flight_tx == Some(id),
+                LateIndication::Start => in_flight_rx == Some(id),
+            };
+            uses && !before_starts(&own_starts, item.clock, placed)
+        };
+        let mut index = 0;
+        while index < unbound.len() {
+            let Some((kind, id)) = unbound[index].late_indication() else {
+                index += 1;
+                continue;
+            };
+            let (owners, all) = late_indication_owners(&inner.links[at].1, kind, id);
+            if in_flight(&unbound[index], unbound_placed[index], kind, id)
+                || !all
+                || owners.len() != 1
+            {
+                index += 1;
+                continue;
+            }
+            let item = unbound.remove(index);
+            let placed = unbound_placed.remove(index);
+            inner.late_item(at, owners[0], kind, &item, placed)?;
+        }
         // The response's own transmit done, which the host read from its item.
         let response_tx_done = vci.tx_done.is_some();
         if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
@@ -1662,6 +1777,9 @@ impl CommLog {
         // A response read during the exchange that it or an earlier exchange could own leaves
         // its own classification at least `undetermined` (design 8.11 `late_response`).
         let mut may_own_unattached = false;
+        // An indication read during it that it or an earlier exchange could own does the same
+        // (design 8.11 `late_item`, ADR-370).
+        let mut may_own_indication = false;
         for (item, placed) in unbound.iter().zip(unbound_placed) {
             let owner = late_response_owner(&inner.links[at].1, item, &evidence);
             if let Some(LateOwner::One(owner)) = owner {
@@ -1676,6 +1794,16 @@ impl CommLog {
                 may_own_unattached |= in_flight;
                 if !owners.is_empty() {
                     inner.late_response_unowned(at, &owners, item, placed, unattached)?;
+                }
+            }
+            if let Some((kind, id)) = item.late_indication() {
+                let (owners, all) = late_indication_owners(&inner.links[at].1, kind, id);
+                let in_flight = in_flight(item, placed, kind, id);
+                if owners.len() + usize::from(in_flight) + usize::from(!all) >= 2 {
+                    may_own_indication |= in_flight;
+                    if !owners.is_empty() {
+                        inner.late_item_unowned(at, &owners, item, placed, unattached)?;
+                    }
                 }
             }
         }
@@ -1698,24 +1826,32 @@ impl CommLog {
                 .unwrap_or_default(),
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
+            start_in_time: None,
             clears,
             matched: false,
         };
         let mut entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
-        if may_own_unattached && entry.classification < exchange::Classification::Undetermined {
+        let floor_reason = if may_own_unattached {
+            Some(MAY_OWN_UNATTACHED)
+        } else if may_own_indication {
+            Some(MAY_OWN_INDICATION)
+        } else {
+            None
+        };
+        if let Some(floor_reason) = floor_reason
+            && entry.classification < exchange::Classification::Undetermined
+        {
             entry.classification = exchange::Classification::Undetermined;
-            entry.reason.push_str(MAY_OWN_UNATTACHED);
+            entry.reason.push_str(floor_reason);
         }
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
         inner.links[at].1.record(&entry);
         inner.links[at].1.log(&entry, kept.evidence.clone(), clears);
         // A reclassification from its history alone does not clear that.
-        if may_own_unattached {
-            inner.links[at].1.floor(
-                seq,
-                exchange::Classification::Undetermined,
-                MAY_OWN_UNATTACHED,
-            );
+        if let Some(floor_reason) = floor_reason {
+            inner.links[at]
+                .1
+                .floor(seq, exchange::Classification::Undetermined, floor_reason);
         }
         let clears = inner.links[at].1.clears();
         // Only an exchange the VCI ended can be settled by a late response (ADR-365), and one
@@ -2341,6 +2477,46 @@ const AMBIGUOUS_OWNER: &str =
 /// its own or an earlier exchange's.
 const MAY_OWN_UNATTACHED: &str = " A response read during this exchange, logged unattached, may be this exchange's or an earlier one's: undetermined.";
 
+/// What an exchange's reason adds when an indication read during it, logged `unattached`, may be
+/// its own or an earlier exchange's.
+const MAY_OWN_INDICATION: &str = " An indication read during this exchange, logged unattached, may be this exchange's or an earlier one's: undetermined.";
+
+/// What an owed exchange's reason adds when an indication read after it ended, logged
+/// `unattached`, may be its own or another exchange's.
+const AMBIGUOUS_INDICATION: &str =
+    " An indication read after it ended may be its own or another exchange's: undetermined.";
+
+/// Whether a time on `clock`, placed at `placed`, comes before every start in `starts` on its
+/// clock and epoch: an exchange whose earliest VCI times those are was not yet in flight then.
+/// A time that cannot be set against them does not.
+fn before_starts(
+    starts: &[(exchange::Clock, clocks::Placed)],
+    clock: Option<exchange::Clock>,
+    placed: Option<clocks::Placed>,
+) -> bool {
+    placed.is_some_and(|placed| {
+        starts
+            .iter()
+            .filter(|(own, start)| clock == Some(*own) && start.epoch == placed.epoch)
+            .map(|(_, start)| start.unwrapped)
+            .min()
+            .is_some_and(|start| placed.unwrapped < start)
+    })
+}
+
+/// The kept exchanges a late indication of `kind` with identifier `id` could belong to, and
+/// whether they are every ended exchange on the link that could (design 8.11 `late_item`).
+fn late_indication_owners(
+    state: &exchange::LinkState,
+    kind: LateIndication,
+    id: u32,
+) -> (Vec<u64>, bool) {
+    match kind {
+        LateIndication::Transmit(_) => state.late_transmit_owners(id),
+        LateIndication::Start => state.late_start_owners(id),
+    }
+}
+
 /// Who could own `item`, read during the exchange of `evidence`, as a late response (design 8.11
 /// `late_response`).
 #[derive(Debug, PartialEq, Eq)]
@@ -2522,6 +2698,194 @@ impl Inner {
             not_reclassified_through: None,
             text: format!(
                 "A response was delivered that two or more exchanges could own (logged unattached as {unattached}); none is chosen as its owner."
+            ),
+            classification,
+        });
+        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+            .map(|_| ())
+    }
+
+    /// Writes the `late_item` settling entry of `item`, an indication of the owed exchange
+    /// `owner` on link `at`, read after its entry (design 8.11 `late_item`, ADR-370): the
+    /// exchange's `sent` and answers restated with it, and its classification again. It ends
+    /// no owed request: an indication is no final response.
+    fn late_item(
+        &mut self,
+        at: usize,
+        owner: u64,
+        kind: LateIndication,
+        item: &UnattachedItem,
+        placed: Option<clocks::Placed>,
+    ) -> Option<()> {
+        let state = &mut self.links[at].1;
+        let Some(kept) = state.kept(owner).cloned() else {
+            return Some(());
+        };
+        let mut evidence = kept.evidence.clone();
+        let mut vci = evidence.times.vci.unwrap_or_default();
+        let time = exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed);
+        let mut start_in_time = None;
+        let what = match kind {
+            LateIndication::Transmit(transmit) => {
+                evidence.transmit_evidence = Some(transmit);
+                vci.tx_done = Some(time)
+                    .into_iter()
+                    .chain(vci.tx_done)
+                    .reduce(exchange::VciTime::prefer);
+                "Its request went out."
+            }
+            LateIndication::Start => {
+                evidence.response_started = true;
+                vci.rx_start = Some(time)
+                    .into_iter()
+                    .chain(vci.rx_start)
+                    .reduce(exchange::VciTime::prefer);
+                if evidence.vci_ended && matches!(evidence.end, exchange::End::NoResponse) {
+                    evidence.end = exchange::End::ResponseIncomplete;
+                }
+                // Judged like a late response by its time, against the limit in force: a start
+                // has no length of its own, so only one before the limit less the margin shows.
+                if let (Some(limits), exchange::End::ResponseIncomplete) =
+                    (kept.limits, &evidence.end)
+                    && let timing::LateWindow::InTime { at_us } = timing::judge_late(
+                        limits,
+                        kept.evidence.absorbing(),
+                        kept.transmit,
+                        &kept.pendings,
+                        item.clock.zip(placed),
+                        0,
+                    )
+                {
+                    start_in_time = Some(at_us);
+                }
+                "Its response began."
+            }
+        };
+        evidence.times.vci = Some(vci);
+        let history = state.history_settling(&evidence, owner);
+        let entry = exchange::ExchangeEntry::build(owner, evidence.clone(), history);
+        let mut classification = entry.classification;
+        let mut reason = entry.reason.clone();
+        if let Some(at_us) = start_in_time {
+            classification = classification.max(exchange::Classification::Undetermined);
+            reason.push_str(&format!(
+                " The response started {:.1} ms after the transmit, within the limit in force less the margin: once it completes, the system missed a response that started in time.",
+                at_us as f64 / 1000.0
+            ));
+        }
+        // A floor an ambiguous item set stands, and so does a fault of the system the exchange's
+        // own entry observed (design 8.11 "Settlement").
+        if let Some((floor, suffix)) = state.floor_of(owner)
+            && classification < floor
+        {
+            classification = floor;
+            reason.push_str(&suffix);
+        }
+        if kept.classification == exchange::Classification::System
+            && classification != exchange::Classification::System
+        {
+            classification = exchange::Classification::System;
+            reason.push_str(
+                " The exchange's own entry had observed a fault of the system, which stands.",
+            );
+        }
+        state.settled(owner, classification, &reason, evidence.clone(), false);
+        state.update_kept(owner, evidence, entry.sent, start_in_time);
+        let answer = entry.settled_answer(&kept);
+        let (later, not_reclassified) = settle_later(state, owner, None, &answer);
+        let top = later
+            .iter()
+            .map(|later| later.classification)
+            .fold(classification, exchange::Classification::max);
+        let event = Event::LateItem(LateItemEntry {
+            refers_to: std::iter::once(owner)
+                .chain(later.iter().map(|later| later.seq))
+                .collect(),
+            item: UnattachedEntry::of(item, placed),
+            unattached: None,
+            sent: Some(entry.sent),
+            sent_evidence: Some(entry.sent_evidence),
+            outcome: Some(entry.outcome),
+            exchanges: std::iter::once(Settled {
+                seq: owner,
+                link: kept.evidence.link,
+                origin: kept.origin,
+                request: kept.request.clone(),
+                classification,
+                reason,
+            })
+            .chain(
+                later
+                    .into_iter()
+                    .map(|later| Settled::reclassified(owner, later)),
+            )
+            .collect(),
+            not_reclassified_through: not_reclassified,
+            text: format!(
+                "An indication of the exchange logged as {owner} was read after that exchange had ended. {what}{}",
+                not_reclassified_text(not_reclassified)
+            ),
+            classification: top,
+        });
+        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+            .map(|_| ())
+    }
+
+    /// Writes the `late_item` settling entry of `item`, an indication two or more exchanges
+    /// could own, logged `unattached` as line `unattached`: each owed exchange of `owners` on
+    /// link `at` is at least `undetermined` (design 8.11 `late_item`, ADR-370).
+    fn late_item_unowned(
+        &mut self,
+        at: usize,
+        owners: &[u64],
+        item: &UnattachedItem,
+        placed: Option<clocks::Placed>,
+        unattached: u64,
+    ) -> Option<()> {
+        let state = &mut self.links[at].1;
+        let mut exchanges = Vec::new();
+        for owner in owners {
+            let Some(kept) = state.kept(*owner).cloned() else {
+                continue;
+            };
+            let classification = kept
+                .classification
+                .max(exchange::Classification::Undetermined);
+            let reason = if classification == kept.classification {
+                "An indication was read after the exchange ended that it or another exchange could own; the exchange keeps its classification, which is at least undetermined.".to_owned()
+            } else {
+                "An indication was read after the exchange ended that it or another exchange could own, so what it shows of this exchange is not decided: undetermined.".to_owned()
+            };
+            state.raise(
+                *owner,
+                exchange::Classification::Undetermined,
+                &reason,
+                AMBIGUOUS_INDICATION,
+            );
+            exchanges.push(Settled {
+                seq: *owner,
+                link: kept.evidence.link,
+                origin: kept.origin,
+                request: kept.request,
+                classification,
+                reason,
+            });
+        }
+        let Some(classification) = exchanges.iter().map(|settled| settled.classification).max()
+        else {
+            return Some(());
+        };
+        let event = Event::LateItem(LateItemEntry {
+            refers_to: owners.to_vec(),
+            item: UnattachedEntry::of(item, placed),
+            unattached: Some(unattached),
+            sent: None,
+            sent_evidence: None,
+            outcome: None,
+            exchanges,
+            not_reclassified_through: None,
+            text: format!(
+                "An indication was read that two or more exchanges could own (logged unattached as {unattached}); none is chosen as its owner."
             ),
             classification,
         });
@@ -6089,8 +6453,8 @@ mod tests {
         )
         .unwrap();
         // The first exchange is owed now (sent on the bus, no final response): an indication
-        // for the same response identifier could be its late one, so it is unattached and this
-        // exchange's send stays unknown.
+        // for the same response identifier could be its late one, so it is unattached, this
+        // exchange's send stays unknown, and each is at least undetermined (ADR-370).
         log.exchange_with(silent(), vec![start_of_message(0x7E8)])
             .unwrap();
         log.end("ok");
@@ -6107,13 +6471,29 @@ mod tests {
                 "unattached",
                 "exchange",
                 "unattached",
+                "late_item",
                 "exchange"
             ]
+        );
+        let late = lines
+            .iter()
+            .find(|line| line["event"] == "late_item")
+            .unwrap();
+        let ambiguous = lines
+            .iter()
+            .filter(|line| line["event"] == "unattached")
+            .nth(3)
+            .unwrap();
+        assert_eq!(late["unattached"], ambiguous["seq"], "{late}");
+        assert_eq!(
+            late["exchanges"][0]["classification"], "undetermined",
+            "{late}"
         );
         let entries: Vec<_> = lines
             .iter()
             .filter(|line| line["event"] == "exchange")
             .collect();
+        assert_eq!(entries[1]["classification"], "undetermined");
         assert_eq!(entries[0]["outcome"]["result"], "response_incomplete");
         assert_eq!(entries[0]["sent"], "confirmed");
         assert_eq!(entries[0]["sent_evidence"], "answer");
@@ -6142,6 +6522,233 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Runs `exchanges` on one log with link 1 opened (its limits and indications recorded),
+    /// each with the unbound items read during it, and gives every line written.
+    fn run_on_opened_link(
+        exchanges: Vec<(exchange::Evidence, Vec<UnattachedItem>)>,
+    ) -> Vec<serde_json::Value> {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        for (evidence, unbound) in exchanges {
+            log.exchange_with(evidence, unbound).unwrap();
+        }
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    fn of_event(lines: &[serde_json::Value], event: &str) -> Vec<serde_json::Value> {
+        lines
+            .iter()
+            .filter(|line| line["event"] == event)
+            .cloned()
+            .collect()
+    }
+
+    /// ADR-370: an unbound transmit indication or loopback echo read during a later exchange,
+    /// whose VCI time comes before that exchange's own transmit done, is the late one of the one
+    /// ended exchange whose send is still unknown: a `late_item` confirms that exchange's send.
+    /// At or after the later exchange's transmit done, or with no time to set against it, or with
+    /// two ended exchanges that could own it, it is `unattached` and each possible owner is at
+    /// least `undetermined`.
+    #[test]
+    fn a_late_transmit_indication_confirms_the_send_of_its_ended_exchange() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        // A read the VCI ended with no response and no transmit seen: its send is unknown.
+        let unknown = |did: u8| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.vci_ended = true;
+            evidence
+        };
+        // A later read whose response carries its own transmit done at `tx_us`.
+        let later = |tx_us: Option<u64>| {
+            let mut evidence = unknown(0x92);
+            evidence.times.vci = tx_us.map(|us| exchange::VciTimes {
+                tx_done: Some(device(us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let indication = |flags: u8, vci_us: u32| UnattachedItem {
+            vci_us,
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, flags],
+                identifier: Some(0x7E0),
+                bytes: vec![0x22, 0xF1, 0x90],
+            },
+            ..tx_done(0x7E0)
+        };
+        for (flags, sent_evidence) in [(0x09, "tx_indication"), (0x01, "loopback")] {
+            let lines = run_on_opened_link(vec![
+                (unknown(0x90), Vec::new()),
+                (later(Some(3_000_000)), vec![indication(flags, 1_000_000)]),
+            ]);
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:?}");
+            let exchanges = of_event(&lines, "exchange");
+            assert_eq!(exchanges[0]["sent"], "unknown", "{lines:?}");
+            let [late] = &of_event(&lines, "late_item")[..] else {
+                panic!("{lines:?}");
+            };
+            assert_eq!(late["refers_to"], serde_json::json!([exchanges[0]["seq"]]));
+            assert_eq!(late["sent"], "confirmed", "{late}");
+            assert_eq!(late["sent_evidence"], sent_evidence, "{late}");
+            assert_eq!(late["exchanges"][0]["seq"], exchanges[0]["seq"], "{late}");
+            // Written before the later exchange's entry, whose send its own transmit done shows.
+            assert!(
+                late["seq"].as_u64() < exchanges[1]["seq"].as_u64(),
+                "{lines:?}"
+            );
+            assert_eq!(exchanges[1]["sent_evidence"], "tx_done_time", "{lines:?}");
+        }
+        // At or after the later exchange's transmit done, or with no time of its own to set
+        // against: either exchange could own it.
+        for tx_us in [Some(500_000), None] {
+            let lines = run_on_opened_link(vec![
+                (unknown(0x90), Vec::new()),
+                (later(tx_us), vec![indication(0x09, 1_000_000)]),
+            ]);
+            let unattached = of_event(&lines, "unattached");
+            let [late] = &of_event(&lines, "late_item")[..] else {
+                panic!("{lines:?}");
+            };
+            assert_eq!(late["unattached"], unattached[0]["seq"], "{late}");
+            assert!(late.get("sent").is_none(), "{late}");
+            assert_eq!(late["exchanges"][0]["classification"], "undetermined");
+            let exchanges = of_event(&lines, "exchange");
+            assert_eq!(exchanges[1]["classification"], "undetermined", "{lines:?}");
+        }
+        // Two ended exchanges whose send is unknown: neither is chosen.
+        let lines = run_on_opened_link(vec![
+            (unknown(0x90), Vec::new()),
+            (unknown(0x91), Vec::new()),
+            (later(Some(3_000_000)), vec![indication(0x09, 1_000_000)]),
+        ]);
+        let exchanges = of_event(&lines, "exchange");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(
+            late["refers_to"],
+            serde_json::json!([exchanges[0]["seq"], exchanges[1]["seq"]]),
+            "{late}"
+        );
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:?}");
+    }
+
+    /// ADR-370: an unbound start-of-message indication read during a later exchange, before
+    /// that exchange's own transmit done, starts the response of the one owed exchange that
+    /// awaits a response on its identifier. That exchange ended with no response, so it is
+    /// `response_incomplete`; the start came within the limit less the margin, so once a late
+    /// response completes it, the system missed a response that started in time.
+    #[test]
+    fn a_late_start_of_message_starts_the_response_of_its_ended_exchange() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence
+        };
+        // A later exchange whose response carries its own transmit done.
+        let own_transmit = |did: u8, at_us: u64| {
+            let mut evidence = silent(did, at_us);
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let start = UnattachedItem {
+            vci_us: 20_000,
+            read: read(3_010_500),
+            ..start_of_message(0x7E8)
+        };
+        let response = UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            vci_us: 6_000_000,
+            clock: Some(exchange::Clock::Device),
+            read: read(6_010_500),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x62, 0xF1, 0x90, 0x41],
+            },
+        };
+        let lines = run_on_opened_link(vec![
+            (silent(0x90, 10_000), vec![transmit(10_000)]),
+            (own_transmit(0x91, 3_010_000), vec![start]),
+            (own_transmit(0x92, 6_010_000), vec![response]),
+        ]);
+        let exchanges = of_event(&lines, "exchange");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:?}");
+        assert_eq!(late["refers_to"][0], exchanges[0]["seq"], "{late}");
+        assert_eq!(late["outcome"]["result"], "response_incomplete", "{late}");
+        assert_eq!(
+            late["exchanges"][0]["classification"], "undetermined",
+            "{late}"
+        );
+        assert!(
+            late["exchanges"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("started 10.0 ms after the transmit")),
+            "{late}"
+        );
+        let [completed] = &of_event(&lines, "late_response")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(
+            completed["exchanges"][0]["classification"], "system",
+            "{completed}"
+        );
+        assert!(
+            completed["exchanges"][0]["reason"]
+                .as_str()
+                .is_some_and(|reason| reason.contains("started in time")),
+            "{completed}"
+        );
     }
 
     /// A second start for the same response identifier in one exchange (the ECU aborted and began

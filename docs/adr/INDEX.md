@@ -359,6 +359,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-367](ADR-367-the-log-settles-a-primitive-that-ends-before-the-next-request.md) | The Log Settles a Primitive That Ends Before the Next Request | Accepted | `agent` host (`settle_cancelled`, `Settling`) and communication log (`primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-346, ADR-358, ADR-366 |
 | [ADR-368](ADR-368-a-settling-entry-reclassifies-the-later-exchanges-in-a-window.md) | A Settling Entry Reclassifies the Later Exchanges in a Window | Accepted (Consequences' open late acceptance of a reset closed by ADR-369) | `agent` communication log (`reclassify_after`, window of 16 exchanges per link, ambiguous `late_response`); design 8.11 "Settlement"; ADR-346, ADR-365, ADR-366 |
 | [ADR-369](ADR-369-a-late-acceptance-of-a-reset-ends-the-evidence-as-in-time.md) | A Late Acceptance of a Reset Ends the Evidence as in Time | Accepted | `agent` communication log (`reset_after`, `late_restart`, `late_response`, `primitive_ended`); design 8.11 "Matched answer", "Owed request", "Settlement"; ADR-346, ADR-365, ADR-366, ADR-368 |
+| [ADR-370](ADR-370-a-late-indication-settles-its-ended-exchange.md) | A Late Indication Settles Its Ended Exchange | Accepted | `agent` communication log (`late_item` for a transmit indication, loopback echo or start-of-message indication; `Kept::start_in_time`); design 8.11 "Settlement", `late_item`; ADR-346, ADR-365, ADR-367, ADR-368 |
 
 ## Status Legend
 
@@ -733,6 +734,7 @@ the predecessor repository these ADRs came from.
 - ADR-367
 - ADR-368 (Consequences' open late acceptance of a reset closed by ADR-369)
 - ADR-369
+- ADR-370
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

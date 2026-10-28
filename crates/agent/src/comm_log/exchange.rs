@@ -1277,6 +1277,10 @@ pub(crate) struct Kept {
     /// A start-of-message with the response's identifier was read during the exchange and not
     /// attached (another exchange could own it): the response may have begun.
     pub start_unattached: bool,
+    /// A start-of-message indication read after its entry showed its response beginning this
+    /// long after the transmit, before the limit in force less the margin (a `late_item`,
+    /// ADR-370): once the response completes, the system missed a response that started in time.
+    pub start_in_time: Option<i64>,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
     pub clears: Clears,
@@ -1483,6 +1487,81 @@ impl LinkState {
         self.owed
             .iter()
             .any(|owed| owed.rx_id == rx_id && owed.seq != seq)
+    }
+
+    /// The kept exchanges an unbound transmit indication or loopback echo for request
+    /// identifier `tx_id` could belong to (design 8.11 `late_item`): those whose `sent` is still
+    /// `unknown`, by `seq`; and whether they are every exchange on the link that could, which
+    /// they are not when an exchange the log keeps nothing of ended with `sent` `unknown`.
+    pub(crate) fn late_transmit_owners(&self, tx_id: u32) -> (Vec<u64>, bool) {
+        let mut owners: Vec<u64> = self
+            .kept
+            .iter()
+            .filter(|(_, kept)| {
+                kept.sent == Sent::Unknown
+                    && matches!(kept.evidence.target, Target::Endpoint { tx_id: id, .. } if id == tx_id)
+            })
+            .map(|(seq, _)| *seq)
+            .collect();
+        owners.sort_unstable();
+        let unknown_kept = self
+            .kept
+            .values()
+            .filter(|kept| kept.sent == Sent::Unknown)
+            .count();
+        (owners, self.unknown_sends as usize == unknown_kept)
+    }
+
+    /// The kept exchanges an unbound start-of-message indication for response identifier
+    /// `rx_id` could belong to (design 8.11 `late_item`): the owed requests that expect a
+    /// response on it, by `seq`; and whether the log keeps every one of them.
+    pub(crate) fn late_start_owners(&self, rx_id: u32) -> (Vec<u64>, bool) {
+        let owed: Vec<u64> = self
+            .owed
+            .iter()
+            .filter(|owed| owed.rx_id == rx_id)
+            .map(|owed| owed.seq)
+            .collect();
+        let kept: Vec<u64> = owed
+            .iter()
+            .copied()
+            .filter(|seq| self.kept.contains_key(seq))
+            .collect();
+        let all = kept.len() == owed.len();
+        (kept, all)
+    }
+
+    /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, and
+    /// the time its response started in time, if it did: an indication that confirms the send
+    /// can own a late transmit indication no more.
+    pub(crate) fn update_kept(
+        &mut self,
+        seq: u64,
+        evidence: Evidence,
+        sent: Sent,
+        start_in_time: Option<i64>,
+    ) {
+        let Some(kept) = self.kept.get_mut(&seq) else {
+            return;
+        };
+        let confirmed = kept.sent == Sent::Unknown && sent != Sent::Unknown;
+        kept.evidence = evidence;
+        kept.sent = sent;
+        if start_in_time.is_some() {
+            kept.start_in_time = start_in_time;
+        }
+        if confirmed {
+            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+        }
+    }
+
+    /// The floor exchange `seq` keeps in the window whatever its history gives, with the reason
+    /// its reason then ends with.
+    pub(crate) fn floor_of(&self, seq: u64) -> Option<(Classification, String)> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .and_then(|logged| logged.floor.clone())
     }
 
     /// Drops what is kept of exchange `seq`, which nothing will settle.
@@ -2414,6 +2493,14 @@ pub(crate) fn settle_late_response(
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
     let base = classify(answered, history);
+    // A start of the response read late before the limit less the margin (ADR-370): the
+    // response started in time, so the system missed it.
+    let window = match (window, kept.start_in_time) {
+        (LateWindow::Late { .. } | LateWindow::Open, Some(at_us)) => {
+            return started_in_time(at_us);
+        }
+        (window, _) => window,
+    };
     let (classification, mut reason) = match window {
         LateWindow::InTime { at_us } => (
             System,
@@ -2462,6 +2549,18 @@ pub(crate) fn settle_late_response(
         return (System, reason);
     }
     (classification, reason)
+}
+
+/// What [`settle_late_response`] gives an exchange whose response a late start showed beginning
+/// `at_us` after the transmit, within the limit in force less the margin.
+fn started_in_time(at_us: i64) -> (Classification, String) {
+    (
+        Classification::System,
+        format!(
+            "The ECU's response started {:.1} ms after the transmit, within the limit in force less the margin, and was delivered after the exchange had ended: the system missed a response that started in time.",
+            at_us as f64 / 1000.0
+        ),
+    )
 }
 
 /// The classification and reason a `primitive_ended` gives the exchange it settles (design 8.11
@@ -2996,6 +3095,7 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
+            start_in_time: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
         };
@@ -4170,6 +4270,7 @@ mod tests {
             pendings: Vec::new(),
             limits: None,
             start_unattached: false,
+            start_in_time: None,
             clears: Clears::default(),
             matched: false,
         };
@@ -4262,6 +4363,7 @@ mod tests {
                 pendings: Vec::new(),
                 limits: None,
                 start_unattached: false,
+                start_in_time: None,
                 clears: Clears::default(),
                 matched: false,
             },

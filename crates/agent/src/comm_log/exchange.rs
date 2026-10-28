@@ -1532,7 +1532,7 @@ impl LinkState {
     }
 
     /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its
-    /// transmit done, and the time its response started in time, if it did: an indication that confirms the send
+    /// transmit done, and, for a start, the time its latest start came in time, if it did: an indication that confirms the send
     /// can own a late transmit indication no more.
     pub(crate) fn update_kept(
         &mut self,
@@ -1540,7 +1540,7 @@ impl LinkState {
         evidence: Evidence,
         sent: Sent,
         transmit: super::timing::At,
-        start_in_time: Option<i64>,
+        start_in_time: Option<Option<i64>>,
     ) {
         let Some(kept) = self.kept.get_mut(&seq) else {
             return;
@@ -1549,7 +1549,7 @@ impl LinkState {
         kept.evidence = evidence;
         kept.sent = sent;
         kept.transmit = transmit;
-        if start_in_time.is_some() {
+        if let Some(start_in_time) = start_in_time {
             kept.start_in_time = start_in_time;
         }
         if confirmed {
@@ -1741,14 +1741,29 @@ impl LinkState {
         final_response: bool,
     ) {
         if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
-            logged.classification = classification;
-            logged.reason = reason.to_owned();
-            logged.evidence = evidence;
             if final_response {
                 logged.settled = true;
             } else {
                 logged.floor = Some((classification, String::new()));
             }
+        }
+        self.settled_from_evidence(seq, classification, reason, evidence);
+    }
+
+    /// [`LinkState::settled`] for a settling entry whose classification its evidence alone gives
+    /// (a `late_item`, ADR-370): it sets no floor, so a later item that refutes what it inferred
+    /// (a start after a timeout it judged early) can lower it; a floor already set stands.
+    pub(crate) fn settled_from_evidence(
+        &mut self,
+        seq: u64,
+        classification: Classification,
+        reason: &str,
+        evidence: Evidence,
+    ) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            logged.classification = classification;
+            logged.reason = reason.to_owned();
+            logged.evidence = evidence;
         }
         // What the entry added gives the exchange an answer, and owners from the owed requests
         // logged before it, as its history would have had them, so its answer is freed once

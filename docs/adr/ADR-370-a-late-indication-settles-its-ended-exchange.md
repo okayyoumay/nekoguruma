@@ -76,8 +76,12 @@ again (2026-10-28):
      a transmit done places its times (and is kept for a later late response), and a start
      refutes a timeout judged on no response having begun. E is classified again from its new
      evidence; the floor an ambiguous item set stands. A `system` E's own entry gave rested on
-     its timing, so it is judged again too. E stays owed, since an indication is no final
-     response.
+     its timing, so it is judged again too. The classification the `late_item` gives sets no
+     floor of its own (`LinkState::settled_from_evidence`), so a later item can refute what it
+     inferred: a start read after a transmit indication refutes the early timeout that
+     indication let the log judge. E stays owed, since an indication is no final response.
+   - The latest start is the response's: a later start replaces E's earlier one, as the ECU
+     aborted and began again, and the in-time judgement is that of the start that stands.
    - A start in time makes a later late response `system` only when that response spans frames:
      one that fits one frame came after a transfer the ECU aborted.
    - The start counts as an answer for the later exchanges (`reclassify_after`), but not as a

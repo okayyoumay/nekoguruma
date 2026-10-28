@@ -27,8 +27,9 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    system. On Linux these are `CLOCK_BOOTTIME`, which counts from the boot and through
    suspend, and the kernel's boot id (`/proc/sys/kernel/random/boot_id`). On other systems the
    log has neither, and a gap across runs stays unmeasured: the maintainer chose Linux only
-   (2026-10-28). The agent's own clock stays the monotonic one; the boot clock is read only
-   for a loss and its settlement, so an exchange's times cost nothing more.
+   (2026-10-28). The agent's own clock stays the monotonic one, and exchange entries carry no
+   boot time. The log reads the boot clock beside each agent time it takes (item 2), at the
+   cost of a few more clock reads per time, so that a loss's times can be set on it.
 
 2. **The record.** The first `vci_loss` record of a loss keeps `boot`: the boot id and the time
    on the boot clock at which the device clock's last time was read. The agent's monotonic clock

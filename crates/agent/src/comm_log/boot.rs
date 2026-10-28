@@ -42,11 +42,10 @@ pub(crate) fn now_us() -> Option<u64> {
     }
 }
 
-#[cfg(test)]
+#[cfg(all(test, target_os = "linux"))]
 mod tests {
     use super::*;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn linux_gives_a_boot_id_and_a_boot_clock_that_runs() {
         assert!(id().is_some_and(|id| id.len() >= 32), "{:?}", id());

@@ -2151,16 +2151,18 @@ impl LinkState {
     /// evidence takes the error, read after its answer, and it is classified again; a final
     /// response that settled it keeps the most severe of its classification and the error's.
     ///
-    /// Gives it with its classification and reason, and whether the error changed them; `own`
-    /// when the error was on the exchange's own link `link`.
+    /// Gives it with its classification and reason, and whether the error changed them. The
+    /// error was on link `link`, at a time placed within the exchange (`placed`); one that may
+    /// only have come during it is H3 evidence wherever it was.
     pub(crate) fn error_in(
         &mut self,
         seq: u64,
         kind: LinkErrorKind,
         link: u32,
+        placed: bool,
     ) -> Option<(Reclassified, bool)> {
         let add = |evidence: &mut Evidence| {
-            if evidence.link == link {
+            if placed && evidence.link == link {
                 evidence.link_errors.push(kind);
                 // Read after the exchange's answer: it ends that answer (`record`).
                 evidence.link_errors_before_answer = false;

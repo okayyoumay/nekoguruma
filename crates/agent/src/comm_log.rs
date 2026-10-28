@@ -3207,7 +3207,7 @@ impl Inner {
         }
         for ((_, state), (owners, after)) in self.links.iter_mut().zip(points) {
             for owner in owners {
-                during.extend(state.error_in(owner, kind, item.link));
+                during.extend(state.error_in(owner, kind, item.link, at.is_some()));
             }
             let (changed, through) = state.error_after(after, written, kind);
             later.extend(changed);
@@ -6094,7 +6094,7 @@ mod tests {
         refused.times.agent.end_us = 3_000_100;
         // Read during the last exchange, before its response, on no clock or on the worker's,
         // which none of the exchanges' times are on.
-        let error = |clock, read_us| UnattachedItem {
+        let error_of = |kind, clock, read_us| UnattachedItem {
             link: 1,
             earlier_primitive: false,
             vci_us: 7,
@@ -6104,9 +6104,10 @@ mod tests {
                 event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
                 extra_error_info: None,
                 extra_error_info_name: None,
-                link_error: Some(exchange::LinkErrorKind::Frame),
+                link_error: Some(kind),
             },
         };
+        let error = |clock, read_us| error_of(exchange::LinkErrorKind::Frame, clock, read_us);
         for clock in [None, Some(exchange::Clock::Worker)] {
             let lines = run_on_opened_link(vec![
                 (answered(0x90, 1_000_000), Vec::new()),
@@ -6125,12 +6126,29 @@ mod tests {
                 serde_json::json!([exchanges[1]["seq"]]),
                 "{late}"
             );
-            assert_eq!(
-                late["exchanges"][0]["classification"], "undetermined",
-                "{late}"
-            );
+            // Its own answer stands against a possible link error on its channel.
+            assert_eq!(late["exchanges"][0]["classification"], "none", "{late}");
             assert_eq!(exchanges[3]["classification"], "undetermined", "{lines:?}");
         }
+        // A fault of the VCI itself is the exchange in flight's own, and only possible evidence
+        // (H3) of the exchange before it: not a fault seen in that one.
+        let lines = run_on_opened_link(vec![
+            (answered(0x90, 1_000_000), Vec::new()),
+            (
+                answered(0x91, 2_000_000),
+                vec![error_of(
+                    exchange::LinkErrorKind::VciHardwareFault,
+                    None,
+                    2_010_000,
+                )],
+            ),
+        ]);
+        let exchanges = of_event(&lines, "exchange");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(late["exchanges"][0]["classification"], "none", "{late}");
+        assert_eq!(exchanges[1]["classification"], "system", "{lines:?}");
         // The window's oldest exchange the first it may have come during: the later ones are
         // counted again, and none is named as not reclassified.
         let lines = run_on_opened_link(vec![

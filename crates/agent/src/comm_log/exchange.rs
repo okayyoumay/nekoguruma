@@ -1281,6 +1281,10 @@ pub(crate) struct Kept {
     /// long after the transmit, before the limit in force less the margin (a `late_item`,
     /// ADR-370): once the response completes, the system missed a response that started in time.
     pub start_in_time: Option<i64>,
+    /// The least classification an ambiguous item read during or after it gave it, with the
+    /// reason its reason then ends with: kept with the owed exchange too, so it stands after the
+    /// exchange leaves the window (ADR-370).
+    pub floor: Option<(Classification, String)>,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
     pub clears: Clears,
@@ -1557,13 +1561,14 @@ impl LinkState {
         }
     }
 
-    /// The floor exchange `seq` keeps in the window whatever its history gives, with the reason
-    /// its reason then ends with.
+    /// The floor exchange `seq` keeps whatever its history gives, with the reason its reason then
+    /// ends with: its window entry's, or, once it has left the window, the one kept with it.
     pub(crate) fn floor_of(&self, seq: u64) -> Option<(Classification, String)> {
         self.window
             .iter()
             .find(|logged| logged.seq == seq)
             .and_then(|logged| logged.floor.clone())
+            .or_else(|| self.kept.get(&seq).and_then(|kept| kept.floor.clone()))
     }
 
     /// Drops what is kept of exchange `seq`, which nothing will settle.
@@ -1724,6 +1729,9 @@ impl LinkState {
         if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
             logged.floor = Some((classification, reason.to_owned()));
         }
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.floor = Some((classification, reason.to_owned()));
+        }
     }
 
     /// Exchange `seq`'s standing classification is now `classification`, which a settling entry
@@ -1797,6 +1805,7 @@ impl LinkState {
         }
         if let Some(kept) = self.kept.get_mut(&seq) {
             kept.classification = kept.classification.max(floor);
+            kept.floor = Some((floor, suffix.to_owned()));
         }
     }
 
@@ -3119,6 +3128,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             start_in_time: None,
+            floor: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
         };
@@ -4294,6 +4304,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             start_in_time: None,
+            floor: None,
             clears: Clears::default(),
             matched: false,
         };
@@ -4387,6 +4398,7 @@ mod tests {
                 limits: None,
                 start_unattached: false,
                 start_in_time: None,
+                floor: None,
                 clears: Clears::default(),
                 matched: false,
             },

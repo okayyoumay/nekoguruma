@@ -91,7 +91,9 @@ again (2026-10-28):
      as ADR-368 does.
 5. **Two or more possible owners.** Ended owners, X, or an exchange the log keeps nothing of. The
    item stays `unattached`. A `late_item` names that line in `unattached` and raises each kept
-   owner to at least `undetermined` as a floor, and those exchanges stay owed. An owner already
+   owner to at least `undetermined` as a floor, kept with the owed exchange as well as in its
+   window entry so that it stands after the exchange leaves the window, and those exchanges stay
+   owed. An owner already
    raised for an ambiguous item, and no lower now, is not named again, and no line is written
    when none is left. X, when it is one of the owners, is at least `undetermined` in its own
    entry, with that floor in the window, but only when the item could change X: a transmit

@@ -1834,6 +1834,7 @@ impl CommLog {
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             start_in_time: None,
+            floor: None,
             clears,
             matched: false,
         };
@@ -1872,6 +1873,8 @@ impl CommLog {
                     sent: entry.sent,
                     clears,
                     matched: entry.matched_answer(),
+                    floor: floor_reason
+                        .map(|reason| (exchange::Classification::Undetermined, reason)),
                     ..kept
                 },
             );
@@ -6910,6 +6913,66 @@ mod tests {
         assert_eq!(
             late[1]["exchanges"][0]["classification"], "undetermined",
             "{lines:?}"
+        );
+    }
+
+    /// ADR-370 item 4: the floor an ambiguous indication gave an owed exchange stands after that
+    /// exchange leaves the window, when a later indication only it could own confirms its send.
+    #[test]
+    fn an_ambiguity_floor_stands_after_its_exchange_leaves_the_window() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |did: u8, end: exchange::End| {
+            let mut evidence = evidence(endpoint(0x7E0), &[0x22, 0xF1, did], end);
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence
+        };
+        let answered = || {
+            let mut evidence = read(0x91, exchange::End::Positive(vec![0x62, 0xF1, 0x91, 0x41]));
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxDoneTime);
+            evidence
+        };
+        let mut later = read(0x92, exchange::End::NoResponse);
+        later.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device(3_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        let indication = |vci_us: u32| UnattachedItem {
+            vci_us,
+            ..tx_done(0x7E0)
+        };
+        let mut exchanges = vec![
+            // A matched answer for F190, then a silent F190 read whose send is unknown.
+            (
+                read(0x90, exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
+                Vec::new(),
+            ),
+            (read(0x90, exchange::End::NoResponse), Vec::new()),
+            // An indication either it or the exchange in flight, whose send its response's
+            // transmit done shows but which has no time of its own, could own raises it.
+            (
+                {
+                    let mut evidence = read(0x93, exchange::End::NoResponse);
+                    evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxDoneTime);
+                    evidence
+                },
+                vec![indication(5)],
+            ),
+        ];
+        exchanges.extend((0..exchange::WINDOW).map(|_| (answered(), Vec::new())));
+        exchanges.push((later, vec![indication(1_000_000)]));
+        let lines = run_on_opened_link(exchanges);
+        let entries = of_event(&lines, "exchange");
+        let late = of_event(&lines, "late_item");
+        let settled = late
+            .iter()
+            .find(|late| late.get("sent").is_some())
+            .unwrap_or_else(|| panic!("{lines:?}"));
+        assert_eq!(settled["refers_to"][0], entries[1]["seq"], "{settled}");
+        assert_eq!(settled["sent"], "confirmed", "{settled}");
+        assert_eq!(
+            settled["exchanges"][0]["classification"], "undetermined",
+            "{settled}"
         );
     }
 

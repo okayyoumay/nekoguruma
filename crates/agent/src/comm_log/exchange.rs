@@ -32,7 +32,7 @@ const EVENT: &str = "exchange";
 
 const SID_SESSION_CONTROL: u8 = 0x10;
 const SID_ECU_RESET: u8 = 0x11;
-const SID_NEGATIVE: u8 = 0x7F;
+pub(crate) const SID_NEGATIVE: u8 = 0x7F;
 pub(crate) const NRC_PENDING: u8 = 0x78;
 
 /// Who sent the request (design 8.11, `origin`).
@@ -967,6 +967,13 @@ pub(crate) struct Expected {
 }
 
 impl Expected {
+    /// Whether `bytes` is a pending (NRC 0x78) carrying this negative pattern.
+    pub(crate) fn pending(&self, bytes: &[u8]) -> bool {
+        !self.negative_pattern.is_empty()
+            && bytes.starts_with(&self.negative_pattern)
+            && bytes.get(self.negative_pattern.len()) == Some(&NRC_PENDING)
+    }
+
     /// UDS's rule for `request`: the positive response's prefix as the worker is given it (the
     /// host's own rule: a data identifier or a sub-function echoed, without its suppress bit),
     /// and `7F` with the SID.
@@ -1281,6 +1288,10 @@ pub(crate) struct Kept {
     /// beginning, judged against the limit in force (a `late_item`, ADR-370, design 8.11
     /// "Settlement"): it decides a late response that completes that response.
     pub late_start: Option<LateStart>,
+    /// The forwarded pendings read after its entry, each with how it stood against the limit in
+    /// force before it (a `late_item`, ADR-371). They come after [`Kept::pendings`], which are
+    /// the ones its entry saw and judge its timing; only one in time carries the limit on.
+    pub late_pendings: Vec<(super::timing::At, LatePending)>,
     /// The least classification an ambiguous item read during or after it gave it, with the
     /// reason its reason then ends with: kept with the owed exchange too, so it stands after the
     /// exchange leaves the window (ADR-370).
@@ -1547,6 +1558,39 @@ impl LinkState {
             .collect();
         let all = kept.len() == owed.len();
         (kept, all)
+    }
+
+    /// The kept exchanges a forwarded pending `pending` with response identifier `rx_id`, bound to
+    /// no primitive, could belong to (design 8.11 `late_item`): the owed requests that expect a
+    /// response on it whose negative pattern it carries, by `seq`; and whether the log keeps
+    /// every one of them.
+    pub(crate) fn late_pending_owners(&self, rx_id: u32, pending: &[u8]) -> (Vec<u64>, bool) {
+        let owed: Vec<u64> = self
+            .owed
+            .iter()
+            .filter(|owed| owed.rx_id == rx_id && owed.expected.pending(pending))
+            .map(|owed| owed.seq)
+            .collect();
+        let kept: Vec<u64> = owed
+            .iter()
+            .copied()
+            .filter(|seq| self.kept.contains_key(seq))
+            .collect();
+        let all = kept.len() == owed.len();
+        (kept, all)
+    }
+
+    /// Owed exchange `seq` got the pending at `at`, which a `late_item` gave it and judged
+    /// `window` against the limit in force before it.
+    pub(crate) fn add_kept_late_pending(
+        &mut self,
+        seq: u64,
+        at: super::timing::At,
+        window: LatePending,
+    ) {
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.late_pendings.push((at, window));
+        }
     }
 
     /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its
@@ -2500,7 +2544,44 @@ pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
     }
 }
 
+/// How a forwarded pending read after its exchange's entry stood against the limit in force
+/// before it (ADR-371).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LatePending {
+    /// Within the limit less the margin: the limit in force then runs from it.
+    InTime,
+    /// After the limit plus the margin: the VCI had ended its wait before it, so it carries no
+    /// limit on, and a later response is judged against the limit before it.
+    Late,
+    /// Neither is shown: the limit in force after it is not known.
+    Open,
+}
+
 impl Kept {
+    /// The pendings the limit in force for a later late item or response runs from: its
+    /// entry's, then each in-time late pending; an open one leaves the limit after it unknown,
+    /// and a late one is passed over.
+    pub(crate) fn limit_pendings(&self) -> Vec<super::timing::At> {
+        let mut pendings = self.pendings.clone();
+        for (at, window) in &self.late_pendings {
+            match window {
+                LatePending::InTime => pendings.push(*at),
+                LatePending::Open => pendings.push(None),
+                LatePending::Late => {}
+            }
+        }
+        pendings
+    }
+
+    /// Every pending the exchange has, its entry's and the late ones, in order, placed.
+    pub(crate) fn all_pendings(&self) -> Vec<super::timing::At> {
+        self.pendings
+            .iter()
+            .copied()
+            .chain(self.late_pendings.iter().map(|(at, _)| *at))
+            .collect()
+    }
+
     /// The exchange's evidence with `response` as its end, judged by the rows that do not turn
     /// on timing: its window is taken as within the limit.
     pub(crate) fn answered(&self, response: &[u8]) -> Evidence {
@@ -2605,6 +2686,64 @@ pub(crate) fn settle_late_response(
     }
     (classification, reason)
 }
+
+/// What a forwarded pending read after its exchange's entry gives that exchange (design 8.11
+/// "Settlement" `late_item`, ADR-371), judged by `window` against the limit in force before it,
+/// with `base` and `base_reason`, what the exchange's own rows give it, as
+/// [`settle_late_response`] judges a late response.
+pub(crate) fn settle_late_pending(
+    kept: &Kept,
+    window: super::timing::LateWindow,
+    base: Classification,
+    base_reason: &str,
+) -> (Classification, String) {
+    use super::timing::LateWindow;
+    use Classification::{System, Undetermined, Vehicle};
+    match window {
+        LateWindow::InTime { at_us } => (
+            System,
+            format!(
+                "The ECU answered with a pending {:.1} ms after the transmit, within the limit in force less the margin, and it reached the agent after the exchange had ended: the system missed an answer that came in time.",
+                at_us as f64 / 1000.0
+            ),
+        ),
+        LateWindow::Late { by_us } => {
+            let late = format!(
+                "The ECU answered with a pending at least {:.1} ms after the limit in force plus the margin.",
+                by_us as f64 / 1000.0
+            );
+            let at_limit = kept.evidence.timing.window == Window::TimeoutAtLimit
+                || matches!(
+                    kept.late_start,
+                    Some(LateStart::Late { at_limit: true, .. })
+                );
+            if base >= Undetermined {
+                (base, format!("{late} {base_reason}"))
+            } else if at_limit {
+                (
+                    Vehicle,
+                    format!("{late} The VCI had ended its wait at the limit."),
+                )
+            } else {
+                (
+                    Undetermined,
+                    format!(
+                        "{late} Whether the VCI ended its wait at the limit, or before, is not shown."
+                    ),
+                )
+            }
+        }
+        LateWindow::Open => (
+            base.max(Undetermined),
+            format!(
+                "The ECU answered with a pending after the exchange had ended, and its time does not show whether it came within the limit in force. {base_reason}"
+            ),
+        ),
+    }
+}
+
+/// The reason a floor a late pending set ends with, when the exchange is classified again.
+pub(crate) const LATE_PENDING_FLOOR: &str = " A pending the ECU sent for it reached the agent after it had ended, and how it stood against the limit in force stands.";
 
 /// What [`settle_late_response`] gives an exchange whose response a late start showed beginning
 /// `at_us` after the transmit, within the limit in force less the margin.
@@ -3151,6 +3290,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            late_pendings: Vec::new(),
             floor: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
@@ -4327,6 +4467,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            late_pendings: Vec::new(),
             floor: None,
             clears: Clears::default(),
             matched: false,
@@ -4421,6 +4562,7 @@ mod tests {
                 limits: None,
                 start_unattached: false,
                 late_start: None,
+                late_pendings: Vec::new(),
                 floor: None,
                 clears: Clears::default(),
                 matched: false,

@@ -503,7 +503,14 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   owed one to at least `undetermined` (once: an owed one already raised is not named again), and
   the exchange in flight that could own it is at least `undetermined` too when the item could
   change it: a transmit indication while its send stays unknown, a start while it has no answer
-  of its own. The others are
+  of its own. A forwarded pending bound to no primitive (`7F`, the service, 0x78) is a late item
+  the same way (ADR-371): the owed request whose negative pattern it carries takes it, judged
+  against that request's limit in force before it as a late response is (`system` within it;
+  past it plus the margin, `vehicle` when the VCI ended its wait at the limit and `undetermined`
+  when that is not shown; otherwise `undetermined`, and not judged on a link whose VCI absorbs
+  pendings). That judgement stands when the exchange is classified again, and the request's own
+  timing is judged without it. Only a pending in time carries the limit in force on for a later
+  late response; after one whose time is not shown, that limit is not known. The others are
   `unattached` events, written in
   the order read and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header

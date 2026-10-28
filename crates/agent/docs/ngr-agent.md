@@ -496,7 +496,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   exchange's own items, and restates that
   exchange's `sent` and outcome, judges its timing again, and reclassifies it and the later
   exchanges (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept
-  (`Kept::start_in_time`), so a late response that completes it, spanning frames, is `system`.
+  (`Kept::late_start`), so a late response that completes it, spanning frames, is `system`; a
+  start after the limit plus the margin is kept the same way, and the completing response is
+  judged as a late one (`vehicle` when the VCI ended its wait at the limit).
   One that two exchanges could own stays `unattached`, followed by a `late_item` that raises each
   owed one to at least `undetermined` (once: an owed one already raised is not named again), and
   the exchange in flight that could own it is at least `undetermined` too when the item could

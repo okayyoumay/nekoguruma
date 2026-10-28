@@ -2118,14 +2118,24 @@ impl LinkState {
 
     /// The window's exchanges whose entries were written after the agent's monotonic time
     /// `since_us` on agent epoch `epoch`, oldest first: those a link error whose time cannot be
-    /// placed may have come during (design 8.11 `late_item`). Each ended after that time, and an
-    /// entry is written when its exchange ends.
+    /// placed may have come during (design 8.11 `late_item`). Each ended at or after that time,
+    /// and an entry is written after its exchange's end is read. A refused exchange sent nothing
+    /// a link error could hit.
     pub(crate) fn written_since(&self, epoch: u32, since_us: Option<u64>) -> Vec<u64> {
         self.window
             .iter()
             .filter(|logged| {
+                !matches!(
+                    logged.evidence.end,
+                    End::NotSent(_)
+                        | End::VciLost {
+                            refused_after_loss: true
+                        }
+                )
+            })
+            .filter(|logged| {
                 let agent = &logged.evidence.times.agent;
-                agent.epoch != epoch || since_us.is_none_or(|since| agent.end_us > since)
+                agent.epoch != epoch || since_us.is_none_or(|since| agent.end_us >= since)
             })
             .map(|logged| logged.seq)
             .collect()
@@ -2134,15 +2144,6 @@ impl LinkState {
     /// The window's newest exchange.
     pub(crate) fn window_last(&self) -> Option<u64> {
         self.window.back().map(|logged| logged.seq)
-    }
-
-    /// The window's exchange logged just before exchange `seq`, if the window holds one.
-    pub(crate) fn window_before(&self, seq: u64) -> Option<u64> {
-        self.window
-            .iter()
-            .rev()
-            .map(|logged| logged.seq)
-            .find(|earlier| *earlier < seq)
     }
 
     /// A link error read late, on link `link`, came during exchange `seq` (design 8.11

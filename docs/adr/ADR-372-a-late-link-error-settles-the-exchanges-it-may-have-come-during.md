@@ -33,8 +33,9 @@ for a late reset.
 1. **Which items.** An unbound link error of no primitive that the exchange in flight does not
    take: its time comes before that exchange's span, or the exchange was refused. Also one of an
    earlier primitive, by its time; it keeps `primitive` `earlier`. One the exchange in flight
-   takes whose time cannot be placed is also taken as a possible error of the exchanges before it
-   (item 4).
+   takes because its time cannot be set against that exchange's (on no clock, or on a clock and
+   epoch none of the exchange's own times are on) is also taken as a possible error of the
+   exchanges before it (item 4).
 2. **Where it falls.** On each target's link state, by its VCI time on one clock and epoch:
    - **within** an exchange, from its earliest placed VCI time (its transmit done or the start of
      its response) to its latest, so a time before its transmit done is between exchanges;
@@ -55,19 +56,26 @@ for a late reset.
      - the exchanges after it count their matched answers and their answers since an error again
        from the window's exchanges after it alone, and are reclassified;
      - the link's own counts start again the same way;
-     - an answer from before it counts for none of the exchanges after it, also one read later.
+     - an answer from before it counts for none of the exchanges after it. The exchange it falls
+       within or after may still get a late answer, whose time against the error is not known;
+       that answer counts for the later exchanges, as it would have had the error been recorded
+       in time.
    - Before the window, the counts start again from the window's exchanges, and no window
      exchange is reclassified, since what they counted from before the window is not known.
      `not_reclassified_through` names the newest exchange it does not reclassify.
 4. **Not placed.** It is a possible link error (H3) during each window exchange whose entry was
    written since the link's items were last read before it:
-   - the last read is the latest read time of an item of its link before it, read with it or
-     during an earlier exchange (`Inner::link_reads`);
-   - an entry was written since when its exchange ended after that time.
+   - the last read is the latest time the host read an item of its link before it, read with it
+     or during an earlier exchange (`Inner::link_reads`): an unbound item, or one bound to a
+     primitive (a pending, a transmit confirmation, a response, the end);
+   - an entry was written since when its exchange ended at or after that time, since an entry is
+     written after its end is read;
+   - a refused exchange sent nothing a link error could hit, read nothing, and is passed over;
+   - an error with no read time takes the latest read of its link.
 
    Each such exchange takes it among its channel link errors, and the counts start again before
-   the first of them. When there is none, the error is no `late_item`: the exchange in flight
-   took it, or it stays `unattached`.
+   the first of them, also when the first is the window's oldest. When there is none, the error
+   is no `late_item`: the exchange in flight took it, or it stays `unattached`.
 5. **The entry.**
    - `refers_to`: the exchanges it came during or may have come during, then the later ones it
      reclassifies.
@@ -83,7 +91,11 @@ for a late reset.
   does not yet pass that primitive's `seq` with it, and at job end it does not pass link errors
   of no primitive to the log. That work is left to a later change.
 - An exchange with no VCI time on the error's clock is taken as after it, so it may lose matched
-  answers from before an error that came after it. This errs towards `undetermined`.
+  answers from before an error that came after it. A target whose exchanges share no clock with
+  the error is taken the same way. Both err towards `undetermined`.
+- The exchange in flight is not among the places an error it does not take can fall (one of an
+  earlier primitive, or one read during a refused exchange): such an error is placed among the
+  exchanges before it, and the exchange in flight takes no H3 evidence from it.
 - The set of exchanges an error that cannot be placed may have come during rests on the read
   times of items alone. A read that returned nothing is not seen, so the set can be larger than
   the reads would show.

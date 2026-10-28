@@ -2825,7 +2825,14 @@ impl Inner {
                     }
                     timing::LateWindow::Late { by_us } => Some(exchange::LateStart::Late {
                         by_us,
-                        at_limit: kept.evidence.timing.window == exchange::Window::TimeoutAtLimit,
+                        // A start after the timeout does not refute it: an earlier late start
+                        // that recorded it keeps it, since judging the timing again with the
+                        // response begun dropped the timeout.
+                        at_limit: kept.evidence.timing.window == exchange::Window::TimeoutAtLimit
+                            || matches!(
+                                kept.late_start,
+                                Some(exchange::LateStart::Late { at_limit: true, .. })
+                            ),
                     }),
                     timing::LateWindow::Open => None,
                 };
@@ -6937,11 +6944,46 @@ mod tests {
                 bytes: [0x62, 0xF1, 0x90].into_iter().chain([0x41; 9]).collect(),
             },
         };
-        let lines = run_on_opened_link(vec![
-            (timed_out, vec![transmit(10_000)]),
-            (own_transmit(0x91, 3_010_000), vec![start]),
-            (own_transmit(0x92, 6_010_000), vec![response]),
-        ]);
+        let run = |starts: Vec<UnattachedItem>, response: UnattachedItem| {
+            run_on_opened_link(vec![
+                (timed_out.clone(), vec![transmit(10_000)]),
+                (own_transmit(0x91, 3_010_000), starts),
+                (own_transmit(0x92, 6_010_000), vec![response]),
+            ])
+        };
+        let with_bytes = |bytes: Vec<u8>| UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes,
+            },
+            ..response.clone()
+        };
+        // The ECU began again, later still: the VCI ended its wait at the limit all the same.
+        // And a response of seven bytes, which may fit one frame, completing a late start, is
+        // late as well.
+        let again = UnattachedItem {
+            vci_us: 1_700_000,
+            read: read(3_010_600),
+            ..start_of_message(0x7E8)
+        };
+        for (starts, response) in [
+            (vec![start.clone(), again], response.clone()),
+            (
+                vec![start.clone()],
+                with_bytes(vec![0x62, 0xF1, 0x90, 0x41, 0x42, 0x43, 0x44]),
+            ),
+        ] {
+            let lines = run(starts, response);
+            let [completed] = &of_event(&lines, "late_response")[..] else {
+                panic!("{lines:?}");
+            };
+            assert_eq!(
+                completed["exchanges"][0]["classification"], "vehicle",
+                "{completed}"
+            );
+        }
+        let lines = run(vec![start], response);
         let exchanges = of_event(&lines, "exchange");
         assert_eq!(
             exchanges[0]["timing"]["window"], "timeout_at_limit",

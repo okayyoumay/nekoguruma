@@ -85,11 +85,12 @@ again (2026-10-28):
    - A start in time makes a later late response `system` only when that response spans frames:
      one that fits one frame came after a transfer the ECU aborted.
    - A start after the limit plus the margin is kept too (`Kept::late_start`): the ECU started
-     late, and a later late response that completes it, spanning frames, is judged as a late
-     response. Its `vehicle` row needs the VCI to have ended its wait at the limit. E's timing
-     judged before the start showed that (`LateStart::Late { at_limit }`), and a start that
-     comes after the timeout does not refute it, though judging E's timing again with the
-     response begun drops the timeout.
+     late, and any later late response that completes it is judged as a late response, since
+     it is past the limit too, whatever its length. Its `vehicle` row needs the VCI to have
+     ended its wait at the limit. E's timing judged before the first such start showed that
+     (`LateStart::Late { at_limit }`), and a start that comes after the timeout does not refute
+     it, though judging E's timing again with the response begun drops the timeout; a later
+     start that replaces it keeps that record.
    - The start counts as an answer for the later exchanges (`reclassify_after`), but not as a
      matched answer (ADR-354).
    - The entry gives the item as `unattached` gives it, with E's `sent`, `sent_evidence` and

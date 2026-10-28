@@ -1550,7 +1550,7 @@ impl LinkState {
     }
 
     /// Owed exchange `seq` has `evidence` now, which a `late_item` gave it, with `sent`, its
-    /// transmit done, and, for a start, the time its latest start came in time, if it did: an indication that confirms the send
+    /// transmit done, and, for a start, how its latest start was judged: an indication that confirms the send
     /// can own a late transmit indication no more.
     pub(crate) fn update_kept(
         &mut self,
@@ -2534,16 +2534,18 @@ pub(crate) fn settle_late_response(
     use Classification::{System, Undetermined, Vehicle};
     let base = classify(answered, history);
     // A start of the response read late (ADR-370): one before the limit less the margin means
-    // the response started in time, so the system missed it; one after the limit plus the
-    // margin means the ECU started late, which the response is judged as (design 8.11
-    // "Settlement"). Only a response that spans frames has a start of its own: one that fits
-    // one frame came after a transfer the ECU aborted.
+    // the response started in time, so the system missed it, but only for a response that
+    // spans frames, since one that fits one frame came after a transfer the ECU aborted; one
+    // after the limit plus the margin means the ECU started late, which any response completing
+    // after it is judged as (design 8.11 "Settlement").
     let spans_frames = answered
         .end
         .response()
         .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
-    let window = match (window, kept.late_start.filter(|_| spans_frames)) {
-        (LateWindow::Late { .. } | LateWindow::Open, Some(LateStart::InTime { at_us })) => {
+    let window = match (window, kept.late_start) {
+        (LateWindow::Late { .. } | LateWindow::Open, Some(LateStart::InTime { at_us }))
+            if spans_frames =>
+        {
             return started_in_time(at_us);
         }
         (LateWindow::Open, Some(LateStart::Late { by_us, .. })) => LateWindow::Late { by_us },

@@ -571,6 +571,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                 .unwrap_or(None)
             })
         };
+        // The errors' times go on their clocks first, in the order they were read.
+        self.place_late_errors(&progress, &bound_errors);
         // Whether an end of it was written, which carries its own errors.
         let end_written = match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
@@ -618,6 +620,29 @@ impl<C: WorkerApi> WorkerHost<C> {
             ),
         }
         self.log_late_errors(&progress, &bound_errors, end_written, &reads, stray.seq);
+    }
+
+    /// Places the times of the error events read at job end, of no primitive and of the stray
+    /// primitive, on their clocks in the order they were read, before the stray's end is
+    /// written (`CommLog::place_job_end_reads`).
+    fn place_late_errors(&self, progress: &Progress, bound_errors: &[Unbound]) {
+        let Some(log) = &self.comm_log else {
+            return;
+        };
+        let items: Vec<UnattachedItem> = unattached_items(&progress.unbound)
+            .into_iter()
+            .filter(|item| matches!(item.data, UnattachedData::Error { .. }))
+            .chain(unattached_items(bound_errors))
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let placed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.place_job_end_reads(&items)
+        }));
+        if placed.is_err() {
+            tracing::warn!("placing a job end's error times panicked");
+        }
     }
 
     /// Hands the communication log the link errors read at job end that no entry carries

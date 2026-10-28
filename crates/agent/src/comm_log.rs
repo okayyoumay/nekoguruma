@@ -2192,6 +2192,24 @@ impl CommLog {
         Some(seq)
     }
 
+    /// Places the times of `items`, read at job end, on their clocks in the order the host read
+    /// them, before the stray primitive's `primitive_ended` places its end's times, which carry
+    /// no read time of their own: a later time placed first would make an earlier one read before
+    /// it look like a step back (design 8.11 `clock_epoch`, ADR-361). Writes the `clock_epoch`
+    /// each opens. `None` once the log has failed.
+    pub(crate) fn place_job_end_reads(&self, items: &[UnattachedItem]) -> Option<()> {
+        let mut inner = self.lock();
+        let mut read: Vec<(&UnattachedItem, AgentNow)> = items
+            .iter()
+            .filter_map(|item| Some((item, item.read?)))
+            .collect();
+        read.sort_by_key(|(_, read)| (read.epoch, read.monotonic_us));
+        for (item, at) in read {
+            inner.place_read(item.clock, u64::from(item.vci_us), Some(at))?;
+        }
+        Some(())
+    }
+
     /// Takes the link errors the host read at job end, after the last exchange's entry: each is
     /// a `late_item` of the exchanges it came or may have come during, through the same rules
     /// as one an exchange reads (design 8.11 `late_item`, ADR-372), and one that settles none is
@@ -7997,6 +8015,98 @@ mod tests {
             serde_json::json!([exchange["seq"]]),
             "{late}"
         );
+    }
+
+    /// ADR-361 at job end: the times of the errors the host read are placed before the stray
+    /// primitive's end, whose times carry no read time of their own, so a response read after an
+    /// error with an earlier time opens no epoch of its own on a clock the exchange had none on.
+    #[test]
+    fn job_end_error_times_are_placed_before_the_primitive_s_end() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let run = |placed_first: bool| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+                Some(true),
+            )
+            .unwrap();
+            // An exchange the agent's deadline ended, with no VCI time.
+            let seq = log
+                .exchange_with(
+                    evidence(
+                        endpoint(0x7E0),
+                        &[0x22, 0xF1, 0x90],
+                        exchange::End::VciDidNotEnd,
+                    ),
+                    Vec::new(),
+                )
+                .unwrap();
+            // At job end: an error at 1 s, read first, then the response at 1.5 s.
+            let read = log.now();
+            let error = UnattachedItem {
+                link: 1,
+                earlier_primitive: false,
+                owner: None,
+                vci_us: 1_000_000,
+                clock: Some(exchange::Clock::Device),
+                read: Some(read),
+                data: UnattachedData::Error {
+                    event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                    link_error: Some(exchange::LinkErrorKind::Frame),
+                },
+            };
+            if placed_first {
+                log.place_job_end_reads(std::slice::from_ref(&error))
+                    .unwrap();
+            }
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    tx_indication: None,
+                    end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
+                    detail: exchange::Detail::default(),
+                    pending: Vec::new(),
+                    vci: exchange::VciTimes {
+                        rx_end: Some(device(1_500_000)),
+                        ..exchange::VciTimes::default()
+                    },
+                    vci_ended: true,
+                    link_errors: Vec::new(),
+                    indications: Vec::new(),
+                },
+            )
+            .unwrap();
+            log.late_link_errors(&[error], &[], Some(seq)).unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            assert_consecutive(&lines);
+            std::fs::remove_dir_all(&dir).unwrap();
+            lines
+        };
+        let reasons = |lines: &[serde_json::Value]| -> Vec<serde_json::Value> {
+            of_event(lines, "clock_epoch")
+                .into_iter()
+                .map(|line| line["reason"].clone())
+                .collect()
+        };
+        // Placed first: one epoch, which both times share.
+        let lines = run(true);
+        assert_eq!(reasons(&lines), [serde_json::json!("first")], "{lines:#?}");
+        // The response's time first would open a second epoch for the error: what the order
+        // avoids.
+        let lines = run(false);
+        assert_eq!(reasons(&lines).len(), 2, "{lines:#?}");
     }
 
     /// Runs `exchanges` on one log with link 1 opened (its limits and indications recorded),

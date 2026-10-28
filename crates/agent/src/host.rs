@@ -498,6 +498,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         // written, and the link errors of no primitive, read after the last exchange's entry
         // (ADR-372).
         let mut bound_errors: Vec<Unbound> = Vec::new();
+        // Every read of the link's items, which stands for the link errors read after it.
+        let mut reads: Vec<(u32, AgentNow)> = Vec::new();
         // `Some(None)` when the event stream failed or ended, `None` when the wait passed.
         let ended = if stray.cancel_failed {
             None
@@ -540,6 +542,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                                     .as_ref()
                                     .filter(|log| log.is_open())
                                     .map(|log| log.now());
+                                reads.extend(read.map(|read| (LOG_LINK, read)));
                                 if let Some(event_notification::EventData::Item(item)) =
                                     &notification.event_data
                                     && item.cop_handle == Some(cop)
@@ -569,15 +572,14 @@ impl<C: WorkerApi> WorkerHost<C> {
             })
         };
         // Whether an end of it was written, which carries its own errors.
-        let mut end_written = true;
-        match &ended {
+        let end_written = match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
             Some(Some(result @ Err(HostError::EventsLost))) => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result))
             }
             Some(Some(result)) => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
-                self.log_late_errors(&progress, &bound_errors, end_written && stray.seq.is_some());
+                let written = self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                self.log_late_errors(&progress, &bound_errors, written, &reads);
                 return;
             }
             // The stream failed or ended before it did: its end is unknown, with every item read
@@ -590,12 +592,10 @@ impl<C: WorkerApi> WorkerHost<C> {
             // The wait passed after the primitive's end was read, before its finished status:
             // that end settles it, and the primitive is still cancelled.
             None => match progress.end_read() {
-                Some(result) => {
-                    self.log_primitive_end(&stray, &progress, StrayEnd::Ended(&result));
-                }
-                None => end_written = false,
+                Some(result) => self.log_primitive_end(&stray, &progress, StrayEnd::Ended(&result)),
+                None => false,
             },
-        }
+        };
         let cancelled = handle.block_on(unary(
             self.timings.unary,
             "CancelComPrimitive",
@@ -607,7 +607,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             // Only a cancel the worker carried out is the agent's: one whose handle had ended,
             // or that failed, leaves the end unknown and the exchange as it was.
             Ok(_) if ended.is_none() && progress.end_read().is_none() => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled)
+                self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled);
             }
             Ok(_) => {}
             Err(HostError::VciLost) => {}
@@ -617,13 +617,19 @@ impl<C: WorkerApi> WorkerHost<C> {
                 "could not cancel a primitive past its deadline at job end"
             ),
         }
-        self.log_late_errors(&progress, &bound_errors, end_written && stray.seq.is_some());
+        self.log_late_errors(&progress, &bound_errors, end_written, &reads);
     }
 
     /// Hands the communication log the link errors read at job end that no entry carries
     /// (design 8.11 `late_item`, ADR-372): those of no primitive, and, when no end of the stray
     /// primitive was written, its own, which go to its exchange.
-    fn log_late_errors(&self, progress: &Progress, bound_errors: &[Unbound], end_written: bool) {
+    fn log_late_errors(
+        &self,
+        progress: &Progress,
+        bound_errors: &[Unbound],
+        end_written: bool,
+        reads: &[(u32, AgentNow)],
+    ) {
         let Some(log) = &self.comm_log else {
             return;
         };
@@ -647,7 +653,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             return;
         }
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            log.late_link_errors(&items)
+            log.late_link_errors(&items, reads)
         }));
         if logged.is_err() {
             tracing::warn!("writing a job end's late link errors panicked");
@@ -700,9 +706,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// Writes the `primitive_ended` entry of `stray`'s exchange, when its entry was written: its
     /// end as `progress` read it, or the agent's cancel when `ended` is `None` (design 8.11
     /// "Settlement", ADR-366).
-    fn log_primitive_end(&self, stray: &Stray, progress: &Progress, ended: StrayEnd<'_>) {
+    fn log_primitive_end(&self, stray: &Stray, progress: &Progress, ended: StrayEnd<'_>) -> bool {
         let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) else {
-            return;
+            return false;
         };
         let primitive = match ended {
             StrayEnd::Ended(result) => {
@@ -781,8 +787,12 @@ impl<C: WorkerApi> WorkerHost<C> {
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             log.primitive_ended(seq, primitive)
         }));
-        if logged.is_err() {
-            tracing::warn!("writing a primitive_ended entry panicked");
+        match logged {
+            Ok(written) => written.is_some(),
+            Err(_) => {
+                tracing::warn!("writing a primitive_ended entry panicked");
+                false
+            }
         }
     }
 
@@ -1562,7 +1572,8 @@ impl Settling {
             self.items.push(Unbound {
                 item: item.clone(),
                 read,
-                owner: self.stray.seq,
+                // Tagged with its exchange once the request's wait is over.
+                owner: None,
             });
         }
         let cancelled = matches!(

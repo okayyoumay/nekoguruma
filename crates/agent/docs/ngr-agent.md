@@ -506,7 +506,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   (`UnattachedItem.owner`). At job end, `WorkerHost::settle_at_end` also reads the link errors
   of no primitive while it waits for the stray primitive, and hands them to the log after its
   `primitive_ended` (`CommLog::late_link_errors`), with the primitive's own errors when no end
-  of it is written. An unbound transmit
+  of it is written; the log places them in the order the host read them, and every read at job
+  end stands for the link errors read after it, as an exchange's own reads do. An unbound transmit
   indication, loopback echo or start-of-message indication that the one ended exchange which
   could own it (one whose `sent` is still `unknown`, or an owed request awaiting a response on
   that identifier) owns, and not the exchange in flight, is a `late_item` settling entry

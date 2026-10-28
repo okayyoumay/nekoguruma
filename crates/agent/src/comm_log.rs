@@ -2189,10 +2189,18 @@ impl CommLog {
     /// Takes the link errors the host read at job end, after the last exchange's entry: each is
     /// a `late_item` of the exchanges it came or may have come during, through the same rules
     /// as one an exchange reads (design 8.11 `late_item`, ADR-372), and one that settles none is
-    /// `unattached`. Items that are no link error are passed over. `None` once the log has
-    /// failed.
-    pub(crate) fn late_link_errors(&self, items: &[UnattachedItem]) -> Option<()> {
+    /// `unattached`. They are placed in the order the host read them, and `reads` are every
+    /// read of the link's items at job end (`link`, when), which stand for the link errors read
+    /// after them as an exchange's own reads do. Items that are no link error are passed over.
+    /// `None` once the log has failed.
+    pub(crate) fn late_link_errors(
+        &self,
+        items: &[UnattachedItem],
+        reads: &[(u32, AgentNow)],
+    ) -> Option<()> {
         let mut inner = self.lock();
+        let mut items: Vec<&UnattachedItem> = items.iter().collect();
+        items.sort_by_key(|item| item.read.map(|read| (read.epoch, read.monotonic_us)));
         for item in items {
             let UnattachedData::Error {
                 link_error: Some(kind),
@@ -2202,17 +2210,15 @@ impl CommLog {
                 continue;
             };
             let placed = inner.place_read(item.clock, u64::from(item.vci_us), item.read)?;
-            let since = inner.read_since(item, &[]);
+            let since = inner.read_since(item, reads);
             if !inner.late_link_error(item, placed, kind, since)? {
                 let event = Event::Unattached(UnattachedEntry::of(item, placed));
                 inner.append_with(|seq, line| {
                     serde_json::to_writer(line, &Line { seq, event: &event })
                 })?;
             }
-            if let Some(read) = item.read {
-                inner.note_reads(&[(item.link, read)]);
-            }
         }
+        inner.note_reads(reads);
         Some(())
     }
 
@@ -3493,7 +3499,7 @@ impl Inner {
             .collect();
         text.push_str(&match (at, owned.as_slice()) {
             _ if owner.is_some() => format!(
-                "A link error of the primitive of the exchange logged as {} was read after that exchange's entry; it is that exchange's.",
+                "A link error of the primitive of the exchange logged as {} was read after that exchange's entry; it is that exchange's own, and is placed by its time for the other targets.",
                 owner.unwrap_or_default()
             ),
             (Some(_), []) => {
@@ -7853,6 +7859,94 @@ mod tests {
 
     /// Runs `exchanges` on one log with link 1 opened (its limits and indications recorded),
     /// each with the unbound items read during it, and gives every line written.
+    /// ADR-372 at job end (`CommLog::late_link_errors`): the errors are placed in the order the
+    /// host read them, so one read later with a later time opens no epoch for the one read
+    /// before it; and a read at job end before an error with no clock stands for it, as an
+    /// exchange's own reads do, so an exchange written before that read is not named.
+    #[test]
+    fn late_link_errors_at_job_end_follow_the_reads() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let at = |monotonic_us| AgentNow {
+            epoch: 0,
+            monotonic_us,
+            wall_unix_ms: 0,
+        };
+        let error = |vci_us: u32, clock, read_us| UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock,
+            read: Some(at(read_us)),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        let run = |items: Vec<UnattachedItem>, reads: Vec<(u32, AgentNow)>| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+                Some(true),
+            )
+            .unwrap();
+            // An answered read, its transmit at 1 s and its response at 1.2 s.
+            let mut answered = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+            );
+            answered.times.agent.before_us = 1_000_000;
+            answered.times.agent.end_us = 1_300_000;
+            answered.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(1_000_000)),
+                rx_end: Some(device(1_200_000)),
+                response_read_us: Some(1_200_100),
+                ..exchange::VciTimes::default()
+            });
+            log.exchange_with(answered, Vec::new()).unwrap();
+            log.late_link_errors(&items, &reads).unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            assert_consecutive(&lines);
+            std::fs::remove_dir_all(&dir).unwrap();
+            lines
+        };
+        // Given in the other order: the one read first, at 2 s, comes first, and the clock
+        // runs on with the one read 50 ms later.
+        let lines = run(
+            vec![
+                error(2_050_000, Some(exchange::Clock::Device), 2_050_100),
+                error(2_000_000, Some(exchange::Clock::Device), 2_000_100),
+            ],
+            Vec::new(),
+        );
+        let epochs: Vec<_> = of_event(&lines, "clock_epoch")
+            .into_iter()
+            .map(|line| line["reason"].clone())
+            .collect();
+        assert_eq!(epochs, [serde_json::json!("first")], "{lines:#?}");
+        // One on no clock, read at 3 s: the exchange may have seen it.
+        let lines = run(vec![error(0, None, 3_000_000)], Vec::new());
+        assert_eq!(of_event(&lines, "late_item").len(), 1, "{lines:#?}");
+        // With a read of the link at job end before it, after the exchange's entry: the
+        // exchange is not named, and it stays unattached.
+        let lines = run(vec![error(0, None, 3_000_000)], vec![(1, at(2_500_000))]);
+        assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+    }
+
     fn run_on_opened_link(
         exchanges: Vec<(exchange::Evidence, Vec<UnattachedItem>)>,
     ) -> Vec<serde_json::Value> {

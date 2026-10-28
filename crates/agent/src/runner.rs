@@ -15226,6 +15226,117 @@ def main():
         }
     }
 
+    /// Runs `requests` reads (`send_recv` each) on a fake worker whose primitives each give a
+    /// bound receive error `after` their start and their finished status 150 ms later, then
+    /// settles the job's end with a wait of `wait`; returns the log's lines.
+    async fn bound_errors_run(
+        requests: usize,
+        send_recv: Duration,
+        after: Duration,
+        wait: Duration,
+    ) -> Vec<serde_json::Value> {
+        let dir = journal_dir("stray-bound-error");
+        let (mut client, _fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((after, StartEvent::FailThenFinishLater)),
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv,
+        };
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(wait);
+            for _ in 0..requests {
+                let result = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            }
+            host.settle_at_end();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// Asserts that `lines` hold a `late_item` that gives the error of the exchange logged first
+    /// to that exchange, as the error of its own primitive (ADR-372).
+    fn assert_bound_to_first(lines: &[serde_json::Value]) {
+        let first = &lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .expect("an exchange entry")["seq"];
+        let late = lines
+            .iter()
+            .find(|line| line["event"] == "late_item")
+            .unwrap_or_else(|| panic!("a late_item in {lines:#?}"));
+        assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+        assert_eq!(late["primitive"], "earlier", "{late}");
+        assert_eq!(late["error_event"], "PDU_ERR_EVT_RX_ERROR", "{late}");
+        assert!(
+            late["text"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("primitive of the exchange logged as {first}")),
+            "{late}"
+        );
+    }
+
+    /// ADR-372: an error bound to the primitive the host cancelled before the next request,
+    /// read during that request's wait after the cancel and with no end of the primitive, goes to
+    /// that primitive's exchange whatever its time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_primitive_s_error_read_during_the_next_request_is_its_exchange_s() {
+        // The first primitive's error comes during the second request's wait (100 to 200 ms),
+        // its finished status after it.
+        let lines = bound_errors_run(
+            2,
+            Duration::from_millis(100),
+            Duration::from_millis(150),
+            Duration::from_millis(500),
+        )
+        .await;
+        let ended = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .expect("the first primitive's end");
+        assert_eq!(ended["cancelled_by_agent"], true, "{ended}");
+        assert_bound_to_first(&lines);
+    }
+
+    /// ADR-372: at job end, an error bound to the primitive past its deadline, read within the
+    /// job-end wait while no end of it is, goes to its exchange once the agent cancels it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_primitive_s_error_read_at_job_end_before_its_cancel_is_its_exchange_s() {
+        // The error comes at 100 ms, within the wait that ends at 150 ms; the finished status
+        // after it.
+        let lines = bound_errors_run(
+            1,
+            Duration::from_millis(50),
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+        )
+        .await;
+        let ended = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .expect("the primitive's end");
+        assert_eq!(ended["cancelled_by_agent"], true, "{ended}");
+        assert_bound_to_first(&lines);
+    }
+
     /// Design 8.11 `late_item` (ADR-372): a link error of no primitive read at job end, while
     /// the host waits for a primitive past its deadline, reaches the log after that primitive's
     /// `primitive_ended`, as a `late_item` of the exchange it may have come during.

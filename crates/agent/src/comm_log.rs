@@ -822,30 +822,17 @@ struct VciLossSettledEntry {
 
 const SUPPLY_NOT_EXCLUDED: &str = " a drop of the vehicle's supply is not excluded.";
 
-/// Whether the power was kept, and why, from the comparison: the VCI's `api` (only a D-PDU
-/// module's clock is its own time base), the `fit` when the gap could be measured, and whether
-/// the serial numbers match.
+/// Whether the power was kept, and why, from the comparison: whether a time of the VCI's own
+/// clock, as the worker names it (ADR-353), was read on both sides of the loss, the `fit` when
+/// the gap could be measured, and whether the serial numbers match. Nothing here depends on the
+/// worker's API (design principle 6): a worker whose clock reading is not the VCI's own time
+/// base names it `worker`, and one that gives no serial number gives none.
 fn power_kept(
-    api: Option<crate::launch::Api>,
     readings: bool,
     fit: Option<clocks::LossFit>,
     serial_match: Option<bool>,
 ) -> (PowerKept, String) {
-    use crate::launch::Api;
     let unknown = |why: &str| (PowerKept::Unknown, format!("{why};{SUPPLY_NOT_EXCLUDED}"));
-    match api {
-        Some(Api::Dpdu) => {}
-        Some(Api::J2534) => {
-            return unknown(
-                "The VCI's frame times have an origin its vendor defines, so they do not show whether it kept its power",
-            );
-        }
-        None => {
-            return unknown(
-                "The job was not told which API the VCI's library implements, so its clock does not show whether it kept its power",
-            );
-        }
-    }
     if !readings {
         return unknown(
             "No time of the VCI's own clock was read both before the loss and after the reconnect",
@@ -2711,10 +2698,11 @@ impl CommLog {
         // A time base that carried on over the connection is not shown yet: each clock's next
         // time opens a new epoch.
         inner.clocks.reconnect();
-        // Only a D-PDU module gives a serial number (design 8.11 `vci_loss_settled`).
+        // A worker that has no serial number to give leaves it zero (design 8.11
+        // `vci_loss_settled`).
         inner.serial_number = version
-            .filter(|_| api == Some(Api::Dpdu))
-            .map(|version| version.hw_serial_number);
+            .map(|version| version.hw_serial_number)
+            .filter(|&number| number != 0);
         let connected = inner
             .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
         // A loss an earlier run recorded is settled at once (ADR-373).
@@ -3673,8 +3661,7 @@ impl Inner {
             .serial_number
             .zip(self.serial_number)
             .map(|(before, after)| before == after);
-        let (power_kept, reason) =
-            power_kept(self.vci.map(|vci| vci.api), readings, fit, serial_match);
+        let (power_kept, reason) = power_kept(readings, fit, serial_match);
         let mut exchanges: Vec<LossSettled> = loss
             .ended
             .iter()
@@ -9310,7 +9297,13 @@ mod tests {
         assert_eq!(entry["serial_match"], false);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert!(entry["reason"].as_str().unwrap().contains("serial number"));
-        // A J2534 VCI's frame times show nothing, and it gives no serial number.
+        // A worker that gives no serial number: unknown, whatever the reading.
+        let entry = settle(0, dpdu_facts(), Some(carried));
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["serial_match"].is_null(), "{entry}");
+        assert!(entry["reason"].as_str().unwrap().contains("serial number"));
+        // The API the job was told changes nothing: the same evidence settles the same
+        // (design principle 6).
         let j2534 = RunFacts {
             vci: Some(VciFacts {
                 api: crate::launch::Api::J2534,
@@ -9319,9 +9312,7 @@ mod tests {
             ..facts()
         };
         let entry = settle(77, j2534, Some(carried));
-        assert_eq!(entry["power_kept"], "unknown", "{entry}");
-        assert!(entry["serial_match"].is_null(), "{entry}");
-        assert!(entry["reason"].as_str().unwrap().contains("vendor"));
+        assert_eq!(entry["power_kept"], true, "{entry}");
         // No reading after the reconnect.
         let entry = settle(77, dpdu_facts(), None);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");

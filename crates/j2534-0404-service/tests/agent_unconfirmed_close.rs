@@ -347,8 +347,9 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup, comm_log:
 }
 
 /// The first job's log records the loss of the VCI on the second request, and the second job's
-/// settles it right after its VCI connected. A J2534 VCI's frame times do not show whether it
-/// kept its power, so the loss stays `undetermined`.
+/// settles it right after its VCI connected. The J2534 worker reads its clock on its own
+/// synthetic clock, not the VCI's, so nothing shows whether the VCI kept its power and the loss
+/// stays `undetermined`.
 fn assert_loss_settled(dir: &Path) {
     let lines = log_lines(dir);
     let text = || format!("{lines:#?}");
@@ -396,7 +397,7 @@ fn assert_loss_settled(dir: &Path) {
         settled["reason"]
             .as_str()
             .expect("a reason")
-            .contains("vendor"),
+            .contains("own clock"),
         "{settled}"
     );
     // Only one settlement.

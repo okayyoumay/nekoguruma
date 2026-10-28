@@ -53,8 +53,11 @@ record alone.
    right after `vci_connected`, against that reading. The reading is placed on its clock first,
    which opens that clock's first epoch of the run. The comparison follows design 8.11:
    - The gap is measured only when the last time and the reading lie in one agent epoch.
-   - The comparison is made only on a D-PDU link, between two times of the VCI's own (`device`)
-     clock.
+   - The comparison is made only between two times the worker names as the VCI's own clock
+     (`device`, ADR-353), and a serial number counts only when the worker gives one (zero is
+     none). The agent does not branch on the worker's API (design principle 6): the J2534
+     worker reads the clock on its own synthetic one (`worker`) and gives no serial number, so
+     its losses stay `undetermined` by the same rule, as design 8.11 expects of J2534.
    - The power is kept only when the reading fits a clock that carried on and not one that
      restarted, and the serial numbers match. The exchanges are then `system`.
 
@@ -67,8 +70,8 @@ record alone.
    Otherwise the loss stays `undetermined`, and the entry says why:
    - a restart (`power_kept` `false`);
    - a reading that fits both or neither, a serial number that does not match or is missing, no
-     reading of the device clock on both sides, a J2534 link, an API the job was not told, or a
-     gap across agent epochs (`power_kept` `unknown`).
+     reading of the device clock on both sides, or a gap across agent epochs (`power_kept`
+     `unknown`).
 
 ## Consequences
 
@@ -82,7 +85,9 @@ record alone.
   show that yet.
 - On a J2534 link the settlement does not wait for a device-timestamped frame. Design 8.11 lets
   a hardware profile state that the VCI's frame clock is its own and restarts at power-up, but
-  the profile has no such field yet, so a J2534 loss settles at the reconnect as `unknown`.
+  the profile has no such field yet, so a J2534 loss settles at the reconnect as `unknown`. When
+  it gains one, the J2534 worker would give its reading on the `device` clock for such a VCI,
+  and the agent's rule stays as it is.
 - A loss record and its settlement are small lines. A loss that causes many refusals writes its
   record once per refusal, growing with each one. A run that loses its VCI ends quickly, so few
   are expected.

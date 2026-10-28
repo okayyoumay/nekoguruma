@@ -1279,14 +1279,6 @@ struct Inner {
     unsettled: Option<VciLoss>,
     /// The serial number of the run's VCI, from `vci_connected`, when the API gave one.
     serial_number: Option<u32>,
-    /// The placements of the job end's error times, made before the stray primitive's end
-    /// (`CommLog::place_job_end_reads`), which `CommLog::late_link_errors` takes instead of
-    /// placing the same times again on a clock that has run on since.
-    job_end_placed: Vec<(UnattachedItem, Option<clocks::Placed>)>,
-    /// The times that started the stray primitive's exchange, taken before its
-    /// `primitive_ended` replaces its evidence's times with its end's: what a job end's error is
-    /// set against, as for the exchange in flight.
-    job_end_starts: Option<(u64, Vec<(exchange::Clock, clocks::Placed)>)>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -1400,8 +1392,6 @@ impl CommLog {
             loss: None,
             unsettled: scan.unsettled,
             serial_number: None,
-            job_end_placed: Vec::new(),
-            job_end_starts: None,
         })))
     }
 
@@ -2000,13 +1990,7 @@ impl CommLog {
                 continue;
             };
             let since = inner.read_since(&unbound[at_item], &batch_reads);
-            if inner.late_link_error(
-                &unbound[at_item],
-                unbound_placed[at_item],
-                kind,
-                since,
-                None,
-            )? {
+            if inner.late_link_error(&unbound[at_item], unbound_placed[at_item], kind, since)? {
                 unbound.remove(at_item);
                 unbound_placed.remove(at_item);
             } else {
@@ -2015,7 +1999,7 @@ impl CommLog {
         }
         for (item, kind) in own_unplaced {
             let since = inner.read_since(&item, &batch_reads);
-            inner.late_link_error(&item, None, kind, since, None)?;
+            inner.late_link_error(&item, None, kind, since)?;
         }
         inner.note_reads(&batch_reads);
         // The transmit done starts the first pending's interval.
@@ -2200,150 +2184,6 @@ impl CommLog {
             inner.note_loss(seq, entry.classification, refused)?;
         }
         Some(seq)
-    }
-
-    /// Places the times of `items`, read at job end, on their clocks in the order the host read
-    /// them, before the stray primitive's `primitive_ended` places its end's times, which carry
-    /// no read time of their own: a later time placed first would make an earlier one read before
-    /// it look like a step back (design 8.11 `clock_epoch`, ADR-361). Writes the `clock_epoch`
-    /// each opens. `None` once the log has failed.
-    pub(crate) fn place_job_end_reads(
-        &self,
-        items: &[UnattachedItem],
-        in_flight: Option<u64>,
-    ) -> Option<()> {
-        let mut inner = self.lock();
-        inner.job_end_placed.clear();
-        inner.job_end_starts = in_flight.map(|seq| {
-            let starts = inner
-                .links
-                .iter()
-                .find(|(_, state)| state.holds(seq))
-                .map(|(_, state)| state.starts_of(seq))
-                .unwrap_or_default();
-            (seq, starts)
-        });
-        let mut read: Vec<(&UnattachedItem, AgentNow)> = items
-            .iter()
-            .filter_map(|item| Some((item, item.read?)))
-            .collect();
-        read.sort_by_key(|(_, read)| (read.epoch, read.monotonic_us));
-        for (item, at) in read {
-            let placed = inner.place_read(item.clock, u64::from(item.vci_us), Some(at))?;
-            inner.job_end_placed.push((item.clone(), placed));
-        }
-        Some(())
-    }
-
-    /// Takes the link errors the host read at job end, after the last exchange's entry: each is
-    /// a `late_item` of the exchanges it came or may have come during, through the same rules
-    /// as one an exchange reads (design 8.11 `late_item`, ADR-372), and one that settles none is
-    /// `unattached`. They are placed in the order the host read them, and `reads` are every
-    /// read of the link's items at job end (`link`, when), which stand for the link errors read
-    /// after them as an exchange's own reads do. `in_flight` is the exchange of the primitive
-    /// the host waited for, still running while they were read: one that cannot be placed may
-    /// have come during it, as the exchange in flight takes such an error. Items that are no
-    /// link error are passed over. `None` once the log has failed.
-    pub(crate) fn late_link_errors(
-        &self,
-        items: &[UnattachedItem],
-        reads: &[(u32, AgentNow)],
-        in_flight: Option<(u64, Option<AgentNow>)>,
-    ) -> Option<()> {
-        let mut inner = self.lock();
-        let mut items: Vec<&UnattachedItem> = items.iter().collect();
-        // In read order, an item with no read time last, as an exchange places its own.
-        items.sort_by_key(|item| {
-            (
-                item.read.is_none(),
-                item.read.map(|read| (read.epoch, read.monotonic_us)),
-            )
-        });
-        let reads: Vec<(u32, AgentNow)> = reads
-            .iter()
-            .copied()
-            .chain(
-                items
-                    .iter()
-                    .filter_map(|item| Some((item.link, item.read?))),
-            )
-            .collect();
-        for item in items {
-            let UnattachedData::Error {
-                link_error: Some(kind),
-                ..
-            } = item.data
-            else {
-                continue;
-            };
-            let pre_placed = inner
-                .job_end_placed
-                .iter()
-                .find(|(placed_item, _)| placed_item == item)
-                .map(|(_, placed)| *placed);
-            let placed = match pre_placed {
-                Some(placed) => placed,
-                None => inner.place_read(item.clock, u64::from(item.vci_us), item.read)?,
-            };
-            let since = inner.read_since(item, &reads);
-            // Read while the primitive still ran, before its end was read: its exchange stands
-            // in for the exchange in flight (design 8.11 "Link error").
-            // An error bound to the stray goes to it by `owner`, placed as it was.
-            let running = in_flight
-                .filter(|_| item.owner.is_none())
-                .and_then(|(seq, end_read)| {
-                    let before_end = match (end_read, item.read) {
-                        (None, _) => true,
-                        (Some(end), Some(read)) => {
-                            read.epoch == end.epoch && read.monotonic_us < end.monotonic_us
-                        }
-                        (Some(_), None) => false,
-                    };
-                    before_end.then_some(seq)
-                });
-            let (placed, took) = match running {
-                Some(seq) => {
-                    // Its starts as they were before its end was written.
-                    let starts = match &inner.job_end_starts {
-                        Some((of, starts)) if *of == seq => starts.clone(),
-                        _ => inner
-                            .links
-                            .iter()
-                            .find(|(_, state)| state.holds(seq))
-                            .map(|(_, state)| state.starts_of(seq))
-                            .unwrap_or_default(),
-                    };
-                    let on_its_clock = |placed: clocks::Placed| {
-                        starts
-                            .iter()
-                            .filter(|(clock, start)| {
-                                item.clock == Some(*clock) && start.epoch == placed.epoch
-                            })
-                            .map(|(_, start)| start.unwrapped)
-                            .min()
-                    };
-                    match placed.and_then(|placed| Some((placed, on_its_clock(placed)?))) {
-                        // Before the exchange's span: an earlier exchange's.
-                        Some((placed, start)) if placed.unwrapped < start => (Some(placed), None),
-                        Some((placed, _)) => (Some(placed), Some(seq)),
-                        // Its time cannot be set against the exchange's: the exchange's, and
-                        // possibly the exchanges' written since the last read.
-                        None => (None, Some(seq)),
-                    }
-                }
-                None => (placed, None),
-            };
-            if !inner.late_link_error(item, placed, kind, since, took)? {
-                let event = Event::Unattached(UnattachedEntry::of(item, placed));
-                inner.append_with(|seq, line| {
-                    serde_json::to_writer(line, &Line { seq, event: &event })
-                })?;
-            }
-        }
-        inner.note_reads(&reads);
-        inner.job_end_placed.clear();
-        inner.job_end_starts = None;
-        Some(())
     }
 
     /// Drops what the log kept of the exchange logged as `seq`, which nothing will settle: its
@@ -3474,6 +3314,9 @@ impl Inner {
             .map(|_| ())
     }
 
+    /// Writes the `late_item` settling entry of `item`, an indication two or more exchanges
+    /// could own, logged `unattached` as line `unattached`: each owed exchange of `owners` on
+    /// link `at` is at least `undetermined` (design 8.11 `late_item`, ADR-370).
     /// The agent epoch and time the host last read an item of `item`'s link before `item`:
     /// another item of `reads`, read with it, or one an earlier exchange read.
     fn read_since(&self, item: &UnattachedItem, reads: &[(u32, AgentNow)]) -> (u32, Option<u64>) {
@@ -3522,7 +3365,7 @@ impl Inner {
     ///
     /// One bound to a primitive whose exchange the host names (`item.owner`) goes to that
     /// exchange, on the link state that holds it, as a fault seen in it on its own link, whatever
-    /// its time; it is placed by its time on the other targets' link states.
+    /// its time; the other targets take it as any late link error.
     ///
     /// Gives whether it wrote a line: one that cannot be placed and that no exchange could have
     /// come during writes none.
@@ -3532,7 +3375,6 @@ impl Inner {
         placed: Option<clocks::Placed>,
         kind: exchange::LinkErrorKind,
         since: (u32, Option<u64>),
-        took: Option<u64>,
     ) -> Option<bool> {
         let written = self.next_seq;
         let mut during: Vec<(exchange::Reclassified, bool)> = Vec::new();
@@ -3560,10 +3402,6 @@ impl Inner {
                     let owner = owner.unwrap_or_default();
                     (vec![owner], Some(owner))
                 }
-                Some(_) if took.is_some_and(|took| state.holds(took)) => {
-                    let took = took.unwrap_or_default();
-                    (vec![took], Some(took))
-                }
                 Some(exchange::ErrorPoint::Within(seq)) => (vec![seq], Some(seq)),
                 Some(exchange::ErrorPoint::After(seq)) => (Vec::new(), Some(seq)),
                 Some(exchange::ErrorPoint::BeforeWindow { within }) => {
@@ -3573,15 +3411,8 @@ impl Inner {
                 Some(exchange::ErrorPoint::NotPlaced) => (Vec::new(), state.window_last()),
                 None => {
                     // Before the first exchange it may have come during; with none, after the
-                    // last. The exchange whose primitive was still running when it was read may
-                    // have seen it.
-                    let mut owners = state.written_since(since.0, since.1);
-                    if let Some(took) = took.filter(|took| state.holds(*took))
-                        && !owners.contains(&took)
-                    {
-                        owners.push(took);
-                        owners.sort_unstable();
-                    }
+                    // last.
+                    let owners = state.written_since(since.0, since.1);
                     let after = match owners.first() {
                         Some(first) => Some(first - 1),
                         None => state.window_last(),
@@ -3595,7 +3426,7 @@ impl Inner {
         }
         for ((_, state), (owners, after)) in self.links.iter_mut().zip(points) {
             for during_seq in owners {
-                let own = owner == Some(during_seq) || took == Some(during_seq);
+                let own = owner == Some(during_seq);
                 during.extend(state.error_in(during_seq, kind, item.link, at.is_some() || own));
             }
             let (changed, through) = state.error_after(after, written, kind);
@@ -3631,10 +3462,6 @@ impl Inner {
             .map(|(owner, _)| owner.seq.to_string())
             .collect();
         text.push_str(&match (at, owned.as_slice()) {
-            _ if took.is_some() && owner.is_none() => format!(
-                "A link error was read while the primitive of the exchange logged as {} still ran; it is that exchange's own, as the exchange in flight takes such an error.",
-                took.unwrap_or_default()
-            ),
             _ if owner.is_some() => format!(
                 "A link error of the primitive of the exchange logged as {} was read after that exchange's entry; it is that exchange's own, and the other targets take it as any late link error.",
                 owner.unwrap_or_default()
@@ -3679,9 +3506,6 @@ impl Inner {
             .map(|_| true)
     }
 
-    /// Writes the `late_item` settling entry of `item`, an indication two or more exchanges
-    /// could own, logged `unattached` as line `unattached`: each owed exchange of `owners` on
-    /// link `at` is at least `undetermined` (design 8.11 `late_item`, ADR-370).
     fn late_item_unowned(
         &mut self,
         at: usize,
@@ -7995,367 +7819,6 @@ mod tests {
             ]
         );
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// ADR-372 at job end (`CommLog::late_link_errors`): the errors are placed in the order the
-    /// host read them, so one read later with a later time opens no epoch for the one read
-    /// before it; and a read at job end before an error with no clock stands for it, as an
-    /// exchange's own reads do, so an exchange written before that read is not named.
-    #[test]
-    fn late_link_errors_at_job_end_follow_the_reads() {
-        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
-        let at = |monotonic_us| AgentNow {
-            epoch: 0,
-            monotonic_us,
-            wall_unix_ms: 0,
-        };
-        let error = |vci_us: u32, clock, read_us| UnattachedItem {
-            link: 1,
-            earlier_primitive: false,
-            owner: None,
-            vci_us,
-            clock,
-            read: Some(at(read_us)),
-            data: UnattachedData::Error {
-                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
-                extra_error_info: None,
-                extra_error_info_name: None,
-                link_error: Some(exchange::LinkErrorKind::Frame),
-            },
-        };
-        let run = |items: Vec<UnattachedItem>, reads: Vec<(u32, AgentNow)>, running: bool| {
-            let dir = dir();
-            let setup = setup(&dir);
-            let log = CommLog::open(&setup).unwrap();
-            log.begin(&facts(), RunKind::First);
-            log.link_opened(
-                1,
-                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
-                &[],
-                crate::link::Indications {
-                    transmit: true,
-                    start_of_message: true,
-                },
-                Some(true),
-            )
-            .unwrap();
-            // An answered read, its transmit at 1 s and its response at 1.2 s.
-            let mut answered = evidence(
-                endpoint(0x7E0),
-                &[0x22, 0xF1, 0x90],
-                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
-            );
-            answered.times.agent.before_us = 1_000_000;
-            answered.times.agent.end_us = 1_300_000;
-            answered.times.vci = Some(exchange::VciTimes {
-                tx_done: Some(device(1_000_000)),
-                rx_end: Some(device(1_200_000)),
-                response_read_us: Some(1_200_100),
-                ..exchange::VciTimes::default()
-            });
-            let seq = log.exchange_with(answered, Vec::new()).unwrap();
-            log.late_link_errors(&items, &reads, running.then_some((seq, None)))
-                .unwrap();
-            log.end("ok");
-            let lines = lines(&setup);
-            assert_consecutive(&lines);
-            std::fs::remove_dir_all(&dir).unwrap();
-            lines
-        };
-        // Given in the other order: the one read first, at 2 s, comes first, and the clock
-        // runs on with the one read 50 ms later.
-        let lines = run(
-            vec![
-                error(2_050_000, Some(exchange::Clock::Device), 2_050_100),
-                error(2_000_000, Some(exchange::Clock::Device), 2_000_100),
-            ],
-            Vec::new(),
-            false,
-        );
-        let epochs: Vec<_> = of_event(&lines, "clock_epoch")
-            .into_iter()
-            .map(|line| line["reason"].clone())
-            .collect();
-        assert_eq!(epochs, [serde_json::json!("first")], "{lines:#?}");
-        // One on no clock, read at 3 s: the exchange may have seen it.
-        let lines = run(vec![error(0, None, 3_000_000)], Vec::new(), false);
-        assert_eq!(of_event(&lines, "late_item").len(), 1, "{lines:#?}");
-        // With a read of the link at job end before it, after the exchange's entry: the
-        // exchange is not named, and it stays unattached.
-        let lines = run(
-            vec![error(0, None, 3_000_000)],
-            vec![(1, at(2_500_000))],
-            false,
-        );
-        assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
-        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
-        // Unless its primitive was the one still running when the error was read: as the
-        // exchange in flight, it may have seen it.
-        let lines = run(
-            vec![error(0, None, 3_000_000)],
-            vec![(1, at(2_500_000))],
-            true,
-        );
-        let [late] = &of_event(&lines, "late_item")[..] else {
-            panic!("{lines:#?}");
-        };
-        let exchange = &of_event(&lines, "exchange")[0];
-        assert_eq!(
-            late["refers_to"],
-            serde_json::json!([exchange["seq"]]),
-            "{late}"
-        );
-    }
-
-    /// ADR-361 at job end: the times of the errors the host read are placed before the stray
-    /// primitive's end, whose times carry no read time of their own, so a response read after an
-    /// error with an earlier time opens no epoch of its own on a clock the exchange had none on;
-    /// and their `late_item`s take those placements, so an earlier error is not placed again
-    /// once the clock has run past it.
-    #[test]
-    fn job_end_error_times_are_placed_before_the_primitive_s_end() {
-        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
-        let run = |placed_first: bool| {
-            let dir = dir();
-            let setup = setup(&dir);
-            let log = CommLog::open(&setup).unwrap();
-            log.begin(&facts(), RunKind::First);
-            log.link_opened(
-                1,
-                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
-                &[],
-                crate::link::Indications {
-                    transmit: true,
-                    start_of_message: true,
-                },
-                Some(true),
-            )
-            .unwrap();
-            // An exchange the agent's deadline ended, with no VCI time.
-            let seq = log
-                .exchange_with(
-                    evidence(
-                        endpoint(0x7E0),
-                        &[0x22, 0xF1, 0x90],
-                        exchange::End::VciDidNotEnd,
-                    ),
-                    Vec::new(),
-                )
-                .unwrap();
-            // At job end: errors at 1 s and 1.05 s, read in that order 50 ms apart, then the
-            // response at 1.5 s.
-            let read = log.now();
-            let error = |vci_us, after_us| UnattachedItem {
-                link: 1,
-                earlier_primitive: false,
-                owner: None,
-                vci_us,
-                clock: Some(exchange::Clock::Device),
-                read: Some(AgentNow {
-                    monotonic_us: read.monotonic_us + after_us,
-                    ..read
-                }),
-                data: UnattachedData::Error {
-                    event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
-                    extra_error_info: None,
-                    extra_error_info_name: None,
-                    link_error: Some(exchange::LinkErrorKind::Frame),
-                },
-            };
-            let errors = [error(1_000_000, 0), error(1_050_000, 50_000)];
-            if placed_first {
-                log.place_job_end_reads(&errors, Some(seq)).unwrap();
-            }
-            log.primitive_ended(
-                seq,
-                PrimitiveEnded {
-                    tx_indication: None,
-                    end: Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
-                    detail: exchange::Detail::default(),
-                    pending: Vec::new(),
-                    vci: exchange::VciTimes {
-                        rx_end: Some(device(1_500_000)),
-                        ..exchange::VciTimes::default()
-                    },
-                    vci_ended: true,
-                    link_errors: Vec::new(),
-                    indications: Vec::new(),
-                },
-            )
-            .unwrap();
-            log.late_link_errors(&errors, &[], Some((seq, None)))
-                .unwrap();
-            log.end("ok");
-            let lines = lines(&setup);
-            assert_consecutive(&lines);
-            std::fs::remove_dir_all(&dir).unwrap();
-            lines
-        };
-        let reasons = |lines: &[serde_json::Value]| -> Vec<serde_json::Value> {
-            of_event(lines, "clock_epoch")
-                .into_iter()
-                .map(|line| line["reason"].clone())
-                .collect()
-        };
-        // Placed first, and not placed again: one epoch, which every time shares.
-        let lines = run(true);
-        assert_eq!(reasons(&lines), [serde_json::json!("first")], "{lines:#?}");
-        // The response's time first would open a second epoch for the error: what the order
-        // avoids.
-        let lines = run(false);
-        assert_eq!(reasons(&lines).len(), 2, "{lines:#?}");
-    }
-
-    /// Design 8.11 "Link error" at job end: the exchange of the primitive the host still waited
-    /// for stands in for the exchange in flight, for the errors read before that primitive's end
-    /// was read. One at or after its earliest time, or not set against its times, is its own;
-    /// one before it is placed among the exchanges before it; one read after its end was read is
-    /// placed by its time alone.
-    #[test]
-    fn a_job_end_error_read_while_the_primitive_ran_is_its_exchange_s() {
-        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
-        // `stray_tx`: the stray's transmit done on the device clock, if any; the error on
-        // `clock` at `error_us`, read 10 ms after the stray's entry; its end read `end_after`
-        // after that entry, if it was. Gives the late item and the two exchanges' `seq`.
-        let run = |stray_tx: Option<u64>,
-                   error_us: u32,
-                   clock: exchange::Clock,
-                   end_after: Option<u64>| {
-            let dir = dir();
-            let setup = setup(&dir);
-            let log = CommLog::open(&setup).unwrap();
-            log.begin(&facts(), RunKind::First);
-            log.link_opened(
-                1,
-                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
-                &[],
-                crate::link::Indications {
-                    transmit: true,
-                    start_of_message: true,
-                },
-                Some(true),
-            )
-            .unwrap();
-            // An answered read, from 1 s to 1.2 s.
-            let mut answered = evidence(
-                endpoint(0x7E0),
-                &[0x22, 0xF1, 0x90],
-                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
-            );
-            answered.times.agent.before_us = 1_000_000;
-            answered.times.agent.end_us = 1_300_000;
-            answered.times.vci = Some(exchange::VciTimes {
-                tx_done: Some(device(1_000_000)),
-                rx_end: Some(device(1_200_000)),
-                response_read_us: Some(1_200_100),
-                ..exchange::VciTimes::default()
-            });
-            let first = log.exchange_with(answered, Vec::new()).unwrap();
-            // The stray, which the agent's deadline ended.
-            let mut stray = evidence(
-                endpoint(0x7E0),
-                &[0x22, 0xF1, 0x91],
-                exchange::End::VciDidNotEnd,
-            );
-            stray.times.agent.before_us = 2_000_000;
-            stray.times.agent.end_us = 2_100_000;
-            stray.times.vci = stray_tx.map(|us| exchange::VciTimes {
-                tx_done: Some(device(us)),
-                ..exchange::VciTimes::default()
-            });
-            let second = log.exchange_with(stray, Vec::new()).unwrap();
-            let at = |monotonic_us| AgentNow {
-                epoch: 0,
-                monotonic_us,
-                wall_unix_ms: 0,
-            };
-            let error = UnattachedItem {
-                link: 1,
-                earlier_primitive: false,
-                owner: None,
-                vci_us: error_us,
-                clock: Some(clock),
-                read: Some(at(2_110_000)),
-                data: UnattachedData::Error {
-                    event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
-                    extra_error_info: None,
-                    extra_error_info_name: None,
-                    link_error: Some(exchange::LinkErrorKind::Frame),
-                },
-            };
-            let end_read = end_after.map(|after| at(2_100_000 + after));
-            // As the host does: the error's time first, then the stray's end (a receive
-            // timeout, which carries no start of its own), then the late item.
-            log.place_job_end_reads(std::slice::from_ref(&error), Some(second))
-                .unwrap();
-            log.primitive_ended(
-                second,
-                PrimitiveEnded {
-                    tx_indication: None,
-                    end: Some(exchange::End::NoResponse),
-                    detail: exchange::Detail::default(),
-                    pending: Vec::new(),
-                    vci: exchange::VciTimes {
-                        rx_timeout: Some(device(3_100_000)),
-                        ..exchange::VciTimes::default()
-                    },
-                    vci_ended: true,
-                    link_errors: Vec::new(),
-                    indications: Vec::new(),
-                },
-            )
-            .unwrap();
-            log.late_link_errors(&[error], &[], Some((second, end_read)))
-                .unwrap();
-            log.end("ok");
-            let lines = lines(&setup);
-            assert_consecutive(&lines);
-            std::fs::remove_dir_all(&dir).unwrap();
-            let late = of_event(&lines, "late_item")
-                .first()
-                .map(|late| (*late).clone())
-                .unwrap_or_else(|| panic!("a late_item in {lines:#?}"));
-            (late, first, second)
-        };
-        let ran = |late: &serde_json::Value| late["text"].as_str().unwrap().contains("still ran");
-        // After the stray's transmit done at 2 s: its own.
-        let (late, _, second) = run(Some(2_000_000), 2_500_000, exchange::Clock::Device, None);
-        assert!(ran(&late), "{late}");
-        assert_eq!(late["refers_to"][0], second, "{late}");
-        // Before it (within the clock margin of the latest time, so on its epoch): placed among
-        // the exchanges before it, not the stray's own.
-        let (late, _, _) = run(Some(2_000_000), 1_999_500, exchange::Clock::Device, None);
-        assert!(!ran(&late), "{late}");
-        // The stray has no time on the error's clock: its own, though the answered read has
-        // one.
-        let (late, _, second) = run(None, 3_000_000, exchange::Clock::Device, None);
-        assert!(ran(&late), "{late}");
-        assert_eq!(late["refers_to"][0], second, "{late}");
-        // On another clock: its own as well.
-        let (late, _, second) = run(Some(2_000_000), 5, exchange::Clock::Worker, None);
-        assert!(ran(&late), "{late}");
-        assert!(
-            late["refers_to"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!(second)),
-            "{late}"
-        );
-        // Read after the stray's end was read: after the stray, which takes nothing.
-        let (late, _, second) = run(
-            Some(2_000_000),
-            2_500_000,
-            exchange::Clock::Device,
-            Some(5_000),
-        );
-        assert!(!ran(&late), "{late}");
-        assert!(
-            !late["refers_to"]
-                .as_array()
-                .unwrap()
-                .contains(&serde_json::json!(second)),
-            "{late}"
-        );
     }
 
     /// Runs `exchanges` on one log with link 1 opened (its limits and indications recorded),

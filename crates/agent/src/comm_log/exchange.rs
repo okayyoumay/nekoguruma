@@ -2141,27 +2141,6 @@ impl LinkState {
             .collect()
     }
 
-    /// The placed times that start the exchange logged as `seq`, in the window or kept beyond
-    /// it: its transmit done and the start of its response, each on its clock and epoch.
-    pub(crate) fn starts_of(&self, seq: u64) -> Vec<(Clock, Placed)> {
-        let evidence = self
-            .window
-            .iter()
-            .find(|logged| logged.seq == seq)
-            .map(|logged| &logged.evidence)
-            .or_else(|| self.kept(seq).map(|kept| &kept.evidence));
-        evidence
-            .and_then(|evidence| evidence.times.vci.as_ref())
-            .map(|vci| {
-                [vci.tx_done, vci.rx_start]
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|time| time.placed())
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     /// Whether the exchange logged as `seq` is in the window, or kept beyond it.
     pub(crate) fn holds(&self, seq: u64) -> bool {
         self.window.iter().any(|logged| logged.seq == seq) || self.kept(seq).is_some()

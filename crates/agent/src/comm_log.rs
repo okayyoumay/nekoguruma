@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use diag_ir::VmState;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::artifact::to_hex;
 use crate::journal::{JobKey, JournalError, Vin, WriterLock, job_file_stem, sync_dir};
@@ -134,7 +134,8 @@ pub enum CommLogIncomplete {
     /// The log was reopened without a clean close, or with a torn last line, so lines not yet
     /// flushed by the earlier run may be missing.
     UncleanReopen,
-    /// The opening lines or the `job_end` could not be made durable.
+    /// The opening lines, a lost VCI's record (`vci_loss`) or the `job_end` could not be made
+    /// durable.
     CloseFailed(io::ErrorKind),
 }
 
@@ -196,6 +197,8 @@ enum Event<'a> {
     LateItem(LateItemEntry<'a>),
     PrimitiveEnded(Box<PrimitiveEndedEntry>),
     ClockEpoch(clocks::ClockEpoch),
+    VciLoss(VciLoss),
+    VciLossSettled(Box<VciLossSettledEntry>),
 }
 
 /// What the agent knows of the VCI it launched the job's worker for: the API its library
@@ -702,6 +705,165 @@ fn settle_later(
     (changed, through.max(answered_through))
 }
 
+/// A lost VCI's record (`vci_loss`, design 8.11 "Settlement", ADR-373): only what its
+/// settlement needs, since the agent does not reconnect within a run and the run that reconnects
+/// reads this record alone from the log. Written at the loss, and again, whole, after every
+/// request the worker refuses afterwards on the offline link; the last one counts.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct VciLoss {
+    /// The `seq` of the loss's first record, which its later records restate.
+    loss: u64,
+    /// The agent epoch of the run the VCI was lost in.
+    agent_epoch: u32,
+    /// The exchanges the loss ended, each with its classification.
+    ended: Vec<LossExchange>,
+    /// The requests the worker refused afterwards on the offline link, naming the loss.
+    refused: Vec<LossExchange>,
+    /// Each clock's last time before the loss, with when the host read it.
+    clocks: Vec<LastTime>,
+    /// The VCI's serial number, when the API gave one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    serial_number: Option<u32>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct LossExchange {
+    seq: u64,
+    classification: exchange::Classification,
+}
+
+/// An exchange `vci_loss_settled` settles: its `seq` and classification with the reason. The
+/// record keeps no link, origin or request, which the exchange's own entry gives (ADR-373).
+#[derive(Serialize)]
+struct LossSettled {
+    seq: u64,
+    classification: exchange::Classification,
+    reason: String,
+}
+
+/// A clock's last time before the loss: raw, with its epoch and when the host read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct LastTime {
+    clock: exchange::Clock,
+    #[serde(flatten)]
+    time: clocks::EndedEpoch,
+}
+
+/// The first reading of the VCI's clock after it connected, which the runner takes when the log
+/// holds a loss to settle: the time with the clock the worker names, and when the agent read it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ConnectReading {
+    pub time: exchange::VciTime,
+    pub read: AgentNow,
+}
+
+/// Whether the VCI kept its power across the loss (`vci_loss_settled`'s `power_kept`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PowerKept {
+    Yes,
+    No,
+    Unknown,
+}
+
+impl Serialize for PowerKept {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        match self {
+            Self::Yes => serializer.serialize_bool(true),
+            Self::No => serializer.serialize_bool(false),
+            Self::Unknown => serializer.serialize_str("unknown"),
+        }
+    }
+}
+
+/// A time of the comparison: raw, with its clock, epoch, and the agent's time when read.
+#[derive(Serialize)]
+struct LossTime {
+    clock: exchange::Clock,
+    epoch: u32,
+    us: u64,
+    read_us: u64,
+    agent_epoch: u32,
+}
+
+/// The inputs and the comparison of `vci_loss_settled`, so a reader can redo it.
+#[derive(Serialize)]
+struct LossClock {
+    /// The VCI's own clock's last time before the loss.
+    last_before: Option<LossTime>,
+    /// The first reading of the VCI's clock after the reconnect.
+    reading: Option<LossTime>,
+    /// The gap the agent's clock measured between the two; `null` across agent epochs.
+    agent_gap_us: Option<u64>,
+    expected_us: Option<u64>,
+    tolerance_us: Option<u64>,
+    drift_ppm: u32,
+    drift_from: &'static str,
+    clock_margin_us: u32,
+    clock_margin_from: &'static str,
+    fits_carried_on: Option<bool>,
+    fits_restarted: Option<bool>,
+}
+
+/// `vci_loss_settled` (design 8.11 "Settlement", ADR-373).
+#[derive(Serialize)]
+struct VciLossSettledEntry {
+    /// The `seq` of the loss's first record.
+    loss: u64,
+    refers_to: Vec<u64>,
+    exchanges: Vec<LossSettled>,
+    clock: LossClock,
+    /// The serial numbers before and after match; `null` when the API gave none on either.
+    serial_match: Option<bool>,
+    power_kept: PowerKept,
+    text: String,
+    classification: exchange::Classification,
+    reason: String,
+}
+
+const SUPPLY_NOT_EXCLUDED: &str = " a drop of the vehicle's supply is not excluded.";
+
+/// Whether the power was kept, and why, from the comparison: whether a time of the VCI's own
+/// clock, as the worker names it (ADR-353), was read on both sides of the loss, the `fit` when
+/// the gap could be measured, and whether the serial numbers match. Nothing here depends on the
+/// worker's API (design principle 6): a worker whose clock reading is not the VCI's own time
+/// base names it `worker`, and one that gives no serial number gives none.
+fn power_kept(
+    readings: bool,
+    fit: Option<clocks::LossFit>,
+    serial_match: Option<bool>,
+) -> (PowerKept, String) {
+    let unknown = |why: &str| (PowerKept::Unknown, format!("{why};{SUPPLY_NOT_EXCLUDED}"));
+    if !readings {
+        return unknown(
+            "No time of the VCI's own clock was read both before the loss and after the reconnect",
+        );
+    }
+    let Some(fit) = fit else {
+        return unknown(
+            "The VCI reconnected in a later run of the agent, whose clock cannot measure the time since the loss",
+        );
+    };
+    match (fit.carried_on, fit.restarted, serial_match) {
+        (true, false, Some(true)) => (
+            PowerKept::Yes,
+            "The VCI kept its power across the loss, so the vehicle's supply did not drop: the loss was the PC's connection to the VCI.".to_owned(),
+        ),
+        (true, false, _) => unknown(
+            "The VCI's clock carried on, but its serial number does not show that the same VCI reconnected",
+        ),
+        (false, true, _) => (
+            PowerKept::No,
+            format!("The VCI's clock started again during the loss, so it was powered off;{SUPPLY_NOT_EXCLUDED}"),
+        ),
+        (true, true, _) => unknown(
+            "The VCI's clock reads what both a clock that carried on and one that started again would read",
+        ),
+        (false, false, _) => unknown(
+            "The VCI's clock reads neither what a clock that carried on nor what one that started again would read",
+        ),
+    }
+}
+
 /// The text a settling entry adds when the answer it adds ends the evidence from before its
 /// exchange ([`settle_later`]).
 fn restart_text(restart: Option<(bool, u64)>) -> &'static str {
@@ -1106,6 +1268,13 @@ struct Inner {
     /// When the host last read an item of each link, by link: a link error whose time cannot
     /// be placed may have come during the exchanges written since (design 8.11 `late_item`).
     link_reads: Vec<(u32, AgentNow)>,
+    /// This run's lost VCI as its last `vci_loss` record gave it (ADR-373).
+    loss: Option<VciLoss>,
+    /// A loss an earlier run recorded that no `vci_loss_settled` settled yet: the next
+    /// `vci_connected` settles it.
+    unsettled: Option<VciLoss>,
+    /// The serial number of the run's VCI, from `vci_connected`, when the API gave one.
+    serial_number: Option<u32>,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -1216,6 +1385,9 @@ impl CommLog {
             exchange_began_us: None,
             limits: Vec::new(),
             link_reads: Vec::new(),
+            loss: None,
+            unsettled: scan.unsettled,
+            serial_number: None,
         })))
     }
 
@@ -1977,6 +2149,10 @@ impl CommLog {
                 .floor(seq, exchange::Classification::Undetermined, floor_reason);
         }
         let clears = inner.links[at].1.clears();
+        let lost = match kept.evidence.end {
+            exchange::End::VciLost { refused_after_loss } => Some(refused_after_loss),
+            _ => None,
+        };
         // Only an exchange the VCI ended can be settled by a late response (ADR-365), and one
         // the agent's deadline ended by its primitive's end (ADR-366).
         if kept.evidence.vci_ended || matches!(kept.evidence.end, exchange::End::VciDidNotEnd) {
@@ -1999,6 +2175,9 @@ impl CommLog {
                     state.channel_link_error(seq, kind);
                 }
             }
+        }
+        if let Some(refused) = lost {
+            inner.note_loss(seq, entry.classification, refused)?;
         }
         Some(seq)
     }
@@ -2070,6 +2249,7 @@ impl CommLog {
             exchange::End::LinkError(kind) => Some(*kind),
             _ => ended.link_errors.first().copied(),
         };
+        let lost = matches!(end, exchange::End::VciLost { .. });
         evidence.end = end;
         evidence.detail = ended.detail;
         evidence.vci_ended = ended.vci_ended;
@@ -2365,6 +2545,11 @@ impl CommLog {
                 state.channel_link_error(written, kind);
             }
         }
+        // A primitive the loss ended: the exchange is one the loss ended, settled as this
+        // entry classifies it.
+        if lost {
+            inner.note_loss(seq, classification, false)?;
+        }
         Some(written)
     }
 
@@ -2462,10 +2647,12 @@ impl CommLog {
 
     /// Writes the `vci_connected` event of the job's VCI (design 8.11 "Header"): the VCI as the
     /// agent launched it, when the run's facts name it, and the module's `version` data, when
-    /// the worker gave it. The event's `seq`; `None` once the log has failed.
+    /// the worker gave it. A loss an earlier run recorded is then settled against `reading`
+    /// (`vci_loss_settled`, ADR-373). The event's `seq`; `None` once the log has failed.
     pub(crate) fn vci_connected(
         &self,
         version: Option<&vci_service_interface::VersionData>,
+        reading: Option<ConnectReading>,
     ) -> Option<u64> {
         use crate::launch::Api;
         let (vci, margins) = {
@@ -2511,7 +2698,24 @@ impl CommLog {
         // A time base that carried on over the connection is not shown yet: each clock's next
         // time opens a new epoch.
         inner.clocks.reconnect();
-        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+        // A worker that has no serial number to give leaves it zero (design 8.11
+        // `vci_loss_settled`).
+        inner.serial_number = version
+            .map(|version| version.hw_serial_number)
+            .filter(|&number| number != 0);
+        let connected = inner
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        // A loss an earlier run recorded is settled at once (ADR-373).
+        if let Some(loss) = inner.unsettled.take() {
+            inner.settle_loss(loss, reading)?;
+        }
+        Some(connected)
+    }
+
+    /// Whether the log holds a loss an earlier run recorded that the next `vci_connected`
+    /// settles, so the runner reads the VCI's clock for it first (ADR-373).
+    pub(crate) fn loss_to_settle(&self) -> bool {
+        self.lock().unsettled.is_some()
     }
 
     /// Writes an `identity` event for the value of `kind` the runner read (design 8.11
@@ -3351,6 +3555,182 @@ impl Inner {
             .map(|_| ())
     }
 
+    /// Takes the exchange logged as `seq`, which the lost VCI ended (`refused` false) or which
+    /// the worker refused afterwards on the offline link, into the run's loss, and writes its
+    /// record again, whole, and syncs it (design 8.11 "Settlement", ADR-373). The first record
+    /// keeps each clock's last time before the loss. `None` once the log has failed.
+    fn note_loss(
+        &mut self,
+        seq: u64,
+        classification: exchange::Classification,
+        refused: bool,
+    ) -> Option<()> {
+        let mut loss = match self.loss.take() {
+            Some(loss) => loss,
+            None => VciLoss {
+                loss: self.next_seq,
+                agent_epoch: u32::try_from(self.epoch).unwrap_or(u32::MAX),
+                ended: Vec::new(),
+                refused: Vec::new(),
+                clocks: [exchange::Clock::Device, exchange::Clock::Worker]
+                    .into_iter()
+                    .filter_map(|clock| {
+                        Some(LastTime {
+                            clock,
+                            time: self.clocks.last(clock)?,
+                        })
+                    })
+                    .collect(),
+                serial_number: self.serial_number,
+            },
+        };
+        let taken = LossExchange {
+            seq,
+            classification,
+        };
+        if refused {
+            loss.refused.push(taken);
+        } else {
+            loss.ended.push(taken);
+        }
+        let written = self.append_with(|seq, line| {
+            serde_json::to_writer(
+                line,
+                &Line {
+                    seq,
+                    event: &Event::VciLoss(loss.clone()),
+                },
+            )
+        });
+        self.loss = Some(loss);
+        written?;
+        self.sync();
+        self.failed.is_none().then_some(())
+    }
+
+    /// Writes the `vci_loss_settled` of the loss an earlier run recorded, against `reading`,
+    /// the first reading of the VCI's clock after it connected (design 8.11 "Settlement",
+    /// ADR-373). `None` once the log has failed.
+    fn settle_loss(&mut self, loss: VciLoss, reading: Option<ConnectReading>) -> Option<u64> {
+        // The reading on its clock, which opens the clock's first epoch of this run.
+        let placed = match reading {
+            Some(reading) => self
+                .place_read(reading.time.clock, reading.time.us, Some(reading.read))?
+                .zip(reading.time.clock)
+                .map(|(placed, clock)| LossTime {
+                    clock,
+                    epoch: placed.epoch,
+                    us: reading.time.us,
+                    read_us: reading.read.monotonic_us,
+                    agent_epoch: reading.read.epoch,
+                }),
+            None => None,
+        };
+        let last = loss
+            .clocks
+            .iter()
+            .find(|last| last.clock == exchange::Clock::Device)
+            .map(|last| LossTime {
+                clock: last.clock,
+                epoch: last.time.epoch,
+                us: last.time.us,
+                read_us: last.time.read_us,
+                agent_epoch: loss.agent_epoch,
+            });
+        // The VCI's own clock on both sides of the loss.
+        let reading = placed;
+        let device = reading
+            .as_ref()
+            .filter(|reading| reading.clock == exchange::Clock::Device);
+        let readings = last.is_some() && device.is_some();
+        let gap = last
+            .as_ref()
+            .zip(device)
+            .filter(|(last, reading)| last.agent_epoch == reading.agent_epoch)
+            .map(|(last, reading)| reading.read_us.saturating_sub(last.read_us));
+        let (drift_ppm, drift_from) = self.margins.drift_bound();
+        let (clock_margin_us, clock_margin_from) = self.margins.clock_margin();
+        let fit = last
+            .as_ref()
+            .zip(device)
+            .zip(gap)
+            .map(|((last, reading), gap)| {
+                clocks::loss_fit(last.us, reading.us, gap, drift_ppm, clock_margin_us)
+            });
+        let serial_match = loss
+            .serial_number
+            .zip(self.serial_number)
+            .map(|(before, after)| before == after);
+        let (power_kept, reason) = power_kept(readings, fit, serial_match);
+        let mut exchanges: Vec<LossSettled> = loss
+            .ended
+            .iter()
+            .chain(&loss.refused)
+            .map(|exchange| match power_kept {
+                PowerKept::Yes => LossSettled {
+                    seq: exchange.seq,
+                    classification: exchange::Classification::System,
+                    reason: reason.clone(),
+                },
+                // What the loss leaves open keeps the exchange as it was.
+                PowerKept::No | PowerKept::Unknown => LossSettled {
+                    seq: exchange.seq,
+                    classification: exchange.classification,
+                    reason: format!("{reason} The exchange keeps its classification."),
+                },
+            })
+            .collect();
+        exchanges.sort_by_key(|exchange| exchange.seq);
+        // The loss's own, or the most severe of the exchanges' (design 8.11 "Settlement").
+        let own = match power_kept {
+            PowerKept::Yes => exchange::Classification::System,
+            PowerKept::No | PowerKept::Unknown => exchange::Classification::Undetermined,
+        };
+        let classification = exchanges
+            .iter()
+            .map(|exchange| exchange.classification)
+            .fold(own, exchange::Classification::max);
+        let mut reason = reason;
+        if classification > own {
+            reason.push_str(" An exchange the loss ended already shows a fault on the system's side, which the entry takes as its own.");
+        }
+        let text = match power_kept {
+            PowerKept::Yes => {
+                "The VCI reconnected and its time base carried on across the loss, so it kept its power: the PC's connection to the VCI was lost, not the vehicle's supply."
+            }
+            PowerKept::No => {
+                "The VCI reconnected, and its time base had started again: it was powered off during the loss."
+            }
+            PowerKept::Unknown => {
+                "The VCI reconnected; whether it kept its power across the loss is unknown."
+            }
+        };
+        let event = Event::VciLossSettled(Box::new(VciLossSettledEntry {
+            loss: loss.loss,
+            refers_to: exchanges.iter().map(|exchange| exchange.seq).collect(),
+            exchanges,
+            clock: LossClock {
+                last_before: last,
+                reading,
+                agent_gap_us: gap,
+                expected_us: fit.map(|fit| fit.expected_us),
+                tolerance_us: fit.map(|fit| fit.tolerance_us),
+                drift_ppm,
+                drift_from,
+                clock_margin_us,
+                clock_margin_from,
+                fits_carried_on: fit.map(|fit| fit.carried_on),
+                fits_restarted: fit.map(|fit| fit.restarted),
+            },
+            serial_match,
+            power_kept,
+            text: text.to_owned(),
+            classification,
+            reason,
+        }));
+        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
     fn clock(&self) -> AgentClock {
         AgentClock {
             epoch: self.epoch,
@@ -3502,6 +3882,8 @@ struct Scan {
     clean_close: bool,
     /// The file was there, empty: an earlier run created it and stopped before its header.
     found_empty: bool,
+    /// The last `vci_loss` record, unless a `vci_loss_settled` names its loss (ADR-373).
+    unsettled: Option<VciLoss>,
 }
 
 /// Reads an existing log. `None` when it holds a `seq` or an epoch with no successor, which
@@ -3522,6 +3904,8 @@ fn scan(bytes: &[u8]) -> Option<Scan> {
     // a run) are whole; `None` before the first. A run reports what it finds since the run
     // before it began: damage further back was reported by the run that found it.
     let mut since_opening: Option<bool> = None;
+    let mut last_loss: Option<VciLoss> = None;
+    let mut settled_losses: Vec<u64> = Vec::new();
     for line in bytes[..complete_len].split_inclusive(|byte| *byte == b'\n') {
         if line.iter().all(u8::is_ascii_whitespace) {
             // A blank line is no line of this writer's.
@@ -3577,6 +3961,19 @@ fn scan(bytes: &[u8]) -> Option<Scan> {
                 if event == Some("job_end") {
                     scan.clean_close = true;
                 }
+                // A record that does not read is no loss the log can settle.
+                if event == Some("vci_loss")
+                    && let Some(loss) = parsed
+                        .as_ref()
+                        .and_then(|value| VciLoss::deserialize(value).ok())
+                {
+                    last_loss = Some(loss);
+                }
+                if event == Some("vci_loss_settled")
+                    && let Some(loss) = object.and_then(|object| object.get("loss")?.as_u64())
+                {
+                    settled_losses.push(loss);
+                }
                 None
             }
         };
@@ -3585,6 +3982,7 @@ fn scan(bytes: &[u8]) -> Option<Scan> {
         }
     }
     scan.consistent = since_opening == Some(true);
+    scan.unsettled = last_loss.filter(|loss| !settled_losses.contains(&loss.loss));
     scan.next_seq = match largest_seq {
         Some(seq) => seq.checked_add(1)?,
         None => 0,
@@ -5131,7 +5529,7 @@ mod tests {
         };
         log.exchange_with(wrapped, vec![start]).unwrap();
         // The VCI connects again: its next time opens an epoch.
-        log.vci_connected(None).unwrap();
+        log.vci_connected(None, None).unwrap();
         let mut again = evidence(endpoint(0x7E0), &request, exchange::End::NoResponse);
         again.times.agent.before_us = agent_of(span + 35_000);
         again.times.agent.end_us = agent_of(span + 40_000);
@@ -8524,5 +8922,425 @@ mod tests {
             None
         );
         assert_eq!(taken_events(&sink), ["header", "job_start"]);
+    }
+
+    /// The `seq` and classification of each exchange a `vci_loss_settled` settles.
+    fn settled_exchanges(entry: &serde_json::Value) -> Vec<(u64, &str)> {
+        entry["exchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|exchange| {
+                (
+                    exchange["seq"].as_u64().unwrap(),
+                    exchange["classification"].as_str().unwrap(),
+                )
+            })
+            .collect()
+    }
+
+    /// The `vci_loss_settled` a run writes over `existing` when its VCI connects with `reading`.
+    fn settled_over(existing: &str, reading: Option<exchange::VciTime>) -> serde_json::Value {
+        let sink = Recording::default();
+        let log = CommLog::over(Box::new(sink.clone()), existing.as_bytes());
+        assert!(log.loss_to_settle(), "{existing}");
+        log.begin(&dpdu_facts(), RunKind::Resume);
+        let reading = reading.map(|time| ConnectReading {
+            time,
+            read: log.now(),
+        });
+        log.vci_connected(Some(&serial(77)), reading).unwrap();
+        let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
+        taken
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|line| line["event"] == "vci_loss_settled")
+            .unwrap()
+    }
+
+    /// A record line of loss `loss` at `seq` that ended the exchanges `ended`.
+    fn loss_line(seq: u64, loss: u64, ended: &[(u64, &str)]) -> String {
+        let ended: Vec<serde_json::Value> = ended
+            .iter()
+            .map(|(seq, classification)| serde_json::json!({"seq": seq, "classification": classification}))
+            .collect();
+        format!(
+            "{}\n",
+            serde_json::json!({"seq": seq, "event": "vci_loss", "loss": loss, "agent_epoch": 0, "ended": ended, "refused": [], "clocks": []})
+        )
+    }
+
+    /// The scan settles the last record no `vci_loss_settled` names: a settlement of another loss
+    /// leaves it, an unreadable record is passed over, and an earlier loss a later one followed
+    /// is not settled. The entry's classification is the most severe of the loss's and its
+    /// exchanges', and the exchanges come in `seq` order; a reading on the worker's clock is
+    /// recorded but compared with nothing.
+    #[test]
+    fn the_last_unsettled_record_is_settled_with_its_most_severe_exchange() {
+        let header = "{\"seq\":0,\"event\":\"header\"}\n";
+        // L1 at 2, settled at 3; L2 at 5, whose later record at 7 does not read.
+        let log = format!(
+            "{header}{}{}{}{}{}{}{}",
+            loss_line(2, 2, &[(1, "undetermined")]),
+            "{\"seq\":3,\"event\":\"vci_loss_settled\",\"loss\":2}\n",
+            "{\"seq\":4,\"event\":\"vci_loss_settled\",\"loss\":99}\n",
+            loss_line(5, 5, &[(4, "system"), (1, "undetermined")]),
+            "{\"seq\":6,\"event\":\"exchange\"}\n",
+            "{\"seq\":7,\"event\":\"vci_loss\",\"loss\":5,\"ended\":\"damaged\"}\n",
+            "{\"seq\":8,\"event\":\"job_end\"}\n",
+        );
+        let worker = exchange::VciTime::new(5, Some(exchange::Clock::Worker));
+        let entry = settled_over(&log, Some(worker));
+        assert_eq!(entry["loss"], 5, "{entry}");
+        assert_eq!(entry["refers_to"], serde_json::json!([1, 4]), "{entry}");
+        assert_eq!(
+            settled_exchanges(&entry),
+            [(1, "undetermined"), (4, "system")]
+        );
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("system's side"),
+            "{entry}"
+        );
+        assert_eq!(entry["clock"]["reading"]["clock"], "worker", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        // Only L1, settled: nothing to settle.
+        let settled = format!(
+            "{header}{}{}",
+            loss_line(2, 2, &[(1, "undetermined")]),
+            "{\"seq\":3,\"event\":\"vci_loss_settled\",\"loss\":2}\n"
+        );
+        let log = CommLog::over(Box::new(Recording::default()), settled.as_bytes());
+        assert!(!log.loss_to_settle());
+        // L1 then L2 unsettled: only L2, the last.
+        let both = format!(
+            "{header}{}{}",
+            loss_line(2, 2, &[(1, "undetermined")]),
+            loss_line(4, 4, &[(3, "undetermined")])
+        );
+        let entry = settled_over(&both, None);
+        assert_eq!(entry["loss"], 4, "{entry}");
+        assert_eq!(entry["refers_to"], serde_json::json!([3]), "{entry}");
+    }
+
+    /// A primitive the loss ended after the agent stopped waiting for it is an exchange the loss
+    /// ended, recorded as its `primitive_ended` classifies it.
+    #[test]
+    fn a_primitive_the_loss_ended_is_recorded_with_its_settlement() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&dpdu_facts(), RunKind::First);
+        let seq = log
+            .exchange_with(
+                evidence(
+                    endpoint(0x7E0),
+                    &[0x22, 0xF1, 0x90],
+                    exchange::End::VciDidNotEnd,
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                tx_indication: None,
+                end: Some(exchange::End::VciLost {
+                    refused_after_loss: false,
+                }),
+                detail: exchange::Detail::default(),
+                pending: Vec::new(),
+                vci: exchange::VciTimes::default(),
+                vci_ended: false,
+                link_errors: Vec::new(),
+                indications: Vec::new(),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        drop(log);
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let ended = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .unwrap();
+        let record = lines
+            .iter()
+            .find(|line| line["event"] == "vci_loss")
+            .unwrap();
+        assert_eq!(
+            record["seq"],
+            ended["seq"].as_u64().unwrap() + 1,
+            "{record}"
+        );
+        assert_eq!(
+            record["ended"],
+            serde_json::json!([{"seq": seq, "classification": ended["exchanges"][0]["classification"]}]),
+            "{record}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    fn dpdu_facts() -> RunFacts {
+        RunFacts {
+            vci: Some(VciFacts {
+                api: crate::launch::Api::Dpdu,
+                long_size: 8,
+            }),
+            ..facts()
+        }
+    }
+
+    fn serial(number: u32) -> vci_service_interface::VersionData {
+        vci_service_interface::VersionData {
+            hw_serial_number: number,
+            ..vci_service_interface::VersionData::default()
+        }
+    }
+
+    /// Design 8.11 `vci_loss_settled`, ADR-373: the run that loses the VCI records the loss
+    /// again after each exchange it ends or causes, and the next run that connects settles the
+    /// last record, after its `vci_connected`, against the first reading of the VCI's clock. A
+    /// later run's agent clock cannot measure the gap, so the power is not shown kept.
+    #[test]
+    fn a_lost_vci_is_recorded_and_settled_when_a_later_run_connects() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let log = CommLog::open(&setup).unwrap();
+        assert!(!log.loss_to_settle());
+        log.begin(&dpdu_facts(), RunKind::First);
+        log.vci_connected(Some(&serial(77)), None).unwrap();
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+        );
+        answered.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(1_835_511_040)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange_with(answered, Vec::new()).unwrap();
+        let lost = |refused_after_loss| {
+            evidence(
+                endpoint(0x7E0),
+                &[0x2E, 0xF1, 0x98, 0],
+                exchange::End::VciLost { refused_after_loss },
+            )
+        };
+        let ended = log.exchange_with(lost(false), Vec::new()).unwrap();
+        let refused = log.exchange_with(lost(true), Vec::new()).unwrap();
+        log.end("Host");
+        drop(log);
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let records = of_event(&lines, "vci_loss");
+        assert_eq!(records.len(), 2, "{lines:?}");
+        assert_eq!(records[0]["seq"], ended + 1);
+        assert_eq!(records[1]["seq"], refused + 1);
+        // The later record restates the loss whole.
+        for record in &records {
+            assert_eq!(record["loss"], ended + 1, "{record}");
+            assert_eq!(record["agent_epoch"], 0, "{record}");
+            assert_eq!(record["serial_number"], 77, "{record}");
+            assert_eq!(
+                record["ended"],
+                serde_json::json!([{"seq": ended, "classification": "undetermined"}]),
+                "{record}"
+            );
+            assert_eq!(
+                record["clocks"],
+                // The evidence gave no agent time for the response's read.
+                serde_json::json!([{"clock": "device", "epoch": 0, "us": 1_835_511_040u64, "read_us": 0}]),
+                "{record}"
+            );
+        }
+        assert_eq!(records[0]["refused"], serde_json::json!([]));
+        assert_eq!(
+            records[1]["refused"],
+            serde_json::json!([{"seq": refused, "classification": "undetermined"}])
+        );
+
+        // A run that does not connect the VCI leaves the loss to the next one.
+        let log = CommLog::open(&setup).unwrap();
+        assert!(log.loss_to_settle());
+        log.begin(&dpdu_facts(), RunKind::Resume);
+        log.end("Link");
+        drop(log);
+
+        let log = CommLog::open(&setup).unwrap();
+        assert!(log.loss_to_settle());
+        log.begin(&dpdu_facts(), RunKind::Resume);
+        let reading = ConnectReading {
+            time: device(1_866_720_397),
+            read: log.now(),
+        };
+        log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
+        assert!(!log.loss_to_settle());
+        log.end("ok");
+        drop(log);
+        let lines = self::lines(&setup);
+        assert_consecutive(&lines);
+        let start = lines.len() - 6;
+        assert_eq!(
+            events(&lines[start..]),
+            [
+                "agent_clock",
+                "job_start",
+                "vci_connected",
+                "clock_epoch",
+                "vci_loss_settled",
+                "job_end"
+            ]
+        );
+        let settled = &lines[start + 4];
+        assert_eq!(settled["loss"], ended + 1, "{settled}");
+        assert_eq!(
+            settled["refers_to"],
+            serde_json::json!([ended, refused]),
+            "{settled}"
+        );
+        assert_eq!(settled["clock"]["last_before"]["us"], 1_835_511_040u64);
+        assert_eq!(settled["clock"]["last_before"]["agent_epoch"], 0);
+        assert_eq!(settled["clock"]["reading"]["us"], 1_866_720_397u64);
+        assert_eq!(settled["clock"]["reading"]["agent_epoch"], 2);
+        assert_eq!(settled["clock"]["reading"]["epoch"], 1, "{settled}");
+        assert!(settled["clock"]["agent_gap_us"].is_null(), "{settled}");
+        assert!(settled["clock"]["fits_carried_on"].is_null(), "{settled}");
+        assert_eq!(settled["serial_match"], true);
+        assert_eq!(settled["power_kept"], "unknown");
+        assert_eq!(settled["classification"], "undetermined");
+        assert!(
+            settled["reason"].as_str().unwrap().contains("later run"),
+            "{settled}"
+        );
+        assert_eq!(
+            settled_exchanges(settled),
+            [(ended, "undetermined"), (refused, "undetermined")]
+        );
+        assert!(
+            settled["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .ends_with("The exchange keeps its classification."),
+            "{settled}"
+        );
+
+        // Settled once: a later run finds nothing to settle.
+        let log = CommLog::open(&setup).unwrap();
+        assert!(!log.loss_to_settle());
+        drop(log);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The comparison of `vci_loss_settled` where one agent epoch measures the gap: a log whose
+    /// record names the agent epoch the reconnecting run is in. A clock that carried on on the
+    /// same VCI shows the power kept, and the exchanges are `system`; a restart shows it lost;
+    /// another serial number, none, a reading on the worker's clock or no reading leave it
+    /// unknown. The API the job was told changes nothing.
+    #[test]
+    fn a_loss_settles_by_the_comparison_when_one_agent_epoch_measures_the_gap() {
+        let record = |serial: u32| {
+            format!(
+                "{{\"seq\":0,\"event\":\"header\",\"clock\":{{\"epoch\":0}}}}\n\
+                 {{\"seq\":1,\"event\":\"vci_loss\",\"loss\":1,\"agent_epoch\":1,\
+                 \"ended\":[{{\"seq\":0,\"classification\":\"undetermined\"}}],\"refused\":[],\
+                 \"clocks\":[{{\"clock\":\"device\",\"epoch\":4,\"us\":1835511040,\"read_us\":0}},\
+                 {{\"clock\":\"worker\",\"epoch\":2,\"us\":9,\"read_us\":0}}],\"serial_number\":{serial}}}\n\
+                 {{\"seq\":2,\"event\":\"job_end\"}}\n"
+            )
+        };
+        let settle_with = |serial_after: u32,
+                           facts: RunFacts,
+                           clock: exchange::Clock,
+                           reading_us: Option<u64>| {
+            let sink = Recording::default();
+            let log = CommLog::over(Box::new(sink.clone()), record(77).as_bytes());
+            assert!(log.loss_to_settle());
+            log.begin(&facts, RunKind::Resume);
+            let reading = reading_us.map(|us| {
+                let read = log.now();
+                // The gap the agent's clock measured: 31.2092 s since the last time was read.
+                let read = AgentNow {
+                    monotonic_us: 31_209_200,
+                    ..read
+                };
+                ConnectReading {
+                    time: exchange::VciTime::new(us, Some(clock)),
+                    read,
+                }
+            });
+            log.vci_connected(Some(&serial(serial_after)), reading)
+                .unwrap();
+            let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
+            let settled: serde_json::Value = taken
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .find(|line| line["event"] == "vci_loss_settled")
+                .unwrap();
+            settled
+        };
+        let settle = |serial_after, facts, reading_us| {
+            settle_with(serial_after, facts, exchange::Clock::Device, reading_us)
+        };
+        let settle_on = |serial_after, clock, reading_us| {
+            settle_with(serial_after, dpdu_facts(), clock, reading_us)
+        };
+        // Carried on: the last time plus the gap, within 2 ms plus 100 ppm of it.
+        let carried = 1_835_511_040 + 31_209_200 + 3_000;
+        let entry = settle(77, dpdu_facts(), Some(carried));
+        assert_eq!(entry["power_kept"], true, "{entry}");
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert_eq!(settled_exchanges(&entry), [(0, "system")]);
+        assert_eq!(entry["clock"]["agent_gap_us"], 31_209_200);
+        assert_eq!(entry["clock"]["expected_us"], 1_835_511_040u64 + 31_209_200);
+        assert_eq!(entry["clock"]["tolerance_us"], 2_000 + 3_120);
+        assert_eq!(entry["clock"]["drift_from"], "default");
+        assert_eq!(entry["clock"]["fits_carried_on"], true);
+        assert_eq!(entry["clock"]["fits_restarted"], false);
+        assert_eq!(entry["clock"]["last_before"]["epoch"], 4);
+        // The reading opens the clock's first epoch of the run, after the log's largest.
+        assert_eq!(entry["clock"]["reading"]["epoch"], 0, "{entry}");
+        // Restarted: powered off, the supply's drop not excluded.
+        let entry = settle(77, dpdu_facts(), Some(20_000_000));
+        assert_eq!(entry["power_kept"], false, "{entry}");
+        assert_eq!(entry["classification"], "undetermined");
+        assert_eq!(settled_exchanges(&entry), [(0, "undetermined")]);
+        // Another VCI's clock that fits: unknown.
+        let entry = settle(78, dpdu_facts(), Some(carried));
+        assert_eq!(entry["serial_match"], false);
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["reason"].as_str().unwrap().contains("serial number"));
+        // A worker that gives no serial number: unknown, whatever the reading.
+        let entry = settle(0, dpdu_facts(), Some(carried));
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["serial_match"].is_null(), "{entry}");
+        assert!(entry["reason"].as_str().unwrap().contains("serial number"));
+        // The API the job was told changes nothing: the same evidence settles the same
+        // (design principle 6).
+        let j2534 = RunFacts {
+            vci: Some(VciFacts {
+                api: crate::launch::Api::J2534,
+                long_size: 8,
+            }),
+            ..facts()
+        };
+        let entry = settle(77, j2534, Some(carried));
+        assert_eq!(entry["power_kept"], true, "{entry}");
+        // A reading on the worker's clock is recorded but compared with nothing.
+        let entry = settle_on(77, exchange::Clock::Worker, Some(carried));
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert_eq!(entry["clock"]["reading"]["clock"], "worker", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("own clock"),
+            "{entry}"
+        );
+        // No reading after the reconnect.
+        let entry = settle(77, dpdu_facts(), None);
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["clock"]["reading"].is_null());
     }
 }

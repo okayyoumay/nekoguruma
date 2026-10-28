@@ -1224,7 +1224,23 @@ fn run_job<C: WorkerApi>(
     );
     // The VCI, then what the link has in force, before anything is sent on it (design 8.11).
     if let Some(log) = &comm_log {
-        log.vci_connected(link.version.as_ref());
+        // A loss an earlier run recorded is settled against the first reading of the VCI's
+        // clock after it connected (design 8.11 `vci_loss_settled`, ADR-373).
+        let reading = if log.loss_to_settle() {
+            handle
+                .block_on(crate::host::read_vci_clock(
+                    &mut client,
+                    link.module_handle,
+                    timings.unary,
+                ))
+                .map(|time| crate::comm_log::ConnectReading {
+                    time,
+                    read: log.now(),
+                })
+        } else {
+            None
+        };
+        log.vci_connected(link.version.as_ref(), reading);
         let valued_by_document = document
             .as_ref()
             .map(|document| link::valued_by_document(&document.variant()))

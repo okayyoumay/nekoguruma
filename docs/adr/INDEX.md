@@ -362,7 +362,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-370](ADR-370-a-late-indication-settles-its-ended-exchange.md) | A Late Indication Settles Its Ended Exchange | Accepted | `agent` communication log (`late_item` for a transmit indication, loopback echo or start-of-message indication; `Kept::late_start`); design 8.11 "Settlement", `late_item`; ADR-346, ADR-365, ADR-367, ADR-368 |
 | [ADR-371](ADR-371-a-late-forwarded-pending-settles-its-ended-exchange.md) | A Late Forwarded Pending Settles Its Ended Exchange | Accepted | `agent` communication log (`late_item` for an unbound forwarded pending); design 8.11 "Settlement", `late_item`; ADR-346, ADR-365, ADR-370 |
 | [ADR-372](ADR-372-a-late-link-error-settles-the-exchanges-it-may-have-come-during.md) | A Late Link Error Settles the Exchanges It May Have Come During | Accepted | `agent` communication log (`late_item` for a link error read late); design 8.11 "Settlement", `late_item`, "Link error"; ADR-346, ADR-361, ADR-368, ADR-369, ADR-370 |
-| [ADR-373](ADR-373-a-lost-vci-is-recorded-and-settled-when-a-later-run-connects.md) | A Lost VCI Is Recorded and Settled When a Later Run Connects | Accepted | `agent` communication log (`vci_loss` record, `vci_loss_settled`), runner and host (clock read at connect); design 8.11 "Settlement", "Reconnect"; ADR-294, ADR-346, ADR-357, ADR-361 |
+| [ADR-373](ADR-373-a-lost-vci-is-recorded-and-settled-when-a-later-run-connects.md) | A Lost VCI Is Recorded and Settled When a Later Run Connects | Accepted (Decision item 4's gap within one agent epoch widened to one boot by ADR-374) | `agent` communication log (`vci_loss` record, `vci_loss_settled`), runner and host (clock read at connect); design 8.11 "Settlement", "Reconnect"; ADR-294, ADR-346, ADR-357, ADR-361 |
+| [ADR-374](ADR-374-a-later-run-in-the-same-boot-measures-a-loss-s-gap-on-the-boot-clock.md) | A Later Run in the Same Boot Measures a Loss's Gap on the Boot Clock | Accepted | `agent` communication log (boot clock and id, `vci_loss` `boot`, `vci_loss_settled` gap and round trip), runner (clock read at connect); design 8.11 `vci_loss_settled`; ADR-373 |
 
 ## Status Legend
 
@@ -740,7 +741,8 @@ the predecessor repository these ADRs came from.
 - ADR-370
 - ADR-371
 - ADR-372
-- ADR-373
+- ADR-373 (Decision item 4's gap within one agent epoch widened to one boot by ADR-374)
+- ADR-374
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

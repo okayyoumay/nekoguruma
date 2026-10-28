@@ -493,6 +493,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         // Its items are read as its exchange's were, so its end is the one the exchange would
         // have had (design 8.11 `primitive_ended`).
         let mut progress = stray.progress();
+        let log = self.comm_log.clone();
+        // The primitive's own error events, which go to its exchange when no end of it is
+        // written, and the link errors of no primitive, read after the last exchange's entry
+        // (ADR-372).
+        let mut bound_errors: Vec<Unbound> = Vec::new();
         // `Some(None)` when the event stream failed or ended, `None` when the wait passed.
         let ended = if stray.cancel_failed {
             None
@@ -509,6 +514,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                                 );
                                 // An indication of no primitive may be the exchange's
                                 // (`Progress::on_event` keeps it as unbound).
+                                // A link error of no primitive is kept for the log's
+                                // `late_item` (design 8.11, ADR-372).
                                 let ours = matches!(
                                     &notification.event_data,
                                     Some(event_notification::EventData::Item(item))
@@ -520,11 +527,36 @@ impl<C: WorkerApi> WorkerHost<C> {
                                                     Some(event_item::Data::ResultData(result))
                                                         if is_indication(result)
                                                 ))
+                                            || (item.cop_handle.is_none()
+                                                && matches!(
+                                                    &item.data,
+                                                    Some(event_item::Data::ErrorData(_))
+                                                ))
                                 );
-                                if (lost || ours)
-                                    && let Some(result) =
-                                        progress.on_notification(notification.event_data, cop)
+                                if !(lost || ours) {
+                                    continue;
+                                }
+                                let read = log
+                                    .as_ref()
+                                    .filter(|log| log.is_open())
+                                    .map(|log| log.now());
+                                if let Some(event_notification::EventData::Item(item)) =
+                                    &notification.event_data
+                                    && item.cop_handle == Some(cop)
+                                    && matches!(&item.data, Some(event_item::Data::ErrorData(_)))
                                 {
+                                    bound_errors.push(Unbound {
+                                        item: item.clone(),
+                                        read,
+                                        owner: stray.seq,
+                                    });
+                                }
+                                let kept = progress.unbound.len();
+                                let done = progress.on_notification(notification.event_data, cop);
+                                for unbound in &mut progress.unbound[kept..] {
+                                    unbound.read = read;
+                                }
+                                if let Some(result) = done {
                                     return Some(Some(result));
                                 }
                             }
@@ -536,6 +568,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                 .unwrap_or(None)
             })
         };
+        // Whether an end of it was written, which carries its own errors.
+        let mut end_written = true;
         match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
             Some(Some(result @ Err(HostError::EventsLost))) => {
@@ -543,6 +577,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             }
             Some(Some(result)) => {
                 self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                self.log_late_errors(&progress, &bound_errors, end_written && stray.seq.is_some());
                 return;
             }
             // The stream failed or ended before it did: its end is unknown, with every item read
@@ -554,11 +589,12 @@ impl<C: WorkerApi> WorkerHost<C> {
             ),
             // The wait passed after the primitive's end was read, before its finished status:
             // that end settles it, and the primitive is still cancelled.
-            None => {
-                if let Some(result) = progress.end_read() {
+            None => match progress.end_read() {
+                Some(result) => {
                     self.log_primitive_end(&stray, &progress, StrayEnd::Ended(&result));
                 }
-            }
+                None => end_written = false,
+            },
         }
         let cancelled = handle.block_on(unary(
             self.timings.unary,
@@ -580,6 +616,41 @@ impl<C: WorkerApi> WorkerHost<C> {
                 error = %crate::oplog::LogSafe::log_text(&error),
                 "could not cancel a primitive past its deadline at job end"
             ),
+        }
+        self.log_late_errors(&progress, &bound_errors, end_written && stray.seq.is_some());
+    }
+
+    /// Hands the communication log the link errors read at job end that no entry carries
+    /// (design 8.11 `late_item`, ADR-372): those of no primitive, and, when no end of the stray
+    /// primitive was written, its own, which go to its exchange.
+    fn log_late_errors(&self, progress: &Progress, bound_errors: &[Unbound], end_written: bool) {
+        let Some(log) = &self.comm_log else {
+            return;
+        };
+        let mut items: Vec<UnattachedItem> = unattached_items(&progress.unbound)
+            .into_iter()
+            .filter(|item| {
+                !item.earlier_primitive
+                    && matches!(
+                        item.data,
+                        UnattachedData::Error {
+                            link_error: Some(_),
+                            ..
+                        }
+                    )
+            })
+            .collect();
+        if !end_written {
+            items.extend(unattached_items(bound_errors));
+        }
+        if items.is_empty() {
+            return;
+        }
+        let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.late_link_errors(&items)
+        }));
+        if logged.is_err() {
+            tracing::warn!("writing a job end's late link errors panicked");
         }
     }
 
@@ -982,6 +1053,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         if let Some(reused) = settling.take_if(|settling| settling.stray.cop == cop) {
             self.settle_cancelled(reused, false);
         }
+        // The cancelled primitive's items read after its end, or that no end of it carries, are
+        // still its exchange's (ADR-372).
+        let earlier = settling
+            .as_ref()
+            .and_then(|settling| Some((settling.stray.cop, settling.stray.seq?)));
 
         let events = &mut self.link.events;
         let log = self.comm_log.as_ref();
@@ -1059,6 +1135,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             );
             let left = self.settle_cancelled(settling, stream_failed);
             progress.unbound.extend(left);
+        }
+        if let Some((earlier_cop, seq)) = earlier {
+            for unbound in &mut progress.unbound {
+                if unbound.item.cop_handle == Some(earlier_cop) {
+                    unbound.owner = Some(seq);
+                }
+            }
         }
         // A receive timeout the worker already reported ended the VCI's wait, even when the
         // primitive's end had not been read before the deadline.
@@ -1312,7 +1395,7 @@ fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
 fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
     unbound
         .iter()
-        .filter_map(|Unbound { item, read }| {
+        .filter_map(|Unbound { item, read, owner }| {
             let data = match &item.data {
                 Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
                     rx_flag: result.rx_flag.clone(),
@@ -1334,6 +1417,7 @@ fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
             Some(UnattachedItem {
                 link: LOG_LINK,
                 earlier_primitive: item.cop_handle.is_some(),
+                owner: *owner,
                 vci_us: item.timestamp,
                 clock: clock_of(item),
                 read: *read,
@@ -1478,6 +1562,7 @@ impl Settling {
             self.items.push(Unbound {
                 item: item.clone(),
                 read,
+                owner: self.stray.seq,
             });
         }
         let cancelled = matches!(
@@ -1701,6 +1786,9 @@ struct RejectedRead {
 struct Unbound {
     item: EventItem,
     read: Option<AgentNow>,
+    /// The `seq` of the exchange whose primitive it is bound to, when the host knows it: the
+    /// stray primitive cancelled before this request (design 8.11 "Settlement", ADR-372).
+    owner: Option<u64>,
 }
 
 /// The error events the worker reported in an exchange beside the one it ended on: faults seen
@@ -2269,7 +2357,11 @@ impl Progress {
                 item.data,
                 Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_))
             ) {
-                self.unbound.push(Unbound { item, read: None });
+                self.unbound.push(Unbound {
+                    item,
+                    read: None,
+                    owner: None,
+                });
             }
             return None;
         }
@@ -4117,6 +4209,7 @@ mod tests {
                 }),
             ),
             read: None,
+            owner: None,
         };
         let kinds: Vec<_> = unattached_items(&[
             error(PduErrorEvent::PduErrEvtRxError),
@@ -4158,6 +4251,7 @@ mod tests {
                 }),
             ),
             read: None,
+            owner: None,
         };
         let items = unattached_items(&[
             with_header(&[0, 0, 7, 0xE0]),
@@ -4165,6 +4259,7 @@ mod tests {
             Unbound {
                 item: event(None, status(PduComPrimitiveStatus::PduCopstFinished)),
                 read: None,
+                owner: None,
             },
         ]);
         let identifiers: Vec<_> = items
@@ -4188,6 +4283,7 @@ mod tests {
                 ..event(None, result(&[0x62]))
             },
             read: None,
+            owner: None,
         };
         let clocks: Vec<_> = unattached_items(&[
             with_clock(TimestampClock::Device as i32),

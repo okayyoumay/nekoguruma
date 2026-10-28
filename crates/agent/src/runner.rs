@@ -14395,6 +14395,9 @@ def main():
         /// A receive error with VCI time 20 ms and extra error information, and the finished
         /// status 150 ms after it.
         FailThenFinishLater,
+        /// A link error of no primitive (a protocol error with VCI time 300 ms), then the
+        /// response and the finished status of [`StartEvent::Respond`].
+        LinkErrorThenRespond,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14638,7 +14641,29 @@ def main():
                         cll_handle: 1,
                         cop_handle,
                     };
-                    if let StartEvent::Respond | StartEvent::RespondThenFinishLater = event
+                    if let StartEvent::LinkErrorThenRespond = event
+                        && let Some(sender) = &sender
+                    {
+                        let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                            event_data: Some(EventData::Item(vci_service_interface::EventItem {
+                                cop_handle: None,
+                                timestamp: 300_000,
+                                data: Some(vci_service_interface::event_item::Data::ErrorData(
+                                    vci_service_interface::ErrorData {
+                                        error_event:
+                                            vci_service_interface::PduErrorEvent::PduErrEvtProtErr
+                                                as i32,
+                                        ..Default::default()
+                                    },
+                                )),
+                                ..Default::default()
+                            })),
+                            ..Default::default()
+                        }));
+                    }
+                    if let StartEvent::Respond
+                    | StartEvent::RespondThenFinishLater
+                    | StartEvent::LinkErrorThenRespond = event
                         && let Some(sender) = &sender
                     {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14729,6 +14754,7 @@ def main():
                     let data = match event {
                         StartEvent::Finish
                         | StartEvent::Respond
+                        | StartEvent::LinkErrorThenRespond
                         | StartEvent::RespondThenFinishLater
                         | StartEvent::TimeOut
                         | StartEvent::TimeOutThenFinishLater
@@ -15198,6 +15224,73 @@ def main():
             assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// Design 8.11 `late_item` (ADR-372): a link error of no primitive read at job end, while
+    /// the host waits for a primitive past its deadline, reaches the log after that primitive's
+    /// `primitive_ended`, as a `late_item` of the exchange it may have come during.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_error_read_at_job_end_is_a_late_item() {
+        let dir = journal_dir("job-end-link-error");
+        let (mut client, _fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((Duration::from_millis(150), StartEvent::LinkErrorThenRespond)),
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_millis(50),
+        };
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(Duration::from_millis(500));
+            let result = host.service_request(0x22, &[0xF1, 0x90]);
+            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            host.settle_at_end();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        let events: Vec<&str> = comm_log_events(&lines)
+            .into_iter()
+            .filter(|event| {
+                ["exchange", "primitive_ended", "late_item", "unattached"].contains(event)
+            })
+            .collect();
+        assert_eq!(
+            events,
+            ["exchange", "primitive_ended", "late_item"],
+            "{lines:#?}"
+        );
+        let exchange = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .unwrap();
+        let late = lines
+            .iter()
+            .find(|line| line["event"] == "late_item")
+            .unwrap();
+        assert_eq!(late["item"], "error_event", "{late}");
+        assert_eq!(late["error_event"], "PDU_ERR_EVT_PROT_ERR", "{late}");
+        assert_eq!(late["primitive"], "none", "{late}");
+        assert!(
+            late["refers_to"]
+                .as_array()
+                .unwrap()
+                .contains(&exchange["seq"]),
+            "{late}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Design 8.11 "Settlement", `primitive_ended` (ADR-366): a primitive past the agent's

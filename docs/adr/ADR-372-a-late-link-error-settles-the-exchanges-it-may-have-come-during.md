@@ -87,9 +87,13 @@ for a late reset.
 
 ## Consequences
 
-- An error bound to the stray primitive the host tracks is placed by its time here. The host
-  does not yet pass that primitive's `seq` with it, and at job end it does not pass link errors
-  of no primitive to the log. That work is left to a later change.
+- An error bound to the stray primitive the host tracks, cancelled before the link's next
+  request, goes to that primitive's exchange whatever its time: the host passes the exchange's
+  `seq` with it (`UnattachedItem.owner`), and the log takes it as a fault seen in that exchange
+  on its own link (the maintainer's decision, 2026-10-27). At job end, the host also reads the
+  link errors of no primitive while it waits for the stray primitive, and passes them to the log
+  after the primitive's `primitive_ended` (`CommLog::late_link_errors`), with the primitive's own
+  when no end of it is written. Both came in a later change than the rest of this ADR.
 - An exchange with no VCI time on the error's clock is taken as after it, so it may lose matched
   answers from before an error that came after it. A target whose exchanges share no clock with
   the error is taken the same way. Both err towards `undetermined`.

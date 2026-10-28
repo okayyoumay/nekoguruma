@@ -501,7 +501,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   the later exchanges are reclassified. Before the window, no window exchange is reclassified.
   One that cannot be placed on one clock with the exchanges is a possible link error (H3) during
   each exchange written since the link's items were last read before it; with none, it stays
-  `unattached`. An unbound transmit
+  `unattached`. One bound to the stray primitive the host cancelled before the request is that
+  primitive's exchange's, whatever its time: the host names the exchange's `seq` with it
+  (`UnattachedItem.owner`). At job end, `WorkerHost::settle_at_end` also reads the link errors
+  of no primitive while it waits for the stray primitive, and hands them to the log after its
+  `primitive_ended` (`CommLog::late_link_errors`), with the primitive's own errors when no end
+  of it is written. An unbound transmit
   indication, loopback echo or start-of-message indication that the one ended exchange which
   could own it (one whose `sent` is still `unknown`, or an owed request awaiting a response on
   that identifier) owns, and not the exchange in flight, is a `late_item` settling entry

@@ -2142,6 +2142,11 @@ impl LinkState {
     }
 
     /// The window's newest exchange.
+    /// Whether the exchange logged as `seq` is in the window, or kept beyond it.
+    pub(crate) fn holds(&self, seq: u64) -> bool {
+        self.window.iter().any(|logged| logged.seq == seq) || self.kept(seq).is_some()
+    }
+
     pub(crate) fn window_last(&self) -> Option<u64> {
         self.window.back().map(|logged| logged.seq)
     }

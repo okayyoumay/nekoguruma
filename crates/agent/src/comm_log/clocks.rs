@@ -13,7 +13,7 @@
 //! after the VCI reconnected. A value ahead of that bound without a wrap is kept: it shows only
 //! that the reads before it came later than their times, since the delay of a read has no ceiling.
 
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::exchange::Clock;
 
@@ -54,7 +54,7 @@ pub(crate) struct EpochTime {
 }
 
 /// The time an epoch ended with: raw, with its epoch and when the host read it.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub(crate) struct EndedEpoch {
     pub epoch: u32,
     pub us: u64,
@@ -246,6 +246,21 @@ impl VciClocks {
         )
     }
 
+    /// The clock's latest time in its current epoch, raw, with when the host read it: what a
+    /// lost VCI's record keeps of the clock (design 8.11 `vci_loss_settled`, ADR-373).
+    pub(crate) fn last(&self, clock: Clock) -> Option<EndedEpoch> {
+        let state = match clock {
+            Clock::Device => &self.device,
+            Clock::Worker => &self.worker,
+        };
+        let epoch = state.current?;
+        Some(EndedEpoch {
+            epoch: epoch.number,
+            us: epoch.latest.raw,
+            read_us: epoch.latest.read_us,
+        })
+    }
+
     /// The clock's latest unwrapped time in its current epoch.
     pub(crate) fn latest(&self, clock: Clock) -> Option<i64> {
         let state = match clock {
@@ -271,6 +286,45 @@ impl VciClocks {
             epoch: epoch.number,
             unwrapped: i64::try_from(raw + k * WRAP).ok()?,
         })
+    }
+}
+
+/// How the first reading of a lost VCI's clock after its reconnect compares with the gap the
+/// agent's clock measured since the clock's last time before the loss (design 8.11
+/// `vci_loss_settled`, ADR-373).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct LossFit {
+    /// What a clock that carried on reads: the last time plus the gap, modulo the wrap.
+    pub expected_us: u64,
+    /// Twice the clock margin, one for each reading, plus the drift bound over the gap.
+    pub tolerance_us: u64,
+    /// The reading lies within the tolerance of the expected value, across the wrap.
+    pub carried_on: bool,
+    /// The reading is no more than the gap plus the tolerance: a clock that started again from
+    /// zero during the gap.
+    pub restarted: bool,
+}
+
+/// Sets `reading_us` against `last_us` and the agent's `gap_us` between them (raw times of one
+/// clock, the gap within one agent epoch).
+pub(crate) fn loss_fit(
+    last_us: u64,
+    reading_us: u64,
+    gap_us: u64,
+    drift_bound_ppm: u32,
+    clock_margin_us: u32,
+) -> LossFit {
+    let tolerance = 2 * i128::from(clock_margin_us)
+        + i128::from(drift_bound_ppm) * i128::from(gap_us) / 1_000_000;
+    let reading = i128::from(reading_us);
+    let expected = (i128::from(last_us) + i128::from(gap_us)).rem_euclid(WRAP);
+    let ahead = (reading - expected).rem_euclid(WRAP);
+    let distance = ahead.min(WRAP - ahead);
+    LossFit {
+        expected_us: u64::try_from(expected).unwrap_or(u64::MAX),
+        tolerance_us: u64::try_from(tolerance).unwrap_or(u64::MAX),
+        carried_on: distance <= tolerance,
+        restarted: reading <= i128::from(gap_us) + tolerance,
     }
 }
 
@@ -545,5 +599,63 @@ mod tests {
         assert_eq!(before(end, 2_000), end);
         // Before the epoch's first time, below it.
         assert_eq!(before(placed(2, 1_000), SPAN - 500), placed(2, -500));
+    }
+
+    /// A gap of 31.2 s at 100 ppm: a tolerance of 2 ms for the two readings plus 3.12 ms.
+    const GAP: u64 = 31_200_000;
+
+    #[test]
+    fn a_clock_that_carried_on_reads_its_last_time_plus_the_gap() {
+        let fit = loss_fit(1_835_511_040, 1_866_711_040 + 4_000, GAP, 100, 1_000);
+        assert_eq!(fit.expected_us, 1_866_711_040);
+        assert_eq!(fit.tolerance_us, 5_120);
+        assert!(fit.carried_on && !fit.restarted, "{fit:?}");
+        // Just past the tolerance on either side, it carried on no longer.
+        for reading in [1_866_711_040 + 5_121, 1_866_711_040 - 5_121] {
+            assert!(!loss_fit(1_835_511_040, reading, GAP, 100, 1_000).carried_on);
+        }
+    }
+
+    #[test]
+    fn a_clock_that_restarted_reads_no_more_than_the_gap() {
+        let fit = loss_fit(1_835_511_040, 2_000_000, GAP, 100, 1_000);
+        assert!(!fit.carried_on && fit.restarted, "{fit:?}");
+        assert!(loss_fit(1_835_511_040, GAP + 5_120, GAP, 100, 1_000).restarted);
+        assert!(!loss_fit(1_835_511_040, GAP + 5_121, GAP, 100, 1_000).restarted);
+    }
+
+    #[test]
+    fn a_clock_whose_last_time_plus_the_gap_reaches_the_wrap_fits_both() {
+        // The expected value wraps to 10 s, within the gap a restarted clock may have run.
+        let last = SPAN - GAP + 10_000_000;
+        let fit = loss_fit(last, 10_000_000, GAP, 100, 1_000);
+        assert_eq!(fit.expected_us, 10_000_000);
+        assert!(fit.carried_on && fit.restarted, "{fit:?}");
+        // And one a few microseconds before the wrap is still near the expected value.
+        let fit = loss_fit(SPAN - 1_000, 500, 0, 100, 1_000);
+        assert!(fit.carried_on, "{fit:?}");
+    }
+
+    #[test]
+    fn a_reading_far_from_both_fits_neither() {
+        let fit = loss_fit(1_835_511_040, 900_000_000, GAP, 100, 1_000);
+        assert!(!fit.carried_on && !fit.restarted, "{fit:?}");
+    }
+
+    #[test]
+    fn the_last_time_is_the_latest_raw_time_and_when_it_was_read() {
+        let mut clocks = VciClocks::default();
+        assert_eq!(clocks.last(Clock::Device), None);
+        read(&mut clocks, 5_000, 7_000);
+        read(&mut clocks, 6_000, 8_100);
+        assert_eq!(
+            clocks.last(Clock::Device),
+            Some(EndedEpoch {
+                epoch: 0,
+                us: 6_000,
+                read_us: 8_100
+            })
+        );
+        assert_eq!(clocks.last(Clock::Worker), None);
     }
 }

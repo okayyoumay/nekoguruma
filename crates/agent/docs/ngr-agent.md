@@ -348,6 +348,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   given it (`Job::with_vci_margins`, which the hardware harness fills from its profile's
   `[vci]` keys), else `default`, the agent's own (`VciMargins::DEFAULT_TIMING_MARGIN_US` 2 ms,
   `DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms).
+  A run that loses the VCI writes `vci_loss`, and writes it again, whole, after each further
+  exchange the loss ended or caused, syncing each one (ADR-373). When the log holds a loss no
+  `vci_loss_settled` names, the next run whose VCI connects reads the VCI's clock once
+  (`GetTimestamp`) before `vci_connected`, and writes `vci_loss_settled` right after it. Every
+  reopen starts a new agent epoch, so the gap since the loss is not measured and `power_kept` is
+  `unknown`.
   `link_opened` then gives the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those

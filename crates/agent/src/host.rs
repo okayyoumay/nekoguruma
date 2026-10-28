@@ -1118,28 +1118,17 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// says it is on and the time from `since`, the agent's deadline, to the read's answer, which
     /// bounds when after it the clock was read; `None` when the read fails.
     async fn read_clock(&mut self, since: tokio::time::Instant) -> Option<ClockReading> {
-        let read = unary(
+        let read = read_vci_clock(
+            &mut self.client,
+            self.link.module_handle,
             self.timings.unary,
-            "GetTimestamp",
-            self.client.get_timestamp(GetTimestampRequest {
-                module_handle: Some(self.link.module_handle),
-            }),
         )
         .await;
         let round_trip = since.elapsed();
-        match read {
-            Ok(reading) => Some(ClockReading {
-                time: VciTime::new(
-                    u64::from(reading.timestamp),
-                    clock_named(reading.timestamp_clock),
-                ),
-                round_trip_us: u64::try_from(round_trip.as_micros()).unwrap_or(u64::MAX),
-            }),
-            Err(error) => {
-                tracing::debug!(?error, "reading the VCI's clock at the deadline failed");
-                None
-            }
-        }
+        read.map(|time| ClockReading {
+            time,
+            round_trip_us: u64::try_from(round_trip.as_micros()).unwrap_or(u64::MAX),
+        })
     }
 
     /// The agent's time now, when the host logs the request it is about to send: it has a log,
@@ -1559,6 +1548,33 @@ fn clock_of(item: &EventItem) -> Option<Clock> {
 }
 
 /// The clock a worker's `TimestampClock` value names, or none when it names none.
+/// Reads the VCI's clock (`GetTimestamp` of `module_handle`), with the clock the worker says it
+/// is on; `None` when the read fails.
+pub(crate) async fn read_vci_clock<C: WorkerApi>(
+    client: &mut C,
+    module_handle: vci_service_interface::ModuleHandle,
+    deadline: Duration,
+) -> Option<VciTime> {
+    let read = unary(
+        deadline,
+        "GetTimestamp",
+        client.get_timestamp(GetTimestampRequest {
+            module_handle: Some(module_handle),
+        }),
+    )
+    .await;
+    match read {
+        Ok(reading) => Some(VciTime::new(
+            u64::from(reading.timestamp),
+            clock_named(reading.timestamp_clock),
+        )),
+        Err(error) => {
+            tracing::debug!(?error, "reading the VCI's clock failed");
+            None
+        }
+    }
+}
+
 fn clock_named(clock: i32) -> Option<Clock> {
     match TimestampClock::try_from(clock) {
         Ok(TimestampClock::Device) => Some(Clock::Device),

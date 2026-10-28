@@ -21,7 +21,7 @@
 use std::collections::{HashMap, VecDeque};
 
 use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use super::clocks::Placed;
 use super::redaction::{Direction, LoggedMessage, redact, redact_unanswering};
@@ -162,7 +162,7 @@ impl From<TransmitEvidence> for SentEvidence {
 }
 
 /// The clock a VCI time is on (design 8.11 "On one clock", ADR-120).
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Clock {
     /// The VCI's own clock.
@@ -817,7 +817,7 @@ pub(crate) struct AnswerItem {
 
 /// Which side an exchange's fault lies on (design 8.11 "Classification"), ordered by severity:
 /// `system` over `undetermined` over `vehicle` over `none`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Classification {
     None,

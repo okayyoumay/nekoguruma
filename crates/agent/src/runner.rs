@@ -1227,17 +1227,20 @@ fn run_job<C: WorkerApi>(
         // A loss an earlier run recorded is settled against the first reading of the VCI's
         // clock after it connected (design 8.11 `vci_loss_settled`, ADR-373).
         let reading = if log.loss_to_settle() {
-            let asked = std::time::Instant::now();
+            let asked = log.now();
             handle
                 .block_on(crate::host::read_vci_clock(
                     &mut client,
                     link.module_handle,
                     timings.unary,
                 ))
-                .map(|time| crate::comm_log::ConnectReading {
-                    time,
-                    read: log.now(),
-                    round_trip_us: u64::try_from(asked.elapsed().as_micros()).unwrap_or(u64::MAX),
+                .map(|time| {
+                    let read = log.now();
+                    crate::comm_log::ConnectReading {
+                        time,
+                        read,
+                        round_trip_us: log.round_trip_us(asked, read),
+                    }
                 })
         } else {
             None

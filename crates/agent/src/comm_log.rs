@@ -1309,10 +1309,12 @@ struct Inner {
     serial_number: Option<u32>,
     /// The machine's boot, when the system identifies it, which a loss's settlement compares.
     boot_id: Option<String>,
-    /// When the device clock's latest time was read, on the agent's clock and on the boot
-    /// clock, the boot time taken as the time was placed, so that a suspend before a loss is
-    /// noted does not skew it (ADR-374).
-    device_read_boot: Option<(u64, u64)>,
+    /// How far the boot clock is ahead of the agent's monotonic clock, from each agent time the
+    /// log has read on: the agent's time of the reading and the offset, one entry for each time
+    /// the offset grew, as it does across a suspend (the agent's clock stops during one, the boot
+    /// clock does not). A time's boot time is then taken with the offset when it was read, so
+    /// that a suspend afterwards does not skew it (ADR-374).
+    boot_offsets: Vec<(u64, u64)>,
     /// For tests: the boot clock reads this plus the agent's monotonic time.
     #[cfg(test)]
     boot_offset_us: Option<u64>,
@@ -1430,7 +1432,7 @@ impl CommLog {
             unsettled: scan.unsettled,
             serial_number: None,
             boot_id: boot::id(),
-            device_read_boot: None,
+            boot_offsets: Vec::new(),
             #[cfg(test)]
             boot_offset_us: None,
         })))
@@ -1449,6 +1451,17 @@ impl CommLog {
         let mut inner = self.lock();
         inner.boot_id = boot.map(|(id, _)| id.to_owned());
         inner.boot_offset_us = boot.map(|(_, offset)| offset);
+        inner.boot_offsets.clear();
+        inner.sample_boot();
+    }
+
+    /// Makes the boot clock run on `us` past the agent's, as across a suspend of the machine.
+    #[cfg(test)]
+    fn suspend(&self, us: u64) {
+        let mut inner = self.lock();
+        if let Some(offset) = &mut inner.boot_offset_us {
+            *offset += us;
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -1472,6 +1485,8 @@ impl CommLog {
             Opening::Fresh => {
                 // The log begins here: the header reads 0.
                 inner.origin = Instant::now();
+                inner.boot_offsets.clear();
+                inner.sample_boot();
                 let clock = AgentClock {
                     monotonic_us: 0,
                     ..inner.clock()
@@ -1530,9 +1545,26 @@ impl CommLog {
         self.lock().failed.is_none()
     }
 
+    /// The time from `asked` to `answered`, two agent times of this log, on the boot clock when
+    /// the system gives one, so that a suspend in between counts (ADR-374).
+    pub(crate) fn round_trip_us(&self, asked: AgentNow, answered: AgentNow) -> u64 {
+        let mut inner = self.lock();
+        let agent = answered.monotonic_us.saturating_sub(asked.monotonic_us);
+        match (
+            inner.boot_at(asked.monotonic_us),
+            inner.boot_at(answered.monotonic_us),
+        ) {
+            (Some(asked), Some(answered)) => answered.saturating_sub(asked).max(agent),
+            _ => agent,
+        }
+    }
+
     /// The agent's clocks now, for an exchange's times.
     pub(crate) fn now(&self) -> AgentNow {
-        let clock = self.lock().clock();
+        let mut inner = self.lock();
+        let clock = inner.clock();
+        inner.sample_boot_at(clock.monotonic_us);
+        drop(inner);
         AgentNow {
             epoch: u32::try_from(clock.epoch).unwrap_or(u32::MAX),
             monotonic_us: clock.monotonic_us,
@@ -3656,17 +3688,15 @@ impl Inner {
                 boot: None,
             },
         };
-        // The boot time taken when the device clock's last time was placed.
         if fresh {
             loss.boot = loss
                 .clocks
                 .iter()
                 .find(|last| last.clock == exchange::Clock::Device)
                 .and_then(|last| {
-                    let (read_us, boot_us) = self.device_read_boot?;
-                    (read_us == last.time.read_us).then_some(LossBoot {
+                    Some(LossBoot {
                         id: self.boot_id.clone()?,
-                        us: boot_us,
+                        us: self.boot_at(last.time.read_us)?,
                     })
                 });
         }
@@ -3844,11 +3874,40 @@ impl Inner {
     }
 
     /// The boot clock's time when the agent's monotonic clock read `monotonic_us` in this agent
-    /// epoch, from the boot clock now; `None` when the system gives no boot clock.
-    fn boot_at(&self, monotonic_us: u64) -> Option<u64> {
+    /// epoch, with the offset between the two clocks then; `None` when the system gives no boot
+    /// clock.
+    fn boot_at(&mut self, monotonic_us: u64) -> Option<u64> {
+        self.sample_boot();
+        let (_, offset) = self
+            .boot_offsets
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= monotonic_us)
+            .or(self.boot_offsets.first())?;
+        monotonic_us.checked_add(*offset)
+    }
+
+    /// Takes the offset between the boot clock and the agent's clock now.
+    fn sample_boot(&mut self) {
         let agent_now_us = self.clock().monotonic_us;
-        let now_us = self.boot_now_us(agent_now_us)?;
-        now_us.checked_sub(agent_now_us.checked_sub(monotonic_us)?)
+        self.sample_boot_at(agent_now_us);
+    }
+
+    /// Takes the offset between the boot clock and the agent's clock, which read `agent_now_us`
+    /// just now. Only a growth beyond the two reads' own jitter is kept: the clocks run at one
+    /// rate but for a suspend.
+    fn sample_boot_at(&mut self, agent_now_us: u64) {
+        const JITTER_US: u64 = 50;
+        let Some(offset) = self
+            .boot_now_us(agent_now_us)
+            .and_then(|boot_us| boot_us.checked_sub(agent_now_us))
+        else {
+            return;
+        };
+        let last = self.boot_offsets.last().map(|(_, last)| *last);
+        if last.is_none_or(|last| offset > last + JITTER_US) {
+            self.boot_offsets.push((agent_now_us, offset));
+        }
     }
 
     /// The boot clock now, the agent's monotonic clock reading `agent_now_us`.
@@ -3901,16 +3960,6 @@ impl Inner {
         let (placed, opened) =
             self.clocks
                 .read(clock, raw, read.monotonic_us, read.epoch, tolerance);
-        if clock == exchange::Clock::Device
-            && self
-                .clocks
-                .last(clock)
-                .is_some_and(|last| last.us == raw && last.read_us == read.monotonic_us)
-        {
-            self.device_read_boot = self
-                .boot_at(read.monotonic_us)
-                .map(|boot_us| (read.monotonic_us, boot_us));
-        }
         if let Some(opened) = opened {
             self.append_with(|seq, line| {
                 serde_json::to_writer(
@@ -9316,8 +9365,9 @@ mod tests {
         });
         log.exchange_with(answered, Vec::new()).unwrap();
         // The machine suspends before the loss is noted: the boot clock runs on, the agent's
-        // does not, and the record keeps the boot time taken when the last time was placed.
-        log.boot_as(Some(("boot-1", 9_000_000_000)));
+        // does not, and the record keeps the boot time the last time was read at, with the
+        // offset between the clocks then.
+        log.suspend(9_000_000_000);
         let lost = |refused_after_loss| {
             evidence(
                 endpoint(0x7E0),
@@ -9552,6 +9602,39 @@ mod tests {
         let entry = settle(77, dpdu_facts(), None);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert!(entry["clock"]["reading"].is_null());
+    }
+
+    /// A suspend between asking the VCI's clock and its answer counts in the round trip: the
+    /// boot clock measures it, as it measures the gap (ADR-374).
+    #[test]
+    fn a_suspend_during_the_reading_counts_in_its_round_trip() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let asked = log.now();
+        // The agent's clock moves on between the two reads, as it does around a real suspend.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        let answered = log.now();
+        let agent = answered.monotonic_us - asked.monotonic_us;
+        assert_eq!(log.round_trip_us(asked, answered), agent + 5_000_000);
+        // A time read before the suspend keeps the boot time it was read at, however late it
+        // is placed.
+        assert_eq!(
+            log.lock().boot_at(asked.monotonic_us),
+            Some(1_000_000 + asked.monotonic_us)
+        );
+        assert_eq!(
+            log.lock().boot_at(answered.monotonic_us),
+            Some(6_000_000 + answered.monotonic_us)
+        );
+        // Without a boot clock, the agent's clock alone.
+        log.boot_as(None);
+        let asked = log.now();
+        let answered = log.now();
+        assert_eq!(
+            log.round_trip_us(asked, answered),
+            answered.monotonic_us - asked.monotonic_us
+        );
     }
 
     /// On Linux the log takes the real boot id and boot clock: a run that reconnects in the

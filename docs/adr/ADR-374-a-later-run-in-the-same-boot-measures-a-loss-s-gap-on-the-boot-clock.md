@@ -31,11 +31,13 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    for a loss and its settlement, so an exchange's times cost nothing more.
 
 2. **The record.** The first `vci_loss` record of a loss keeps `boot`: the boot id and the time
-   on the boot clock at which the device clock's last time was read. That time is taken when the
-   log places the device time, from the boot clock then and the agent time elapsed since the
-   read, so a suspend between the read and the loss does not skew it: the agent's monotonic
-   clock stops during a suspend, the boot clock does not. A record without a device time, or
-   written on a system without a boot clock, has no `boot`.
+   on the boot clock at which the device clock's last time was read. The agent's monotonic clock
+   stops during a suspend and the boot clock does not, so the offset between them grows with
+   each suspend. Whenever the log reads the agent's clock it also reads the boot clock, and it
+   keeps each growth of the offset with the agent time it was seen at. A time's boot time is its
+   agent time plus the offset in force when it was read, so a suspend between the read and the
+   time's placement, or before the loss is noted, does not skew it. A record without a device
+   time, or written on a system without a boot clock, has no `boot`.
 
 3. **The gap.** The settlement measures the gap on the boot clock when the record's boot id is
    the reconnecting run's, whatever the agent epochs; otherwise, as before, on the agent's clock
@@ -47,9 +49,10 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    read's boot time (`boot_us`), so a reader can redo it. A different boot leaves the loss
    `undetermined`, as a gap across agent epochs did.
 
-4. **The reading's round trip.** The runner times its `GetTimestamp` at the reconnect, and the
-   reading's agent time is taken after the answer, so the VCI's clock was read at most that
-   round trip earlier. The tolerance of the comparison adds the round trip
+4. **The reading's round trip.** The runner times its `GetTimestamp` at the reconnect, on the
+   boot clock when there is one so that a suspend during the read counts, and the reading's
+   agent time is taken after the answer, so the VCI's clock was read at most that round trip
+   earlier. The tolerance of the comparison adds the round trip
    (`round_trip_us` in `vci_loss_settled`) to twice the clock margin and the drift bound over
    the gap.
 

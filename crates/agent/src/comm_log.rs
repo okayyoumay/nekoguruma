@@ -3893,21 +3893,38 @@ impl Inner {
         self.sample_boot_at(agent_now_us);
     }
 
-    /// Takes the offset between the boot clock and the agent's clock, which read `agent_now_us`
-    /// just now. Only a growth beyond the two reads' own jitter is kept: the clocks run at one
-    /// rate but for a suspend.
+    /// Takes the offset between the boot clock and the agent's clock for the agent time
+    /// `agent_now_us`, read just now. The boot clock's read is bracketed by two reads of the
+    /// agent's clock, and a sample whose bracket is wider than the reads' own jitter (the thread
+    /// was preempted in between) is taken again, up to a few times, or not at all, so that a
+    /// delay is not taken for a suspend. Only a growth beyond the jitter is kept: the clocks run
+    /// at one rate but for a suspend.
     fn sample_boot_at(&mut self, agent_now_us: u64) {
         const JITTER_US: u64 = 50;
-        let Some(offset) = self
-            .boot_now_us(agent_now_us)
-            .and_then(|boot_us| boot_us.checked_sub(agent_now_us))
-        else {
+        const TRIES: usize = 3;
+        let offset = (0..TRIES).find_map(|_| {
+            let before = self.monotonic_us();
+            let boot_us = self.boot_now_us(before);
+            let after = self.monotonic_us();
+            match boot_us {
+                None => Some(None),
+                Some(boot_us) => {
+                    (after.saturating_sub(before) <= JITTER_US).then(|| boot_us.checked_sub(before))
+                }
+            }
+        });
+        let Some(Some(offset)) = offset else {
             return;
         };
         let last = self.boot_offsets.last().map(|(_, last)| *last);
         if last.is_none_or(|last| offset > last + JITTER_US) {
             self.boot_offsets.push((agent_now_us, offset));
         }
+    }
+
+    /// The agent's monotonic time since the log began, in this agent epoch.
+    fn monotonic_us(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
     }
 
     /// The boot clock now, the agent's monotonic clock reading `agent_now_us`.
@@ -3924,7 +3941,7 @@ impl Inner {
     fn clock(&self) -> AgentClock {
         AgentClock {
             epoch: self.epoch,
-            monotonic_us: u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX),
+            monotonic_us: self.monotonic_us(),
             wall_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as u64),

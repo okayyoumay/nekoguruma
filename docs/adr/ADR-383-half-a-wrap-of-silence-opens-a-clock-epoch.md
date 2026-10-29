@@ -89,7 +89,9 @@ ADR-361 item 3 already draws by placing a time nearest the latest within half a 
 - On a system without a boot clock (today every one but Linux), a suspend within the silence
   goes unseen. A VCI that stays connected through a suspend of half a wrap or more can then be
   placed with a false wrap count.
-- Two cases open an epoch more often than needed, and never place a time falsely:
+- Three cases open an epoch more often than needed, and never place a time falsely:
+  - A read whose boot time is missing when it is placed (every sample from its read to then
+    was delayed) counts as a silence, and so does the next read after it in the epoch.
   - When a time with no read time of its own opens the epoch, it is taken as read at the end of
     its exchange. That overstates the epoch's least delay and understates its reach, so a wrap
     soon after can open a further epoch as a step back.

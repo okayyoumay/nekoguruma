@@ -5988,6 +5988,46 @@ mod tests {
         assert_eq!(exchanges[2]["times"]["vci"]["rx_end"]["epoch"], 1);
     }
 
+    /// A suspend between two exchanges a minute apart on the agent's clock counts in the
+    /// clock's silence: on the boot clock it lasts half a wrap, so the next time opens an epoch
+    /// (ADR-383).
+    #[test]
+    fn a_suspend_between_exchanges_opens_a_clock_epoch() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let request = [0x22, 0xF1, 0x90];
+        let answered = |read_us: u64, vci_us: u64| {
+            let mut answered = evidence(
+                endpoint(0x7E0),
+                &request,
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+            );
+            answered.times.agent.before_us = read_us - 2_000;
+            answered.times.agent.end_us = read_us + 1_000;
+            answered.times.vci = Some(exchange::VciTimes {
+                rx_end: Some(device(vci_us)),
+                response_read_us: Some(read_us),
+                ..exchange::VciTimes::default()
+            });
+            answered
+        };
+        log.exchange(answered(1_000_000, 999_000)).unwrap();
+        log.suspend((1 << 31) + 1_000_000);
+        log.exchange(answered(61_000_000, 5_000)).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let reasons: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "clock_epoch")
+            .map(|line| line["reason"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(reasons, ["first", "gap_beyond_wrap"], "{lines:?}");
+    }
+
     /// A read's boot time, which a clock's silence counts a suspend by: none on a system
     /// without a boot clock, missing where no sample came near the read (ADR-383).
     #[test]

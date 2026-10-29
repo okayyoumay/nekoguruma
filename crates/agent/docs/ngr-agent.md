@@ -604,11 +604,14 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   completion limit), narrowed by any pending the worker still passes on there (ADR-362). A
   receive timeout after a response may have begun is the transport's and is not judged; one
   early or late otherwise is `system`; a final response whose start is late is `system`; a
-  suppressed request's silence with a timeout at P2, a confirmed send and no hidden cause is
-  `none`. Without a transmit time on the same clock the
+  suppressed request's silence with a timeout judged at P2 on a link that forwards pendings, a
+  confirmed send and no hidden cause is `none`. Without a transmit time on the same clock the
   timing is `not_judged`, with the reason, so on a link whose VCI absorbs pendings a response
   with no pending seen is `undetermined` (a pending may have come first), while one after a
-  pending seen takes its own row;
+  pending seen takes its own row. Nothing presumes a timer right (ADR-376, `exchange::row`):
+  a final response whose time is not judged is never `none` or `vehicle`, since it may have
+  come late with the VCI past its own limit, and a silence is `vehicle` only after a receive
+  timeout judged at the limit on a link that forwards pendings (`exchange::silence_open`);
   an answer an owed request could own leaves the exchange that received it `undetermined`, and
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
   later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched

@@ -335,7 +335,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-343](ADR-343-the-guarded-socketcan-end-of-a-t0-loopback.md) | The Guarded SocketCAN End of a T0 Loopback | Accepted | `ngr-hw-checks` guard and T0 check, `j2534-0404-service` hardware and mock tests, design 13.5; ADR-275, ADR-333 |
 | [ADR-344](ADR-344-the-write-job-journal-binds-the-flash-artifact.md) | The Write-Job Journal Binds the Flash Artifact's Hash | Accepted | `agent` journal (`Record::ArtifactSha256`), runner restart order, restart (`OnSiteReason::ArtifactDiffers`), design 8.2.5 and 11.3; ADR-229, ADR-244, ADR-261, ADR-268, ADR-318, ADR-327, ADR-336 |
 | [ADR-345](ADR-345-the-agent-builds-its-source-table-from-the-job-s-document.md) | The Agent Builds Its Source Table From the Job's Document | Accepted | `agent` (`ServiceSources::from_document`, `check_job`, `JobError::Sources`, journal setup's table), design 8.9; ADR-245, ADR-336, ADR-338 |
-| [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354; item 2 extended by ADR-375, which rules out an estimate added to reach a judgement) | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
+| [ADR-346](ADR-346-the-agent-s-communication-log.md) | The Agent's Communication Log | Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354; item 2 extended by ADR-375, which rules out an estimate added to reach a judgement; item 6's one accepted presumption, of the VCI's timer and pending handling, superseded by ADR-376) | design 8.11; `agent` host, link and job runner (the log), `sim-vci` transmit indications; ADR-235 item 3, ADR-236, ADR-289, ADR-294 |
 | [ADR-347](ADR-347-the-communication-log-s-file-and-writer.md) | The Communication Log's File and Writer | Accepted (Decision item 2 extended by ADR-348) | design 8.11; `agent` `comm_log`, job runner entry points (`JobRun`), journal writer lock; ADR-255, ADR-346 item 10 |
 | [ADR-348](ADR-348-operational-logs.md) | Operational Logs | Accepted | design 12.2, 8.7, 8.11 (`procedure_log`) and 16.2; `agent` logging setup and worker output capture, `vci-service-launcher` and `vci-service-config` file output and rotation, `server`; ADR-024, ADR-033, ADR-089, ADR-285, ADR-346 |
 | [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-251 |
@@ -365,6 +365,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-373](ADR-373-a-lost-vci-is-recorded-and-settled-when-a-later-run-connects.md) | A Lost VCI Is Recorded and Settled When a Later Run Connects | Accepted (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374) | `agent` communication log (`vci_loss` record, `vci_loss_settled`), runner and host (clock read at connect); design 8.11 "Settlement", "Reconnect"; ADR-294, ADR-346, ADR-357, ADR-361 |
 | [ADR-374](ADR-374-a-lost-vci-s-gap-across-runs-is-recorded-on-the-boot-clock.md) | A Lost VCI's Gap Across Runs Is Recorded on the Boot Clock | Accepted | `agent` communication log (boot clock, boot id and sleep figures, `vci_loss` `boot`, `vci_loss_settled` gap and round trip, recorded but not judged), runner (clock read at connect); design 8.11 `vci_loss_settled`; ADR-373 |
 | [ADR-375](ADR-375-the-communication-log-adds-no-estimate-to-reach-a-judgement.md) | The Communication Log Adds No Estimate to Reach a Judgement | Accepted | `agent` communication log (every outcome); design 8.11 head; `.github/instructions/rust.instructions.md`; ADR-346 item 2 |
+| [ADR-376](ADR-376-the-communication-log-presumes-no-timer-right.md) | The Communication Log Presumes No Timer Right | Accepted | `agent` communication log (`comm_log/exchange.rs`: `row`, `silence_open`); design 8.11 "Classification"; ADR-346 item 6 |
 
 ## Status Legend
 
@@ -637,7 +638,7 @@ the predecessor repository these ADRs came from.
 - ADR-135 (superseded by ADR-187)
 - ADR-139
 - ADR-187
-- ADR-346 (item 6's cases resting on the extra error information superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354; item 2 extended by ADR-375, which rules out an estimate added to reach a judgement)
+- ADR-346 (item 6's cases resting on the extra error information superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354; item 2 extended by ADR-375, which rules out an estimate added to reach a judgement; item 6's one accepted presumption, of the VCI's timer and pending handling, superseded by ADR-376)
 - ADR-347
 - ADR-348
 - ADR-350 (item 1's agent use of a known code superseded by ADR-351)
@@ -745,6 +746,7 @@ the predecessor repository these ADRs came from.
 - ADR-373 (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374)
 - ADR-374
 - ADR-375
+- ADR-376
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

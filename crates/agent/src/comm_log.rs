@@ -6752,7 +6752,11 @@ mod tests {
         let lines = run(None);
         let exchanges = of_event(&lines, "exchange");
         let (first, second) = (&exchanges[0]["seq"], &exchanges[1]["seq"]);
-        assert_ne!(exchanges[1]["classification"], "undetermined", "{lines:?}");
+        // The silent read is open only for its timeout, which is not judged (ADR-376): the
+        // matched answer before it rules out a wrong address or filter.
+        let silent_reason = exchanges[1]["reason"].as_str().unwrap();
+        assert!(silent_reason.contains("not presumed right"), "{lines:?}");
+        assert!(!silent_reason.contains("(H2)"), "{lines:?}");
         // Within the answered read (on its clock's epoch, within the margin of its end): its
         // own fault, and the silent read after it has no matched answer from before the error.
         let lines = run(Some(error(1_199_500, Some(exchange::Clock::Device))));
@@ -6760,6 +6764,13 @@ mod tests {
         let [late] = &of_event(&lines, "late_item")[..] else {
             panic!("{lines:?}");
         };
+        assert!(
+            late["exchanges"][1]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("(H2)"),
+            "{late}"
+        );
         assert_eq!(
             late["refers_to"],
             serde_json::json!([first, second]),
@@ -9008,8 +9019,15 @@ mod tests {
         ]);
         let exchanges = of_event(&lines, "exchange");
         assert_eq!(exchanges[0]["sent"], "unknown", "{lines:?}");
+        // Each keeps its own rows' classification: a response whose time is not judged (it
+        // carries no transmit done), so it may also have come late (ADR-376).
         for answered in &exchanges[1..] {
-            assert_eq!(answered["classification"], "none", "{answered}");
+            assert_eq!(answered["classification"], "undetermined", "{answered}");
+            let reason = answered["reason"].as_str().unwrap();
+            assert!(
+                reason.starts_with("The ECU responded positively. Its time is not judged"),
+                "{answered}"
+            );
         }
         // Not settled by the indication before the start; raised once, not after each.
         assert_eq!(of_event(&lines, "late_item").len(), 1, "{lines:?}");

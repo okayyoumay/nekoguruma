@@ -56,7 +56,8 @@ to record what a later judgement needs and to judge nothing from it yet.
    slept since its boot then (`slept_us`: the boot time less the system's monotonic time, which
    stops during a suspend). The system clock's offset from the agent's is constant, so it is
    read once, between two reads of the agent's clock as a boot sample is. A record without a
-   device time, or written on a system without a boot clock, has no `boot`.
+   device time, written on a system without a boot clock, or whose device time was read where
+   a sample was missing, has no `boot`.
 
 4. **The settlement's record.** When the record's boot id is the reconnecting run's, the
    settlement measures the gap on the boot clock, whatever the agent epochs, and records it in
@@ -80,8 +81,9 @@ to record what a later judgement needs and to judge nothing from it yet.
 
 5. **No judgement from it.** A gap on the boot clock settles a loss as `power_kept` `unknown`,
    whatever its comparison gives, and the reason says that the gap is recorded but not judged.
-   A gap on the agent's clock, within one agent epoch, settles as ADR-373 says; no settlement
-   reaches it today, since every reopen starts a new agent epoch.
+   A gap on the agent's clock, within one agent epoch, is judged as ADR-373 says, with the
+   round trip of item 4 in its tolerance and no comparison when the round trip is unbounded;
+   no settlement reaches it today, since every reopen starts a new agent epoch.
 
 ## Consequences
 

@@ -823,11 +823,11 @@ struct LossClock {
     last_before: Option<LossTime>,
     /// The first reading of the VCI's clock after the reconnect.
     reading: Option<LossTime>,
-    /// The loss's boot and the reconnect's are the same; `null` when the system gave no boot
-    /// id on either side.
+    /// The loss's boot and the reconnect's are the same; `null` when the record has no boot or
+    /// the reconnecting run has no boot id.
     boot_match: Option<bool>,
-    /// How much longer the machine had slept by the reconnect than by the loss; a gap with a
-    /// suspend in it is compared with nothing.
+    /// How much longer the machine had slept by the reconnect than by the loss, recorded for a
+    /// later judgement (ADR-374).
     slept_in_gap_us: Option<u64>,
     /// The gap between the two reads: on the boot clock when both lie in one boot, else on the
     /// agent's clock when both lie in one agent epoch, else `null`.
@@ -10001,6 +10001,14 @@ mod tests {
                 .contains("could not bound"),
             "{entry}"
         );
+        // A reading that fits a restart judges nothing either.
+        let entry = settle(
+            &record(with_boot),
+            Some("boot-1"),
+            20_000_000 - 1_875_511_040,
+        );
+        assert_eq!(entry["clock"]["fits_restarted"], true, "{entry}");
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
         // A suspend in the gap is recorded.
         let entry = settle_with(
             &record(with_boot),

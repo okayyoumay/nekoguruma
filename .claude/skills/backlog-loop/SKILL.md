@@ -180,7 +180,9 @@ backlog-only PR.
 
 Work the item as any other task, following CLAUDE.md and `.claude/README.md` (task size, agents,
 documentation sync, ADRs). For an item whose blocker a decision of the maintainer just resolved,
-write CLAUDE.md's design summary ("Guidelines") and get it confirmed before implementing. Close the item with the `backlog` skill in the same PR. A Dependabot
+write CLAUDE.md's design summary ("Guidelines") and get it confirmed before implementing. When
+the item meets the case-table gate in `.claude/README.md` (ADR-381), get `design-advisor`'s case
+table before implementing it. Close the item with the `backlog` skill in the same PR. A Dependabot
 replacement (step 2) has no item to close. If its work shows the loop cannot finish it, put the
 Dependabot PR on the run's Dependabot list with the reason, mark the replacement "final" in its
 run state, close it unmerged with a comment giving the reason, and write the final report. Its
@@ -234,9 +236,10 @@ verdict or its reasons changed.
 
 ## 6. Wait for the merge, then continue
 
-End the turn. While the PR is open, any wake other than its merge or close (a review, a CI
-result, a comment) is handled by `pr-review-loop`, and the turn ends again; it does not start
-step 1.
+Start the 30-minute merge-wait timer (`pr-review-loop`, "Waking up" in Step 0; ADR-380) and end
+the turn. A timer wake reads the PR's state: merged or closed goes on as below, and still open
+starts the next timer. While the PR is open, any other wake (a review, a CI result, a comment) is
+handled by `pr-review-loop`, and the turn ends again; it does not start step 1.
 
 A PR marked "final" ends the run whether it is merged or closed: write the final report if it
 was not written yet, and do nothing else.

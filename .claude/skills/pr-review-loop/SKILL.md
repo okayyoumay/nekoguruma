@@ -40,10 +40,26 @@ contributor rules and milestones the script does not check, so a PR touching the
 as usual. If a later push makes the PR change any other file, request a review at that point and
 run the loop as usual from Step 1.
 
-A submitted review wakes the session as a PR event. Still, right after each request, schedule a
-one-shot check-in about 15 minutes later (`send_later`) as a safety net for a review that never
-comes. Once the result is in, read it and act on it right away, and delete that check-in
-(`delete_trigger`).
+**Waking up (ADR-380).** A submitted review, a CI result or a merge normally wakes the session
+as a PR event, but events go missing, and nothing else wakes a session that has ended its turn.
+So whenever a turn ends waiting for something on GitHub, first start a timer: `sleep <seconds>`
+as a background shell command (Bash with `run_in_background`), whose exit wakes the session. Do
+not use `send_later` or other scheduled triggers for these waits; some sessions do not offer
+them. Run one timer per wait:
+
+- after a review request (Codex or Copilot): 15 minutes;
+- after a push whose CI Step 5 waits for: 10 minutes, then 5 minutes while any check run of the
+  head is still queued or in progress;
+- while a handed-over PR waits for the maintainer's merge (`backlog-loop` step 6): 30 minutes,
+  repeated.
+
+Every wake, from an event or a timer, starts by reading the PR's current state from GitHub: the
+head commit, the Codex summary's state line, the reviews after the latest request, the head's
+check runs, and whether the PR is open, merged or closed. Then do only what that state still
+needs. A wake that finds nothing new starts the next timer of the same wait and ends the turn,
+so an event that arrives late, or a timer that fires after the result, changes nothing. When the
+awaited result arrives by event, stop that wait's timer if it is still running (`TaskStop`), or
+let it fire.
 
 **Never write an at-sign mention of either reviewer** in a PR comment, review reply, commit
 message or PR description, not even quoted in backticks, except the exact Codex request comment
@@ -89,7 +105,7 @@ Only a result posted after the latest request whose reviewed commit is a prefix 
 head counts as that request's result (after a retry, below, a result of the request it retried
 counts too).
 
-**Codex not set up.** If the request gets no summary comment and no result by the second check-in
+**Codex not set up.** If the request and its retry (below) get no summary comment and no result
 and the app has never answered on this repository, or Codex answers that it is not set up for the
 repository or account, Codex cannot review here (installing the ChatGPT Codex GitHub app and
 turning on code review for the repository in the Codex settings are steps only the owner can take).
@@ -99,16 +115,13 @@ Say so once in the thread, naming those steps, and switch the PR to Copilot.
 right away; do not wait for the allowance to come back. Say so once in the thread. The next PR
 starts with Codex again.
 
-**Codex requested but never finished.** If a check-in finds no result for the latest request,
-schedule one more check-in 15 minutes later. While the summary's state shows `status: running` for
-the current head, keep scheduling check-ins instead of counting the request as stalled, but only
-up to 30 minutes after the request (a Codex review usually takes under ten); a state still running
-after that counts as stalled too. A request has stalled when the second check-in finds no result
-and no running state, or the 30 minutes have passed.
+**Codex requested but never finished.** A request has stalled when its 15-minute timer finds no
+result for it, also when the summary's state still shows `status: running` for the current head
+(a Codex review usually takes under two minutes and rarely more than seven; ADR-380).
 
 A stalled or errored request is retried once per head (ADR-360): the Codex service is known to
 leave some reviews running indefinitely, and a new request on the same head usually completes.
-Post a new `@codex review` comment as under "Request" above, schedule its check-in, and say
+Post a new `@codex review` comment as under "Request" above, start its 15-minute timer, and say
 nothing in the thread yet; the timing above starts again from the new request. A result of
 either request on the current head then counts. If the earlier one also finishes, its result is
 on the same head: route only the findings the other result has not already raised. If the retry
@@ -150,13 +163,13 @@ the fallback review under "Copilot not available" above right away. If the maint
 says the budget is back, request Copilot again on the head as it is then and continue the loop
 from Step 1.
 
-**Copilot requested but never finished.** If the request call succeeded but the check-in finds
-no review of the current head, schedule one more check-in 15 minutes later. Decide this from the
+**Copilot requested but never finished.** If the request call succeeded but its 15-minute timer
+finds no review of the current head, start one more 15-minute timer. Decide this from the
 reviews alone: while the review runs, Copilot can already be gone from the PR's requested
 reviewers, so that list says nothing about whether a review is coming. The review runs as a
 check run named `copilot-pull-request-reviewer` (`get_check_runs`); while that check run's
-status is anything but `completed` (`queued` and `in_progress` alike), schedule the next
-check-in instead of counting the round as stalled. Only a completed or absent check run with no
+status is anything but `completed` (`queued` and `in_progress` alike), start the next 15-minute
+timer instead of counting the round as stalled. Only a completed or absent check run with no
 review counts toward the stall. If that one
 still finds no review, treat the round as stalled: tell the maintainer once in the thread and
 run one fallback pass (as under "Copilot not available") on this head instead of re-requesting.
@@ -287,7 +300,7 @@ finding. A round where every finding was declined (2d) or answered by pointing a
 reply changes no file: skip the sweep, checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
 newly declined finding *and* this head has not been re-requested after a no-change round
-before, and, on a specification pull request, the pause in Step 4 does not withhold it.
+before, and the pause in Step 4 does not withhold it.
 Otherwise the loop ends: go to Step 5 after the replies. So the same head is
 re-requested at most once.
 
@@ -369,10 +382,8 @@ conditions fixed only Low-rated findings, in Markdown files only: its fix still 
 Step 3 check, and the loop then ends without a re-request. Step 5 reports those findings as
 fixed after the last review.
 
-**Specification pull requests: pause after eight rounds (ADR-349).** A specification pull request
-is one whose changed files, `work/` aside, are all Markdown and include an ADR
-(`docs/adr/ADR-*.md`) or `docs/system-architecture.md`. On one, count the review rounds that
-reported findings, from either reviewer. After the eighth such round, and after each later one,
+**Long loops: pause after eight rounds (ADR-349, ADR-381).** On every PR, specification or code,
+count the review rounds that reported findings, from either reviewer. After the eighth such round, and after each later one,
 push the round's fix as usual, if it has one. Then, before any re-request, whether the rule above allows it
 or a round that changed no file does (Step 3), check where the last four rounds' findings landed. For each finding, run
 `git blame -L <line>,<line> <reviewed commit> -- <path>`, using the line and commit the finding
@@ -391,7 +402,8 @@ fix-written:
     backlog item (`backlog` skill), then request one review on the cut head. The count starts
     again, and that head becomes the baseline.
   - **Rewrite**: rewrite that section in one piece, from rules that settle the neighbouring
-    cases together, then request one review. The count starts again, and the rewritten head
+    cases together; on code, rebuild the affected logic from a new `design-advisor` case table
+    for that part (`.claude/README.md`, ADR-381). Then request one review. The count starts again, and the rewritten head
     becomes the baseline.
   - **Continue**: re-request as usual. The count starts again; the baseline stays.
 - Give the share, the rounds so far and the section the findings land on with the question, and
@@ -430,8 +442,8 @@ fallback review in Step 0 is done:
    count after a later qualifying fix. If this step edits a file, go back through Steps 3 and 4.
 2. **Resolve the threads** that were fixed, accepted or declined (`resolve_review_thread`, with
    the thread `id` from `get_review_comments`). Neither reviewer resolves its own threads.
-3. **CI on the current head.** Wait for the check runs of the commit you are handing over and
-   require them to pass (`get_check_runs`); the local checks in Step 3 do not cover the Windows
+3. **CI on the current head.** Wait for the check runs of the commit you are handing over, with
+   the CI timers under "Waking up" (Step 0), and require them to pass (`get_check_runs`); the local checks in Step 3 do not cover the Windows
    tests or the worker targets. On a PR whose build jobs are skipped (see "CI facts"),
    `changes` and `repo-checks` passing is enough. A red run sends you back to fixing it per CLAUDE.md. Also check the
    base, even after a no-change round: if the PR conflicts with `main`

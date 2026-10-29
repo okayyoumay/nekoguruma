@@ -1,7 +1,7 @@
 # ADR-349: Pause the Review Loop on Long Specification Pull Requests
 
 **Date:** 2026-10-23
-**Status:** Accepted
+**Status:** Accepted (Decision items 1 and 4 amended by ADR-381: the pause applies to code pull requests too)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Step 4), `CLAUDE.md` ("Pull requests"), `.github/copilot-instructions.md` ("Writing findings"); ADR-251
 
 ## Context

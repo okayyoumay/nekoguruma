@@ -1590,18 +1590,21 @@ impl CommLog {
     }
 
     /// The time from `asked` to `answered`, two agent times of this log, on the boot clock when
-    /// the system gives one, so that a suspend in between counts (ADR-374). `None` when only one
-    /// of the two has a boot time: the agent's clock would leave out a suspend in between, so
-    /// nothing bounds the time.
+    /// the system gives one, so that a suspend in between counts (ADR-374). `None` when the
+    /// system gives a boot clock but one of the two has no boot time: the agent's clock would
+    /// leave out a suspend in between, so nothing bounds the time (ADR-379).
     pub(crate) fn round_trip_us(&self, asked: AgentNow, answered: AgentNow) -> Option<u64> {
         let mut inner = self.lock();
         let agent = answered.monotonic_us.saturating_sub(asked.monotonic_us);
+        // One sample for both lookups, so that both see the same offsets.
+        inner.sample_boot();
         match (
             inner.boot_at(asked.monotonic_us),
             inner.boot_at(answered.monotonic_us),
         ) {
             (Some(asked), Some(answered)) => Some(answered.saturating_sub(asked).max(agent)),
-            (None, None) => Some(agent),
+            // No boot clock: the agent's clock alone.
+            (None, None) if inner.boot_offsets.is_empty() => Some(agent),
             _ => None,
         }
     }
@@ -3738,6 +3741,7 @@ impl Inner {
             },
         };
         if fresh {
+            self.sample_boot();
             loss.boot = loss
                 .clocks
                 .iter()
@@ -3779,6 +3783,8 @@ impl Inner {
     /// ADR-373). `None` once the log has failed.
     fn settle_loss(&mut self, loss: VciLoss, reading: Option<ConnectReading>) -> Option<u64> {
         let round_trip_us = reading.and_then(|reading| reading.round_trip_us);
+        // One sample for every boot time looked up below, so that all see the same offsets.
+        self.sample_boot();
         // A reading taken at a time nothing bounds is compared with nothing (ADR-374 item 4).
         let unbounded = reading.is_some_and(|reading| reading.round_trip_us.is_none());
         // The reading on its clock, which opens the clock's first epoch of this run.
@@ -3973,9 +3979,9 @@ impl Inner {
 
     /// The boot clock's time when the agent's monotonic clock read `monotonic_us` in this agent
     /// epoch, with the offset between the two clocks then; `None` when the system gives no boot
-    /// clock.
-    fn boot_at(&mut self, monotonic_us: u64) -> Option<u64> {
-        self.sample_boot();
+    /// clock, or no sample came near that time. It takes no sample itself: a caller looking up
+    /// several times takes one first ([`Inner::sample_boot`]), so that all see the same offsets.
+    fn boot_at(&self, monotonic_us: u64) -> Option<u64> {
         let (_, offset) = self
             .boot_offsets
             .iter()
@@ -10026,7 +10032,7 @@ mod tests {
         let during = log.now();
         std::thread::sleep(std::time::Duration::from_millis(1));
         let after = log.now();
-        let mut inner = log.lock();
+        let inner = log.lock();
         assert_eq!(inner.boot_at(during.monotonic_us), None);
         assert_eq!(
             inner.boot_at(before.monotonic_us),
@@ -10044,7 +10050,7 @@ mod tests {
         let during = log.now();
         std::thread::sleep(std::time::Duration::from_millis(1));
         let after = log.now();
-        let mut inner = log.lock();
+        let inner = log.lock();
         assert_eq!(
             inner.boot_at(during.monotonic_us),
             Some(6_000_000 + during.monotonic_us)
@@ -10054,6 +10060,47 @@ mod tests {
             Some(6_000_000 + after.monotonic_us)
         );
         assert_eq!(inner.boot_offsets.len(), entries);
+    }
+
+    /// Both ends of a round trip read where no sample could be taken bound nothing when the
+    /// system gives a boot clock: a suspend between them would be left out (ADR-379).
+    #[test]
+    fn a_round_trip_with_no_boot_time_at_either_end_is_unbounded() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        log.now();
+        log.delay_samples(3);
+        let asked = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        log.delay_samples(3);
+        let answered = log.now();
+        assert_eq!(log.round_trip_us(asked, answered), None);
+    }
+
+    /// A missing sample's mark is dropped only when the next sample's offset is within the
+    /// jitter of the one before: one microsecond more keeps it (ADR-379).
+    #[test]
+    fn a_missing_sample_is_dropped_only_within_the_jitter() {
+        for (slept_us, dropped) in [(50, true), (51, false)] {
+            let log = CommLog::over(Box::new(Recording::default()), b"");
+            log.boot_as(Some(("boot-1", 1_000_000)));
+            log.now();
+            let entries = log.lock().boot_offsets.len();
+            log.delay_samples(3);
+            let during = log.now();
+            log.suspend(slept_us);
+            std::thread::sleep(std::time::Duration::from_millis(1));
+            log.now();
+            let inner = log.lock();
+            let expected = if dropped { entries } else { entries + 2 };
+            assert_eq!(inner.boot_offsets.len(), expected, "{slept_us}");
+            assert_eq!(
+                inner.boot_at(during.monotonic_us).is_some(),
+                dropped,
+                "{slept_us}"
+            );
+        }
     }
 
     /// Missing samples with no suspend between them leave no entries behind, however many there
@@ -10079,7 +10126,7 @@ mod tests {
         log.suspend(5_000_000);
         std::thread::sleep(std::time::Duration::from_millis(1));
         let after = log.now();
-        let mut inner = log.lock();
+        let inner = log.lock();
         assert_eq!(inner.boot_offsets.len(), entries.len() + 2);
         assert_eq!(
             inner.boot_at(before.monotonic_us),

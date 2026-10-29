@@ -3,8 +3,9 @@
 **Date:** 2026-10-29
 **Status:** Accepted
 **Affects:** design 8.11 (`vci_loss_settled`); `agent` communication log (`comm_log.rs`
-`Inner::settle_loss`, `Inner::sample_boot_at`); `crates/agent/docs/ngr-agent.md`; ADR-374
-item 5 and its Consequences
+`CommLog::round_trip_us`, `Inner::note_loss`, `Inner::settle_loss`, `Inner::sample_boot_at`,
+`Inner::boot_at`); `crates/agent/docs/ngr-agent.md`; ADR-374 items 2, 4 and 5 and its
+Consequences
 
 ## Context
 
@@ -53,7 +54,16 @@ missed sample on a machine whose clock reads often miss the jitter bound.
    the run by no more than the jitter, no suspend came in the run. The run's mark is then
    removed and no new entry is added, so a time read during the run takes the earlier offset,
    as one read between two samples does. A run whose next sample shows the offset grown keeps
-   its mark: its times have no boot time, as before.
+   its mark: its times have no boot time, as before. A figure that looks up several boot times
+   (a round trip, a loss's `boot`, a settlement's reads) takes one sample first and looks every
+   time up in the same list, so that a sample taken between two lookups cannot give them
+   different offsets.
+
+3. **A round trip with no boot time at either end is unbounded.** On a machine with a boot
+   clock, a round trip whose two ends both lie in a run of missing samples has no boot time at
+   either end, and the agent's clock would leave out a suspend between them. It is `null`, as
+   one with a boot time at one end only is (ADR-374 item 4). Only a system without a boot clock
+   measures a round trip on the agent's clock alone.
 
 ## Consequences
 

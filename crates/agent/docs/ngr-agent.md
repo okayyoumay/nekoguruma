@@ -616,7 +616,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   both stay owed (the earlier exchange is reclassified only by a settling entry, which comes
   later). An accepted session change or ECUReset, of any type (ADR-346 item 6), ends the matched
   answers and the owed requests, and an unusable answer to either ends only the matched
-  answers. Read late, in a `late_response` or a `primitive_ended`, either answer ends them as of
+  answers, as does either one sent with its positive response suppressed whose silence is not
+  `none` (`LinkEffect::unsure_restart`, ADR-376). Read late, in a `late_response` or a `primitive_ended`, either answer ends them as of
   its exchange's entry (`exchange::LinkState::reset_after`, ADR-369): the later exchanges in the
   window are reclassified on their matched answers counted again from the window and, after an
   acceptance, without the owed requests from before it as owners. A link error ends the matched answers too, but a final response that came after

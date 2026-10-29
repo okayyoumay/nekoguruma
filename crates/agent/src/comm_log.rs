@@ -9023,9 +9023,9 @@ mod tests {
         // carries no transmit done), so it may also have come late (ADR-376).
         for answered in &exchanges[1..] {
             assert_eq!(answered["classification"], "undetermined", "{answered}");
-            let reason = answered["reason"].as_str().unwrap();
-            assert!(
-                reason.starts_with("The ECU responded positively. Its time is not judged"),
+            assert_eq!(
+                answered["reason"],
+                "The ECU responded positively. Its time is not judged, so it may also have come after the limit in force with the VCI past its own limit (system); the log does not presume the VCI's timer right, so both readings stay.",
                 "{answered}"
             );
         }

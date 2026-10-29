@@ -1,7 +1,7 @@
 # ADR-346: The Agent's Communication Log
 
 **Date:** 2026-10-22
-**Status:** Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354; item 2 extended by ADR-375, which rules out an estimate added to reach a judgement; item 6's one accepted presumption, of the VCI's timer and pending handling, superseded by ADR-376)
+**Status:** Accepted (item 6's flow-control wait named by the extra error information, and the outcomes that rested on that information, superseded by ADR-351; item 6's exclusion of H2 and its matched answer by a response start alone superseded by ADR-354; item 2 extended by ADR-375, which rules out an estimate added to reach a judgement; item 6's one accepted presumption, of the VCI's timer and pending handling, and its exclusion of H4 by a receive timeout judged at or within P2, superseded by ADR-376)
 **Affects:** design 8.11 (new); `agent` (`WorkerHost::send_recv` / `send_recv_async` and the
 link's event handling in `host.rs`, the ComParams `link.rs` sets, the job runner); the worker
 interface's error events (`vci-service-interface`, `docs/rpc-api-guide.md`); `sim-vci`

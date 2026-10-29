@@ -2,10 +2,12 @@
 
 **Date:** 2026-10-29
 **Status:** Accepted
-**Affects:** design 8.11 "Classification" (H4, the paragraph after the hidden causes, the rule
-above the table, the suppressed no-response rows, the `positive` row, the no-response rows
-after a matched answer or a pending, the example of an ECU that stops answering); `agent`
-communication log (`comm_log/exchange.rs`: `row`, `rows`, `silence_open`);
+**Affects:** design 8.11 "Matched answer", "Possible pending", "Classification" (H4, the
+paragraph after the hidden causes, the rule above the table, the suppressed no-response rows,
+the `answers` row, the `positive` row, the no-response rows after a matched answer or a
+pending, the example of an ECU that stops answering) and "Settlement" (`late_response`);
+`agent` communication log (`comm_log/exchange.rs`: `row`, `rows`, `silence_open`,
+`LinkState::record`, `LinkEffect::unsure_restart`, `settle_late_response`);
 `crates/agent/docs/ngr-agent.md`; ADR-346 item 6
 
 ## Context
@@ -19,7 +21,11 @@ right. Three kinds of outcome rested on it:
   answer or a pending was `vehicle`, and a suppressed request's silence `none`. On a J2534 link
   the worker's own timer was taken as right in the same way;
 - on a link whose VCI absorbs pendings, a receive timeout judged at P2 was taken to show that no
-  pending came, since a pending would have restarted the VCI's wait.
+  pending came, since a pending would have restarted the VCI's wait. So a late response after
+  such a timeout was `vehicle`.
+
+A suppressed ECUReset or session change ended the earlier requests' evidence only when its
+silence was `none`, which the same presumption gave it on any link that forwards pendings.
 
 ADR-375 then ruled that the log states an outcome only when every case its evidence leaves
 gives it, and adds no value it did not read; its item 5 left the existing rules standing until
@@ -49,12 +55,27 @@ worker's timer like the VCI's.
 
    So H4 is excluded only on a link that forwards pendings.
 
+4. **A late response after a timeout at P2 on an absorbing link.** A `late_response` past the
+   limit in force, after the VCI ended its wait at P2 on a link whose VCI absorbs pendings, is
+   `undetermined`, not `vehicle`. Without a pending, the ECU answered late; after one the VCI
+   absorbed, the VCI should have waited longer (`system`). The two give the same times (H4).
+
+5. **An unsure restart.** A session change or ECUReset sent with its positive response
+   suppressed, with no final response, that may have reached the ECU but whose silence is not
+   `none`, may have restarted the ECU, though nothing shows it. It ends the matched answers, as
+   an unusable answer to such a request does, so an answer from before it rules out a wrong
+   address or filter no longer. It does not end the owed requests, so a later answer that one
+   of them could own stays `undetermined`. One the agent refused before sending changes
+   nothing.
+
 ## Consequences
 
-- On a link without transmit times, which includes every J2534 link today, a positive response
-  is `undetermined` rather than `none`. A silence there is `undetermined` rather than `vehicle`.
-  So are a refusal for the ECU's state and a positive response to a suppressed request when
-  their time is not judged.
+- A final response whose time is not judged (no transmit time on its clock, for example) is
+  `undetermined` rather than `none` or `vehicle`. Responses judged within P2 keep their rows.
+- On a J2534 link the worker's receive timeout is on the worker's own clock (ADR-120), never on
+  one clock with the transmit, so no J2534 silence is `vehicle`, and no suppressed J2534
+  request's silence is `none`. So a suppressed session change or ECUReset there never ends the
+  owed requests; it ends the matched answers (item 5).
 - On a link whose VCI absorbs pendings, no silence is `vehicle` or `none`, even with a timeout
   judged at P2. The design's example of an ECU that stops answering shows such a link, and is
   now `undetermined`.

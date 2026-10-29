@@ -1259,6 +1259,21 @@ struct LinkEffect {
     answer_after_error: bool,
 }
 
+impl LinkEffect {
+    /// A session change or ECUReset that may have been carried out, though nothing shows it:
+    /// one whose answer the agent cannot use, or one sent, with its positive response
+    /// suppressed and no final response, whose silence is not classified `none` (no judged
+    /// timeout shows that the ECU accepted it, ADR-376). It ends the matched answers only.
+    fn unsure_restart(&self, classification: Classification) -> bool {
+        self.restarts_ecu
+            && (self.unusable
+                || (self.suppressed
+                    && !self.final_response
+                    && self.sent != Sent::NotSent
+                    && classification != Classification::None))
+    }
+}
+
 /// Whether `request` is one whose acceptance ends the earlier requests' evidence: a
 /// DiagnosticSessionControl or an ECUReset of any type (design 8.11 "Owed request", ADR-346
 /// item 6).
@@ -1699,8 +1714,10 @@ impl LinkState {
     ///   item 6), or one sent with its positive response suppressed and classified `none`, ends
     ///   the matched answers and the owed requests: all of them when its answer could belong to
     ///   none, otherwise those sent before the earliest request it could belong to.
-    /// - A response to such a request that was accepted but is unusable (a bad field) ends the
-    ///   matched answers only, since the ECU may be restarting but the agent cannot tell.
+    /// - A response to such a request that was accepted but is unusable (a bad field), or such
+    ///   a request sent with its positive response suppressed whose silence is not classified
+    ///   `none` (ADR-376), ends the matched answers only, since the ECU may be restarting but
+    ///   the agent cannot tell.
     /// - The exchange is owed when its request may have reached the ECU whole (`sent`
     ///   `confirmed` or `unknown`) and no final response is placed with it alone.
     pub(crate) fn record(&mut self, entry: &ExchangeEntry) {
@@ -1708,7 +1725,7 @@ impl LinkState {
         let accepting = effect.restarts_ecu
             && ((effect.positive && effect.final_response)
                 || (effect.suppressed && entry.classification == Classification::None));
-        let unsure_restart = effect.restarts_ecu && effect.unusable;
+        let unsure_restart = effect.unsure_restart(entry.classification);
         // An error that came before the final response leaves the response counted since it:
         // the error is applied first. Any other error ends the answer of its exchange.
         if let (true, Some(kind)) = (effect.answer_after_error, effect.link_error) {
@@ -2618,7 +2635,7 @@ impl ExchangeEntry {
     /// Whether its answer is a matched answer, as [`LinkState::record`] counts it.
     pub(crate) fn matched_answer(&self) -> bool {
         let effect = &self.effect;
-        let unsure_restart = effect.restarts_ecu && effect.unusable;
+        let unsure_restart = effect.unsure_restart(self.classification);
         effect.this_exchange
             && effect.bound_answer
             && !self.accepting()
@@ -2988,6 +3005,15 @@ pub(crate) fn settle_late_response(
             );
             if base.classification >= Undetermined {
                 (base.classification, format!("{late} {}", base.reason))
+            } else if at_limit && kept.evidence.absorbing() {
+                // A pending the VCI absorbed would have put the limit off (ADR-376).
+                (
+                    Undetermined,
+                    format!(
+                        "{late} The VCI ended its wait at P2, but it absorbs pendings: after a pending it absorbed it should have waited longer ({}); the two give the same times (H4).",
+                        severity_word(System)
+                    ),
+                )
             } else if at_limit {
                 (
                     Vehicle,
@@ -3210,18 +3236,19 @@ fn negative_note(code: Option<u8>) -> &'static str {
 /// force ran out (ADR-376): `None` only for a receive timeout judged at the limit on one clock
 /// on a link that forwards pendings. The log presumes neither the VCI's timer nor, on J2534,
 /// the worker's right, nor that a pending the VCI absorbed restarted its wait.
-fn silence_open(evidence: &Evidence) -> Option<&'static str> {
-    if evidence.absorbing() {
-        Some(
-            "the VCI absorbs pendings, so a pending it absorbed may have come, and how its wait went on after one is not seen (H4)",
-        )
-    } else if evidence.timing.window != Window::TimeoutAtLimit {
-        Some(
-            "the end of the wait is not judged against the limit in force on one clock, so it may have come early: the VCI's timer, or on a J2534 link the worker's, is not presumed right",
-        )
-    } else {
-        None
+fn silence_open(evidence: &Evidence) -> Option<String> {
+    let mut open = Vec::new();
+    if evidence.timing.window != Window::TimeoutAtLimit {
+        open.push(
+            "the end of the wait is not judged against the limit in force on one clock, so it may have come early or late: the VCI's timer, or on a J2534 link the worker's, is not presumed right",
+        );
     }
+    if evidence.absorbing() {
+        open.push(
+            "the VCI absorbs pendings, so a pending it absorbed may have come, and how its wait went on after one is not seen (H4)",
+        );
+    }
+    (!open.is_empty()).then(|| open.join("; and "))
 }
 
 /// The rows of the table, in its order, for the exchange's own outcome, with no outcome that
@@ -3388,6 +3415,15 @@ fn rows(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) 
                     NoFault,
                     to_owned(
                         "No response was expected, and none came: the request was sent, the ECU has answered requests matched this way, no link error came and no pending was hidden.",
+                    ),
+                )
+            } else if hidden.is_empty() && timed_out_at_p2 {
+                // Only a partial send leaves this: any other send but a confirmed one is H1.
+                (
+                    Undetermined,
+                    format!(
+                        "No response was expected and none came, but {}, so the ECU may not have received the whole request.",
+                        send_phrase(sent).to_lowercase()
                     ),
                 )
             } else if hidden.is_empty() {
@@ -4599,7 +4635,43 @@ mod tests {
                 absorbed.reason
             );
             assert!(absorbed.reason.contains("(H4)"), "{}", absorbed.reason);
+            assert!(
+                !absorbed.reason.contains("not presumed right"),
+                "{}",
+                absorbed.reason
+            );
+            // Neither judged nor forwarding: the possible-pending row names both readings.
+            let mut both = silent.clone();
+            both.pending_visibility = PendingVisibility::AbsorbedByVci;
+            let both = of(&both);
+            assert_eq!(both.classification, Classification::Undetermined);
+            assert!(both.reason.contains("not judged"), "{}", both.reason);
+            assert!(both.reason.contains("(H4)"), "{}", both.reason);
         }
+        // A suppressed request's silence, timed out at P2 on a forwarding link, when only its
+        // first frame went out: the reason says so, not that no timeout was judged.
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            forwarding(evidence(&[0x3E, 0x00], End::Positive(vec![0x7E, 0x00]))),
+        );
+        let mut partial = judged(forwarding(evidence(&[0x3E, 0x80], End::NoResponse)));
+        partial.suppressed = true;
+        partial.flow_control = true;
+        let entry = log(&mut state, 2, partial);
+        assert_eq!(entry.sent, Sent::Partial, "{}", entry.reason);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(
+            entry.reason.contains("only the first frame"),
+            "{}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("no receive timeout"),
+            "{}",
+            entry.reason
+        );
     }
 
     #[test]
@@ -4977,6 +5049,13 @@ mod tests {
             settle(&unjudged, &positive, LateWindow::Late { by_us: 1 }).0,
             Classification::Undetermined
         );
+        // Late after a timeout at P2 on a link whose VCI absorbs pendings: had the ECU sent one
+        // the VCI absorbed, it should have waited longer (H4, ADR-376).
+        let mut absorbing = vehicle.clone();
+        absorbing.evidence.pending_visibility = PendingVisibility::AbsorbedByVci;
+        let (class, reason) = settle(&absorbing, &positive, LateWindow::Late { by_us: 1 });
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.contains("(H4)"), "{reason}");
         // Late, but its outcome's own row is not `vehicle`: an invalid key stays undetermined.
         assert_eq!(
             settle(&vehicle, &[0x7F, 0x22, 0x35], LateWindow::Late { by_us: 1 }).0,
@@ -5349,14 +5428,35 @@ mod tests {
         assert_eq!(state.last_reset(), Some(2));
         let probe = read([0xF1, 0x89], End::Positive(vec![0x62, 0xF1, 0x89]));
         assert_eq!(state.history_for(&probe).owed_matching, 0);
-        // As undetermined it ends nothing.
+        // As undetermined it may still have been carried out, which nothing shows (ADR-376):
+        // it ends the matched answers, as an unusable answer would, but not the owed requests.
         let mut state = LinkState::default();
         log(&mut state, 1, read([0xF1, 0x89], End::NoResponse));
+        log(
+            &mut state,
+            2,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        let matched = read([0xF1, 0x86], End::NoResponse);
+        assert_eq!(state.history_for(&matched).answered_same_match, 1);
         let mut reset = evidence(&[0x11, 0x81], End::NoResponse);
         reset.suppressed = true;
-        log(&mut state, 2, reset);
+        let entry = log(&mut state, 3, reset.clone());
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(!entry.matched_answer());
         assert_eq!(state.last_reset(), None);
         assert_eq!(state.history_for(&probe).owed_matching, 1);
+        assert_eq!(state.history_for(&matched).answered_same_match, 0);
+        // One the agent refused before sending it changes nothing.
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        reset.end = End::NotSent(RefusalCause::Policy);
+        log(&mut state, 2, reset);
+        assert_eq!(state.history_for(&matched).answered_same_match, 1);
     }
 
     #[test]

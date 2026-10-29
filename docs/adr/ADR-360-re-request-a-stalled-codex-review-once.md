@@ -1,7 +1,7 @@
 # ADR-360: Re-Request a Stalled Codex Review Once
 
 **Date:** 2026-10-26
-**Status:** Accepted
+**Status:** Accepted (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer)
 **Affects:** `.claude/skills/pr-review-loop/SKILL.md` (Step 0, Codex; Step 5's review summary), `CLAUDE.md` ("Pull requests"); ADR-312 Decision item 1
 
 ## Context

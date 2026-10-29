@@ -349,7 +349,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged; the default drift bound and clock margin no longer settle a loss, ADR-378) | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
 | [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
-| [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 5), `CLAUDE.md`; ADR-312 |
+| [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer) | `.claude/skills/pr-review-loop` (Steps 0, 5), `CLAUDE.md`; ADR-312 |
 | [ADR-361](ADR-361-the-log-unwraps-each-vci-clock-within-a-window-of-the-agent-s-clock.md) | The Log Unwraps Each VCI Clock Within a Window of the Agent's Clock | Accepted | `agent` communication log (`VciClocks`, `clock_epoch`, `pending_intervals`, the reopen scan); design 8.11 "Timing judged", `clock_epoch`; ADR-353, ADR-357 |
 | [ADR-362](ADR-362-the-log-judges-a-receive-timeout-only-before-a-response-began.md) | The Log Judges a Receive Timeout Only Before a Response Began | Accepted (Decision item 4 narrowed by ADR-364; item 1's `response_times_judged` narrowed by ADR-377 to a link with a timing margin) | `agent` communication log (`comm_log::timing`, `link_opened`, the timeout and late rows); design 8.11 "Timing judged", "Limit in force", `timing`; ADR-346, ADR-361 |
 | [ADR-363](ADR-363-an-ecu-definition-declares-the-identifier-a-vehicle-definition-names.md) | An ECU Definition Declares the Identifier a Vehicle Definition Names | Accepted | `diag-ir` (`EcuDocument.definition_id`, schema 20), `diag-frontend` (`definition.csv`); design 8.8.2; ADR-326, ADR-307 |
@@ -368,6 +368,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-376](ADR-376-the-communication-log-presumes-no-timer-right.md) | The Communication Log Presumes No Timer Right | Accepted | `agent` communication log (`comm_log/exchange.rs`: `row`, `rows`, `silence_open`, `LinkState::record`, `settle_late_response`); design 8.11 "Matched answer", "Possible pending", "Classification", "Settlement"; ADR-346 item 6 |
 | [ADR-377](ADR-377-the-communication-log-judges-no-time-on-a-default-margin.md) | The Communication Log Judges No Time on a Default Margin | Accepted | `agent` communication log (`comm_log/timing.rs` `Limits`, `judge`, `judge_late_at`, `past_vci_limits`; `VciMargins`, `link_opened`); design 8.11 "Timing margin", `timing`; 9.3; 13.5; ADR-357 |
 | [ADR-378](ADR-378-a-loss-is-judged-only-on-clock-tolerances-a-profile-gives.md) | A Loss Is Judged Only on Clock Tolerances a Profile Gives | Accepted | `agent` communication log (`Inner::settle_loss`); design 8.11 `vci_loss_settled`, "Drift bound"; ADR-357; ADR-373 item 4 |
+| [ADR-380](ADR-380-the-review-loops-wake-themselves-with-a-timer.md) | The Review Loops Wake Themselves with a Timer | Accepted | `.claude/skills/pr-review-loop` (Step 0, Step 5), `.claude/skills/backlog-loop` (step 6); ADR-360 item 2 |
 
 ## Status Legend
 
@@ -725,7 +726,8 @@ the predecessor repository these ADRs came from.
 - ADR-343
 - ADR-349
 - ADR-356
-- ADR-360
+- ADR-360 (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer)
+- ADR-380
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

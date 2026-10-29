@@ -872,7 +872,7 @@ fn power_kept(
     }
     let Some(fit) = fit else {
         return unknown(
-            "The VCI reconnected in a later run of the agent, and nothing measured the time since the loss: the agent's clock starts over with each run, and the system gave no boot clock that both runs share",
+            "The VCI reconnected in a later run of the agent, and nothing measured the time since the loss: the agent's clock starts over with each run, and no boot clock both runs share was read at both times",
         );
     };
     match (fit.carried_on, fit.restarted, serial_match) {
@@ -2302,6 +2302,7 @@ impl CommLog {
         let mut inner = self.lock();
         let now = {
             let clock = inner.clock();
+            inner.sample_boot_at(clock.monotonic_us);
             Some(AgentNow {
                 epoch: u32::try_from(clock.epoch).unwrap_or(u32::MAX),
                 monotonic_us: clock.monotonic_us,
@@ -9706,6 +9707,18 @@ mod tests {
             inner.boot_at(before.monotonic_us),
             Some(1_000_000 + before.monotonic_us)
         );
+        assert_eq!(
+            inner.boot_at(after.monotonic_us),
+            Some(6_000_000 + after.monotonic_us)
+        );
+        drop(inner);
+        // After a missing sample, the next one is kept even when the offset did not grow.
+        log.delay_samples(3);
+        let during = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let after = log.now();
+        let mut inner = log.lock();
+        assert_eq!(inner.boot_at(during.monotonic_us), None);
         assert_eq!(
             inner.boot_at(after.monotonic_us),
             Some(6_000_000 + after.monotonic_us)

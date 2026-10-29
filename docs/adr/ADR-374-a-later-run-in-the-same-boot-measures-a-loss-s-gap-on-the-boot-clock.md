@@ -37,7 +37,7 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    each suspend. Whenever the log reads the agent's clock it also reads the boot clock, between
    two further reads of the agent's clock, and it keeps each growth of the offset with the agent
    time it was seen at. A read whose two agent readings lie further apart than the reads'
-   jitter (50 µs: the thread was preempted between them) is taken again, at most three times,
+   jitter (50 µs: the thread was preempted between them) is tried at most three times in all,
    so that a scheduling delay is not taken for a suspend. When every try is delayed, the log
    marks the sample as missing: a time read from then to the next sample has no boot time, since
    a suspend may have come since the last one. A time's boot time is its
@@ -72,6 +72,16 @@ come from the same boot of the machine, since such a clock starts over at a rebo
   work. So is allowing for the read delay of the clock's last time before the loss (its read
   time is when the host read its largest raw time, which a batch read can delay), which the
   tolerance does not yet take in.
+- A gap that spans a suspend of the PC is only as exact as the kernel's measure of the sleep.
+  A machine whose clock source stops in suspend (most x86 machines) adds the sleep time from
+  the real-time clock, which counts whole seconds, so the gap can be off by up to about a
+  second against a tolerance of milliseconds. Such a loss then fits neither a clock that
+  carried on nor one that restarted, and stays `unknown`: the error fails safe, but a VCI that
+  kept its power across a suspend of the PC is not shown to have kept it there. Telling such a
+  gap apart, and widening its tolerance by the sleep's error, is follow-up work.
+- The log keeps one entry per growth of the offset and per missing sample. On a machine whose
+  clock reads are slow enough to miss the jitter bound often (some virtual machines), the
+  entries grow with the job's clock reads; nothing prunes the ones no time needs any more.
 - The comparison assumes both runs see one boot clock. On Linux a time namespace (a container
   restored onto another host's boot, for example) can offset `CLOCK_BOOTTIME` while the boot id
   stays the host's, and the comparison does not hold there.

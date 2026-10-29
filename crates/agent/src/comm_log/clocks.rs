@@ -304,19 +304,22 @@ pub(crate) struct LossFit {
     /// The reading is no more than the gap plus the tolerance: a clock that started again from
     /// zero during the gap.
     pub restarted: bool,
-    /// A clock that carried on could have passed its wrap during the gap, the tolerance
-    /// included: it then reads a low value too, so a low reading does not show a restart.
-    pub may_have_wrapped: bool,
+    /// The reading lies further from what a clock that carried on reads than the tolerance
+    /// plus the gap's own error. Only then does a reading that fits a restart show one: a clock
+    /// that carried on past its wrap, or from a time just after it, reads as low as a restarted
+    /// one, and a gap that is off by its error moves it out of the tolerance.
+    pub excludes_carried_on: bool,
 }
 
 /// Sets `reading_us` against `last_us` and the `gap_us` between their reads (raw times of one
-/// clock; the gap on one clock of the agent's machine), where the reading was taken within
-/// `round_trip_us` before its read.
+/// clock; the gap on one clock of the agent's machine, off by up to `gap_error_us`), where the
+/// reading was taken within `round_trip_us` before its read.
 pub(crate) fn loss_fit(
     last_us: u64,
     reading_us: u64,
     gap_us: u64,
     round_trip_us: u64,
+    gap_error_us: u64,
     drift_bound_ppm: u32,
     clock_margin_us: u32,
 ) -> LossFit {
@@ -332,7 +335,7 @@ pub(crate) fn loss_fit(
         tolerance_us: u64::try_from(tolerance).unwrap_or(u64::MAX),
         carried_on: distance <= tolerance,
         restarted: reading <= i128::from(gap_us) + tolerance,
-        may_have_wrapped: i128::from(last_us) + i128::from(gap_us) + tolerance >= WRAP,
+        excludes_carried_on: distance > tolerance + i128::from(gap_error_us),
     }
 }
 
@@ -614,58 +617,81 @@ mod tests {
 
     #[test]
     fn a_clock_that_carried_on_reads_its_last_time_plus_the_gap() {
-        let fit = loss_fit(1_835_511_040, 1_866_711_040 + 4_000, GAP, 0, 100, 1_000);
+        let fit = loss_fit(1_835_511_040, 1_866_711_040 + 4_000, GAP, 0, 0, 100, 1_000);
         assert_eq!(fit.expected_us, 1_866_711_040);
         assert_eq!(fit.tolerance_us, 5_120);
         assert!(fit.carried_on && !fit.restarted, "{fit:?}");
         // Just past the tolerance on either side, it carried on no longer.
         for reading in [1_866_711_040 + 5_121, 1_866_711_040 - 5_121] {
-            assert!(!loss_fit(1_835_511_040, reading, GAP, 0, 100, 1_000).carried_on);
+            assert!(!loss_fit(1_835_511_040, reading, GAP, 0, 0, 100, 1_000).carried_on);
         }
     }
 
     #[test]
     fn the_reading_s_round_trip_widens_the_tolerance() {
         // The clock was read up to 3 ms before its answer came.
-        let fit = loss_fit(1_835_511_040, 1_866_711_040 - 8_000, GAP, 3_000, 100, 1_000);
+        let fit = loss_fit(
+            1_835_511_040,
+            1_866_711_040 - 8_000,
+            GAP,
+            3_000,
+            0,
+            100,
+            1_000,
+        );
         assert_eq!(fit.tolerance_us, 8_120);
         assert!(fit.carried_on && !fit.restarted, "{fit:?}");
-        assert!(!loss_fit(1_835_511_040, 1_866_711_040 - 8_121, GAP, 3_000, 100, 1_000).carried_on);
+        assert!(
+            !loss_fit(
+                1_835_511_040,
+                1_866_711_040 - 8_121,
+                GAP,
+                3_000,
+                0,
+                100,
+                1_000
+            )
+            .carried_on
+        );
     }
 
     #[test]
     fn a_clock_that_restarted_reads_no_more_than_the_gap() {
-        let fit = loss_fit(1_835_511_040, 2_000_000, GAP, 0, 100, 1_000);
-        assert!(!fit.carried_on && fit.restarted, "{fit:?}");
-        assert!(loss_fit(1_835_511_040, GAP + 5_120, GAP, 0, 100, 1_000).restarted);
-        assert!(!loss_fit(1_835_511_040, GAP + 5_121, GAP, 0, 100, 1_000).restarted);
+        let fit = loss_fit(1_835_511_040, 2_000_000, GAP, 0, 0, 100, 1_000);
+        assert!(
+            !fit.carried_on && fit.restarted && fit.excludes_carried_on,
+            "{fit:?}"
+        );
+        assert!(loss_fit(1_835_511_040, GAP + 5_120, GAP, 0, 0, 100, 1_000).restarted);
+        assert!(!loss_fit(1_835_511_040, GAP + 5_121, GAP, 0, 0, 100, 1_000).restarted);
     }
 
     #[test]
     fn a_clock_whose_last_time_plus_the_gap_reaches_the_wrap_fits_both() {
         // The expected value wraps to 10 s, within the gap a restarted clock may have run.
         let last = SPAN - GAP + 10_000_000;
-        let fit = loss_fit(last, 10_000_000, GAP, 0, 100, 1_000);
+        let fit = loss_fit(last, 10_000_000, GAP, 0, 0, 100, 1_000);
         assert_eq!(fit.expected_us, 10_000_000);
         assert!(
-            fit.carried_on && fit.restarted && fit.may_have_wrapped,
+            fit.carried_on && fit.restarted && !fit.excludes_carried_on,
             "{fit:?}"
         );
         // A clock that carried on past the wrap, read further off than the tolerance (a gap
-        // measured a second long), still reads low: that shows no restart.
-        let fit = loss_fit(last, 9_000_000, GAP, 0, 100, 1_000);
+        // measured a second long, within its error of a second), still reads low: that shows
+        // no restart.
+        let fit = loss_fit(last, 9_000_000, GAP, 0, 1_000_000, 100, 1_000);
         assert!(
-            !fit.carried_on && fit.restarted && fit.may_have_wrapped,
+            !fit.carried_on && fit.restarted && !fit.excludes_carried_on,
             "{fit:?}"
         );
         // And one a few microseconds before the wrap is still near the expected value.
-        let fit = loss_fit(SPAN - 1_000, 500, 0, 0, 100, 1_000);
+        let fit = loss_fit(SPAN - 1_000, 500, 0, 0, 0, 100, 1_000);
         assert!(fit.carried_on, "{fit:?}");
     }
 
     #[test]
     fn a_reading_far_from_both_fits_neither() {
-        let fit = loss_fit(1_835_511_040, 900_000_000, GAP, 0, 100, 1_000);
+        let fit = loss_fit(1_835_511_040, 900_000_000, GAP, 0, 0, 100, 1_000);
         assert!(!fit.carried_on && !fit.restarted, "{fit:?}");
     }
 

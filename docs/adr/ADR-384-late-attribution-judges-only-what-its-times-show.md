@@ -110,8 +110,13 @@ Four judgements rest on an ordering their times do not show:
 
 ## Consequences
 
-- More exchanges settle as `undetermined` after a late link error, and none settles `vehicle`
-  or `system` on an ordering its times do not show.
+- More exchanges settle as `undetermined` after a late link error. A settling entry read after
+  the error no longer counts an answer since it on an ordering its times do not show.
+- The recount a late link error starts is not narrowed the same way: an answer read and counted
+  before the error was read keeps counting when the error's recount shows it came before the
+  error. The answer's time is not kept with the window's exchanges, so the recount, which
+  starts from their positions (ADR-372 item 3), cannot test it. A later silence can then still
+  settle `vehicle`. The maintainer chose (2026-10-29) to leave this to a change of its own.
 - On a J2534 link, where an error is often not placed, a late answer read after an unplaced
   error never counts as a matched answer since it.
 - The link state keeps one merged late-error time per clock and epoch: the latest time, and the

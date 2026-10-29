@@ -2429,7 +2429,9 @@ impl LinkState {
                     *at += 1;
                 }
             }
-            if seq.is_none_or(|seq| logged.seq >= seq) {
+            // The exchange the error falls after answered before it: its answer, freed later,
+            // counts with the clears from before the error (ADR-384).
+            if seq.is_none_or(|seq| logged.seq > seq) {
                 logged.after.matched += 1;
                 logged.after.errors += 1;
             }
@@ -2602,6 +2604,11 @@ impl LinkState {
         time: (AnswerTime, bool),
     ) {
         let (time, new) = time;
+        // A settling entry that adds no answer has nothing to judge, and marks nothing as
+        // counted alone.
+        if !answer.newly_answered && !answer.newly_matched {
+            return;
+        }
         answer.set_since_error(
             self.since_late_error(answer.seq, time) && (new || !kept.answered_only),
         );
@@ -4938,6 +4945,65 @@ mod tests {
     /// later settling path offers it as one since the error or as a matched answer again, however
     /// it reads the answer's time; only an answering item the path adds, shown after the error,
     /// counts.
+    /// The exchange a late link error falls after answered before it: when its answer is freed
+    /// later, by its owner's final response after the error, it counts for no exchange after
+    /// the error (ADR-384).
+    #[test]
+    fn an_answer_freed_after_an_error_placed_after_its_exchange_counts_before_it() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let response = vec![0x62, 0xF1, 0x86, 0x41];
+        let mut answered = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(response.clone()),
+        )));
+        answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, kept);
+        let (answer, _) = log_kept(&mut state, 2, timed(answered, Some(2_000), Some(2_200)));
+        assert!(!answer.matched_answer());
+        log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+        let at = placed_at(Clock::Device, 0, 5_000);
+        assert_eq!(state.place_error(at), ErrorPoint::After(2));
+        state.error_after(Some(2), 4, LinkErrorKind::Receive, Some(at));
+        let kept = state.kept(1).unwrap().clone();
+        state.settle_owed(1);
+        let late = kept.answered(&response);
+        let history = state.history_settling(&late, 1);
+        let entry = ExchangeEntry::build(1, late.clone(), history);
+        let mut settled = entry.settled_answer(&kept);
+        let (clock, placed) = placed_at(Clock::Device, 0, 7_000);
+        state.judge_answer(&mut settled, &kept, (AnswerTime::At(clock, placed), true));
+        state.settled(1, entry.classification, &entry.reason, late, true);
+        state.reclassify_after(&settled);
+        assert_eq!(window_history(&state, 3).answered_same_match, 0);
+        let third = state.window.iter().find(|logged| logged.seq == 3).unwrap();
+        assert_ne!(third.classification, Classification::Vehicle);
+    }
+
+    /// A settling entry that adds no answer marks nothing as counted alone (ADR-384).
+    #[test]
+    fn a_settlement_with_no_answer_marks_nothing_answered_only() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        state.keep(1, kept);
+        log_kept(&mut state, 2, silent);
+        let at = placed_at(Clock::Device, 0, 5_000);
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, Some(at));
+        let kept = state.kept(1).unwrap().clone();
+        let history = state.history_settling(&kept.evidence, 1);
+        let entry = ExchangeEntry::build(1, kept.evidence.clone(), history);
+        let mut settled = entry.settled_answer(&kept);
+        let time = kept.answer_time(None, &[], None);
+        assert!(matches!(time.0, AnswerTime::None));
+        state.judge_answer(&mut settled, &kept, time);
+        state.reclassify_after(&settled);
+        assert!(!state.kept(1).unwrap().answered_only);
+    }
+
     #[test]
     fn an_answered_only_answer_is_not_offered_again_by_a_later_settling_path() {
         let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));

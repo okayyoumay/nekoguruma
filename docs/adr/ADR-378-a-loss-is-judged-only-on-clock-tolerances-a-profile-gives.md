@@ -1,7 +1,7 @@
 # ADR-378: A Loss Is Judged Only on Clock Tolerances a Profile Gives
 
 **Date:** 2026-10-29
-**Status:** Accepted
+**Status:** Accepted (the placement it left open settled by ADR-383)
 **Affects:** design 8.11 (`vci_loss_settled`, "Drift bound"); `agent` communication log
 (`comm_log.rs` `Inner::settle_loss`); `crates/agent/docs/ngr-agent.md`,
 `crates/ngr-hw-checks/docs/hardware-profile.md`; ADR-357 (the defaults' use in a settlement);

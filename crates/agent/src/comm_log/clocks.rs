@@ -8,10 +8,14 @@
 //! against the most the clock can have run since: the agent's read time less that least delay,
 //! plus the drift bound over the agent time since the least delay was seen and the clock margin
 //! (design 8.11 "Drift bound"). A value past a wrap that the clock cannot have reached is a step
-//! back that no wrap explains, and one a wrap later still within it means the agent read nothing
-//! on the clock for longer than a wrap; each opens a new epoch, and so does the first time read
-//! after the VCI reconnected. A value ahead of that bound without a wrap is kept: it shows only
-//! that the reads before it came later than their times, since the delay of a read has no ceiling.
+//! back that no wrap explains, or a run the tolerances do not cover, and opens a new epoch. The
+//! tolerances tell a wrap from a step back, never how many wraps a silence holds: once the agent
+//! has read nothing on the clock for half a wrap of its own time, the next time opens a new epoch
+//! whatever its value, since the model of a clock this log follows (a microsecond counter running
+//! at less than twice the agent's rate) no longer decides the wrap count (ADR-383). So does the
+//! first time read after the VCI reconnected. A value ahead of the bound without a wrap is kept:
+//! it shows only that the reads before it came later than their times, since the delay of a read
+//! has no ceiling.
 
 use serde::{Deserialize, Serialize};
 
@@ -20,17 +24,21 @@ use super::exchange::Clock;
 /// The span of the VCI's 32-bit microsecond times (ISO 22900-2:2022 8.1.6.1).
 const WRAP: i128 = 1 << 32;
 
+/// Half the span, on the agent's clock: after this long with nothing read on a clock, how many
+/// wraps it has run is open for a clock at up to twice the agent's rate (ADR-383).
+const HALF_WRAP_US: u64 = 1 << 31;
+
 /// Why a clock's epoch began (`clock_epoch`'s `reason`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum EpochReason {
     /// The clock's first time in this run of the log.
     First,
-    /// The time lies behind the clock's latest one, and the clock cannot have run to the next
-    /// wrap since.
+    /// The time lies behind the clock's latest one, and the tolerances do not let the clock have
+    /// run to the next wrap since: a step back, or a run faster than they cover.
     BackwardStep,
-    /// The agent read nothing on the clock for longer than a wrap, so how many wraps passed is
-    /// unknown.
+    /// The agent read nothing on the clock for half a wrap or more, so how many wraps passed is
+    /// unknown (ADR-383).
     GapBeyondWrap,
     /// The first time read after the VCI connected again.
     Reconnect,
@@ -93,6 +101,37 @@ impl Tolerance {
     }
 }
 
+/// When the host read a time: on the agent's clock, which stops during a suspend of the
+/// machine, and on its boot clock, which does not (ADR-374, ADR-383).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ReadAt {
+    pub agent_us: u64,
+    pub boot: Boot,
+}
+
+impl ReadAt {
+    /// A read on a system that gives no boot clock.
+    #[cfg(test)]
+    pub(crate) fn agent(agent_us: u64) -> Self {
+        Self {
+            agent_us,
+            boot: Boot::NoClock,
+        }
+    }
+}
+
+/// A read's time on the machine's boot clock.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Boot {
+    /// The system gives no boot clock: the agent's clock alone measures a silence, and a
+    /// suspend within it goes unseen.
+    NoClock,
+    /// The system gives one, but no sample came near the read: a suspend since the epoch's
+    /// latest read cannot be excluded.
+    Missing,
+    At(u64),
+}
+
 /// A time the host read: raw, unwrapped, and when it was read.
 #[derive(Debug, Clone, Copy)]
 struct Reading {
@@ -108,6 +147,25 @@ struct Epoch {
     /// The least delay seen (agent time less unwrapped time) and when it was seen.
     least_delay: i128,
     least_at_us: u64,
+    /// The agent's latest read of a time kept in the epoch, from which a silence is measured.
+    last_read: ReadAt,
+}
+
+impl Epoch {
+    /// The agent has read nothing on the clock for half a wrap by `at`, suspends of the machine
+    /// included, so how many wraps the clock has run since is open (ADR-383). On a system with
+    /// a boot clock, a read with no boot time at either end could hide a suspend, so it is
+    /// taken as such a silence.
+    fn silent_at(&self, at: ReadAt) -> bool {
+        if at.agent_us.saturating_sub(self.last_read.agent_us) >= HALF_WRAP_US {
+            return true;
+        }
+        match (self.last_read.boot, at.boot) {
+            (Boot::At(last), Boot::At(now)) => now.saturating_sub(last) >= HALF_WRAP_US,
+            (Boot::NoClock, Boot::NoClock) => false,
+            _ => true,
+        }
+    }
 }
 
 #[derive(Debug, Default)]
@@ -151,16 +209,18 @@ impl VciClocks {
         }
     }
 
-    /// Places `raw`, a time on `clock` the host read at `read_us` of agent epoch `agent_epoch`,
-    /// and takes it into the clock's state. The `clock_epoch` event when it opened an epoch.
+    /// Places `raw`, a time on `clock` the host read `at` (agent time `at.agent_us` of agent
+    /// epoch `agent_epoch`), and takes it into the clock's state. The `clock_epoch` event when it
+    /// opened an epoch.
     pub(crate) fn read(
         &mut self,
         clock: Clock,
         raw: u64,
-        read_us: u64,
+        at: ReadAt,
         agent_epoch: u32,
         tolerance: Tolerance,
     ) -> (Placed, Option<ClockEpoch>) {
+        let read_us = at.agent_us;
         let index = match clock {
             Clock::Device => 0,
             Clock::Worker => 1,
@@ -175,6 +235,7 @@ impl VciClocks {
         let reason = match (state.current, state.reconnected) {
             (None, _) => EpochReason::First,
             (Some(_), true) => EpochReason::Reconnect,
+            (Some(epoch), false) if epoch.silent_at(at) => EpochReason::GapBeyondWrap,
             (Some(mut epoch), false) => {
                 let raw = i128::from(raw);
                 let mut reach = i128::from(read_us) - epoch.least_delay
@@ -194,11 +255,12 @@ impl VciClocks {
                     (unwrapped - raw) > (epoch.latest.unwrapped - i128::from(epoch.latest.raw));
                 if wrapped && unwrapped > reach {
                     EpochReason::BackwardStep
-                } else if unwrapped + WRAP <= reach {
-                    EpochReason::GapBeyondWrap
                 } else {
                     if unwrapped > epoch.latest.unwrapped {
                         epoch.latest = reading(unwrapped);
+                    }
+                    if read_us >= epoch.last_read.agent_us {
+                        epoch.last_read = at;
                     }
                     let delay = i128::from(read_us) - unwrapped;
                     if delay < epoch.least_delay {
@@ -227,6 +289,7 @@ impl VciClocks {
             latest: reading(unwrapped),
             least_delay: i128::from(read_us) - unwrapped,
             least_at_us: read_us,
+            last_read: at,
         });
         state.reconnected = false;
         self.next[index] = next.saturating_add(1);
@@ -261,25 +324,33 @@ impl VciClocks {
         })
     }
 
-    /// The clock's latest unwrapped time in its current epoch.
-    pub(crate) fn latest(&self, clock: Clock) -> Option<i64> {
+    /// The clock's latest unwrapped time in its current epoch, for a time read `at`; `None` when
+    /// the VCI connected again since, or the agent had read nothing on the clock for half a wrap
+    /// by then (ADR-383).
+    pub(crate) fn latest(&self, clock: Clock, at: ReadAt) -> Option<i64> {
         let state = match clock {
             Clock::Device => &self.device,
             Clock::Worker => &self.worker,
         };
-        let latest = state.current?.latest.unwrapped;
+        let epoch = state
+            .current
+            .filter(|epoch| !state.reconnected && !epoch.silent_at(at))?;
+        let latest = epoch.latest.unwrapped;
         i64::try_from(latest).ok()
     }
 
-    /// Places `raw`, a time on `clock` with no read time of its own, nearest the clock's latest
-    /// time, without taking it into the clock's state. `None` when the clock has no epoch, or
-    /// the VCI connected again since its latest time.
-    pub(crate) fn near_latest(&self, clock: Clock, raw: u64) -> Option<Placed> {
+    /// Places `raw`, a time on `clock` with no read time of its own that the host read by
+    /// `by`, nearest the clock's latest time, without taking it into the clock's state. `None`
+    /// when the clock has no epoch, the VCI connected again since its latest time, or the agent
+    /// had read nothing on the clock for half a wrap by `by` (ADR-383).
+    pub(crate) fn near_latest(&self, clock: Clock, raw: u64, by: ReadAt) -> Option<Placed> {
         let state = match clock {
             Clock::Device => &self.device,
             Clock::Worker => &self.worker,
         };
-        let epoch = state.current.filter(|_| !state.reconnected)?;
+        let epoch = state
+            .current
+            .filter(|epoch| !state.reconnected && !epoch.silent_at(by))?;
         let raw = i128::from(raw);
         let k = (epoch.latest.unwrapped - raw + WRAP / 2).div_euclid(WRAP);
         Some(Placed {
@@ -365,7 +436,7 @@ mod tests {
 
     /// Reads `raw` on the device clock at `read_us` of agent epoch 0.
     fn read(clocks: &mut VciClocks, raw: u64, read_us: u64) -> (Placed, Option<ClockEpoch>) {
-        clocks.read(Clock::Device, raw, read_us, 0, TOLERANCE)
+        clocks.read(Clock::Device, raw, ReadAt::agent(read_us), 0, TOLERANCE)
     }
 
     fn placed(epoch: u32, unwrapped: i64) -> Placed {
@@ -392,7 +463,7 @@ mod tests {
             })
         );
         // Each clock has its own epochs.
-        let (worker, opened) = clocks.read(Clock::Worker, 9, 7_100, 0, TOLERANCE);
+        let (worker, opened) = clocks.read(Clock::Worker, 9, ReadAt::agent(7_100), 0, TOLERANCE);
         assert_eq!(worker, placed(0, 9));
         assert_eq!(opened.map(|opened| opened.reason), Some(EpochReason::First));
     }
@@ -511,8 +582,14 @@ mod tests {
         };
         let together = |raw| {
             let mut clocks = VciClocks::default();
-            clocks.read(Clock::Device, SPAN - 5_000, 50_000, 0, in_exchange);
-            clocks.read(Clock::Device, raw, 50_000, 0, in_exchange)
+            clocks.read(
+                Clock::Device,
+                SPAN - 5_000,
+                ReadAt::agent(50_000),
+                0,
+                in_exchange,
+            );
+            clocks.read(Clock::Device, raw, ReadAt::agent(50_000), 0, in_exchange)
         };
         assert_eq!(together(3_000), (placed(0, (SPAN + 3_000) as i64), None));
         // Without the exchange's start the same pair reads as a step back.
@@ -544,16 +621,185 @@ mod tests {
         );
     }
 
+    /// The raw time a clock running `ppm` fast (negative: slow) reads `elapsed_us` of agent
+    /// time after `start`.
+    fn ran(start: u64, elapsed_us: u64, ppm: i64) -> u64 {
+        let run = i128::from(elapsed_us) + i128::from(elapsed_us) * i128::from(ppm) / 1_000_000;
+        u64::try_from((i128::from(start) + run).rem_euclid(WRAP)).unwrap()
+    }
+
+    /// Half a wrap of the agent's clock with nothing read opens an epoch whatever the value:
+    /// one microsecond less is kept (ADR-383).
+    #[test]
+    fn half_a_wrap_of_silence_opens_an_epoch_whatever_the_value() {
+        let half = SPAN / 2;
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, 1_000, 1_000);
+        let (at, opened) = read(&mut clocks, 1_000 + half - 1, 1_000 + half - 1);
+        assert_eq!((at, opened), (placed(0, (half - 1 + 1_000) as i64), None));
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, 1_000, 1_000);
+        let (at, opened) = read(&mut clocks, 1_000 + half, 1_000 + half);
+        assert_eq!(at, placed(1, (1_000 + half) as i64));
+        assert_eq!(
+            opened.map(|opened| opened.reason),
+            Some(EpochReason::GapBeyondWrap)
+        );
+    }
+
+    /// A clock faster than the drift bound, read after a gap a little over a wrap or a little
+    /// under one, opens an epoch rather than being placed a wrap short; so does a slow one after
+    /// more than a wrap (ADR-383).
+    #[test]
+    fn a_fast_or_slow_clock_after_a_long_gap_opens_an_epoch() {
+        for (elapsed_us, ppm) in [
+            (SPAN + 10_000_000, 200),
+            (SPAN - 1_000_000, 300),
+            (SPAN + 10_000_000, -200),
+        ] {
+            let mut clocks = VciClocks::default();
+            read(&mut clocks, 1_000, 1_000);
+            let raw = ran(1_000, elapsed_us, ppm);
+            let (at, opened) = read(&mut clocks, raw, 1_000 + elapsed_us);
+            assert_eq!(at, placed(1, raw as i64), "{elapsed_us} {ppm}");
+            assert_eq!(
+                opened.map(|opened| opened.reason),
+                Some(EpochReason::GapBeyondWrap),
+                "{elapsed_us} {ppm}"
+            );
+        }
+    }
+
+    /// The silence is checked before the step back: a value behind the latest one after half a
+    /// wrap is a gap, not a step back (ADR-383).
+    #[test]
+    fn a_value_behind_the_latest_after_a_long_silence_is_a_gap() {
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, 1_000_000, 1_000);
+        let (_, opened) = read(&mut clocks, 5_000, 1_000 + SPAN / 2);
+        assert_eq!(
+            opened.map(|opened| opened.reason),
+            Some(EpochReason::GapBeyondWrap)
+        );
+    }
+
+    /// A suspend of the machine counts in the silence: the boot clock runs through it, the
+    /// agent's does not. Where the system gives a boot clock but a read has no boot time, a
+    /// suspend cannot be excluded, and the silence is taken as long (ADR-383).
+    #[test]
+    fn a_suspend_counts_in_the_silence() {
+        let half = SPAN / 2;
+        let boot = |agent_us, boot| ReadAt { agent_us, boot };
+        let reason = |last: ReadAt, next: ReadAt| {
+            let mut clocks = VciClocks::default();
+            clocks.read(Clock::Device, 1_000, last, 0, TOLERANCE);
+            let (_, opened) = clocks.read(Clock::Device, 2_000, next, 0, TOLERANCE);
+            opened.map(|opened| opened.reason)
+        };
+        // A minute on the agent's clock, with half a wrap of sleep in it.
+        assert_eq!(
+            reason(
+                boot(1_000, Boot::At(5_000)),
+                boot(61_000_000, Boot::At(5_000 + half + 60_000_000))
+            ),
+            Some(EpochReason::GapBeyondWrap)
+        );
+        // The same minute without the sleep.
+        assert_eq!(
+            reason(
+                boot(1_000, Boot::At(5_000)),
+                boot(61_000_000, Boot::At(61_004_000))
+            ),
+            None
+        );
+        // No boot time at either end, on a system with a boot clock.
+        assert_eq!(
+            reason(
+                boot(1_000, Boot::Missing),
+                boot(61_000_000, Boot::At(61_004_000))
+            ),
+            Some(EpochReason::GapBeyondWrap)
+        );
+        assert_eq!(
+            reason(
+                boot(1_000, Boot::At(5_000)),
+                boot(61_000_000, Boot::Missing)
+            ),
+            Some(EpochReason::GapBeyondWrap)
+        );
+        // No boot clock: the agent's clock alone.
+        assert_eq!(
+            reason(ReadAt::agent(1_000), ReadAt::agent(61_000_000)),
+            None
+        );
+    }
+
+    /// A reconnect leaves the latest time out of the order of times read together, as it does
+    /// for a time with no read time of its own.
+    #[test]
+    fn a_reconnect_leaves_the_latest_time_out_of_the_order() {
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, 1_000, 1_000);
+        assert_eq!(
+            clocks.latest(Clock::Device, ReadAt::agent(2_000)),
+            Some(1_000)
+        );
+        clocks.reconnect();
+        assert_eq!(clocks.latest(Clock::Device, ReadAt::agent(2_000)), None);
+    }
+
+    /// The silence runs from the latest read of a time kept in the epoch, a time just behind
+    /// the latest one included.
+    #[test]
+    fn a_silence_runs_from_the_latest_read_kept_in_the_epoch() {
+        let half = SPAN / 2;
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, 10_000, 10_000);
+        // Behind the latest within the margin, read a second later: kept, and read since.
+        let (_, opened) = read(&mut clocks, 9_500, 1_010_000);
+        assert_eq!(opened, None);
+        let (_, opened) = read(&mut clocks, 10_000 + half, 1_010_000 + half - 1);
+        assert_eq!(opened, None);
+    }
+
+    /// A time with no read time of its own, and the latest time that orders times read
+    /// together, decide nothing once the agent has read nothing on the clock for half a wrap.
+    #[test]
+    fn nothing_is_placed_nearest_a_latest_time_half_a_wrap_old() {
+        let half = SPAN / 2;
+        let mut clocks = VciClocks::default();
+        read(&mut clocks, 1_000, 1_000);
+        assert_eq!(
+            clocks.near_latest(Clock::Device, 2_000, ReadAt::agent(1_000 + half - 1)),
+            Some(placed(0, 2_000))
+        );
+        assert_eq!(
+            clocks.near_latest(Clock::Device, 2_000, ReadAt::agent(1_000 + half)),
+            None
+        );
+        assert_eq!(
+            clocks.latest(Clock::Device, ReadAt::agent(1_000 + half - 1)),
+            Some(1_000)
+        );
+        assert_eq!(
+            clocks.latest(Clock::Device, ReadAt::agent(1_000 + half)),
+            None
+        );
+    }
+
     #[test]
     fn a_reconnect_opens_a_new_epoch_on_each_clock_that_had_one() {
         let mut clocks = VciClocks::default();
         read(&mut clocks, 1_000, 1_000);
         clocks.reconnect();
         // A clock with no epoch yet has nothing to carry on from.
-        let (_, worker) = clocks.read(Clock::Worker, 5, 2_000, 0, TOLERANCE);
+        let (_, worker) = clocks.read(Clock::Worker, 5, ReadAt::agent(2_000), 0, TOLERANCE);
         assert_eq!(worker.map(|opened| opened.reason), Some(EpochReason::First));
         // The device clock carried on, but nothing shows it yet.
-        assert_eq!(clocks.near_latest(Clock::Device, 1_500), None);
+        assert_eq!(
+            clocks.near_latest(Clock::Device, 1_500, ReadAt::agent(2_000)),
+            None
+        );
         let (at, opened) = read(&mut clocks, 1_500, 2_000);
         assert_eq!(at, placed(1, 1_500));
         assert_eq!(
@@ -569,7 +815,7 @@ mod tests {
         let mut clocks = VciClocks::starting_at([4, 2]);
         let (at, _) = read(&mut clocks, 5_000, 1_000);
         assert_eq!(at.epoch, 4);
-        let (at, _) = clocks.read(Clock::Worker, 1_000, 1_000, 0, TOLERANCE);
+        let (at, _) = clocks.read(Clock::Worker, 1_000, ReadAt::agent(1_000), 0, TOLERANCE);
         assert_eq!(at.epoch, 2);
         let (at, _) = read(&mut clocks, 10, 2_000);
         assert_eq!(at.epoch, 5);
@@ -578,15 +824,15 @@ mod tests {
     #[test]
     fn a_time_with_no_read_time_is_placed_nearest_the_latest() {
         let mut clocks = VciClocks::default();
-        assert_eq!(clocks.near_latest(Clock::Device, 5), None);
+        assert_eq!(clocks.near_latest(Clock::Device, 5, ReadAt::agent(0)), None);
         read(&mut clocks, SPAN - 1_000, 1_000);
         // Just after the wrap, and just before the latest time.
         assert_eq!(
-            clocks.near_latest(Clock::Device, 500),
+            clocks.near_latest(Clock::Device, 500, ReadAt::agent(1_500)),
             Some(placed(0, (SPAN + 500) as i64))
         );
         assert_eq!(
-            clocks.near_latest(Clock::Device, SPAN - 3_000),
+            clocks.near_latest(Clock::Device, SPAN - 3_000, ReadAt::agent(1_500)),
             Some(placed(0, (SPAN - 3_000) as i64))
         );
         // It does not move the clock's state.

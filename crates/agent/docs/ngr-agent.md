@@ -360,7 +360,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   gap since the loss, and `power_kept` is `unknown`. On Linux the machine's boot clock
   (`CLOCK_BOOTTIME`) measures the gap when both runs lie in one boot (the kernel's boot id),
   and the entry records it with the machine's sleep in it and the comparison it gives, for a
-  later judgement (ADR-374).
+  reader to weigh; the log judges nothing from it (ADR-374, ADR-379).
   `link_opened` then gives the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those

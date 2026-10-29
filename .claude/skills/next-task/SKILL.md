@@ -1,7 +1,7 @@
 ---
 name: next-task
 description: Recommend what to work on next in nekoguruma by surveying the whole backlog in work/ (project-wide and worker-crate files). Use when the user asks what to do next, what the top priority is, or which open item to pick up. Produces one pick plus one alternative, not a full list.
-argument-hint: "[area or crate to focus on] [cap=P1|P2] [skip=<items to leave out>]"
+argument-hint: "[area or crate to focus on] [cap=P1|P2] [skip=<items to leave out>] [avoid=<paths>]"
 context: fork
 agent: Explore
 model: sonnet
@@ -19,8 +19,11 @@ are large, and only the recommendation comes back to the main conversation.
 Arguments, if any: $ARGUMENTS
 
 The arguments may name a focus area, and two optional inputs used by
-`backlog-loop`: `cap=P1` or `cap=P2` (never recommend an item below it) and
-`skip=` followed by items to leave out entirely.
+`backlog-loop`: `cap=P1` or `cap=P2` (never recommend an item below it),
+`skip=` followed by items to leave out entirely, and `avoid=` followed by
+paths an open pull request changes: leave out an item whose change would
+touch any of them, judged from the files the item names and the code it
+points at.
 
 ## Steps
 

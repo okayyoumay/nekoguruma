@@ -1,7 +1,7 @@
 # ADR-357: The VCI Margins Take a Profile's Values or the Agent's Defaults
 
 **Date:** 2026-10-26
-**Status:** Accepted (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged)
+**Status:** Accepted (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged; the default drift bound and clock margin no longer settle a loss, ADR-378)
 **Affects:** `agent` communication log (`comm_log.rs` `VciMargins`, `vci_connected`,
 `link_opened`), `agent::Job::with_vci_margins`, `ngr-hw-checks` profile (`profile.rs`
 `Vci::drift_bound_ppm`, `Vci::clock_margin_us`, `Vci::margins`) and `GuardedClient`,

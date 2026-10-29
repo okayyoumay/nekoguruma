@@ -346,7 +346,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`, `crates/agent/docs/ngr-agent.md`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`, "Settlement" `late_item`; ADR-346 item 6 |
 | [ADR-355](ADR-355-a-link-says-whether-it-forwards-every-pending.md) | A Link Says Whether It Forwards Every Pending | Accepted | `vci-service-interface` (`ComLogicalLinkResponse.pending_forwarding`), `j2534-0404-service` and `iso22900-service` `CreateComLogicalLink`, `agent` link and communication log; design 8.11 `link_opened`, `pending`, H4; design principle 6, ADR-346 item 3 |
 | [ADR-356](ADR-356-the-t2-timing-check-judges-the-latency-the-vci-measured.md) | The T2 Timing Check Judges the Latency the VCI Measured | Accepted | `ngr-hw-checks` guarded handle (`send_receive_timed`, the link's indications), profile (`timing_margin_us`) and T2 timing check, `crates/ngr-hw-checks/docs/hardware-profile.md`; design 13.5, design 8.11 "Timing margin", "Timing judged", "On one clock"; ADR-275, ADR-333, ADR-353 |
-| [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged) | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
+| [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged; the default drift bound and clock margin no longer settle a loss, ADR-378) | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
 | [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
 | [ADR-360](ADR-360-re-request-a-stalled-codex-review-once.md) | Re-Request a Stalled Codex Review Once | Accepted | `.claude/skills/pr-review-loop` (Steps 0, 5), `CLAUDE.md`; ADR-312 |
@@ -362,11 +362,12 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-370](ADR-370-a-late-indication-settles-its-ended-exchange.md) | A Late Indication Settles Its Ended Exchange | Accepted | `agent` communication log (`late_item` for a transmit indication, loopback echo or start-of-message indication; `Kept::late_start`); design 8.11 "Settlement", `late_item`; ADR-346, ADR-365, ADR-367, ADR-368 |
 | [ADR-371](ADR-371-a-late-forwarded-pending-settles-its-ended-exchange.md) | A Late Forwarded Pending Settles Its Ended Exchange | Accepted | `agent` communication log (`late_item` for an unbound forwarded pending); design 8.11 "Settlement", `late_item`; ADR-346, ADR-365, ADR-370 |
 | [ADR-372](ADR-372-a-late-link-error-settles-the-exchanges-it-may-have-come-during.md) | A Late Link Error Settles the Exchanges It May Have Come During | Accepted | `agent` communication log (`late_item` for a link error read late); design 8.11 "Settlement", `late_item`, "Link error"; ADR-346, ADR-361, ADR-368, ADR-369, ADR-370 |
-| [ADR-373](ADR-373-a-lost-vci-is-recorded-and-settled-when-a-later-run-connects.md) | A Lost VCI Is Recorded and Settled When a Later Run Connects | Accepted (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374) | `agent` communication log (`vci_loss` record, `vci_loss_settled`), runner and host (clock read at connect); design 8.11 "Settlement", "Reconnect"; ADR-294, ADR-346, ADR-357, ADR-361 |
+| [ADR-373](ADR-373-a-lost-vci-is-recorded-and-settled-when-a-later-run-connects.md) | A Lost VCI Is Recorded and Settled When a Later Run Connects | Accepted (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374; item 4's comparison judged only on a drift bound and clock margin a profile gives, by ADR-378) | `agent` communication log (`vci_loss` record, `vci_loss_settled`), runner and host (clock read at connect); design 8.11 "Settlement", "Reconnect"; ADR-294, ADR-346, ADR-357, ADR-361 |
 | [ADR-374](ADR-374-a-lost-vci-s-gap-across-runs-is-recorded-on-the-boot-clock.md) | A Lost VCI's Gap Across Runs Is Recorded on the Boot Clock | Accepted | `agent` communication log (boot clock, boot id and sleep figures, `vci_loss` `boot`, `vci_loss_settled` gap and round trip, recorded but not judged), runner (clock read at connect); design 8.11 `vci_loss_settled`; ADR-373 |
-| [ADR-375](ADR-375-the-communication-log-adds-no-estimate-to-reach-a-judgement.md) | The Communication Log Adds No Estimate to Reach a Judgement | Accepted (item 5's default timing margin settled by ADR-377, the presumed VCI timer by ADR-376) | `agent` communication log (every outcome); design 8.11 head; `.github/instructions/rust.instructions.md`; ADR-346 item 2 |
+| [ADR-375](ADR-375-the-communication-log-adds-no-estimate-to-reach-a-judgement.md) | The Communication Log Adds No Estimate to Reach a Judgement | Accepted (item 5's default timing margin settled by ADR-377, the default drift bound and clock margin in a settlement by ADR-378, the presumed VCI timer by ADR-376) | `agent` communication log (every outcome); design 8.11 head; `.github/instructions/rust.instructions.md`; ADR-346 item 2 |
 | [ADR-376](ADR-376-the-communication-log-presumes-no-timer-right.md) | The Communication Log Presumes No Timer Right | Accepted | `agent` communication log (`comm_log/exchange.rs`: `row`, `rows`, `silence_open`, `LinkState::record`, `settle_late_response`); design 8.11 "Matched answer", "Possible pending", "Classification", "Settlement"; ADR-346 item 6 |
 | [ADR-377](ADR-377-the-communication-log-judges-no-time-on-a-default-margin.md) | The Communication Log Judges No Time on a Default Margin | Accepted | `agent` communication log (`comm_log/timing.rs` `Limits`, `judge`, `judge_late_at`, `past_vci_limits`; `VciMargins`, `link_opened`); design 8.11 "Timing margin", `timing`; 9.3; 13.5; ADR-357 |
+| [ADR-378](ADR-378-a-loss-is-judged-only-on-clock-tolerances-a-profile-gives.md) | A Loss Is Judged Only on Clock Tolerances a Profile Gives | Accepted | `agent` communication log (`Inner::settle_loss`); design 8.11 `vci_loss_settled`, "Drift bound"; ADR-357; ADR-373 item 4 |
 
 ## Status Legend
 
@@ -732,7 +733,7 @@ the predecessor repository these ADRs came from.
 - ADR-143
 - ADR-239
 - ADR-353
-- ADR-357 (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged)
+- ADR-357 (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged; the default drift bound and clock margin no longer settle a loss, ADR-378)
 - ADR-361
 - ADR-362 (Decision item 4 narrowed by ADR-364; item 1's `response_times_judged` narrowed by ADR-377 to a link with a timing margin)
 - ADR-364
@@ -744,11 +745,12 @@ the predecessor repository these ADRs came from.
 - ADR-370
 - ADR-371
 - ADR-372
-- ADR-373 (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374)
+- ADR-373 (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374; item 4's comparison judged only on a drift bound and clock margin a profile gives, by ADR-378)
 - ADR-374
-- ADR-375 (item 5's default timing margin settled by ADR-377, the presumed VCI timer by ADR-376)
+- ADR-375 (item 5's default timing margin settled by ADR-377, the default drift bound and clock margin in a settlement by ADR-378, the presumed VCI timer by ADR-376)
 - ADR-376
 - ADR-377
+- ADR-378
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)

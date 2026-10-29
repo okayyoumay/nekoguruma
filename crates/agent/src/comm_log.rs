@@ -10151,8 +10151,8 @@ mod tests {
 
     /// A later run in the same boot measures the gap on the boot clock, across agent epochs, and
     /// records it with the comparison it gives, the reading's round trip in the tolerance and
-    /// the sleep in the gap, but judges nothing from it (ADR-374 item 5, ADR-379). Another boot, or a
-    /// record without one, measures nothing.
+    /// the sleep in the gap, but judges nothing from it (ADR-374 item 5, ADR-379). Another boot,
+    /// or a record without one, measures nothing.
     #[test]
     fn a_later_run_in_the_same_boot_measures_the_gap_on_the_boot_clock() {
         // The loss's last device time was read at 5 s on the boot clock, in agent epoch 0.

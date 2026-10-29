@@ -16675,9 +16675,11 @@ def main():
         assert_eq!(opened["response_times_judged"], true);
         // The mock worker does not say whether it forwards pendings (ADR-355).
         assert!(opened["forwards_pendings"].is_null());
+        // No profile gives the VCI's timing margin, so none is in force and the link's times
+        // are recorded, not judged (ADR-377).
         assert_eq!(
             opened["timing_margin"],
-            serde_json::json!({ "us": 2_000, "source": "default" })
+            serde_json::json!({ "source": "none" })
         );
         assert_eq!(lines[4]["outcome"], "ok");
         std::fs::remove_dir_all(&dir).unwrap();

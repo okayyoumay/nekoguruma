@@ -346,8 +346,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   Its `drift_bound` (`ppm`) and `clock_margin` (`us`), and `link_opened`'s `timing_margin`
   (`us`), each give the value in force and its `source` (ADR-357): `profile` when the job was
   given it (`Job::with_vci_margins`, which the hardware harness fills from its profile's
-  `[vci]` keys), else `default`, the agent's own (`VciMargins::DEFAULT_TIMING_MARGIN_US` 2 ms,
-  `DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms).
+  `[vci]` keys), else, for the drift bound and the clock margin, `default`, the agent's own
+  (`VciMargins::DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms). The agent
+  has no timing margin of its own: without one, `timing_margin` is `{"source":"none"}` and the
+  link's times are recorded and not judged (`not_judged_reason` `no_margin`, ADR-377).
   A run that loses the VCI writes `vci_loss`, and writes it again, whole, after each further
   exchange the loss ended or caused, syncing each one (ADR-373). When the log holds a loss no
   `vci_loss_settled` names, the next run whose VCI connects reads the VCI's clock once
@@ -366,8 +368,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   request on a busy answer, and turns `CP_TransmitIndEnable` and `CP_StartMsgIndEnable` on;
   their entries carry `accepted`, and a library that refuses one opens the link without it.
   `transmit_confirmation` names `transmit_indication` when the library accepted
-  `CP_TransmitIndEnable` (the link turns no loopback on). The event gives response times not
-  judged and no timing margin (`source` `none`), since no indication is used as evidence yet.
+  `CP_TransmitIndEnable` (the link turns no loopback on). The event gives
+  `response_times_judged`, true when the transmit indication is on, and the timing margin in
+  force (`timing_margin`, above; none without a profile, so no time is judged, ADR-377).
   `forwards_pendings` is what the worker answered to `CreateComLogicalLink`
   (`Link::forwards_pendings`, ADR-355): `true` for the J2534 worker, `false` for the D-PDU
   worker, `null` from a worker that does not say. The agent takes it from that answer alone, and

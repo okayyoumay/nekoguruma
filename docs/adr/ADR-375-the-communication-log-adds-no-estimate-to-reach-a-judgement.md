@@ -1,7 +1,7 @@
 # ADR-375: The Communication Log Adds No Estimate to Reach a Judgement
 
 **Date:** 2026-10-29
-**Status:** Accepted
+**Status:** Accepted (item 5's default timing margin settled by ADR-377, the presumed VCI timer by ADR-376)
 **Affects:** design 8.11 (the section's head); `agent` communication log (`crates/agent/src/comm_log.rs`
 and `crates/agent/src/comm_log/`); the review guidelines for Rust code
 (`.github/instructions/rust.instructions.md`); ADR-346 item 2

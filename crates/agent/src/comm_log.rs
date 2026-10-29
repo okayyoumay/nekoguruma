@@ -214,9 +214,11 @@ pub struct VciFacts {
 }
 
 /// A VCI's timing tolerances as a hardware profile gives them (design 8.11 "Timing margin",
-/// "Drift bound", 13.5, ADR-357): each value the profile does not give is `None` and takes the
-/// agent's default ([`VciMargins::DEFAULT_TIMING_MARGIN_US`] and the others). A job told none
-/// ([`crate::Job::with_vci_margins`]) takes every default.
+/// "Drift bound", 13.5, ADR-357): each value the profile does not give is `None`. A timing
+/// margin left out leaves the link's times not judged (ADR-377); the drift bound and the clock
+/// margin take the agent's defaults ([`VciMargins::DEFAULT_DRIFT_BOUND_PPM`],
+/// [`VciMargins::DEFAULT_CLOCK_MARGIN_US`]). A job told none ([`crate::Job::with_vci_margins`])
+/// has no timing margin and takes the other defaults.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct VciMargins {
     /// A link's timing margin, in microseconds.
@@ -228,16 +230,14 @@ pub struct VciMargins {
 }
 
 impl VciMargins {
-    /// The agent's timing margin: a USB VCI's timestamps and their latency vary by up to about
-    /// a millisecond, so two.
-    pub const DEFAULT_TIMING_MARGIN_US: u32 = 2_000;
     /// The agent's drift bound: a common crystal is within 50 ppm, on each side.
     pub const DEFAULT_DRIFT_BOUND_PPM: u32 = 100;
     /// The agent's clock margin.
     pub const DEFAULT_CLOCK_MARGIN_US: u32 = 1_000;
 
-    fn timing_margin(&self) -> (u32, &'static str) {
-        sourced(self.timing_margin_us, Self::DEFAULT_TIMING_MARGIN_US)
+    /// The timing margin a profile gave, if any: the agent has no default (ADR-377).
+    fn timing_margin(&self) -> Option<u32> {
+        self.timing_margin_us
     }
 
     fn drift_bound(&self) -> (u32, &'static str) {
@@ -1057,11 +1057,12 @@ enum SetBy {
     LibraryDefault,
 }
 
-/// The timing margin in use and where it came from: none is configured yet, so no time is
-/// compared with a limit beyond one.
+/// The timing margin in use and where it came from: `profile`, or `none`, with no value, when
+/// no profile gives one, so the link's times are recorded and not judged (ADR-377).
 #[derive(Serialize)]
 struct TimingMargin {
-    us: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    us: Option<u32>,
     source: &'static str,
 }
 
@@ -2757,8 +2758,11 @@ impl CommLog {
             response_times_judged: indications.transmit,
             forwards_pendings,
             timing_margin: {
-                let (us, source) = self.lock().margins.timing_margin();
-                TimingMargin { us, source }
+                let us = self.lock().margins.timing_margin();
+                TimingMargin {
+                    us,
+                    source: if us.is_some() { "profile" } else { "none" },
+                }
             },
         });
         let mut inner = self.lock();
@@ -2767,7 +2771,7 @@ impl CommLog {
             p2_star_us: u64::from(config.p2_star_ms) * 1000,
             completion_us: (config.rc78_completion_ms != 0)
                 .then(|| u64::from(config.rc78_completion_ms) * 1000),
-            margin_us: u64::from(inner.margins.timing_margin().0),
+            margin_us: inner.margins.timing_margin().map(u64::from),
             start_indications: indications.start_of_message,
             single_frame: config.single_frame(),
         };
@@ -4468,6 +4472,8 @@ mod tests {
         }
     }
 
+    /// A run whose VCI has a profile that gives its timing margin, 2 ms, so the log judges its
+    /// times (ADR-377); the drift bound and the clock margin are the agent's defaults.
     fn facts() -> RunFacts {
         RunFacts {
             job_id: "comm-log-test".to_owned(),
@@ -4477,7 +4483,10 @@ mod tests {
             target_vin: Some(Vin::new("WVWZZZ1JZXW000001".to_owned())),
             writes: false,
             vci: None,
-            margins: VciMargins::default(),
+            margins: VciMargins {
+                timing_margin_us: Some(2_000),
+                ..VciMargins::default()
+            },
         }
     }
 
@@ -5970,12 +5979,77 @@ mod tests {
     /// exchange's window is judged from its VCI times on one clock and epoch, and the rows that
     /// need it classify: a receive timeout early is `system`, also where a response had begun.
     #[test]
+    fn a_link_with_no_margin_a_profile_gives_records_its_times_and_judges_none() {
+        // ADR-377: a run told no margins has no timing margin; `link_opened` says so, and an
+        // exchange keeps its times and limits but no window, so a timeout at P2 shows nothing.
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(
+            &RunFacts {
+                margins: VciMargins::default(),
+                ..facts()
+            },
+            RunKind::First,
+        );
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let mut silent = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        silent.pending_visibility = exchange::PendingVisibility::Forwarded;
+        silent.vci_ended = true;
+        silent.times.agent.before_us = 10_000;
+        silent.times.agent.end_us = 1_020_000;
+        silent.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device(10_500)),
+            rx_timeout: Some(device(1_010_500)),
+            error: Some(device(1_010_500)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(silent).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let opened = lines
+            .iter()
+            .find(|line| line["event"] == "link_opened")
+            .unwrap();
+        assert_eq!(
+            opened["timing_margin"],
+            serde_json::json!({ "source": "none" }),
+            "{opened}"
+        );
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .unwrap();
+        assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
+        assert_eq!(entry["timing"]["not_judged_reason"], "no_margin", "{entry}");
+        assert_eq!(entry["timing"]["p2_ms"], 1_000, "{entry}");
+        assert!(entry["timing"].get("margin_ms").is_none(), "{entry}");
+        assert_eq!(entry["times"]["vci"]["error"]["us"], 1_010_500, "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
+    }
+
+    #[test]
     fn windows_are_judged_against_the_link_s_limits() {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
         log.begin(&facts(), RunKind::First);
-        // P2 1 s, P2* 5 s, completion 25 s; the agent's 2 ms margin.
+        // P2 1 s, P2* 5 s, completion 25 s; the profile's 2 ms margin.
         log.link_opened(
             1,
             &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -6068,7 +6142,7 @@ mod tests {
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
         log.begin(&facts(), RunKind::First);
-        // P2 1 s, P2* 5 s, completion 25 s; the agent's 2 ms margin.
+        // P2 1 s, P2* 5 s, completion 25 s; the profile's 2 ms margin.
         log.link_opened(
             1,
             &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
@@ -6169,7 +6243,7 @@ mod tests {
             let setup = setup(&dir);
             let log = CommLog::open(&setup).unwrap();
             log.begin(&facts(), RunKind::First);
-            // P2 1 s; the agent's 2 ms margin; one frame 320 µs.
+            // P2 1 s; the profile's 2 ms margin; one frame 320 µs.
             log.link_opened(
                 1,
                 &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),

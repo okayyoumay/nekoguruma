@@ -485,7 +485,14 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
             generation: 1,
         },
     };
-    let job = document_job(&comm_log_program()).with_comm_log(setup.clone());
+    // A profile gives `sim-vci`'s timing margin, so the log judges the windows below; with
+    // none it would record the times and judge nothing (ADR-377).
+    let job = document_job(&comm_log_program())
+        .with_comm_log(setup.clone())
+        .with_vci_margins(agent::VciMargins {
+            timing_margin_us: Some(2_000),
+            ..agent::VciMargins::default()
+        });
     let JobRun {
         result: state,
         guards: _guards,

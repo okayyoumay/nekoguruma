@@ -2166,7 +2166,9 @@ impl LinkState {
                 return None;
             }
             let last = latest(evidence)?;
-            if at.unwrapped > last {
+            // With an exchange gone from the window, an error at this exchange's latest time
+            // is not shown before its answer either: the answer is not counted after it.
+            if at.unwrapped > last || (self.left_window.is_some() && at.unwrapped == last) {
                 return Some(ErrorPoint::After(seq));
             }
             // The earlier exchanges' latest times must all be known to compare with: with one
@@ -2597,11 +2599,14 @@ impl LinkState {
                 self.unknown_sends = self.unknown_sends.saturating_sub(1);
             }
         }
+        // An answer counted as an answer alone, not shown after a late error, stays so when its
+        // owners are freed (ADR-384).
+        let answered_only = self.window[at].answered_only;
         let freed = (alone || now_matched).then(|| SettledAnswer {
             seq,
             key: entry.effect.key.clone(),
             newly_answered: false,
-            newly_matched: now_matched,
+            newly_matched: now_matched && !answered_only,
             final_response: alone,
             // A link error after the answer, or in no known order with it, ended its matched
             // answer, as `record` applies it: the answer comes before.
@@ -2610,7 +2615,7 @@ impl LinkState {
             } else {
                 self.window[at].after
             },
-            since_error: true,
+            since_error: !answered_only,
         });
         let logged = &mut self.window[at];
         logged.history = entry.link_history.clone();
@@ -4704,8 +4709,10 @@ mod tests {
             state.place_error(at(4_000)),
             ErrorPoint::BeforeWindow { within: None }
         );
-        // After its latest time it is after it, as ever.
+        // After its latest time it is after it, as ever; at that time too, since its answer is
+        // not shown before the error then either.
         assert_eq!(state.place_error(at(5_100)), ErrorPoint::After(2));
+        assert_eq!(state.place_error(at(5_000)), ErrorPoint::After(2));
         // Owed and kept beyond the window, with only an end: no exchange holds the error.
         let mut owed = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
         owed.transmit_evidence = Some(TransmitEvidence::TxIndication);
@@ -4724,6 +4731,43 @@ mod tests {
 
     /// ADR-384: a late answer counted as answered only is not counted again as one since an error
     /// by a later recount of the answers since an error.
+    /// An answer counted as an answer alone stays out of the matched answers when its exchange's
+    /// owners are freed later: here an earlier owner's final response, also shown before the
+    /// error, leaves the answer to exchange 2 alone (ADR-384).
+    #[test]
+    fn an_answered_only_answer_freed_later_is_still_no_matched_answer() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let response: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let mut state = LinkState::default();
+        let (_, first) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, first);
+        let (_, second) = log_kept(&mut state, 2, silent.clone());
+        state.keep(2, second);
+        let (later, _) = log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+        let error = placed_at(Clock::Device, 0, 5_000);
+        assert_eq!(state.place_error(error), ErrorPoint::After(1));
+        state.error_after(Some(1), 4, LinkErrorKind::Receive, Some(error));
+        let settle = |state: &mut LinkState, seq: u64, at: i64| {
+            let kept = state.kept(seq).unwrap().clone();
+            state.settle_owed(seq);
+            let answered = kept.answered(response);
+            let history = state.history_settling(&answered, seq);
+            let entry = ExchangeEntry::build(seq, answered.clone(), history);
+            state.settled(seq, entry.classification, &entry.reason, answered, true);
+            let mut answer = entry.settled_answer(&kept);
+            let since = state.since_late_error(seq, Some(placed_at(Clock::Device, 0, at)));
+            assert!(!since, "{seq}");
+            answer.set_since_error(since);
+            state.reclassify_after(&answer);
+        };
+        settle(&mut state, 2, 4_000);
+        settle(&mut state, 1, 4_500);
+        assert_eq!(state.window[2].history.answered_same_match, 0);
+        assert_eq!(state.window[2].classification, later.classification);
+        assert_ne!(state.window[2].classification, Classification::Vehicle);
+    }
+
     #[test]
     fn a_recount_after_an_error_keeps_an_answer_counted_as_answered_only_out() {
         let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));

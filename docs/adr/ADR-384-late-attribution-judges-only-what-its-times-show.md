@@ -58,7 +58,8 @@ Four judgements rest on an ordering their times do not show:
      it. The counts start again before it, as for an error within an exchange.
    - The `late_item` entry says that the error came during it, or between it and the exchange
      before.
-   - An error after L is after that exchange.
+   - An error after L is after that exchange. Once an exchange has left the window, so is an
+     error at L itself, since the exchange's answer is not shown before the error.
 
    The maintainer chose H3 only (2026-10-29). Such an exchange has no transmit time, so its
    timing is not judged and its classification is already `undetermined` (ADR-376, ADR-377).
@@ -71,7 +72,8 @@ Four judgements rest on an ordering their times do not show:
    and epoch. An answer whose time is shown at or before an error's, on that error's clock and
    epoch, is never counted there. This holds also when its exchange had no time on that clock
    at its entry and the error was placed before it: the agent stopped waiting, and the result
-   read at job end carries the time. An answer before the error, or one whose order against it is not shown, is not
+   read at job end carries the time. Such an answer stays out of the matched answers when its
+   exchange's owners are freed later, for example by an earlier owner's final response. An answer before the error, or one whose order against it is not shown, is not
    counted there: on another clock or epoch, with no time, or after an error that could not be
    placed. The maintainer chose this (2026-10-29). A start is no matched answer, as before
    (ADR-354).

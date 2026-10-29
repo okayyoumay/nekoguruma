@@ -1730,14 +1730,17 @@ impl CommLog {
         // Among times read together, the VCI order is taken on each clock nearest its latest
         // time, or nearest the clock's first time read here when it has none, so a wrap between
         // them keeps their order.
+        // After half a wrap with nothing read on the clock, its latest time decides nothing
+        // (ADR-383), and the first time read here anchors the order.
         let anchor = |clock| {
-            inner.clocks.latest(clock).or_else(|| {
-                reads
-                    .iter()
-                    .filter(|(_, of, _, _)| *of == Some(clock))
-                    .min_by_key(|(read_us, _, _, _)| *read_us)
-                    .and_then(|(_, _, raw, _)| raw.and_then(|raw| i64::try_from(raw).ok()))
-            })
+            let first = reads
+                .iter()
+                .filter(|(_, of, _, _)| *of == Some(clock))
+                .min_by_key(|(read_us, _, _, _)| *read_us)?;
+            inner
+                .clocks
+                .latest(clock, first.0)
+                .or_else(|| first.2.and_then(|raw| i64::try_from(raw).ok()))
         };
         let anchors = [
             anchor(exchange::Clock::Device),
@@ -4149,7 +4152,9 @@ impl Inner {
             return Some(None);
         };
         let Some(read) = read else {
-            return Some(self.clocks.near_latest(clock, raw));
+            // Read by now, at the latest.
+            let now_us = self.clock().monotonic_us;
+            return Some(self.clocks.near_latest(clock, raw, now_us));
         };
         let tolerance = self.tolerance();
         let (placed, opened) =
@@ -4170,15 +4175,19 @@ impl Inner {
     }
 
     /// Places `raw`, a time on `clock` the host read at no known time, nearest the clock's
-    /// latest time; on a clock with no epoch yet, as read at `fallback`, a time after it was
-    /// read.
+    /// latest time; on a clock with no epoch yet, or one the agent had read nothing on for half
+    /// a wrap by `fallback` (ADR-383), as read at `fallback`, a time after it was read.
     fn place_unread(
         &mut self,
         clock: Option<exchange::Clock>,
         raw: u64,
         fallback: Option<AgentNow>,
     ) -> Option<Option<clocks::Placed>> {
-        match clock.and_then(|clock| self.clocks.near_latest(clock, raw)) {
+        let by_us = match fallback {
+            Some(fallback) => fallback.monotonic_us,
+            None => self.clock().monotonic_us,
+        };
+        match clock.and_then(|clock| self.clocks.near_latest(clock, raw, by_us)) {
             Some(placed) => Some(Some(placed)),
             None => self.place_read(clock, raw, fallback),
         }
@@ -5871,7 +5880,8 @@ mod tests {
 
         // An indication for another identifier read after the final response's item, before
         // the primitive's end; then a start after a pending across the wrap, and a rejected
-        // result between them.
+        // result between them. The first exchange ends a second before the wrap, so the clock
+        // is not silent for half a wrap before the second (ADR-383).
         let dir = self::dir();
         let setup = self::setup(&dir);
         let log = CommLog::open(&setup).unwrap();
@@ -5881,15 +5891,16 @@ mod tests {
             &request,
             exchange::End::Positive(long.clone()),
         );
-        answered.times.agent.end_us = 1_016_000;
+        let near = span - 1_100_000;
+        answered.times.agent.end_us = near + 1_016_000;
         answered.times.vci = Some(exchange::VciTimes {
-            rx_end: Some(device(1_010_000)),
-            response_read_us: Some(1_011_000),
+            rx_end: Some(device(near + 1_010_000)),
+            response_read_us: Some(near + 1_011_000),
             ..exchange::VciTimes::default()
         });
         let other = UnattachedItem {
-            vci_us: 1_013_000,
-            read: Some(read(1_014_000)),
+            vci_us: u32::try_from(near + 1_013_000).unwrap(),
+            read: Some(read(near + 1_014_000)),
             ..start_of_message(0x7E9)
         };
         log.exchange_with(answered, vec![other]).unwrap();
@@ -5958,6 +5969,117 @@ mod tests {
         assert_eq!(entry["rejected"][0]["epoch"], 0, "{entry}");
         assert_eq!(entry["pending"][0]["epoch"], 0, "{entry}");
         assert_eq!(exchanges[2]["times"]["vci"]["rx_end"]["epoch"], 1);
+    }
+
+    /// A time read at no known time after half a wrap with nothing read on its clock is not
+    /// placed nearest the clock's old latest time: as read at the exchange's end, it opens an
+    /// epoch (ADR-383).
+    #[test]
+    fn a_time_read_at_no_known_time_after_a_long_silence_opens_an_epoch() {
+        let half = 1_u64 << 31;
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let request = [0x22, 0xF1, 0x90];
+        let mut first = evidence(
+            endpoint(0x7E0),
+            &request,
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+        );
+        first.times.agent.end_us = 3_000;
+        first.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(1_000)),
+            response_read_us: Some(2_000),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(first).unwrap();
+        let mut failed = evidence(endpoint(0x7E0), &request, exchange::End::NoResponse);
+        failed.times.agent.before_us = half + 1_000_000;
+        failed.times.agent.end_us = half + 2_000_000;
+        failed.times.vci = Some(exchange::VciTimes {
+            error: Some(device(5_000)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(failed).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let reasons: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "clock_epoch")
+            .map(|line| line["reason"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(reasons, ["first", "gap_beyond_wrap"], "{lines:?}");
+        let entry = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .nth(1)
+            .unwrap();
+        assert_eq!(entry["times"]["vci"]["error"]["epoch"], 1, "{entry}");
+    }
+
+    /// Times read together after half a wrap with nothing read on their clock take their order
+    /// from the first of them, not from the clock's old latest time: two pendings on each side
+    /// of that time's opposite point open one epoch, not a step back (ADR-383).
+    #[test]
+    fn times_read_together_after_a_long_silence_open_one_epoch() {
+        let half = 1_u64 << 31;
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let request = [0x22, 0xF1, 0x90];
+        let answer = vec![0x62, 0xF1, 0x90, 1];
+        let mut first = evidence(
+            endpoint(0x7E0),
+            &request,
+            exchange::End::Positive(answer.clone()),
+        );
+        first.times.agent.end_us = 3_000;
+        first.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(1_000)),
+            response_read_us: Some(2_000),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(first).unwrap();
+        // More than half a wrap later, two pendings read in one notification, 10 ms apart on
+        // each side of the point half a wrap from the clock's latest time.
+        let read_us = half + 10_000_000;
+        let (before, after) = (1_000 + half - 5_000, 1_000 + half + 5_000);
+        let pending = |vci_us| exchange::Pending {
+            vci_us: Some(vci_us),
+            clock: Some(exchange::Clock::Device),
+            epoch: None,
+            agent_us: read_us,
+            since_previous_ms: None,
+        };
+        let mut later = evidence(endpoint(0x7E0), &request, exchange::End::Positive(answer));
+        later.pending = vec![pending(before), pending(after)];
+        later.times.agent.before_us = read_us - 1_000_000;
+        later.times.agent.end_us = read_us + 10_000;
+        later.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(after + 5_000)),
+            response_read_us: Some(read_us + 5_000),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(later).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let reasons: Vec<_> = lines
+            .iter()
+            .filter(|line| line["event"] == "clock_epoch")
+            .map(|line| line["reason"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(reasons, ["first", "gap_beyond_wrap"], "{lines:?}");
+        let entry = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .nth(1)
+            .unwrap();
+        assert_eq!(entry["pending"][0]["epoch"], 1, "{entry}");
+        assert_eq!(entry["pending"][1]["epoch"], 1, "{entry}");
     }
 
     /// ADR-361 item 3: times read together keep their VCI order across a wrap, so two pendings

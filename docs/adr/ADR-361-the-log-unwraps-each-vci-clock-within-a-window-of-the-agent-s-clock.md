@@ -1,7 +1,7 @@
 # ADR-361: The Log Unwraps Each VCI Clock Within a Window of the Agent's Clock
 
 **Date:** 2026-10-26
-**Status:** Accepted
+**Status:** Accepted (item 2's gap beyond the wrap and item 3's placement nearest the latest time revised by ADR-383: half a wrap with nothing read on a clock opens an epoch, and the tolerances only tell a wrap from a step back)
 **Affects:** `agent` communication log (`comm_log/clocks.rs` `VciClocks`, `comm_log.rs`
 `CommLog::exchange_with`, `vci_connected`, the reopen scan; `comm_log/exchange.rs` `VciTime`,
 `Pending`, `Rejected`, `pending_intervals`); design 8.11 (`clock_epoch`, "Timing judged",

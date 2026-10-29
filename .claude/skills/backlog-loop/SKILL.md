@@ -234,9 +234,10 @@ verdict or its reasons changed.
 
 ## 6. Wait for the merge, then continue
 
-End the turn. While the PR is open, any wake other than its merge or close (a review, a CI
-result, a comment) is handled by `pr-review-loop`, and the turn ends again; it does not start
-step 1.
+Start the 30-minute merge-wait timer (`pr-review-loop`, "Waking up" in Step 0; ADR-380) and end
+the turn. A timer wake reads the PR's state: merged or closed goes on as below, and still open
+starts the next timer. While the PR is open, any other wake (a review, a CI result, a comment) is
+handled by `pr-review-loop`, and the turn ends again; it does not start step 1.
 
 A PR marked "final" ends the run whether it is merged or closed: write the final report if it
 was not written yet, and do nothing else.

@@ -770,12 +770,13 @@ struct LastTime {
 
 /// The first reading of the VCI's clock after it connected, which the runner takes when the log
 /// holds a loss to settle: the time with the clock the worker names, when the agent had the
-/// answer, and the read's round trip, within which the clock was read.
+/// answer, and the read's round trip, within which the clock was read: `None` when it cannot
+/// be bounded ([`CommLog::round_trip_us`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectReading {
     pub time: exchange::VciTime,
     pub read: AgentNow,
-    pub round_trip_us: u64,
+    pub round_trip_us: Option<u64>,
 }
 
 /// Whether the VCI kept its power across the loss (`vci_loss_settled`'s `power_kept`).
@@ -1577,16 +1578,19 @@ impl CommLog {
     }
 
     /// The time from `asked` to `answered`, two agent times of this log, on the boot clock when
-    /// the system gives one, so that a suspend in between counts (ADR-374).
-    pub(crate) fn round_trip_us(&self, asked: AgentNow, answered: AgentNow) -> u64 {
+    /// the system gives one, so that a suspend in between counts (ADR-374). `None` when only one
+    /// of the two has a boot time: the agent's clock would leave out a suspend in between, so
+    /// nothing bounds the time.
+    pub(crate) fn round_trip_us(&self, asked: AgentNow, answered: AgentNow) -> Option<u64> {
         let mut inner = self.lock();
         let agent = answered.monotonic_us.saturating_sub(asked.monotonic_us);
         match (
             inner.boot_at(asked.monotonic_us),
             inner.boot_at(answered.monotonic_us),
         ) {
-            (Some(asked), Some(answered)) => answered.saturating_sub(asked).max(agent),
-            _ => agent,
+            (Some(asked), Some(answered)) => Some(answered.saturating_sub(asked).max(agent)),
+            (None, None) => Some(agent),
+            _ => None,
         }
     }
 
@@ -3760,7 +3764,9 @@ impl Inner {
     /// the first reading of the VCI's clock after it connected (design 8.11 "Settlement",
     /// ADR-373). `None` once the log has failed.
     fn settle_loss(&mut self, loss: VciLoss, reading: Option<ConnectReading>) -> Option<u64> {
-        let round_trip_us = reading.map(|reading| reading.round_trip_us);
+        let round_trip_us = reading.and_then(|reading| reading.round_trip_us);
+        // A reading taken at a time nothing bounds is compared with nothing (ADR-374 item 4).
+        let unbounded = reading.is_some_and(|reading| reading.round_trip_us.is_none());
         // The reading on its clock, which opens the clock's first epoch of this run.
         let placed = match reading {
             Some(reading) => self
@@ -3829,7 +3835,7 @@ impl Inner {
                     last.us,
                     reading.us,
                     gap,
-                    round_trip_us.unwrap_or(0),
+                    round_trip_us.unwrap_or_default(),
                     gap_error_us,
                     drift_ppm,
                     clock_margin_us,
@@ -3839,7 +3845,17 @@ impl Inner {
             .serial_number
             .zip(self.serial_number)
             .map(|(before, after)| before == after);
-        let (power_kept, reason) = power_kept(readings, fit, serial_match);
+        let fit = fit.filter(|_| !unbounded);
+        let (power_kept, reason) = if readings && unbounded {
+            (
+                PowerKept::Unknown,
+                format!(
+                    "The reconnect's reading of the VCI's clock came at a time the boot clock could not bound, so it is compared with nothing;{SUPPLY_NOT_EXCLUDED}"
+                ),
+            )
+        } else {
+            power_kept(readings, fit, serial_match)
+        };
         let mut exchanges: Vec<LossSettled> = loss
             .ended
             .iter()
@@ -9260,7 +9276,7 @@ mod tests {
         let reading = reading.map(|time| ConnectReading {
             time,
             read: log.now(),
-            round_trip_us: 0,
+            round_trip_us: Some(0),
         });
         log.vci_connected(Some(&serial(77)), reading).unwrap();
         let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
@@ -9502,7 +9518,7 @@ mod tests {
         let reading = ConnectReading {
             time: device(1_866_720_397),
             read: log.now(),
-            round_trip_us: 0,
+            round_trip_us: Some(0),
         };
         log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
         assert!(!log.loss_to_settle());
@@ -9602,7 +9618,7 @@ mod tests {
                 ConnectReading {
                     time: exchange::VciTime::new(us, Some(clock)),
                     read,
-                    round_trip_us: 0,
+                    round_trip_us: Some(0),
                 }
             });
             log.vci_connected(Some(&serial(serial_after)), reading)
@@ -9693,7 +9709,7 @@ mod tests {
         log.suspend(5_000_000);
         let answered = log.now();
         let agent = answered.monotonic_us - asked.monotonic_us;
-        assert_eq!(log.round_trip_us(asked, answered), agent + 5_000_000);
+        assert_eq!(log.round_trip_us(asked, answered), Some(agent + 5_000_000));
         // A time read before the suspend keeps the boot time it was read at, however late it
         // is placed.
         assert_eq!(
@@ -9710,8 +9726,15 @@ mod tests {
         let answered = log.now();
         assert_eq!(
             log.round_trip_us(asked, answered),
-            answered.monotonic_us - asked.monotonic_us
+            Some(answered.monotonic_us - asked.monotonic_us)
         );
+        // A boot time at only one end bounds nothing: a suspend between may be left out.
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        log.delay_samples(3);
+        let asked = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let answered = log.now();
+        assert_eq!(log.round_trip_us(asked, answered), None);
     }
 
     /// A clock that carried on reads as low as a restarted one past its wrap, or from a time
@@ -9840,7 +9863,7 @@ mod tests {
         let reading = ConnectReading {
             time: device(1_835_511_040),
             read: log.now(),
-            round_trip_us: 0,
+            round_trip_us: Some(0),
         };
         log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
         log.end("ok");
@@ -9874,7 +9897,7 @@ mod tests {
         let with_boot = ",\"boot\":{\"id\":\"boot-1\",\"us\":5000000}";
         // The reconnect is read 40 s later on the boot clock; the clock was read up to 3 ms
         // before its answer, `ahead_us` past the last time plus the gap.
-        let settle = |record: &str, boot: Option<&str>, ahead_us: i64| {
+        let settle_with = |record: &str, boot: Option<&str>, ahead_us: i64, round_trip_us| {
             let sink = Recording::default();
             let log = CommLog::over(Box::new(sink.clone()), record.as_bytes());
             assert!(log.loss_to_settle());
@@ -9885,7 +9908,7 @@ mod tests {
             let reading = ConnectReading {
                 time: exchange::VciTime::new(us as u64, Some(exchange::Clock::Device)),
                 read,
-                round_trip_us: 3_000,
+                round_trip_us,
             };
             log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
             let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
@@ -9894,6 +9917,9 @@ mod tests {
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
                 .find(|line| line["event"] == "vci_loss_settled")
                 .unwrap()
+        };
+        let settle = |record: &str, boot: Option<&str>, ahead_us: i64| {
+            settle_with(record, boot, ahead_us, Some(3_000))
         };
         let entry = settle(&record(with_boot), Some("boot-1"), -6_000);
         assert_eq!(entry["power_kept"], true, "{entry}");
@@ -9911,6 +9937,17 @@ mod tests {
         // Twice the margin, the round trip, and 100 ppm of 40 s.
         assert_eq!(clock["tolerance_us"], 2_000 + 3_000 + 4_000, "{entry}");
         // Just past that tolerance, it carried on no longer.
+        // A reading whose round trip nothing bounds is compared with nothing.
+        let entry = settle_with(&record(with_boot), Some("boot-1"), -6_000, None);
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        assert!(
+            entry["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not bound"),
+            "{entry}"
+        );
         let entry = settle(&record(with_boot), Some("boot-1"), -9_001);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert_eq!(entry["clock"]["fits_carried_on"], false, "{entry}");

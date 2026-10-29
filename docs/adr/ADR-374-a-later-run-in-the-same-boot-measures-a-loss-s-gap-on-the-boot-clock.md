@@ -60,7 +60,10 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    agent time is taken after the answer, so the VCI's clock was read at most that round trip
    earlier. The tolerance of the comparison adds the round trip
    (`round_trip_us` in `vci_loss_settled`) to twice the clock margin and the drift bound over
-   the gap.
+   the gap. When only one end of the read has a boot time (a sample there was missing),
+   the agent's clock could leave out a suspend in between, so nothing bounds the round trip:
+   the reading is then compared with nothing, `round_trip_us` is `null` and `power_kept` is
+   `unknown`.
 
 5. **A restart is shown only beyond the gap's error.** A gap measured on the boot clock may
    be off by about a second either way when it spans a suspend (Consequences), and the

@@ -90,6 +90,15 @@ delegated (the final commit and push) or a single targeted read to check an agen
   and signature design, a choice that needs an ADR, or a bug that survived a `code-scout` +
   `cargo-runner` investigation. Hand it a distilled brief with the facts already collected, not
   an exploration task.
+- **`design-advisor` case table** before implementation (ADR-381), when the change's outcome
+  depends on combinations of states and events (settlement or attribution of results, clocks and
+  time placement, concurrency, state machines, protocol timing), when its estimated change, tests
+  aside, exceeds 300 lines, or when the latest merged PR that changed the same source files
+  needed five or more review rounds with findings. The gate is the nature of the change, not a
+  module. Ask for every combination with its expected outcome, or out of scope with the reason.
+  The implementation and its tests cover every in-scope row, the table goes into the PR
+  description under "Cases", and the `edge-case-hunter` brief carries it and asks for
+  combinations missing from it; a missing row it finds is added to the table as well as fixed.
 
 ## Working rules
 

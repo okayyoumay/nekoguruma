@@ -71,9 +71,14 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    just after the wrap or its start. With a gap that is off, such a reading fits only the
    restart test, and the loss would read as a power loss. So a gap measured on the boot clock
    settles a loss as `power_kept` `true` or `unknown`, never `false`: a reading that fits a
-   restart and not a clock that carried on leaves it `unknown`. The test for a clock that
-   carried on keeps the tolerance, so the gap's error never shows the power kept; at worst it
-   leaves a clock that carried on `unknown`. A gap on the agent's clock, within one agent
+   restart and not a clock that carried on leaves it `unknown`. The error matters for kept
+   power too, in one case: a clock that started again during the gap reads no more than the
+   true gap, so it can read where a clock that carried on would only when the clock's last
+   time before the loss lies within the gap's error and the tolerance. The log takes that
+   error as two seconds (the real-time clock's whole second at each end of the sleep, and the
+   kernel's adjustment between it and the system time), and such a young clock on a boot clock
+   gap leaves `power_kept` `unknown` as well. Otherwise the gap's error at worst leaves a clock
+   that carried on `unknown`. A gap on the agent's clock, within one agent
    epoch, is exact and settles as ADR-373 says, `false` included. The maintainer chose this
    (2026-10-29) over bounding the gap's error. ADR-373 measured no gap across runs, so the
    case did not arise before.

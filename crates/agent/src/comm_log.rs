@@ -853,6 +853,11 @@ struct VciLossSettledEntry {
     reason: String,
 }
 
+/// How far a gap measured on the boot clock may be off across a suspend (ADR-374 item 5): the
+/// real-time clock's whole second at each end of the sleep, and the kernel's adjustment between
+/// it and the system time, taken at two seconds.
+const BOOT_GAP_ERROR_US: u64 = 2_000_000;
+
 const SUPPLY_NOT_EXCLUDED: &str = " a drop of the vehicle's supply is not excluded.";
 
 /// Whether the power was kept, and why, from the comparison: whether a time of the VCI's own
@@ -861,11 +866,20 @@ const SUPPLY_NOT_EXCLUDED: &str = " a drop of the vehicle's supply is not exclud
 /// match. Nothing here depends on the
 /// worker's API (design principle 6): a worker whose clock reading is not the VCI's own time
 /// base names it `worker`, and one that gives no serial number gives none.
+/// A gap the boot clock measured, which a suspend can put off by up to [`BOOT_GAP_ERROR_US`]:
+/// `young` when the VCI clock's last time before the loss lies within that error and the
+/// tolerance, so that a clock that started again during the loss can read where one that
+/// carried on would.
+#[derive(Debug, Clone, Copy)]
+struct GapOnBoot {
+    young: bool,
+}
+
 fn power_kept(
     readings: bool,
     fit: Option<clocks::LossFit>,
     serial_match: Option<bool>,
-    gap_on_boot: bool,
+    gap_on_boot: Option<GapOnBoot>,
 ) -> (PowerKept, String) {
     let unknown = |why: &str| (PowerKept::Unknown, format!("{why};{SUPPLY_NOT_EXCLUDED}"));
     if !readings {
@@ -879,6 +893,9 @@ fn power_kept(
         );
     };
     match (fit.carried_on, fit.restarted, serial_match) {
+        (true, false, Some(true)) if gap_on_boot.is_some_and(|gap| gap.young) => unknown(
+            "The VCI's clock reads as one that carried on would, but it was younger at the loss than the boot clock's gap may be off, so a clock that started again during the loss could read the same",
+        ),
         (true, false, Some(true)) => (
             PowerKept::Yes,
             "The VCI kept its power across the loss, so the vehicle's supply did not drop: the loss was the PC's connection to the VCI.".to_owned(),
@@ -886,7 +903,7 @@ fn power_kept(
         (true, false, _) => unknown(
             "The VCI's clock carried on, but its serial number does not show that the same VCI reconnected",
         ),
-        (false, true, _) if gap_on_boot => unknown(
+        (false, true, _) if gap_on_boot.is_some() => unknown(
             "The VCI's clock reads as one that started again would, but the gap was measured on the boot clock, which a suspend of the PC can put off by seconds, and a clock that carried on past its wrap reads as low; such a gap shows no power loss",
         ),
         (false, true, _) => (
@@ -3842,7 +3859,12 @@ impl Inner {
                 readings,
                 fit,
                 serial_match,
-                matches!(gap, Some((_, "boot"))),
+                matches!(gap, Some((_, "boot"))).then(|| GapOnBoot {
+                    young: last.as_ref().zip(fit).is_some_and(|(last, fit)| {
+                        u128::from(last.us)
+                            <= u128::from(BOOT_GAP_ERROR_US) + u128::from(fit.tolerance_us)
+                    }),
+                }),
             )
         };
         let mut exchanges: Vec<LossSettled> = loss
@@ -9723,18 +9745,31 @@ mod tests {
 
     /// A gap measured on the boot clock shows no power loss (ADR-374 item 5): a suspend can put
     /// it off by seconds, and a clock that carried on past its wrap then reads as low as a
-    /// restarted one. The same fit on the agent's clock does show it.
+    /// restarted one. The same fit on the agent's clock does show it. Nor does such a gap show
+    /// kept power for a clock younger at the loss than the gap's error.
     #[test]
     fn a_gap_on_the_boot_clock_shows_no_restart() {
+        let boot = |young| Some(GapOnBoot { young });
         // A 600 s gap past the wrap, measured a second long.
         let fit = clocks::loss_fit(4_000_000_000, 305_032_704, 601_000_000, 0, 100, 1_000);
         assert!(fit.restarted && !fit.carried_on, "{fit:?}");
-        let (kept, reason) = power_kept(true, Some(fit), Some(true), true);
+        let (kept, reason) = power_kept(true, Some(fit), Some(true), boot(false));
         assert_eq!(kept, PowerKept::Unknown, "{reason}");
         assert!(reason.contains("boot clock"), "{reason}");
         assert_eq!(
-            power_kept(true, Some(fit), Some(true), false).0,
+            power_kept(true, Some(fit), Some(true), None).0,
             PowerKept::No
+        );
+        // A clock that started again 0.5 s into a 10 s gap measured 9 s long reads where one
+        // that carried on from 0.5 s would: a clock that young shows no kept power.
+        let fit = clocks::loss_fit(500_000, 9_500_000, 9_000_000, 1_000, 100, 1_000);
+        assert!(fit.carried_on && !fit.restarted, "{fit:?}");
+        let (kept, reason) = power_kept(true, Some(fit), Some(true), boot(true));
+        assert_eq!(kept, PowerKept::Unknown, "{reason}");
+        assert!(reason.contains("younger"), "{reason}");
+        assert_eq!(
+            power_kept(true, Some(fit), Some(true), boot(false)).0,
+            PowerKept::Yes
         );
     }
 

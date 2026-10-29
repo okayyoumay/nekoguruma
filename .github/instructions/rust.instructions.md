@@ -60,3 +60,12 @@ Flag as P1:
   An ECU-specific recovery written as the framework user's own procedure may continue from a
   later address (item 4). Flag it only if it bypasses the journal, the state check before
   resuming or the interruptibility attributes.
+- **A communication-log outcome its evidence does not decide** (`crates/agent/src/comm_log.rs`,
+  `crates/agent/src/comm_log/`, ADR-375): a new or changed classification, lateness, owner or
+  settlement that holds only by an estimate the log adds itself, such as a bound on an
+  unmeasured error, a tolerance chosen so that the comparison decides, a value assumed for one
+  it did not read, or a rule about what usually happens. Also flag an outcome that a realistic
+  case consistent with the evidence would make false, and a fix to such a case that adds a
+  further estimate instead of reading what is missing or narrowing the judgement. An open
+  outcome (`unknown`, `undetermined`, "not judged") must give its reason and the inputs a
+  reader needs to redo it.

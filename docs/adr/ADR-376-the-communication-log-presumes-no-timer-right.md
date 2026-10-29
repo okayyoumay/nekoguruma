@@ -84,4 +84,5 @@ worker's timer like the VCI's.
 - A late response's settlement (`settle_late_response`) classifies the response as if it came
   in time and judges its time by its own window, so item 2 does not reach it. Whether that
   judgement, and the log's other rules on attribution, timing and settlement, rest on an
-  estimate is checked against ADR-375 separately.
+  estimate was checked against ADR-375 separately: the timing by ADR-377, the settlements by
+  ADR-378, the attribution by ADR-384.

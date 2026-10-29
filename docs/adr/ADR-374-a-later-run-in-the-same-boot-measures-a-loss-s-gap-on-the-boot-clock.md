@@ -63,13 +63,16 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    the gap.
 
 5. **A restart is shown only beyond the gap's error.** A gap measured on the boot clock may
-   be off by up to a second either way when it spans a suspend (Consequences). A clock that
+   be off by about a second either way when it spans a suspend (Consequences), and the
+   kernel's adjustment between the real-time clock and the system time can add to that; the
+   log takes the error as two seconds. A clock that
    carried on can read as low as ADR-373's restart test allows: past its 32-bit wrap during the
    gap, or from a last time just after the wrap or its start. With a gap that is off, such a
    reading fits only the restart test, and the loss would read as a power loss. So the
-   comparison takes the gap's error, a second for a gap on the boot clock and none for one on
+   comparison takes the gap's error, two seconds for a gap on the boot clock and none for one on
    the agent's clock, and a reading that fits a restart shows one only when it lies further
-   than the tolerance plus that error from what a clock that carried on reads; otherwise
+   than the tolerance, that error and the drift bound over it from what a clock that carried
+   on reads; otherwise
    `power_kept` is `unknown`, not `false`. The test for a clock that carried on keeps the
    tolerance alone, so the error never shows the power kept. `vci_loss_settled` records the
    error (`gap_error_us`) and the result (`excludes_carried_on`). ADR-373 measured no gap

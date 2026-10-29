@@ -335,7 +335,12 @@ pub(crate) fn loss_fit(
         tolerance_us: u64::try_from(tolerance).unwrap_or(u64::MAX),
         carried_on: distance <= tolerance,
         restarted: reading <= i128::from(gap_us) + tolerance,
-        excludes_carried_on: distance > tolerance + i128::from(gap_error_us),
+        // The error, and the drift over it: a gap measured short leaves out the drift over the
+        // time it missed.
+        excludes_carried_on: distance
+            > tolerance
+                + i128::from(gap_error_us)
+                + (i128::from(drift_bound_ppm) * i128::from(gap_error_us) + 999_999) / 1_000_000,
     }
 }
 

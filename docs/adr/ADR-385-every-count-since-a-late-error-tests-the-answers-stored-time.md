@@ -5,7 +5,7 @@
 **Affects:** `agent` communication log (`comm_log/exchange.rs` `Kept::answer_at`,
 `Logged::answer_at`, `Kept::answer_time`, `LinkState::log`, `LinkState::judge_answer`,
 `LinkState::since_late_error`, `LinkState::error_after`, `LinkState::reclassify_one`,
-`LinkState::take_answer`, `LinkState::place_error`; `comm_log.rs` `CommLog::exchange_with`,
+`LinkState::take_answer`; `comm_log.rs` `CommLog::exchange_with`,
 `CommLog::primitive_ended`, `Inner::late_response`, `Inner::late_item`); design 8.11
 "Settlement", `late_item`; ADR-372 items 2 and 3; ADR-384 item 2 and Consequences
 
@@ -45,12 +45,20 @@ the paths that offered an answer again were where its findings kept coming from.
    maintainer chose this (2026-10-29). Only an exchange logged after the error was read counts
    an answer with no comparable time.
 
-4. **The stored time places a later error.** An exchange's latest time on the error's clock and
-   epoch includes its stored answer time, for the window and for the exchanges kept beyond it.
-   An error after the answer is after the exchange; one at or before it may fall within it as
-   ADR-384 item 1 places it. The maintainer chose this (2026-10-29).
+4. **The stored time does not place a later error.** A late error is placed by the entries'
+   own times, as before. An answer settled late can come after later exchanges began, so
+   letting it stretch its exchange's span would break the order the placement rests on: an error
+   a later exchange may have held would be taken as certainly within the earlier one. The
+   maintainer first chose to place by the stored time and, after review found this, chose not to
+   (2026-10-29).
 
-5. **The kept answer's time is its final response's.** An owed exchange that keeps a final
+5. **An answer the recount leaves out is no longer counted.** When a late error's recount leaves
+   an owed exchange's matched answer out, the exchange has no matched answer counted any more.
+   A later answering item of its own is then a new matched answer and is tested by its own
+   time; without this, a later final response shown after the error would have been passed
+   over as already counted.
+
+6. **The kept answer's time is its final response's.** An owed exchange that keeps a final
    response another request may own takes that response's time as its answer's, not its latest
    pending's, as ADR-384 item 2 orders the answering items. The maintainer confirmed this
    (2026-10-29).
@@ -67,3 +75,6 @@ the paths that offered an answer again were where its findings kept coming from.
   window exchange. That can only count too few.
 - One field per exchange replaces the flag ADR-384 kept, and the answering item's time is
   picked in one place.
+- Because the stored time does not place an error, an error after an exchange's late answer
+  can still fall after that exchange's entry times and recount the exchange's own history,
+  and the entry may say the error fell between exchanges. That only counts too few.

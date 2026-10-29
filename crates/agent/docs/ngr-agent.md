@@ -513,7 +513,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   as an answer since a late error, only when its answering item's time, which every exchange
   keeps, is shown after the error's on one clock and epoch, or its exchange was logged after
   the error was read: the settling entries, the error's recount and an answer freed through
-  its owners all use that test, and the stored time also places a later error (ADR-384,
+  its owners all use that test; the stored time does not place a later error (ADR-384,
   ADR-385). Before the window,
   every window exchange is reclassified from the window alone.
   One that cannot be placed on one clock with the exchanges is a possible link error (H3) during

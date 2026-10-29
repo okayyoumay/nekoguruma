@@ -349,8 +349,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `[vci]` keys), else, for the drift bound and the clock margin, `default`, the agent's own
   (`VciMargins::DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms), which place
   a clock's times, telling a wrap from a step back but never deciding how many wraps a silence
-  holds (half a wrap of silence opens an epoch, ADR-383), and never settle a loss: with either at its default, `vci_loss_settled`
-  records its comparison and gives `power_kept` `unknown` (ADR-378). The agent
+  holds (half a wrap of silence opens an epoch, ADR-383), and never settle a loss: with
+  either at its default, `vci_loss_settled` records its comparison and gives `power_kept`
+  `unknown` (ADR-378). The agent
   has no timing margin of its own: without one, `timing_margin` is `{"source":"none"}` and the
   link's times are recorded and not judged (`not_judged_reason` `no_margin`, ADR-377).
   A run that loses the VCI writes `vci_loss`, and writes it again, whole, after each further

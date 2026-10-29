@@ -44,6 +44,14 @@ ADR-361 item 3 already draws by placing a time nearest the latest within half a 
    new epoch with `gap_beyond_wrap`, whatever its value. The silence runs from the agent's
    latest read of a time kept in the epoch, so a time just behind the latest one that is read
    later counts too. The old check, a value a wrap later still within the reach, is removed.
+   - A suspend of the machine counts in the silence: the agent's clock stops during one and the
+     VCI's does not. Where the system gives a boot clock (ADR-374), the silence is also measured
+     on it, from each read's boot time. Its error of about a second across a suspend does not
+     matter against half a wrap.
+   - Where the system gives a boot clock but either read has no boot time (a missing sample,
+     ADR-374 item 2), a suspend between them cannot be excluded, so the silence is taken as
+     half a wrap or more.
+   - Where the system gives none, the agent's clock alone measures the silence.
 
 2. **The model behind it.** The log follows a clock that is a microsecond counter running at
    less than twice the agent's rate, whose times are read far less than half a wrap late. This
@@ -64,9 +72,9 @@ ADR-361 item 3 already draws by placing a time nearest the latest within half a 
      have been read: the exchange's end, or the agent's time now. Otherwise it is read as at
      that time, and opens the epoch.
    - Times read together are ordered nearest the clock's latest time only when it lies within
-     half a wrap before the first of them. Otherwise the first of them anchors the order. Two
-     items read together on each side of the old latest time's opposite point then open one
-     epoch, not a step back.
+     half a wrap before the first of them, and the VCI has not connected again since. Otherwise
+     the first of them anchors the order. Two items read together on each side of the old
+     latest time's opposite point then open one epoch, not a step back.
 
 ## Consequences
 
@@ -78,5 +86,15 @@ ADR-361 item 3 already draws by placing a time nearest the latest within half a 
   so nothing is lost. An exchange whose primitive waited that long has its times in two epochs,
   and its timing is not judged.
 - ADR-361's accepted limitation stands: a reset that lands within the reach reads as a wrap.
+- On a system without a boot clock (today every one but Linux), a suspend within the silence
+  goes unseen. A VCI that stays connected through a suspend of half a wrap or more can then be
+  placed with a false wrap count.
+- Two cases open an epoch more often than needed, and never place a time falsely:
+  - When a time with no read time of its own opens the epoch, it is taken as read at the end of
+    its exchange. That overstates the epoch's least delay and understates its reach, so a wrap
+    soon after can open a further epoch as a step back.
+  - The order of times read together is anchored once per exchange, at the clock's earliest
+    read in it. A group read in the same exchange half a wrap later is still ordered nearest
+    the old latest time, and can open a step back after its gap.
 - A clock the model does not describe is outside this rule: one at twice the agent's rate or
   more, or a profile whose drift bound or clock margin approaches half a wrap.

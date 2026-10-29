@@ -1732,6 +1732,7 @@ impl CommLog {
         // them keeps their order.
         // After half a wrap with nothing read on the clock, its latest time decides nothing
         // (ADR-383), and the first time read here anchors the order.
+        inner.sample_boot();
         let anchor = |clock| {
             let first = reads
                 .iter()
@@ -1739,7 +1740,7 @@ impl CommLog {
                 .min_by_key(|(read_us, _, _, _)| *read_us)?;
             inner
                 .clocks
-                .latest(clock, first.0)
+                .latest(clock, inner.read_at(first.0))
                 .or_else(|| first.2.and_then(|raw| i64::try_from(raw).ok()))
         };
         let anchors = [
@@ -3993,6 +3994,19 @@ impl Inner {
         monotonic_us.checked_add((*offset)?)
     }
 
+    /// When the agent's clock read `agent_us`, also on the boot clock, so that a suspend since
+    /// counts in a clock's silence (ADR-383): no boot clock on the system, none known for that
+    /// time (a missing sample), or the boot time.
+    fn read_at(&self, agent_us: u64) -> clocks::ReadAt {
+        let boot = if self.boot_offsets.is_empty() {
+            clocks::Boot::NoClock
+        } else {
+            self.boot_at(agent_us)
+                .map_or(clocks::Boot::Missing, clocks::Boot::At)
+        };
+        clocks::ReadAt { agent_us, boot }
+    }
+
     /// Takes the offset between the boot clock and the agent's clock now.
     fn sample_boot(&mut self) {
         let agent_now_us = self.clock().monotonic_us;
@@ -4151,15 +4165,16 @@ impl Inner {
         let Some(clock) = clock else {
             return Some(None);
         };
+        // One sample for the boot times looked up below (ADR-379).
+        self.sample_boot();
         let Some(read) = read else {
             // Read by now, at the latest.
-            let now_us = self.clock().monotonic_us;
-            return Some(self.clocks.near_latest(clock, raw, now_us));
+            let now = self.read_at(self.clock().monotonic_us);
+            return Some(self.clocks.near_latest(clock, raw, now));
         };
         let tolerance = self.tolerance();
-        let (placed, opened) =
-            self.clocks
-                .read(clock, raw, read.monotonic_us, read.epoch, tolerance);
+        let at = self.read_at(read.monotonic_us);
+        let (placed, opened) = self.clocks.read(clock, raw, at, read.epoch, tolerance);
         if let Some(opened) = opened {
             self.append_with(|seq, line| {
                 serde_json::to_writer(
@@ -4187,7 +4202,9 @@ impl Inner {
             Some(fallback) => fallback.monotonic_us,
             None => self.clock().monotonic_us,
         };
-        match clock.and_then(|clock| self.clocks.near_latest(clock, raw, by_us)) {
+        self.sample_boot();
+        let by = self.read_at(by_us);
+        match clock.and_then(|clock| self.clocks.near_latest(clock, raw, by)) {
             Some(placed) => Some(Some(placed)),
             None => self.place_read(clock, raw, fallback),
         }
@@ -5969,6 +5986,42 @@ mod tests {
         assert_eq!(entry["rejected"][0]["epoch"], 0, "{entry}");
         assert_eq!(entry["pending"][0]["epoch"], 0, "{entry}");
         assert_eq!(exchanges[2]["times"]["vci"]["rx_end"]["epoch"], 1);
+    }
+
+    /// A read's boot time, which a clock's silence counts a suspend by: none on a system
+    /// without a boot clock, missing where no sample came near the read (ADR-383).
+    #[test]
+    fn a_read_gives_its_clock_silence_a_boot_time() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let before = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        let after = log.now();
+        let inner = log.lock();
+        assert_eq!(
+            inner.read_at(before.monotonic_us).boot,
+            clocks::Boot::At(1_000_000 + before.monotonic_us)
+        );
+        assert_eq!(
+            inner.read_at(after.monotonic_us).boot,
+            clocks::Boot::At(6_000_000 + after.monotonic_us)
+        );
+        drop(inner);
+        log.delay_samples(3);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        let during = log.now();
+        assert_eq!(
+            log.lock().read_at(during.monotonic_us).boot,
+            clocks::Boot::Missing
+        );
+        log.boot_as(None);
+        let read = log.now();
+        assert_eq!(
+            log.lock().read_at(read.monotonic_us).boot,
+            clocks::Boot::NoClock
+        );
     }
 
     /// A time read at no known time after half a wrap with nothing read on its clock is not

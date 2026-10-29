@@ -506,9 +506,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   or cannot be set against it: that is a link error of the exchange itself. Any other link error,
   of no primitive or of an earlier one, is a `late_item` (ADR-372). Within an earlier exchange
   (by its VCI time on one clock and epoch), that exchange takes it: its own fault on its own
-  link, H3 on another. Between exchanges, it settles the exchanges after it alone. Either way,
-  the matched answers and the answers since an error from before it end for every target, and
-  the later exchanges are reclassified. Before the window, no window exchange is reclassified.
+  link, H3 on another. An exchange with only end-side times may have held one no later than
+  its latest time while no exchange has left the window, and takes it as H3 only. Between exchanges, it settles the exchanges after
+  it alone. Either way, the matched answers and the answers since an error from before it end
+  for every target, and the later exchanges are reclassified; a late answer counts as matched
+  since the error only when its time is shown after the error's (ADR-384). Before the window,
+  every window exchange is reclassified from the window alone.
   One that cannot be placed on one clock with the exchanges is a possible link error (H3) during
   each exchange written since the link's items were last read before it; with none, it stays
   `unattached`. One bound to the stray primitive the host cancelled before the request is that

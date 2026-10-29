@@ -1319,6 +1319,64 @@ pub(crate) struct Kept {
     pub clears: Clears,
     /// Its entry's answer counted as a matched answer ([`ExchangeEntry::matched_answer`]).
     pub matched: bool,
+    /// A settling entry counted its answer as answered only, since a late link error may have
+    /// come after it ([`LinkState::since_late_error`]). It stays so: no later settling entry
+    /// offers that answer as one since an error or as a matched answer again; only an answering
+    /// item it adds itself, shown after the error, counts (ADR-384).
+    pub answered_only: bool,
+}
+
+/// The time of the item that answers an owed exchange, as a settling entry sees it (ADR-384).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AnswerTime {
+    /// No item answers it.
+    None,
+    /// An item answers it, with no placed time.
+    Unknown,
+    /// The answering item's time.
+    At(Clock, super::clocks::Placed),
+}
+
+#[cfg(test)]
+impl From<Option<(Clock, super::clocks::Placed)>> for AnswerTime {
+    fn from(time: Option<(Clock, super::clocks::Placed)>) -> Self {
+        time.map_or(Self::Unknown, |(clock, placed)| Self::At(clock, placed))
+    }
+}
+
+impl Kept {
+    /// The time of the item that answers this exchange, and whether that item is one the settling
+    /// entry adds (design 8.11 `late_item`, ADR-384): the final response (`final_response`),
+    /// else the latest pending, the settling entry's own (`new_pendings`), then those read late,
+    /// then those its entry saw; a start (`start`) only when there is neither, since it answers
+    /// nothing (ADR-354). A time that is not placed is [`AnswerTime::Unknown`], whatever else
+    /// the exchange has.
+    pub(crate) fn answer_time(
+        &self,
+        final_response: Option<super::timing::At>,
+        new_pendings: &[super::timing::At],
+        start: Option<super::timing::At>,
+    ) -> (AnswerTime, bool) {
+        let new = final_response
+            .or_else(|| new_pendings.last().copied())
+            .or(start.filter(|_| self.late_pendings.is_empty() && self.pendings.is_empty()));
+        let (item, new) = match new {
+            Some(item) => (Some(item), true),
+            None => (
+                self.late_pendings
+                    .last()
+                    .map(|(at, _)| *at)
+                    .or_else(|| self.pendings.last().copied()),
+                false,
+            ),
+        };
+        let time = match item {
+            None => AnswerTime::None,
+            Some(None) => AnswerTime::Unknown,
+            Some(Some((clock, placed))) => AnswerTime::At(clock, placed),
+        };
+        (time, new)
+    }
 }
 
 /// When a start-of-message indication read after an exchange's entry showed its response
@@ -1375,6 +1433,10 @@ struct Logged {
     /// ECUReset or session change read late counts the matched answers again from these
     /// ([`LinkState::reset_after`]).
     matched_at: Option<u64>,
+    /// A late answer it got was counted as answered only, since a late link error may have come
+    /// after it ([`LinkState::since_late_error`]): a recount of the answers since an error does
+    /// not count it again (ADR-384).
+    answered_only: bool,
 }
 
 /// Where a link error read late falls among a link's exchanges ([`LinkState::place_error`]).
@@ -1382,6 +1444,11 @@ struct Logged {
 pub(crate) enum ErrorPoint {
     /// Within the exchange logged as this `seq`.
     Within(u64),
+    /// The exchange logged as this `seq` has no placed start on the error's clock and epoch, only
+    /// a later placed time, and the error comes after every earlier exchange's latest placed
+    /// time and not after its own: it may have come during the exchange, or between it and the
+    /// one before. Only the exchange's own H3 reading holds (ADR-384).
+    MaybeWithin(u64),
     /// After the exchange logged as this `seq`, before the next.
     After(u64),
     /// Before every exchange the window holds, within the owed exchange kept beyond it logged
@@ -1406,6 +1473,10 @@ pub(crate) struct SettledAnswer {
     /// It is a final response, which ends the earlier exchange as an owed request.
     final_response: bool,
     clears: Clears,
+    /// The answer counts as one since the last link error: no late link error read after the
+    /// exchange's entry may have come after it ([`LinkState::since_late_error`], ADR-384). When
+    /// it does not, the answer counts as answered only, and as no matched answer.
+    since_error: bool,
 }
 
 impl SettledAnswer {
@@ -1413,6 +1484,27 @@ impl SettledAnswer {
     pub(crate) fn no_matched_answer(&mut self) {
         self.newly_matched = false;
     }
+
+    /// Whether the answer is shown to come after every late link error that may have come after
+    /// it ([`LinkState::since_late_error`]); when it is not, it counts in `answered` only and is
+    /// no matched answer for the exchanges after it (ADR-384).
+    pub(crate) fn set_since_error(&mut self, since_error: bool) {
+        self.since_error = since_error;
+        if !since_error {
+            self.newly_matched = false;
+        }
+    }
+}
+
+/// The time of a late link error read after the exchanges it falls within or after, on its clock
+/// and epoch, and the newest exchange whose answer it may precede (ADR-384).
+#[derive(Debug, Clone, Copy)]
+struct LateError {
+    clock: Clock,
+    epoch: u32,
+    unwrapped: i64,
+    /// An answer of an exchange logged at or before this may have come after the error.
+    through: u64,
 }
 
 /// A later exchange a settling entry reclassified, with its new classification and reason.
@@ -1450,6 +1542,12 @@ pub(crate) struct LinkState {
     window: VecDeque<Logged>,
     /// The largest `seq` that left the window.
     left_window: Option<u64>,
+    /// The latest late link error placed within or after the exchanges the link keeps, per clock
+    /// and epoch (ADR-384).
+    late_errors: Vec<LateError>,
+    /// The largest line a late link error was written as that could not be placed against the
+    /// link's exchanges: it may have come after the answer of any exchange logged before it.
+    late_error_unplaced: Option<u64>,
 }
 
 impl LinkState {
@@ -1806,6 +1904,7 @@ impl LinkState {
             after: self.clears,
             floor: None,
             settled: false,
+            answered_only: false,
             matched_at: entry.matched_answer().then(|| {
                 if entry.error_after_answer() {
                     clears.matched
@@ -1929,7 +2028,7 @@ impl LinkState {
                 let mut history = logged.history.clone();
                 if answer.newly_answered {
                     history.answered += 1;
-                    if logged.clears.errors == answer.clears.errors {
+                    if answer.since_error && logged.clears.errors == answer.clears.errors {
                         history.answered_since_error += 1;
                     }
                 }
@@ -2063,21 +2162,20 @@ impl LinkState {
     /// `late_item`): within an exchange, from its earliest placed VCI time (its transmit done or
     /// the start of its response) to its latest, on one clock and epoch; else after the latest
     /// exchange shown to start before it. An exchange whose times cannot be set against `at` is
-    /// taken as after it; when no exchange the link keeps can be, `at` is not placed.
+    /// taken as after it; when no exchange the link keeps can be, `at` is not placed. An
+    /// exchange with a placed time but no placed start is after the error when its latest time
+    /// is before it, else the error may have come during it ([`ErrorPoint::MaybeWithin`]).
     pub(crate) fn place_error(&self, at: (Clock, super::clocks::Placed)) -> ErrorPoint {
         let (clock, at) = at;
-        let span = |evidence: &Evidence| {
+        let on_clock = |time: &Option<VciTime>| {
+            time.and_then(|time| time.placed())
+                .filter(|(own, placed)| *own == clock && placed.epoch == at.epoch)
+                .map(|(_, placed)| placed.unwrapped)
+        };
+        // The latest placed VCI time of an exchange on the error's clock and epoch.
+        let latest = |evidence: &Evidence| {
             let vci = evidence.times.vci.as_ref()?;
-            let on_clock = |time: &Option<VciTime>| {
-                time.and_then(|time| time.placed())
-                    .filter(|(own, placed)| *own == clock && placed.epoch == at.epoch)
-                    .map(|(_, placed)| placed.unwrapped)
-            };
-            let start = [on_clock(&vci.tx_done), on_clock(&vci.rx_start)]
-                .into_iter()
-                .flatten()
-                .min()?;
-            let end = [
+            [
                 on_clock(&vci.tx_done),
                 on_clock(&vci.rx_start),
                 on_clock(&vci.rx_end),
@@ -2087,8 +2185,14 @@ impl LinkState {
             .into_iter()
             .flatten()
             .max()
-            .unwrap_or(start);
-            Some((start, end))
+        };
+        let span = |evidence: &Evidence| {
+            let vci = evidence.times.vci.as_ref()?;
+            let start = [on_clock(&vci.tx_done), on_clock(&vci.rx_start)]
+                .into_iter()
+                .flatten()
+                .min()?;
+            Some((start, latest(evidence).unwrap_or(start)))
         };
         let point = |seq: u64, evidence: &Evidence| {
             span(evidence)
@@ -2106,16 +2210,46 @@ impl LinkState {
             .iter()
             .map(|logged| &logged.evidence)
             .chain(self.kept.values().map(|kept| &kept.evidence))
-            .any(|evidence| span(evidence).is_some())
+            .any(|evidence| latest(evidence).is_some())
         {
             return ErrorPoint::NotPlaced;
         }
-        if let Some(found) = self
-            .window
-            .iter()
-            .rev()
-            .find_map(|logged| point(logged.seq, &logged.evidence))
-        {
+        // An exchange with a time on the clock but no placed start (a single-frame response
+        // with no transmit indication has only its end) has no span: the error is after it when
+        // it comes after its latest time, else it may have come during it, unless an earlier
+        // exchange's latest time is not before the error (the link is sequential, so it came
+        // during or before that one) (ADR-384).
+        let maybe_within = |seq: u64, evidence: &Evidence| {
+            if span(evidence).is_some() {
+                return None;
+            }
+            let last = latest(evidence)?;
+            // With an exchange gone from the window, an error at this exchange's latest time
+            // is not shown before its answer either: the answer is not counted after it.
+            if at.unwrapped > last || (self.left_window.is_some() && at.unwrapped == last) {
+                return Some(ErrorPoint::After(seq));
+            }
+            // The earlier exchanges' latest times must all be known to compare with: with one
+            // gone from the window, the error is not shown to fall within this exchange.
+            if self.left_window.is_some() {
+                return None;
+            }
+            let earlier = self
+                .window
+                .iter()
+                .map(|logged| (logged.seq, &logged.evidence))
+                .chain(self.kept.iter().map(|(seq, kept)| (*seq, &kept.evidence)))
+                .filter(|(other, _)| *other < seq)
+                .filter_map(|(_, evidence)| latest(evidence))
+                .max();
+            earlier
+                .is_none_or(|earlier| earlier < at.unwrapped)
+                .then_some(ErrorPoint::MaybeWithin(seq))
+        };
+        if let Some(found) = self.window.iter().rev().find_map(|logged| {
+            point(logged.seq, &logged.evidence)
+                .or_else(|| maybe_within(logged.seq, &logged.evidence))
+        }) {
             return found;
         }
         // Before the window: an owed exchange kept beyond it may hold it.
@@ -2266,20 +2400,26 @@ impl LinkState {
     /// - After `seq`: the exchanges logged after it count their matched answers and their answers
     ///   since an error again from the window's exchanges after `seq` alone, and are
     ///   reclassified.
-    /// - Before the window: the link's counts start again from the window's exchanges, which
-    ///   are not reclassified, since what they counted from before the window is not known.
+    /// - Before the window: every exchange the window holds is after the error. The link's
+    ///   counts and the window's exchanges' counts start again from the window alone, and the
+    ///   exchanges are reclassified, since what they counted from before the window no longer
+    ///   counts (ADR-384).
     ///
-    /// Gives each later exchange whose classification or reason this changes, in `seq` order,
-    /// and the largest `seq` of a later exchange it does not reclassify.
+    /// `time` is the error's placed time when it is placed against this link's exchanges (else
+    /// it is kept as one that could not be), which [`LinkState::since_late_error`] uses. Gives
+    /// each later exchange whose classification or reason this changes, in `seq` order, and the
+    /// largest `seq` of a later exchange it does not reclassify.
     pub(crate) fn error_after(
         &mut self,
         seq: Option<u64>,
         written: u64,
         kind: LinkErrorKind,
+        time: Option<(Clock, super::clocks::Placed)>,
     ) -> (Vec<Reclassified>, Option<u64>) {
         self.clears.matched += 1;
         self.clears.errors += 1;
         self.last_link_error = Some((written, kind));
+        self.note_late_error(written, time);
         let after = |other: u64| seq.is_none_or(|seq| other > seq);
         for logged in &mut self.window {
             if after(logged.seq) {
@@ -2289,7 +2429,9 @@ impl LinkState {
                     *at += 1;
                 }
             }
-            if seq.is_none_or(|seq| logged.seq >= seq) {
+            // The exchange the error falls after answered before it: its answer, freed later,
+            // counts with the clears from before the error (ADR-384).
+            if seq.is_none_or(|seq| logged.seq > seq) {
                 logged.after.matched += 1;
                 logged.after.errors += 1;
             }
@@ -2315,50 +2457,47 @@ impl LinkState {
             }
         };
         let mut changed = Vec::new();
-        let not_reclassified;
-        if let Some(seq) = seq {
-            for at in 0..self.window.len() {
-                let logged = &self.window[at];
-                if logged.seq <= seq {
-                    continue;
-                }
-                let mut history = logged.history.clone();
-                let key = MatchKey::of(&logged.evidence);
-                let (later, clears) = (logged.seq, logged.clears);
-                let since: Vec<&Logged> = self
-                    .window
-                    .iter()
-                    .filter(|earlier| earlier.seq > seq && earlier.seq < later)
-                    .collect();
-                history.answered_same_match = since
-                    .iter()
-                    .filter(|earlier| {
-                        earlier.matched_at == Some(clears.matched)
-                            && MatchKey::of(&earlier.evidence) == key
-                    })
-                    .count() as u32;
-                history.answered_since_error = since
-                    .iter()
-                    .filter(|earlier| {
-                        earlier.history.this_exchange && answered_in(earlier) == clears.errors
-                    })
-                    .count() as u32;
-                let (freed, reclassified) = self.reclassify_one(at, history);
-                if let Some(freed) = freed
-                    && freed.newly_matched
-                {
-                    self.window[at].matched_at = Some(freed.clears.matched);
-                }
-                changed.extend(reclassified);
+        for at in 0..self.window.len() {
+            let logged = &self.window[at];
+            if !after(logged.seq) {
+                continue;
             }
-            not_reclassified = self.left_window.filter(|left| *left > seq);
-        } else {
-            not_reclassified = self
+            let mut history = logged.history.clone();
+            let key = MatchKey::of(&logged.evidence);
+            let (later, clears) = (logged.seq, logged.clears);
+            let since: Vec<&Logged> = self
                 .window
-                .back()
-                .map(|logged| logged.seq)
-                .or(self.left_window);
+                .iter()
+                .filter(|earlier| after(earlier.seq) && earlier.seq < later)
+                .collect();
+            history.answered_same_match = since
+                .iter()
+                .filter(|earlier| {
+                    earlier.matched_at == Some(clears.matched)
+                        && MatchKey::of(&earlier.evidence) == key
+                })
+                .count() as u32;
+            history.answered_since_error = since
+                .iter()
+                .filter(|earlier| {
+                    earlier.history.this_exchange
+                        && !earlier.answered_only
+                        && answered_in(earlier) == clears.errors
+                })
+                .count() as u32;
+            let (freed, reclassified) = self.reclassify_one(at, history);
+            if let Some(freed) = freed
+                && freed.newly_matched
+            {
+                self.window[at].matched_at = Some(freed.clears.matched);
+            }
+            changed.extend(reclassified);
         }
+        // What left the window is past the exchanges reclassified.
+        let not_reclassified = match seq {
+            Some(seq) => self.left_window.filter(|left| *left > seq),
+            None => self.left_window,
+        };
         let first = |logged: &&Logged| seq.is_none_or(|seq| logged.seq > seq);
         self.matched.clear();
         for logged in self.window.iter().filter(first) {
@@ -2374,10 +2513,113 @@ impl LinkState {
             .iter()
             .filter(first)
             .filter(|logged| {
-                logged.history.this_exchange && answered_in(logged) == self.clears.errors
+                logged.history.this_exchange
+                    && !logged.answered_only
+                    && answered_in(logged) == self.clears.errors
             })
             .count() as u32;
         (changed, not_reclassified)
+    }
+
+    /// Keeps a late link error written as line `written`, placed at `time` or not, for
+    /// [`LinkState::since_late_error`]: the answers of the exchanges known when it is read count
+    /// since it only when their own time shows it (ADR-384). An
+    /// error that is not placed against this link's exchanges may have come after the answer of
+    /// any exchange logged before it.
+    fn note_late_error(&mut self, written: u64, time: Option<(Clock, super::clocks::Placed)>) {
+        let Some((clock, placed)) = time else {
+            self.late_error_unplaced = self.late_error_unplaced.max(Some(written));
+            return;
+        };
+        // Every exchange the link knows when the error is read may have answered before it:
+        // one placed after the error by its position alone (an exchange with no time on the
+        // error's clock is taken as after it) is not shown to have answered after it. Only an
+        // exchange logged later, whose request followed the error's read, is (ADR-384). An
+        // answer of a known exchange counts since the error only when its own time shows it.
+        let through = self
+            .window
+            .back()
+            .map(|logged| logged.seq)
+            .into_iter()
+            .chain(self.kept.keys().copied())
+            .max();
+        let Some(through) = through else {
+            return;
+        };
+        match self
+            .late_errors
+            .iter_mut()
+            .find(|error| error.clock == clock && error.epoch == placed.epoch)
+        {
+            // Merged, the pair can only count fewer answers since an error.
+            Some(error) => {
+                error.unwrapped = error.unwrapped.max(placed.unwrapped);
+                error.through = error.through.max(through);
+            }
+            None => self.late_errors.push(LateError {
+                clock,
+                epoch: placed.epoch,
+                unwrapped: placed.unwrapped,
+                through,
+            }),
+        }
+    }
+
+    /// Whether an answer of exchange `seq`, read after its entry and placed at `time`, counts
+    /// as an answer since the last link error: no late link error read after the exchange's entry
+    /// may have come after it, or its time is shown after the error's on the error's clock and
+    /// epoch (design 8.11 `late_item`, ADR-384). An error that could not be placed, or an
+    /// answer whose time cannot be set against it, leaves the answer counted as answered only.
+    pub(crate) fn since_late_error(&self, seq: u64, time: AnswerTime) -> bool {
+        if self
+            .late_error_unplaced
+            .is_some_and(|written| seq < written)
+        {
+            return false;
+        }
+        // An answer shown on an error's clock and epoch counts only when it is after the error,
+        // whatever exchange the error was placed after (an exchange with no time on the clock
+        // at its entry is placed as after the error, although its answer may be before it);
+        // one that cannot be set against the error counts only when the error is not after its
+        // exchange.
+        self.late_errors.iter().all(|error| match time {
+            AnswerTime::At(clock, placed)
+                if clock == error.clock && placed.epoch == error.epoch =>
+            {
+                placed.unwrapped > error.unwrapped
+            }
+            _ => seq > error.through,
+        })
+    }
+
+    /// Judges `answer`, which a settling entry adds to the owed exchange `kept` (as it was before
+    /// the entry), from the time of its answering item and whether that item is new
+    /// ([`Kept::answer_time`]): it counts since a late link error only when shown after it, and
+    /// an answer already counted as answered only counts again only through a new item that is
+    /// shown after the error (ADR-384).
+    pub(crate) fn judge_answer(
+        &self,
+        answer: &mut SettledAnswer,
+        kept: &Kept,
+        time: (AnswerTime, bool),
+    ) {
+        let (time, new) = time;
+        // A settling entry that adds no answer has nothing to judge, and marks nothing as
+        // counted alone.
+        if !answer.newly_answered && !answer.newly_matched {
+            return;
+        }
+        answer.set_since_error(
+            self.since_late_error(answer.seq, time) && (new || !kept.answered_only),
+        );
+    }
+
+    /// The response of owed exchange `seq` no longer counts as started in time: a later start
+    /// that it or another exchange could own was read (design 8.11 `late_item`, ADR-384).
+    pub(crate) fn forget_late_start(&mut self, seq: u64) {
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.late_start = None;
+        }
     }
 
     /// Classifies the window's exchange at `at` again with `history`, as
@@ -2436,11 +2678,14 @@ impl LinkState {
                 self.unknown_sends = self.unknown_sends.saturating_sub(1);
             }
         }
+        // An answer counted as an answer alone, not shown after a late error, stays so when its
+        // owners are freed (ADR-384).
+        let answered_only = self.window[at].answered_only;
         let freed = (alone || now_matched).then(|| SettledAnswer {
             seq,
             key: entry.effect.key.clone(),
             newly_answered: false,
-            newly_matched: now_matched,
+            newly_matched: now_matched && !answered_only,
             final_response: alone,
             // A link error after the answer, or in no known order with it, ended its matched
             // answer, as `record` applies it: the answer comes before.
@@ -2449,6 +2694,7 @@ impl LinkState {
             } else {
                 self.window[at].after
             },
+            since_error: !answered_only,
         });
         let logged = &mut self.window[at];
         logged.history = entry.link_history.clone();
@@ -2478,9 +2724,21 @@ impl LinkState {
     /// last link error unless one came since, and a matched answer unless the matched answers
     /// ended since.
     fn take_answer(&mut self, answer: &SettledAnswer) {
+        if !answer.since_error {
+            if let Some(logged) = self
+                .window
+                .iter_mut()
+                .find(|logged| logged.seq == answer.seq)
+            {
+                logged.answered_only = true;
+            }
+            if let Some(kept) = self.kept.get_mut(&answer.seq) {
+                kept.answered_only = true;
+            }
+        }
         if answer.newly_answered {
             self.answered += 1;
-            if answer.clears.errors == self.clears.errors {
+            if answer.since_error && answer.clears.errors == self.clears.errors {
                 self.answered_since_error += 1;
             }
         }
@@ -2610,6 +2868,7 @@ impl ExchangeEntry {
             newly_matched: self.matched_answer() && !kept.matched,
             final_response: effect.final_response,
             clears: kept.clears,
+            since_error: true,
         }
     }
 
@@ -3727,6 +3986,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            answered_only: false,
             late_pendings: Vec::new(),
             floor: None,
             clears: state.clears(),
@@ -4236,6 +4496,596 @@ mod tests {
         );
     }
 
+    /// A time on `clock` at `unwrapped` microseconds in epoch `epoch`.
+    fn placed_at(
+        clock: Clock,
+        epoch: u32,
+        unwrapped: i64,
+    ) -> (Clock, super::super::clocks::Placed) {
+        (clock, super::super::clocks::Placed { epoch, unwrapped })
+    }
+
+    /// `evidence` with its VCI times placed on the device clock, epoch 0: the transmit done and
+    /// the response's end, each when given.
+    fn timed(mut evidence: Evidence, tx_done: Option<i64>, rx_end: Option<i64>) -> Evidence {
+        let time = |us: i64| {
+            VciTime::new(us as u64, Some(Clock::Device)).at(Some(super::super::clocks::Placed {
+                epoch: 0,
+                unwrapped: us,
+            }))
+        };
+        evidence.times.vci = Some(VciTimes {
+            tx_done: tx_done.map(time),
+            rx_end: rx_end.map(time),
+            ..VciTimes::default()
+        });
+        evidence
+    }
+
+    /// ADR-384: a late link error falls within an exchange from its earliest placed transmit done
+    /// or response start; an exchange with only end-side times (a single-frame response with no
+    /// transmit indication) has no start, so an error after its latest time is after it, one
+    /// after the exchange before and not after that time may have come during it, and an exchange
+    /// with no time on the error's clock and epoch is taken as after the error, as before.
+    #[test]
+    fn an_exchange_with_only_end_side_times_may_hold_a_late_link_error() {
+        let answer: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let answered = || forwarding(evidence(&READ_F186, End::Positive(answer.to_vec())));
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, timed(answered(), Some(1_000), Some(1_200)));
+        log_kept(&mut state, 2, timed(answered(), None, Some(2_300)));
+        let at = |unwrapped| placed_at(Clock::Device, 0, unwrapped);
+        // Within the first exchange's span: the exchange before the one with end-side times
+        // only holds it.
+        assert_eq!(state.place_error(at(1_100)), ErrorPoint::Within(1));
+        // After the first exchange's latest time, not after the second's: it may have come
+        // during the second, or between them.
+        assert_eq!(state.place_error(at(1_500)), ErrorPoint::MaybeWithin(2));
+        assert_eq!(state.place_error(at(2_300)), ErrorPoint::MaybeWithin(2));
+        // After the second's latest time: after it, not after the exchange before.
+        assert_eq!(state.place_error(at(2_301)), ErrorPoint::After(2));
+        // Before every start: before the window.
+        assert_eq!(
+            state.place_error(at(500)),
+            ErrorPoint::BeforeWindow { within: None }
+        );
+        // The second exchange's times are on another epoch of the clock: it has no time on the
+        // error's clock and epoch, so the error is placed against the first, and the second is
+        // taken as after it.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, timed(answered(), Some(1_000), Some(1_200)));
+        let mut elsewhere = timed(answered(), None, Some(2_300));
+        if let Some(vci) = &mut elsewhere.times.vci {
+            vci.rx_end = vci.rx_end.map(|time| {
+                time.at(Some(super::super::clocks::Placed {
+                    epoch: 1,
+                    unwrapped: 2_300,
+                }))
+            });
+        }
+        log_kept(&mut state, 2, elsewhere);
+        assert_eq!(state.place_error(at(1_500)), ErrorPoint::After(1));
+        // No exchange with a time on the clock at all: not placed.
+        assert_eq!(
+            state.place_error(placed_at(Clock::Worker, 0, 1_500)),
+            ErrorPoint::NotPlaced
+        );
+        // Only end-side times in the whole window: they place the error too.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, timed(answered(), None, Some(2_300)));
+        assert_eq!(state.place_error(at(2_000)), ErrorPoint::MaybeWithin(1));
+        assert_eq!(state.place_error(at(2_400)), ErrorPoint::After(1));
+    }
+
+    /// ADR-384: an answer a settling entry adds after a late link error counts as one since the
+    /// error, and as a matched answer for the exchanges after it, only when its time is shown
+    /// after the error's on the same clock and epoch, or no such error applies to its exchange;
+    /// otherwise it counts as answered only. A pending that counts as a matched answer follows
+    /// the same rule.
+    #[test]
+    fn a_late_answer_counts_since_a_late_error_only_when_shown_after_it() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let device = |epoch, unwrapped| Some(placed_at(Clock::Device, epoch, unwrapped));
+        // The first exchange is owed, a silent one follows it, and a late link error falls after
+        // the first (placed at 2 000 us on the device clock, epoch 0, or not placed). Then its
+        // answer is read, at `answered_at`: what the later exchange gets.
+        let run = |error: Option<(Clock, super::super::clocks::Placed)>,
+                   answered_at: Option<(Clock, super::super::clocks::Placed)>,
+                   pending: bool| {
+            let mut state = LinkState::default();
+            let (_, kept) = log_kept(&mut state, 1, silent.clone());
+            state.keep(1, kept);
+            let (later, _) = log_kept(&mut state, 2, silent.clone());
+            assert_eq!(later.classification, Classification::Undetermined);
+            state.error_after(Some(1), 3, LinkErrorKind::Receive, error);
+            let kept = state.kept(1).unwrap().clone();
+            // The answer is a matched answer, as the settling entry's own classification of the
+            // first exchange gives it; a pending is no final response.
+            let mut settled = SettledAnswer {
+                seq: 1,
+                key: MatchKey::of(&silent),
+                newly_answered: true,
+                newly_matched: true,
+                final_response: !pending,
+                clears: kept.clears,
+                since_error: true,
+            };
+            settled.set_since_error(state.since_late_error(1, answered_at.into()));
+            let (changed, _) = state.reclassify_after(&settled);
+            let later = changed
+                .iter()
+                .find(|later| later.seq == 2)
+                .map(|later| later.classification);
+            (later, state.answered, state.answered_since_error)
+        };
+        let error = Some(placed_at(Clock::Device, 0, 2_000));
+        for pending in [false, true] {
+            // Shown after the error: it counts, and the later exchange has a matched answer.
+            assert_eq!(
+                run(error, device(0, 3_000), pending),
+                (Some(Classification::Vehicle), 1, 1),
+                "pending {pending}"
+            );
+            // Shown before it, on another clock, on another epoch, with no time, or the error
+            // not placed: answered only, and no matched answer.
+            for (error, answered_at) in [
+                (error, device(0, 1_500)),
+                (error, device(0, 2_000)),
+                (error, Some(placed_at(Clock::Worker, 0, 3_000))),
+                (error, device(1, 3_000)),
+                (error, None),
+                (None, device(0, 3_000)),
+            ] {
+                assert_eq!(
+                    run(error, answered_at, pending),
+                    (None, 1, 0),
+                    "pending {pending} {error:?} {answered_at:?}"
+                );
+            }
+        }
+        // An error read when exchanges 1 and 2 are known may come after either one's answer, so
+        // neither counts one with no time since it, though the error falls after exchange 1
+        // (ADR-384); an exchange logged after the error was read does. An error not placed does
+        // not apply to an exchange logged after it either.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, silent.clone());
+        log_kept(&mut state, 2, silent.clone());
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, error);
+        assert!(!state.since_late_error(2, AnswerTime::None));
+        assert!(!state.since_late_error(1, AnswerTime::None));
+        assert!(state.since_late_error(3, AnswerTime::None));
+        assert!(state.since_late_error(2, device(0, 9_000).into()));
+        let mut state = LinkState::default();
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, None);
+        assert!(!state.since_late_error(2, device(0, 9_000).into()));
+        assert!(state.since_late_error(3, AnswerTime::None));
+    }
+
+    /// ADR-384: a late link error that falls before the window's exchanges ends the matched
+    /// answers from before it: every window exchange is after it, counts again from the window
+    /// alone and is reclassified, so one that rested on an answer of an exchange that has left
+    /// the window loses it.
+    #[test]
+    fn a_link_error_before_the_window_reclassifies_the_windows_exchanges() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut answered = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 0x41]),
+        )));
+        answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut other = judged(forwarding(evidence(
+            &[0x22, 0xF1, 0x87],
+            End::Positive(vec![0x62, 0xF1, 0x87, 0x41]),
+        )));
+        other.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, answered);
+        let (rests, _) = log_kept(&mut state, 2, silent);
+        assert_eq!(rests.classification, Classification::Vehicle);
+        // Fill the window so that the first exchange leaves it.
+        for seq in 3..=u64::try_from(WINDOW).unwrap() + 1 {
+            log_kept(&mut state, seq, other.clone());
+        }
+        assert_eq!(state.left_window, Some(1));
+        let (changed, not_reclassified) = state.error_after(None, 99, LinkErrorKind::Receive, None);
+        let [reclassified] = &changed[..] else {
+            panic!("{changed:?}");
+        };
+        assert_eq!(reclassified.seq, 2);
+        assert_eq!(reclassified.classification, Classification::Undetermined);
+        // What left the window is named: it cannot be told whether it is after the error.
+        assert_eq!(not_reclassified, Some(1));
+        // The counts start again from the window alone: the answers of its other exchanges.
+        assert_eq!(state.answered_since_error, 15);
+    }
+
+    /// ADR-384: an error placed after an earlier exchange (one with no time on the clock at its
+    /// entry is taken as after the error) does not make the late answer of that exchange count
+    /// since the error when the answer is shown at or before the error on the error's clock and
+    /// epoch; an answer that cannot be set against it keeps the rule by position.
+    #[test]
+    fn a_late_answer_shown_before_an_error_placed_before_its_exchange_is_answered_only() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut answered = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 0x41]),
+        )));
+        answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let device = |unwrapped| Some(placed_at(Clock::Device, 0, unwrapped));
+        // Exchange 1 has times, exchange 2 is owed and has none, exchange 3 is silent with the
+        // same match and transmits late. The error at 5 000 falls after exchange 1.
+        let run = |error_at: i64, answered_at: Option<(Clock, super::super::clocks::Placed)>| {
+            let mut state = LinkState::default();
+            log_kept(
+                &mut state,
+                1,
+                timed(answered.clone(), Some(1_000), Some(1_200)),
+            );
+            let (_, kept) = log_kept(&mut state, 2, silent.clone());
+            state.keep(2, kept);
+            log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+            let at = placed_at(Clock::Device, 0, error_at);
+            let point = state.place_error(at);
+            let after = match point {
+                ErrorPoint::After(seq) | ErrorPoint::Within(seq) => Some(seq),
+                ErrorPoint::BeforeWindow { .. } => None,
+                other => panic!("{other:?}"),
+            };
+            state.error_after(after, 4, LinkErrorKind::Receive, Some(at));
+            let kept = state.kept(2).unwrap().clone();
+            let mut settled = SettledAnswer {
+                seq: 2,
+                key: MatchKey::of(&silent),
+                newly_answered: true,
+                newly_matched: true,
+                final_response: true,
+                clears: kept.clears,
+                since_error: true,
+            };
+            settled.set_since_error(state.since_late_error(2, answered_at.into()));
+            let (changed, _) = state.reclassify_after(&settled);
+            let later = changed
+                .iter()
+                .find(|later| later.seq == 3)
+                .map(|later| later.classification);
+            (point, later, state.answered_since_error)
+        };
+        // Placed after exchange 1: exchange 2's answer at 4 000 is before the error.
+        let (point, later, since) = run(5_000, device(4_000));
+        assert_eq!(point, ErrorPoint::After(1));
+        assert_eq!((later, since), (None, 0));
+        // After the error: it counts.
+        let (_, later, since) = run(5_000, device(5_500));
+        assert_eq!((later, since), (Some(Classification::Vehicle), 1));
+        // Not set against it: its exchange was known when the error was read, and nothing shows
+        // its answer came after (its position alone, taken as after, does not).
+        let (_, later, since) = run(5_000, None);
+        assert_eq!((later, since), (None, 0));
+        // Before the window: the untimed exchange in the window after the error is the same.
+        let (point, later, since) = run(500, device(400));
+        assert_eq!(point, ErrorPoint::BeforeWindow { within: None });
+        // (exchange 1's own answer counts since the error either way)
+        assert_eq!((later, since), (None, 1));
+        let (_, _, since) = run(500, device(600));
+        assert_eq!(since, 2);
+    }
+
+    /// ADR-384: an error is shown to fall within an exchange that has only end-side times only
+    /// when every exchange before it is still known to the link state. With one gone from the
+    /// window the error is placed as before: after an earlier exchange shown to start before it,
+    /// else before the window. An end-side exchange kept beyond the window holds none.
+    #[test]
+    fn an_end_side_exchange_holds_an_error_only_while_the_exchanges_before_it_are_known() {
+        let answered = || {
+            forwarding(evidence(
+                &READ_F186,
+                End::Positive(vec![0x62, 0xF1, 0x86, 0x41]),
+            ))
+        };
+        let at = |unwrapped| placed_at(Clock::Device, 0, unwrapped);
+        // The window front has only an end, and the exchange before it has left the window.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, timed(answered(), Some(1_000), Some(1_200)));
+        log_kept(&mut state, 2, timed(answered(), None, Some(5_000)));
+        for seq in 3..=u64::try_from(WINDOW).unwrap() + 1 {
+            let us = 10_000 * i64::try_from(seq).unwrap();
+            log_kept(&mut state, seq, timed(answered(), Some(us), Some(us + 200)));
+        }
+        assert_eq!(state.left_window, Some(1));
+        assert_eq!(state.window.front().map(|logged| logged.seq), Some(2));
+        assert_eq!(
+            state.place_error(at(4_000)),
+            ErrorPoint::BeforeWindow { within: None }
+        );
+        // After its latest time it is after it, as ever; at that time too, since its answer is
+        // not shown before the error then either.
+        assert_eq!(state.place_error(at(5_100)), ErrorPoint::After(2));
+        assert_eq!(state.place_error(at(5_000)), ErrorPoint::After(2));
+        // Owed and kept beyond the window, with only an end: no exchange holds the error.
+        let mut owed = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        owed.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(owed, None, Some(2_000)));
+        state.keep(1, kept);
+        for seq in 2..=u64::try_from(WINDOW).unwrap() + 1 {
+            let us = 10_000 * i64::try_from(seq).unwrap();
+            log_kept(&mut state, seq, timed(answered(), Some(us), Some(us + 200)));
+        }
+        assert_eq!(
+            state.place_error(at(1_500)),
+            ErrorPoint::BeforeWindow { within: None }
+        );
+    }
+
+    /// ADR-384: a late answer counted as answered only is not counted again as one since an error
+    /// by a later recount of the answers since an error.
+    /// An answer counted as an answer alone stays out of the matched answers when its exchange's
+    /// owners are freed later: here an earlier owner's final response, also shown before the
+    /// error, leaves the answer to exchange 2 alone (ADR-384).
+    #[test]
+    fn an_answered_only_answer_freed_later_is_still_no_matched_answer() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let response: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let mut state = LinkState::default();
+        let (_, first) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, first);
+        let (_, second) = log_kept(&mut state, 2, silent.clone());
+        state.keep(2, second);
+        let (later, _) = log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+        let error = placed_at(Clock::Device, 0, 5_000);
+        assert_eq!(state.place_error(error), ErrorPoint::After(1));
+        state.error_after(Some(1), 4, LinkErrorKind::Receive, Some(error));
+        let settle = |state: &mut LinkState, seq: u64, at: i64| {
+            let kept = state.kept(seq).unwrap().clone();
+            state.settle_owed(seq);
+            let answered = kept.answered(response);
+            let history = state.history_settling(&answered, seq);
+            let entry = ExchangeEntry::build(seq, answered.clone(), history);
+            state.settled(seq, entry.classification, &entry.reason, answered, true);
+            let mut answer = entry.settled_answer(&kept);
+            let since = state.since_late_error(seq, Some(placed_at(Clock::Device, 0, at)).into());
+            assert!(!since, "{seq}");
+            answer.set_since_error(since);
+            state.reclassify_after(&answer);
+        };
+        settle(&mut state, 2, 4_000);
+        settle(&mut state, 1, 4_500);
+        assert_eq!(state.window[2].history.answered_same_match, 0);
+        assert_eq!(state.window[2].classification, later.classification);
+        assert_ne!(state.window[2].classification, Classification::Vehicle);
+    }
+
+    #[test]
+    fn a_recount_after_an_error_keeps_an_answer_counted_as_answered_only_out() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, kept);
+        log_kept(&mut state, 2, timed(silent.clone(), Some(5_000), None));
+        let first = placed_at(Clock::Device, 0, 3_000);
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, Some(first));
+        // The first exchange's answer at 2 500 is before the error: answered only.
+        let kept = state.kept(1).unwrap().clone();
+        let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
+        let history = state.history_settling(&answered, 1);
+        let entry = ExchangeEntry::build(1, answered.clone(), history);
+        let mut settled = entry.settled_answer(&kept);
+        settled.set_since_error(
+            state.since_late_error(1, Some(placed_at(Clock::Device, 0, 2_500)).into()),
+        );
+        state.settled(1, entry.classification, &entry.reason, answered, true);
+        state.reclassify_after(&settled);
+        assert_eq!(state.answered_since_error, 0);
+        // An error before the window recounts from the window: the answer is still not one.
+        state.error_after(
+            None,
+            4,
+            LinkErrorKind::Receive,
+            Some(placed_at(Clock::Device, 0, 500)),
+        );
+        assert_eq!(state.answered_since_error, 0);
+        assert_eq!(state.window[1].history.answered_since_error, 0);
+    }
+
+    /// ADR-384: the item that answers an owed exchange gives its answer's time: the final
+    /// response, else the latest pending (the settling entry's own, then those read late, then
+    /// the entry's), and a start only when there is no pending; a pending with no placed time is
+    /// unknown, and no other item's time stands in for it.
+    #[test]
+    fn the_answer_time_is_that_of_the_item_that_answers() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, mut kept) = log_kept(&mut state, 1, silent);
+        let at = |us| Some(placed_at(Clock::Device, 0, us));
+        let time = |us| {
+            let (clock, placed) = placed_at(Clock::Device, 0, us);
+            AnswerTime::At(clock, placed)
+        };
+        // Nothing answers.
+        assert_eq!(kept.answer_time(None, &[], None), (AnswerTime::None, false));
+        // A start alone answers by its own time, which is new.
+        assert_eq!(kept.answer_time(None, &[], Some(at(30))), (time(30), true));
+        assert_eq!(
+            kept.answer_time(None, &[], Some(None)),
+            (AnswerTime::Unknown, true)
+        );
+        // The entry's pending, then a late one, then one the settling entry adds, then the final
+        // response, each over the one before it and over a start.
+        kept.pendings = vec![at(10)];
+        assert_eq!(kept.answer_time(None, &[], Some(at(30))), (time(10), false));
+        kept.late_pendings = vec![(at(20), LatePending::Open)];
+        assert_eq!(kept.answer_time(None, &[], Some(at(30))), (time(20), false));
+        assert_eq!(
+            kept.answer_time(None, &[at(25), at(26)], Some(at(30))),
+            (time(26), true)
+        );
+        assert_eq!(
+            kept.answer_time(Some(at(40)), &[at(25)], None),
+            (time(40), true)
+        );
+        // A pending with no placed time is unknown, whatever else the exchange has.
+        kept.late_pendings = vec![(None, LatePending::Open)];
+        assert_eq!(
+            kept.answer_time(None, &[], Some(at(30))),
+            (AnswerTime::Unknown, false)
+        );
+        assert_eq!(
+            kept.answer_time(Some(None), &[at(25)], None),
+            (AnswerTime::Unknown, true)
+        );
+    }
+
+    /// ADR-384: once a settling entry counted an owed exchange's answer as answered only, no
+    /// later settling path offers it as one since the error or as a matched answer again, however
+    /// it reads the answer's time; only an answering item the path adds, shown after the error,
+    /// counts.
+    /// The exchange a late link error falls after answered before it: when its answer is freed
+    /// later, by its owner's final response after the error, it counts for no exchange after
+    /// the error (ADR-384).
+    #[test]
+    fn an_answer_freed_after_an_error_placed_after_its_exchange_counts_before_it() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let response = vec![0x62, 0xF1, 0x86, 0x41];
+        let mut answered = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(response.clone()),
+        )));
+        answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, kept);
+        let (answer, _) = log_kept(&mut state, 2, timed(answered, Some(2_000), Some(2_200)));
+        assert!(!answer.matched_answer());
+        log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+        let at = placed_at(Clock::Device, 0, 5_000);
+        assert_eq!(state.place_error(at), ErrorPoint::After(2));
+        state.error_after(Some(2), 4, LinkErrorKind::Receive, Some(at));
+        let kept = state.kept(1).unwrap().clone();
+        state.settle_owed(1);
+        let late = kept.answered(&response);
+        let history = state.history_settling(&late, 1);
+        let entry = ExchangeEntry::build(1, late.clone(), history);
+        let mut settled = entry.settled_answer(&kept);
+        let (clock, placed) = placed_at(Clock::Device, 0, 7_000);
+        state.judge_answer(&mut settled, &kept, (AnswerTime::At(clock, placed), true));
+        state.settled(1, entry.classification, &entry.reason, late, true);
+        state.reclassify_after(&settled);
+        assert_eq!(window_history(&state, 3).answered_same_match, 0);
+        let third = state.window.iter().find(|logged| logged.seq == 3).unwrap();
+        assert_ne!(third.classification, Classification::Vehicle);
+    }
+
+    /// A settling entry that adds no answer marks nothing as counted alone (ADR-384).
+    #[test]
+    fn a_settlement_with_no_answer_marks_nothing_answered_only() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, silent.clone());
+        state.keep(1, kept);
+        log_kept(&mut state, 2, silent);
+        let at = placed_at(Clock::Device, 0, 5_000);
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, Some(at));
+        let kept = state.kept(1).unwrap().clone();
+        let history = state.history_settling(&kept.evidence, 1);
+        let entry = ExchangeEntry::build(1, kept.evidence.clone(), history);
+        let mut settled = entry.settled_answer(&kept);
+        let time = kept.answer_time(None, &[], None);
+        assert!(matches!(time.0, AnswerTime::None));
+        state.judge_answer(&mut settled, &kept, time);
+        state.reclassify_after(&settled);
+        assert!(!state.kept(1).unwrap().answered_only);
+    }
+
+    #[test]
+    fn an_answered_only_answer_is_not_offered_again_by_a_later_settling_path() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let at = |us| {
+            let (clock, placed) = placed_at(Clock::Device, 0, us);
+            AnswerTime::At(clock, placed)
+        };
+        // (path, time of the answering item, whether the path adds it, whether it counts)
+        let table = [
+            (
+                "an indication re-offers the pending: unknown",
+                AnswerTime::Unknown,
+                false,
+                false,
+            ),
+            (
+                "an indication re-offers the pending: before",
+                at(4_000),
+                false,
+                false,
+            ),
+            (
+                "an indication re-offers the pending: after",
+                at(6_000),
+                false,
+                false,
+            ),
+            (
+                "job end with only kept pendings",
+                AnswerTime::None,
+                false,
+                false,
+            ),
+            ("a new pending before the error", at(4_500), true, false),
+            (
+                "a new item with no placed time",
+                AnswerTime::Unknown,
+                true,
+                false,
+            ),
+            ("a new response after the error", at(6_000), true, true),
+        ];
+        for (path, time, new, counts) in table {
+            let mut state = LinkState::default();
+            let (_, kept) = log_kept(&mut state, 1, silent.clone());
+            state.keep(1, kept);
+            let (later, _) = log_kept(&mut state, 2, silent.clone());
+            assert_eq!(later.classification, Classification::Undetermined);
+            state.error_after(
+                Some(1),
+                3,
+                LinkErrorKind::Receive,
+                Some(placed_at(Clock::Device, 0, 5_000)),
+            );
+            let offer = |state: &mut LinkState, time: AnswerTime, new: bool| {
+                let kept = state.kept(1).unwrap().clone();
+                let mut answer = SettledAnswer {
+                    seq: 1,
+                    key: MatchKey::of(&silent),
+                    newly_answered: true,
+                    newly_matched: !kept.matched,
+                    final_response: true,
+                    clears: kept.clears,
+                    since_error: true,
+                };
+                state.judge_answer(&mut answer, &kept, (time, new));
+                let since = answer.since_error;
+                let (changed, _) = state.reclassify_after(&answer);
+                (since, changed.iter().any(|later| later.seq == 2))
+            };
+            // The first decision: a pending shown before the error is answered only.
+            assert_eq!(offer(&mut state, at(4_000), true), (false, false));
+            assert!(state.kept(1).unwrap().answered_only);
+            assert_eq!(state.answered_since_error, 0);
+            // The path under test.
+            let (since, reclassified) = offer(&mut state, time, new);
+            assert_eq!((since, reclassified), (counts, counts), "{path}");
+            assert_eq!(state.answered_since_error, u32::from(counts), "{path}");
+        }
+    }
+
     /// Design 8.11 "Settlement": a final response a settling entry adds to an earlier exchange
     /// ends it as an owed request for the later exchanges in the window, and a matched answer
     /// it adds counts for those with the same match unless a link error came between them; each
@@ -4281,6 +5131,7 @@ mod tests {
             newly_matched: true,
             final_response: true,
             clears: kept.clears,
+            since_error: true,
         };
         let mut state = LinkState::default();
         let (_, kept) = log_kept(&mut state, 1, silent.clone());
@@ -5022,6 +5873,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            answered_only: false,
             late_pendings: Vec::new(),
             floor: None,
             clears: Clears::default(),
@@ -5124,6 +5976,7 @@ mod tests {
                 limits: None,
                 start_unattached: false,
                 late_start: None,
+                answered_only: false,
                 late_pendings: Vec::new(),
                 floor: None,
                 clears: Clears::default(),

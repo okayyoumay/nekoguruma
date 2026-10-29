@@ -2234,7 +2234,7 @@ impl CommLog {
                         }
                     }
                     if !owners.is_empty() {
-                        inner.late_item_unowned(at, &owners, item, placed, unattached)?;
+                        inner.late_item_unowned(at, &owners, kind, item, placed, unattached)?;
                     }
                 }
             }
@@ -2259,6 +2259,7 @@ impl CommLog {
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             late_start: None,
+            answered_only: false,
             late_pendings: Vec::new(),
             floor: None,
             clears,
@@ -2441,6 +2442,7 @@ impl CommLog {
             evidence.end = exchange::End::ResponseIncomplete;
         }
         // The pendings, read before the end, are placed first, after the kept ones.
+        let kept_pendings = kept.pendings.len();
         let mut pendings = kept.pendings.clone();
         let mut placed_all: Vec<Option<clocks::Placed>> = kept
             .pendings
@@ -2632,6 +2634,19 @@ impl CommLog {
         if error_with_end.is_some() {
             answer.no_matched_answer();
         }
+        // Its answer counts since the last link error only where no late link error read
+        // after its entry may have come after it (ADR-384), by the time of the item that
+        // answers it: the response's end, else the latest pending, then a start.
+        let answer_time = kept.answer_time(
+            times
+                .and_then(|times| times.rx_end)
+                .map(|time| time.placed()),
+            &pendings[kept_pendings..],
+            times
+                .and_then(|times| times.rx_start)
+                .map(|time| time.placed()),
+        );
+        state.judge_answer(&mut answer, &kept, answer_time);
         let restart = entry.late_restart();
         let (later, not_reclassified) = settle_later(state, seq, restart, &answer);
         let refers_to = std::iter::once(seq)
@@ -3082,7 +3097,9 @@ impl Inner {
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
-        let answer = entry.settled_answer(&kept);
+        let mut answer = entry.settled_answer(&kept);
+        let answer_time = kept.answer_time(Some(time), &[], None);
+        state.judge_answer(&mut answer, &kept, answer_time);
         let restart = entry.late_restart();
         state.settled(owner, classification, &reason, answered_evidence, true);
         let (later, not_reclassified) = settle_later(state, owner, restart, &answer);
@@ -3412,7 +3429,17 @@ impl Inner {
                 state.raise(owner, verdict, &reason, exchange::LATE_PENDING_FLOOR);
             }
         }
-        let answer = entry.settled_answer(&kept);
+        let mut answer = entry.settled_answer(&kept);
+        // The answer's time is that of the item that answers (ADR-384): this pending, or the
+        // exchange's latest, for a transmit or start indication, which answers nothing
+        // (ADR-354); a start's own time decides only an answer that is a start alone.
+        let own = item.clock.zip(placed);
+        let answer_time = match kind {
+            LateIndication::Pending => kept.answer_time(None, &[own], None),
+            LateIndication::Transmit(_) => kept.answer_time(None, &[], None),
+            LateIndication::Start => kept.answer_time(None, &[], Some(own)),
+        };
+        state.judge_answer(&mut answer, &kept, answer_time);
         let (later, not_reclassified) = settle_later(state, owner, None, &answer);
         let top = later
             .iter()
@@ -3520,8 +3547,7 @@ impl Inner {
         let mut not_reclassified: Option<u64> = None;
         let at = item.clock.zip(placed);
         let mut text = String::new();
-        // On each target's link state, the exchanges it came during and the one whose answer it
-        // came after (`None` before the window).
+        let mut maybe_within: Vec<u64> = Vec::new();
         // Placed when an exchange on some target's link state has a time on its clock and
         // epoch.
         let at = at.filter(|at| {
@@ -3532,21 +3558,35 @@ impl Inner {
         let owner = item
             .owner
             .filter(|owner| self.links.iter().any(|(_, state)| state.holds(*owner)));
-        let points: Vec<(Vec<u64>, Option<u64>)> = self
+        // Each target's exchanges the error came during, the one it came after (`None` before the
+        // window), and whether the error is placed against that target's exchanges.
+        let points: Vec<(Vec<u64>, Option<u64>, bool)> = self
             .links
             .iter()
             .map(|(_, state)| match at.map(|at| state.place_error(at)) {
                 _ if owner.is_some_and(|owner| state.holds(owner)) => {
                     let owner = owner.unwrap_or_default();
-                    (vec![owner], Some(owner))
+                    (
+                        vec![owner],
+                        Some(owner),
+                        at.is_some_and(|at| {
+                            state.place_error(at) != exchange::ErrorPoint::NotPlaced
+                        }),
+                    )
                 }
-                Some(exchange::ErrorPoint::Within(seq)) => (vec![seq], Some(seq)),
-                Some(exchange::ErrorPoint::After(seq)) => (Vec::new(), Some(seq)),
+                Some(exchange::ErrorPoint::Within(seq)) => (vec![seq], Some(seq), true),
+                // It may have come during the exchange (ADR-384): the exchange takes it as H3
+                // evidence only, and counts restart as for one within.
+                Some(exchange::ErrorPoint::MaybeWithin(seq)) => {
+                    maybe_within.push(seq);
+                    (vec![seq], Some(seq), true)
+                }
+                Some(exchange::ErrorPoint::After(seq)) => (Vec::new(), Some(seq), true),
                 Some(exchange::ErrorPoint::BeforeWindow { within }) => {
-                    (within.into_iter().collect(), None)
+                    (within.into_iter().collect(), None, true)
                 }
                 // Another target's exchanges on no shared clock: after its last one.
-                Some(exchange::ErrorPoint::NotPlaced) => (Vec::new(), state.window_last()),
+                Some(exchange::ErrorPoint::NotPlaced) => (Vec::new(), state.window_last(), false),
                 None => {
                     // Before the first exchange it may have come during; with none, after the
                     // last.
@@ -3555,19 +3595,26 @@ impl Inner {
                         Some(first) => Some(first - 1),
                         None => state.window_last(),
                     };
-                    (owners, after)
+                    (owners, after, false)
                 }
             })
             .collect();
-        if at.is_none() && points.iter().all(|(owners, _)| owners.is_empty()) {
+        if at.is_none() && points.iter().all(|(owners, _, _)| owners.is_empty()) {
             return Some(false);
         }
-        for ((_, state), (owners, after)) in self.links.iter_mut().zip(points) {
+        for ((_, state), (owners, after, comparable)) in self.links.iter_mut().zip(points) {
+            // Before the window, the exchanges that left it after the one the error came during
+            // are the ones not reclassified; with none known, any that left may be.
+            let within = owners.iter().max().copied();
             for during_seq in owners {
                 let own = owner == Some(during_seq);
-                during.extend(state.error_in(during_seq, kind, item.link, at.is_some() || own));
+                let certain = (at.is_some() && !maybe_within.contains(&during_seq)) || own;
+                during.extend(state.error_in(during_seq, kind, item.link, certain));
             }
-            let (changed, through) = state.error_after(after, written, kind);
+            let time = at.filter(|_| comparable);
+            let (changed, through) = state.error_after(after, written, kind, time);
+            let through = through
+                .filter(|left| after.is_some() || within.is_none_or(|within| *left > within));
             later.extend(changed);
             not_reclassified = not_reclassified.max(through);
         }
@@ -3607,6 +3654,10 @@ impl Inner {
             (Some(_), []) => {
                 "A link error was read after the exchanges before it had ended; its time falls between exchanges, so it ends the matched answers from before it.".to_owned()
             }
+            (Some(_), _) if !maybe_within.is_empty() => format!(
+                "A link error was read after the exchange logged as {} had ended; the exchange has no placed start, so the error came during it or between it and the exchange before: it may have come during it (H3), and the exchange's answer does not count as one since the error.",
+                owned.join(", ")
+            ),
             (Some(_), _) => format!(
                 "A link error was read after the exchange logged as {} had ended; its time falls within that exchange.",
                 owned.join(", ")
@@ -3648,6 +3699,7 @@ impl Inner {
         &mut self,
         at: usize,
         owners: &[u64],
+        kind: LateIndication,
         item: &UnattachedItem,
         placed: Option<clocks::Placed>,
         unattached: u64,
@@ -3655,13 +3707,37 @@ impl Inner {
         let state = &mut self.links[at].1;
         let mut exchanges = Vec::new();
         for owner in owners {
-            let Some(kept) = state.kept(*owner).cloned() else {
+            let Some(mut kept) = state.kept(*owner).cloned() else {
                 continue;
             };
+            // A start that this exchange or another could own, not shown before the start the
+            // exchange kept, may be its response's start instead: a kept start that showed the
+            // response began in time no longer does, and a response that completes it is judged
+            // by its own window. A start that showed it began late stands under both readings
+            // (ADR-384).
+            let start_forgotten = kind == LateIndication::Start
+                && matches!(kept.late_start, Some(exchange::LateStart::InTime { .. }))
+                && !before_starts(
+                    &kept
+                        .evidence
+                        .times
+                        .vci
+                        .and_then(|vci| vci.rx_start)
+                        .and_then(|start| start.placed())
+                        .into_iter()
+                        .collect::<Vec<_>>(),
+                    item.clock,
+                    placed,
+                );
+            if start_forgotten {
+                state.forget_late_start(*owner);
+                kept.late_start = None;
+            }
             // One already raised for an ambiguous item, and no lower now, gains nothing: an
             // exchange ended with its send unknown would otherwise be named after every later
             // exchange.
-            if kept.classification >= exchange::Classification::Undetermined
+            if !start_forgotten
+                && kept.classification >= exchange::Classification::Undetermined
                 && state
                     .floor_of(*owner)
                     .is_some_and(|(floor, _)| floor >= exchange::Classification::Undetermined)
@@ -3671,7 +3747,16 @@ impl Inner {
             let classification = kept
                 .classification
                 .max(exchange::Classification::Undetermined);
-            let reason = if classification == kept.classification {
+            let reason = if start_forgotten {
+                format!(
+                    "An indication was read after the exchange ended that it or another exchange could own; it may be this exchange's response start, so the start the exchange kept no longer shows when the response began, and the exchange stays at least undetermined.{}",
+                    if classification == kept.classification {
+                        ""
+                    } else {
+                        " What it shows of this exchange is not decided."
+                    }
+                )
+            } else if classification == kept.classification {
                 "An indication was read after the exchange ended that it or another exchange could own; the exchange keeps its classification, which is at least undetermined.".to_owned()
             } else {
                 "An indication was read after the exchange ended that it or another exchange could own, so what it shows of this exchange is not decided: undetermined.".to_owned()
@@ -7313,8 +7398,9 @@ mod tests {
     }
 
     /// ADR-372: a late link error within an owed exchange that has left the window settles it
-    /// from what the log keeps of it, and reclassifies none of the window's exchanges, which it
-    /// names as not reclassified.
+    /// from what the log keeps of it. The window's exchanges are all after it and are
+    /// reclassified from the window alone (ADR-384); none that left the window is after the
+    /// exchange it came during, so none is named as not reclassified.
     #[test]
     fn a_late_link_error_settles_a_kept_exchange_beyond_the_window() {
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
@@ -7406,11 +7492,1026 @@ mod tests {
             late["exchanges"][0]["classification"], "undetermined",
             "{late}"
         );
-        assert_eq!(
-            late["not_reclassified_through"],
-            logged[logged.len() - 2]["seq"],
+        assert!(late.get("not_reclassified_through").is_none(), "{late}");
+    }
+
+    /// The classification the latest entry that refers to the exchange logged as `seq` gives it.
+    fn standing(lines: &[serde_json::Value], seq: &serde_json::Value) -> serde_json::Value {
+        lines
+            .iter()
+            .rev()
+            .find_map(|line| {
+                if line["event"] == "exchange" {
+                    return (line["seq"] == *seq).then(|| line["classification"].clone());
+                }
+                line["exchanges"]
+                    .as_array()?
+                    .iter()
+                    .find(|settled| settled["seq"] == *seq)
+                    .map(|settled| settled["classification"].clone())
+            })
+            .unwrap_or_default()
+    }
+
+    /// ADR-384: an exchange with a placed time but no placed start (a single-frame response with
+    /// no transmit indication has only its end) is after a late link error that comes after that
+    /// time; one that comes after the exchange before and not after its time may have come during
+    /// it (H3 only), or between them, so the exchange's answer is no answer since the error. An
+    /// exchange with no time on the clock is taken as after the error, as before.
+    #[test]
+    fn a_late_link_error_may_have_come_during_an_exchange_with_only_end_side_times() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        // A read answered at `end_us`, with `tx_us` its transmit done (read from an indication)
+        // or none.
+        let answered = |end_us: Option<u64>| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.times.agent.before_us = end_us.unwrap_or(2_300_000) - 200_000;
+            evidence.times.agent.end_us = end_us.unwrap_or(2_300_000) + 100_000;
+            evidence.times.vci = end_us.map(|end_us| exchange::VciTimes {
+                rx_end: Some(device(end_us)),
+                response_read_us: Some(end_us + 100),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        // The same read sent at 5 s, which the VCI ended at P2 (1 s) with no response.
+        let mut silent = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        silent.pending_visibility = exchange::PendingVisibility::Forwarded;
+        silent.vci_ended = true;
+        silent.times.agent.before_us = 5_000_000;
+        silent.times.agent.end_us = 6_001_000;
+        silent.times.vci = Some(exchange::VciTimes {
+            rx_timeout: Some(device(6_000_000)),
+            error: Some(device(6_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        let error = |vci_us: u32| UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_050),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        // An answered read with a transmit done, then the one under test, then the silent read
+        // during which the error is read late.
+        let run = |second: Option<u64>, error_us: u32| {
+            run_on_opened_link(vec![
+                (answered(Some(1_200_000)), vec![transmit(1_000_000)]),
+                (answered(second), Vec::new()),
+                (silent.clone(), vec![error(error_us), transmit(5_000_000)]),
+            ])
+        };
+        // Before the second read's answer: it may have come during it, or between it and the
+        // first read. Only H3 holds for it, and its answer is no answer since the error, so the
+        // silent read has no matched answer.
+        let lines = run(Some(2_300_000), 2_299_800);
+        let exchanges = of_event(&lines, "exchange");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(late["refers_to"][0], exchanges[1]["seq"], "{lines:?}");
+        assert!(
+            late["text"].as_str().unwrap().contains("no placed start"),
             "{late}"
         );
+        let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains("A link error also came during the exchange"),
+            "{late}"
+        );
+        assert_eq!(exchanges[2]["classification"], "undetermined", "{lines:?}");
+        assert_eq!(
+            exchanges[2]["link_history"]["answered_since_error"], 0,
+            "{lines:?}"
+        );
+        assert_eq!(
+            exchanges[2]["link_history"]["answered_same_match"], 0,
+            "{lines:?}"
+        );
+        // After its answer: it is after that exchange, whose answer the error ended.
+        let lines = run(Some(2_300_000), 2_500_000);
+        let exchanges = of_event(&lines, "exchange");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(late["refers_to"], serde_json::json!([]), "{late}");
+        assert_eq!(exchanges[2]["classification"], "undetermined", "{lines:?}");
+        assert_eq!(
+            exchanges[2]["link_history"]["answered_since_error"], 0,
+            "{lines:?}"
+        );
+        // With no time on the clock, the second read is taken as after the error, as before: its
+        // answer counts as one since it.
+        let lines = run(None, 2_299_800);
+        let exchanges = of_event(&lines, "exchange");
+        let [late] = &of_event(&lines, "late_item")[..] else {
+            panic!("{lines:?}");
+        };
+        assert_eq!(late["refers_to"], serde_json::json!([]), "{late}");
+        assert_eq!(exchanges[2]["classification"], "vehicle", "{lines:?}");
+        assert_eq!(
+            exchanges[2]["link_history"]["answered_since_error"], 1,
+            "{lines:?}"
+        );
+    }
+
+    /// ADR-384: an answer read late counts as one since a late link error read before it, and as
+    /// a matched answer for the exchanges after the error, only when its time is shown after the
+    /// error's on the same clock and epoch; otherwise it counts as answered only.
+    #[test]
+    fn a_late_answer_counts_since_a_late_link_error_only_when_shown_after_it() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                rx_timeout: Some(device(at_us + 1_000_000)),
+                error: Some(device(at_us + 1_000_000)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        // A read of another identifier, during which the items are read, with its own
+        // transmit done.
+        let other = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 300_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                rx_end: Some(device(at_us + 100_000)),
+                response_read_us: Some(at_us + 200_000),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let error = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 2_500_000,
+            clock: Some(exchange::Clock::Device),
+            read: read(4_000_500),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        let answer = |vci_us: u32, clock, bytes: Vec<u8>, read_us: u64| UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock,
+            read: read(read_us),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes,
+            },
+        };
+        let response = [0x62, 0xF1, 0x90, 0x42].to_vec();
+        let device_clock = Some(exchange::Clock::Device);
+        // The first read times out at 2 s and is owed; the error at 2.5 s falls after it; the
+        // answer is read right after the error, at the given time, during the same read. A
+        // silent read of the same match follows in the log.
+        let run = |item: UnattachedItem| {
+            run_on_opened_link(vec![
+                (silent(0x90, 1_000_000), vec![transmit(1_000_000)]),
+                (other(0x91, 4_000_000), vec![error.clone(), item]),
+                (silent(0x90, 6_000_000), vec![transmit(6_000_000)]),
+            ])
+        };
+        let run = |vci_us, clock| run(answer(vci_us, clock, response.clone(), 4_000_600));
+        // Shown after the error on its clock and epoch: it counts, and the silent read after
+        // the error has a matched answer: `vehicle`.
+        let lines = run(2_800_000, device_clock);
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(
+            standing(&lines, &exchanges[2]["seq"]),
+            "vehicle",
+            "{lines:?}"
+        );
+        // Before the error, within the clock's margin: the answer may have come before it, so
+        // it ends with it. The same on another clock.
+        for (vci_us, clock) in [
+            (2_499_800, device_clock),
+            (2_800_000, Some(exchange::Clock::Worker)),
+        ] {
+            let lines = run(vci_us, clock);
+            let exchanges = of_event(&lines, "exchange");
+            assert_eq!(
+                standing(&lines, &exchanges[2]["seq"]),
+                "undetermined",
+                "{vci_us} {clock:?} {lines:?}"
+            );
+        }
+    }
+
+    /// ADR-384: the sites that read a late answer's time. A pending a `primitive_ended` adds,
+    /// or its response's end, counts as an answer since a late link error only when shown after
+    /// it; a forwarded pending read late (a `late_item`) the same. The exchange logged after
+    /// them shows the count.
+    #[test]
+    fn a_late_answer_read_at_job_end_or_as_a_pending_counts_since_an_error_only_when_after_it() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |did: u8, at_us: u64, timeout: bool| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: (!timeout).then(|| device(at_us)),
+                rx_timeout: timeout.then(|| device(at_us + 1_000_000)),
+                error: timeout.then(|| device(at_us + 1_000_000)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let error = |vci_us: u32| UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_050),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        let pending_item = |vci_us: u32| UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_100),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x7F, 0x22, 0x78],
+            },
+        };
+        let since = |lines: &[serde_json::Value]| {
+            let exchanges = of_event(lines, "exchange");
+            exchanges.last().unwrap()["link_history"]["answered_since_error"].clone()
+        };
+        // A forwarded pending read late, for the owed first read, before the transmit done of
+        // the last read: the link error at 4 999.5 ms falls after the first read, within the
+        // margin of the clock's latest time.
+        // (the read between answers, which is no owed request the pending could belong to, and
+        // counts as one answer since the error either way)
+        let answered = |did: u8, at_us: u64| {
+            let mut evidence = silent(did, at_us, false);
+            evidence.end = exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]);
+            evidence.vci_ended = false;
+            evidence
+        };
+        let late_pending = |vci_us: u32| {
+            run_on_opened_link(vec![
+                (silent(0x90, 1_000_000, true), vec![transmit(1_000_000)]),
+                (
+                    answered(0x91, 5_000_000),
+                    vec![error(4_999_500), transmit(5_000_000)],
+                ),
+                (
+                    silent(0x92, 6_000_000, false),
+                    vec![pending_item(vci_us), transmit(6_000_000)],
+                ),
+            ])
+        };
+        assert_eq!(since(&late_pending(4_999_600)), 2);
+        assert_eq!(since(&late_pending(4_999_400)), 1);
+        // An exchange the agent stopped waiting for, ended at job end after the error: its
+        // response's end, else its pending.
+        let ended = |end: Option<exchange::End>,
+                     vci: exchange::VciTimes,
+                     pending: Vec<u32>,
+                     timed: bool| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+                Some(true),
+            )
+            .unwrap();
+            let mut waited = silent(0x90, 1_000_000, false);
+            waited.vci_ended = false;
+            waited.end = exchange::End::VciDidNotEnd;
+            let mut items = vec![transmit(1_000_000)];
+            if !timed {
+                // It has no VCI time at its entry, so a link error read late is placed after
+                // the read before it, which has times.
+                log.exchange_with(answered(0x93, 500_000), vec![transmit(500_000)])
+                    .unwrap();
+                waited.times.vci = None;
+                items.clear();
+            }
+            let seq = log.exchange_with(waited, items).unwrap();
+            log.exchange_with(
+                silent(0x91, 5_000_000, false),
+                vec![error(4_999_500), transmit(5_000_000)],
+            )
+            .unwrap();
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    tx_indication: None,
+                    end,
+                    detail: exchange::Detail::default(),
+                    pending: pending
+                        .into_iter()
+                        .map(|us| exchange::Pending {
+                            vci_us: Some(u64::from(us)),
+                            clock: Some(exchange::Clock::Device),
+                            epoch: None,
+                            agent_us: 0,
+                            since_previous_ms: None,
+                        })
+                        .collect(),
+                    vci,
+                    vci_ended: false,
+                    link_errors: Vec::new(),
+                    indications: Vec::new(),
+                },
+            )
+            .unwrap();
+            log.exchange_with(silent(0x92, 6_000_000, false), vec![transmit(6_000_000)])
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            lines
+        };
+        let response = |end_us: u64| {
+            (
+                Some(exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41])),
+                exchange::VciTimes {
+                    rx_end: Some(device(end_us)),
+                    ..exchange::VciTimes::default()
+                },
+                Vec::new(),
+            )
+        };
+        for (end_us, counted) in [(4_999_900, 1), (4_999_400, 0)] {
+            let (end, vci, pending) = response(end_us);
+            assert_eq!(
+                since(&ended(end.clone(), vci, pending.clone(), true)),
+                counted,
+                "end {end_us}"
+            );
+            assert_eq!(
+                since(&ended(end, vci, pending, false)),
+                counted,
+                "untimed, end {end_us}"
+            );
+        }
+        // A pending only: the answer's time is the pending's.
+        for (pending_us, counted) in [(4_999_900, 1), (4_999_400, 0)] {
+            let lines = ended(
+                Some(exchange::End::NoResponse),
+                exchange::VciTimes::default(),
+                vec![pending_us],
+                true,
+            );
+            assert_eq!(since(&lines), counted, "pending {pending_us}");
+        }
+        // A start after the error beside a pending before it: a start answers nothing, so the
+        // pending's time is the answer's, and the answer is not one since the error.
+        let lines = ended(
+            Some(exchange::End::NoResponse),
+            exchange::VciTimes {
+                rx_start: Some(device(4_999_900)),
+                ..exchange::VciTimes::default()
+            },
+            vec![4_999_400],
+            true,
+        );
+        assert_eq!(since(&lines), 0, "start after the error, pending before it");
+    }
+
+    /// ADR-384: an ambiguous later start leaves a kept record that the ECU started late standing,
+    /// since that holds under both readings of the start; a completing late response settles
+    /// the exchange as it would without the ambiguous start.
+    #[test]
+    fn an_ambiguous_later_start_leaves_a_kept_late_start_standing() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence
+        };
+        let own_transmit = |did: u8, at_us: u64| {
+            let mut evidence = silent(did, at_us);
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let start = |vci_us: u32, read_us: u64| UnattachedItem {
+            vci_us,
+            read: read(read_us),
+            ..start_of_message(0x7E8)
+        };
+        let response = UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            owner: None,
+            vci_us: 6_000_000,
+            clock: Some(exchange::Clock::Device),
+            read: read(6_010_500),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: [0x62, 0xF1, 0x90].into_iter().chain([0x41; 9]).collect(),
+            },
+        };
+        // The VCI ended its wait at the limit (1 s) or its end is not shown; the first start,
+        // at 1.5 s, comes after the limit plus the margin.
+        let mut at_limit = silent(0x90, 10_000);
+        at_limit.times.vci = Some(exchange::VciTimes {
+            rx_timeout: Some(device(1_010_000)),
+            error: Some(device(1_010_000)),
+            ..exchange::VciTimes::default()
+        });
+        for owed in [at_limit, silent(0x90, 10_000)] {
+            let run = |later: Option<UnattachedItem>| {
+                let lines = run_on_opened_link(vec![
+                    (owed.clone(), vec![transmit(10_000)]),
+                    (
+                        own_transmit(0x91, 3_010_000),
+                        vec![start(1_500_000, 3_010_500)],
+                    ),
+                    (own_transmit(0x93, 4_010_000), later.into_iter().collect()),
+                    (own_transmit(0x92, 6_010_000), vec![response.clone()]),
+                ]);
+                let [completed] = &of_event(&lines, "late_response")[..] else {
+                    panic!("{lines:?}");
+                };
+                (
+                    completed["exchanges"][0]["classification"].clone(),
+                    completed["exchanges"][0]["reason"].clone(),
+                )
+            };
+            let without = run(None);
+            // Ambiguous with the read in flight, which has its own transmit done before it.
+            let with = run(Some(start(4_100_000, 4_110_500)));
+            assert_eq!(without, with);
+            assert_ne!(with.0, "system");
+        }
+    }
+
+    /// ADR-384: a late pending shown before a late link error, then a start-of-message for the
+    /// same owed exchange shown after it: the start answers nothing, so the answer's time is the
+    /// pending's, and the pending is no matched answer since the error.
+    #[test]
+    fn a_late_start_after_an_error_does_not_make_an_earlier_pending_count_since_it() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let read_of = |did: u8, at_us: u64, timeout: bool| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: (!timeout).then(|| device(at_us)),
+                rx_timeout: timeout.then(|| device(at_us + 1_000_000)),
+                error: timeout.then(|| device(at_us + 1_000_000)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let mut answered = read_of(0x91, 5_000_000, false);
+        answered.end = exchange::End::Positive(vec![0x62, 0xF1, 0x91, 0x41]);
+        answered.vci_ended = false;
+        let error = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 4_999_500,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_050),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        let pending = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 4_999_400,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_100),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x7F, 0x22, 0x78],
+            },
+        };
+        let start = |vci_us: u32| UnattachedItem {
+            vci_us,
+            read: read(5_000_150),
+            ..start_of_message(0x7E8)
+        };
+        // The owed first read, an answered one during which the error is read, one during which
+        // the pending and the start are read, and a read of the first one's match after them.
+        let run = |start_us: u32| {
+            run_on_opened_link(vec![
+                (read_of(0x90, 1_000_000, true), vec![transmit(1_000_000)]),
+                (answered.clone(), vec![error.clone(), transmit(5_000_000)]),
+                (
+                    read_of(0x92, 6_000_000, false),
+                    vec![pending.clone(), start(start_us), transmit(6_000_000)],
+                ),
+                (read_of(0x90, 8_000_000, false), vec![transmit(8_000_000)]),
+            ])
+        };
+        let lines = run(4_999_600);
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(
+            exchanges[3]["link_history"]["answered_same_match"], 0,
+            "{lines:?}"
+        );
+    }
+
+    /// ADR-384: an exchange the agent stopped waiting for has no VCI time at its entry, so a late
+    /// link error is placed after the read before it. A pending read late for it before the
+    /// error, or a start alone shown before the error, counts as answered only: neither a later
+    /// `primitive_ended` without an answer time of its own, nor the next exchange, takes it as
+    /// an answer since the error.
+    #[test]
+    fn a_late_pending_or_start_before_an_error_stays_answered_only_for_an_untimed_exchange() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let read_of = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let answered = |did: u8, at_us: u64| {
+            let mut evidence = read_of(did, at_us);
+            evidence.end = exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]);
+            evidence.vci_ended = false;
+            evidence
+        };
+        // The owed read the agent stopped waiting for: no VCI time.
+        let mut waited = read_of(0x90, 1_000_000);
+        waited.vci_ended = false;
+        waited.end = exchange::End::VciDidNotEnd;
+        waited.times.vci = None;
+        let error = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 4_999_500,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_050),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        let pending = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 4_999_400,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_100),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x7F, 0x22, 0x78],
+            },
+        };
+        let start = UnattachedItem {
+            vci_us: 4_999_400,
+            read: read(5_000_100),
+            ..start_of_message(0x7E8)
+        };
+        // The read before it with times, the owed read, the one during which the error is read,
+        // the one during which `late` is read, then the job-end of the owed read when `ended`,
+        // and a silent read of the owed read's match.
+        let run = |late: UnattachedItem, ended: bool| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    transmit: true,
+                    start_of_message: true,
+                },
+                Some(true),
+            )
+            .unwrap();
+            log.exchange_with(answered(0x93, 500_000), vec![transmit(500_000)])
+                .unwrap();
+            let seq = log.exchange_with(waited.clone(), Vec::new()).unwrap();
+            log.exchange_with(
+                answered(0x91, 5_000_000),
+                vec![error.clone(), transmit(5_000_000)],
+            )
+            .unwrap();
+            log.exchange_with(answered(0x92, 6_000_000), vec![late, transmit(6_000_000)])
+                .unwrap();
+            if ended {
+                log.primitive_ended(
+                    seq,
+                    PrimitiveEnded {
+                        tx_indication: None,
+                        end: Some(exchange::End::NoResponse),
+                        detail: exchange::Detail::default(),
+                        pending: Vec::new(),
+                        vci: exchange::VciTimes {
+                            rx_timeout: Some(device(6_100_000)),
+                            ..exchange::VciTimes::default()
+                        },
+                        vci_ended: true,
+                        link_errors: Vec::new(),
+                        indications: Vec::new(),
+                    },
+                )
+                .unwrap();
+            }
+            log.exchange_with(read_of(0x90, 8_000_000), vec![transmit(8_000_000)])
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            lines
+        };
+        // The pending, then the end without an answer time: the next read of the match has no
+        // matched answer since the error and is not `vehicle`.
+        let lines = run(pending, true);
+        let last = of_event(&lines, "exchange").pop().unwrap();
+        assert_eq!(last["link_history"]["answered_same_match"], 0, "{lines:?}");
+        assert_ne!(standing(&lines, &last["seq"]), "vehicle", "{lines:?}");
+        // A start alone before the error: the read between it and the error answered once since
+        // it (the read during which the error is read), and the start adds none.
+        let lines = run(start, false);
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(
+            exchanges[3]["link_history"]["answered_since_error"], 1,
+            "{lines:?}"
+        );
+    }
+
+    /// ADR-384: a late pending with no clock or placed time is still the item that answers, so a
+    /// start shown after a late link error does not stand in for its time: the answer is not one
+    /// since the error, and the next exchange of the match has no matched answer.
+    #[test]
+    fn a_late_start_does_not_give_an_untimed_pending_its_time() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let read_of = |request: &[u8], at_us: u64, end: exchange::End| {
+            let mut evidence = evidence(endpoint(0x7E0), request, end);
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let owed = |at_us: u64| {
+            let mut evidence = read_of(&[0x22, 0xF1, 0x90], at_us, exchange::End::NoResponse);
+            evidence.vci_ended = true;
+            evidence
+        };
+        let answered = |did: u8, at_us: u64| {
+            read_of(
+                &[0x22, 0xF1, did],
+                at_us,
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            )
+        };
+        // The agent stopped waiting for the owed read, which has its transmit done.
+        let mut waited = owed(1_000_000);
+        waited.vci_ended = false;
+        waited.end = exchange::End::VciDidNotEnd;
+        let error = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 4_999_500,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_050),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        // A pending with no clock, then a start after the error, read during a read of another
+        // service, which the pending does not belong to.
+        let pending = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 0,
+            clock: None,
+            read: read(5_000_100),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x7F, 0x22, 0x78],
+            },
+        };
+        let start = UnattachedItem {
+            vci_us: 4_999_600,
+            read: read(5_000_150),
+            ..start_of_message(0x7E8)
+        };
+        let other_service = {
+            let mut evidence = read_of(
+                &[0x19, 0x02, 0x08],
+                6_000_000,
+                exchange::End::Positive(vec![0x59, 0x02, 0xFF]),
+            );
+            evidence.expected = exchange::Evidence::new(
+                exchange::Origin::Procedure,
+                endpoint(0x7E0),
+                1,
+                0x7E8,
+                vec![0x19, 0x02, 0x08],
+                exchange::End::NoResponse,
+            )
+            .expected;
+            evidence
+        };
+        let lines = run_on_opened_link(vec![
+            (answered(0x93, 500_000), vec![transmit(500_000)]),
+            (waited, vec![transmit(1_000_000)]),
+            (answered(0x91, 5_000_000), vec![error, transmit(5_000_000)]),
+            (other_service, vec![pending, start, transmit(6_000_000)]),
+            (owed(8_000_000), vec![transmit(8_000_000)]),
+        ]);
+        let last = of_event(&lines, "exchange").pop().unwrap();
+        assert_eq!(last["link_history"]["answered_same_match"], 0, "{lines:?}");
+        assert_ne!(last["classification"], "vehicle", "{lines:?}");
+    }
+
+    /// ADR-384: a start-of-message indication that an owed exchange or another could own, read
+    /// after an earlier start the owed exchange kept as showing its response began in time,
+    /// leaves that start standing only when it is shown before it on one clock and epoch;
+    /// otherwise the response that completes the exchange is judged by its own window.
+    #[test]
+    fn an_ambiguous_later_start_unsettles_a_kept_start_unless_shown_before_it() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let silent = |did: u8, at_us: u64| {
+            let mut evidence = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, did],
+                exchange::End::NoResponse,
+            );
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.vci_ended = true;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence
+        };
+        let own_transmit = |did: u8, at_us: u64| {
+            let mut evidence = silent(did, at_us);
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let start = |vci_us: u32, read_us: u64| UnattachedItem {
+            vci_us,
+            read: read(read_us),
+            ..start_of_message(0x7E8)
+        };
+        let response = UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            owner: None,
+            vci_us: 6_000_000,
+            clock: Some(exchange::Clock::Device),
+            read: read(6_010_500),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: [0x62, 0xF1, 0x90].into_iter().chain([0x41; 9]).collect(),
+            },
+        };
+        // The owed read, a start of its response at 20 ms (sole-owned, before the next read's
+        // transmit done), then the later start during `middle`, then the response.
+        let run = |middle: exchange::Evidence, later: UnattachedItem| {
+            run_on_opened_link(vec![
+                (silent(0x90, 10_000), vec![transmit(10_000)]),
+                (
+                    own_transmit(0x91, 3_010_000),
+                    vec![start(20_000, 3_010_500)],
+                ),
+                (middle, vec![later]),
+                (own_transmit(0x92, 6_010_000), vec![response.clone()]),
+            ])
+        };
+        let completed = |lines: &[serde_json::Value]| {
+            let [completed] = &of_event(lines, "late_response")[..] else {
+                panic!("{lines:?}");
+            };
+            completed["exchanges"][0]["classification"].clone()
+        };
+        // Not before the kept start, and in flight with a read with its own transmit done it
+        // is not before: ambiguous, so the kept start no longer shows the response began in
+        // time. The response comes after the limit and no timeout at the limit is shown:
+        // `undetermined`, not `system`.
+        let lines = run(own_transmit(0x93, 4_010_000), start(4_100_000, 4_110_500));
+        assert_eq!(completed(&lines), "undetermined", "{lines:?}");
+        // Ambiguous with a read that has no transmit done, and 0.2 ms before the kept start:
+        // shown before it, so it stands.
+        let lines = run(silent(0x93, 4_010_000), start(19_800, 4_110_500));
+        assert_eq!(completed(&lines), "system", "{lines:?}");
+        // The same read without a time against the kept start's: not shown before it.
+        let lines = run(
+            silent(0x93, 4_010_000),
+            UnattachedItem {
+                clock: None,
+                ..start(19_800, 4_110_500)
+            },
+        );
+        assert_eq!(completed(&lines), "undetermined", "{lines:?}");
+        // Sole-owned (before the middle read's transmit done) and late after the limit: it
+        // replaces the kept start, as before.
+        let lines = run(own_transmit(0x93, 4_010_000), start(1_500_000, 4_110_500));
+        assert_ne!(completed(&lines), "system", "{lines:?}");
     }
 
     /// ADR-369: a late response that accepts a timed-out session change ends the evidence from

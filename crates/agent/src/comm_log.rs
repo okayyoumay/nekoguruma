@@ -1337,6 +1337,9 @@ struct Inner {
     /// For tests: the system's monotonic clock reads this plus the agent's.
     #[cfg(test)]
     system_offset_us: u64,
+    /// The system's monotonic time when the agent's clock began, once read
+    /// ([`Inner::system_origin_us`]).
+    system_origin_us: Option<u64>,
     /// For tests: this many tries of a boot clock sample come out delayed.
     #[cfg(test)]
     delayed_tries: usize,
@@ -1459,6 +1462,7 @@ impl CommLog {
             boot_offset_us: None,
             #[cfg(test)]
             system_offset_us: 0,
+            system_origin_us: None,
             #[cfg(test)]
             delayed_tries: 0,
         };
@@ -1483,6 +1487,7 @@ impl CommLog {
         inner.boot_offset_us = boot.map(|(_, offset)| offset);
         // A machine that has not slept: the system's clock reads what the boot clock does.
         inner.system_offset_us = boot.map_or(0, |(_, offset)| offset);
+        inner.system_origin_us = None;
         inner.boot_offsets.clear();
         // As though the boot clock had read so since the log began.
         inner.sample_boot_at(0);
@@ -1526,6 +1531,7 @@ impl CommLog {
                 // The log begins here: the header reads 0.
                 inner.origin = Instant::now();
                 inner.boot_offsets.clear();
+                inner.system_origin_us = None;
                 inner.sample_boot_at(0);
                 let clock = AgentClock {
                     monotonic_us: 0,
@@ -4030,10 +4036,35 @@ impl Inner {
     /// beside the agent's clock but for its origin.
     fn slept_at(&mut self, monotonic_us: u64) -> Option<u64> {
         let boot_us = self.boot_at(monotonic_us)?;
-        let agent_now_us = self.monotonic_us();
-        let system_now_us = self.system_monotonic_us(agent_now_us)?;
-        let origin_us = system_now_us.checked_sub(agent_now_us)?;
+        let origin_us = self.system_origin_us()?;
         boot_us.checked_sub(monotonic_us.checked_add(origin_us)?)
+    }
+
+    /// The system's monotonic time when the agent's clock began. Both clocks run alike, so it is
+    /// read once, between two reads of the agent's clock as a boot clock sample is
+    /// ([`Inner::sample_boot_at`]), so that a delay in between does not skew it; `None` when no
+    /// try came within the jitter, or the system gives no such clock.
+    fn system_origin_us(&mut self) -> Option<u64> {
+        const JITTER_US: u64 = 50;
+        const TRIES: usize = 3;
+        if self.system_origin_us.is_none() {
+            self.system_origin_us = (0..TRIES).find_map(|_| {
+                let before = self.monotonic_us();
+                let system_us = self.system_monotonic_us(before);
+                let after = self.monotonic_us();
+                #[cfg(test)]
+                let after = if self.delayed_tries > 0 {
+                    self.delayed_tries -= 1;
+                    after + JITTER_US + 1
+                } else {
+                    after
+                };
+                (after.saturating_sub(before) <= JITTER_US)
+                    .then(|| system_us.and_then(|system_us| system_us.checked_sub(before)))
+                    .flatten()
+            });
+        }
+        self.system_origin_us
     }
 
     /// The system's monotonic clock now, the agent's reading `agent_now_us`.
@@ -9779,6 +9810,24 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(1));
         let answered = log.now();
         assert_eq!(log.round_trip_us(asked, answered), None);
+    }
+
+    /// The system clock's origin is read between two reads of the agent's clock: a delayed try
+    /// is taken again, and one that never comes within the jitter gives no sleep figure.
+    #[test]
+    fn the_sleep_figure_is_read_within_the_jitter_or_not_at_all() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let read = log.now();
+        let mut inner = log.lock();
+        inner.delayed_tries = 2;
+        assert_eq!(inner.system_origin_us(), Some(1_000_000));
+        assert_eq!(inner.slept_at(read.monotonic_us), Some(0));
+        drop(inner);
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let mut inner = log.lock();
+        inner.delayed_tries = 3;
+        assert_eq!(inner.system_origin_us(), None);
     }
 
     /// A sample that every try takes delayed is left out, and a time read then has no boot time:

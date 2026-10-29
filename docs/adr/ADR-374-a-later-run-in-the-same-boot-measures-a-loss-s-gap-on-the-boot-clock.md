@@ -72,6 +72,8 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    shown from such a gap. The log therefore records, beside each boot time, how long the
    machine had slept since its boot: the boot clock less the system's monotonic clock, which
    stops during a suspend (`slept_us` in the record and in each read of `vci_loss_settled`).
+   The system clock's offset from the agent's is read once, between two reads of the agent's
+   clock as a boot clock sample is (item 2), so that a delay does not pass for a suspend.
    When the reconnect's figure exceeds the loss's by more than the reads' jitter (1 ms), or a
    boot clock gap has no such figure, `vci_loss_settled` records the difference
    (`slept_in_gap_us`) and compares nothing: `power_kept` is `unknown`. A gap without a suspend

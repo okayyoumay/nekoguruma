@@ -2259,6 +2259,7 @@ impl CommLog {
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             late_start: None,
+            answered_only: false,
             late_pendings: Vec::new(),
             floor: None,
             clears,
@@ -2634,22 +2635,18 @@ impl CommLog {
             answer.no_matched_answer();
         }
         // Its answer counts since the last link error only where no late link error read
-        // after its entry may have come after it (ADR-384). The answer's time is that of the
-        // item that answers: the final response, else the latest pending, those read at its
-        // end, then those read late, then those its entry saw. A start answers nothing
-        // (ADR-354), and a start alone is no answer at a primitive's end.
-        let answered_at = times
-            .and_then(|times| times.rx_end)
-            .and_then(|time| time.placed())
-            .or_else(|| {
-                pendings[kept_pendings..]
-                    .last()
-                    .copied()
-                    .or_else(|| kept.late_pendings.last().map(|(at, _)| *at))
-                    .or_else(|| kept.pendings.last().copied())
-                    .flatten()
-            });
-        answer.set_since_error(state.since_late_error(seq, answered_at));
+        // after its entry may have come after it (ADR-384), by the time of the item that
+        // answers it: the response's end, else the latest pending, then a start.
+        let answer_time = kept.answer_time(
+            times
+                .and_then(|times| times.rx_end)
+                .map(|time| time.placed()),
+            &pendings[kept_pendings..],
+            times
+                .and_then(|times| times.rx_start)
+                .map(|time| time.placed()),
+        );
+        state.judge_answer(&mut answer, &kept, answer_time);
         let restart = entry.late_restart();
         let (later, not_reclassified) = settle_later(state, seq, restart, &answer);
         let refers_to = std::iter::once(seq)
@@ -3101,7 +3098,8 @@ impl Inner {
         let answered_evidence = answered.clone();
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
         let mut answer = entry.settled_answer(&kept);
-        answer.set_since_error(state.since_late_error(owner, time));
+        let answer_time = kept.answer_time(Some(time), &[], None);
+        state.judge_answer(&mut answer, &kept, answer_time);
         let restart = entry.late_restart();
         state.settled(owner, classification, &reason, answered_evidence, true);
         let (later, not_reclassified) = settle_later(state, owner, restart, &answer);
@@ -3432,22 +3430,16 @@ impl Inner {
             }
         }
         let mut answer = entry.settled_answer(&kept);
-        // The answer's time is that of the item that answers: this pending, or for a transmit
-        // or start indication, which answers nothing (ADR-354), the exchange's latest pending
-        // the answer rests on; a start's own time decides only an answer that is a start alone
-        // (ADR-384).
-        let latest_pending = kept
-            .late_pendings
-            .last()
-            .map(|(at, _)| *at)
-            .or_else(|| kept.pendings.last().copied())
-            .flatten();
-        let answered_at = match kind {
-            LateIndication::Pending => item.clock.zip(placed),
-            LateIndication::Transmit(_) => latest_pending,
-            LateIndication::Start => latest_pending.or(item.clock.zip(placed)),
+        // The answer's time is that of the item that answers (ADR-384): this pending, or the
+        // exchange's latest, for a transmit or start indication, which answers nothing
+        // (ADR-354); a start's own time decides only an answer that is a start alone.
+        let own = item.clock.zip(placed);
+        let answer_time = match kind {
+            LateIndication::Pending => kept.answer_time(None, &[own], None),
+            LateIndication::Transmit(_) => kept.answer_time(None, &[], None),
+            LateIndication::Start => kept.answer_time(None, &[], Some(own)),
         };
-        answer.set_since_error(state.since_late_error(owner, answered_at));
+        state.judge_answer(&mut answer, &kept, answer_time);
         let (later, not_reclassified) = settle_later(state, owner, None, &answer);
         let top = later
             .iter()
@@ -8311,6 +8303,114 @@ mod tests {
             exchanges[3]["link_history"]["answered_since_error"], 1,
             "{lines:?}"
         );
+    }
+
+    /// ADR-384: a late pending with no clock or placed time is still the item that answers, so a
+    /// start shown after a late link error does not stand in for its time: the answer is not one
+    /// since the error, and the next exchange of the match has no matched answer.
+    #[test]
+    fn a_late_start_does_not_give_an_untimed_pending_its_time() {
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let read = |monotonic_us| {
+            Some(AgentNow {
+                epoch: 0,
+                monotonic_us,
+                wall_unix_ms: 0,
+            })
+        };
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: read(at_us + 100),
+            ..tx_done(0x7E0)
+        };
+        let read_of = |request: &[u8], at_us: u64, end: exchange::End| {
+            let mut evidence = evidence(endpoint(0x7E0), request, end);
+            evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+            evidence.times.agent.before_us = at_us;
+            evidence.times.agent.end_us = at_us + 1_001_000;
+            evidence.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device(at_us)),
+                ..exchange::VciTimes::default()
+            });
+            evidence
+        };
+        let owed = |at_us: u64| {
+            let mut evidence = read_of(&[0x22, 0xF1, 0x90], at_us, exchange::End::NoResponse);
+            evidence.vci_ended = true;
+            evidence
+        };
+        let answered = |did: u8, at_us: u64| {
+            read_of(
+                &[0x22, 0xF1, did],
+                at_us,
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            )
+        };
+        // The agent stopped waiting for the owed read, which has its transmit done.
+        let mut waited = owed(1_000_000);
+        waited.vci_ended = false;
+        waited.end = exchange::End::VciDidNotEnd;
+        let error = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 4_999_500,
+            clock: Some(exchange::Clock::Device),
+            read: read(5_000_050),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        };
+        // A pending with no clock, then a start after the error, read during a read of another
+        // service, which the pending does not belong to.
+        let pending = UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us: 0,
+            clock: None,
+            read: read(5_000_100),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x7F, 0x22, 0x78],
+            },
+        };
+        let start = UnattachedItem {
+            vci_us: 4_999_600,
+            read: read(5_000_150),
+            ..start_of_message(0x7E8)
+        };
+        let other_service = {
+            let mut evidence = read_of(
+                &[0x19, 0x02, 0x08],
+                6_000_000,
+                exchange::End::Positive(vec![0x59, 0x02, 0xFF]),
+            );
+            evidence.expected = exchange::Evidence::new(
+                exchange::Origin::Procedure,
+                endpoint(0x7E0),
+                1,
+                0x7E8,
+                vec![0x19, 0x02, 0x08],
+                exchange::End::NoResponse,
+            )
+            .expected;
+            evidence
+        };
+        let lines = run_on_opened_link(vec![
+            (answered(0x93, 500_000), vec![transmit(500_000)]),
+            (waited, vec![transmit(1_000_000)]),
+            (answered(0x91, 5_000_000), vec![error, transmit(5_000_000)]),
+            (other_service, vec![pending, start, transmit(6_000_000)]),
+            (owed(8_000_000), vec![transmit(8_000_000)]),
+        ]);
+        let last = of_event(&lines, "exchange").pop().unwrap();
+        assert_eq!(last["link_history"]["answered_same_match"], 0, "{lines:?}");
+        assert_ne!(last["classification"], "vehicle", "{lines:?}");
     }
 
     /// ADR-384: a start-of-message indication that an owed exchange or another could own, read

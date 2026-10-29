@@ -77,14 +77,23 @@ Four judgements rest on an ordering their times do not show:
      at job end carries the time.
    - An answer whose order against the error is not shown is not counted there either: one on
      another clock or epoch, one with no time, or one after an error that could not be placed.
-     The maintainer chose this (2026-10-29).
+     The maintainer chose this (2026-10-29). An exchange's position after the error does not
+     show it: an exchange with no time on the error's clock is taken as after the error
+     (ADR-372 item 2), but its answer is not shown after it. Only an exchange logged after the
+     error was read, whose request came after it, counts an answer with no comparable time.
+   - The answering item is picked in one place for every settling path, and a pending with no
+     placed time is an answering item whose time is unknown: no other item's time stands in
+     for it.
+   - Once an exchange's answer has counted as an answer alone, no later settling of that
+     exchange counts it as a matched answer or since the error. Only a new answering item of
+     its own, shown after the error, does.
    - The answer's time is that of the item that answers: the final response, else the latest
      pending, those read at the primitive's end before those read late and those its entry saw.
      A transmit or start indication answers nothing (ADR-354), so one read after the error does
      not make an earlier pending count since it. A late start with no pending, which counts as
      an answer but never as a matched one, takes its own time.
-   - An answer counted as an answer alone stays so when its exchange's owners are freed later,
-     for example by an earlier owner's final response, and when its exchange settles again.
+   - An answer counted as an answer alone also stays so when its exchange's owners are freed
+     later, for example by an earlier owner's final response.
 
 3. **An ambiguous later start opens a kept start.** When an owed exchange keeps a start that
    started in time, and a later start is read that it or another exchange may own, the kept

@@ -219,7 +219,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-227](ADR-227-windows-workers-target-gnullvm.md) | Windows Workers Target `*-pc-windows-gnullvm`, Cross-Built on Linux | Accepted | CI, `.cargo/config.toml`, worker target docs |
 | [ADR-228](ADR-228-fixed-library-resolution-locations.md) | Library Resolution from Fixed Locations, Shared by Agent and Worker | Accepted (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended by ADR-281 with the mode and, for J2534, a module label and the `pname` the agent locked, which the worker checks; no library path is read from the worker's configuration file since ADR-281; in debug builds item 1's runtime override also replaces the Windows registry, ADR-282) | design 7.1.1 / 7.2 / 7.3, `vci-discovery`, `vci-service-config`, worker services |
 | [ADR-229](ADR-229-interrupted-transfer-restarts-from-request-download.md) | Interrupted Transfers Restart from RequestDownload; Write Procedures Are a Reference Implementation | Accepted (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327) | design 8.2.5 / 16.1, `agent` journal, `sim-ecu` |
-| [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements) | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
+| [ADR-230](ADR-230-backlog-loop-serialization-and-claims.md) | Backlog Loop Runs One Item at a Time, with PR-Based Claims and Run State | Accepted (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements; one item at a time relaxed by ADR-382: the next item may be prepared locally while a PR waits for merge) | `.claude/skills/backlog-loop`, `next-task`, `scripts/classify-pr-risk.sh` |
 | [ADR-231](ADR-231-agent-mints-worker-tokens-in-process.md) | The Agent Mints Worker Bearer Tokens In-Process | Accepted | `worker-host` client, `vci-service-interface` token |
 | [ADR-232](ADR-232-linux-support-scope-and-minimum-glibc.md) | Linux Support Scope and Minimum glibc 2.17 | Accepted | design 2 / 7.1.2 / 12.1 / 17, `worker-linux` CI job |
 | [ADR-233](ADR-233-diag-ir-vm-execution-semantics.md) | diag-ir VM Execution Semantics | Accepted (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1); `Op::FlashBlock` appended, a block of a declared flash segment read through `DiagHost::artifact_bytes`, by ADR-336 item 11; `Op::ReadInput` appended, a runtime input read through `DiagHost::runtime_input`, by ADR-338; `Op::HmiRequestFromStack` appended, a form whose run-time parameters come from the stack, and item 7's constant of `HmiRequest` and `RecordInput` read as an encoded `HmiTemplate`, by ADR-340) | `diag-ir` VM |
@@ -370,6 +370,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-378](ADR-378-a-loss-is-judged-only-on-clock-tolerances-a-profile-gives.md) | A Loss Is Judged Only on Clock Tolerances a Profile Gives | Accepted | `agent` communication log (`Inner::settle_loss`); design 8.11 `vci_loss_settled`, "Drift bound"; ADR-357; ADR-373 item 4 |
 | [ADR-380](ADR-380-the-review-loops-wake-themselves-with-a-timer.md) | The Review Loops Wake Themselves with a Timer | Accepted | `.claude/skills/pr-review-loop` (Step 0, Step 5), `.claude/skills/backlog-loop` (step 6); ADR-360 item 2 |
 | [ADR-381](ADR-381-enumerate-the-cases-before-coding-and-pause-long-code-review-loops.md) | Enumerate the Cases Before Coding, and Pause Long Code Review Loops | Accepted | `.claude/README.md` (gates), `.claude/skills/backlog-loop` (step 4), `.claude/skills/pr-review-loop` (Steps 3-4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-349 items 1 and 4 |
+| [ADR-382](ADR-382-the-backlog-loop-prepares-the-next-item-while-a-pr-waits-for-merge.md) | The Backlog Loop Prepares the Next Item While a PR Waits for Merge | Accepted | `.claude/skills/backlog-loop`, `.claude/skills/next-task`, `CLAUDE.md`; ADR-230 |
 
 ## Status Legend
 
@@ -707,7 +708,7 @@ the predecessor repository these ADRs came from.
 - ADR-163
 - ADR-195 (the test config files lose `library_path`, ADR-281; the per-process-unique path rule stands)
 - ADR-227
-- ADR-230 (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements)
+- ADR-230 (Decision items 1-2's claim set extended to `codeql-alerts` PRs by ADR-243; Decision item 5 superseded by ADR-249; Decision items 3 and 6 amended by ADR-279 for Dependabot replacements; one item at a time relaxed by ADR-382: the next item may be prepared locally while a PR waits for merge)
 - ADR-238 (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`)
 - ADR-241
 - ADR-243 (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283)
@@ -730,6 +731,7 @@ the predecessor repository these ADRs came from.
 - ADR-360 (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer)
 - ADR-380
 - ADR-381
+- ADR-382
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

@@ -61,8 +61,9 @@ The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog 
 - `milestone-exit`: count what is left of the current milestone per exit criterion, sweep the
   lower priorities for work it should still take, and close it on request
 - `backlog-loop` (run on request only): work through the backlog one item and one pull request
-  at a time, replacing failing Dependabot pull requests first; the next item starts only after
-  the maintainer merges the previous PR
+  at a time, replacing failing Dependabot pull requests first; the next PR opens only after
+  the maintainer merges the previous one, and the next item may be prepared locally meanwhile
+  (ADR-382)
 
 ### Documentation sync
 

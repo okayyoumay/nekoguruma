@@ -5603,6 +5603,48 @@ def main():
         Sent::Service(0x22, did.to_vec())
     }
 
+    /// A thread that sets a job's cancel flag once the job has sent a given request.
+    struct Canceller {
+        ended: Arc<AtomicBool>,
+        thread: std::thread::JoinHandle<()>,
+    }
+
+    impl Canceller {
+        /// Sets `cancelled` `delay` after `mirror` first holds a request `reached` accepts.
+        /// It waits as long as the job takes to send it, since a loaded runner's journal
+        /// commits can take many seconds, and it cancels nothing if the job ends first.
+        fn once_sent(
+            mirror: &Arc<Mutex<Vec<Sent>>>,
+            cancelled: &Arc<AtomicBool>,
+            reached: fn(&[Sent]) -> bool,
+            delay: Duration,
+        ) -> Self {
+            let ended = Arc::new(AtomicBool::new(false));
+            let (mirror, cancelled, job_ended) = (
+                Arc::clone(mirror),
+                Arc::clone(cancelled),
+                Arc::clone(&ended),
+            );
+            let thread = std::thread::spawn(move || {
+                while !reached(&mirror.lock().unwrap()) {
+                    if job_ended.load(Ordering::Relaxed) {
+                        return;
+                    }
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                std::thread::sleep(delay);
+                cancelled.store(true, Ordering::Relaxed);
+            });
+            Self { ended, thread }
+        }
+
+        /// Called once the job has ended: stops the wait and joins the thread.
+        fn join(self) {
+            self.ended.store(true, Ordering::Relaxed);
+            self.thread.join().unwrap();
+        }
+    }
+
     /// The journal file in `dir`, beside its writer lock's sidecar.
     fn journal_file(dir: &std::path::Path) -> std::path::PathBuf {
         std::fs::read_dir(dir)
@@ -7930,17 +7972,12 @@ def main():
         // long the journal's commits before it take.
         let mirror = Arc::new(Mutex::new(Vec::new()));
         host.mirror = Some(Arc::clone(&mirror));
-        let canceller = {
-            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
-            std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(20);
-                while mirror.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-                cancelled.store(true, Ordering::Relaxed);
-            })
-        };
+        let canceller = Canceller::once_sent(
+            &mirror,
+            &cancelled,
+            |sent| !sent.is_empty(),
+            Duration::from_millis(10),
+        );
         let started = std::time::Instant::now();
         let result = resume_to_erase(
             &program,
@@ -7953,7 +7990,7 @@ def main():
             None,
             &dir_slot(&dir),
         );
-        canceller.join().unwrap();
+        canceller.join();
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert!(started.elapsed() < Duration::from_secs(40));
         assert_eq!(host.sent(), [read_of([0xF1, 0x90])]);
@@ -8419,19 +8456,12 @@ def main():
         host.session_script = [SessionAnswer::Other(0x03)].into();
         let mirror = Arc::new(Mutex::new(Vec::new()));
         host.mirror = Some(Arc::clone(&mirror));
-        let canceller = {
-            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
-            std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(20);
-                while !mirror.lock().unwrap().contains(&read_of([0xF1, 0x86]))
-                    && std::time::Instant::now() < deadline
-                {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                std::thread::sleep(Duration::from_millis(10));
-                cancelled.store(true, Ordering::Relaxed);
-            })
-        };
+        let canceller = Canceller::once_sent(
+            &mirror,
+            &cancelled,
+            |sent| sent.contains(&read_of([0xF1, 0x86])),
+            Duration::from_millis(10),
+        );
         let limits = JobLimits {
             wait_poll: Duration::from_millis(2),
             ..JobLimits::default()
@@ -8447,7 +8477,7 @@ def main():
             None,
             &dir_slot(&dir),
         );
-        canceller.join().unwrap();
+        canceller.join();
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(host.session_reads.len(), 1);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -12630,21 +12660,16 @@ def main():
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         host.software_version = None;
         host.mirror = Some(Arc::clone(&mirror));
-        let canceller = {
-            let (cancelled, mirror) = (Arc::clone(&cancelled), Arc::clone(&mirror));
-            std::thread::spawn(move || {
-                let deadline = std::time::Instant::now() + Duration::from_secs(20);
-                while mirror.lock().unwrap().is_empty() && std::time::Instant::now() < deadline {
-                    std::thread::sleep(Duration::from_millis(1));
-                }
-                std::thread::sleep(Duration::from_millis(20));
-                cancelled.store(true, Ordering::Relaxed);
-            })
-        };
+        let canceller = Canceller::once_sent(
+            &mirror,
+            &cancelled,
+            |sent| !sent.is_empty(),
+            Duration::from_millis(20),
+        );
         let started = std::time::Instant::now();
         let result =
             state_check_polling(&program, &mut host, Duration::from_millis(300), &cancelled);
-        canceller.join().unwrap();
+        canceller.join();
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         // The pause ends at its first step, with the second read not made.
         assert!(started.elapsed() < Duration::from_secs(5));
@@ -14369,9 +14394,22 @@ def main():
         /// How CancelComPrimitive answers.
         cancel: CancelAnswer,
         /// What the link's events give after each start, and when.
-        on_start: Option<(Duration, StartEvent)>,
+        on_start: Option<(When, StartEvent)>,
+        /// One permit per primitive whose events the test has released ([`When::Released`]).
+        released: Arc<tokio::sync::Semaphore>,
         /// The sender of the link's event stream, once subscribed.
         events: Arc<Mutex<Option<EventSender>>>,
+    }
+
+    /// When a [`FakeWorker`] gives a start's event.
+    #[derive(Clone, Copy)]
+    enum When {
+        /// That long after the start.
+        After(Duration),
+        /// Once the test releases the primitive, by a permit on [`Started`]'s `released`, after
+        /// the agent's deadline has ended the wait: the event then comes after that deadline
+        /// however slowly a loaded runner runs, which no delay ensures (ADR-149).
+        Released,
     }
 
     /// The sender of a [`FakeWorker`]'s event stream.
@@ -14388,17 +14426,18 @@ def main():
         Lose,
         /// A positive response to `22 F1 90` with VCI time 600 ms, then the finished status.
         Respond,
-        /// The same response, and the finished status 150 ms after it.
+        /// The same response, and the finished status once the test releases the primitive.
         RespondThenFinishLater,
         /// A receive timeout with VCI time 1 s, then the finished status.
         TimeOut,
-        /// The same receive timeout, and the finished status 1 s after it.
+        /// The same receive timeout, and the finished status once the agent has cancelled the
+        /// primitive.
         TimeOutThenFinishLater,
         /// A transmit indication bound to the primitive with VCI time 10 ms, then the receive
         /// timeout and the finished status.
         TransmitThenTimeOut,
         /// A receive error with VCI time 20 ms and extra error information, and the finished
-        /// status 150 ms after it.
+        /// status once the test releases the primitive.
         FailThenFinishLater,
         /// The receive error of [`StartEvent::FailThenFinishLater`], and no finished status: the
         /// primitive runs until the agent cancels it.
@@ -14636,10 +14675,15 @@ def main():
                 started.push(next);
                 next
             };
-            if let Some((after, event)) = self.on_start {
+            if let Some((when, event)) = self.on_start {
                 let sender = self.events.lock().unwrap().clone();
+                let (released, cancelled) =
+                    (Arc::clone(&self.released), Arc::clone(&self.cancelled));
                 tokio::spawn(async move {
-                    tokio::time::sleep(after).await;
+                    match when {
+                        When::After(after) => tokio::time::sleep(after).await,
+                        When::Released => released.acquire().await.unwrap().forget(),
+                    }
                     use vci_service_interface::event_notification::EventData;
                     let handle = vci_service_interface::ComPrimitiveHandle {
                         module_handle: 1,
@@ -14730,12 +14774,14 @@ def main():
                         return;
                     }
                     if let StartEvent::TimeOutThenFinishLater = event {
-                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        while !cancelled.lock().unwrap().contains(&cop_handle) {
+                            tokio::time::sleep(Duration::from_millis(1)).await;
+                        }
                     }
                     if let StartEvent::RespondThenFinishLater | StartEvent::FailThenFinishLater =
                         event
                     {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                        released.acquire().await.unwrap().forget();
                     }
                     let data = match event {
                         StartEvent::Finish
@@ -14909,6 +14955,7 @@ def main():
             cancelled: Arc::default(),
             cancel: CancelAnswer::Done,
             on_start: None,
+            released: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
         };
         serve(service, calls, set).await
@@ -14920,6 +14967,8 @@ def main():
         calls: Arc<Mutex<Vec<&'static str>>>,
         started: Arc<Mutex<Vec<u32>>>,
         cancelled: Arc<Mutex<Vec<u32>>>,
+        /// One permit per primitive whose events the test releases ([`When::Released`]).
+        released: Arc<tokio::sync::Semaphore>,
     }
 
     impl Started {
@@ -14943,14 +14992,16 @@ def main():
         fake_worker_starting_with(cancel, None).await
     }
 
-    /// [`fake_worker_starting`], whose link gives `on_start`'s event that long after each start.
+    /// [`fake_worker_starting`], whose link gives `on_start`'s event after each start, when it
+    /// says.
     async fn fake_worker_starting_with(
         cancel: CancelAnswer,
-        on_start: Option<(Duration, StartEvent)>,
+        on_start: Option<(When, StartEvent)>,
     ) -> (WorkerClient, Started) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let (started, cancelled) = (Arc::default(), Arc::default());
+        let released = Arc::new(tokio::sync::Semaphore::new(0));
         let service = FakeWorker {
             fail_disconnect: false,
             fail_open: false,
@@ -14963,6 +15014,7 @@ def main():
             cancelled: Arc::clone(&cancelled),
             cancel,
             on_start,
+            released: Arc::clone(&released),
             events: Arc::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
@@ -14972,6 +15024,7 @@ def main():
                 calls,
                 started,
                 cancelled,
+                released,
             },
         )
     }
@@ -15005,8 +15058,18 @@ def main():
         (client, calls, set)
     }
 
+    /// The agent's deadline for the reads whose primitives outlast it. Starting the primitive
+    /// counts against it, so it leaves a loaded runner room for that round trip and for an
+    /// event sent at the start (ADR-149: a margin per round trip); an event meant to come after
+    /// it waits for the test's release ([`When::Released`]).
+    const PAST_DEADLINE: Duration = Duration::from_secs(1);
+
+    /// The job-end wait of the tests that read a primitive's end at job end: room for the
+    /// events the test released before the job end to be read.
+    const JOB_END_WAIT: Duration = Duration::from_secs(1);
+
     /// Runs `requests` reads of F190 on a host over `client` whose send-receive deadline is
-    /// short, so each primitive the fake starts passes it.
+    /// [`PAST_DEADLINE`], so each primitive the fake starts and never ends passes it.
     async fn reads_past_the_deadline(
         client: WorkerClient,
         requests: usize,
@@ -15020,7 +15083,7 @@ def main():
         requests: usize,
         comm_log: Option<crate::comm_log::CommLog>,
     ) -> Vec<Result<Vec<u8>, HostError>> {
-        reads_logged_within(client, requests, comm_log, Duration::from_millis(50)).await
+        reads_logged_within(client, requests, comm_log, PAST_DEADLINE).await
     }
 
     /// [`reads_past_the_deadline_logged`] with the agent's deadline `send_recv` for each read.
@@ -15120,10 +15183,11 @@ def main():
     }
 
     /// Opens a link on `client`, sends `reads` reads past the deadline (`send_recv`), each
-    /// giving its result, then settles the job's end with a job-end wait of `wait`; returns the
-    /// reads' results and how long the job's end took.
+    /// giving its result, releases one primitive of `fake`, then settles the job's end with a
+    /// job-end wait of `wait`; returns the reads' results and how long the job's end took.
     async fn reads_then_job_end(
         mut client: WorkerClient,
+        fake: &Started,
         reads: usize,
         send_recv: Duration,
         wait: Duration,
@@ -15138,12 +15202,14 @@ def main():
             unary: Duration::from_secs(5),
             send_recv,
         };
+        let released = Arc::clone(&fake.released);
         tokio::task::spawn_blocking(move || {
             let mut host = WorkerHost::new(handle, client, link, timings);
             host.set_job_end_wait(wait);
             let results = (0..reads)
                 .map(|_| host.service_request(0x22, &[0xF1, 0x90]))
                 .collect();
+            released.add_permits(1);
             let at = std::time::Instant::now();
             host.settle_at_end();
             (results, at.elapsed())
@@ -15158,15 +15224,14 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_transmit_indication_bound_to_the_primitive_confirms_the_send() {
         // Read before the deadline, the exchange ends with it; read after, at job end.
-        for (delay, event) in ["exchange", "primitive_ended"]
-            .into_iter()
-            .zip([Duration::from_millis(10), Duration::from_millis(150)])
-            .map(|(event, delay)| (delay, event))
-        {
+        for (when, event) in [
+            (When::After(Duration::ZERO), "exchange"),
+            (When::Released, "primitive_ended"),
+        ] {
             let dir = journal_dir("bound-transmit");
-            let (mut client, _fake) = fake_worker_starting_with(
+            let (mut client, fake) = fake_worker_starting_with(
                 CancelAnswer::Done,
-                Some((delay, StartEvent::TransmitThenTimeOut)),
+                Some((when, StartEvent::TransmitThenTimeOut)),
             )
             .await;
             let log =
@@ -15178,17 +15243,19 @@ def main():
             let handle = tokio::runtime::Handle::current();
             let timings = Timings {
                 unary: Duration::from_secs(5),
-                send_recv: Duration::from_millis(50),
+                send_recv: PAST_DEADLINE,
             };
+            let released = Arc::clone(&fake.released);
             tokio::task::spawn_blocking(move || {
                 use diag_ir::DiagHost;
                 let mut host = WorkerHost::new(handle, client, link, timings);
                 host.set_comm_log(Some(log));
                 host.set_link_ids(0x7E0, 0x7E8);
                 host.own_reads(Some(OwnRead::Identification));
-                host.set_job_end_wait(Duration::from_millis(500));
+                host.set_job_end_wait(JOB_END_WAIT);
                 let result = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                released.add_permits(1);
                 host.settle_at_end();
             })
             .await
@@ -15224,7 +15291,7 @@ def main():
         let dir = journal_dir("stray-bound-error");
         let (mut client, _fake) = fake_worker_starting_with(
             CancelAnswer::Done,
-            Some((after, StartEvent::FailNeverFinish)),
+            Some((When::After(after), StartEvent::FailNeverFinish)),
         )
         .await;
         let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
@@ -15324,38 +15391,35 @@ def main():
         // settles it); an error read before the deadline ends it with its finished status after.
         for (on_start, cancelled, result) in [
             (
-                Some((Duration::from_millis(150), StartEvent::Respond)),
+                Some((When::Released, StartEvent::Respond)),
                 false,
                 Some("positive"),
             ),
             (
                 Some((
-                    Duration::from_millis(10),
+                    When::After(Duration::ZERO),
                     StartEvent::RespondThenFinishLater,
                 )),
                 false,
                 Some("positive"),
             ),
             (
-                Some((Duration::from_millis(150), StartEvent::Lose)),
+                Some((When::Released, StartEvent::Lose)),
                 false,
                 Some("unknown"),
             ),
             (
-                Some((Duration::from_millis(150), StartEvent::TimeOut)),
+                Some((When::Released, StartEvent::TimeOut)),
                 false,
                 Some("no_response"),
             ),
             (
-                Some((
-                    Duration::from_millis(150),
-                    StartEvent::TimeOutThenFinishLater,
-                )),
+                Some((When::Released, StartEvent::TimeOutThenFinishLater)),
                 false,
                 Some("no_response"),
             ),
             (
-                Some((Duration::from_millis(10), StartEvent::FailThenFinishLater)),
+                Some((When::After(Duration::ZERO), StartEvent::FailThenFinishLater)),
                 false,
                 Some("link_error"),
             ),
@@ -15372,17 +15436,19 @@ def main():
             let handle = tokio::runtime::Handle::current();
             let timings = Timings {
                 unary: Duration::from_secs(5),
-                send_recv: Duration::from_millis(50),
+                send_recv: PAST_DEADLINE,
             };
+            let released = Arc::clone(&fake.released);
             tokio::task::spawn_blocking(move || {
                 use diag_ir::DiagHost;
                 let mut host = WorkerHost::new(handle, client, link, timings);
                 host.set_comm_log(Some(log));
                 host.set_link_ids(0x7E0, 0x7E8);
                 host.own_reads(Some(OwnRead::Identification));
-                host.set_job_end_wait(Duration::from_millis(500));
+                host.set_job_end_wait(JOB_END_WAIT);
                 let result = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+                released.add_permits(1);
                 host.settle_at_end();
             })
             .await
@@ -15459,14 +15525,14 @@ def main():
         // no end, the cancel carried out; no end, the handle had ended.
         for (on_start, cancel, cancelled, outcome) in [
             (
-                Some((Duration::from_millis(150), StartEvent::Respond)),
+                Some((When::Released, StartEvent::Respond)),
                 CancelAnswer::InvalidHandle,
                 Some(false),
                 Some("positive"),
             ),
             (
                 Some((
-                    Duration::from_millis(10),
+                    When::After(Duration::ZERO),
                     StartEvent::RespondThenFinishLater,
                 )),
                 CancelAnswer::InvalidHandle,
@@ -15474,7 +15540,7 @@ def main():
                 Some("positive"),
             ),
             (
-                Some((Duration::from_millis(150), StartEvent::Lose)),
+                Some((When::Released, StartEvent::Lose)),
                 CancelAnswer::Done,
                 Some(false),
                 Some("unknown"),
@@ -15494,17 +15560,20 @@ def main():
             let handle = tokio::runtime::Handle::current();
             let timings = Timings {
                 unary: Duration::from_secs(5),
-                send_recv: Duration::from_millis(50),
+                send_recv: PAST_DEADLINE,
             };
+            let released = Arc::clone(&fake.released);
             tokio::task::spawn_blocking(move || {
                 use diag_ir::DiagHost;
                 let mut host = WorkerHost::new(handle, client, link, timings);
                 host.set_comm_log(Some(log));
                 host.set_link_ids(0x7E0, 0x7E8);
                 host.own_reads(Some(OwnRead::Identification));
-                host.set_job_end_wait(Duration::from_millis(500));
+                host.set_job_end_wait(JOB_END_WAIT);
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::NoResponse)), "{first:?}");
+                // Only the first primitive's events are released; the second's never come.
+                released.add_permits(1);
                 // The first primitive's end, if any, is on the stream before the next request.
                 std::thread::sleep(Duration::from_millis(300));
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
@@ -15567,7 +15636,7 @@ def main():
     async fn a_primitive_past_the_deadline_is_waited_for_then_cancelled_at_job_end() {
         let (client, fake) = fake_worker_starting(CancelAnswer::Done).await;
         let wait = Duration::from_millis(200);
-        let (results, took) = reads_then_job_end(client, 1, Duration::from_millis(50), wait).await;
+        let (results, took) = reads_then_job_end(client, &fake, 1, PAST_DEADLINE, wait).await;
         assert!(
             matches!(results[0], Err(HostError::NoResponse)),
             "{results:?}"
@@ -15585,11 +15654,11 @@ def main():
     async fn a_primitive_that_ends_within_the_job_end_wait_is_not_cancelled() {
         let (client, fake) = fake_worker_starting_with(
             CancelAnswer::Done,
-            Some((Duration::from_millis(150), StartEvent::Finish)),
+            Some((When::Released, StartEvent::Finish)),
         )
         .await;
         let wait = Duration::from_secs(5);
-        let (results, took) = reads_then_job_end(client, 1, Duration::from_millis(50), wait).await;
+        let (results, took) = reads_then_job_end(client, &fake, 1, PAST_DEADLINE, wait).await;
         assert!(
             matches!(results[0], Err(HostError::NoResponse)),
             "{results:?}"
@@ -15604,12 +15673,12 @@ def main():
     async fn a_primitive_left_by_lost_events_is_waited_for_past_its_deadline() {
         let (client, fake) = fake_worker_starting_with(
             CancelAnswer::Done,
-            Some((Duration::from_millis(20), StartEvent::Lose)),
+            Some((When::After(Duration::from_millis(20)), StartEvent::Lose)),
         )
         .await;
         let send_recv = Duration::from_millis(600);
         let wait = Duration::from_millis(100);
-        let (results, took) = reads_then_job_end(client, 1, send_recv, wait).await;
+        let (results, took) = reads_then_job_end(client, &fake, 1, send_recv, wait).await;
         assert!(
             matches!(results[0], Err(HostError::EventsLost)),
             "{results:?}"
@@ -15625,7 +15694,7 @@ def main():
     async fn a_primitive_whose_cancel_failed_is_cancelled_at_job_end_at_once() {
         let (client, fake) = fake_worker_starting(CancelAnswer::Failed).await;
         let wait = Duration::from_secs(5);
-        let (results, took) = reads_then_job_end(client, 2, Duration::from_millis(50), wait).await;
+        let (results, took) = reads_then_job_end(client, &fake, 2, PAST_DEADLINE, wait).await;
         assert!(
             matches!(results[1], Err(HostError::LinkHeld)),
             "{results:?}"
@@ -15695,7 +15764,7 @@ def main():
         let dir = journal_dir("events-lost");
         let (client, _fake) = fake_worker_starting_with(
             CancelAnswer::Done,
-            Some((Duration::from_millis(20), StartEvent::Lose)),
+            Some((When::After(Duration::from_millis(20)), StartEvent::Lose)),
         )
         .await;
         let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");

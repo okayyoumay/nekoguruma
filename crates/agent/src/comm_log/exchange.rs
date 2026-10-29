@@ -2635,11 +2635,9 @@ impl LinkState {
     /// so a later offer of the answer, a recount or a placement judges the same time
     /// (ADR-385).
     pub(crate) fn judge_answer(&mut self, answer: &mut SettledAnswer, time: AnswerTime) {
-        // A settling entry that adds no answer has nothing to judge, and stores no time.
-        if !answer.newly_answered && !answer.newly_matched {
-            return;
-        }
-        answer.set_since_error(self.since_late_error(answer.seq, time));
+        // The answering item's time is stored whatever the entry counts, so that a late error
+        // read later tests it whichever came first; with no new item it is the stored one
+        // (ADR-385).
         if let Some(logged) = self
             .window
             .iter_mut()
@@ -2650,6 +2648,11 @@ impl LinkState {
         if let Some(kept) = self.kept.get_mut(&answer.seq) {
             kept.answer_at = time;
         }
+        // A settling entry that adds no answer has nothing to judge.
+        if !answer.newly_answered && !answer.newly_matched {
+            return;
+        }
+        answer.set_since_error(self.since_late_error(answer.seq, time));
     }
 
     /// The response of owed exchange `seq` no longer counts as started in time: a later start
@@ -4029,7 +4032,26 @@ mod tests {
             let start = evidence
                 .response_started
                 .then(|| vci.and_then(|vci| vci.rx_start?.placed()));
-            kept.answer_at = kept.answer_time(final_response, &[], start);
+            // The entry's pendings, placed on their clock when they name one, as the log places
+            // them.
+            let pendings: Vec<super::super::timing::At> = evidence
+                .pending
+                .iter()
+                .map(|pending| {
+                    pending.clock.zip(pending.epoch.zip(pending.vci_us)).map(
+                        |(clock, (epoch, us))| {
+                            (
+                                clock,
+                                super::super::clocks::Placed {
+                                    epoch,
+                                    unwrapped: i64::try_from(us).unwrap_or(i64::MAX),
+                                },
+                            )
+                        },
+                    )
+                })
+                .collect();
+            kept.answer_at = kept.answer_time(final_response, &pendings, start);
         }
         state.log(&entry, evidence, clears, kept.answer_at);
         (entry, kept)
@@ -4951,6 +4973,53 @@ mod tests {
             assert_eq!(answer.since_error, counts, "{late_us}");
             assert_eq!(answer.newly_matched, counts, "{late_us}");
             assert_eq!(state.kept(2).unwrap().answer_at, device_time(0, late_us));
+        }
+    }
+
+    /// ADR-385: an owed exchange's final response, settled after its pending already counted as
+    /// a matched answer, stores its time, so a late error read afterwards tests it by that time:
+    /// the outcome does not depend on which of the two was read first.
+    #[test]
+    fn a_later_answer_settled_before_the_error_is_read_is_tested_by_its_own_time() {
+        for (late_us, counts) in [(7_000, true), (4_500, false)] {
+            let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+            silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            let mut other = judged(forwarding(evidence(
+                &[0x22, 0xF1, 0x87],
+                End::Positive(vec![0x62, 0xF1, 0x87, 0x41]),
+            )));
+            other.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            let mut state = LinkState::default();
+            log_kept(&mut state, 1, timed(other, Some(1_000), Some(1_200)));
+            // Its entry holds a forwarded pending with no clock: a matched answer at the entry,
+            // whose time is unknown.
+            let mut pended = silent.clone();
+            pended.pending = vec![Pending {
+                vci_us: None,
+                clock: None,
+                agent_us: 3_000,
+                epoch: None,
+                since_previous_ms: None,
+            }];
+            let (entry, kept) = log_kept(&mut state, 2, pended);
+            assert!(entry.matched_answer() && kept.matched);
+            assert_eq!(kept.answer_at, AnswerTime::Unknown);
+            state.keep(2, kept);
+            // The final response first: it counts as nothing new, but its time is stored.
+            let kept = state.kept(2).unwrap().clone();
+            let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
+            let history = state.history_settling(&response, 2);
+            let entry = ExchangeEntry::build(2, response, history);
+            let mut answer = entry.settled_answer(&kept);
+            assert!(!answer.newly_answered && !answer.newly_matched);
+            let time =
+                kept.answer_time(Some(Some(placed_at(Clock::Device, 0, late_us))), &[], None);
+            state.judge_answer(&mut answer, time);
+            assert_eq!(state.kept(2).unwrap().answer_at, device_time(0, late_us));
+            // Then the error, at 5 000: the recount tests the stored time.
+            read_late_error(&mut state, 4, placed_at(Clock::Device, 0, 5_000));
+            let logged = state.window.iter().find(|logged| logged.seq == 2).unwrap();
+            assert_eq!(state.counts_since_error(logged), counts, "{late_us}");
         }
     }
 

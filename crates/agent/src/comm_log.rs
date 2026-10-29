@@ -3880,6 +3880,18 @@ impl Inner {
                     "The VCI reconnected in a later run of the agent; the time since the loss was measured on the boot clock and is recorded with the comparison it gives, but the log does not judge a loss from it, since a suspend of the PC can put it off;{SUPPLY_NOT_EXCLUDED}"
                 ),
             )
+        } else if readings
+            && fit.is_some()
+            && (drift_from != "profile" || clock_margin_from != "profile")
+        {
+            // The agent's defaults stand in for the VCI's clock error, which no profile gives, so
+            // the comparison is recorded and judges nothing (ADR-378).
+            (
+                PowerKept::Unknown,
+                format!(
+                    "The time since the loss was measured and is recorded with the comparison it gives, but no profile gives the VCI's drift bound and clock margin, so nothing bounds the error of its clock and the log does not judge a loss from it;{SUPPLY_NOT_EXCLUDED}"
+                ),
+            )
         } else {
             power_kept(readings, fit, serial_match)
         };
@@ -4471,8 +4483,9 @@ mod tests {
         }
     }
 
-    /// A run whose VCI has a profile that gives its timing margin, 2 ms, so the log judges its
-    /// times (ADR-377); the drift bound and the clock margin are the agent's defaults.
+    /// A run whose VCI has a profile that gives its margins: a timing margin of 2 ms, so the
+    /// log judges its times (ADR-377), and a drift bound of 100 ppm and a clock margin of 1 ms,
+    /// so it judges a loss's settlement (ADR-378).
     fn facts() -> RunFacts {
         RunFacts {
             job_id: "comm-log-test".to_owned(),
@@ -4484,7 +4497,8 @@ mod tests {
             vci: None,
             margins: VciMargins {
                 timing_margin_us: Some(2_000),
-                ..VciMargins::default()
+                drift_bound_ppm: Some(100),
+                clock_margin_us: Some(1_000),
             },
         }
     }
@@ -9839,8 +9853,39 @@ mod tests {
         assert_eq!(entry["clock"]["gap_from"], "agent");
         assert_eq!(entry["clock"]["expected_us"], 1_835_511_040u64 + 31_209_200);
         assert_eq!(entry["clock"]["tolerance_us"], 2_000 + 3_120);
-        assert_eq!(entry["clock"]["drift_from"], "default");
+        assert_eq!(entry["clock"]["drift_from"], "profile");
         assert_eq!(entry["clock"]["fits_carried_on"], true);
+        // With the agent's defaults for the drift bound or the clock margin, which no profile
+        // gives, the same comparison is recorded and judges nothing (ADR-378).
+        for margins in [
+            VciMargins {
+                timing_margin_us: Some(2_000),
+                ..VciMargins::default()
+            },
+            VciMargins {
+                drift_bound_ppm: Some(100),
+                ..VciMargins::default()
+            },
+        ] {
+            let entry = settle(
+                77,
+                RunFacts {
+                    margins,
+                    ..dpdu_facts()
+                },
+                Some(carried),
+            );
+            assert_eq!(entry["power_kept"], "unknown", "{entry}");
+            assert_eq!(entry["classification"], "undetermined", "{entry}");
+            assert_eq!(entry["clock"]["fits_carried_on"], true, "{entry}");
+            assert!(
+                entry["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("no profile gives the VCI's drift bound and clock margin"),
+                "{entry}"
+            );
+        }
         assert_eq!(entry["clock"]["fits_restarted"], false);
         assert_eq!(entry["clock"]["last_before"]["epoch"], 4);
         // The reading opens the clock's first epoch of the run, after the log's largest.

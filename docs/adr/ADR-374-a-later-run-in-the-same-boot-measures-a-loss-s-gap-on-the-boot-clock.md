@@ -65,23 +65,19 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    the reading is then compared with nothing, `round_trip_us` is `null` and `power_kept` is
    `unknown`.
 
-5. **A gap on the boot clock shows no power loss.** Such a gap may be off by a second or more
-   when it spans a suspend of the PC (Consequences). A clock that carried on can read as low
-   as ADR-373's restart test allows: past its 32-bit wrap during the gap, or from a last time
-   just after the wrap or its start. With a gap that is off, such a reading fits only the
-   restart test, and the loss would read as a power loss. So a gap measured on the boot clock
-   settles a loss as `power_kept` `true` or `unknown`, never `false`: a reading that fits a
-   restart and not a clock that carried on leaves it `unknown`. The error matters for kept
-   power too, in one case: a clock that started again during the gap reads no more than the
-   true gap, so it can read where a clock that carried on would only when the clock's last
-   time before the loss lies within the gap's error and the tolerance. The log takes that
-   error as two seconds (the real-time clock's whole second at each end of the sleep, and the
-   kernel's adjustment between it and the system time), and such a young clock on a boot clock
-   gap leaves `power_kept` `unknown` as well. Otherwise the gap's error at worst leaves a clock
-   that carried on `unknown`. A gap on the agent's clock, within one agent
-   epoch, is exact and settles as ADR-373 says, `false` included. The maintainer chose this
-   (2026-10-29) over bounding the gap's error. ADR-373 measured no gap across runs, so the
-   case did not arise before.
+5. **A gap with a suspend in it is compared with nothing.** A gap that spans a suspend of the
+   PC is only as exact as the kernel's measure of the sleep (Consequences), and a clock that
+   carried on past its wrap, or one that started again just after the clock's start, can read
+   within that error of the other outcome, so neither a kept power nor a power loss can be
+   shown from such a gap. The log therefore records, beside each boot time, how long the
+   machine had slept since its boot: the boot clock less the system's monotonic clock, which
+   stops during a suspend (`slept_us` in the record and in each read of `vci_loss_settled`).
+   When the reconnect's figure exceeds the loss's by more than the reads' jitter (1 ms), or a
+   boot clock gap has no such figure, `vci_loss_settled` records the difference
+   (`slept_in_gap_us`) and compares nothing: `power_kept` is `unknown`. A gap without a suspend
+   is exact, on the boot clock as on the agent's, and settles as ADR-373 says, `false`
+   included. The maintainer chose this (2026-10-29) over bounding the sleep's error. ADR-373
+   measured no gap across runs, so the case did not arise before.
 
 ## Consequences
 
@@ -95,12 +91,11 @@ come from the same boot of the machine, since such a clock starts over at a rebo
   tolerance does not yet take in.
 - A gap that spans a suspend of the PC is only as exact as the kernel's measure of the sleep.
   A machine whose clock source stops in suspend (most x86 machines) adds the sleep time from
-  the real-time clock, which counts whole seconds, so the gap can be off by up to about a
-  second, against a tolerance of a few milliseconds plus the drift bound over the gap. Such a
-  loss then fits no clock that carried on, and stays `unknown` (item 5 shows no power loss
-  from such a gap): the error fails safe, but a VCI that kept its power
-  across a suspend of the PC is not shown to have kept it there. Telling such a
-  gap apart, and widening its tolerance by the sleep's error, is follow-up work.
+  the real-time clock, which counts whole seconds, and the kernel's adjustment between that
+  clock and the system time can add more. So a VCI lost while the PC slept, or before a
+  suspend that came before the reconnect, settles as `unknown` (item 5), however it fared:
+  the common case of a laptop that suspends while the VCI keeps its power is not shown kept.
+  Settling such a loss needs a bound on the sleep's error, which is follow-up work.
 - The log keeps one entry per growth of the offset, one per run of missing samples, and the
   first sample after such a run. On a machine whose
   clock reads are slow enough to miss the jitter bound often (some virtual machines), the

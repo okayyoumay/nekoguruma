@@ -22,19 +22,38 @@ pub(crate) fn id() -> Option<String> {
 pub(crate) fn now_us() -> Option<u64> {
     #[cfg(target_os = "linux")]
     {
-        let mut time = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: 0,
-        };
-        // SAFETY: `clock_gettime` writes one `timespec` through a pointer to a live, writable
-        // one, and reads nothing else.
-        let read = unsafe { libc::clock_gettime(libc::CLOCK_BOOTTIME, &mut time) };
-        if read != 0 {
-            return None;
-        }
-        let secs = u64::try_from(time.tv_sec).ok()?;
-        let nanos = u64::try_from(time.tv_nsec).ok()?;
-        secs.checked_mul(1_000_000)?.checked_add(nanos / 1_000)
+        read(libc::CLOCK_BOOTTIME)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Reads `clock` in microseconds.
+#[cfg(target_os = "linux")]
+fn read(clock: libc::clockid_t) -> Option<u64> {
+    let mut time = libc::timespec {
+        tv_sec: 0,
+        tv_nsec: 0,
+    };
+    // SAFETY: `clock_gettime` writes one `timespec` through a pointer to a live, writable one,
+    // and reads nothing else.
+    let read = unsafe { libc::clock_gettime(clock, &mut time) };
+    if read != 0 {
+        return None;
+    }
+    let secs = u64::try_from(time.tv_sec).ok()?;
+    let nanos = u64::try_from(time.tv_nsec).ok()?;
+    secs.checked_mul(1_000_000)?.checked_add(nanos / 1_000)
+}
+
+/// The system's monotonic clock in microseconds, which stops during a suspend, when the system
+/// gives it; with [`now_us`] it shows how long the machine has slept.
+pub(crate) fn monotonic_us() -> Option<u64> {
+    #[cfg(target_os = "linux")]
+    {
+        read(libc::CLOCK_MONOTONIC)
     }
     #[cfg(not(target_os = "linux"))]
     {
@@ -53,5 +72,8 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         let second = now_us().expect("CLOCK_BOOTTIME");
         assert!(second >= first + 1_000, "{first} {second}");
+        // The boot clock leads the monotonic one by the time the machine has slept.
+        let monotonic = monotonic_us().expect("CLOCK_MONOTONIC");
+        assert!(now_us().unwrap() >= monotonic);
     }
 }

@@ -743,6 +743,9 @@ struct VciLoss {
 struct LossBoot {
     id: String,
     us: u64,
+    /// How long the machine had slept since its boot at that time, when the system gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slept_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -808,6 +811,9 @@ struct LossTime {
     /// When on the machine's boot clock the time was read, when the system gives the clock.
     #[serde(skip_serializing_if = "Option::is_none")]
     boot_us: Option<u64>,
+    /// How long the machine had slept since its boot then, when the system gives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slept_us: Option<u64>,
 }
 
 /// The inputs and the comparison of `vci_loss_settled`, so a reader can redo it.
@@ -820,6 +826,9 @@ struct LossClock {
     /// The loss's boot and the reconnect's are the same; `null` when the system gave no boot
     /// id on either side.
     boot_match: Option<bool>,
+    /// How much longer the machine had slept by the reconnect than by the loss; a gap with a
+    /// suspend in it is compared with nothing.
+    slept_in_gap_us: Option<u64>,
     /// The gap between the two reads: on the boot clock when both lie in one boot, else on the
     /// agent's clock when both lie in one agent epoch, else `null`.
     gap_us: Option<u64>,
@@ -853,33 +862,22 @@ struct VciLossSettledEntry {
     reason: String,
 }
 
-/// How far a gap measured on the boot clock may be off across a suspend (ADR-374 item 5): the
-/// real-time clock's whole second at each end of the sleep, and the kernel's adjustment between
-/// it and the system time, taken at two seconds.
-const BOOT_GAP_ERROR_US: u64 = 2_000_000;
+/// How much more the machine may have slept by the reconnect than by the loss before the boot
+/// clock's gap counts as spanning a suspend (ADR-374 item 5): the two clocks run at one rate but
+/// for a suspend, so a growth beyond the reads' own jitter is a sleep.
+const SLEPT_JITTER_US: u64 = 1_000;
 
 const SUPPLY_NOT_EXCLUDED: &str = " a drop of the vehicle's supply is not excluded.";
 
 /// Whether the power was kept, and why, from the comparison: whether a time of the VCI's own
 /// clock, as the worker names it (ADR-353), was read on both sides of the loss, the `fit` when
-/// the gap could be measured, whether the boot clock measured it, and whether the serial numbers
-/// match. Nothing here depends on the
+/// the gap could be measured, and whether the serial numbers match. Nothing here depends on the
 /// worker's API (design principle 6): a worker whose clock reading is not the VCI's own time
 /// base names it `worker`, and one that gives no serial number gives none.
-/// A gap the boot clock measured, which a suspend can put off by up to [`BOOT_GAP_ERROR_US`]:
-/// `young` when the VCI clock's last time before the loss lies within that error and the
-/// tolerance, so that a clock that started again during the loss can read where one that
-/// carried on would.
-#[derive(Debug, Clone, Copy)]
-struct GapOnBoot {
-    young: bool,
-}
-
 fn power_kept(
     readings: bool,
     fit: Option<clocks::LossFit>,
     serial_match: Option<bool>,
-    gap_on_boot: Option<GapOnBoot>,
 ) -> (PowerKept, String) {
     let unknown = |why: &str| (PowerKept::Unknown, format!("{why};{SUPPLY_NOT_EXCLUDED}"));
     if !readings {
@@ -893,18 +891,12 @@ fn power_kept(
         );
     };
     match (fit.carried_on, fit.restarted, serial_match) {
-        (true, false, Some(true)) if gap_on_boot.is_some_and(|gap| gap.young) => unknown(
-            "The VCI's clock reads as one that carried on would, but it was younger at the loss than the boot clock's gap may be off, so a clock that started again during the loss could read the same",
-        ),
         (true, false, Some(true)) => (
             PowerKept::Yes,
             "The VCI kept its power across the loss, so the vehicle's supply did not drop: the loss was the PC's connection to the VCI.".to_owned(),
         ),
         (true, false, _) => unknown(
             "The VCI's clock carried on, but its serial number does not show that the same VCI reconnected",
-        ),
-        (false, true, _) if gap_on_boot.is_some() => unknown(
-            "The VCI's clock reads as one that started again would, but the gap was measured on the boot clock, which a suspend of the PC can put off by seconds, and a clock that carried on past its wrap reads as low; such a gap shows no power loss",
         ),
         (false, true, _) => (
             PowerKept::No,
@@ -1342,6 +1334,9 @@ struct Inner {
     /// For tests: the boot clock reads this plus the agent's monotonic time.
     #[cfg(test)]
     boot_offset_us: Option<u64>,
+    /// For tests: the system's monotonic clock reads this plus the agent's.
+    #[cfg(test)]
+    system_offset_us: u64,
     /// For tests: this many tries of a boot clock sample come out delayed.
     #[cfg(test)]
     delayed_tries: usize,
@@ -1463,6 +1458,8 @@ impl CommLog {
             #[cfg(test)]
             boot_offset_us: None,
             #[cfg(test)]
+            system_offset_us: 0,
+            #[cfg(test)]
             delayed_tries: 0,
         };
         // The offset between the clocks when the agent's clock began.
@@ -1477,12 +1474,15 @@ impl CommLog {
     }
 
     /// Makes the log see the machine's boot as `id`, with a boot clock that reads `offset_us`
-    /// plus the agent's monotonic time; `None` for a system that gives neither.
+    /// plus the agent's monotonic time and a machine that has not slept; `None` for a system
+    /// that gives neither.
     #[cfg(test)]
     fn boot_as(&self, boot: Option<(&str, u64)>) {
         let mut inner = self.lock();
         inner.boot_id = boot.map(|(id, _)| id.to_owned());
         inner.boot_offset_us = boot.map(|(_, offset)| offset);
+        // A machine that has not slept: the system's clock reads what the boot clock does.
+        inner.system_offset_us = boot.map_or(0, |(_, offset)| offset);
         inner.boot_offsets.clear();
         // As though the boot clock had read so since the log began.
         inner.sample_boot_at(0);
@@ -3741,6 +3741,7 @@ impl Inner {
                     Some(LossBoot {
                         id: self.boot_id.clone()?,
                         us: self.boot_at(last.time.read_us)?,
+                        slept_us: self.slept_at(last.time.read_us),
                     })
                 });
         }
@@ -3787,6 +3788,7 @@ impl Inner {
                     read_us: reading.read.monotonic_us,
                     agent_epoch: reading.read.epoch,
                     boot_us: self.boot_at(reading.read.monotonic_us),
+                    slept_us: self.slept_at(reading.read.monotonic_us),
                 }),
             None => None,
         };
@@ -3801,6 +3803,7 @@ impl Inner {
                 read_us: last.time.read_us,
                 agent_epoch: loss.agent_epoch,
                 boot_us: loss.boot.as_ref().map(|boot| boot.us),
+                slept_us: loss.boot.as_ref().and_then(|boot| boot.slept_us),
             });
         // The VCI's own clock on both sides of the loss.
         let reading = placed;
@@ -3826,6 +3829,21 @@ impl Inner {
                 .then(|| (reading.read_us.saturating_sub(last.read_us), "agent"));
             boot.or(agent)
         });
+        // How much longer the machine had slept by the reconnect than by the loss. A gap with a
+        // suspend in it is compared with nothing: the kernel measures a sleep only to about a
+        // second, and the agent's clock leaves it out (ADR-374 item 5).
+        let slept_in_gap_us = last
+            .as_ref()
+            .zip(device)
+            .filter(|_| boot_match == Some(true))
+            .and_then(|(last, reading)| last.slept_us.zip(reading.slept_us))
+            .map(|(before, after)| after.saturating_sub(before));
+        let slept = match (gap, slept_in_gap_us) {
+            (Some(_), Some(slept)) => slept > SLEPT_JITTER_US,
+            // A boot clock gap whose sleep is not known may hold one.
+            (Some((_, "boot")), None) => true,
+            _ => false,
+        };
         let (drift_ppm, drift_from) = self.margins.drift_bound();
         let (clock_margin_us, clock_margin_from) = self.margins.clock_margin();
         let fit = last
@@ -3846,8 +3864,15 @@ impl Inner {
             .serial_number
             .zip(self.serial_number)
             .map(|(before, after)| before == after);
-        let fit = fit.filter(|_| !unbounded);
-        let (power_kept, reason) = if readings && unbounded {
+        let fit = fit.filter(|_| !unbounded && !slept);
+        let (power_kept, reason) = if readings && slept {
+            (
+                PowerKept::Unknown,
+                format!(
+                    "The PC slept during the loss, and a suspend leaves the time since the loss uncertain, so the reading is compared with nothing;{SUPPLY_NOT_EXCLUDED}"
+                ),
+            )
+        } else if readings && unbounded {
             (
                 PowerKept::Unknown,
                 format!(
@@ -3855,17 +3880,7 @@ impl Inner {
                 ),
             )
         } else {
-            power_kept(
-                readings,
-                fit,
-                serial_match,
-                matches!(gap, Some((_, "boot"))).then(|| GapOnBoot {
-                    young: last.as_ref().zip(fit).is_some_and(|(last, fit)| {
-                        u128::from(last.us)
-                            <= u128::from(BOOT_GAP_ERROR_US) + u128::from(fit.tolerance_us)
-                    }),
-                }),
-            )
+            power_kept(readings, fit, serial_match)
         };
         let mut exchanges: Vec<LossSettled> = loss
             .ended
@@ -3918,6 +3933,7 @@ impl Inner {
                 last_before: last,
                 reading,
                 boot_match,
+                slept_in_gap_us,
                 gap_us: gap.map(|(gap, _)| gap),
                 gap_from: gap.map(|(_, from)| from),
                 round_trip_us,
@@ -4007,6 +4023,28 @@ impl Inner {
     /// The agent's monotonic time since the log began, in this agent epoch.
     fn monotonic_us(&self) -> u64 {
         u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// How long the machine had slept since its boot when the agent's clock read
+    /// `monotonic_us`: the boot time then less the system's monotonic time then, which runs
+    /// beside the agent's clock but for its origin.
+    fn slept_at(&mut self, monotonic_us: u64) -> Option<u64> {
+        let boot_us = self.boot_at(monotonic_us)?;
+        let agent_now_us = self.monotonic_us();
+        let system_now_us = self.system_monotonic_us(agent_now_us)?;
+        let origin_us = system_now_us.checked_sub(agent_now_us)?;
+        boot_us.checked_sub(monotonic_us.checked_add(origin_us)?)
+    }
+
+    /// The system's monotonic clock now, the agent's reading `agent_now_us`.
+    fn system_monotonic_us(&self, agent_now_us: u64) -> Option<u64> {
+        #[cfg(test)]
+        if self.boot_id.is_none() || self.boot_offset_us.is_some() {
+            return Some(agent_now_us + self.system_offset_us);
+        }
+        #[cfg(not(test))]
+        let _ = agent_now_us;
+        boot::monotonic_us()
     }
 
     /// The boot clock now, the agent's monotonic clock reading `agent_now_us`.
@@ -9503,7 +9541,7 @@ mod tests {
             // Read at agent time 0, so at the boot clock's offset.
             assert_eq!(
                 record["boot"],
-                serde_json::json!({"id": "boot-1", "us": 7_000_000}),
+                serde_json::json!({"id": "boot-1", "us": 7_000_000, "slept_us": 0}),
                 "{record}"
             );
         }
@@ -9743,36 +9781,6 @@ mod tests {
         assert_eq!(log.round_trip_us(asked, answered), None);
     }
 
-    /// A gap measured on the boot clock shows no power loss (ADR-374 item 5): a suspend can put
-    /// it off by seconds, and a clock that carried on past its wrap then reads as low as a
-    /// restarted one. The same fit on the agent's clock does show it. Nor does such a gap show
-    /// kept power for a clock younger at the loss than the gap's error.
-    #[test]
-    fn a_gap_on_the_boot_clock_shows_no_restart() {
-        let boot = |young| Some(GapOnBoot { young });
-        // A 600 s gap past the wrap, measured a second long.
-        let fit = clocks::loss_fit(4_000_000_000, 305_032_704, 601_000_000, 0, 100, 1_000);
-        assert!(fit.restarted && !fit.carried_on, "{fit:?}");
-        let (kept, reason) = power_kept(true, Some(fit), Some(true), boot(false));
-        assert_eq!(kept, PowerKept::Unknown, "{reason}");
-        assert!(reason.contains("boot clock"), "{reason}");
-        assert_eq!(
-            power_kept(true, Some(fit), Some(true), None).0,
-            PowerKept::No
-        );
-        // A clock that started again 0.5 s into a 10 s gap measured 9 s long reads where one
-        // that carried on from 0.5 s would: a clock that young shows no kept power.
-        let fit = clocks::loss_fit(500_000, 9_500_000, 9_000_000, 1_000, 100, 1_000);
-        assert!(fit.carried_on && !fit.restarted, "{fit:?}");
-        let (kept, reason) = power_kept(true, Some(fit), Some(true), boot(true));
-        assert_eq!(kept, PowerKept::Unknown, "{reason}");
-        assert!(reason.contains("younger"), "{reason}");
-        assert_eq!(
-            power_kept(true, Some(fit), Some(true), boot(false)).0,
-            PowerKept::Yes
-        );
-    }
-
     /// A sample that every try takes delayed is left out, and a time read then has no boot time:
     /// a suspend may have come since the last sample, so neither neighbour's offset is its own.
     #[test]
@@ -9880,32 +9888,42 @@ mod tests {
                  {{\"seq\":2,\"event\":\"job_end\"}}\n"
             )
         };
-        let with_boot = ",\"boot\":{\"id\":\"boot-1\",\"us\":5000000}";
+        // The machine had not slept by then.
+        let with_boot = ",\"boot\":{\"id\":\"boot-1\",\"us\":5000000,\"slept_us\":0}";
         // The reconnect is read 40 s later on the boot clock; the clock was read up to 3 ms
         // before its answer, `ahead_us` past the last time plus the gap.
-        let settle_with = |record: &str, boot: Option<&str>, ahead_us: i64, round_trip_us| {
-            let sink = Recording::default();
-            let log = CommLog::over(Box::new(sink.clone()), record.as_bytes());
-            assert!(log.loss_to_settle());
-            log.begin(&dpdu_facts(), RunKind::Resume);
-            let read = log.now();
-            log.boot_as(boot.map(|id| (id, 45_000_000 - read.monotonic_us)));
-            let us = 1_835_511_040 + 40_000_000 + ahead_us;
-            let reading = ConnectReading {
-                time: exchange::VciTime::new(us as u64, Some(exchange::Clock::Device)),
-                read,
-                round_trip_us,
+        let settle_with =
+            |record: &str, boot: Option<&str>, ahead_us: i64, round_trip_us, slept_us: u64| {
+                let sink = Recording::default();
+                let log = CommLog::over(Box::new(sink.clone()), record.as_bytes());
+                assert!(log.loss_to_settle());
+                log.begin(&dpdu_facts(), RunKind::Resume);
+                let read = log.now();
+                log.boot_as(boot.map(|id| (id, 45_000_000 - read.monotonic_us)));
+                // A suspend before the reconnect's read, which then comes after it.
+                let read = if slept_us > 0 {
+                    log.suspend(slept_us);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    log.now()
+                } else {
+                    read
+                };
+                let us = 1_835_511_040 + 40_000_000 + ahead_us;
+                let reading = ConnectReading {
+                    time: exchange::VciTime::new(us as u64, Some(exchange::Clock::Device)),
+                    read,
+                    round_trip_us,
+                };
+                log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
+                let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
+                taken
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .find(|line| line["event"] == "vci_loss_settled")
+                    .unwrap()
             };
-            log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
-            let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
-            taken
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .find(|line| line["event"] == "vci_loss_settled")
-                .unwrap()
-        };
         let settle = |record: &str, boot: Option<&str>, ahead_us: i64| {
-            settle_with(record, boot, ahead_us, Some(3_000))
+            settle_with(record, boot, ahead_us, Some(3_000), 0)
         };
         let entry = settle(&record(with_boot), Some("boot-1"), -6_000);
         assert_eq!(entry["power_kept"], true, "{entry}");
@@ -9919,9 +9937,8 @@ mod tests {
         assert_eq!(clock["round_trip_us"], 3_000, "{entry}");
         // Twice the margin, the round trip, and 100 ppm of 40 s.
         assert_eq!(clock["tolerance_us"], 2_000 + 3_000 + 4_000, "{entry}");
-        // Just past that tolerance, it carried on no longer.
         // A reading whose round trip nothing bounds is compared with nothing.
-        let entry = settle_with(&record(with_boot), Some("boot-1"), -6_000, None);
+        let entry = settle_with(&record(with_boot), Some("boot-1"), -6_000, None, 0);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
         assert!(
@@ -9931,6 +9948,22 @@ mod tests {
                 .contains("could not bound"),
             "{entry}"
         );
+        // A gap with a suspend in it is compared with nothing (ADR-374 item 5).
+        let entry = settle_with(
+            &record(with_boot),
+            Some("boot-1"),
+            -6_000,
+            Some(3_000),
+            5_000_000,
+        );
+        assert_eq!(entry["clock"]["slept_in_gap_us"], 5_000_000, "{entry}");
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("slept"),
+            "{entry}"
+        );
+        // Just past that tolerance, it carried on no longer.
         let entry = settle(&record(with_boot), Some("boot-1"), -9_001);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert_eq!(entry["clock"]["fits_carried_on"], false, "{entry}");

@@ -264,13 +264,16 @@ is not marked "final", at least one item would be left after it, and nothing is 
 At most one item is prepared at a time.
 
 1. In the session's own checkout, list the files the current PR changes, the backlog files aside:
-   `git fetch origin && git diff --name-only origin/main...HEAD`. Pick as step 2's "Backlog item"
-   does, passing `next-task` also `avoid=` followed by those files. Also leave out an item that
-   needs the current PR's change. Do not handle Dependabot PRs here; step 2 does that at the next
-   iteration. If nothing passes, prepare nothing and make no worktree.
+   `git fetch origin && git diff --name-only origin/main...HEAD`. Change nothing there.
 2. Make a local worktree from `origin/main` on a local branch that is never pushed:
-   `git worktree add ../loop-next origin/main -B loop-next`. Work only there; the session's
-   branch stays on the current PR.
+   `git worktree add ../loop-next origin/main -B loop-next`, and work only there from now on; the
+   session's branch stays on the current PR. Pick as step 2's "Backlog item" does, passing
+   `next-task` also `avoid=` followed by the files just listed; any backlog edits the pick makes
+   go into the worktree. Also leave out an item that needs the current PR's change. Do not handle
+   Dependabot PRs here; step 2 does that at the next iteration. If nothing passes, prepare
+   nothing: remove the worktree and the local branch (`git worktree remove --force ../loop-next`,
+   `git branch -D loop-next`), and leave any backlog edits the pick made to the next iteration's
+   step 2.
 3. Implement the item as step 4 does, the case-table gate and the backlog edits included, through
    Step 3's local checks of `pr-review-loop` and its `edge-case-hunter` pass, and commit in the
    worktree. Do not push, open a PR or request a review. Name the item in the current PR's run

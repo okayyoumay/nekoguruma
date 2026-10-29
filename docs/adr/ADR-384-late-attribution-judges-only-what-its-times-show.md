@@ -72,7 +72,10 @@ Four judgements rest on an ordering their times do not show:
    and epoch. An answer whose time is shown at or before an error's, on that error's clock and
    epoch, is never counted there. This holds also when its exchange had no time on that clock
    at its entry and the error was placed before it: the agent stopped waiting, and the result
-   read at job end carries the time. Such an answer stays out of the matched answers when its
+   read at job end carries the time. The answer's time is that of the item that answers: the
+   final response, else the latest pending. A transmit or start indication answers nothing
+   (ADR-354), so one read after the error does not make an earlier pending count since it.
+   Such an answer stays out of the matched answers when its
    exchange's owners are freed later, for example by an earlier owner's final response. An answer before the error, or one whose order against it is not shown, is not
    counted there: on another clock or epoch, with no time, or after an error that could not be
    placed. The maintainer chose this (2026-10-29). A start is no matched answer, as before

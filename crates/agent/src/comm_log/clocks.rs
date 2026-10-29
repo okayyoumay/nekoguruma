@@ -304,8 +304,8 @@ pub(crate) struct LossFit {
     /// The reading is no more than the gap plus the tolerance: a clock that started again from
     /// zero during the gap.
     pub restarted: bool,
-    /// The reading lies further from what a clock that carried on reads than the tolerance
-    /// plus the gap's own error. Only then does a reading that fits a restart show one: a clock
+    /// The reading lies further from what a clock that carried on reads than the tolerance,
+    /// the gap's own error and the drift bound over that error. Only then does a reading that fits a restart show one: a clock
     /// that carried on past its wrap, or from a time just after it, reads as low as a restarted
     /// one, and a gap that is off by its error moves it out of the tolerance.
     pub excludes_carried_on: bool,

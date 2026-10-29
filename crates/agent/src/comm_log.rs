@@ -837,8 +837,8 @@ struct LossClock {
     /// How far the gap may be off: two seconds for one measured on the boot clock, whose sleep
     /// the kernel may add in whole seconds, else 0.
     gap_error_us: Option<u64>,
-    /// The reading lies beyond the tolerance and the gap's error from a clock that carried on,
-    /// so a reading that fits a restart shows one.
+    /// The reading lies beyond the tolerance, the gap's error and the drift bound over it from
+    /// a clock that carried on, so a reading that fits a restart shows one.
     excludes_carried_on: Option<bool>,
 }
 
@@ -9737,6 +9737,19 @@ mod tests {
         unknown(300_000, 600_300_000, 601_000_000);
         // Measured just under two seconds short, the clock at the drift bound over the true gap.
         unknown(3_694_467_296, 1_562_150, 600_000_000);
+        // At the bound itself, and a microsecond past it.
+        unknown(3_694_467_296, 1_562_200, 600_000_000);
+        let past = clocks::loss_fit(
+            3_694_467_296,
+            1_562_201,
+            600_000_000,
+            0,
+            BOOT_GAP_ERROR_US,
+            100,
+            1_000,
+        );
+        assert!(past.excludes_carried_on, "{past:?}");
+        assert_eq!(power_kept(true, Some(past), Some(true)).0, PowerKept::No);
         // A clock that started again, far below what one that carried on reads.
         let fit = clocks::loss_fit(
             1_000_000_000,

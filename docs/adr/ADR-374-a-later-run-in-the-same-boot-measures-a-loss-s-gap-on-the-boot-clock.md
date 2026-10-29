@@ -65,21 +65,18 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    the reading is then compared with nothing, `round_trip_us` is `null` and `power_kept` is
    `unknown`.
 
-5. **A restart is shown only beyond the gap's error.** A gap measured on the boot clock may
-   be off by about a second either way when it spans a suspend (Consequences), and the
-   kernel's adjustment between the real-time clock and the system time can add to that; the
-   log takes the error as two seconds. A clock that
-   carried on can read as low as ADR-373's restart test allows: past its 32-bit wrap during the
-   gap, or from a last time just after the wrap or its start. With a gap that is off, such a
-   reading fits only the restart test, and the loss would read as a power loss. So the
-   comparison takes the gap's error, two seconds for a gap on the boot clock and none for one on
-   the agent's clock, and a reading that fits a restart shows one only when it lies further
-   than the tolerance, that error and the drift bound over it from what a clock that carried
-   on reads; otherwise
-   `power_kept` is `unknown`, not `false`. The test for a clock that carried on keeps the
-   tolerance alone, so the error never shows the power kept. `vci_loss_settled` records the
-   error (`gap_error_us`) and the result (`excludes_carried_on`). ADR-373 measured no gap
-   across runs, so the case did not arise before.
+5. **A gap on the boot clock shows no power loss.** Such a gap may be off by a second or more
+   when it spans a suspend of the PC (Consequences). A clock that carried on can read as low
+   as ADR-373's restart test allows: past its 32-bit wrap during the gap, or from a last time
+   just after the wrap or its start. With a gap that is off, such a reading fits only the
+   restart test, and the loss would read as a power loss. So a gap measured on the boot clock
+   settles a loss as `power_kept` `true` or `unknown`, never `false`: a reading that fits a
+   restart and not a clock that carried on leaves it `unknown`. The test for a clock that
+   carried on keeps the tolerance, so the gap's error never shows the power kept; at worst it
+   leaves a clock that carried on `unknown`. A gap on the agent's clock, within one agent
+   epoch, is exact and settles as ADR-373 says, `false` included. The maintainer chose this
+   (2026-10-29) over bounding the gap's error. ADR-373 measured no gap across runs, so the
+   case did not arise before.
 
 ## Consequences
 
@@ -95,8 +92,8 @@ come from the same boot of the machine, since such a clock starts over at a rebo
   A machine whose clock source stops in suspend (most x86 machines) adds the sleep time from
   the real-time clock, which counts whole seconds, so the gap can be off by up to about a
   second, against a tolerance of a few milliseconds plus the drift bound over the gap. Such a
-  loss then fits no clock that carried on, and stays `unknown` (item 5 keeps such a clock from
-  reading as restarted): the error fails safe, but a VCI that kept its power
+  loss then fits no clock that carried on, and stays `unknown` (item 5 shows no power loss
+  from such a gap): the error fails safe, but a VCI that kept its power
   across a suspend of the PC is not shown to have kept it there. Telling such a
   gap apart, and widening its tolerance by the sleep's error, is follow-up work.
 - The log keeps one entry per growth of the offset, one per run of missing samples, and the

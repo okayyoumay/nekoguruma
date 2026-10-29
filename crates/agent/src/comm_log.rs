@@ -835,12 +835,6 @@ struct LossClock {
     clock_margin_from: &'static str,
     fits_carried_on: Option<bool>,
     fits_restarted: Option<bool>,
-    /// How far the gap may be off: two seconds for one measured on the boot clock, whose sleep
-    /// the kernel may add in whole seconds, else 0.
-    gap_error_us: Option<u64>,
-    /// The reading lies beyond the tolerance, the gap's error and the drift bound over it from
-    /// a clock that carried on, so a reading that fits a restart shows one.
-    excludes_carried_on: Option<bool>,
 }
 
 /// `vci_loss_settled` (design 8.11 "Settlement", ADR-373).
@@ -859,22 +853,19 @@ struct VciLossSettledEntry {
     reason: String,
 }
 
-/// How far a gap measured on the boot clock may be off (ADR-374 item 5): the real-time clock's
-/// whole second at each end of a sleep, and the kernel's adjustment between it and the system
-/// time, taken at two seconds.
-const BOOT_GAP_ERROR_US: u64 = 2_000_000;
-
 const SUPPLY_NOT_EXCLUDED: &str = " a drop of the vehicle's supply is not excluded.";
 
 /// Whether the power was kept, and why, from the comparison: whether a time of the VCI's own
 /// clock, as the worker names it (ADR-353), was read on both sides of the loss, the `fit` when
-/// the gap could be measured, and whether the serial numbers match. Nothing here depends on the
+/// the gap could be measured, whether the boot clock measured it, and whether the serial numbers
+/// match. Nothing here depends on the
 /// worker's API (design principle 6): a worker whose clock reading is not the VCI's own time
 /// base names it `worker`, and one that gives no serial number gives none.
 fn power_kept(
     readings: bool,
     fit: Option<clocks::LossFit>,
     serial_match: Option<bool>,
+    gap_on_boot: bool,
 ) -> (PowerKept, String) {
     let unknown = |why: &str| (PowerKept::Unknown, format!("{why};{SUPPLY_NOT_EXCLUDED}"));
     if !readings {
@@ -895,8 +886,8 @@ fn power_kept(
         (true, false, _) => unknown(
             "The VCI's clock carried on, but its serial number does not show that the same VCI reconnected",
         ),
-        (false, true, _) if !fit.excludes_carried_on => unknown(
-            "The VCI's clock reads as low as one that started again, but also within the gap's error of one that carried on (a gap measured across a suspend of the PC may be off by seconds), so the reading does not show that it started again",
+        (false, true, _) if gap_on_boot => unknown(
+            "The VCI's clock reads as one that started again would, but the gap was measured on the boot clock, which a suspend of the PC can put off by seconds, and a clock that carried on past its wrap reads as low; such a gap shows no power loss",
         ),
         (false, true, _) => (
             PowerKept::No,
@@ -3820,12 +3811,6 @@ impl Inner {
         });
         let (drift_ppm, drift_from) = self.margins.drift_bound();
         let (clock_margin_us, clock_margin_from) = self.margins.clock_margin();
-        // A gap on the boot clock may span a suspend, whose sleep a kernel whose clock source
-        // stops in suspend adds from the real-time clock in whole seconds (ADR-374 item 5).
-        let gap_error_us = match gap {
-            Some((_, "boot")) => BOOT_GAP_ERROR_US,
-            _ => 0,
-        };
         let fit = last
             .as_ref()
             .zip(device)
@@ -3836,7 +3821,6 @@ impl Inner {
                     reading.us,
                     gap,
                     round_trip_us.unwrap_or_default(),
-                    gap_error_us,
                     drift_ppm,
                     clock_margin_us,
                 )
@@ -3854,7 +3838,12 @@ impl Inner {
                 ),
             )
         } else {
-            power_kept(readings, fit, serial_match)
+            power_kept(
+                readings,
+                fit,
+                serial_match,
+                matches!(gap, Some((_, "boot"))),
+            )
         };
         let mut exchanges: Vec<LossSettled> = loss
             .ended
@@ -3918,8 +3907,6 @@ impl Inner {
                 clock_margin_from,
                 fits_carried_on: fit.map(|fit| fit.carried_on),
                 fits_restarted: fit.map(|fit| fit.restarted),
-                gap_error_us: fit.map(|_| gap_error_us),
-                excludes_carried_on: fit.map(|fit| fit.excludes_carried_on),
             },
             serial_match,
             power_kept,
@@ -9645,9 +9632,6 @@ mod tests {
         assert_eq!(settled_exchanges(&entry), [(0, "system")]);
         assert_eq!(entry["clock"]["gap_us"], 31_209_200);
         assert_eq!(entry["clock"]["gap_from"], "agent");
-        // The agent's clock measures the gap with no error of its own.
-        assert_eq!(entry["clock"]["gap_error_us"], 0, "{entry}");
-        assert_eq!(entry["clock"]["excludes_carried_on"], false, "{entry}");
         assert_eq!(entry["clock"]["expected_us"], 1_835_511_040u64 + 31_209_200);
         assert_eq!(entry["clock"]["tolerance_us"], 2_000 + 3_120);
         assert_eq!(entry["clock"]["drift_from"], "default");
@@ -9737,54 +9721,21 @@ mod tests {
         assert_eq!(log.round_trip_us(asked, answered), None);
     }
 
-    /// A clock that carried on reads as low as a restarted one past its wrap, or from a time
-    /// just after it; with a gap off by a suspend's error, it fits only a restart, which then
-    /// shows nothing (ADR-374 item 5). A reading beyond that error shows the power was lost.
+    /// A gap measured on the boot clock shows no power loss (ADR-374 item 5): a suspend can put
+    /// it off by seconds, and a clock that carried on past its wrap then reads as low as a
+    /// restarted one. The same fit on the agent's clock does show it.
     #[test]
-    fn a_low_reading_within_the_gap_s_error_shows_no_restart() {
-        let unknown = |last, reading, gap| {
-            let fit = clocks::loss_fit(last, reading, gap, 0, BOOT_GAP_ERROR_US, 100, 1_000);
-            assert!(
-                fit.restarted && !fit.carried_on && !fit.excludes_carried_on,
-                "{fit:?}"
-            );
-            let (kept, reason) = power_kept(true, Some(fit), Some(true));
-            assert_eq!(kept, PowerKept::Unknown, "{reason}");
-            assert!(reason.contains("gap's error"), "{reason}");
-        };
+    fn a_gap_on_the_boot_clock_shows_no_restart() {
         // A 600 s gap past the wrap, measured a second long.
-        unknown(4_000_000_000, 305_032_704, 601_000_000);
-        // Measured a second short.
-        unknown(3_694_467_296, 500_000, 600_000_000);
-        // From a time just after the wrap, measured a second long.
-        unknown(300_000, 600_300_000, 601_000_000);
-        // Measured just under two seconds short, the clock at the drift bound over the true gap.
-        unknown(3_694_467_296, 1_562_150, 600_000_000);
-        // At the bound itself, and a microsecond past it.
-        unknown(3_694_467_296, 1_562_200, 600_000_000);
-        let past = clocks::loss_fit(
-            3_694_467_296,
-            1_562_201,
-            600_000_000,
-            0,
-            BOOT_GAP_ERROR_US,
-            100,
-            1_000,
+        let fit = clocks::loss_fit(4_000_000_000, 305_032_704, 601_000_000, 0, 100, 1_000);
+        assert!(fit.restarted && !fit.carried_on, "{fit:?}");
+        let (kept, reason) = power_kept(true, Some(fit), Some(true), true);
+        assert_eq!(kept, PowerKept::Unknown, "{reason}");
+        assert!(reason.contains("boot clock"), "{reason}");
+        assert_eq!(
+            power_kept(true, Some(fit), Some(true), false).0,
+            PowerKept::No
         );
-        assert!(past.excludes_carried_on, "{past:?}");
-        assert_eq!(power_kept(true, Some(past), Some(true)).0, PowerKept::No);
-        // A clock that started again, far below what one that carried on reads.
-        let fit = clocks::loss_fit(
-            1_000_000_000,
-            20_000_000,
-            600_000_000,
-            0,
-            BOOT_GAP_ERROR_US,
-            100,
-            1_000,
-        );
-        assert!(fit.excludes_carried_on);
-        assert_eq!(power_kept(true, Some(fit), Some(true)).0, PowerKept::No);
     }
 
     /// A sample that every try takes delayed is left out, and a time read then has no boot time:
@@ -9931,9 +9882,6 @@ mod tests {
         assert_eq!(clock["reading"]["boot_us"], 45_000_000, "{entry}");
         assert_eq!(clock["reading"]["agent_epoch"], 1, "{entry}");
         assert_eq!(clock["round_trip_us"], 3_000, "{entry}");
-        // The boot clock's gap may be off by two seconds (ADR-374 item 5).
-        assert_eq!(clock["gap_error_us"], 2_000_000, "{entry}");
-        assert_eq!(clock["excludes_carried_on"], false, "{entry}");
         // Twice the margin, the round trip, and 100 ppm of 40 s.
         assert_eq!(clock["tolerance_us"], 2_000 + 3_000 + 4_000, "{entry}");
         // Just past that tolerance, it carried on no longer.

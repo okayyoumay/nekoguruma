@@ -1259,6 +1259,21 @@ struct LinkEffect {
     answer_after_error: bool,
 }
 
+impl LinkEffect {
+    /// A session change or ECUReset that may have been carried out, though nothing shows it:
+    /// one whose answer the agent cannot use, or one sent, with its positive response
+    /// suppressed and no final response, whose silence is not classified `none` (no judged
+    /// timeout shows that the ECU accepted it, ADR-376). It ends the matched answers only.
+    fn unsure_restart(&self, classification: Classification) -> bool {
+        self.restarts_ecu
+            && (self.unusable
+                || (self.suppressed
+                    && !self.final_response
+                    && self.sent != Sent::NotSent
+                    && classification != Classification::None))
+    }
+}
+
 /// Whether `request` is one whose acceptance ends the earlier requests' evidence: a
 /// DiagnosticSessionControl or an ECUReset of any type (design 8.11 "Owed request", ADR-346
 /// item 6).
@@ -1699,8 +1714,10 @@ impl LinkState {
     ///   item 6), or one sent with its positive response suppressed and classified `none`, ends
     ///   the matched answers and the owed requests: all of them when its answer could belong to
     ///   none, otherwise those sent before the earliest request it could belong to.
-    /// - A response to such a request that was accepted but is unusable (a bad field) ends the
-    ///   matched answers only, since the ECU may be restarting but the agent cannot tell.
+    /// - A response to such a request that was accepted but is unusable (a bad field), or such
+    ///   a request sent with its positive response suppressed whose silence is not classified
+    ///   `none` (ADR-376), ends the matched answers only, since the ECU may be restarting but
+    ///   the agent cannot tell.
     /// - The exchange is owed when its request may have reached the ECU whole (`sent`
     ///   `confirmed` or `unknown`) and no final response is placed with it alone.
     pub(crate) fn record(&mut self, entry: &ExchangeEntry) {
@@ -1708,7 +1725,7 @@ impl LinkState {
         let accepting = effect.restarts_ecu
             && ((effect.positive && effect.final_response)
                 || (effect.suppressed && entry.classification == Classification::None));
-        let unsure_restart = effect.restarts_ecu && effect.unusable;
+        let unsure_restart = effect.unsure_restart(entry.classification);
         // An error that came before the final response leaves the response counted since it:
         // the error is applied first. Any other error ends the answer of its exchange.
         if let (true, Some(kind)) = (effect.answer_after_error, effect.link_error) {
@@ -2618,7 +2635,7 @@ impl ExchangeEntry {
     /// Whether its answer is a matched answer, as [`LinkState::record`] counts it.
     pub(crate) fn matched_answer(&self) -> bool {
         let effect = &self.effect;
-        let unsure_restart = effect.restarts_ecu && effect.unusable;
+        let unsure_restart = effect.unsure_restart(self.classification);
         effect.this_exchange
             && effect.bound_answer
             && !self.accepting()
@@ -2988,6 +3005,15 @@ pub(crate) fn settle_late_response(
             );
             if base.classification >= Undetermined {
                 (base.classification, format!("{late} {}", base.reason))
+            } else if at_limit && kept.evidence.absorbing() {
+                // A pending the VCI absorbed would have put the limit off (ADR-376).
+                (
+                    Undetermined,
+                    format!(
+                        "{late} The VCI ended its wait at P2, but it absorbs pendings: after a pending it absorbed it should have waited longer ({}); the two give the same times (H4).",
+                        severity_word(System)
+                    ),
+                )
             } else if at_limit {
                 (
                     Vehicle,
@@ -3206,8 +3232,50 @@ fn negative_note(code: Option<u8>) -> &'static str {
     }
 }
 
-/// The rows of the table, in its order, for the exchange's own outcome.
+/// Why the end of an exchange's wait, with no response, does not show that the limit in
+/// force ran out (ADR-376): `None` only for a receive timeout judged at the limit on one clock
+/// on a link that forwards pendings. The log presumes neither the VCI's timer nor, on J2534,
+/// the worker's right, nor that a pending the VCI absorbed restarted its wait.
+fn silence_open(evidence: &Evidence) -> Option<String> {
+    let mut open = Vec::new();
+    if evidence.timing.window != Window::TimeoutAtLimit {
+        open.push(
+            "the end of the wait is not judged against the limit in force on one clock, so it may have come early or late: the VCI's timer, or on a J2534 link the worker's, is not presumed right",
+        );
+    }
+    if evidence.absorbing() {
+        open.push(
+            "the VCI absorbs pendings, so a pending it absorbed may have come, and how its wait went on after one is not seen (H4)",
+        );
+    }
+    (!open.is_empty()).then(|| open.join("; and "))
+}
+
+/// The rows of the table, in its order, for the exchange's own outcome, with no outcome that
+/// a time not judged leaves open (ADR-376): a final response whose time is not judged may also
+/// have come after the limit in force with the VCI past its own limit, a `system` reading, so
+/// it is never `none` or `vehicle` on its own.
 fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
+    let (classification, mut reason) = rows(evidence, history);
+    let final_response = matches!(
+        evidence.end,
+        End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
+    );
+    if final_response
+        && evidence.timing.window == Window::NotJudged
+        && classification < Classification::Undetermined
+    {
+        reason.push_str(&format!(
+            " Its time is not judged, so it may also have come after the limit in force with the VCI past its own limit ({}); the log does not presume the VCI's timer right, so both readings stay.",
+            severity_word(Classification::System)
+        ));
+        return (Classification::Undetermined, reason);
+    }
+    (classification, reason)
+}
+
+/// [`row`] before a time that is not judged is taken into account.
+fn rows(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
     use Classification::{None as NoFault, System, Undetermined, Vehicle};
 
     let (sent, _) = sent_of(evidence, history);
@@ -3334,13 +3402,13 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         End::NoResponse if late => last_row(),
         End::NoResponse if suppressed && !this_exchange && !answers_listed => {
             let mut hidden = open_readings(evidence, history, sent, true);
-            if absorbing && !matches!(window, Window::TimeoutAtLimit | Window::WithinP2) {
+            // A timeout at P2 does not show that no pending came: the VCI's handling of one it
+            // absorbed is not seen (ADR-376).
+            if absorbing {
                 hidden.push("a pending the VCI absorbed may have obliged an answer (H4)");
             }
-            // The VCI's own timeout at P2 on one clock, or on a link that would have shown a
-            // pending, whose worker times P2 itself.
-            let timed_out_at_p2 =
-                window == Window::TimeoutAtLimit || (!absorbing && evidence.vci_ended);
+            // The VCI's own timeout judged at P2 on one clock.
+            let timed_out_at_p2 = window == Window::TimeoutAtLimit;
             if hidden.is_empty() && sent == Sent::Confirmed && timed_out_at_p2 {
                 // Sent, matched as earlier answers were, no link error, no pending hidden.
                 (
@@ -3349,11 +3417,20 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
                         "No response was expected, and none came: the request was sent, the ECU has answered requests matched this way, no link error came and no pending was hidden.",
                     ),
                 )
+            } else if hidden.is_empty() && timed_out_at_p2 {
+                // Only a partial send leaves this: any other send but a confirmed one is H1.
+                (
+                    Undetermined,
+                    format!(
+                        "No response was expected and none came, but {}, so the ECU may not have received the whole request.",
+                        send_phrase(sent).to_lowercase()
+                    ),
+                )
             } else if hidden.is_empty() {
                 (
                     Undetermined,
                     to_owned(
-                        "No response was expected and none came, and no hidden cause (H1 to H4) is open, but the VCI's receive timeout at P2 is not shown, so nothing shows the wait ran its course.",
+                        "No response was expected and none came, and no hidden cause (H1 to H4) is open, but no receive timeout is judged at P2 on one clock, so nothing shows the wait ran its course: the VCI's timer, or on a J2534 link the worker's, is not presumed right.",
                     ),
                 )
             } else {
@@ -3413,14 +3490,7 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         }
         // Not implemented: a negative response with a code the definition declares definitive
         // for an identification or guard read (`none`). Needs the definition's declared codes.
-        End::Positive(_) => {
-            let note = if window == Window::NotJudged {
-                " Its time is not judged: this rests on the one presumption that the VCI's own timer found it within the limit in force."
-            } else {
-                ""
-            };
-            (NoFault, format!("The ECU responded positively.{note}"))
-        }
+        End::Positive(_) => (NoFault, to_owned("The ECU responded positively.")),
         End::PositiveUnusable(_) => (
             Undetermined,
             to_owned("The ECU's response does not match the definition."),
@@ -3470,7 +3540,14 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
             ),
         ),
         End::NoResponse if pending_answer && !any_link_error => {
-            if history.owed_matching == 0 {
+            if let Some(open) = silence_open(evidence) {
+                (
+                    Undetermined,
+                    format!(
+                        "The ECU answered with a pending and then sent no response before the wait ended, but {open}."
+                    ),
+                )
+            } else if history.owed_matching == 0 {
                 (
                     Vehicle,
                     to_owned(
@@ -3496,12 +3573,20 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         End::NoResponse
             if sent == Sent::Confirmed && history.answered_same_match > 0 && !any_link_error =>
         {
-            (
-                Vehicle,
-                to_owned(
-                    "Sent on the bus; no response within the limit in force, from an ECU that has answered requests matched this way.",
+            match silence_open(evidence) {
+                Some(open) => (
+                    Undetermined,
+                    format!(
+                        "Sent on the bus; no response before the wait ended, from an ECU that has answered requests matched this way, but {open}."
+                    ),
                 ),
-            )
+                None => (
+                    Vehicle,
+                    to_owned(
+                        "Sent on the bus; no response within the limit in force, from an ECU that has answered requests matched this way.",
+                    ),
+                ),
+            }
         }
         End::NoResponse if sent == Sent::Confirmed => (
             Undetermined,
@@ -3575,6 +3660,19 @@ mod tests {
 
     fn forwarding(mut evidence: Evidence) -> Evidence {
         evidence.pending_visibility = PendingVisibility::Forwarded;
+        evidence
+    }
+
+    /// `evidence` with its time judged on one clock, as on a link with transmit times: a
+    /// missing response by a receive timeout at the limit in force, a response within P2. A
+    /// time not judged leaves a late reading open (ADR-376), which the tests of other rows set
+    /// aside this way.
+    fn judged(mut evidence: Evidence) -> Evidence {
+        evidence.timing.window = match evidence.end {
+            End::NoResponse => Window::TimeoutAtLimit,
+            _ => Window::WithinP2,
+        };
+        evidence.timing.not_judged_reason = None;
         evidence
     }
 
@@ -3676,7 +3774,7 @@ mod tests {
     #[test]
     fn a_late_acceptance_ends_the_evidence_from_before_it() {
         let confirmed = |request: &[u8], end| {
-            let mut evidence = forwarding(evidence(request, end));
+            let mut evidence = judged(forwarding(evidence(request, end)));
             evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
             evidence
         };
@@ -3827,7 +3925,7 @@ mod tests {
     #[test]
     fn a_late_unusable_answer_to_a_reset_ends_the_matched_answers_only() {
         let confirmed = |request: &[u8], end| {
-            let mut evidence = forwarding(evidence(request, end));
+            let mut evidence = judged(forwarding(evidence(request, end)));
             evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
             evidence
         };
@@ -3965,7 +4063,7 @@ mod tests {
         pending_only.pending = vec![pending()];
         let (second, _) = log_kept(&mut state, 2, pending_only);
         assert_eq!(second.link_history.owed_matching, 1);
-        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        let mut silent = judged(forwarding(read([0xF1, 0x87], End::NoResponse)));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let (third, _) = log_kept(&mut state, 3, silent);
         assert_eq!(third.classification, Classification::Undetermined);
@@ -3993,7 +4091,7 @@ mod tests {
         let own = final_answer(&state, 2, &kept_second, &[0x62, 0xF1, 0x87, 0x41]);
         assert!(own.newly_matched);
         state.reclassify_after(&own);
-        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        let mut silent = judged(forwarding(read([0xF1, 0x87], End::NoResponse)));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let (after, _) = log_kept(&mut state, 3, silent);
         assert_eq!(after.classification, Classification::Vehicle);
@@ -4076,7 +4174,7 @@ mod tests {
             Some(vec![1])
         );
         state.reclassify_after(&final_answer(&state, 1, &kept, answer));
-        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        let mut silent = judged(forwarding(read([0xF1, 0x87], End::NoResponse)));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let (after, _) = log_kept(&mut state, 3, silent);
         assert_eq!(after.classification, Classification::Vehicle);
@@ -4110,7 +4208,7 @@ mod tests {
                 .iter()
                 .all(|logged| logged.seq != 2 || logged.classification == Classification::System)
         );
-        let mut silent = forwarding(read([0xF1, 0x87], End::NoResponse));
+        let mut silent = judged(forwarding(read([0xF1, 0x87], End::NoResponse)));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let (after, _) = log_kept(&mut state, 3, silent);
         assert_eq!(after.classification, Classification::Vehicle);
@@ -4142,10 +4240,13 @@ mod tests {
     /// it is named, not reclassified.
     #[test]
     fn a_settled_answer_reclassifies_the_later_exchanges_in_the_window() {
-        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let answer: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
-        let mut answered = forwarding(evidence(&READ_F186, End::Positive(answer.to_vec())));
+        let mut answered = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(answer.to_vec()),
+        )));
         answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
         // A later answer the earlier owed request could own is `undetermined`; once that
         // request has its own response, the later one is its own rows' again.
@@ -4314,10 +4415,10 @@ mod tests {
 
     #[test]
     fn an_ecu_negative_response_on_a_forwarding_link_is_vehicle_for_ecu_state_codes() {
-        let evidence = forwarding(evidence(
+        let evidence = judged(forwarding(evidence(
             &[0x31, 0x01, 0xFF, 0x00],
             End::Negative(vec![0x7F, 0x31, 0x22]),
-        ));
+        )));
         let verdict = verdict(&evidence);
         assert_eq!(verdict.classification, Classification::Vehicle);
         assert!(verdict.reason.contains("conditionsNotCorrect (0x22)"));
@@ -4448,7 +4549,10 @@ mod tests {
             );
         }
         for code in [0x21, 0x25, 0x26, 0x70, 0x81, 0x94, 0xF0] {
-            let evidence = forwarding(evidence(&READ_F186, End::Negative(vec![0x7F, 0x22, code])));
+            let evidence = judged(forwarding(evidence(
+                &READ_F186,
+                End::Negative(vec![0x7F, 0x22, code]),
+            )));
             assert_eq!(
                 verdict(&evidence).classification,
                 Classification::Vehicle,
@@ -4480,14 +4584,123 @@ mod tests {
     }
 
     #[test]
-    fn a_positive_response_on_a_forwarding_link_not_judged_is_none_resting_on_the_presumption() {
-        let evidence = forwarding(evidence(
-            &READ_F186,
+    fn a_silence_is_vehicle_only_after_a_timeout_judged_at_the_limit_on_a_forwarding_link() {
+        // ADR-376: a pending then silence, and a silence after a matched answer, are `vehicle`
+        // only when the receive timeout is judged at the limit on one clock and the link
+        // forwards pendings; the VCI's timer, or the worker's, is not presumed right, and a
+        // timeout at P2 does not show that a VCI that absorbs pendings absorbed none.
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            forwarding(read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1]))),
+        );
+        let mut silent = forwarding(read([0xF1, 0x86], End::NoResponse));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        silent.vci_ended = true;
+        let mut pending_then_silence = forwarding(evidence(&READ_F186, End::NoResponse));
+        pending_then_silence.pending = vec![pending()];
+        pending_then_silence.vci_ended = true;
+        for (silent, history) in [
+            (&silent, state.history_for(&silent)),
+            (
+                &pending_then_silence,
+                LinkState::default().history_for(&pending_then_silence),
+            ),
+        ] {
+            let of = |evidence: &Evidence| classify(evidence, &history);
+            let unjudged = of(silent);
+            assert_eq!(
+                unjudged.classification,
+                Classification::Undetermined,
+                "{}",
+                unjudged.reason
+            );
+            assert!(
+                unjudged.reason.contains("not presumed right"),
+                "{}",
+                unjudged.reason
+            );
+            assert_eq!(
+                of(&judged(silent.clone())).classification,
+                Classification::Vehicle
+            );
+            let mut absorbing = judged(silent.clone());
+            absorbing.pending_visibility = PendingVisibility::AbsorbedByVci;
+            let absorbed = of(&absorbing);
+            assert_eq!(
+                absorbed.classification,
+                Classification::Undetermined,
+                "{}",
+                absorbed.reason
+            );
+            assert!(absorbed.reason.contains("(H4)"), "{}", absorbed.reason);
+            assert!(
+                !absorbed.reason.contains("not presumed right"),
+                "{}",
+                absorbed.reason
+            );
+            // Neither judged nor forwarding: the possible-pending row names both readings.
+            let mut both = silent.clone();
+            both.pending_visibility = PendingVisibility::AbsorbedByVci;
+            let both = of(&both);
+            assert_eq!(both.classification, Classification::Undetermined);
+            assert!(both.reason.contains("not judged"), "{}", both.reason);
+            assert!(both.reason.contains("(H4)"), "{}", both.reason);
+        }
+        // A suppressed request's silence, timed out at P2 on a forwarding link, when only its
+        // first frame went out: the reason says so, not that no timeout was judged.
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            forwarding(evidence(&[0x3E, 0x00], End::Positive(vec![0x7E, 0x00]))),
+        );
+        let mut partial = judged(forwarding(evidence(&[0x3E, 0x80], End::NoResponse)));
+        partial.suppressed = true;
+        partial.flow_control = true;
+        let entry = log(&mut state, 2, partial);
+        assert_eq!(entry.sent, Sent::Partial, "{}", entry.reason);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(
+            entry.reason.contains("only the first frame"),
+            "{}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("no receive timeout"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn a_final_response_whose_time_is_not_judged_is_undetermined() {
+        // ADR-376: on time it would be `none` or `vehicle`; late, with the VCI past its own
+        // limit, `system`; nothing presumes the VCI's timer right.
+        for end in [
             End::Positive(vec![0x62, 0xF1, 0x86, 1]),
-        ));
-        let verdict = verdict(&evidence);
-        assert_eq!(verdict.classification, Classification::None);
-        assert!(verdict.reason.contains("presumption"));
+            End::Negative(vec![0x7F, 0x22, 0x22]),
+        ] {
+            let evidence = forwarding(evidence(&READ_F186, end));
+            assert_eq!(evidence.timing.window, Window::NotJudged);
+            let verdict = verdict(&evidence);
+            assert_eq!(verdict.classification, Classification::Undetermined);
+            assert!(
+                verdict.reason.contains("Its time is not judged"),
+                "{}",
+                verdict.reason
+            );
+            assert!(verdict.reason.contains("system"), "{}", verdict.reason);
+            assert!(
+                !verdict.reason.contains("presumption"),
+                "{}",
+                verdict.reason
+            );
+            // Judged within P2, its own row decides.
+            let judged = verdict_of(&judged(evidence)).0;
+            assert!(judged < Classification::Undetermined, "{judged:?}");
+        }
     }
 
     #[test]
@@ -4613,7 +4826,7 @@ mod tests {
 
     #[test]
     fn a_pending_then_silence_is_vehicle_and_confirms_the_send() {
-        let mut evidence = forwarding(evidence(&READ_F186, End::NoResponse));
+        let mut evidence = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
         evidence.pending = vec![pending()];
         evidence.vci_ended = true;
         let entry = ExchangeEntry::build(3, evidence.clone(), {
@@ -4640,7 +4853,10 @@ mod tests {
 
     #[test]
     fn a_link_error_during_the_exchange_takes_the_most_severe() {
-        let mut evidence = forwarding(evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86])));
+        let mut evidence = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86]),
+        )));
         evidence.link_errors = vec![LinkErrorKind::Frame];
         assert_eq!(verdict_of(&evidence).0, Classification::Undetermined);
         evidence.link_errors = vec![LinkErrorKind::Frame, LinkErrorKind::VciHardwareFault];
@@ -4651,7 +4867,7 @@ mod tests {
         assert!(reason.contains("fault of the VCI"));
         // A negative ecu_state is vehicle; a link error of the channel's other link is evidence
         // only.
-        let mut evidence = forwarding(evidence_neg(0x22));
+        let mut evidence = judged(forwarding(evidence_neg(0x22)));
         evidence.channel_link_errors = vec![LinkErrorKind::Receive];
         assert_eq!(verdict_of(&evidence).0, Classification::Vehicle);
     }
@@ -4833,6 +5049,13 @@ mod tests {
             settle(&unjudged, &positive, LateWindow::Late { by_us: 1 }).0,
             Classification::Undetermined
         );
+        // Late after a timeout at P2 on a link whose VCI absorbs pendings: had the ECU sent one
+        // the VCI absorbed, it should have waited longer (H4, ADR-376).
+        let mut absorbing = vehicle.clone();
+        absorbing.evidence.pending_visibility = PendingVisibility::AbsorbedByVci;
+        let (class, reason) = settle(&absorbing, &positive, LateWindow::Late { by_us: 1 });
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.contains("(H4)"), "{reason}");
         // Late, but its outcome's own row is not `vehicle`: an invalid key stays undetermined.
         assert_eq!(
             settle(&vehicle, &[0x7F, 0x22, 0x35], LateWindow::Late { by_us: 1 }).0,
@@ -4948,13 +5171,15 @@ mod tests {
         assert!(!reason.contains("H3"));
         silent.link_errors = vec![LinkErrorKind::Receive];
         assert!(verdict_of(&silent).1.contains("H3"));
-        // A positive response nobody asked for: vehicle on a forwarding link, undetermined on an
-        // absorbing one.
+        // A positive response nobody asked for: vehicle on a forwarding link when its time is
+        // judged within P2, undetermined when it is not (it may have come late, with the VCI
+        // past its limit, ADR-376) and on an absorbing link.
         let mut positive = evidence(&[0x3E, 0x80], End::Positive(vec![0x7E, 0x00]));
         positive.suppressed = true;
         assert_eq!(verdict_of(&positive).0, Classification::Undetermined);
         let positive = forwarding(positive);
-        assert_eq!(verdict_of(&positive).0, Classification::Vehicle);
+        assert_eq!(verdict_of(&positive).0, Classification::Undetermined);
+        assert_eq!(verdict_of(&judged(positive)).0, Classification::Vehicle);
     }
 
     #[test]
@@ -5203,14 +5428,35 @@ mod tests {
         assert_eq!(state.last_reset(), Some(2));
         let probe = read([0xF1, 0x89], End::Positive(vec![0x62, 0xF1, 0x89]));
         assert_eq!(state.history_for(&probe).owed_matching, 0);
-        // As undetermined it ends nothing.
+        // As undetermined it may still have been carried out, which nothing shows (ADR-376):
+        // it ends the matched answers, as an unusable answer would, but not the owed requests.
         let mut state = LinkState::default();
         log(&mut state, 1, read([0xF1, 0x89], End::NoResponse));
+        log(
+            &mut state,
+            2,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        let matched = read([0xF1, 0x86], End::NoResponse);
+        assert_eq!(state.history_for(&matched).answered_same_match, 1);
         let mut reset = evidence(&[0x11, 0x81], End::NoResponse);
         reset.suppressed = true;
-        log(&mut state, 2, reset);
+        let entry = log(&mut state, 3, reset.clone());
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(!entry.matched_answer());
         assert_eq!(state.last_reset(), None);
         assert_eq!(state.history_for(&probe).owed_matching, 1);
+        assert_eq!(state.history_for(&matched).answered_same_match, 0);
+        // One the agent refused before sending it changes nothing.
+        let mut state = LinkState::default();
+        log(
+            &mut state,
+            1,
+            read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1])),
+        );
+        reset.end = End::NotSent(RefusalCause::Policy);
+        log(&mut state, 2, reset);
+        assert_eq!(state.history_for(&matched).answered_same_match, 1);
     }
 
     #[test]
@@ -5355,7 +5601,7 @@ mod tests {
         let mut state = LinkState::default();
         let answered = read([0xF1, 0x86], End::Positive(vec![0x62, 0xF1, 0x86, 1]));
         log(&mut state, 1, forwarding(answered));
-        let mut silent = forwarding(read([0xF1, 0x86], End::NoResponse));
+        let mut silent = judged(forwarding(read([0xF1, 0x86], End::NoResponse)));
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         let judged = |evidence: &Evidence, state: &LinkState| {
             let verdict = classify(evidence, &state.history_for(evidence));
@@ -5931,7 +6177,7 @@ mod tests {
     fn a_link_error_on_the_channel_counts_for_h3_and_ends_the_matched_answers() {
         // A pending then silence is `vehicle` only when no link error came on the link or on
         // another link of its channel.
-        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
         silent.pending = vec![pending()];
         silent.vci_ended = true;
         assert_eq!(verdict_of(&silent).0, Classification::Vehicle);
@@ -5940,7 +6186,10 @@ mod tests {
         assert_eq!(class, Classification::Undetermined);
         assert!(reason.contains("H3"), "{reason}");
         // The channel's error is evidence only: it adds no fault to an exchange that ended well.
-        let mut positive = forwarding(evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86])));
+        let mut positive = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86]),
+        )));
         positive.channel_link_errors = vec![LinkErrorKind::VciHardwareFault];
         assert_eq!(verdict_of(&positive).0, Classification::None);
         // It ends the matched answers and the count since the error, not the owed requests.
@@ -5968,7 +6217,7 @@ mod tests {
             1,
             evidence(&[0x3E, 0x00], End::Positive(vec![0x7E, 0x00])),
         );
-        let mut silent = evidence(&[0x3E, 0x80], End::NoResponse);
+        let mut silent = forwarding(evidence(&[0x3E, 0x80], End::NoResponse));
         silent.suppressed = true;
         silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
         silent.timing.window = Window::TimeoutAtLimit;
@@ -5985,9 +6234,19 @@ mod tests {
             "{}",
             entry.reason
         );
-        // On a link whose VCI absorbs pendings, a time not judged may hide one.
+        // A timeout not judged does not show that the wait ran its course; on a link whose VCI
+        // absorbs pendings, even a timeout at P2 may hide one (ADR-376).
         silent.timing.window = Window::NotJudged;
-        let entry = log(&mut state, 3, silent);
+        let entry = log(&mut state, 3, silent.clone());
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(
+            entry.reason.contains("not presumed right"),
+            "{}",
+            entry.reason
+        );
+        silent.timing.window = Window::TimeoutAtLimit;
+        silent.pending_visibility = PendingVisibility::AbsorbedByVci;
+        let entry = log(&mut state, 4, silent);
         assert_eq!(entry.classification, Classification::Undetermined);
         assert!(entry.reason.contains("(H4)"), "{}", entry.reason);
     }

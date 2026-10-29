@@ -62,6 +62,15 @@ come from the same boot of the machine, since such a clock starts over at a rebo
    (`round_trip_us` in `vci_loss_settled`) to twice the clock margin and the drift bound over
    the gap.
 
+5. **A low reading shows a restart only without a wrap.** The comparison works on the
+   clock's raw 32-bit times. A clock that carried on past its wrap during the gap reads a low
+   value too, no more than the gap, and passes ADR-373's restart test; with a gap that is a
+   little off (a suspend's sleep, below), it fits only that test, and the loss would read as a
+   power loss. So when the last time plus the gap and the tolerance reaches the wrap, a reading
+   that fits a restart and not a clock that carried on leaves `power_kept` `unknown`, not
+   `false`, and `vci_loss_settled` records `may_have_wrapped`. ADR-373 measured no gap across
+   runs, so the case did not arise before.
+
 ## Consequences
 
 - On Linux a loss that a later run of the same boot settles, on a link whose worker reads the
@@ -75,11 +84,13 @@ come from the same boot of the machine, since such a clock starts over at a rebo
 - A gap that spans a suspend of the PC is only as exact as the kernel's measure of the sleep.
   A machine whose clock source stops in suspend (most x86 machines) adds the sleep time from
   the real-time clock, which counts whole seconds, so the gap can be off by up to about a
-  second against a tolerance of milliseconds. Such a loss then fits neither a clock that
-  carried on nor one that restarted, and stays `unknown`: the error fails safe, but a VCI that
-  kept its power across a suspend of the PC is not shown to have kept it there. Telling such a
+  second, against a tolerance of a few milliseconds plus the drift bound over the gap. Such a
+  loss then fits no clock that carried on, and stays `unknown` (item 5 keeps a clock that
+  wrapped from reading as restarted): the error fails safe, but a VCI that kept its power
+  across a suspend of the PC is not shown to have kept it there. Telling such a
   gap apart, and widening its tolerance by the sleep's error, is follow-up work.
-- The log keeps one entry per growth of the offset and per missing sample. On a machine whose
+- The log keeps one entry per growth of the offset, one per run of missing samples, and the
+  first sample after such a run. On a machine whose
   clock reads are slow enough to miss the jitter bound often (some virtual machines), the
   entries grow with the job's clock reads; nothing prunes the ones no time needs any more.
 - The comparison assumes both runs see one boot clock. On Linux a time namespace (a container

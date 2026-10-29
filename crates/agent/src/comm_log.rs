@@ -834,6 +834,8 @@ struct LossClock {
     clock_margin_from: &'static str,
     fits_carried_on: Option<bool>,
     fits_restarted: Option<bool>,
+    /// A clock that carried on could have passed its wrap during the gap.
+    may_have_wrapped: Option<bool>,
 }
 
 /// `vci_loss_settled` (design 8.11 "Settlement", ADR-373).
@@ -882,6 +884,9 @@ fn power_kept(
         ),
         (true, false, _) => unknown(
             "The VCI's clock carried on, but its serial number does not show that the same VCI reconnected",
+        ),
+        (false, true, _) if fit.may_have_wrapped => unknown(
+            "The VCI's clock reads low, but a clock that carried on could have passed its wrap during the loss and read as low, so the reading does not show that it started again",
         ),
         (false, true, _) => (
             PowerKept::No,
@@ -3881,6 +3886,7 @@ impl Inner {
                 clock_margin_from,
                 fits_carried_on: fit.map(|fit| fit.carried_on),
                 fits_restarted: fit.map(|fit| fit.restarted),
+                may_have_wrapped: fit.map(|fit| fit.may_have_wrapped),
             },
             serial_match,
             power_kept,
@@ -3913,7 +3919,7 @@ impl Inner {
     /// Takes the offset between the boot clock and the agent's clock for the agent time
     /// `agent_now_us`, read just now. The boot clock's read is bracketed by two reads of the
     /// agent's clock, and a sample whose bracket is wider than the reads' own jitter (the thread
-    /// was preempted in between) is taken again, up to a few times, or not at all, so that a
+    /// was preempted in between) is tried at most three times in all, or left out, so that a
     /// delay is not taken for a suspend. Only a growth beyond the jitter is kept: the clocks run
     /// at one rate but for a suspend.
     fn sample_boot_at(&mut self, agent_now_us: u64) {
@@ -9685,6 +9691,26 @@ mod tests {
         assert_eq!(
             log.round_trip_us(asked, answered),
             answered.monotonic_us - asked.monotonic_us
+        );
+    }
+
+    /// A clock that carried on past its wrap reads low, as a restarted one does: with a gap a
+    /// little off (a suspend's sleep), the reading fits only a restart, and that shows nothing
+    /// (ADR-374 item 5). Without a wrap, the same fit shows the power was lost.
+    #[test]
+    fn a_low_reading_shows_no_restart_when_the_clock_may_have_wrapped() {
+        // The last time 4 000 s in; a 600 s gap, measured a second long.
+        const GAP: u64 = 601_000_000;
+        let wrapped = clocks::loss_fit(4_000_000_000, 305_032_704, GAP, 0, 100, 1_000);
+        assert!(!wrapped.carried_on && wrapped.restarted && wrapped.may_have_wrapped);
+        let (kept, reason) = power_kept(true, Some(wrapped), Some(true));
+        assert_eq!(kept, PowerKept::Unknown, "{reason}");
+        assert!(reason.contains("wrap"), "{reason}");
+        let restarted = clocks::loss_fit(1_000_000_000, 20_000_000, GAP, 0, 100, 1_000);
+        assert!(!restarted.may_have_wrapped);
+        assert_eq!(
+            power_kept(true, Some(restarted), Some(true)).0,
+            PowerKept::No
         );
     }
 

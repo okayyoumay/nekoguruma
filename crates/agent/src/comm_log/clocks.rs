@@ -304,6 +304,9 @@ pub(crate) struct LossFit {
     /// The reading is no more than the gap plus the tolerance: a clock that started again from
     /// zero during the gap.
     pub restarted: bool,
+    /// A clock that carried on could have passed its wrap during the gap, the tolerance
+    /// included: it then reads a low value too, so a low reading does not show a restart.
+    pub may_have_wrapped: bool,
 }
 
 /// Sets `reading_us` against `last_us` and the `gap_us` between their reads (raw times of one
@@ -329,6 +332,7 @@ pub(crate) fn loss_fit(
         tolerance_us: u64::try_from(tolerance).unwrap_or(u64::MAX),
         carried_on: distance <= tolerance,
         restarted: reading <= i128::from(gap_us) + tolerance,
+        may_have_wrapped: i128::from(last_us) + i128::from(gap_us) + tolerance >= WRAP,
     }
 }
 
@@ -643,7 +647,17 @@ mod tests {
         let last = SPAN - GAP + 10_000_000;
         let fit = loss_fit(last, 10_000_000, GAP, 0, 100, 1_000);
         assert_eq!(fit.expected_us, 10_000_000);
-        assert!(fit.carried_on && fit.restarted, "{fit:?}");
+        assert!(
+            fit.carried_on && fit.restarted && fit.may_have_wrapped,
+            "{fit:?}"
+        );
+        // A clock that carried on past the wrap, read further off than the tolerance (a gap
+        // measured a second long), still reads low: that shows no restart.
+        let fit = loss_fit(last, 9_000_000, GAP, 0, 100, 1_000);
+        assert!(
+            !fit.carried_on && fit.restarted && fit.may_have_wrapped,
+            "{fit:?}"
+        );
         // And one a few microseconds before the wrap is still near the expected value.
         let fit = loss_fit(SPAN - 1_000, 500, 0, 0, 100, 1_000);
         assert!(fit.carried_on, "{fit:?}");

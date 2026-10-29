@@ -50,7 +50,10 @@ Four judgements rest on an ordering their times do not show:
 1. **An end-side exchange may have held the error.** Take an exchange with a latest placed time
    L on the error's clock and epoch, but no placed transmit done or response start:
    - An error at t with t no later than L, and later than every earlier exchange's latest time,
-     may have come during it (`MaybeWithin`).
+     may have come during it (`MaybeWithin`). This holds only while no exchange has left the
+     window, so that every earlier exchange's latest time is known. Once one has, such an error
+     is not shown to fall in that exchange. It is placed as before, such as before the window
+     (item 4), and an owed exchange kept beyond the window takes no such error.
    - Such an exchange takes the error as a possible link error (H3) only, not as a fault seen in
      it. The counts start again before it, as for an error within an exchange.
    - The `late_item` entry says that the error came during it, or between it and the exchange
@@ -65,7 +68,10 @@ Four judgements rest on an ordering their times do not show:
    not be placed. A late answer, a final response or a pending ADR-368 counts as matched, still
    counts as an answer. It counts as a matched answer and as an answer since an error only when
    no such error applies to its exchange, or its time is shown after the error's on one clock
-   and epoch. An answer before the error, or one whose order against it is not shown, is not
+   and epoch. An answer whose time is shown at or before an error's, on that error's clock and
+   epoch, is never counted there. This holds also when its exchange had no time on that clock
+   at its entry and the error was placed before it: the agent stopped waiting, and the result
+   read at job end carries the time. An answer before the error, or one whose order against it is not shown, is not
    counted there: on another clock or epoch, with no time, or after an error that could not be
    placed. The maintainer chose this (2026-10-29). A start is no matched answer, as before
    (ADR-354).
@@ -73,6 +79,9 @@ Four judgements rest on an ordering their times do not show:
 3. **An ambiguous later start opens a kept start.** When an owed exchange keeps a start that
    started in time, and a later start is read that it or another exchange may own, the kept
    start's record is dropped unless the new start is shown before it on one clock and epoch. A
+   record that the response started late (with or without the VCI's timeout at its limit) or
+   at an open time stands, since the exchange started late under either reading of the new
+   start. A
    late response is then judged by its own time. A later start that the exchange alone owns
    replaces the record, as before.
 
@@ -92,5 +101,16 @@ Four judgements rest on an ordering their times do not show:
   that has left the window, since every window exchange is reclassified. It is left out when
   the error came during an owed exchange kept beyond the window and no exchange that has left
   the window is newer than that one.
+- An answer counted as an answer alone stays out of the answers since an error when a later
+  error makes the counts start again. A recount can then count it too few, never too many.
+- Once an exchange has left the window (a long run, or a session change that empties it), no
+  late error is placed within an end-side exchange for the rest of the run. Such an exchange
+  has no transmit time, so its classification is `undetermined` either way.
+- Two cases count fewer answers since an error than the times would allow. Neither counts one
+  falsely:
+  - The answer's time is taken from its final item, else its start, else its last pending. A
+    final item on another clock hides an earlier item that could be compared.
+  - With several links on one channel, the `late_item` text for an end-side exchange can also
+    describe another link's exchange. Today a job has one link.
 - An end-side exchange's own `reason` keeps the H3 wording of a possible link error. The
   `late_item` entry's text names where the error may have come.

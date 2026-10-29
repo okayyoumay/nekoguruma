@@ -1375,6 +1375,10 @@ struct Logged {
     /// ECUReset or session change read late counts the matched answers again from these
     /// ([`LinkState::reset_after`]).
     matched_at: Option<u64>,
+    /// A late answer it got was counted as answered only, since a late link error may have come
+    /// after it ([`LinkState::since_late_error`]): a recount of the answers since an error does
+    /// not count it again (ADR-384).
+    answered_only: bool,
 }
 
 /// Where a link error read late falls among a link's exchanges ([`LinkState::place_error`]).
@@ -1842,6 +1846,7 @@ impl LinkState {
             after: self.clears,
             floor: None,
             settled: false,
+            answered_only: false,
             matched_at: entry.matched_answer().then(|| {
                 if entry.error_after_answer() {
                     clears.matched
@@ -2164,6 +2169,11 @@ impl LinkState {
             if at.unwrapped > last {
                 return Some(ErrorPoint::After(seq));
             }
+            // The earlier exchanges' latest times must all be known to compare with: with one
+            // gone from the window, the error is not shown to fall within this exchange.
+            if self.left_window.is_some() {
+                return None;
+            }
             let earlier = self
                 .window
                 .iter()
@@ -2408,7 +2418,9 @@ impl LinkState {
             history.answered_since_error = since
                 .iter()
                 .filter(|earlier| {
-                    earlier.history.this_exchange && answered_in(earlier) == clears.errors
+                    earlier.history.this_exchange
+                        && !earlier.answered_only
+                        && answered_in(earlier) == clears.errors
                 })
                 .count() as u32;
             let (freed, reclassified) = self.reclassify_one(at, history);
@@ -2439,7 +2451,9 @@ impl LinkState {
             .iter()
             .filter(first)
             .filter(|logged| {
-                logged.history.this_exchange && answered_in(logged) == self.clears.errors
+                logged.history.this_exchange
+                    && !logged.answered_only
+                    && answered_in(logged) == self.clears.errors
             })
             .count() as u32;
         (changed, not_reclassified)
@@ -2506,16 +2520,17 @@ impl LinkState {
         {
             return false;
         }
-        self.late_errors
-            .iter()
-            .filter(|error| seq <= error.through)
-            .all(|error| {
-                time.is_some_and(|(clock, placed)| {
-                    clock == error.clock
-                        && placed.epoch == error.epoch
-                        && placed.unwrapped > error.unwrapped
-                })
-            })
+        // An answer shown on an error's clock and epoch counts only when it is after the error,
+        // whatever exchange the error was placed after (an exchange with no time on the clock
+        // at its entry is placed as after the error, although its answer may be before it);
+        // one that cannot be set against the error counts only when the error is not after its
+        // exchange.
+        self.late_errors.iter().all(|error| match time {
+            Some((clock, placed)) if clock == error.clock && placed.epoch == error.epoch => {
+                placed.unwrapped > error.unwrapped
+            }
+            _ => seq > error.through,
+        })
     }
 
     /// The response of owed exchange `seq` no longer counts as started in time: a later start
@@ -2625,6 +2640,14 @@ impl LinkState {
     /// last link error unless one came since, and a matched answer unless the matched answers
     /// ended since.
     fn take_answer(&mut self, answer: &SettledAnswer) {
+        if !answer.since_error
+            && let Some(logged) = self
+                .window
+                .iter_mut()
+                .find(|logged| logged.seq == answer.seq)
+        {
+            logged.answered_only = true;
+        }
         if answer.newly_answered {
             self.answered += 1;
             if answer.since_error && answer.clears.errors == self.clears.errors {
@@ -4581,6 +4604,156 @@ mod tests {
         assert_eq!(not_reclassified, Some(1));
         // The counts start again from the window alone: the answers of its other exchanges.
         assert_eq!(state.answered_since_error, 15);
+    }
+
+    /// ADR-384: an error placed after an earlier exchange (one with no time on the clock at its
+    /// entry is taken as after the error) does not make the late answer of that exchange count
+    /// since the error when the answer is shown at or before the error on the error's clock and
+    /// epoch; an answer that cannot be set against it keeps the rule by position.
+    #[test]
+    fn a_late_answer_shown_before_an_error_placed_before_its_exchange_is_answered_only() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut answered = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 0x41]),
+        )));
+        answered.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let device = |unwrapped| Some(placed_at(Clock::Device, 0, unwrapped));
+        // Exchange 1 has times, exchange 2 is owed and has none, exchange 3 is silent with the
+        // same match and transmits late. The error at 5 000 falls after exchange 1.
+        let run = |error_at: i64, answered_at: Option<(Clock, super::super::clocks::Placed)>| {
+            let mut state = LinkState::default();
+            log_kept(
+                &mut state,
+                1,
+                timed(answered.clone(), Some(1_000), Some(1_200)),
+            );
+            let (_, kept) = log_kept(&mut state, 2, silent.clone());
+            state.keep(2, kept);
+            log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+            let at = placed_at(Clock::Device, 0, error_at);
+            let point = state.place_error(at);
+            let after = match point {
+                ErrorPoint::After(seq) | ErrorPoint::Within(seq) => Some(seq),
+                ErrorPoint::BeforeWindow { .. } => None,
+                other => panic!("{other:?}"),
+            };
+            state.error_after(after, 4, LinkErrorKind::Receive, Some(at));
+            let kept = state.kept(2).unwrap().clone();
+            let mut settled = SettledAnswer {
+                seq: 2,
+                key: MatchKey::of(&silent),
+                newly_answered: true,
+                newly_matched: true,
+                final_response: true,
+                clears: kept.clears,
+                since_error: true,
+            };
+            settled.set_since_error(state.since_late_error(2, answered_at));
+            let (changed, _) = state.reclassify_after(&settled);
+            let later = changed
+                .iter()
+                .find(|later| later.seq == 3)
+                .map(|later| later.classification);
+            (point, later, state.answered_since_error)
+        };
+        // Placed after exchange 1: exchange 2's answer at 4 000 is before the error.
+        let (point, later, since) = run(5_000, device(4_000));
+        assert_eq!(point, ErrorPoint::After(1));
+        assert_eq!((later, since), (None, 0));
+        // After the error: it counts.
+        let (_, later, since) = run(5_000, device(5_500));
+        assert_eq!((later, since), (Some(Classification::Vehicle), 1));
+        // Not set against it: by position, the error is before the exchange's answer.
+        let (_, later, since) = run(5_000, None);
+        assert_eq!((later, since), (Some(Classification::Vehicle), 1));
+        // Before the window: the untimed exchange in the window after the error is the same.
+        let (point, later, since) = run(500, device(400));
+        assert_eq!(point, ErrorPoint::BeforeWindow { within: None });
+        // (exchange 1's own answer counts since the error either way)
+        assert_eq!((later, since), (None, 1));
+        let (_, _, since) = run(500, device(600));
+        assert_eq!(since, 2);
+    }
+
+    /// ADR-384: an error is shown to fall within an exchange that has only end-side times only
+    /// when every exchange before it is still known to the link state. With one gone from the
+    /// window the error is placed as before: after an earlier exchange shown to start before it,
+    /// else before the window. An end-side exchange kept beyond the window holds none.
+    #[test]
+    fn an_end_side_exchange_holds_an_error_only_while_the_exchanges_before_it_are_known() {
+        let answered = || {
+            forwarding(evidence(
+                &READ_F186,
+                End::Positive(vec![0x62, 0xF1, 0x86, 0x41]),
+            ))
+        };
+        let at = |unwrapped| placed_at(Clock::Device, 0, unwrapped);
+        // The window front has only an end, and the exchange before it has left the window.
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, timed(answered(), Some(1_000), Some(1_200)));
+        log_kept(&mut state, 2, timed(answered(), None, Some(5_000)));
+        for seq in 3..=u64::try_from(WINDOW).unwrap() + 1 {
+            let us = 10_000 * i64::try_from(seq).unwrap();
+            log_kept(&mut state, seq, timed(answered(), Some(us), Some(us + 200)));
+        }
+        assert_eq!(state.left_window, Some(1));
+        assert_eq!(state.window.front().map(|logged| logged.seq), Some(2));
+        assert_eq!(
+            state.place_error(at(4_000)),
+            ErrorPoint::BeforeWindow { within: None }
+        );
+        // After its latest time it is after it, as ever.
+        assert_eq!(state.place_error(at(5_100)), ErrorPoint::After(2));
+        // Owed and kept beyond the window, with only an end: no exchange holds the error.
+        let mut owed = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        owed.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(owed, None, Some(2_000)));
+        state.keep(1, kept);
+        for seq in 2..=u64::try_from(WINDOW).unwrap() + 1 {
+            let us = 10_000 * i64::try_from(seq).unwrap();
+            log_kept(&mut state, seq, timed(answered(), Some(us), Some(us + 200)));
+        }
+        assert_eq!(
+            state.place_error(at(1_500)),
+            ErrorPoint::BeforeWindow { within: None }
+        );
+    }
+
+    /// ADR-384: a late answer counted as answered only is not counted again as one since an error
+    /// by a later recount of the answers since an error.
+    #[test]
+    fn a_recount_after_an_error_keeps_an_answer_counted_as_answered_only_out() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, kept);
+        log_kept(&mut state, 2, timed(silent.clone(), Some(5_000), None));
+        let first = placed_at(Clock::Device, 0, 3_000);
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, Some(first));
+        // The first exchange's answer at 2 500 is before the error: answered only.
+        let kept = state.kept(1).unwrap().clone();
+        let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
+        let history = state.history_settling(&answered, 1);
+        let entry = ExchangeEntry::build(1, answered.clone(), history);
+        let mut settled = entry.settled_answer(&kept);
+        settled
+            .set_since_error(state.since_late_error(1, Some(placed_at(Clock::Device, 0, 2_500))));
+        state.settled(1, entry.classification, &entry.reason, answered, true);
+        state.reclassify_after(&settled);
+        assert_eq!(state.answered_since_error, 0);
+        // An error before the window recounts from the window: the answer is still not one.
+        state.error_after(
+            None,
+            4,
+            LinkErrorKind::Receive,
+            Some(placed_at(Clock::Device, 0, 500)),
+        );
+        assert_eq!(state.answered_since_error, 0);
+        assert_eq!(state.window[1].history.answered_since_error, 0);
     }
 
     /// Design 8.11 "Settlement": a final response a settling entry adds to an earlier exchange

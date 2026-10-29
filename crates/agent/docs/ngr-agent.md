@@ -507,7 +507,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   of no primitive or of an earlier one, is a `late_item` (ADR-372). Within an earlier exchange
   (by its VCI time on one clock and epoch), that exchange takes it: its own fault on its own
   link, H3 on another. An exchange with only end-side times may have held one no later than
-  its latest time, and takes it as H3 only. Between exchanges, it settles the exchanges after
+  its latest time while no exchange has left the window, and takes it as H3 only. Between exchanges, it settles the exchanges after
   it alone. Either way, the matched answers and the answers since an error from before it end
   for every target, and the later exchanges are reclassified; a late answer counts as matched
   since the error only when its time is shown after the error's (ADR-384). Before the window,

@@ -1,7 +1,7 @@
 # ADR-384: Late Attribution Judges Only What Its Times Show
 
 **Date:** 2026-10-29
-**Status:** Accepted
+**Status:** Accepted (item 2's stored answered-only flag, and the Consequences' recount by position, revised by ADR-385)
 **Affects:** `agent` communication log (`comm_log/exchange.rs` `ErrorPoint`,
 `LinkState::place_error`, `LinkState::error_after`, `SettledAnswer`, `LinkState::take_answer`,
 `LinkState::reclassify_after`; `comm_log.rs` `Inner::late_link_error`,
@@ -112,11 +112,9 @@ Four judgements rest on an ordering their times do not show:
 
 - More exchanges settle as `undetermined` after a late link error. A settling entry read after
   the error no longer counts an answer since it on an ordering its times do not show.
-- The recount a late link error starts is not narrowed the same way: an answer read and counted
-  before the error was read keeps counting when the error's recount shows it came before the
-  error. The answer's time is not kept with the window's exchanges, so the recount, which
-  starts from their positions (ADR-372 item 3), cannot test it. A later silence can then still
-  settle `vehicle`. The maintainer chose (2026-10-29) to leave this to a change of its own.
+- The recount a late link error starts was not narrowed the same way: an answer read and
+  counted before the error was read kept counting when it came before the error. ADR-385 keeps
+  each answer's time with its exchange and makes the recount use the same test.
 - On a J2534 link, where an error is often not placed, a late answer read after an unplaced
   error never counts as a matched answer since it.
 - The link state keeps one merged late-error time per clock and epoch: the latest time, and the

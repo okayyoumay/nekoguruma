@@ -66,20 +66,25 @@ Four judgements rest on an ordering their times do not show:
 
 2. **A late answer counts since an error only when shown after it.** The link state keeps the
    latest late link error placed within or after the exchanges it keeps, and whether one could
-   not be placed. A late answer, a final response or a pending ADR-368 counts as matched, still
-   counts as an answer. It counts as a matched answer and as an answer since an error only when
-   no such error applies to its exchange, or its time is shown after the error's on one clock
-   and epoch. An answer whose time is shown at or before an error's, on that error's clock and
-   epoch, is never counted there. This holds also when its exchange had no time on that clock
-   at its entry and the error was placed before it: the agent stopped waiting, and the result
-   read at job end carries the time. The answer's time is that of the item that answers: the
-   final response, else the latest pending. A transmit or start indication answers nothing
-   (ADR-354), so one read after the error does not make an earlier pending count since it.
-   Such an answer stays out of the matched answers when its
-   exchange's owners are freed later, for example by an earlier owner's final response. An answer before the error, or one whose order against it is not shown, is not
-   counted there: on another clock or epoch, with no time, or after an error that could not be
-   placed. The maintainer chose this (2026-10-29). A start is no matched answer, as before
-   (ADR-354).
+   not be placed.
+   - A late answer (a final response, or a pending ADR-368 counts as matched) still counts as an
+     answer.
+   - It counts as a matched answer and as an answer since an error only when no such error
+     applies to its exchange, or its time is shown after the error's on one clock and epoch.
+   - An answer whose time is shown at or before an error's, on that error's clock and epoch, is
+     never counted there. This holds also when its exchange had no time on that clock at its
+     entry and the error was placed before it: the agent stopped waiting, and the result read
+     at job end carries the time.
+   - An answer whose order against the error is not shown is not counted there either: one on
+     another clock or epoch, one with no time, or one after an error that could not be placed.
+     The maintainer chose this (2026-10-29).
+   - The answer's time is that of the item that answers: the final response, else the latest
+     pending, those read at the primitive's end before those read late and those its entry saw.
+     A transmit or start indication answers nothing (ADR-354), so one read after the error does
+     not make an earlier pending count since it. A late start with no pending, which counts as
+     an answer but never as a matched one, takes its own time.
+   - An answer counted as an answer alone stays so when its exchange's owners are freed later,
+     for example by an earlier owner's final response, and when its exchange settles again.
 
 3. **An ambiguous later start opens a kept start.** When an owed exchange keeps a start that
    started in time, and a later start is read that it or another exchange may own, the kept
@@ -113,8 +118,8 @@ Four judgements rest on an ordering their times do not show:
   has no transmit time, so its classification is `undetermined` either way.
 - Two cases count fewer answers since an error than the times would allow. Neither counts one
   falsely:
-  - The answer's time is taken from its final item, else its start, else its last pending. A
-    final item on another clock hides an earlier item that could be compared.
+  - The answer's time is taken from its final response, else its latest pending. A final
+    response on another clock hides an earlier pending that could be compared.
   - With several links on one channel, the `late_item` text for an end-side exchange can also
     describe another link's exchange. Today a job has one link.
 - An end-side exchange's own `reason` keeps the H3 wording of a possible link error. The

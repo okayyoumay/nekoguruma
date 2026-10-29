@@ -1,7 +1,7 @@
 # ADR-374: A Lost VCI's Gap Across Runs Is Recorded on the Boot Clock
 
 **Date:** 2026-10-28
-**Status:** Accepted
+**Status:** Accepted (item 5's gap not judged, now also because no suspend count decides it, and the Consequences' growing list of offsets bounded, by ADR-379)
 **Affects:** `agent` communication log (`comm_log/boot.rs`; `comm_log.rs` `VciLoss`, `LossBoot`,
 `LossTime`, `LossClock`, `ConnectReading`, `CommLog::now`, `CommLog::round_trip_us`,
 `Inner::note_loss`, `Inner::settle_loss`, `Inner::sample_boot_at`, `Inner::boot_at`,

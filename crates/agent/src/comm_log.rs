@@ -827,7 +827,7 @@ struct LossClock {
     /// the reconnecting run has no boot id.
     boot_match: Option<bool>,
     /// How much longer the machine had slept by the reconnect than by the loss, recorded for a
-    /// later judgement (ADR-374).
+    /// reader to weigh; the log judges nothing from it (ADR-374, ADR-379).
     slept_in_gap_us: Option<u64>,
     /// The gap between the two reads: on the boot clock when both lie in one boot, else on the
     /// agent's clock when both lie in one agent epoch, else `null`.
@@ -1326,7 +1326,8 @@ struct Inner {
     /// the offset grew, as it does across a suspend (the agent's clock stops during one, the boot
     /// clock does not). A time's boot time is then taken with the offset when it was read, so
     /// that a suspend afterwards does not skew it (ADR-374). `None` marks a sample that could
-    /// not be taken: a time from then until the next sample has no boot time.
+    /// not be taken: a time from then until the next sample has no boot time, unless that sample
+    /// shows the offset unchanged, which drops the mark (ADR-379).
     boot_offsets: Vec<(u64, Option<u64>)>,
     /// For tests: the boot clock reads this plus the agent's monotonic time.
     #[cfg(test)]
@@ -3834,7 +3835,7 @@ impl Inner {
             boot.or(agent)
         });
         // How much longer the machine had slept by the reconnect than by the loss, recorded for a
-        // later judgement (ADR-374 item 5).
+        // reader to weigh (ADR-374 item 5, ADR-379).
         let slept_in_gap_us = last
             .as_ref()
             .zip(device)
@@ -3842,8 +3843,10 @@ impl Inner {
             .and_then(|(last, reading)| last.slept_us.zip(reading.slept_us))
             .map(|(before, after)| after.saturating_sub(before));
         // A gap on the boot clock is recorded with the comparison it gives, but judges nothing
-        // (ADR-374 item 5): across a suspend the kernel measures the sleep only to about a
-        // second, and no check of the sleep found so far rules out a false outcome.
+        // (ADR-374 item 5, ADR-379): across a suspend the kernel measures the sleep only to about
+        // a second, and nothing the system gives shows that no suspend came in the gap (Linux's
+        // count of completed suspends leaves out hibernation, and grows only after the machine's
+        // processes run again).
         let on_boot = matches!(gap, Some((_, "boot")));
         let (drift_ppm, drift_from) = self.margins.drift_bound();
         let (clock_margin_us, clock_margin_from) = self.margins.clock_margin();
@@ -4019,6 +4022,16 @@ impl Inner {
             // No boot clock.
             Some(None) => {}
             Some(Some(offset)) => {
+                // Missing samples between two whose offsets agree within the jitter had no
+                // suspend in them: the offset grows only across one. Their mark is dropped, so
+                // that their times take the earlier offset and the list grows only with the
+                // offset (ADR-379).
+                if let [.., (_, Some(before)), (_, None)] = self.boot_offsets[..]
+                    && offset <= before + JITTER_US
+                {
+                    self.boot_offsets.pop();
+                    return;
+                }
                 if last.is_none_or(|last| last.is_none_or(|last| offset > last + JITTER_US)) {
                     self.boot_offsets.push((agent_now_us, Some(offset)));
                 }
@@ -9967,8 +9980,19 @@ mod tests {
         log.delay_samples(3);
         let asked = log.now();
         std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
         let answered = log.now();
         assert_eq!(log.round_trip_us(asked, answered), None);
+        // A missing sample that the next one shows had no suspend in it takes the offset both
+        // sides agree on, so the round trip is bounded again (ADR-379).
+        log.delay_samples(3);
+        let asked = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let answered = log.now();
+        assert_eq!(
+            log.round_trip_us(asked, answered),
+            Some(answered.monotonic_us - asked.monotonic_us)
+        );
     }
 
     /// The system clock's origin is read between two reads of the agent's clock: a delayed try
@@ -10013,12 +10037,54 @@ mod tests {
             Some(6_000_000 + after.monotonic_us)
         );
         drop(inner);
-        // After a missing sample, the next one is kept even when the offset did not grow.
+        // A missing sample whose next one shows the offset unchanged had no suspend in it: its
+        // time takes the offset both sides agree on, and its mark is dropped.
+        let entries = log.lock().boot_offsets.len();
         log.delay_samples(3);
         let during = log.now();
         std::thread::sleep(std::time::Duration::from_millis(1));
         let after = log.now();
         let mut inner = log.lock();
+        assert_eq!(
+            inner.boot_at(during.monotonic_us),
+            Some(6_000_000 + during.monotonic_us)
+        );
+        assert_eq!(
+            inner.boot_at(after.monotonic_us),
+            Some(6_000_000 + after.monotonic_us)
+        );
+        assert_eq!(inner.boot_offsets.len(), entries);
+    }
+
+    /// Missing samples with no suspend between them leave no entries behind, however many there
+    /// are, while one with a suspend in it keeps its mark (ADR-379).
+    #[test]
+    fn missing_samples_without_a_suspend_leave_the_offsets_unchanged() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        log.now();
+        let entries = log.lock().boot_offsets.clone();
+        for _ in 0..100 {
+            log.delay_samples(3);
+            log.now();
+            log.now();
+        }
+        assert_eq!(log.lock().boot_offsets, entries);
+        // A suspend during the missing sample: the next sample shows the growth, so the mark
+        // stays, and a time read during it has no boot time.
+        let before = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.delay_samples(3);
+        let during = log.now();
+        log.suspend(5_000_000);
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let after = log.now();
+        let mut inner = log.lock();
+        assert_eq!(inner.boot_offsets.len(), entries.len() + 2);
+        assert_eq!(
+            inner.boot_at(before.monotonic_us),
+            Some(1_000_000 + before.monotonic_us)
+        );
         assert_eq!(inner.boot_at(during.monotonic_us), None);
         assert_eq!(
             inner.boot_at(after.monotonic_us),
@@ -10085,7 +10151,7 @@ mod tests {
 
     /// A later run in the same boot measures the gap on the boot clock, across agent epochs, and
     /// records it with the comparison it gives, the reading's round trip in the tolerance and
-    /// the sleep in the gap, but judges nothing from it (ADR-374 item 5). Another boot, or a
+    /// the sleep in the gap, but judges nothing from it (ADR-374 item 5, ADR-379). Another boot, or a
     /// record without one, measures nothing.
     #[test]
     fn a_later_run_in_the_same_boot_measures_the_gap_on_the_boot_clock() {
@@ -10137,7 +10203,7 @@ mod tests {
         let settle = |record: &str, boot: Option<&str>, ahead_us: i64| {
             settle_with(record, boot, ahead_us, Some(3_000), 0)
         };
-        // The gap and the comparison are recorded, but judge nothing (ADR-374 item 5).
+        // The gap and the comparison are recorded, but judge nothing (ADR-374 item 5, ADR-379).
         let entry = settle(&record(with_boot), Some("boot-1"), -6_000);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert_eq!(entry["classification"], "undetermined", "{entry}");

@@ -1,7 +1,7 @@
 # ADR-362: The Log Judges a Receive Timeout Only Before a Response Began
 
 **Date:** 2026-10-26
-**Status:** Accepted (Decision item 4 narrowed by ADR-364)
+**Status:** Accepted (Decision item 4 narrowed by ADR-364; item 1's `response_times_judged` narrowed by ADR-377 to a link with a timing margin)
 **Affects:** `agent` communication log (`comm_log/timing.rs` `judge`, `comm_log.rs`
 `link_opened` and `CommLog::exchange_with`, `comm_log/exchange.rs` rows); design 8.11 ("Timing
 judged", "Limit in force", `timing`); ADR-346, ADR-357, ADR-361

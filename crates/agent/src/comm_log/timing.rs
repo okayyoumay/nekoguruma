@@ -86,11 +86,11 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
         timing.window_by_ms = None;
     };
     // Without a margin a profile gives, nothing bounds the error of the VCI's times, so no time
-    // is compared with a limit (ADR-377); the times stay recorded.
-    let Some(margin) = limits.margin_us.map(to_i64) else {
-        not_judged(&mut timing, NotJudgedReason::NoMargin);
-        return timing;
-    };
+    // is compared with a limit (ADR-377): an outcome that a comparison would give is
+    // `no_margin` instead, and a reason the times' own placement gives (no transmit, another
+    // clock, a time before the transmit, a response begun) stands. The times stay recorded.
+    let given = limits.margin_us.is_some();
+    let margin = limits.margin_us.map_or(0, to_i64);
     let p2 = to_i64(limits.p2_us);
     let p2_star = to_i64(limits.p2_star_us);
     let completion = limits.completion_us.map(to_i64);
@@ -102,6 +102,10 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             .map(|frame| to_i64(frame.transfer_us))
     };
     let set = |timing: &mut Timing, window: Window, by_us: Option<i64>| {
+        if !given {
+            not_judged(timing, NotJudgedReason::NoMargin);
+            return;
+        }
         timing.window = window;
         timing.window_by_ms = by_us.map(ms);
         timing.not_judged_reason = None;
@@ -135,7 +139,9 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
                     Window::Late,
                     Some(at - pending_transfer - latest),
                 );
-                timing.late_pending = Some(place);
+                if given {
+                    timing.late_pending = Some(place);
+                }
                 return timing;
             }
         }
@@ -192,8 +198,10 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             && end > latest + margin + transfer
         {
             set(&mut timing, Window::Late, Some(end - transfer - latest));
-        } else {
+        } else if given {
             not_judged(&mut timing, NotJudgedReason::EndAfterLimit);
+        } else {
+            not_judged(&mut timing, NotJudgedReason::NoMargin);
         }
     } else if times.timeout.is_some() && times.response_may_have_begun {
         not_judged(&mut timing, NotJudgedReason::ResponseBegun);
@@ -496,6 +504,44 @@ mod tests {
             None
         );
         assert!(past_vci_limits(LIMITS, false, transmit(), &[], at(900_000), 0).is_some());
+        // A reason the times' placement gives stands: no margin would let them be judged.
+        let no_transmit = Times {
+            start: at(10_000),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, no_transmit).not_judged_reason,
+            Some(NotJudgedReason::NoTransmitTime)
+        );
+        let before = Times {
+            transmit: transmit(),
+            start: at(-500),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, before).not_judged_reason,
+            Some(NotJudgedReason::BeforeTransmit)
+        );
+        let other_epoch = Times {
+            transmit: transmit(),
+            timeout: on(1, 1_050_000),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, other_epoch).not_judged_reason,
+            Some(NotJudgedReason::OtherClock)
+        );
+        // An end past the limit is not judged for want of a comparison, so it is `no_margin`.
+        let end = Times {
+            transmit: transmit(),
+            end: at(900_000),
+            end_len: Some(20),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, end).not_judged_reason,
+            Some(NotJudgedReason::NoMargin)
+        );
     }
 
     #[test]

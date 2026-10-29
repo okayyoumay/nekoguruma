@@ -595,7 +595,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   ECU that has answered requests matched this way with no link error, `undetermined` otherwise
   (on a link whose VCI absorbs pendings, the possible-pending row below comes first).
   `comm_log::timing` judges the window against the limits `link_opened` recorded for the link
-  (P2, P2* and the 0x78 completion timeout, with the timing margin), from the transmit done to
+  (P2, P2* and the 0x78 completion timeout, with the timing margin; with none, every time it
+  would compare is `not_judged` `no_margin`, while the reasons the times' own placement gives,
+  such as `no_transmit_time` or `other_clock`, stand, ADR-377), from the transmit done to
   a VCI time on the same clock and epoch (ADR-361): a response start and the receive timeout
   both ways, a response end as proof the response was on time and, for a response of at most
   six bytes on UDS on CAN (one frame whatever the addressing, at most 160 bits at the baud rate,

@@ -7,7 +7,7 @@ timing row), 13.5 ("Hardware profile"); `agent` communication log (`comm_log/tim
 `Limits`, `judge`, `judge_late_at`, `past_vci_limits`; `comm_log/exchange.rs`:
 `NotJudgedReason::NoMargin`; `comm_log.rs`: `VciMargins`, `link_opened`'s `timing_margin`);
 `crates/agent/docs/ngr-agent.md`, `crates/ngr-hw-checks/docs/hardware-profile.md`; ADR-357 items
-1, 3 and 5 for the timing margin; ADR-375 item 5
+1, 3 and 5 for the timing margin; ADR-362 item 1 (`response_times_judged`); ADR-375 item 5
 
 ## Context
 
@@ -32,7 +32,11 @@ profile, it records the latency and judges nothing.
 
 2. **No margin, no judgement.** Without a margin, nothing bounds the error of the VCI's times.
    So no time of the link is compared with a limit:
-   - an exchange's `window` is `not_judged`, with the reason `no_margin`;
+   - an exchange's `window` is `not_judged`, with the reason `no_margin` wherever a comparison
+     would have given its outcome. A reason the times' own placement gives stands, since no
+     margin would let such times be judged: `no_transmit_time`, `other_clock`,
+     `before_transmit`, `response_begun`. An end past the limit is a comparison, so it is
+     `no_margin`, not `end_after_limit`;
    - a response, start or pending read after its exchange ended is judged neither in time nor
      late;
    - the agent's deadline reading does not show the VCI past its own limits.
@@ -42,8 +46,10 @@ profile, it records the latency and judges nothing.
    a response or silence is `undetermined`.
 
 3. **The record.** `link_opened`'s `timing_margin` gives the margin in force with `source`
-   `profile`, or `{"source": "none"}` with no value when none is given. An exchange's
-   `timing.margin_ms` is left out then.
+   `profile`, or `{"source": "none"}` with no value when none is given. Its
+   `response_times_judged` is true only when the link has transmit indications and a margin,
+   which narrows ADR-362 item 1. An exchange's `timing.margin_ms` is left out when there is no
+   margin.
 
 4. **The other margins.** The drift bound and the clock margin keep their defaults
    (ADR-357), which a loss's settlement uses. Whether they stand under ADR-375 is checked with

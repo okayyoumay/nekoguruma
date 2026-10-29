@@ -139,8 +139,10 @@ impl Job {
     }
 
     /// Gives the job the margins a hardware profile states for its VCI (design 8.11 "Timing
-    /// margin", "Drift bound", 13.5, ADR-357). Each value the profile leaves out takes the
-    /// agent's default, as every value does for a job never told any; the log records which.
+    /// margin", "Drift bound", 13.5, ADR-357). A drift bound or clock margin the profile leaves
+    /// out takes the agent's default, as both do for a job never told any; a timing margin left
+    /// out leaves the job's times not judged, since the agent has none (ADR-377). The log
+    /// records which.
     pub fn with_vci_margins(mut self, margins: VciMargins) -> Self {
         self.vci_margins = margins;
         self
@@ -16671,8 +16673,9 @@ def main():
             opened["transmit_confirmation"],
             serde_json::json!(["transmit_indication"])
         );
-        // A transmit indication gives a transmit time, so response times can be judged.
-        assert_eq!(opened["response_times_judged"], true);
+        // A transmit indication gives a transmit time, but with no timing margin a profile
+        // gives no response time is judged (ADR-377).
+        assert_eq!(opened["response_times_judged"], false);
         // The mock worker does not say whether it forwards pendings (ADR-355).
         assert!(opened["forwards_pendings"].is_null());
         // No profile gives the VCI's timing margin, so none is in force and the link's times

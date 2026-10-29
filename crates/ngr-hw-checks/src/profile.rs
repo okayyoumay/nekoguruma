@@ -117,8 +117,9 @@ pub struct Vci {
 }
 
 impl Vci {
-    /// The margins this profile gives its VCI, for a job the harness runs on it (ADR-357): each
-    /// key it leaves out takes the agent's default.
+    /// The margins this profile gives its VCI, for a job the harness runs on it (ADR-357): a
+    /// drift bound or clock margin it leaves out takes the agent's default, and without a timing
+    /// margin the job judges no time (ADR-377).
     pub fn margins(&self) -> agent::VciMargins {
         agent::VciMargins {
             timing_margin_us: self.timing_margin_us,

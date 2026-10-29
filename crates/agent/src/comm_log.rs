@@ -1023,7 +1023,8 @@ struct LinkOpened<'a> {
     /// What can confirm a request's transmission on this link: `transmit_indication` when the
     /// library accepted `CP_TransmitIndEnable`. The link turns no loopback on.
     transmit_confirmation: Vec<&'static str>,
-    /// Whether response times can be judged on the link: not without a transmit time.
+    /// Whether response times can be judged on the link: not without a transmit time, nor
+    /// without a timing margin a profile gives (ADR-377).
     response_times_judged: bool,
     /// Whether the worker passes on every response pending the link sees, as the worker's
     /// answer to `CreateComLogicalLink` says (ADR-355); `null` when the worker does not say.
@@ -2697,6 +2698,7 @@ impl CommLog {
         indications: crate::link::Indications,
         forwards_pendings: Option<bool>,
     ) -> Option<u64> {
+        let margin = self.lock().margins.timing_margin();
         let mut comparams: Vec<ComParamInForce<'_>> = crate::link::own_comparams(config)
             .into_iter()
             .map(|(name, value)| ComParamInForce {
@@ -2755,14 +2757,11 @@ impl CommLog {
             } else {
                 Vec::new()
             },
-            response_times_judged: indications.transmit,
+            response_times_judged: indications.transmit && margin.is_some(),
             forwards_pendings,
-            timing_margin: {
-                let us = self.lock().margins.timing_margin();
-                TimingMargin {
-                    us,
-                    source: if us.is_some() { "profile" } else { "none" },
-                }
+            timing_margin: TimingMargin {
+                us: margin,
+                source: if margin.is_some() { "profile" } else { "none" },
             },
         });
         let mut inner = self.lock();
@@ -2771,7 +2770,7 @@ impl CommLog {
             p2_star_us: u64::from(config.p2_star_ms) * 1000,
             completion_us: (config.rc78_completion_ms != 0)
                 .then(|| u64::from(config.rc78_completion_ms) * 1000),
-            margin_us: inner.margins.timing_margin().map(u64::from),
+            margin_us: margin.map(u64::from),
             start_indications: indications.start_of_message,
             single_frame: config.single_frame(),
         };
@@ -5975,9 +5974,8 @@ mod tests {
         assert_eq!(entry["times"]["vci"]["rx_end"]["epoch"], 0, "{entry}");
     }
 
-    /// Design 8.11 "Timing judged": once `link_opened` has recorded the link's limits, an
-    /// exchange's window is judged from its VCI times on one clock and epoch, and the rows that
-    /// need it classify: a receive timeout early is `system`, also where a response had begun.
+    /// ADR-377: a link whose timing margin no profile gives records its times and limits, and
+    /// judges none of them.
     #[test]
     fn a_link_with_no_margin_a_profile_gives_records_its_times_and_judges_none() {
         // ADR-377: a run told no margins has no timing margin; `link_opened` says so, and an
@@ -6020,6 +6018,22 @@ mod tests {
             ..exchange::VciTimes::default()
         });
         log.exchange(silent).unwrap();
+        // A positive response well within P2 by its times: on time it would be `none`, but its
+        // time is not judged (ADR-376).
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+        );
+        answered.pending_visibility = exchange::PendingVisibility::Forwarded;
+        answered.times.agent.before_us = 2_000_000;
+        answered.times.agent.end_us = 2_030_000;
+        answered.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device(2_000_500)),
+            rx_end: Some(device(2_020_500)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(answered).unwrap();
         log.end("ok");
         let lines = lines(&setup);
         let opened = lines
@@ -6041,8 +6055,23 @@ mod tests {
         assert!(entry["timing"].get("margin_ms").is_none(), "{entry}");
         assert_eq!(entry["times"]["vci"]["error"]["us"], 1_010_500, "{entry}");
         assert_eq!(entry["classification"], "undetermined", "{entry}");
+        assert_eq!(opened["response_times_judged"], false, "{opened}");
+        let answered = lines
+            .iter()
+            .filter(|line| line["event"] == "exchange")
+            .nth(1)
+            .unwrap();
+        assert_eq!(answered["timing"]["response_ms"], 20.0, "{answered}");
+        assert_eq!(
+            answered["timing"]["not_judged_reason"], "no_margin",
+            "{answered}"
+        );
+        assert_eq!(answered["classification"], "undetermined", "{answered}");
     }
 
+    /// Design 8.11 "Timing judged": once `link_opened` has recorded the link's limits, an
+    /// exchange's window is judged from its VCI times on one clock and epoch, and the rows that
+    /// need it classify: a receive timeout early is `system`, also where a response had begun.
     #[test]
     fn windows_are_judged_against_the_link_s_limits() {
         let dir = dir();

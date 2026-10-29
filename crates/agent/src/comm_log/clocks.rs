@@ -296,7 +296,8 @@ impl VciClocks {
 pub(crate) struct LossFit {
     /// What a clock that carried on reads: the last time plus the gap, modulo the wrap.
     pub expected_us: u64,
-    /// Twice the clock margin, one for each reading, plus the drift bound over the gap.
+    /// Twice the clock margin, one for each reading, plus the reading's round trip, within
+    /// which the clock was read, plus the drift bound over the gap.
     pub tolerance_us: u64,
     /// The reading lies within the tolerance of the expected value, across the wrap.
     pub carried_on: bool,
@@ -305,16 +306,19 @@ pub(crate) struct LossFit {
     pub restarted: bool,
 }
 
-/// Sets `reading_us` against `last_us` and the agent's `gap_us` between them (raw times of one
-/// clock, the gap within one agent epoch).
+/// Sets `reading_us` against `last_us` and the `gap_us` between their reads (raw times of one
+/// clock; the gap on one clock of the agent's machine), where the reading was taken within
+/// `round_trip_us` before its read.
 pub(crate) fn loss_fit(
     last_us: u64,
     reading_us: u64,
     gap_us: u64,
+    round_trip_us: u64,
     drift_bound_ppm: u32,
     clock_margin_us: u32,
 ) -> LossFit {
     let tolerance = 2 * i128::from(clock_margin_us)
+        + i128::from(round_trip_us)
         + i128::from(drift_bound_ppm) * i128::from(gap_us) / 1_000_000;
     let reading = i128::from(reading_us);
     let expected = (i128::from(last_us) + i128::from(gap_us)).rem_euclid(WRAP);
@@ -606,39 +610,48 @@ mod tests {
 
     #[test]
     fn a_clock_that_carried_on_reads_its_last_time_plus_the_gap() {
-        let fit = loss_fit(1_835_511_040, 1_866_711_040 + 4_000, GAP, 100, 1_000);
+        let fit = loss_fit(1_835_511_040, 1_866_711_040 + 4_000, GAP, 0, 100, 1_000);
         assert_eq!(fit.expected_us, 1_866_711_040);
         assert_eq!(fit.tolerance_us, 5_120);
         assert!(fit.carried_on && !fit.restarted, "{fit:?}");
         // Just past the tolerance on either side, it carried on no longer.
         for reading in [1_866_711_040 + 5_121, 1_866_711_040 - 5_121] {
-            assert!(!loss_fit(1_835_511_040, reading, GAP, 100, 1_000).carried_on);
+            assert!(!loss_fit(1_835_511_040, reading, GAP, 0, 100, 1_000).carried_on);
         }
     }
 
     #[test]
+    fn the_reading_s_round_trip_widens_the_tolerance() {
+        // The clock was read up to 3 ms before its answer came.
+        let fit = loss_fit(1_835_511_040, 1_866_711_040 - 8_000, GAP, 3_000, 100, 1_000);
+        assert_eq!(fit.tolerance_us, 8_120);
+        assert!(fit.carried_on && !fit.restarted, "{fit:?}");
+        assert!(!loss_fit(1_835_511_040, 1_866_711_040 - 8_121, GAP, 3_000, 100, 1_000).carried_on);
+    }
+
+    #[test]
     fn a_clock_that_restarted_reads_no_more_than_the_gap() {
-        let fit = loss_fit(1_835_511_040, 2_000_000, GAP, 100, 1_000);
+        let fit = loss_fit(1_835_511_040, 2_000_000, GAP, 0, 100, 1_000);
         assert!(!fit.carried_on && fit.restarted, "{fit:?}");
-        assert!(loss_fit(1_835_511_040, GAP + 5_120, GAP, 100, 1_000).restarted);
-        assert!(!loss_fit(1_835_511_040, GAP + 5_121, GAP, 100, 1_000).restarted);
+        assert!(loss_fit(1_835_511_040, GAP + 5_120, GAP, 0, 100, 1_000).restarted);
+        assert!(!loss_fit(1_835_511_040, GAP + 5_121, GAP, 0, 100, 1_000).restarted);
     }
 
     #[test]
     fn a_clock_whose_last_time_plus_the_gap_reaches_the_wrap_fits_both() {
         // The expected value wraps to 10 s, within the gap a restarted clock may have run.
         let last = SPAN - GAP + 10_000_000;
-        let fit = loss_fit(last, 10_000_000, GAP, 100, 1_000);
+        let fit = loss_fit(last, 10_000_000, GAP, 0, 100, 1_000);
         assert_eq!(fit.expected_us, 10_000_000);
         assert!(fit.carried_on && fit.restarted, "{fit:?}");
         // And one a few microseconds before the wrap is still near the expected value.
-        let fit = loss_fit(SPAN - 1_000, 500, 0, 100, 1_000);
+        let fit = loss_fit(SPAN - 1_000, 500, 0, 0, 100, 1_000);
         assert!(fit.carried_on, "{fit:?}");
     }
 
     #[test]
     fn a_reading_far_from_both_fits_neither() {
-        let fit = loss_fit(1_835_511_040, 900_000_000, GAP, 100, 1_000);
+        let fit = loss_fit(1_835_511_040, 900_000_000, GAP, 0, 100, 1_000);
         assert!(!fit.carried_on && !fit.restarted, "{fit:?}");
     }
 

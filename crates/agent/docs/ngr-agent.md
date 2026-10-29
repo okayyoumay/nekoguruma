@@ -351,9 +351,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   A run that loses the VCI writes `vci_loss`, and writes it again, whole, after each further
   exchange the loss ended or caused, syncing each one (ADR-373). When the log holds a loss no
   `vci_loss_settled` names, the next run whose VCI connects reads the VCI's clock once
-  (`GetTimestamp`) before `vci_connected`, and writes `vci_loss_settled` right after it. Every
-  reopen starts a new agent epoch, so the gap since the loss is not measured and `power_kept` is
-  `unknown`.
+  (`GetTimestamp`) before `vci_connected`, timing its round trip, and writes `vci_loss_settled`
+  right after it. Every reopen starts a new agent epoch, so the agent's clock cannot measure the
+  gap since the loss, and `power_kept` is `unknown`. On Linux the machine's boot clock
+  (`CLOCK_BOOTTIME`) measures the gap when both runs lie in one boot (the kernel's boot id),
+  and the entry records it with the machine's sleep in it and the comparison it gives, for a
+  later judgement (ADR-374).
   `link_opened` then gives the link, its endpoint and
   channel, the protocol, baud rate and identifiers, and every ComParam by name with its value
   and `set_by` (`link` for those `agent::link` sets to its own value, `document` for those

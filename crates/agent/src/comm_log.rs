@@ -36,6 +36,9 @@ use crate::runner::JobError;
 /// What an exchange entry carries of a message's bytes (design 8.11, ADR-347).
 pub(crate) mod redaction;
 
+/// The machine's boot: its identifier and a clock from it (design 8.11 `vci_loss_settled`, ADR-373).
+pub(crate) mod boot;
+
 /// The VCI's clocks: alignment, unwrapping and epochs (design 8.11 `clock_epoch`, ADR-361).
 pub(crate) mod clocks;
 
@@ -729,6 +732,20 @@ struct VciLoss {
     /// The VCI's serial number, when the API gave one.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     serial_number: Option<u32>,
+    /// The machine's boot and the time on its boot clock the device clock's last time was read,
+    /// when the system gives both, so that a later run in the same boot measures the gap.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    boot: Option<LossBoot>,
+}
+
+/// The boot a lost VCI's last device time was read in, and when on the boot clock.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct LossBoot {
+    id: String,
+    us: u64,
+    /// How long the machine had slept since its boot at that time, when the system gives it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    slept_us: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -755,11 +772,14 @@ struct LastTime {
 }
 
 /// The first reading of the VCI's clock after it connected, which the runner takes when the log
-/// holds a loss to settle: the time with the clock the worker names, and when the agent read it.
+/// holds a loss to settle: the time with the clock the worker names, when the agent had the
+/// answer, and the read's round trip, within which the clock was read: `None` when it cannot
+/// be bounded ([`CommLog::round_trip_us`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct ConnectReading {
     pub time: exchange::VciTime,
     pub read: AgentNow,
+    pub round_trip_us: Option<u64>,
 }
 
 /// Whether the VCI kept its power across the loss (`vci_loss_settled`'s `power_kept`).
@@ -788,6 +808,12 @@ struct LossTime {
     us: u64,
     read_us: u64,
     agent_epoch: u32,
+    /// When on the machine's boot clock the time was read, when the system gives the clock.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    boot_us: Option<u64>,
+    /// How long the machine had slept since its boot then, when the system gives it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    slept_us: Option<u64>,
 }
 
 /// The inputs and the comparison of `vci_loss_settled`, so a reader can redo it.
@@ -797,8 +823,19 @@ struct LossClock {
     last_before: Option<LossTime>,
     /// The first reading of the VCI's clock after the reconnect.
     reading: Option<LossTime>,
-    /// The gap the agent's clock measured between the two; `null` across agent epochs.
-    agent_gap_us: Option<u64>,
+    /// The loss's boot and the reconnect's are the same; `null` when the record has no boot or
+    /// the reconnecting run has no boot id.
+    boot_match: Option<bool>,
+    /// How much longer the machine had slept by the reconnect than by the loss, recorded for a
+    /// later judgement (ADR-374).
+    slept_in_gap_us: Option<u64>,
+    /// The gap between the two reads: on the boot clock when both lie in one boot, else on the
+    /// agent's clock when both lie in one agent epoch, else `null`.
+    gap_us: Option<u64>,
+    /// The clock that measured the gap: `boot` or `agent`.
+    gap_from: Option<&'static str>,
+    /// The reading's round trip, which the tolerance takes in.
+    round_trip_us: Option<u64>,
     expected_us: Option<u64>,
     tolerance_us: Option<u64>,
     drift_ppm: u32,
@@ -845,7 +882,7 @@ fn power_kept(
     }
     let Some(fit) = fit else {
         return unknown(
-            "The VCI reconnected in a later run of the agent, whose clock cannot measure the time since the loss",
+            "The VCI reconnected in a later run of the agent, and nothing measured the time since the loss: the agent's clock starts over with each run, and no boot clock both runs share was read at both times",
         );
     };
     match (fit.carried_on, fit.restarted, serial_match) {
@@ -1280,6 +1317,27 @@ struct Inner {
     unsettled: Option<VciLoss>,
     /// The serial number of the run's VCI, from `vci_connected`, when the API gave one.
     serial_number: Option<u32>,
+    /// The machine's boot, when the system identifies it, which a loss's settlement compares.
+    boot_id: Option<String>,
+    /// How far the boot clock is ahead of the agent's monotonic clock, from each agent time the
+    /// log has read on: the agent's time of the reading and the offset, one entry for each time
+    /// the offset grew, as it does across a suspend (the agent's clock stops during one, the boot
+    /// clock does not). A time's boot time is then taken with the offset when it was read, so
+    /// that a suspend afterwards does not skew it (ADR-374). `None` marks a sample that could
+    /// not be taken: a time from then until the next sample has no boot time.
+    boot_offsets: Vec<(u64, Option<u64>)>,
+    /// For tests: the boot clock reads this plus the agent's monotonic time.
+    #[cfg(test)]
+    boot_offset_us: Option<u64>,
+    /// For tests: the system's monotonic clock reads this plus the agent's.
+    #[cfg(test)]
+    system_offset_us: u64,
+    /// The system's monotonic time when the agent's clock began, once read
+    /// ([`Inner::system_origin_us`]).
+    system_origin_us: Option<u64>,
+    /// For tests: this many tries of a boot clock sample come out delayed.
+    #[cfg(test)]
+    delayed_tries: usize,
 }
 
 /// The agent's clocks at one moment, as an exchange's `times` give them: the agent epoch, the
@@ -1366,7 +1424,7 @@ impl CommLog {
         // A log goes on after an earlier run once it holds a header; otherwise a header is
         // written after whatever the file holds, marked incomplete.
         let reopened = scan.header;
-        Self(Arc::new(Mutex::new(Inner {
+        let mut inner = Inner {
             sink,
             next_seq: scan.next_seq,
             failed: None,
@@ -1393,13 +1451,57 @@ impl CommLog {
             loss: None,
             unsettled: scan.unsettled,
             serial_number: None,
-        })))
+            boot_id: boot::id(),
+            boot_offsets: Vec::new(),
+            #[cfg(test)]
+            boot_offset_us: None,
+            #[cfg(test)]
+            system_offset_us: 0,
+            system_origin_us: None,
+            #[cfg(test)]
+            delayed_tries: 0,
+        };
+        // The offset between the clocks when the agent's clock began.
+        inner.sample_boot_at(0);
+        Self(Arc::new(Mutex::new(inner)))
     }
 
     /// A log over `sink` that continues a file `scan` describes, for tests.
     #[cfg(test)]
     fn over(sink: Box<dyn LineSink>, existing: &[u8]) -> Self {
         Self::new(sink, scan(existing).expect("a scannable log"), None)
+    }
+
+    /// Makes the log see the machine's boot as `id`, with a boot clock that reads `offset_us`
+    /// plus the agent's monotonic time and a machine that has not slept; `None` for a system
+    /// that gives neither.
+    #[cfg(test)]
+    fn boot_as(&self, boot: Option<(&str, u64)>) {
+        let mut inner = self.lock();
+        inner.boot_id = boot.map(|(id, _)| id.to_owned());
+        inner.boot_offset_us = boot.map(|(_, offset)| offset);
+        // A machine that has not slept: the system's clock reads what the boot clock does.
+        inner.system_offset_us = boot.map_or(0, |(_, offset)| offset);
+        inner.system_origin_us = None;
+        inner.boot_offsets.clear();
+        // As though the boot clock had read so since the log began.
+        inner.sample_boot_at(0);
+    }
+
+    /// Makes the next `tries` tries of a boot clock sample come out delayed, as when the
+    /// thread is preempted between the reads.
+    #[cfg(test)]
+    fn delay_samples(&self, tries: usize) {
+        self.lock().delayed_tries = tries;
+    }
+
+    /// Makes the boot clock run on `us` past the agent's, as across a suspend of the machine.
+    #[cfg(test)]
+    fn suspend(&self, us: u64) {
+        let mut inner = self.lock();
+        if let Some(offset) = &mut inner.boot_offset_us {
+            *offset += us;
+        }
     }
 
     fn lock(&self) -> MutexGuard<'_, Inner> {
@@ -1423,6 +1525,9 @@ impl CommLog {
             Opening::Fresh => {
                 // The log begins here: the header reads 0.
                 inner.origin = Instant::now();
+                inner.boot_offsets.clear();
+                inner.system_origin_us = None;
+                inner.sample_boot_at(0);
                 let clock = AgentClock {
                     monotonic_us: 0,
                     ..inner.clock()
@@ -1481,9 +1586,29 @@ impl CommLog {
         self.lock().failed.is_none()
     }
 
+    /// The time from `asked` to `answered`, two agent times of this log, on the boot clock when
+    /// the system gives one, so that a suspend in between counts (ADR-374). `None` when only one
+    /// of the two has a boot time: the agent's clock would leave out a suspend in between, so
+    /// nothing bounds the time.
+    pub(crate) fn round_trip_us(&self, asked: AgentNow, answered: AgentNow) -> Option<u64> {
+        let mut inner = self.lock();
+        let agent = answered.monotonic_us.saturating_sub(asked.monotonic_us);
+        match (
+            inner.boot_at(asked.monotonic_us),
+            inner.boot_at(answered.monotonic_us),
+        ) {
+            (Some(asked), Some(answered)) => Some(answered.saturating_sub(asked).max(agent)),
+            (None, None) => Some(agent),
+            _ => None,
+        }
+    }
+
     /// The agent's clocks now, for an exchange's times.
     pub(crate) fn now(&self) -> AgentNow {
-        let clock = self.lock().clock();
+        let mut inner = self.lock();
+        let clock = inner.clock();
+        inner.sample_boot_at(clock.monotonic_us);
+        drop(inner);
         AgentNow {
             epoch: u32::try_from(clock.epoch).unwrap_or(u32::MAX),
             monotonic_us: clock.monotonic_us,
@@ -2204,6 +2329,7 @@ impl CommLog {
         let mut inner = self.lock();
         let now = {
             let clock = inner.clock();
+            inner.sample_boot_at(clock.monotonic_us);
             Some(AgentNow {
                 epoch: u32::try_from(clock.epoch).unwrap_or(u32::MAX),
                 monotonic_us: clock.monotonic_us,
@@ -3586,6 +3712,7 @@ impl Inner {
         classification: exchange::Classification,
         refused: bool,
     ) -> Option<()> {
+        let fresh = self.loss.is_none();
         let mut loss = match self.loss.take() {
             Some(loss) => loss,
             None => VciLoss {
@@ -3603,8 +3730,22 @@ impl Inner {
                     })
                     .collect(),
                 serial_number: self.serial_number,
+                boot: None,
             },
         };
+        if fresh {
+            loss.boot = loss
+                .clocks
+                .iter()
+                .find(|last| last.clock == exchange::Clock::Device)
+                .and_then(|last| {
+                    Some(LossBoot {
+                        id: self.boot_id.clone()?,
+                        us: self.boot_at(last.time.read_us)?,
+                        slept_us: self.slept_at(last.time.read_us),
+                    })
+                });
+        }
         let taken = LossExchange {
             seq,
             classification,
@@ -3633,6 +3774,9 @@ impl Inner {
     /// the first reading of the VCI's clock after it connected (design 8.11 "Settlement",
     /// ADR-373). `None` once the log has failed.
     fn settle_loss(&mut self, loss: VciLoss, reading: Option<ConnectReading>) -> Option<u64> {
+        let round_trip_us = reading.and_then(|reading| reading.round_trip_us);
+        // A reading taken at a time nothing bounds is compared with nothing (ADR-374 item 4).
+        let unbounded = reading.is_some_and(|reading| reading.round_trip_us.is_none());
         // The reading on its clock, which opens the clock's first epoch of this run.
         let placed = match reading {
             Some(reading) => self
@@ -3644,6 +3788,8 @@ impl Inner {
                     us: reading.time.us,
                     read_us: reading.read.monotonic_us,
                     agent_epoch: reading.read.epoch,
+                    boot_us: self.boot_at(reading.read.monotonic_us),
+                    slept_us: self.slept_at(reading.read.monotonic_us),
                 }),
             None => None,
         };
@@ -3657,6 +3803,8 @@ impl Inner {
                 us: last.time.us,
                 read_us: last.time.read_us,
                 agent_epoch: loss.agent_epoch,
+                boot_us: loss.boot.as_ref().map(|boot| boot.us),
+                slept_us: loss.boot.as_ref().and_then(|boot| boot.slept_us),
             });
         // The VCI's own clock on both sides of the loss.
         let reading = placed;
@@ -3664,25 +3812,74 @@ impl Inner {
             .as_ref()
             .filter(|reading| reading.clock == exchange::Clock::Device);
         let readings = last.is_some() && device.is_some();
-        let gap = last
+        let boot_match = loss
+            .boot
+            .as_ref()
+            .zip(self.boot_id.as_ref())
+            .map(|(before, after)| before.id == *after);
+        // The gap on the boot clock when both reads lie in one boot (suspend included), else on
+        // the agent's clock within one agent epoch.
+        let gap = last.as_ref().zip(device).and_then(|(last, reading)| {
+            let boot = last
+                .boot_us
+                .zip(reading.boot_us)
+                .filter(|_| boot_match == Some(true))
+                .and_then(|(before, after)| after.checked_sub(before))
+                .map(|gap| (gap, "boot"));
+            let agent = (last.agent_epoch == reading.agent_epoch)
+                .then(|| (reading.read_us.saturating_sub(last.read_us), "agent"));
+            boot.or(agent)
+        });
+        // How much longer the machine had slept by the reconnect than by the loss, recorded for a
+        // later judgement (ADR-374 item 5).
+        let slept_in_gap_us = last
             .as_ref()
             .zip(device)
-            .filter(|(last, reading)| last.agent_epoch == reading.agent_epoch)
-            .map(|(last, reading)| reading.read_us.saturating_sub(last.read_us));
+            .filter(|_| boot_match == Some(true))
+            .and_then(|(last, reading)| last.slept_us.zip(reading.slept_us))
+            .map(|(before, after)| after.saturating_sub(before));
+        // A gap on the boot clock is recorded with the comparison it gives, but judges nothing
+        // (ADR-374 item 5): across a suspend the kernel measures the sleep only to about a
+        // second, and no check of the sleep found so far rules out a false outcome.
+        let on_boot = matches!(gap, Some((_, "boot")));
         let (drift_ppm, drift_from) = self.margins.drift_bound();
         let (clock_margin_us, clock_margin_from) = self.margins.clock_margin();
         let fit = last
             .as_ref()
             .zip(device)
             .zip(gap)
-            .map(|((last, reading), gap)| {
-                clocks::loss_fit(last.us, reading.us, gap, drift_ppm, clock_margin_us)
+            .map(|((last, reading), (gap, _))| {
+                clocks::loss_fit(
+                    last.us,
+                    reading.us,
+                    gap,
+                    round_trip_us.unwrap_or_default(),
+                    drift_ppm,
+                    clock_margin_us,
+                )
             });
         let serial_match = loss
             .serial_number
             .zip(self.serial_number)
             .map(|(before, after)| before == after);
-        let (power_kept, reason) = power_kept(readings, fit, serial_match);
+        let fit = fit.filter(|_| !unbounded);
+        let (power_kept, reason) = if readings && unbounded {
+            (
+                PowerKept::Unknown,
+                format!(
+                    "The reconnect's reading of the VCI's clock came at a time the boot clock could not bound, so it is compared with nothing;{SUPPLY_NOT_EXCLUDED}"
+                ),
+            )
+        } else if readings && on_boot && fit.is_some() {
+            (
+                PowerKept::Unknown,
+                format!(
+                    "The VCI reconnected in a later run of the agent; the time since the loss was measured on the boot clock and is recorded with the comparison it gives, but the log does not judge a loss from it, since a suspend of the PC can put it off;{SUPPLY_NOT_EXCLUDED}"
+                ),
+            )
+        } else {
+            power_kept(readings, fit, serial_match)
+        };
         let mut exchanges: Vec<LossSettled> = loss
             .ended
             .iter()
@@ -3733,7 +3930,11 @@ impl Inner {
             clock: LossClock {
                 last_before: last,
                 reading,
-                agent_gap_us: gap,
+                boot_match,
+                slept_in_gap_us,
+                gap_us: gap.map(|(gap, _)| gap),
+                gap_from: gap.map(|(_, from)| from),
+                round_trip_us,
                 expected_us: fit.map(|fit| fit.expected_us),
                 tolerance_us: fit.map(|fit| fit.tolerance_us),
                 drift_ppm,
@@ -3752,10 +3953,139 @@ impl Inner {
         self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
+    /// The boot clock's time when the agent's monotonic clock read `monotonic_us` in this agent
+    /// epoch, with the offset between the two clocks then; `None` when the system gives no boot
+    /// clock.
+    fn boot_at(&mut self, monotonic_us: u64) -> Option<u64> {
+        self.sample_boot();
+        let (_, offset) = self
+            .boot_offsets
+            .iter()
+            .rev()
+            .find(|(at, _)| *at <= monotonic_us)?;
+        monotonic_us.checked_add((*offset)?)
+    }
+
+    /// Takes the offset between the boot clock and the agent's clock now.
+    fn sample_boot(&mut self) {
+        let agent_now_us = self.clock().monotonic_us;
+        self.sample_boot_at(agent_now_us);
+    }
+
+    /// Takes the offset between the boot clock and the agent's clock for the agent time
+    /// `agent_now_us`, read just now. The boot clock's read is bracketed by two reads of the
+    /// agent's clock, and a sample whose bracket is wider than the reads' own jitter (the thread
+    /// was preempted in between) is tried at most three times in all, or left out, so that a
+    /// delay is not taken for a suspend. Only a growth beyond the jitter is kept: the clocks run
+    /// at one rate but for a suspend.
+    fn sample_boot_at(&mut self, agent_now_us: u64) {
+        const JITTER_US: u64 = 50;
+        const TRIES: usize = 3;
+        let offset = (0..TRIES).find_map(|_| {
+            let before = self.monotonic_us();
+            let boot_us = self.boot_now_us(before);
+            let after = self.monotonic_us();
+            #[cfg(test)]
+            let after = if self.delayed_tries > 0 {
+                self.delayed_tries -= 1;
+                after + JITTER_US + 1
+            } else {
+                after
+            };
+            match boot_us {
+                None => Some(None),
+                Some(boot_us) => {
+                    (after.saturating_sub(before) <= JITTER_US).then(|| boot_us.checked_sub(before))
+                }
+            }
+        });
+        let last = self.boot_offsets.last().map(|(_, last)| *last);
+        match offset {
+            // No boot clock.
+            Some(None) => {}
+            Some(Some(offset)) => {
+                if last.is_none_or(|last| last.is_none_or(|last| offset > last + JITTER_US)) {
+                    self.boot_offsets.push((agent_now_us, Some(offset)));
+                }
+            }
+            // Every try was delayed: until the next sample, a time's offset is unknown, since a
+            // suspend may have come since the last one.
+            None => {
+                if last.is_none_or(|last| last.is_some()) {
+                    self.boot_offsets.push((agent_now_us, None));
+                }
+            }
+        }
+    }
+
+    /// The agent's monotonic time since the log began, in this agent epoch.
+    fn monotonic_us(&self) -> u64 {
+        u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX)
+    }
+
+    /// How long the machine had slept since its boot when the agent's clock read
+    /// `monotonic_us`: the boot time then less the system's monotonic time then, which runs
+    /// beside the agent's clock but for its origin.
+    fn slept_at(&mut self, monotonic_us: u64) -> Option<u64> {
+        let boot_us = self.boot_at(monotonic_us)?;
+        let origin_us = self.system_origin_us()?;
+        // A machine that has not slept reads the two clocks alike, to a microsecond either way.
+        Some(boot_us.saturating_sub(monotonic_us.checked_add(origin_us)?))
+    }
+
+    /// The system's monotonic time when the agent's clock began. Both clocks run alike, so it is
+    /// read once, between two reads of the agent's clock as a boot clock sample is
+    /// ([`Inner::sample_boot_at`]), so that a delay in between does not skew it; `None` when no
+    /// try came within the jitter, or the system gives no such clock.
+    fn system_origin_us(&mut self) -> Option<u64> {
+        const JITTER_US: u64 = 50;
+        const TRIES: usize = 3;
+        if self.system_origin_us.is_none() {
+            self.system_origin_us = (0..TRIES).find_map(|_| {
+                let before = self.monotonic_us();
+                let system_us = self.system_monotonic_us(before);
+                let after = self.monotonic_us();
+                #[cfg(test)]
+                let after = if self.delayed_tries > 0 {
+                    self.delayed_tries -= 1;
+                    after + JITTER_US + 1
+                } else {
+                    after
+                };
+                (after.saturating_sub(before) <= JITTER_US)
+                    .then(|| system_us.and_then(|system_us| system_us.checked_sub(before)))
+                    .flatten()
+            });
+        }
+        self.system_origin_us
+    }
+
+    /// The system's monotonic clock now, the agent's reading `agent_now_us`.
+    fn system_monotonic_us(&self, agent_now_us: u64) -> Option<u64> {
+        #[cfg(test)]
+        if self.boot_id.is_none() || self.boot_offset_us.is_some() {
+            return Some(agent_now_us + self.system_offset_us);
+        }
+        #[cfg(not(test))]
+        let _ = agent_now_us;
+        boot::monotonic_us()
+    }
+
+    /// The boot clock now, the agent's monotonic clock reading `agent_now_us`.
+    fn boot_now_us(&self, agent_now_us: u64) -> Option<u64> {
+        #[cfg(test)]
+        if self.boot_id.is_none() || self.boot_offset_us.is_some() {
+            return self.boot_offset_us.map(|offset| offset + agent_now_us);
+        }
+        #[cfg(not(test))]
+        let _ = agent_now_us;
+        boot::now_us()
+    }
+
     fn clock(&self) -> AgentClock {
         AgentClock {
             epoch: self.epoch,
-            monotonic_us: u64::try_from(self.origin.elapsed().as_micros()).unwrap_or(u64::MAX),
+            monotonic_us: self.monotonic_us(),
             wall_unix_ms: SystemTime::now()
                 .duration_since(UNIX_EPOCH)
                 .map_or(0, |elapsed| elapsed.as_millis() as u64),
@@ -9017,6 +9347,7 @@ mod tests {
         let reading = reading.map(|time| ConnectReading {
             time,
             read: log.now(),
+            round_trip_us: Some(0),
         });
         log.vci_connected(Some(&serial(77)), reading).unwrap();
         let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
@@ -9171,14 +9502,16 @@ mod tests {
 
     /// Design 8.11 `vci_loss_settled`, ADR-373: the run that loses the VCI records the loss
     /// again after each exchange it ends or causes, and the next run that connects settles the
-    /// last record, after its `vci_connected`, against the first reading of the VCI's clock. A
-    /// later run's agent clock cannot measure the gap, so the power is not shown kept.
+    /// last record, after its `vci_connected`, against the first reading of the VCI's clock. The
+    /// record keeps the boot the last time was read in; a later run whose system gives no boot
+    /// clock cannot measure the gap, so the power is not shown kept.
     #[test]
     fn a_lost_vci_is_recorded_and_settled_when_a_later_run_connects() {
         let dir = dir();
         let setup = setup(&dir);
         let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
         let log = CommLog::open(&setup).unwrap();
+        log.boot_as(Some(("boot-1", 7_000_000)));
         assert!(!log.loss_to_settle());
         log.begin(&dpdu_facts(), RunKind::First);
         log.vci_connected(Some(&serial(77)), None).unwrap();
@@ -9192,6 +9525,10 @@ mod tests {
             ..exchange::VciTimes::default()
         });
         log.exchange_with(answered, Vec::new()).unwrap();
+        // The machine suspends before the loss is noted: the boot clock runs on, the agent's
+        // does not, and the record keeps the boot time the last time was read at, with the
+        // offset between the clocks then.
+        log.suspend(9_000_000_000);
         let lost = |refused_after_loss| {
             evidence(
                 endpoint(0x7E0),
@@ -9225,6 +9562,12 @@ mod tests {
                 serde_json::json!([{"clock": "device", "epoch": 0, "us": 1_835_511_040u64, "read_us": 0}]),
                 "{record}"
             );
+            // Read at agent time 0, so at the boot clock's offset.
+            assert_eq!(
+                record["boot"],
+                serde_json::json!({"id": "boot-1", "us": 7_000_000, "slept_us": 0}),
+                "{record}"
+            );
         }
         assert_eq!(records[0]["refused"], serde_json::json!([]));
         assert_eq!(
@@ -9240,11 +9583,13 @@ mod tests {
         drop(log);
 
         let log = CommLog::open(&setup).unwrap();
+        log.boot_as(None);
         assert!(log.loss_to_settle());
         log.begin(&dpdu_facts(), RunKind::Resume);
         let reading = ConnectReading {
             time: device(1_866_720_397),
             read: log.now(),
+            round_trip_us: Some(0),
         };
         log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
         assert!(!log.loss_to_settle());
@@ -9276,7 +9621,12 @@ mod tests {
         assert_eq!(settled["clock"]["reading"]["us"], 1_866_720_397u64);
         assert_eq!(settled["clock"]["reading"]["agent_epoch"], 2);
         assert_eq!(settled["clock"]["reading"]["epoch"], 1, "{settled}");
-        assert!(settled["clock"]["agent_gap_us"].is_null(), "{settled}");
+        assert!(settled["clock"]["gap_us"].is_null(), "{settled}");
+        assert!(settled["clock"]["boot_match"].is_null(), "{settled}");
+        assert_eq!(
+            settled["clock"]["last_before"]["boot_us"], 7_000_000,
+            "{settled}"
+        );
         assert!(settled["clock"]["fits_carried_on"].is_null(), "{settled}");
         assert_eq!(settled["serial_match"], true);
         assert_eq!(settled["power_kept"], "unknown");
@@ -9339,6 +9689,7 @@ mod tests {
                 ConnectReading {
                     time: exchange::VciTime::new(us, Some(clock)),
                     read,
+                    round_trip_us: Some(0),
                 }
             });
             log.vci_connected(Some(&serial(serial_after)), reading)
@@ -9363,7 +9714,8 @@ mod tests {
         assert_eq!(entry["power_kept"], true, "{entry}");
         assert_eq!(entry["classification"], "system", "{entry}");
         assert_eq!(settled_exchanges(&entry), [(0, "system")]);
-        assert_eq!(entry["clock"]["agent_gap_us"], 31_209_200);
+        assert_eq!(entry["clock"]["gap_us"], 31_209_200);
+        assert_eq!(entry["clock"]["gap_from"], "agent");
         assert_eq!(entry["clock"]["expected_us"], 1_835_511_040u64 + 31_209_200);
         assert_eq!(entry["clock"]["tolerance_us"], 2_000 + 3_120);
         assert_eq!(entry["clock"]["drift_from"], "default");
@@ -9411,5 +9763,281 @@ mod tests {
         let entry = settle(77, dpdu_facts(), None);
         assert_eq!(entry["power_kept"], "unknown", "{entry}");
         assert!(entry["clock"]["reading"].is_null());
+    }
+
+    /// A suspend between asking the VCI's clock and its answer counts in the round trip: the
+    /// boot clock measures it, as it measures the gap (ADR-374).
+    #[test]
+    fn a_suspend_during_the_reading_counts_in_its_round_trip() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let asked = log.now();
+        // The agent's clock moves on between the two reads, as it does around a real suspend.
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        let answered = log.now();
+        let agent = answered.monotonic_us - asked.monotonic_us;
+        assert_eq!(log.round_trip_us(asked, answered), Some(agent + 5_000_000));
+        // A time read before the suspend keeps the boot time it was read at, however late it
+        // is placed.
+        assert_eq!(
+            log.lock().boot_at(asked.monotonic_us),
+            Some(1_000_000 + asked.monotonic_us)
+        );
+        assert_eq!(
+            log.lock().boot_at(answered.monotonic_us),
+            Some(6_000_000 + answered.monotonic_us)
+        );
+        // Without a boot clock, the agent's clock alone.
+        log.boot_as(None);
+        let asked = log.now();
+        let answered = log.now();
+        assert_eq!(
+            log.round_trip_us(asked, answered),
+            Some(answered.monotonic_us - asked.monotonic_us)
+        );
+        // A boot time at only one end bounds nothing: a suspend between may be left out.
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        log.delay_samples(3);
+        let asked = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let answered = log.now();
+        assert_eq!(log.round_trip_us(asked, answered), None);
+    }
+
+    /// The system clock's origin is read between two reads of the agent's clock: a delayed try
+    /// is taken again, and one that never comes within the jitter gives no sleep figure.
+    #[test]
+    fn the_sleep_figure_is_read_within_the_jitter_or_not_at_all() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let read = log.now();
+        let mut inner = log.lock();
+        inner.delayed_tries = 2;
+        assert_eq!(inner.system_origin_us(), Some(1_000_000));
+        assert_eq!(inner.slept_at(read.monotonic_us), Some(0));
+        drop(inner);
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let mut inner = log.lock();
+        inner.delayed_tries = 3;
+        assert_eq!(inner.system_origin_us(), None);
+    }
+
+    /// A sample that every try takes delayed is left out, and a time read then has no boot time:
+    /// a suspend may have come since the last sample, so neither neighbour's offset is its own.
+    #[test]
+    fn a_time_read_when_no_sample_could_be_taken_has_no_boot_time() {
+        let log = CommLog::over(Box::new(Recording::default()), b"");
+        log.boot_as(Some(("boot-1", 1_000_000)));
+        let before = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        log.suspend(5_000_000);
+        log.delay_samples(3);
+        let during = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let after = log.now();
+        let mut inner = log.lock();
+        assert_eq!(inner.boot_at(during.monotonic_us), None);
+        assert_eq!(
+            inner.boot_at(before.monotonic_us),
+            Some(1_000_000 + before.monotonic_us)
+        );
+        assert_eq!(
+            inner.boot_at(after.monotonic_us),
+            Some(6_000_000 + after.monotonic_us)
+        );
+        drop(inner);
+        // After a missing sample, the next one is kept even when the offset did not grow.
+        log.delay_samples(3);
+        let during = log.now();
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        let after = log.now();
+        let mut inner = log.lock();
+        assert_eq!(inner.boot_at(during.monotonic_us), None);
+        assert_eq!(
+            inner.boot_at(after.monotonic_us),
+            Some(6_000_000 + after.monotonic_us)
+        );
+    }
+
+    /// On Linux the log takes the real boot id and boot clock: a run that reconnects in the
+    /// same boot measures the gap on the boot clock.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_later_run_on_linux_measures_the_gap_on_the_real_boot_clock() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&dpdu_facts(), RunKind::First);
+        log.vci_connected(Some(&serial(77)), None).unwrap();
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+        );
+        answered.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(1_835_511_040)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange_with(answered, Vec::new()).unwrap();
+        log.exchange_with(
+            evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::VciLost {
+                    refused_after_loss: false,
+                },
+            ),
+            Vec::new(),
+        )
+        .unwrap();
+        log.end("Host");
+        drop(log);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&dpdu_facts(), RunKind::Resume);
+        let reading = ConnectReading {
+            time: device(1_835_511_040),
+            read: log.now(),
+            round_trip_us: Some(0),
+        };
+        log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
+        log.end("ok");
+        drop(log);
+        let lines = lines(&setup);
+        let settled = &of_event(&lines, "vci_loss_settled")[0];
+        let clock = &settled["clock"];
+        assert_eq!(clock["boot_match"], true, "{settled}");
+        assert_eq!(clock["gap_from"], "boot", "{settled}");
+        assert!(clock["gap_us"].as_u64().unwrap() < 60_000_000, "{settled}");
+        // The sleep figures read on real clocks, the machine's sleep in the gap among them.
+        assert!(clock["last_before"]["slept_us"].is_u64(), "{settled}");
+        assert!(clock["reading"]["slept_us"].is_u64(), "{settled}");
+        assert!(clock["slept_in_gap_us"].is_u64(), "{settled}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A later run in the same boot measures the gap on the boot clock, across agent epochs, and
+    /// records it with the comparison it gives, the reading's round trip in the tolerance and
+    /// the sleep in the gap, but judges nothing from it (ADR-374 item 5). Another boot, or a
+    /// record without one, measures nothing.
+    #[test]
+    fn a_later_run_in_the_same_boot_measures_the_gap_on_the_boot_clock() {
+        // The loss's last device time was read at 5 s on the boot clock, in agent epoch 0.
+        let record = |boot: &str| {
+            format!(
+                "{{\"seq\":0,\"event\":\"header\",\"clock\":{{\"epoch\":0}}}}\n\
+                 {{\"seq\":1,\"event\":\"vci_loss\",\"loss\":1,\"agent_epoch\":0,\
+                 \"ended\":[{{\"seq\":0,\"classification\":\"undetermined\"}}],\"refused\":[],\
+                 \"clocks\":[{{\"clock\":\"device\",\"epoch\":0,\"us\":1835511040,\"read_us\":900}}],\
+                 \"serial_number\":77{boot}}}\n\
+                 {{\"seq\":2,\"event\":\"job_end\"}}\n"
+            )
+        };
+        // The machine had not slept by then.
+        let with_boot = ",\"boot\":{\"id\":\"boot-1\",\"us\":5000000,\"slept_us\":0}";
+        // The reconnect is read 40 s later on the boot clock; the clock was read up to 3 ms
+        // before its answer, `ahead_us` past the last time plus the gap.
+        let settle_with =
+            |record: &str, boot: Option<&str>, ahead_us: i64, round_trip_us, slept_us: u64| {
+                let sink = Recording::default();
+                let log = CommLog::over(Box::new(sink.clone()), record.as_bytes());
+                assert!(log.loss_to_settle());
+                log.begin(&dpdu_facts(), RunKind::Resume);
+                let read = log.now();
+                log.boot_as(boot.map(|id| (id, 45_000_000 - read.monotonic_us)));
+                // A suspend before the reconnect's read, which then comes after it.
+                let read = if slept_us > 0 {
+                    log.suspend(slept_us);
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                    log.now()
+                } else {
+                    read
+                };
+                let us = 1_835_511_040 + 40_000_000 + ahead_us;
+                let reading = ConnectReading {
+                    time: exchange::VciTime::new(us as u64, Some(exchange::Clock::Device)),
+                    read,
+                    round_trip_us,
+                };
+                log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
+                let taken = String::from_utf8(sink.taken.lock().unwrap().clone()).unwrap();
+                taken
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .find(|line| line["event"] == "vci_loss_settled")
+                    .unwrap()
+            };
+        let settle = |record: &str, boot: Option<&str>, ahead_us: i64| {
+            settle_with(record, boot, ahead_us, Some(3_000), 0)
+        };
+        // The gap and the comparison are recorded, but judge nothing (ADR-374 item 5).
+        let entry = settle(&record(with_boot), Some("boot-1"), -6_000);
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("boot clock"),
+            "{entry}"
+        );
+        let clock = &entry["clock"];
+        assert_eq!(clock["fits_carried_on"], true, "{entry}");
+        assert_eq!(clock["slept_in_gap_us"], 0, "{entry}");
+        assert_eq!(clock["boot_match"], true, "{entry}");
+        assert_eq!(clock["gap_from"], "boot", "{entry}");
+        assert_eq!(clock["gap_us"], 40_000_000, "{entry}");
+        assert_eq!(clock["reading"]["boot_us"], 45_000_000, "{entry}");
+        assert_eq!(clock["reading"]["agent_epoch"], 1, "{entry}");
+        assert_eq!(clock["round_trip_us"], 3_000, "{entry}");
+        // Twice the margin, the round trip, and 100 ppm of 40 s.
+        assert_eq!(clock["tolerance_us"], 2_000 + 3_000 + 4_000, "{entry}");
+        // A reading whose round trip nothing bounds is compared with nothing.
+        let entry = settle_with(&record(with_boot), Some("boot-1"), -6_000, None, 0);
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(entry["clock"]["fits_carried_on"].is_null(), "{entry}");
+        assert!(
+            entry["reason"]
+                .as_str()
+                .unwrap()
+                .contains("could not bound"),
+            "{entry}"
+        );
+        // A reading that fits a restart judges nothing either.
+        let entry = settle(
+            &record(with_boot),
+            Some("boot-1"),
+            20_000_000 - 1_875_511_040,
+        );
+        assert_eq!(entry["clock"]["fits_restarted"], true, "{entry}");
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        // A suspend in the gap is recorded.
+        let entry = settle_with(
+            &record(with_boot),
+            Some("boot-1"),
+            -6_000,
+            Some(3_000),
+            5_000_000,
+        );
+        assert_eq!(entry["clock"]["slept_in_gap_us"], 5_000_000, "{entry}");
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        // Just past that tolerance, it carried on no longer.
+        let entry = settle(&record(with_boot), Some("boot-1"), -9_001);
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert_eq!(entry["clock"]["fits_carried_on"], false, "{entry}");
+        // Another boot: the boot clocks are not one, so nothing measures the gap.
+        let entry = settle(&record(with_boot), Some("boot-2"), 0);
+        assert_eq!(entry["clock"]["boot_match"], false, "{entry}");
+        assert!(entry["clock"]["gap_us"].is_null(), "{entry}");
+        assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        assert!(
+            entry["reason"].as_str().unwrap().contains("later run"),
+            "{entry}"
+        );
+        // A system that gives no boot, on either side.
+        for (record, boot) in [(record(""), Some("boot-1")), (record(with_boot), None)] {
+            let entry = settle(&record, boot, 0);
+            assert!(entry["clock"]["boot_match"].is_null(), "{entry}");
+            assert!(entry["clock"]["gap_us"].is_null(), "{entry}");
+            assert_eq!(entry["power_kept"], "unknown", "{entry}");
+        }
     }
 }

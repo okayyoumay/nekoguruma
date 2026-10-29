@@ -392,6 +392,13 @@ fn assert_loss_settled(dir: &Path) {
         "{settled}"
     );
     assert_eq!(settled["power_kept"], "unknown", "{settled}");
+    // The runner timed its clock read at the reconnect (ADR-374).
+    assert!(
+        settled["clock"]["round_trip_us"]
+            .as_u64()
+            .is_some_and(|round_trip| round_trip > 0),
+        "{settled}"
+    );
     assert_eq!(settled["classification"], "undetermined", "{settled}");
     assert!(
         settled["reason"]

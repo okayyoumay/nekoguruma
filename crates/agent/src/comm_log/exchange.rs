@@ -241,6 +241,9 @@ pub(crate) enum NotJudgedReason {
     /// The receive timeout came after the ECU may have begun a response, so it is the
     /// transport's consecutive-frame timer, not the limit in force.
     ResponseBegun,
+    /// No profile gives the link's timing margin, so nothing bounds the error of the VCI's
+    /// times (ADR-377).
+    NoMargin,
 }
 
 /// The entry's timing group (design 8.11, `timing`).

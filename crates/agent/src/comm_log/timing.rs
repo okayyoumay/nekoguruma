@@ -19,14 +19,15 @@ use crate::link::SingleFrame;
 const PENDING_BYTES: usize = 3;
 
 /// The limits of a link, as `link_opened` records them, and its timing margin, in
-/// microseconds, whether its start-of-message indications are on, and what it sends as one
-/// frame (`None` when the log has no bound for the link's protocol).
+/// microseconds (`None` when no profile gives one, so no time is judged, ADR-377), whether its
+/// start-of-message indications are on, and what it sends as one frame (`None` when the log has
+/// no bound for the link's protocol).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Limits {
     pub p2_us: u64,
     pub p2_star_us: u64,
     pub completion_us: Option<u64>,
-    pub margin_us: u64,
+    pub margin_us: Option<u64>,
     pub start_indications: bool,
     pub single_frame: Option<SingleFrame>,
 }
@@ -58,7 +59,7 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
         p2_ms: Some(ms_ceil(limits.p2_us)),
         p2_star_ms: Some(ms_ceil(limits.p2_star_us)),
         completion_ms: limits.completion_us.map(ms_ceil),
-        margin_ms: Some(ms_ceil(limits.margin_us)),
+        margin_ms: limits.margin_us.map(ms_ceil),
         ..Timing::not_judged()
     };
     let Some((clock, transmit)) = times.transmit else {
@@ -79,7 +80,17 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             timing.since_latest_pending_ms = Some(ms(us - latest));
         }
     }
-    let margin = to_i64(limits.margin_us);
+    let not_judged = |timing: &mut Timing, reason: NotJudgedReason| {
+        timing.window = Window::NotJudged;
+        timing.not_judged_reason = Some(reason);
+        timing.window_by_ms = None;
+    };
+    // Without a margin a profile gives, nothing bounds the error of the VCI's times, so no time
+    // is compared with a limit (ADR-377): an outcome that a comparison would give is
+    // `no_margin` instead, and a reason the times' own placement gives (no transmit, another
+    // clock, a time before the transmit, a response begun) stands. The times stay recorded.
+    let given = limits.margin_us.is_some();
+    let margin = limits.margin_us.map_or(0, to_i64);
     let p2 = to_i64(limits.p2_us);
     let p2_star = to_i64(limits.p2_star_us);
     let completion = limits.completion_us.map(to_i64);
@@ -90,12 +101,11 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             .filter(|frame| len <= frame.max_bytes)
             .map(|frame| to_i64(frame.transfer_us))
     };
-    let not_judged = |timing: &mut Timing, reason: NotJudgedReason| {
-        timing.window = Window::NotJudged;
-        timing.not_judged_reason = Some(reason);
-        timing.window_by_ms = None;
-    };
     let set = |timing: &mut Timing, window: Window, by_us: Option<i64>| {
+        if !given {
+            not_judged(timing, NotJudgedReason::NoMargin);
+            return;
+        }
         timing.window = window;
         timing.window_by_ms = by_us.map(ms);
         timing.not_judged_reason = None;
@@ -129,7 +139,9 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
                     Window::Late,
                     Some(at - pending_transfer - latest),
                 );
-                timing.late_pending = Some(place);
+                if given {
+                    timing.late_pending = Some(place);
+                }
                 return timing;
             }
         }
@@ -186,8 +198,10 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
             && end > latest + margin + transfer
         {
             set(&mut timing, Window::Late, Some(end - transfer - latest));
-        } else {
+        } else if given {
             not_judged(&mut timing, NotJudgedReason::EndAfterLimit);
+        } else {
+            not_judged(&mut timing, NotJudgedReason::NoMargin);
         }
     } else if times.timeout.is_some() && times.response_may_have_begun {
         not_judged(&mut timing, NotJudgedReason::ResponseBegun);
@@ -209,8 +223,8 @@ pub(crate) enum LateWindow {
     /// It began after the latest limit plus the margin, by at least this much: it came as one
     /// frame, and its end less that frame's longest transfer is past that limit.
     Late { by_us: i64 },
-    /// Neither is shown: its time is between, it may span frames, or it cannot be judged on one
-    /// clock with the transmit.
+    /// Neither is shown: its time is between, it may span frames, it cannot be judged on one
+    /// clock with the transmit, or no profile gives the link's margin (ADR-377).
     Open,
 }
 
@@ -278,7 +292,9 @@ fn judge_late_at(
     if at < 0 || pendings.iter().any(|&us| us < 0 || us > at) {
         return LateWindow::Open;
     }
-    let margin = to_i64(limits.margin_us);
+    let Some(margin) = limits.margin_us.map(to_i64) else {
+        return LateWindow::Open;
+    };
     let in_force = limit_in_force(
         to_i64(limits.p2_us),
         to_i64(limits.p2_star_us),
@@ -301,7 +317,7 @@ fn judge_late_at(
 /// (design 8.11 `vci_did_not_end`): the reading less its round trip, from the transmit, past
 /// the latest limit in force plus the margin plus the longest transfer of a single-frame
 /// response, which would have given no start-of-message indication. `None` when it is not past,
-/// or cannot be shown: the reading or the transmit is not on the device clock (on a J2534 link
+/// or cannot be shown: no profile gives the link's margin (ADR-377), the reading or the transmit is not on the device clock (on a J2534 link
 /// the reading is the worker's, ADR-120), they are on different epochs, a pending is not on
 /// their clock and epoch or came before the transmit, nothing bounds the limit, or the link's
 /// protocol has no single-frame bound.
@@ -343,7 +359,7 @@ pub(crate) fn past_vci_limits(
     )
     .latest?;
     let elapsed = reading.unwrapped - to_i64(round_trip_us) - transmit.unwrapped;
-    let by = elapsed - (latest + to_i64(limits.margin_us) + transfer);
+    let by = elapsed - (latest + to_i64(limits.margin_us?) + transfer);
     (by > 0).then_some(by)
 }
 
@@ -419,7 +435,7 @@ mod tests {
         p2_us: 50_000,
         p2_star_us: 5_000_000,
         completion_us: Some(25_000_000),
-        margin_us: 2_000,
+        margin_us: Some(2_000),
         start_indications: true,
         single_frame: Some(SingleFrame {
             max_bytes: 6,
@@ -443,6 +459,89 @@ mod tests {
     fn judged(absorbing: bool, times: Times<'_>) -> (Window, Option<f64>, Option<NotJudgedReason>) {
         let timing = judge(LIMITS, absorbing, times);
         (timing.window, timing.window_by_ms, timing.not_judged_reason)
+    }
+
+    #[test]
+    fn with_no_margin_a_profile_gives_no_time_is_judged() {
+        // ADR-377: the agent has no default margin, so nothing bounds the error of the VCI's
+        // times; they are recorded with the limits, and no comparison is made, however far
+        // past a limit they are.
+        let limits = Limits {
+            margin_us: None,
+            ..LIMITS
+        };
+        let times = Times {
+            transmit: transmit(),
+            start: at(900_000),
+            ..Times::default()
+        };
+        assert_eq!(judged(false, times).0, Window::Late);
+        let timing = judge(limits, false, times);
+        assert_eq!(timing.window, Window::NotJudged);
+        assert_eq!(timing.not_judged_reason, Some(NotJudgedReason::NoMargin));
+        assert_eq!(timing.response_ms, Some(900.0));
+        assert_eq!((timing.p2_ms, timing.margin_ms), (Some(50), None));
+        let timeout = Times {
+            transmit: transmit(),
+            timeout: at(50_000),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, timeout).not_judged_reason,
+            Some(NotJudgedReason::NoMargin)
+        );
+        // A late response and a reading at the deadline are not judged either.
+        assert_eq!(
+            judge_late(limits, false, transmit(), &[], at(900_000), 4),
+            LateWindow::Open
+        );
+        assert_ne!(
+            judge_late(LIMITS, false, transmit(), &[], at(900_000), 4),
+            LateWindow::Open
+        );
+        assert_eq!(
+            past_vci_limits(limits, false, transmit(), &[], at(900_000), 0),
+            None
+        );
+        assert!(past_vci_limits(LIMITS, false, transmit(), &[], at(900_000), 0).is_some());
+        // A reason the times' placement gives stands: no margin would let them be judged.
+        let no_transmit = Times {
+            start: at(10_000),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, no_transmit).not_judged_reason,
+            Some(NotJudgedReason::NoTransmitTime)
+        );
+        let before = Times {
+            transmit: transmit(),
+            start: at(-500),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, before).not_judged_reason,
+            Some(NotJudgedReason::BeforeTransmit)
+        );
+        let other_epoch = Times {
+            transmit: transmit(),
+            timeout: on(1, 1_050_000),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, other_epoch).not_judged_reason,
+            Some(NotJudgedReason::OtherClock)
+        );
+        // An end past the limit is not judged for want of a comparison, so it is `no_margin`.
+        let end = Times {
+            transmit: transmit(),
+            end: at(900_000),
+            end_len: Some(20),
+            ..Times::default()
+        };
+        assert_eq!(
+            judge(limits, false, end).not_judged_reason,
+            Some(NotJudgedReason::NoMargin)
+        );
     }
 
     #[test]

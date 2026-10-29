@@ -300,7 +300,7 @@ finding. A round where every finding was declined (2d) or answered by pointing a
 reply changes no file: skip the sweep, checks 1 to 4 below and the push (still do check 5, the base), never make an empty commit, and go straight to
 the replies in Step 4. Re-request a review of the unchanged head only if the round contained a
 newly declined finding *and* this head has not been re-requested after a no-change round
-before, and, on a specification pull request, the pause in Step 4 does not withhold it.
+before, and the pause in Step 4 does not withhold it.
 Otherwise the loop ends: go to Step 5 after the replies. So the same head is
 re-requested at most once.
 
@@ -382,10 +382,8 @@ conditions fixed only Low-rated findings, in Markdown files only: its fix still 
 Step 3 check, and the loop then ends without a re-request. Step 5 reports those findings as
 fixed after the last review.
 
-**Specification pull requests: pause after eight rounds (ADR-349).** A specification pull request
-is one whose changed files, `work/` aside, are all Markdown and include an ADR
-(`docs/adr/ADR-*.md`) or `docs/system-architecture.md`. On one, count the review rounds that
-reported findings, from either reviewer. After the eighth such round, and after each later one,
+**Long loops: pause after eight rounds (ADR-349, ADR-381).** On every PR, specification or code,
+count the review rounds that reported findings, from either reviewer. After the eighth such round, and after each later one,
 push the round's fix as usual, if it has one. Then, before any re-request, whether the rule above allows it
 or a round that changed no file does (Step 3), check where the last four rounds' findings landed. For each finding, run
 `git blame -L <line>,<line> <reviewed commit> -- <path>`, using the line and commit the finding
@@ -404,7 +402,8 @@ fix-written:
     backlog item (`backlog` skill), then request one review on the cut head. The count starts
     again, and that head becomes the baseline.
   - **Rewrite**: rewrite that section in one piece, from rules that settle the neighbouring
-    cases together, then request one review. The count starts again, and the rewritten head
+    cases together; on code, rebuild the affected logic from a new `design-advisor` case table
+    for that part (`.claude/README.md`, ADR-381). Then request one review. The count starts again, and the rewritten head
     becomes the baseline.
   - **Continue**: re-request as usual. The count starts again; the baseline stays.
 - Give the share, the rounds so far and the section the findings land on with the question, and

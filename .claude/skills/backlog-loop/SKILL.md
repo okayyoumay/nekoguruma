@@ -180,7 +180,9 @@ backlog-only PR.
 
 Work the item as any other task, following CLAUDE.md and `.claude/README.md` (task size, agents,
 documentation sync, ADRs). For an item whose blocker a decision of the maintainer just resolved,
-write CLAUDE.md's design summary ("Guidelines") and get it confirmed before implementing. Close the item with the `backlog` skill in the same PR. A Dependabot
+write CLAUDE.md's design summary ("Guidelines") and get it confirmed before implementing. When
+the item meets the case-table gate in `.claude/README.md` (ADR-381), get `design-advisor`'s case
+table before implementing it. Close the item with the `backlog` skill in the same PR. A Dependabot
 replacement (step 2) has no item to close. If its work shows the loop cannot finish it, put the
 Dependabot PR on the run's Dependabot list with the reason, mark the replacement "final" in its
 run state, close it unmerged with a comment giving the reason, and write the final report. Its

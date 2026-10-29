@@ -264,7 +264,7 @@ is not marked "final", at least one item would be left after it, and nothing is 
 At most one item is prepared at a time.
 
 1. Make a local worktree from `origin/main` on a local branch that is never pushed:
-   `git fetch origin && git worktree add ../loop-next origin/main -b loop-next`. Work only there;
+   `git fetch origin && git worktree add ../loop-next origin/main -B loop-next`. Work only there;
    the session's branch stays on the current PR.
 2. Pick as step 2's "Backlog item" does, passing `next-task` also `avoid=` followed by the files
    the current PR changes, the backlog files aside (`git diff --name-only origin/main...HEAD`).
@@ -286,9 +286,10 @@ in the worktree, `git fetch origin && git rebase origin/main` (the commits were 
 this rewrites nothing shared). Resolve a conflict in a backlog file by taking `origin/main`'s
 side and redoing the item's own backlog edits with the `backlog` skill; resolve a code conflict
 as `pr-review-loop` resolves one with its base (Step 3, check 5), then run its local checks and
-the `edge-case-hunter` pass again. Then set the session's branch to the result
-(`git checkout -B <branch> loop-next`, after `git worktree remove ../loop-next`; the branch was
-deleted with the merged PR), push it with `git push -u origin <branch>`, and claim the item as
+the `edge-case-hunter` pass again. Then set the session's branch to the result and drop the
+temporary ones: `git worktree remove ../loop-next`, `git checkout -B <branch> loop-next`,
+`git branch -D loop-next` (the remote branch was deleted with the merged PR). Push it with
+`git push -u origin <branch>`, and claim the item as
 step 3 does, the claim race check included. Its PR then goes straight to step 5.
 
 **Discarding.** Prepared work is dropped when the current PR is closed unmerged (step 1 stops the

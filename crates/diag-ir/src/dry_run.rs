@@ -29,7 +29,7 @@ use crate::{
     VmError, WaitingOn,
 };
 
-/// The most bytes of requests, answers, transfer data, forms and messages one report holds,
+/// The most bytes of requests, answers, forms and messages one report holds,
 /// each event counted as at least [`EVENT_COST`] bytes, so a definition run at ingestion cannot
 /// make the report take unbounded memory (ADR-328 item 7).
 pub const MAX_REPORT_BYTES: usize = 64 << 20;
@@ -46,12 +46,21 @@ pub const PROFILE_SEED_REQUEST: &str = "profile:security_access_seed";
 /// Like [`PROFILE_SEED_REQUEST`], for the send-key request.
 pub const PROFILE_KEY_REQUEST: &str = "profile:security_access_key";
 
+/// The digest a [`DryRunEvent::FlashTransfer`] carries: 64-bit FNV-1a over the block's bytes.
+/// Not cryptographic; it tells blocks apart in a report and nothing more.
+pub fn block_digest(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf2_9ce4_8422_2325, |hash, &byte| {
+        (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01b3)
+    })
+}
+
 /// The seed a built answer to the profile's seed request carries; not zero, which on UDS means
 /// the ECU is already unlocked.
 const BUILT_SEED: [u8; 4] = [1, 2, 3, 4];
 
-/// Every [`RuntimeInput`]; [`Script::built_defaults`] gives each a value, and its `match` fails to
-/// compile when a new input is added without one.
+/// Every [`RuntimeInput`]; [`Script::built_defaults`] gives each a value. Its `match` fails to
+/// compile when a new input is added without a value, and a test that decodes every variant tag
+/// fails when the input is missing from this list.
 const ALL_INPUTS: [RuntimeInput; 5] = [
     RuntimeInput::SupplyVoltageMillivolts,
     RuntimeInput::ExternalSupplyConnected,
@@ -204,9 +213,13 @@ pub enum DryRunEvent {
         seed: Vec<u8>,
         key: Vec<u8>,
     },
+    /// A block sent with `FlashTransfer`. The report keeps its length and a digest of its
+    /// bytes ([`block_digest`]), not the bytes: a dry run serves a block as zeros (ADR-336 item
+    /// 15), and a flash image can be larger than the report's budget (ADR-391).
     FlashTransfer {
         block: u32,
-        data: Vec<u8>,
+        len: u64,
+        digest: u64,
     },
     /// Passes at once: a dry run does not wait.
     Wait {
@@ -341,7 +354,7 @@ pub fn dry_run(
         pc: 0,
         events: Vec::new(),
         report_bytes: 0,
-        over_budget: false,
+        over_budget: None,
     };
     if let Err(error) = program.validate() {
         return DryRunReport {
@@ -358,7 +371,7 @@ pub fn dry_run(
         }
         host.pc = vm.state.pc;
         let outcome = vm.step_with_declarations(program, Some(variant), &mut host);
-        if host.over_budget {
+        if host.over_budget.is_some() {
             break DryRunEnd::Host(DryRunError::ReportTooLarge);
         }
         match outcome {
@@ -374,7 +387,9 @@ pub fn dry_run(
         events: host.events,
         end,
         steps: vm.state.steps,
-        pc: vm.state.pc,
+        // A `log` past the budget cannot fail, so the step completes and moves the pc on; the
+        // report names the instruction that went over.
+        pc: host.over_budget.unwrap_or(vm.state.pc),
     }
 }
 
@@ -459,8 +474,9 @@ struct ScriptedHost<'s, 'v> {
     events: Vec<DryRunEvent>,
     /// What the events count toward [`MAX_REPORT_BYTES`].
     report_bytes: usize,
-    /// Whether an event was refused for the budget; the run ends after that step.
-    over_budget: bool,
+    /// The pc of the instruction whose event was refused for the budget, if any; the run ends
+    /// after that step, and the report's pc is this one.
+    over_budget: Option<u32>,
 }
 
 impl ScriptedHost<'_, '_> {
@@ -474,7 +490,7 @@ impl ScriptedHost<'_, '_> {
     fn charge_total(&mut self, cost: usize) -> Result<(), DryRunError> {
         let total = self.report_bytes.saturating_add(cost);
         if total > MAX_REPORT_BYTES {
-            self.over_budget = true;
+            self.over_budget.get_or_insert(self.pc);
             return Err(DryRunError::ReportTooLarge);
         }
         self.report_bytes = total;
@@ -901,10 +917,11 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     fn flash_transfer(&mut self, block: u32, data: &[u8]) -> Result<(), DryRunError> {
-        self.charge(data.len())?;
+        self.charge(0)?;
         self.events.push(DryRunEvent::FlashTransfer {
             block,
-            data: data.to_vec(),
+            len: data.len() as u64,
+            digest: block_digest(data),
         });
         Ok(())
     }
@@ -961,11 +978,11 @@ impl DiagHost for ScriptedHost<'_, '_> {
     }
 
     // A dry run has no artifact: the block is zero bytes of the requested length (ADR-336 item
-    // 15). It leaves no event, as it is no request, so only its bytes are charged (no event
-    // cost). One block is at most `MAX_BYTES_LEN` (`check_declarations`); the charge, made before
-    // the allocation, bounds the total over a run.
+    // 15). It leaves no event and the report keeps none of its bytes (`flash_transfer` records
+    // a length and a digest), so it is not charged: an image larger than the report's budget
+    // is a valid plan (ADR-391). One block is at most `MAX_BYTES_LEN` (`check_declarations`),
+    // and the VM's stack bounds how many it holds at once.
     fn artifact_bytes(&mut self, _offset: u64, len: u32) -> Result<Vec<u8>, DryRunError> {
-        self.charge_total(len as usize)?;
         Ok(vec![0; len as usize])
     }
 

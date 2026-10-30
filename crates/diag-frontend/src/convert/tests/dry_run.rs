@@ -4,6 +4,7 @@ use diag_ir::Failure;
 use diag_ir::decode::{DecodeError, DecodedField};
 use diag_ir::dry_run::DryRunError;
 
+use super::flash_plan::with_segment;
 use super::*;
 
 /// The rejection of `source` as the only procedure of the example, or `None` when it converts.
@@ -75,6 +76,69 @@ fn an_index_out_of_range_is_refused_at_its_line() {
     assert!(error.hint.contains("index out of range"), "{}", error.hint);
     // Both variants of the example give it, so no variant is named.
     assert!(!error.hint.contains("(in variant"), "{}", error.hint);
+}
+
+#[test]
+fn a_flash_image_larger_than_the_report_budget_is_accepted() {
+    use diag_ir::dry_run::{DryRunEvent, Script, dry_run};
+    // 0x05000000 bytes (80 MiB, over the report's 64 MiB) in blocks of 0x1000: 20480 blocks of
+    // 12 instructions each, within the 1,000,000 of the step budget. The report keeps a length
+    // and a digest per block, not the bytes.
+    let files = with_segment(example(), "0x08000000", "0x05000000", "0x1000", "0x44");
+    let source = "\
+# @section uninterruptible expected=180000
+# @flashPlan session=1
+def write():
+    # @erase
+    diag.routine(0xFF00, 0x01, {})
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+";
+    let files = with(files, "main.star", source);
+    let started = std::time::Instant::now();
+    // `@preconditions` lowers to no instruction, so conversion's dry run sends every block.
+    assert_eq!(procedures(files.clone()).map(|p| p.len()).ok(), Some(1));
+    eprintln!("converted in {:?}", started.elapsed());
+    // The run conversion makes, on the same built defaults, holds an event per block.
+    let converted = convert(files);
+    let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
+    let program: Program =
+        postcard::from_bytes(document.procedure().expect("a program").bytes()).expect("a program");
+    let report = dry_run(
+        &program,
+        &document.variant().expect("a variant"),
+        &Script::built_defaults(),
+        DEFAULT_MAX_STEPS,
+    );
+    assert_eq!(report.end, DryRunEnd::Finished, "{:?}", report.end);
+    let blocks = report
+        .events
+        .iter()
+        .filter(|event| matches!(event, DryRunEvent::FlashTransfer { .. }))
+        .count();
+    assert_eq!(blocks, 0x0500_0000 / 0x1000);
+}
+
+#[test]
+fn a_refused_variants_lowering_warnings_are_kept() {
+    // `f` has no `@maxIterations`, so lowering warns; the index then stops the dry run.
+    let source = "def f(n):\n\
+        \x20   for i in range(n):\n\
+        \x20       pass\n\
+        \n\
+        def main():\n\
+        \x20   f(1)\n\
+        \x20   dtcs = diag.read_dtc(0x09)\n\
+        \x20   records = dtcs[\"fields\"][\"dtcs\"]\n\
+        \x20   if records[0][\"code\"] == 1:\n\
+        \x20       diag.log(1, \"b\")\n";
+    let rejected = procedures(with(example(), "p.star", source)).expect_err("refused");
+    assert_eq!(rejected.errors.len(), 1, "{:?}", rejected.errors);
+    let codes: Vec<_> = rejected.warnings.iter().map(|w| w.code).collect();
+    assert_eq!(codes, [star::StarCode::LoopLimitDefaulted]);
 }
 
 #[test]
@@ -224,7 +288,24 @@ fn the_verdict_accepts_an_undecodable_answer_only_when_it_was_built() {
         let error = verdict(&refused).expect_err("refused");
         assert_eq!(error.code, star::StarCode::DryRunStopped);
         assert!(error.hint.contains("does not decode"), "{}", error.hint);
+        // The service is named, by its short name when it has one.
+        assert!(
+            error.hint.contains(&format!("service {name}'s")),
+            "{}",
+            error.hint
+        );
     }
+    // A service the variant does not declare is named by its number.
+    let unknown = verdict(&report(
+        DryRunEnd::Vm(VmError::Undecodable { service: u32::MAX }),
+        vec![],
+    ))
+    .expect_err("refused");
+    assert!(
+        unknown.hint.contains(&format!("service {}'s", u32::MAX)),
+        "{}",
+        unknown.hint
+    );
 }
 
 #[test]

@@ -1045,25 +1045,25 @@ fn dtc_records_are_checked_at_ingestion() {
     let codes = |body: &str| -> Vec<crate::star::StarCode> {
         let source =
             format!("def main():\n    dtcs = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n{body}");
-        // The records indexed here are none in the conversion's dry run (ADR-391), whose
-        // refusal is not what this test is about.
         procedures(with(example(), "main.star", &source))
             .err()
             .map_or_else(Vec::new, |rejected| {
-                rejected
-                    .errors
-                    .iter()
-                    .map(|e| e.code)
-                    .filter(|code| *code != crate::star::StarCode::DryRunStopped)
-                    .collect()
+                rejected.errors.iter().map(|e| e.code).collect()
             })
     };
     use crate::star::StarCode::*;
     assert_eq!(codes("    x = len(dtcs)\n"), []);
     // A record has `code` and `status`, read by a literal.
-    assert_eq!(codes("    x = dtcs[0][\"code\"]\n"), []);
+    // The conversion's dry run reads no record (ADR-391), so the indexing is guarded.
     assert_eq!(
-        codes("    if dtcs[0][\"status\"] & 0x08:\n        diag.log(1, \"confirmed\")\n"),
+        codes("    if len(dtcs) > 0:\n        x = dtcs[0][\"code\"]\n"),
+        []
+    );
+    assert_eq!(
+        codes(
+            "    if len(dtcs) > 0:\n        if dtcs[0][\"status\"] & 0x08:\n            \
+             diag.log(1, \"confirmed\")\n"
+        ),
         []
     );
     assert_eq!(codes("    x = dtcs[0][\"mask\"]\n"), [NotInProfile]);

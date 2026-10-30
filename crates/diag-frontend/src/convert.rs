@@ -86,7 +86,7 @@ pub struct Procedure {
 }
 
 /// Why [`lower_procedures`] failed: the errors of every file that failed, and the warnings of
-/// every file that lowered, which a rejected report carries too (`starlark-subset.md` section 5).
+/// every file that lowered, refused by the dry run or not, which a rejected report carries too (`starlark-subset.md` section 5).
 #[derive(Debug, Clone)]
 pub struct ProceduresRejected {
     pub errors: Vec<StarError>,
@@ -119,6 +119,7 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
         .collect();
     let mut procedures = Vec::new();
     let mut errors = Vec::new();
+    let mut refused_warnings = Vec::new();
     for (file, source) in &definition.tables.procedures {
         let checked = match star::check_file(file, source) {
             Ok(checked) => checked,
@@ -138,9 +139,11 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
                 Ok(lowered) => {
                     let script = Script::built_defaults();
                     let report = dry_run(&lowered.program, variant, &script, DEFAULT_MAX_STEPS);
-                    if let Err(error) =
-                        dry_run_verdict(file, &text, &lowered.program, variant, &report)
-                    {
+                    // The warnings stay when the dry run refuses the variant: they can explain
+                    // the refusal, such as a step limit.
+                    let verdict = dry_run_verdict(file, &text, &lowered.program, variant, &report);
+                    file_warnings.push((name, lowered.warnings));
+                    if let Err(error) = verdict {
                         file_errors.push((name, vec![error]));
                         continue;
                     }
@@ -148,7 +151,6 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
                         postcard::to_allocvec(&lowered.program)
                             .expect("a program serializes into memory"),
                     );
-                    file_warnings.push((name, lowered.warnings));
                 }
                 Err(more) => file_errors.push((name, more)),
             }
@@ -163,6 +165,7 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
             });
         } else {
             errors.extend(merge(file_errors, variants.len()));
+            refused_warnings.extend(warnings);
         }
     }
     if errors.is_empty() {
@@ -170,7 +173,11 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
     } else {
         Err(ProceduresRejected {
             errors,
-            warnings: procedures.into_iter().flat_map(|p| p.warnings).collect(),
+            warnings: procedures
+                .into_iter()
+                .flat_map(|p| p.warnings)
+                .chain(refused_warnings)
+                .collect(),
         })
     }
 }
@@ -196,6 +203,14 @@ fn dry_run_verdict(
             if built_answer_undecodable(variant, report, *service) =>
         {
             return Ok(());
+        }
+        DryRunEnd::Vm(VmError::Undecodable { service }) => {
+            let name = variant
+                .services()
+                .and_then(|services| services.iter().find(|s| s.id() == *service))
+                .and_then(|s| s.short_name().map(str::to_owned))
+                .unwrap_or_else(|| service.to_string());
+            format!("the response does not decode as service {name}'s positive response")
         }
         DryRunEnd::Vm(error) => error.to_string(),
         DryRunEnd::Host(error) => error.to_string(),

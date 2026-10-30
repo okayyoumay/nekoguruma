@@ -283,7 +283,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-291](ADR-291-recovery-required-sections-outside-the-plans-are-written-ahead.md) | A `RecoveryRequired` Section outside the Flash Recovery Plans Is Written Ahead | Accepted (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal) | `agent` journaling, restart; design 8.2.5 / 8.10.1 |
 | [ADR-292](ADR-292-a-crashed-sim-vci-fails-every-call.md) | A Crashed Simulated VCI Fails Every Call with `ERR_FAILED` | Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`) | `sim-vci`, `j2534-0404-service` tests; design 13.4 |
 | [ADR-293](ADR-293-a-recovery-required-section-keeps-a-journal-without-a-plan.md) | A `RecoveryRequired` Section Keeps a Journal without a Flash Recovery Plan | Accepted (a job with several target combinations keeps a journal when any of them would, by ADR-325 item 7; items 1 to 3 amended by ADR-335: every journaled job keeps a journal, and a missing one is a plain start only for an all-`Safe` program) | `agent` runner, restart; design 8.2.5 / 8.10.1 |
-| [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted | `agent` host, `j2534-0404-service` hard-error handling; design 8.2.4 |
+| [ADR-294](ADR-294-a-vci-lost-between-primitives-is-vci-lost.md) | A VCI Lost between Two Primitives Is Reported as `HostError::VciLost` | Accepted (item 1's variant carries `refused_after_loss`, ADR-389) | `agent` host, `j2534-0404-service` hard-error handling; design 8.2.4 |
 | [ADR-295](ADR-295-csv-table-format-of-the-vehicle-knowledge-format.md) | The CSV Table Format of the Proprietary Vehicle-Knowledge Format | Accepted (item 11 amended by ADR-298; item 1 amended by ADR-307; item 5 and item 1's field tables superseded by ADR-310; one-variant lowering consequence extended to combinations of target variants by ADR-325 item 6; item 12 and the table list extended by ADR-336: `identity.csv`, `preconditions.csv` and new `flash_sessions.csv` and `flash_segments.csv` columns) | `diag-frontend` CSV table spec and example; design 8.4 |
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
@@ -378,6 +378,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-386](ADR-386-a-primitive-s-end-is-placed-in-one-pass-in-read-order.md) | A Primitive's End Is Placed in One Pass, in Read Order | Accepted | `agent` host (`settle_at_end`, `Progress`, `log_primitive_end`), communication log (`PrimitiveEnded`, `primitive_ended`, `late_link_errors`, `late_link_error`, `refresh_loss`); design 8.11 "Order", "Link error", `primitive_ended`, `late_item`; ADR-358; ADR-366; ADR-367; ADR-372; ADR-373 |
 | [ADR-387](ADR-387-a-case-table-lists-every-path-that-writes-the-value-it-decides.md) | A Case Table Lists Every Path That Writes the Value It Decides | Accepted | `.claude/README.md` (gates); ADR-381 item 1 |
 | [ADR-388](ADR-388-an-item-another-is-blocked-on-takes-its-priority.md) | An Item Another Is Blocked On Takes Its Priority | Accepted | `work/README.md` (priorities), `.claude/skills/backlog`, `.claude/skills/backlog-triage` |
+| [ADR-389](ADR-389-the-host-says-whether-a-failed-request-may-have-reached-the-ecu.md) | The Host Says Whether a Failed Request May Have Reached the ECU | Accepted | `agent` host (`HostError::send_state`, `SendState`, `VciLost`, `sent_end`), communication log `sent`; `docs/rpc-api-guide.md`; ADR-289; ADR-294 item 1; ADR-350 item 2 |
 
 ## Status Legend
 
@@ -809,7 +810,7 @@ the predecessor repository these ADRs came from.
 - ADR-290
 - ADR-291 (the consequence on programs without a flash recovery plan superseded by ADR-293: such a program with a `RecoveryRequired` section keeps a journal)
 - ADR-293 (a job with several target combinations keeps a journal when any of them would, by ADR-325 item 7; items 1 to 3 amended by ADR-335: every journaled job keeps a journal, and a missing one is a plain start only for an all-`Safe` program)
-- ADR-294
+- ADR-294 (item 1's variant carries `refused_after_loss`, ADR-389)
 - ADR-330 (the Consequences' program with one section over all of its code can be cancelled before its first step since ADR-337; item 2 amended by ADR-340: a procedure that ends while an HMI timeout's cancel is held ends as cancelled, not completed)
 - ADR-331
 - ADR-335 (the Consequences' remedy realized by ADR-336: session control and TesterPresent default to `Safe`)
@@ -819,6 +820,7 @@ the predecessor repository these ADRs came from.
 - ADR-344
 - ADR-345
 - ADR-358 (item 5's items read but not logged now logged, ADR-386)
+- ADR-389
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1); `Op::FlashBlock` appended, a block of a declared flash segment read through `DiagHost::artifact_bytes`, by ADR-336 item 11; `Op::ReadInput` appended, a runtime input read through `DiagHost::runtime_input`, by ADR-338; `Op::HmiRequestFromStack` appended, a form whose run-time parameters come from the stack, and item 7's constant of `HmiRequest` and `RecordInput` read as an encoded `HmiTemplate`, by ADR-340)

@@ -595,14 +595,15 @@ impl<C: WorkerApi> WorkerHost<C> {
         // What was read and no entry carries, because the primitive has none to write: its
         // handle was invalid, or the cancel failed with no end read.
         let rest = progress.take_reads(0, None);
-        self.log_unattached(&rest);
+        self.log_unattached(&rest, stray.seq);
     }
 
-    /// Hands the link errors of no primitive or of an earlier one among `reads` to the log, for
-    /// a job end that has no `primitive_ended` entry to write (design 8.11 `late_item`,
-    /// ADR-386). Anything else read stays unwritten, as the entry of a primitive that has none
-    /// takes it.
-    fn log_unattached(&self, reads: &[EndRead]) {
+    /// Hands the link errors among `reads` to the log, for a job end that has no
+    /// `primitive_ended` entry to write (design 8.11 `late_item`, ADR-386): those of no primitive
+    /// or of an earlier one, and the primitive's own, which are its exchange's `seq` (the
+    /// exchange the entry of the cancel would have followed), or no exchange's without one.
+    /// Anything else read stays unwritten, as the entry of a primitive that has none takes it.
+    fn log_unattached(&self, reads: &[EndRead], seq: Option<u64>) {
         let Some(log) = &self.comm_log else {
             return;
         };
@@ -610,6 +611,21 @@ impl<C: WorkerApi> WorkerHost<C> {
             .iter()
             .filter_map(|read| match &read.item {
                 EndItem::Unattached(item) => Some(item.clone()),
+                // A lost VCI, which ends the primitive, is no link error.
+                EndItem::Error(error) => Some(UnattachedItem {
+                    link: LOG_LINK,
+                    earlier_primitive: true,
+                    owner: seq,
+                    vci_us: u32::try_from(error.time.us).unwrap_or(u32::MAX),
+                    clock: error.time.clock,
+                    read: Some(read.read),
+                    data: UnattachedData::Error {
+                        event: error.event.clone(),
+                        extra_error_info: error.extra_error_info,
+                        extra_error_info_name: error.extra_error_info_name.clone(),
+                        link_error: error.kind,
+                    },
+                }),
                 _ => None,
             })
             .collect();
@@ -686,7 +702,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let epoch = log.now().epoch;
         let Some(seq) = stray.seq else {
             let reads = progress.take_reads(epoch, None);
-            self.log_unattached(&reads);
+            self.log_unattached(&reads, None);
             return;
         };
         let primitive = match ended {
@@ -722,11 +738,16 @@ impl<C: WorkerApi> WorkerHost<C> {
                 reads: progress.take_reads(epoch, None),
             },
         };
+        let reads = primitive.reads.clone();
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             log.primitive_ended(seq, primitive)
         }));
-        if logged.is_err() {
-            tracing::warn!("writing a primitive_ended entry panicked");
+        match logged {
+            Err(_) => tracing::warn!("writing a primitive_ended entry panicked"),
+            // The log keeps no such exchange: the link errors read for it are not lost
+            // (ADR-386).
+            Ok(None) if log.is_open() => self.log_unattached(&reads, Some(seq)),
+            Ok(_) => {}
         }
     }
 

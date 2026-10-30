@@ -15439,6 +15439,17 @@ def main():
         device_clock: bool,
         cancel: CancelAnswer,
     ) -> Vec<serde_json::Value> {
+        job_end_script_run_with(script, device_clock, cancel, false).await
+    }
+
+    /// [`job_end_script_run`]; with `forget_exchange` the log is made to keep nothing of the
+    /// stray's exchange before the job end, so its `primitive_ended` cannot be written.
+    async fn job_end_script_run_with(
+        script: &'static [Step],
+        device_clock: bool,
+        cancel: CancelAnswer,
+        forget_exchange: bool,
+    ) -> Vec<serde_json::Value> {
         let dir = journal_dir("job-end-script");
         let (mut client, fake) = fake_worker_with_clock(
             cancel,
@@ -15457,15 +15468,24 @@ def main():
             send_recv: PAST_DEADLINE,
         };
         let released = Arc::clone(&fake.released);
+        let read_dir = dir.clone();
         tokio::task::spawn_blocking(move || {
             use diag_ir::DiagHost;
             let mut host = WorkerHost::new(handle, client, link, timings);
-            host.set_comm_log(Some(log));
+            host.set_comm_log(Some(log.clone()));
             host.set_link_ids(0x7E0, 0x7E8);
             host.own_reads(Some(OwnRead::Identification));
             host.set_job_end_wait(JOB_END_WAIT);
             let result = host.service_request(0x22, &[0xF1, 0x90]);
             assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            if forget_exchange {
+                let seq = comm_log_lines(&read_dir)
+                    .iter()
+                    .find(|line| line["event"] == "exchange")
+                    .map(|line| line["seq"].as_u64().unwrap())
+                    .expect("the exchange has an entry");
+                log.release_kept(seq);
+            }
             released.add_permits(1);
             host.settle_at_end();
         })
@@ -15774,6 +15794,95 @@ def main():
         assert_eq!(ended["vci"]["tx_done"]["us"], 3_000, "{ended}");
         assert_eq!(ended["vci"]["rx_end"]["epoch"], 0, "{ended}");
         assert_eq!(of_event(&lines, "clock_epoch").len(), 1, "{lines:#?}");
+    }
+
+    /// ADR-386: a response read before the agent's deadline, more than the clock margin
+    /// before the reading the exchange's entry took at that deadline, opens no step back: the
+    /// end anchors it before that reading.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_read_well_before_the_deadline_reading_opens_no_step_back() {
+        let lines = job_end_script_run(
+            &[
+                Step::Transmit(2_000),
+                Step::Respond(3_000, None),
+                Step::Release,
+                Step::Finish,
+            ],
+            true,
+            CancelAnswer::Done,
+        )
+        .await;
+        let ended = &of_event(&lines, "primitive_ended")[0];
+        assert_eq!(ended["vci"]["rx_end"]["us"], 3_000, "{ended}");
+        assert!(
+            of_event(&lines, "clock_epoch")
+                .iter()
+                .all(|epoch| epoch["reason"] != "backward_step"),
+            "{lines:#?}"
+        );
+        assert_eq!(of_event(&lines, "clock_epoch").len(), 1, "{lines:#?}");
+        assert_eq!(ended["vci"]["rx_end"]["epoch"], 0, "{ended}");
+    }
+
+    /// A response read before the deadline is not the end's when a lost VCI ended the primitive:
+    /// the entry has no response time and judges none.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_is_not_the_end_s_when_a_lost_vci_ended_the_primitive() {
+        let lines = job_end_script_run(
+            &[
+                Step::Transmit(3_000),
+                Step::Respond(3_500, None),
+                Step::Release,
+                Step::LostVci(4_600),
+            ],
+            true,
+            CancelAnswer::Done,
+        )
+        .await;
+        let ended = &of_event(&lines, "primitive_ended")[0];
+        assert_eq!(ended["outcome"]["result"], "vci_lost", "{ended}");
+        assert!(ended["vci"].get("rx_end").is_none(), "{ended}");
+        assert_eq!(ended["timing"]["window"], "not_judged", "{ended}");
+    }
+
+    /// ADR-386: the primitive's own error, with the cancel answered as for a handle that had
+    /// ended, so no entry is written, is still its exchange's own late item.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_own_error_read_with_no_entry_to_write_is_the_exchange_s_own() {
+        const OWN: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::Own, 4_500),
+        ];
+        let lines = job_end_script_run(OWN, true, CancelAnswer::InvalidHandle).await;
+        assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+        let exchange = &of_event(&lines, "exchange")[0];
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"][0], exchange["seq"], "{}", late[0]);
+        assert!(
+            late[0]["text"].as_str().unwrap().contains(&format!(
+                "primitive of the exchange logged as {}",
+                exchange["seq"]
+            )),
+            "{}",
+            late[0]
+        );
+    }
+
+    /// ADR-386: when the log keeps no such exchange for the entry, the link errors read for it
+    /// are still written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_errors_read_for_an_exchange_the_log_does_not_keep_are_still_written() {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::None, 4_500),
+            Step::Finish,
+        ];
+        let lines = job_end_script_run_with(SCRIPT, true, CancelAnswer::Done, true).await;
+        assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+        assert_eq!(of_event(&lines, "late_item").len(), 1, "{lines:#?}");
     }
 
     /// ADR-386: a lost VCI that ends the primitive at job end, with an error of no primitive

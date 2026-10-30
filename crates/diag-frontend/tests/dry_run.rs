@@ -432,9 +432,74 @@ fn security_access_runs_against_a_variant_that_declares_no_security_access_servi
             (diag_ir::dry_run::PROFILE_KEY_REQUEST, true)
         ]
     );
+    let sent: Vec<(&[u8], &[u8])> = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            DryRunEvent::Request {
+                request, answer, ..
+            } => Some((request.as_slice(), answer.as_slice())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(sent[1], (&[0x27, 0x02, 0xAA, 0xBB][..], &[0x67, 0x02][..]));
     assert!(report.events.iter().any(|event| matches!(
         event,
         DryRunEvent::SecurityAccess { level: 1, seed, key }
             if seed == &[1, 2, 3, 4] && key == &[0xAA, 0xBB]
     )));
+}
+
+const UNLOCK_NO_SERVICE: &str = "def main():\n    a = diag.security_access(0x01)\n    b = diag.security_access(0x03)\n    c = diag.security_access(0x05)\n";
+
+#[test]
+fn a_negative_seed_ends_the_call_before_its_key_step() {
+    let source = "def main():\n    unlock = diag.security_access(0x01)\n";
+    let document = document_of(
+        "unlock.star",
+        source,
+        "exampleEcuV1",
+        Some("securityAccess,"),
+    );
+    let report = run(&document, None, &Script::new().seed(vec![0x7F, 0x27, 0x35]));
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(
+        requests(&report),
+        [(diag_ir::dry_run::PROFILE_SEED_REQUEST, false)]
+    );
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|event| matches!(event, DryRunEvent::SecurityAccess { .. }))
+    );
+}
+
+#[test]
+fn seeds_are_answered_in_order_and_the_last_one_again() {
+    let document = document_of(
+        "unlock.star",
+        UNLOCK_NO_SERVICE,
+        "exampleEcuV1",
+        Some("securityAccess,"),
+    );
+    let script = Script::new()
+        .seed(vec![0x7F, 0x27, 0x35])
+        .seed(vec![0x67, 0x03, 9, 8])
+        .key(vec![0x55]);
+    let report = run(&document, None, &script);
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    let accesses: Vec<_> = report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            DryRunEvent::SecurityAccess { level, seed, key } => Some((*level, seed, key)),
+            _ => None,
+        })
+        .collect();
+    // The first call is refused and skips its key step; the others get the second seed.
+    assert_eq!(
+        accesses,
+        [(3, &vec![9, 8], &vec![0x55]), (5, &vec![9, 8], &vec![0x55])]
+    );
 }

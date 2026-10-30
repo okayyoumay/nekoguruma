@@ -50,9 +50,6 @@ pub const PROFILE_KEY_REQUEST: &str = "profile:security_access_key";
 /// the ECU is already unlocked.
 const BUILT_SEED: [u8; 4] = [1, 2, 3, 4];
 
-/// The SID of a positive response to the profile's SecurityAccess requests.
-const SECURITY_ACCESS_POSITIVE_SID: u8 = 0x67;
-
 /// The answers a dry run gives. Each list is answered in order, and its last answer again once
 /// the list is used up, so a procedure that polls gets a steady answer.
 ///
@@ -87,9 +84,10 @@ impl Script {
     }
 
     /// Adds a whole response, SID included, to the answers to the profile's seed request, in
-    /// place of the built `positive, level, 01 02 03 04` answer. A negative response may be
+    /// place of the built `positive SID, sub-function, 01 02 03 04` answer. A negative response may be
     /// scripted; the call then ends as it would on a vehicle. It applies only when no declared
-    /// service answers the request (use [`Script::response`] for one that does).
+    /// service answers the request: when a declared service does, it is not used, and that
+    /// service's [`Script::response`] list answers both requests.
     pub fn seed(mut self, bytes: impl Into<Vec<u8>>) -> Self {
         self.seeds.push(bytes.into());
         self
@@ -340,11 +338,11 @@ pub fn dry_run(
     }
 }
 
-/// A request of the UDS profile's SecurityAccess call, and its level (the odd seed level).
+/// A request of the UDS profile's SecurityAccess call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProfileRequest {
-    Seed(u8),
-    Key(u8),
+    Seed,
+    Key,
 }
 
 /// Whether `op` ends a scan from a `SecurityAccess` for its requests: any instruction that
@@ -381,7 +379,7 @@ fn profile_requests(program: &Program) -> HashMap<u32, ProfileRequest> {
     let mut marks = HashMap::new();
     let code = &program.code;
     for (at, op) in code.iter().enumerate() {
-        let Op::SecurityAccess { level } = op else {
+        let Op::SecurityAccess { .. } = op else {
             continue;
         };
         let near = |mut range: Box<dyn Iterator<Item = usize>>| {
@@ -391,10 +389,7 @@ fn profile_requests(program: &Program) -> HashMap<u32, ProfileRequest> {
         };
         let seed = near(Box::new((0..at).rev()));
         let key = near(Box::new(at + 1..code.len()));
-        for (pc, request) in [
-            (seed, ProfileRequest::Seed(*level)),
-            (key, ProfileRequest::Key(*level)),
-        ] {
+        for (pc, request) in [(seed, ProfileRequest::Seed), (key, ProfileRequest::Key)] {
             if let Some(pc) = pc.and_then(|pc| u32::try_from(pc).ok()) {
                 marks.entry(pc).or_insert(request);
             }
@@ -499,29 +494,32 @@ impl ScriptedHost<'_, '_> {
     }
 
     /// Answers `request`, the profile's `kind` of SecurityAccess request that no declared
-    /// service answers, and records it.
+    /// service has, and records it. A request that matches several declared services is
+    /// `Ambiguous` and never reaches here.
     fn answer_profile(
         &mut self,
         request: &[u8],
         kind: ProfileRequest,
     ) -> Result<Vec<u8>, DryRunError> {
+        // The positive SID and the sub-function echo come from the request. A request without
+        // a sub-function is none of the profile's.
+        let &[sid, sub, ..] = request else {
+            return Err(DryRunError::Undeclared {
+                request: error_request(request),
+            });
+        };
+        let mut built_answer = vec![sid.wrapping_add(0x40), sub];
         let script = self.script;
-        let (name, scripted, built_answer) = match kind {
-            ProfileRequest::Seed(level) => {
-                let mut built = vec![SECURITY_ACCESS_POSITIVE_SID, level];
-                built.extend_from_slice(&BUILT_SEED);
+        let (name, scripted) = match kind {
+            ProfileRequest::Seed => {
+                built_answer.extend_from_slice(&BUILT_SEED);
                 (
                     PROFILE_SEED_REQUEST,
                     self.next(Answers::Seed, &script.seeds),
-                    built,
                 )
             }
             // Its scripted response is out of scope (`Script`): always built.
-            ProfileRequest::Key(level) => (
-                PROFILE_KEY_REQUEST,
-                None,
-                vec![SECURITY_ACCESS_POSITIVE_SID, level.saturating_add(1)],
-            ),
+            ProfileRequest::Key => (PROFILE_KEY_REQUEST, None),
         };
         let built = scripted.is_none();
         let answer = scripted.unwrap_or(built_answer);
@@ -792,14 +790,14 @@ impl DiagHost for ScriptedHost<'_, '_> {
         let mut request =
             vec![u8::try_from(service).map_err(|_| DryRunError::NotASid { service })?];
         request.extend_from_slice(payload);
-        match resolve(*self.variant, &request) {
-            Err(DryRunError::Undeclared { .. }) if self.marks.contains_key(&self.pc) => {
-                let kind = self.marks[&self.pc];
-                self.answer_profile(&request, kind)
-            }
-            Ok(service) => self.answer(&request, service),
-            Err(error) => Err(error),
+        let resolved = resolve(*self.variant, &request);
+        // `Ambiguous` and every other error end the run, as for any request (ADR-328 item 2):
+        // only a request no declared service has is answered as the profile's.
+        let kind = self.marks.get(&self.pc).copied();
+        if let (Err(DryRunError::Undeclared { .. }), Some(kind)) = (&resolved, kind) {
+            return self.answer_profile(&request, kind);
         }
+        self.answer(&request, resolved?)
     }
 
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, DryRunError> {

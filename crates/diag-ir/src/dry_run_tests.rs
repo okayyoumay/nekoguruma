@@ -414,21 +414,26 @@ fn security_access_program() -> Program {
             Op::ServiceRequest { service: 0x27 },
             Op::StoreLocal(0),
             Op::LoadLocal(0),
+            Op::PushI64(0),
+            Op::PushI64(1),
+            Op::Slice,
             Op::PushBytes(1),
             Op::CmpEq,
-            Op::JumpIfFalse(8),
-            Op::Jump(15),
+            Op::Not,
+            Op::JumpIfFalse(20),
+            Op::PushBytes(2),
             Op::LoadLocal(0),
             Op::PushI64(2),
             Op::PushI64(i64::MAX),
             Op::Slice,
             Op::SecurityAccess { level: 1 },
+            Op::Concat,
             Op::ServiceRequest { service: 0x27 },
             Op::Pop,
             Op::PushI64(0),
             Op::Pop,
         ],
-        vec![vec![1], vec![0x7F, 0x27, 0x37]],
+        vec![vec![1], vec![0x7F], vec![2]],
     )
 }
 
@@ -471,6 +476,10 @@ fn the_profiles_seed_and_send_key_requests_are_answered_without_a_declared_servi
         profile_request(key),
         (PROFILE_KEY_REQUEST, &[0x67, 2][..], true, true)
     );
+    let DryRunEvent::Request { request, .. } = key else {
+        panic!("{key:?}");
+    };
+    assert_eq!(request, &[0x27, 2, 0xAA]);
 }
 
 #[test]
@@ -530,6 +539,44 @@ fn a_declared_security_access_service_still_answers_the_profiles_requests() {
         assert_eq!(answer, &[0x67]);
         assert!(decoded.is_some());
     }
+}
+
+#[test]
+fn an_ambiguous_profile_request_still_ends_the_run() {
+    let buf = document(
+        vec![
+            service(7, "a", 0x27, &[], vec![]),
+            service(8, "b", 0x27, &[], vec![]),
+        ],
+        vec![],
+    );
+    let report = run(
+        &buf,
+        &security_access_program(),
+        &Script::new().key(vec![1]),
+    );
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::Ambiguous {
+            request: vec![0x27, 1],
+            services: vec!["a".into(), "b".into()],
+        })
+    );
+}
+
+#[test]
+fn a_profile_request_without_a_sub_function_is_undeclared() {
+    let buf = document(vec![], vec![]);
+    // The seed payload is empty, so the request is the SID alone.
+    let mut code = security_access_program();
+    code.constants[0] = Vec::new();
+    let report = run(&buf, &code, &Script::new().key(vec![1]));
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::Undeclared {
+            request: vec![0x27]
+        })
+    );
 }
 
 #[test]

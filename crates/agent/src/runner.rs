@@ -20635,9 +20635,10 @@ def main():
         }
     }
 
-    /// A client whose link disconnect never answers, as a hung worker's does.
+    /// A client whose link disconnect never answers, as a hung worker's does, or, with `true`,
+    /// whose link destroy never answers.
     #[derive(Clone)]
-    struct Hung(WorkerClient);
+    struct Hung(WorkerClient, bool);
 
     impl WorkerApi for Hung {
         delegate! {
@@ -20649,7 +20650,6 @@ def main():
             get_resource_ids(vci_service_interface::GetResourceIdsRequest) -> vci_service_interface::ResourceIdsResponse;
             get_object_id(vci_service_interface::GetObjectIdRequest) -> vci_service_interface::ObjectIdResponse;
             create_com_logical_link(vci_service_interface::CreateComLogicalLinkRequest) -> vci_service_interface::ComLogicalLinkResponse;
-            destroy_com_logical_link(vci_service_interface::DestroyComLogicalLinkRequest) -> vci_service_interface::Response;
             connect_com_logical_link(vci_service_interface::ConnectComLogicalLinkRequest) -> vci_service_interface::Response;
             set_com_param(vci_service_interface::SetComParamRequest) -> vci_service_interface::Response;
             set_unique_resp_id_table(vci_service_interface::SetUniqueRespIdTableRequest) -> vci_service_interface::Response;
@@ -20661,10 +20661,34 @@ def main():
 
         fn disconnect_com_logical_link(
             &mut self,
-            _: vci_service_interface::DisconnectComLogicalLinkRequest,
+            request: vci_service_interface::DisconnectComLogicalLinkRequest,
         ) -> impl Future<Output = crate::client::Reply<vci_service_interface::Response>> + Send
         {
-            std::future::pending()
+            let hangs = !self.1;
+            let call = WorkerApi::disconnect_com_logical_link(&mut self.0, request);
+            async move {
+                if hangs {
+                    std::future::pending().await
+                } else {
+                    call.await
+                }
+            }
+        }
+
+        fn destroy_com_logical_link(
+            &mut self,
+            request: vci_service_interface::DestroyComLogicalLinkRequest,
+        ) -> impl Future<Output = crate::client::Reply<vci_service_interface::Response>> + Send
+        {
+            let hangs = self.1;
+            let call = WorkerApi::destroy_com_logical_link(&mut self.0, request);
+            async move {
+                if hangs {
+                    std::future::pending().await
+                } else {
+                    call.await
+                }
+            }
         }
     }
 
@@ -20756,7 +20780,7 @@ def main():
                 Err(failure) => panic!("{tag}: {}", failure.error),
             };
             let handles = (link.module_handle, link.cll_handle);
-            let hung = Hung(first);
+            let hung = Hung(first, false);
             let log =
                 crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
             log.begin(
@@ -20784,8 +20808,12 @@ def main():
             host.set_comm_log(Some(log));
             let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
             // The process answers alive before the close and after it hung.
-            let (source, asked_of) =
-                scripted(hung.clone(), vec![Ok(Hung(second))], statuses, vec![ending]);
+            let (source, asked_of) = scripted(
+                hung.clone(),
+                vec![Ok(Hung(second, false))],
+                statuses,
+                vec![ending],
+            );
             host.set_relink(Relink {
                 source: Box::new(source),
                 config,
@@ -21261,5 +21289,95 @@ def main():
                 "ModuleDisconnect"
             ]
         );
+    }
+
+    /// ADR-394: the worker refuses the link's disconnect with its own answer and a later step of
+    /// the close, the link's destroy, never answers. `teardown` returns the refusal, the first
+    /// failure, but the reopen sees the step that hung: the live worker is ended and a new one
+    /// takes the link.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hang_behind_a_refused_disconnect_still_ends_the_worker() {
+        use std::sync::atomic::AtomicU32;
+        let dir = journal_dir("hang-behind-refusal");
+        let (first, _) = fake_worker_closing(
+            vec![Some(tonic::Status::internal("library")); 2],
+            Vec::new(),
+        )
+        .await;
+        let (second, second_calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let mut client = first.clone();
+        let link = match link::open_tracked(&mut client, &config, Duration::from_secs(5)).await {
+            Ok(link) => link,
+            Err(failure) => panic!("{}", failure.error),
+        };
+        let handles = (link.module_handle, link.cll_handle);
+        let hung = Hung(first, true);
+        let mut host = WorkerHost::new(
+            Handle::current(),
+            hung.clone(),
+            link,
+            crate::host::Timings {
+                unary: Duration::from_millis(100),
+                send_recv: Duration::from_secs(5),
+            },
+        );
+        let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let (source, asked_of) = scripted(
+            hung.clone(),
+            vec![Ok(Hung(second, false))],
+            vec![WorkerStatus::Alive, WorkerStatus::Alive],
+            vec![Ok(WorkerExit {
+                pid: Some(100),
+                how: ExitHow::KilledByAgent,
+            })],
+        );
+        host.set_relink(Relink {
+            source: Box::new(source),
+            config,
+            open: Arc::new(Mutex::new(Some(OpenOn {
+                client: hung,
+                module_handle: handles.0,
+                cll_handle: handles.1,
+            }))),
+            mark_unconfirmed: {
+                let marks = Arc::clone(&counts.0);
+                Box::new(move || {
+                    marks.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+            worker_gone: {
+                let clears = Arc::clone(&counts.1);
+                Box::new(move || {
+                    clears.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+            old_open: true,
+            path_lost: Arc::new(AtomicBool::new(false)),
+            worker_ended: false,
+            exit_grace: Duration::ZERO,
+        });
+        let (attempt, host) = tokio::task::spawn_blocking(move || {
+            let attempt = host.reopen_link();
+            (attempt, host)
+        })
+        .await
+        .unwrap();
+        drop(host);
+        assert_eq!(attempt, ReopenAttempt::Opened);
+        assert_eq!(counts.0.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.1.load(Ordering::Relaxed), 1);
+        assert_eq!(asked(&asked_of, "end"), 1);
+        assert_eq!(asked(&asked_of, "launch"), 1);
+        assert_eq!(
+            second_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == "ModuleConnect")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

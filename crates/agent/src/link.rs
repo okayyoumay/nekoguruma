@@ -948,24 +948,62 @@ pub(crate) async fn teardown<C: WorkerApi>(
     deadline: Duration,
     path_lost: bool,
 ) -> Result<(), HostError> {
+    teardown_observed(client, module_handle, cll_handle, deadline, path_lost)
+        .await
+        .0
+}
+
+/// What the steps of a close showed of the worker, over every pass made (ADR-394). The error
+/// [`teardown`] returns is the first failure, which hides a later step that went unanswered.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct CloseEvidence {
+    /// Some step got no answer from the worker: a deadline that passed, or a connection that
+    /// failed.
+    pub(crate) unanswered: bool,
+    /// Some step timed out: the worker is there and does not answer.
+    pub(crate) hung: bool,
+}
+
+impl CloseEvidence {
+    fn note(&mut self, outcome: &CloseOutcome) {
+        for step in [&outcome.disconnect, &outcome.destroy, &outcome.module] {
+            if let Err(error) = step {
+                self.unanswered |= !is_workers_answer(error);
+                self.hung |= matches!(error, HostError::WorkerUnresponsive(_));
+            }
+        }
+    }
+}
+
+/// [`teardown`] that also returns what its steps showed of the worker.
+pub(crate) async fn teardown_observed<C: WorkerApi>(
+    client: &mut C,
+    module_handle: ModuleHandle,
+    cll_handle: ComLogicalLinkHandle,
+    deadline: Duration,
+    path_lost: bool,
+) -> (Result<(), HostError>, CloseEvidence) {
+    let mut evidence = CloseEvidence::default();
     let first = close_steps(client, module_handle, cll_handle, deadline).await;
+    evidence.note(&first);
     if !path_lost || first.all_ok() {
-        return first.first_failure();
+        return (first.first_failure(), evidence);
     }
     if lost_path_confirmed(client, &first) {
-        return Ok(());
+        return (Ok(()), evidence);
     }
     // A second close is for a worker that answered every step of the first: one that did not
     // answer (a deadline that passed, a connection that failed) would cost another full pass.
     if !first.all_answered() || client.held_module().is_some() {
-        return first.first_failure();
+        return (first.first_failure(), evidence);
     }
     let second = close_steps(client, module_handle, cll_handle, deadline).await;
+    evidence.note(&second);
     if lost_path_confirmed(client, &second) {
-        return Ok(());
+        return (Ok(()), evidence);
     }
     // The first failure of the last close, after every step was tried.
-    second.first_failure()
+    (second.first_failure(), evidence)
 }
 
 /// The outcomes of one close, kept apart: the link's disconnect, the link's destroy and the

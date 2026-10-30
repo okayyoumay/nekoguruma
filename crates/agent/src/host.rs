@@ -708,7 +708,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             self.link.events = None;
             // The path is lost: a module disconnect that succeeds confirms the link closed even
             // if the link's own disconnect failed (ADR-393).
-            let closed = self.handle.block_on(crate::link::teardown(
+            let (closed, evidence) = self.handle.block_on(crate::link::teardown_observed(
                 &mut self.client,
                 self.link.module_handle,
                 self.link.cll_handle,
@@ -728,9 +728,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     // A process that was killed closes its sockets before it can be reaped, so
                     // a close that got no answer from a worker still reported alive is asked
                     // about again for a short while before the worker is given up as alive.
-                    if matches!(status, WorkerStatus::Alive)
-                        && !crate::link::is_workers_answer(&error)
-                    {
+                    if matches!(status, WorkerStatus::Alive) && evidence.unanswered {
                         let until = Instant::now() + relink.exit_grace;
                         while matches!(status, WorkerStatus::Alive) && Instant::now() < until {
                             std::thread::sleep(EXIT_POLL.min(relink.exit_grace));
@@ -742,23 +740,21 @@ impl<C: WorkerApi> WorkerHost<C> {
                             self.worker_ends(relink, exit, in_flight);
                             true
                         }
-                        WorkerStatus::Alive
-                            if matches!(error, HostError::WorkerUnresponsive(_)) =>
-                        {
-                            match relink.source.end() {
-                                Ok(exit) => {
-                                    self.worker_ends(relink, exit, in_flight);
-                                    true
-                                }
-                                Err(end_error) => {
-                                    tracing::warn!(
-                                        error = %crate::oplog::LogSafe::log_text(&end_error),
-                                        "could not end the worker that did not answer"
-                                    );
-                                    false
-                                }
+                        // Any step of the close may be the one that hung: the error is the
+                        // first failure, which a worker's refusal can hide it behind.
+                        WorkerStatus::Alive if evidence.hung => match relink.source.end() {
+                            Ok(exit) => {
+                                self.worker_ends(relink, exit, in_flight);
+                                true
                             }
-                        }
+                            Err(end_error) => {
+                                tracing::warn!(
+                                    error = %crate::oplog::LogSafe::log_text(&end_error),
+                                    "could not end the worker that did not answer"
+                                );
+                                false
+                            }
+                        },
                         _ => false,
                     };
                     if !ended {

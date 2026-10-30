@@ -798,8 +798,10 @@ again only after a client of a new worker was given):
   link). `client` then starts a new worker from the recipe; the log gets `worker_restart` before
   the link opens (`vci_connected` and `link_opened`, as after a lost VCI).
 - `Alive` or `Unknown`: the lost link is closed through the worker as above. If the close fails
-  and the process has exited meanwhile it is taken in as `Exited`. If the close got no answer
-  (`HostError::WorkerUnresponsive`) and the process is alive, `end` ends it (`worker_exit` with
+  and the process has exited meanwhile it is taken in as `Exited`. If any step of the close got no
+  answer in time (`link::teardown_observed` reports it as `CloseEvidence::hung`, also when an
+  earlier step failed with the worker's own answer, which `teardown` returns as its error) and
+  the process is alive, `end` ends it (`worker_exit` with
   `killed_by_agent`) and a new worker is started. If `end` fails, or the close failed in any
   other way, the guards are marked and the attempt is `Cannot`, as before.
 - A start that fails because the system will not create the process is
@@ -808,7 +810,7 @@ again only after a client of a new worker was given):
   (`spawn_failed: false`) gives `NotYet`: the poll starts again until `vci_return_wait`.
 - The reopen a start belongs to counts against `JobLimits::max_link_reopens` with the reopens
   of a lost VCI; several starts within one reopen (tried again at each poll) count once.
-- A close that got no answer from a worker still reported alive asks `status` again every
+- A close with a step that got no answer from a worker still reported alive asks `status` again every
   50 ms for up to `Relink::exit_grace` (1 s), since a killed process closes its sockets before
   it can be reaped; `end` kills a worker still alive after that, waiting at most 5 s for the
   reap, and reports the worker's own exit when it had exited on its own. The source starts a

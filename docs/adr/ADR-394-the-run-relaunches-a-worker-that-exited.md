@@ -32,8 +32,10 @@ no longer exists (ADR-258).
    the launch recipe of the first (binary, service kind, VCI, mode, launch and connect
    options), and the link opens on it as in ADR-393.
 3. **A worker that is alive and does not answer is ended.** When the close of the lost link
-   gets no answer from a worker whose process is alive, the agent ends the process, which is
-   reaped, and goes on as in item 2. If it cannot end it, the guards are marked and the run
+   gets no answer to any of its steps (a deadline passes) from a worker whose process is
+   alive, the agent ends the process, which is reaped, and goes on as in item 2. The step that
+   hung counts even when an earlier step failed with the worker's own answer, which the close
+   returns as its error. If it cannot end it, the guards are marked and the run
    ends in the host error as before. A close the worker answers with a failure does not end
    it: ADR-258 and ADR-393 decide that case.
 4. **A start that cannot happen ends the run; one that fails may pass.** When the system

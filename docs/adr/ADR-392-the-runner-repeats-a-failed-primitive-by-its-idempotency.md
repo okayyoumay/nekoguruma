@@ -1,7 +1,7 @@
 # ADR-392: The Runner Repeats a Failed Primitive by Its Idempotency
 
 **Date:** 2026-10-30
-**Status:** Accepted (item 6's lost VCI continues within the run by ADR-393)
+**Status:** Accepted (item 6's lost VCI continues within the run by ADR-393, a crashed worker by ADR-394)
 **Affects:** `agent` runner (`runner.rs` `run_vm`, `JobLimits::max_primitive_repeats`),
 restart (`restart.rs` repeat decision, plain-procedure classification), journal (`journal.rs`
 `Record::RequestNotSent`), host and communication log (`origin: repeat`); design 5.6, 8.2.5,
@@ -70,5 +70,6 @@ the rest of this decision (2026-10-30).
 - A request marker withdrawn at the first primitive of a recovery-required section leaves the
   section's intent behind, so a resume still ends in on-site intervention for the section,
   although nothing in it was sent. That errs toward the safe side.
-- A worker crash or a lost VCI still ends the run, and the VM state is resumed only through the
-  journal (backlog).
+- A worker crash or a lost VCI continues within the run where ADR-393 (a lost VCI) and ADR-394
+  (a worker crash) allow it; where they do not, the run ends and the VM state is resumed only
+  through the journal.

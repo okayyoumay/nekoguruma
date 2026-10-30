@@ -1188,6 +1188,9 @@ async fn run_checked<C: WorkerApi>(
     Ok(run)
 }
 
+/// How long a close that got no answer waits for a killed worker's exit to show (ADR-394).
+const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
+
 /// The whole job, on the blocking thread: open, run, close.
 #[expect(
     clippy::too_many_arguments,
@@ -1328,8 +1331,14 @@ fn run_job<C: WorkerApi>(
             let guards = Arc::clone(&guards);
             Box::new(move || mark_link_unconfirmed(&guards))
         },
+        worker_gone: {
+            let guards = Arc::clone(&guards);
+            Box::new(move || clear_link_unconfirmed(&guards))
+        },
         old_open: true,
         path_lost: Arc::clone(&path_lost),
+        worker_ended: false,
+        exit_grace: WORKER_EXIT_GRACE,
     });
     if let Err(error) = refused {
         drop(host);
@@ -1366,15 +1375,22 @@ fn run_job<C: WorkerApi>(
         ),
     }))
     .unwrap_or(Err(JobError::Panicked));
-    // A primitive past its deadline is waited for, or cancelled, before the link closes.
-    if std::panic::catch_unwind(AssertUnwindSafe(|| host.settle_at_end())).is_err() {
-        tracing::warn!("settling a primitive past its deadline at job end panicked");
-    }
     // A run that ended because the path to the VCI was lost closes its link by the same rule as
     // the host's reopen does (ADR-393). The host's flag follows the cause, set in `run_vm` whatever
     // ending followed; the errors that did not come from a step add to it here.
     if ended_on_lost_path(&result) {
         path_lost.store(true, Ordering::Relaxed);
+    }
+    // On a lost path the worker may have exited: it is then reaped here, and the link it held is
+    // not closed through it, which would fail and mark the guards (ADR-394).
+    if path_lost.load(Ordering::Relaxed)
+        && std::panic::catch_unwind(AssertUnwindSafe(|| host.reap_exited_worker())).is_err()
+    {
+        tracing::warn!("asking whether the worker had exited at job end panicked");
+    }
+    // A primitive past its deadline is waited for, or cancelled, before the link closes.
+    if std::panic::catch_unwind(AssertUnwindSafe(|| host.settle_at_end())).is_err() {
+        tracing::warn!("settling a primitive past its deadline at job end panicked");
     }
     // The event stream goes before the link is closed.
     drop(host);
@@ -1464,6 +1480,14 @@ impl<C: WorkerApi> OpenLink<C> {
 fn mark_link_unconfirmed(slot: &GuardSlot) {
     if let Some(guards) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         guards.mark_link_unconfirmed();
+    }
+}
+
+/// Clears the guards' mark in `slot`: the worker's process that held the job's link is gone
+/// (ADR-258 item 3, ADR-394).
+fn clear_link_unconfirmed(slot: &GuardSlot) {
+    if let Some(guards) = slot.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        guards.worker_gone();
     }
 }
 
@@ -14994,6 +15018,9 @@ def main():
         /// The items in order: a no-primitive or earlier-primitive error before or after the
         /// response, and so on.
         Script(&'static [Step]),
+        /// The worker's process ends while the primitive is pending: the link's event stream
+        /// ends with no event (ADR-394).
+        Die,
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -15241,6 +15268,10 @@ def main():
             };
             let scripted = self.start_script.lock().unwrap().pop_front();
             if let Some((when, event)) = scripted.or(self.on_start) {
+                if let StartEvent::Die = event {
+                    // Nothing holds the stream's sender any more, so the stream ends.
+                    *self.events.lock().unwrap() = None;
+                }
                 let sender = self.events.lock().unwrap().clone();
                 let (released, cancelled) =
                     (Arc::clone(&self.released), Arc::clone(&self.cancelled));
@@ -15432,7 +15463,7 @@ def main():
                             ..Default::default()
                         }));
                     }
-                    if let StartEvent::FailNeverFinish = event {
+                    if let StartEvent::FailNeverFinish | StartEvent::Die = event {
                         return;
                     }
                     if let StartEvent::TimeOutThenFinishLater = event {
@@ -15469,6 +15500,7 @@ def main():
                         }
                         StartEvent::Lose => EventData::Lost(Default::default()),
                         StartEvent::Script(_) => unreachable!("a script returned above"),
+                        StartEvent::Die => unreachable!("the stream ended above"),
                     };
                     if let Some(sender) = sender {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -20243,5 +20275,1109 @@ def main():
         );
         let mut guards = run.guards;
         guards.worker_gone();
+    }
+
+    // ------------------------------------------- a worker that exited (ADR-394)
+
+    use crate::client::{ExitHow, WorkerExit, WorkerStatus};
+
+    /// What a [`Scripted`] source was asked, in order.
+    type SourceCalls = Arc<Mutex<Vec<&'static str>>>;
+
+    /// A [`WorkerSource`] that plays a script: the client of the worker it gives first, the clients
+    /// of the workers it starts once one is gone (an `Err` is a start that fails; a script that
+    /// ran out fails the start the way a worker that does not become ready does), how the
+    /// process stands at each question (alive when the script ran out) and what ending it gives.
+    /// It writes down each question it is asked.
+    struct Scripted<C> {
+        current: Option<C>,
+        launches: std::collections::VecDeque<Result<C, HostError>>,
+        statuses: std::collections::VecDeque<WorkerStatus>,
+        ends: std::collections::VecDeque<Result<WorkerExit, HostError>>,
+        /// The process was found exited or ended, and no worker was started since.
+        gone: bool,
+        pid: u32,
+        calls: SourceCalls,
+        /// The nth question about the process (from 1) panics.
+        panic_on_status: Option<usize>,
+    }
+
+    fn scripted<C: WorkerApi>(
+        first: C,
+        launches: Vec<Result<C, HostError>>,
+        statuses: Vec<WorkerStatus>,
+        ends: Vec<Result<WorkerExit, HostError>>,
+    ) -> (Scripted<C>, SourceCalls) {
+        let calls = SourceCalls::default();
+        let source = Scripted {
+            current: Some(first),
+            launches: launches.into(),
+            statuses: statuses.into(),
+            ends: ends.into(),
+            gone: false,
+            pid: 100,
+            calls: Arc::clone(&calls),
+            panic_on_status: None,
+        };
+        (source, calls)
+    }
+
+    impl<C: WorkerApi> WorkerSource for Scripted<C> {
+        type Client = C;
+
+        fn client(&mut self) -> Result<C, HostError> {
+            self.calls.lock().unwrap().push("client");
+            if !self.gone
+                && let Some(current) = &self.current
+            {
+                return Ok(current.clone());
+            }
+            self.calls.lock().unwrap().push("launch");
+            match self.launches.pop_front() {
+                Some(Ok(client)) => {
+                    self.gone = false;
+                    self.pid += 1;
+                    self.current = Some(client.clone());
+                    Ok(client)
+                }
+                Some(Err(error)) => Err(error),
+                None => Err(HostError::WorkerStart {
+                    spawn_failed: false,
+                    reason: "the script ran out".to_owned(),
+                }),
+            }
+        }
+
+        fn status(&mut self) -> WorkerStatus {
+            self.calls.lock().unwrap().push("status");
+            if self.panic_on_status == Some(asked(&self.calls, "status")) {
+                panic!("the script panics at this question");
+            }
+            let status = self.statuses.pop_front().unwrap_or(WorkerStatus::Alive);
+            self.gone |= matches!(status, WorkerStatus::Exited(_));
+            status
+        }
+
+        fn end(&mut self) -> Result<WorkerExit, HostError> {
+            self.calls.lock().unwrap().push("end");
+            let ended = self.ends.pop_front().expect("an end was scripted");
+            self.gone |= ended.is_ok();
+            ended
+        }
+
+        fn pid(&self) -> Option<u32> {
+            Some(self.pid)
+        }
+    }
+
+    /// The first worker of the scripts below, ended by `how`.
+    fn exited(how: ExitHow) -> WorkerStatus {
+        WorkerStatus::Exited(WorkerExit {
+            pid: Some(100),
+            how,
+        })
+    }
+
+    fn unavailable() -> tonic::Status {
+        tonic::Status::unavailable("gone")
+    }
+
+    fn start_failed(spawn_failed: bool) -> HostError {
+        HostError::WorkerStart {
+            spawn_failed,
+            reason: "the system said so".to_owned(),
+        }
+    }
+
+    /// The RPCs of a [`FakeWorker`] that close a link.
+    fn closes(calls: &Arc<Mutex<Vec<&'static str>>>) -> Vec<&'static str> {
+        calls
+            .lock()
+            .unwrap()
+            .iter()
+            .copied()
+            .filter(|call| {
+                matches!(
+                    *call,
+                    "DisconnectComLogicalLink"
+                        | "DestroyComLogicalLink"
+                        | "ModuleDisconnect"
+                        | "CancelComPrimitive"
+                )
+            })
+            .collect()
+    }
+
+    /// How often `source` was asked `question`.
+    fn asked(source: &SourceCalls, question: &str) -> usize {
+        source
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|call| **call == question)
+            .count()
+    }
+
+    /// The events of the log in `dir` that tell a worker's exit and restart, a loss and a
+    /// connection, in order.
+    fn worker_events(dir: &std::path::Path) -> Vec<String> {
+        comm_log_lines(dir)
+            .iter()
+            .filter_map(|line| line["event"].as_str())
+            .filter(|event| {
+                matches!(
+                    *event,
+                    "worker_exit"
+                        | "worker_restart"
+                        | "vci_loss"
+                        | "vci_loss_settled"
+                        | "vci_connected"
+                        | "link_opened"
+                )
+            })
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// A run of `program` on `source` with the log in `dir` (or none) and `limits`.
+    async fn run_on_source<W: WorkerSource>(
+        source: W,
+        program: Program,
+        dir: Option<&std::path::Path>,
+        limits: JobLimits,
+        tag: &str,
+    ) -> JobRun {
+        let job = Job::from(program);
+        let job = match dir {
+            Some(dir) => job.with_comm_log(comm_log_setup_in(dir)),
+            None => job,
+        };
+        run_program(
+            source,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            job,
+            limits,
+            vci_only_guards(tag),
+        )
+        .await
+    }
+
+    /// ADR-394: a worker that exited under a `Safe` read is told from a lost VCI by its process.
+    /// Nothing is closed through it, the log has its exit, a new worker is started and logged,
+    /// the link opens on it and the read is sent again with the origin `repeat`; the run
+    /// finishes with the new worker's link closed and the guards unmarked. It makes no
+    /// difference whether the worker ended under the pending primitive (its event stream ends,
+    /// and the exit names that exchange) or between two primitives (the next start cannot reach
+    /// it). Without a log the run is the same.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_exited_is_started_again_and_the_read_is_sent_again() {
+        const DIES: &[(When, StartEvent)] = &[(When::After(Duration::ZERO), StartEvent::Die)];
+        for (tag, in_flight, logged) in [
+            ("crash-mid", true, true),
+            ("crash-between", false, true),
+            ("crash-unlogged", false, false),
+        ] {
+            let dir = journal_dir(tag);
+            let (first, first_calls) = if in_flight {
+                let (client, started) =
+                    fake_worker_scripted(CancelAnswer::Done, None, false, false, DIES.to_vec())
+                        .await;
+                (client, started.calls)
+            } else {
+                fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await
+            };
+            let (second, second_calls) =
+                fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+            let (source, asked_of) = scripted(
+                first,
+                vec![Ok(second)],
+                vec![exited(ExitHow::Signal(9))],
+                Vec::new(),
+            );
+            let run = run_on_source(
+                source,
+                plain_steps(&[(0x22, Safe)]),
+                logged.then_some(dir.as_path()),
+                after_loss_limits(),
+                tag,
+            )
+            .await;
+            run.result.unwrap_or_else(|error| panic!("{tag}: {error}"));
+            assert!(!run.guards.link_unconfirmed(), "{tag}");
+            // Nothing went through the first worker after it was gone, to close or to cancel.
+            assert_eq!(closes(&first_calls), Vec::<&str>::new(), "{tag}");
+            // The second worker opened the link once, took the read and closed the link.
+            let calls = second_calls.lock().unwrap().clone();
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| **call == "ModuleConnect")
+                    .count(),
+                1,
+                "{tag}: {calls:?}"
+            );
+            assert_eq!(
+                calls
+                    .iter()
+                    .filter(|call| **call == "StartComPrimitive")
+                    .count(),
+                1,
+                "{tag}: {calls:?}"
+            );
+            assert_eq!(
+                closes(&second_calls),
+                [
+                    "DisconnectComLogicalLink",
+                    "DestroyComLogicalLink",
+                    "ModuleDisconnect"
+                ],
+                "{tag}"
+            );
+            // The process was asked about once, at the reopen, and not again at the run's end.
+            assert_eq!(asked(&asked_of, "status"), 1, "{tag}");
+            assert_eq!(asked(&asked_of, "launch"), 1, "{tag}");
+            assert_eq!(asked(&asked_of, "end"), 0, "{tag}");
+            if !logged {
+                assert_eq!(run.comm_log, CommLogStatus::None, "{tag}");
+                continue;
+            }
+            assert_eq!(run.comm_log, CommLogStatus::Complete, "{tag}");
+            // No loss of the VCI: the exit settles nothing, and the connection settles nothing.
+            assert_eq!(
+                worker_events(&dir),
+                [
+                    "vci_connected",
+                    "link_opened",
+                    "worker_exit",
+                    "worker_restart",
+                    "vci_connected",
+                    "link_opened"
+                ],
+                "{tag}"
+            );
+            let lines = comm_log_lines(&dir);
+            let exchanges = of_event(&lines, "exchange");
+            let origins: Vec<_> = exchanges
+                .iter()
+                .map(|line| line["origin"].as_str().unwrap().to_owned())
+                .collect();
+            assert_eq!(origins, ["procedure", "repeat"], "{tag}: {lines:#?}");
+            let exit = &of_event(&lines, "worker_exit")[0];
+            assert_eq!(exit["pid"], 100, "{tag}: {exit}");
+            assert_eq!(exit["exit"], serde_json::json!({"signal": 9}), "{tag}");
+            let named = if in_flight {
+                serde_json::json!([exchanges[0]["seq"]])
+            } else {
+                serde_json::json!([])
+            };
+            assert_eq!(exit["refers_to"], named, "{tag}: {exit}");
+            assert_eq!(of_event(&lines, "worker_restart")[0]["pid"], 101, "{tag}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-394: when the run cannot go on after a worker exited (a request not safe to repeat
+    /// that may have reached the ECU, or one that is safe with a hazard ahead), it ends as it did
+    /// before, but the dead worker is reaped at its end: the log has the exit, no link is closed
+    /// through it, so the guards are not marked even though a close through that worker would
+    /// have failed, and no new worker is started.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_run_that_cannot_go_on_reaps_the_dead_worker_at_its_end() {
+        let internal = || Some(tonic::Status::internal("library"));
+        for (tag, program, on_site) in [
+            ("end-unsafe", plain_steps(&[(0x22, Unsafe)]), true),
+            (
+                "end-hazard-ahead",
+                plain_steps(&[(0x22, Safe), (0x22, Unsafe)]),
+                false,
+            ),
+        ] {
+            let dir = journal_dir(tag);
+            let (first, first_calls) = fake_worker_losing(
+                vec![unavailable()],
+                vec![internal(), internal()],
+                vec![internal(), internal()],
+            )
+            .await;
+            let (source, asked_of) = scripted(
+                first,
+                Vec::new(),
+                vec![exited(ExitHow::Code(139))],
+                Vec::new(),
+            );
+            let run = run_on_source(source, program, Some(&dir), after_loss_limits(), tag).await;
+            if on_site {
+                assert!(
+                    matches!(run.result, Err(JobError::OnSiteInterventionRequired(_))),
+                    "{tag}: {:?}",
+                    run.result
+                );
+            } else {
+                assert!(
+                    matches!(run.result, Err(JobError::Host { pc: 1, .. })),
+                    "{tag}: {:?}",
+                    run.result
+                );
+            }
+            assert!(!run.guards.link_unconfirmed(), "{tag}");
+            assert_eq!(closes(&first_calls), Vec::<&str>::new(), "{tag}");
+            // Asked once, at the run's end: the reopen was not tried.
+            assert_eq!(asked(&asked_of, "status"), 1, "{tag}");
+            assert_eq!(asked(&asked_of, "launch"), 0, "{tag}");
+            assert_eq!(
+                worker_events(&dir),
+                ["vci_connected", "link_opened", "worker_exit"],
+                "{tag}"
+            );
+            let exit = &of_event(&comm_log_lines(&dir), "worker_exit")[0];
+            assert_eq!(exit["exit"], serde_json::json!({"code": 139}), "{tag}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A client whose link disconnect never answers, as a hung worker's does, or, with `true`,
+    /// whose link destroy never answers.
+    #[derive(Clone)]
+    struct Hung(WorkerClient, bool);
+
+    impl WorkerApi for Hung {
+        delegate! {
+            get_module_ids(vci_service_interface::GetModuleIdsRequest) -> vci_service_interface::ModuleIdsResponse;
+            module_connect(vci_service_interface::ModuleConnectRequest) -> vci_service_interface::Response;
+            module_disconnect(vci_service_interface::ModuleDisconnectRequest) -> vci_service_interface::Response;
+            get_version(vci_service_interface::GetVersionRequest) -> vci_service_interface::VersionResponse;
+            get_timestamp(vci_service_interface::GetTimestampRequest) -> vci_service_interface::TimestampResponse;
+            get_resource_ids(vci_service_interface::GetResourceIdsRequest) -> vci_service_interface::ResourceIdsResponse;
+            get_object_id(vci_service_interface::GetObjectIdRequest) -> vci_service_interface::ObjectIdResponse;
+            create_com_logical_link(vci_service_interface::CreateComLogicalLinkRequest) -> vci_service_interface::ComLogicalLinkResponse;
+            connect_com_logical_link(vci_service_interface::ConnectComLogicalLinkRequest) -> vci_service_interface::Response;
+            set_com_param(vci_service_interface::SetComParamRequest) -> vci_service_interface::Response;
+            set_unique_resp_id_table(vci_service_interface::SetUniqueRespIdTableRequest) -> vci_service_interface::Response;
+            start_com_primitive(vci_service_interface::StartComPrimitiveRequest) -> vci_service_interface::ComPrimitiveResponse;
+            cancel_com_primitive(vci_service_interface::CancelComPrimitiveRequest) -> vci_service_interface::Response;
+            subscribe_event(vci_service_interface::SubscribeEventRequest) -> tonic::Streaming<vci_service_interface::EventNotification>;
+            io_ctl(vci_service_interface::IoCtlRequest) -> vci_service_interface::IoCtlResponse;
+        }
+
+        fn disconnect_com_logical_link(
+            &mut self,
+            request: vci_service_interface::DisconnectComLogicalLinkRequest,
+        ) -> impl Future<Output = crate::client::Reply<vci_service_interface::Response>> + Send
+        {
+            let hangs = !self.1;
+            let call = WorkerApi::disconnect_com_logical_link(&mut self.0, request);
+            async move {
+                if hangs {
+                    std::future::pending().await
+                } else {
+                    call.await
+                }
+            }
+        }
+
+        fn destroy_com_logical_link(
+            &mut self,
+            request: vci_service_interface::DestroyComLogicalLinkRequest,
+        ) -> impl Future<Output = crate::client::Reply<vci_service_interface::Response>> + Send
+        {
+            let hangs = self.1;
+            let call = WorkerApi::destroy_com_logical_link(&mut self.0, request);
+            async move {
+                if hangs {
+                    std::future::pending().await
+                } else {
+                    call.await
+                }
+            }
+        }
+    }
+
+    /// ADR-394: a worker that is alive and does not answer the close of the lost link is ended by
+    /// the agent, logged as its exit `killed_by_agent`, and a new worker takes the link; the
+    /// guards stay unmarked. When the agent cannot end it, the guards are marked, no new worker
+    /// is started and the attempt is the end of the run.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_does_not_answer_the_close_is_ended_and_started_again() {
+        use std::sync::atomic::AtomicU32;
+        // (tag, the process's answers, grace, what ending it gives, the attempt, marks, clears,
+        // workers started, questions about the process, asks to end it)
+        let alive = || vec![WorkerStatus::Alive, WorkerStatus::Alive];
+        let cases = [
+            (
+                "ended",
+                alive(),
+                Duration::ZERO,
+                Ok(WorkerExit {
+                    pid: Some(100),
+                    how: ExitHow::KilledByAgent,
+                }),
+                ReopenAttempt::Opened,
+                0,
+                1,
+                1,
+                2,
+                1,
+            ),
+            (
+                "not-ended",
+                alive(),
+                Duration::ZERO,
+                Err(HostError::Setup("not ended")),
+                ReopenAttempt::Cannot,
+                1,
+                0,
+                0,
+                2,
+                1,
+            ),
+            // A killed process closes its sockets before it can be reaped: the exit shows at
+            // the third question, within the grace, and nobody ends the worker.
+            (
+                "late-exit",
+                vec![
+                    WorkerStatus::Alive,
+                    WorkerStatus::Alive,
+                    exited(ExitHow::Signal(9)),
+                ],
+                Duration::from_secs(5),
+                Err(HostError::Setup("not asked")),
+                ReopenAttempt::Opened,
+                0,
+                1,
+                1,
+                3,
+                0,
+            ),
+            // The exit does not show within the grace: the worker is ended.
+            (
+                "no-exit-in-grace",
+                alive(),
+                Duration::from_millis(50),
+                Ok(WorkerExit {
+                    pid: Some(100),
+                    how: ExitHow::KilledByAgent,
+                }),
+                ReopenAttempt::Opened,
+                0,
+                1,
+                1,
+                3,
+                1,
+            ),
+        ];
+        for (tag, statuses, grace, ending, expected, marks, clears, started, questions, ends) in
+            cases
+        {
+            let dir = journal_dir(tag);
+            let (first, _) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+            let (second, second_calls) =
+                fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let mut client = first.clone();
+            let link = match link::open_tracked(&mut client, &config, Duration::from_secs(5)).await
+            {
+                Ok(link) => link,
+                Err(failure) => panic!("{tag}: {}", failure.error),
+            };
+            let handles = (link.module_handle, link.cll_handle);
+            let hung = Hung(first, false);
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            log.begin(
+                &crate::comm_log::RunFacts {
+                    job_id: "crash".to_owned(),
+                    generation: 1,
+                    document_sha256: None,
+                    variant_name: None,
+                    target_vin: None,
+                    writes: false,
+                    vci: None,
+                    margins: Default::default(),
+                },
+                crate::comm_log::RunKind::First,
+            );
+            let mut host = WorkerHost::new(
+                Handle::current(),
+                hung.clone(),
+                link,
+                crate::host::Timings {
+                    unary: Duration::from_millis(100),
+                    send_recv: Duration::from_secs(5),
+                },
+            );
+            host.set_comm_log(Some(log));
+            let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+            // The process answers alive before the close and after it hung.
+            let (source, asked_of) = scripted(
+                hung.clone(),
+                vec![Ok(Hung(second, false))],
+                statuses,
+                vec![ending],
+            );
+            host.set_relink(Relink {
+                source: Box::new(source),
+                config,
+                open: Arc::new(Mutex::new(Some(OpenOn {
+                    client: hung,
+                    module_handle: handles.0,
+                    cll_handle: handles.1,
+                }))),
+                mark_unconfirmed: {
+                    let marks = Arc::clone(&counts.0);
+                    Box::new(move || {
+                        marks.fetch_add(1, Ordering::Relaxed);
+                    })
+                },
+                worker_gone: {
+                    let clears = Arc::clone(&counts.1);
+                    Box::new(move || {
+                        clears.fetch_add(1, Ordering::Relaxed);
+                    })
+                },
+                old_open: true,
+                path_lost: Arc::new(AtomicBool::new(false)),
+                worker_ended: false,
+                exit_grace: grace,
+            });
+            let (attempt, host) = tokio::task::spawn_blocking(move || {
+                let attempt = host.reopen_link();
+                (attempt, host)
+            })
+            .await
+            .unwrap();
+            drop(host);
+            assert_eq!(attempt, expected, "{tag}");
+            assert_eq!(counts.0.load(Ordering::Relaxed), marks, "{tag}");
+            assert_eq!(counts.1.load(Ordering::Relaxed), clears, "{tag}");
+            assert_eq!(asked(&asked_of, "status"), questions, "{tag}");
+            assert_eq!(asked(&asked_of, "end"), ends, "{tag}");
+            assert_eq!(asked(&asked_of, "launch"), started, "{tag}");
+            let connects = second_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == "ModuleConnect")
+                .count();
+            assert_eq!(connects, started, "{tag}");
+            let events = worker_events(&dir);
+            if started == 1 {
+                assert_eq!(
+                    events,
+                    [
+                        "worker_exit",
+                        "worker_restart",
+                        "vci_connected",
+                        "link_opened"
+                    ],
+                    "{tag}"
+                );
+                assert_eq!(
+                    of_event(&comm_log_lines(&dir), "worker_exit")[0]["exit"],
+                    if tag == "late-exit" {
+                        serde_json::json!({"signal": 9})
+                    } else {
+                        serde_json::json!("killed_by_agent")
+                    },
+                    "{tag}"
+                );
+            } else {
+                assert_eq!(events, Vec::<String>::new(), "{tag}");
+            }
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-394, ADR-258: a worker that is alive and answers the close with failures is not ended:
+    /// the lost link is not confirmed closed, the guards are marked, no new worker is started
+    /// and the run ends in the host error.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_is_alive_and_fails_the_close_is_not_ended() {
+        let internal = || Some(tonic::Status::internal("library"));
+        let (first, first_calls) = fake_worker_losing(
+            vec![unavailable()],
+            vec![internal(), internal()],
+            vec![internal(), internal()],
+        )
+        .await;
+        let (source, asked_of) = scripted(first, Vec::new(), Vec::new(), Vec::new());
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            None,
+            after_loss_limits(),
+            "alive-fails-close",
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::Host { pc: 1, .. })),
+            "{:?}",
+            run.result
+        );
+        let mut guards = run.guards;
+        assert!(guards.link_unconfirmed());
+        guards.worker_gone();
+        assert!(closes(&first_calls).contains(&"ModuleDisconnect"));
+        // Asked before the close and after it failed; never ended or started again.
+        assert_eq!(asked(&asked_of, "status"), 3, "{:?}", asked_of);
+        assert_eq!(asked(&asked_of, "end"), 0);
+        assert_eq!(asked(&asked_of, "launch"), 0);
+    }
+
+    /// ADR-394: a worker that cannot be started because the system will not create the process
+    /// ends the run in the original host error at once: the log has the exit and no restart, the
+    /// guards are not marked, and no further start is tried.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_the_system_will_not_start_ends_the_run_in_the_host_error() {
+        let dir = journal_dir("spawn-fails");
+        let (first, _) = fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        let (source, asked_of) = scripted(
+            first,
+            vec![Err(start_failed(true))],
+            vec![exited(ExitHow::Signal(11))],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            Some(&dir),
+            after_loss_limits(),
+            "spawn-fails",
+        )
+        .await;
+        assert!(
+            matches!(
+                &run.result,
+                Err(JobError::Host {
+                    pc: 1,
+                    source: HostError::Rpc { status, .. }
+                }) if status.code() == tonic::Code::Unavailable
+            ),
+            "{:?}",
+            run.result
+        );
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(asked(&asked_of, "launch"), 1);
+        assert_eq!(
+            worker_events(&dir),
+            ["vci_connected", "link_opened", "worker_exit"]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: a worker that starts but is not ready, or cannot be connected to, is tried again
+    /// at every poll until `vci_return_wait`, with the process asked about once: the worker's
+    /// exit is taken in once. A start that succeeds later carries the run on; one that does not
+    /// by the end of the wait ends it in the host error, with no restart in the log.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_does_not_start_is_tried_until_the_wait_has_passed() {
+        let (second, _) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        // (tag, the starts, wait, the run goes on, the starts tried)
+        let cases = [
+            (
+                "late",
+                vec![
+                    Err(start_failed(false)),
+                    Err(start_failed(false)),
+                    Ok(second),
+                ],
+                Duration::from_secs(10),
+                true,
+                3,
+            ),
+            ("never", Vec::new(), Duration::from_millis(50), false, 0),
+        ];
+        for (tag, launches, wait, goes_on, tried) in cases {
+            let dir = journal_dir(tag);
+            let (first, _) = fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+            let (source, asked_of) = scripted(
+                first,
+                launches,
+                vec![exited(ExitHow::Signal(9))],
+                Vec::new(),
+            );
+            let run = run_on_source(
+                source,
+                plain_steps(&[(0x22, Safe)]),
+                Some(&dir),
+                JobLimits {
+                    vci_return_wait: wait,
+                    ..after_loss_limits()
+                },
+                tag,
+            )
+            .await;
+            assert_eq!(run.result.is_ok(), goes_on, "{tag}: {:?}", run.result);
+            assert!(!run.guards.link_unconfirmed(), "{tag}");
+            assert_eq!(asked(&asked_of, "status"), 1, "{tag}");
+            if goes_on {
+                assert_eq!(asked(&asked_of, "launch"), tried, "{tag}");
+            } else {
+                // Every poll starts again until the wait passes.
+                assert!(asked(&asked_of, "launch") >= 2, "{tag}: {asked_of:?}");
+                assert!(
+                    matches!(&run.result, Err(JobError::Host { pc: 1, .. })),
+                    "{tag}: {:?}",
+                    run.result
+                );
+            }
+            let events = worker_events(&dir);
+            let restarts = events.iter().filter(|event| *event == "worker_restart");
+            assert_eq!(restarts.count(), usize::from(goes_on), "{tag}: {events:?}");
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|event| *event == "worker_exit")
+                    .count(),
+                1,
+                "{tag}: {events:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-394: the open on the new worker fails. When the worker cleaned up after itself, the
+    /// next poll uses the same worker, which is alive, and starts no other; when it did not, the
+    /// guards are marked and the run ends. (The mark is not undone by the earlier exit.)
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_failed_open_on_the_new_worker_is_judged_as_any_failed_open() {
+        let (cleaned, _, _) = fake_worker_refusing(false, false, Some("cp_p2max")).await;
+        let (not_cleaned, _) = fake_worker_with(false, true).await;
+        // (tag, the new worker, marked)
+        for (tag, second, marked) in [
+            ("cleaned", cleaned, false),
+            ("not-cleaned", not_cleaned, true),
+        ] {
+            let (first, _) = fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+            let (source, asked_of) = scripted(
+                first,
+                vec![Ok(second)],
+                vec![exited(ExitHow::Signal(9))],
+                Vec::new(),
+            );
+            let run = run_on_source(
+                source,
+                plain_steps(&[(0x22, Safe)]),
+                None,
+                JobLimits {
+                    vci_return_wait: Duration::from_millis(100),
+                    ..after_loss_limits()
+                },
+                tag,
+            )
+            .await;
+            assert!(
+                matches!(&run.result, Err(JobError::Host { pc: 1, .. })),
+                "{tag}: {:?}",
+                run.result
+            );
+            let mut guards = run.guards;
+            assert_eq!(guards.link_unconfirmed(), marked, "{tag}");
+            guards.worker_gone();
+            assert_eq!(asked(&asked_of, "launch"), 1, "{tag}");
+            // Every attempt asks the process once, and the run's end asks once: the process of
+            // the worker that took the link is alive, so the polls start no other.
+            assert_eq!(
+                asked(&asked_of, "status"),
+                asked(&asked_of, "client"),
+                "{tag}"
+            );
+            if !marked {
+                assert!(asked(&asked_of, "client") >= 3, "{tag}: {asked_of:?}");
+            }
+        }
+    }
+
+    /// ADR-394: workers that exit one after the other are started again within the bound the VCI's
+    /// reopens share (`max_link_reopens`, 2): the second exit is survived, a third ends the run
+    /// in the host error, with the dead worker reaped at its end.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn restarts_of_a_worker_share_the_bound_of_the_link_reopens() {
+        // (tag, workers that fail the read before the one that answers, the run goes on)
+        for (tag, crashes, goes_on) in [("twice", 2, true), ("three-times", 3, false)] {
+            let dir = journal_dir(tag);
+            let mut workers = Vec::new();
+            for _ in 0..crashes {
+                workers.push(
+                    fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new())
+                        .await
+                        .0,
+                );
+            }
+            workers.push(
+                fake_worker_losing(Vec::new(), Vec::new(), Vec::new())
+                    .await
+                    .0,
+            );
+            let first = workers.remove(0);
+            let (source, asked_of) = scripted(
+                first,
+                workers.into_iter().map(Ok).collect(),
+                vec![exited(ExitHow::Signal(9)); crashes],
+                Vec::new(),
+            );
+            let run = run_on_source(
+                source,
+                plain_steps(&[(0x22, Safe)]),
+                Some(&dir),
+                JobLimits {
+                    max_primitive_repeats: 5,
+                    ..after_loss_limits()
+                },
+                tag,
+            )
+            .await;
+            assert_eq!(run.result.is_ok(), goes_on, "{tag}: {:?}", run.result);
+            assert!(!run.guards.link_unconfirmed(), "{tag}");
+            // The shared bound: two restarts, whatever the cause of the reopen.
+            assert_eq!(asked(&asked_of, "launch"), 2, "{tag}");
+            let events = worker_events(&dir);
+            let count = |name: &str| events.iter().filter(|event| *event == name).count();
+            assert_eq!(count("worker_exit"), crashes, "{tag}: {events:?}");
+            assert_eq!(count("worker_restart"), 2, "{tag}: {events:?}");
+            assert_eq!(count("link_opened"), 3, "{tag}: {events:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-394: a source that is a bare client says nothing of the worker's process, so a run
+    /// behaves as it did before: the link reopens on the same worker, which closes the lost
+    /// link first, and the log has no worker event.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_bare_client_writes_no_worker_events() {
+        let dir = journal_dir("bare-client");
+        let (client, calls) = fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        let run = run_on_source(
+            client,
+            plain_steps(&[(0x22, Safe)]),
+            Some(&dir),
+            after_loss_limits(),
+            "bare-client",
+        )
+        .await;
+        run.result.expect("the run goes on");
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(
+            worker_events(&dir),
+            [
+                "vci_connected",
+                "link_opened",
+                "vci_connected",
+                "link_opened"
+            ]
+        );
+        let calls = calls.lock().unwrap().clone();
+        let at = |call: &str, nth: usize| {
+            calls
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| **name == call)
+                .nth(nth)
+                .map(|(at, _)| at)
+                .unwrap_or_else(|| panic!("no {call} #{nth} in {calls:?}"))
+        };
+        assert!(
+            at("ModuleDisconnect", 0) < at("ModuleConnect", 1),
+            "{calls:?}"
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: a VCI lost under a read, and then the worker's exit: the log tells the loss, the
+    /// exit, the restart and then the new connection, which settles the loss. The crash adds no
+    /// loss record of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vci_loss_followed_by_a_worker_exit_is_settled_by_the_new_connection() {
+        const LOSE: &[Step] = &[Step::Transmit(1_000), Step::LostVci(2_000)];
+        let dir = journal_dir("loss-then-crash");
+        let (first, first_started) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            false,
+            vec![(When::After(Duration::ZERO), StartEvent::Script(LOSE))],
+        )
+        .await;
+        let (second, _) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            false,
+            vec![(When::After(Duration::ZERO), StartEvent::Respond)],
+        )
+        .await;
+        let (source, asked_of) = scripted(
+            first,
+            vec![Ok(second)],
+            vec![exited(ExitHow::Code(1))],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            Some(&dir),
+            after_loss_limits(),
+            "loss-then-crash",
+        )
+        .await;
+        run.result.expect("the run goes on");
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        assert_eq!(closes(&first_started.calls), Vec::<&str>::new());
+        assert_eq!(asked(&asked_of, "launch"), 1);
+        assert_eq!(
+            worker_events(&dir),
+            [
+                "vci_connected",
+                "link_opened",
+                "vci_loss",
+                "worker_exit",
+                "worker_restart",
+                "vci_connected",
+                "vci_loss_settled",
+                "link_opened"
+            ]
+        );
+        let lines = comm_log_lines(&dir);
+        assert_eq!(of_event(&lines, "vci_loss_settled").len(), 1);
+        assert_eq!(
+            of_event(&lines, "worker_exit")[0]["exit"],
+            serde_json::json!({"code": 1})
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: a panic after a worker was started again closes the link on the new worker, the
+    /// one that holds it, and leaves the guards unmarked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panic_after_a_restart_closes_the_link_on_the_new_worker() {
+        let (first, first_calls) =
+            fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        let (second, second_calls) =
+            fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        let (mut source, _) = scripted(
+            first,
+            vec![Ok(second)],
+            vec![exited(ExitHow::Signal(9))],
+            Vec::new(),
+        );
+        // The first question restarts the worker; the new worker fails the read again, and the
+        // second question, at the next reopen, panics.
+        source.panic_on_status = Some(2);
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            None,
+            JobLimits {
+                max_primitive_repeats: 5,
+                ..after_loss_limits()
+            },
+            "panic-after-restart",
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::Panicked)),
+            "{:?}",
+            run.result
+        );
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(closes(&first_calls), Vec::<&str>::new());
+        assert_eq!(
+            closes(&second_calls),
+            [
+                "DisconnectComLogicalLink",
+                "DestroyComLogicalLink",
+                "ModuleDisconnect"
+            ]
+        );
+    }
+
+    /// ADR-394: the worker refuses the link's disconnect with its own answer and a later step of
+    /// the close, the link's destroy, never answers. `teardown` returns the refusal, the first
+    /// failure, but the reopen sees the step that hung: the live worker is ended and a new one
+    /// takes the link.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_hang_behind_a_refused_disconnect_still_ends_the_worker() {
+        use std::sync::atomic::AtomicU32;
+        let dir = journal_dir("hang-behind-refusal");
+        let (first, _) = fake_worker_closing(
+            vec![Some(tonic::Status::internal("library")); 2],
+            Vec::new(),
+        )
+        .await;
+        let (second, second_calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let mut client = first.clone();
+        let link = match link::open_tracked(&mut client, &config, Duration::from_secs(5)).await {
+            Ok(link) => link,
+            Err(failure) => panic!("{}", failure.error),
+        };
+        let handles = (link.module_handle, link.cll_handle);
+        let hung = Hung(first, true);
+        let mut host = WorkerHost::new(
+            Handle::current(),
+            hung.clone(),
+            link,
+            crate::host::Timings {
+                unary: Duration::from_millis(100),
+                send_recv: Duration::from_secs(5),
+            },
+        );
+        let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+        let (source, asked_of) = scripted(
+            hung.clone(),
+            vec![Ok(Hung(second, false))],
+            vec![WorkerStatus::Alive, WorkerStatus::Alive],
+            vec![Ok(WorkerExit {
+                pid: Some(100),
+                how: ExitHow::KilledByAgent,
+            })],
+        );
+        host.set_relink(Relink {
+            source: Box::new(source),
+            config,
+            open: Arc::new(Mutex::new(Some(OpenOn {
+                client: hung,
+                module_handle: handles.0,
+                cll_handle: handles.1,
+            }))),
+            mark_unconfirmed: {
+                let marks = Arc::clone(&counts.0);
+                Box::new(move || {
+                    marks.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+            worker_gone: {
+                let clears = Arc::clone(&counts.1);
+                Box::new(move || {
+                    clears.fetch_add(1, Ordering::Relaxed);
+                })
+            },
+            old_open: true,
+            path_lost: Arc::new(AtomicBool::new(false)),
+            worker_ended: false,
+            exit_grace: Duration::ZERO,
+        });
+        let (attempt, host) = tokio::task::spawn_blocking(move || {
+            let attempt = host.reopen_link();
+            (attempt, host)
+        })
+        .await
+        .unwrap();
+        drop(host);
+        assert_eq!(attempt, ReopenAttempt::Opened);
+        assert_eq!(counts.0.load(Ordering::Relaxed), 0);
+        assert_eq!(counts.1.load(Ordering::Relaxed), 1);
+        assert_eq!(asked(&asked_of, "end"), 1);
+        assert_eq!(asked(&asked_of, "launch"), 1);
+        assert_eq!(
+            second_calls
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|call| **call == "ModuleConnect")
+                .count(),
+            1
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

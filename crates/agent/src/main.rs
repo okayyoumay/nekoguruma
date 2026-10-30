@@ -11,7 +11,7 @@ use std::time::Duration;
 use agent::artifact::{Artifact, SHA256_LEN, parse_sha256};
 use agent::guards::{GuardSetup, JobGuards};
 use agent::journal::JobKey;
-use agent::launch::{Api, launch_worker};
+use agent::launch::{Api, RelaunchingWorker, launch_worker};
 use agent::policy::build_ceiling;
 use agent::{
     CommLogSetup, Job, JobDocument, JobLimits, JobRun, VciFacts, check_job, run_key, run_program,
@@ -331,11 +331,15 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
         api: args.api,
         long_size: worker.long_size,
     });
+    // The run owns the worker's process through its source, which starts a new worker if the
+    // current one exits (ADR-394); the process in the slot is the one to stop at the end.
+    let source = RelaunchingWorker::new(worker.recipe, worker.process, worker.client);
+    let slot = source.slot();
     let JobRun {
         result,
         mut guards,
         comm_log,
-    } = run_program(worker.client, &link, job, JobLimits::default(), guards).await;
+    } = run_program(source, &link, job, JobLimits::default(), guards).await;
     // The path is printed only once the log exists: a job that never ran, or a log that could
     // not be opened, names none.
     match (&comm_log, &log_path) {
@@ -354,7 +358,12 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
     // The job has closed its link whatever the result, unless its guards say otherwise
     // (ADR-258). A stop that reaped the worker means the worker no longer holds the link; a
     // vendor device server may still hold the device a while, which the next open detects.
-    match worker.process.stop(STOP_GRACE).await {
+    let process = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .take()
+        .expect("the run leaves its worker's process in the slot");
+    match process.stop(STOP_GRACE).await {
         Ok(Stopped::Exited) => guards.worker_gone(),
         Ok(Stopped::Killed) => {
             eprintln!("ngr-agent: the worker did not stop in time and was killed");

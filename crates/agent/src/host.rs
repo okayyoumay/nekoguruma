@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use crate::client::WorkerApi;
+use crate::client::{WorkerApi, WorkerExit, WorkerStatus};
 use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
@@ -148,6 +148,12 @@ pub enum HostError {
     TransferInterrupted(u8),
     #[error("link setup: {0}")]
     Setup(&'static str),
+    /// A worker the agent starts again for the run (ADR-394) could not be started. `spawn_failed`
+    /// is true when the system would not create the process, which a later try does not mend,
+    /// and false when the worker started but did not become ready or reachable, which may pass.
+    /// `reason` is the system's or the worker's text.
+    #[error("the worker could not be started again")]
+    WorkerStart { spawn_failed: bool, reason: String },
     /// A `ReadInput` of a runtime input the agent cannot establish: it has no source on this VCI,
     /// the reading could not be decoded, or it is not an integer. Nothing was changed, so the job
     /// can be resumed once the input can be read (ADR-338, ADR-288).
@@ -213,6 +219,7 @@ impl HostError {
             HostError::Rpc { .. }
             | HostError::WorkerUnresponsive(_)
             | HostError::Setup(_)
+            | HostError::WorkerStart { .. }
             | HostError::VciLost {
                 refused_after_loss: false,
             }
@@ -601,6 +608,9 @@ pub(crate) struct Relink<C: WorkerApi> {
     pub(crate) open: OpenHandles<C>,
     /// Marks the job's guards: the worker may still hold the link (ADR-258).
     pub(crate) mark_unconfirmed: Box<dyn Fn() + Send>,
+    /// Clears the job's guards' mark: the worker's process is gone, so it holds no link
+    /// (ADR-258 item 3, ADR-394).
+    pub(crate) worker_gone: Box<dyn Fn() + Send>,
     /// Whether the link the host holds is still open on the worker.
     pub(crate) old_open: bool,
     /// Whether the path to the VCI is lost now (ADR-393): set when a failure of the run says so
@@ -608,7 +618,17 @@ pub(crate) struct Relink<C: WorkerApi> {
     /// the runner, whose final close then follows the same rule as the host's. A link that
     /// opened again is healthy, so a later failure to close it stays unconfirmed.
     pub(crate) path_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    /// Whether the worker's end was found and no client of a new worker has been given since
+    /// (ADR-394): the process is not asked about again, and the next client written to the log
+    /// is a restart.
+    pub(crate) worker_ended: bool,
+    /// How long a close that got no answer from a worker still reported alive waits for its
+    /// exit to show before the worker is taken as alive (ADR-394).
+    pub(crate) exit_grace: Duration,
 }
+
+/// How often the worker's process is asked about within [`Relink::exit_grace`].
+const EXIT_POLL: Duration = Duration::from_millis(50);
 
 impl<C: WorkerApi> WorkerHost<C> {
     pub fn new(handle: Handle, client: C, link: Link, timings: Timings) -> Self {
@@ -676,15 +696,19 @@ impl<C: WorkerApi> WorkerHost<C> {
         relink
             .path_lost
             .store(true, std::sync::atomic::Ordering::Relaxed);
-        if relink.old_open {
+        // A worker that exited holds no link and answers nothing: it is not asked to close it
+        // (ADR-394).
+        if !self.worker_exited(relink) && relink.old_open {
             // A primitive the loss left is settled first, then the lost link is closed: the
             // worker takes the module again only after it was disconnected. The event stream
             // goes before the link is closed.
+            // The exchange whose primitive was left running, for the worker's exit if it ends.
+            let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
             self.settle_at_end();
             self.link.events = None;
             // The path is lost: a module disconnect that succeeds confirms the link closed even
             // if the link's own disconnect failed (ADR-393).
-            let closed = self.handle.block_on(crate::link::teardown(
+            let (closed, evidence) = self.handle.block_on(crate::link::teardown_observed(
                 &mut self.client,
                 self.link.module_handle,
                 self.link.cll_handle,
@@ -697,19 +721,70 @@ impl<C: WorkerApi> WorkerHost<C> {
                     *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 Err(error) => {
-                    // The worker may still hold the lost link (ADR-258); the runner's own
-                    // close at the end tries again.
-                    tracing::warn!(
-                        error = %crate::oplog::LogSafe::log_text(&error),
-                        "could not close the lost link before opening it again"
-                    );
-                    (relink.mark_unconfirmed)();
-                    return ReopenAttempt::Cannot;
+                    // The close got no answer, or the worker ended while it ran. A worker that
+                    // exited is reaped; one that is alive and does not answer is ended by the
+                    // agent (ADR-394). Either way no process of it holds the link.
+                    let mut status = relink.source.status();
+                    // A process that was killed closes its sockets before it can be reaped, so
+                    // a close that got no answer from a worker still reported alive is asked
+                    // about again for a short while before the worker is given up as alive.
+                    if matches!(status, WorkerStatus::Alive) && evidence.unanswered {
+                        let until = Instant::now() + relink.exit_grace;
+                        while matches!(status, WorkerStatus::Alive) && Instant::now() < until {
+                            std::thread::sleep(EXIT_POLL.min(relink.exit_grace));
+                            status = relink.source.status();
+                        }
+                    }
+                    let ended = match status {
+                        WorkerStatus::Exited(exit) => {
+                            self.worker_ends(relink, exit, in_flight);
+                            true
+                        }
+                        // Any step of the close may be the one that hung: the error is the
+                        // first failure, which a worker's refusal can hide it behind.
+                        WorkerStatus::Alive if evidence.hung => match relink.source.end() {
+                            Ok(exit) => {
+                                self.worker_ends(relink, exit, in_flight);
+                                true
+                            }
+                            Err(end_error) => {
+                                tracing::warn!(
+                                    error = %crate::oplog::LogSafe::log_text(&end_error),
+                                    "could not end the worker that did not answer"
+                                );
+                                false
+                            }
+                        },
+                        _ => false,
+                    };
+                    if !ended {
+                        // The worker may still hold the lost link (ADR-258); the runner's own
+                        // close at the end tries again.
+                        tracing::warn!(
+                            error = %crate::oplog::LogSafe::log_text(&error),
+                            "could not close the lost link before opening it again"
+                        );
+                        (relink.mark_unconfirmed)();
+                        return ReopenAttempt::Cannot;
+                    }
                 }
             }
         }
         let mut client = match relink.source.client() {
             Ok(client) => client,
+            // The system would not create the process, and will not at the next poll.
+            Err(
+                error @ HostError::WorkerStart {
+                    spawn_failed: true, ..
+                },
+            ) => {
+                tracing::warn!(
+                    error = %crate::oplog::LogSafe::log_text(&error),
+                    external = crate::oplog::LogSafe::log_external(&error),
+                    "could not start the worker again"
+                );
+                return ReopenAttempt::Cannot;
+            }
             Err(error) => {
                 tracing::debug!(
                     error = %crate::oplog::LogSafe::log_text(&error),
@@ -718,6 +793,11 @@ impl<C: WorkerApi> WorkerHost<C> {
                 return ReopenAttempt::NotYet;
             }
         };
+        if std::mem::take(&mut relink.worker_ended)
+            && let Some(log) = &self.comm_log
+        {
+            log.worker_restart(relink.source.pid());
+        }
         let opened = self.handle.block_on(crate::link::open_tracked(
             &mut client,
             &relink.config,
@@ -752,6 +832,54 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
             }
         }
+    }
+
+    /// Whether the worker's process has exited since the last time this was asked, and if it has,
+    /// takes the end in ([`WorkerHost::worker_ends`]). A source that does not own the process
+    /// never says so, and neither does one whose worker's end was taken in already, until a
+    /// client of a new worker is given (ADR-394).
+    fn worker_exited(&mut self, relink: &mut Relink<C>) -> bool {
+        if relink.worker_ended {
+            return false;
+        }
+        match relink.source.status() {
+            WorkerStatus::Exited(exit) => {
+                let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
+                self.worker_ends(relink, exit, in_flight);
+                true
+            }
+            WorkerStatus::Alive | WorkerStatus::Unknown => false,
+        }
+    }
+
+    /// Takes in that the worker's process is gone (ADR-394): the log gets its `worker_exit` with
+    /// the exchange that was in flight, the link it held counts as closed, with no close made
+    /// through it, and the guards' mark is cleared, since a process that no longer exists holds
+    /// no link (ADR-258 item 3). The primitive the host was settling is dropped: its end cannot be
+    /// read, and its exchange stays as it was written.
+    fn worker_ends(&mut self, relink: &mut Relink<C>, exit: WorkerExit, in_flight: Option<u64>) {
+        self.stray = None;
+        let in_flight: Vec<u64> = in_flight.into_iter().collect();
+        self.link.events = None;
+        if let Some(log) = &self.comm_log {
+            log.worker_exit(exit, &in_flight);
+        }
+        relink.old_open = false;
+        *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        relink.worker_ended = true;
+        (relink.worker_gone)();
+    }
+
+    /// At the end of a run that ended on a lost path: whether the worker's process has exited,
+    /// which is then taken in ([`WorkerHost::worker_ends`]) so that the final close, which would
+    /// go through a dead worker, is not made and does not mark the guards (ADR-394).
+    pub(crate) fn reap_exited_worker(&mut self) -> bool {
+        let Some(mut relink) = self.relink.take() else {
+            return false;
+        };
+        let exited = self.worker_exited(&mut relink);
+        self.relink = Some(relink);
+        exited
     }
 
     /// Sets how long the host waits at job end for a primitive past its deadline
@@ -1195,11 +1323,11 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.times.vci = (!vci.is_empty()).then_some(vci);
             });
             // The primitive left running belongs to this entry, which its end settles.
-            if let Some(stray) = &mut self.stray
-                && agent_deadline
-                && stray.seq.is_none()
-            {
-                stray.seq = seq;
+            if let Some(stray) = &mut self.stray {
+                if agent_deadline && stray.seq.is_none() {
+                    stray.seq = seq;
+                }
+                stray.exchange = stray.exchange.or(seq);
             }
         }
         sent.result
@@ -1421,6 +1549,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                     negative: progress.negative.clone(),
                 },
                 seq: None,
+                exchange: None,
                 response: progress.response.clone(),
                 response_times: progress.response_times,
                 error: progress.error,
@@ -1757,6 +1886,9 @@ struct Stray {
     /// The `seq` of its exchange's entry, when one was written (design 8.11 `primitive_ended`):
     /// only for an exchange the agent's deadline ended.
     seq: Option<u64>,
+    /// The `seq` of its exchange's entry, when one was written, whatever ended the wait: the
+    /// exchange that was in flight if the worker ends (`worker_exit`, ADR-394).
+    exchange: Option<u64>,
     /// What the wait had read of its end before the deadline: a final response and its times,
     /// and the error events, so its end at job end is read on from there.
     response: Option<Vec<u8>>,
@@ -2287,6 +2419,7 @@ fn host_error_name(error: &HostError) -> &'static str {
     match error {
         HostError::Rpc { .. } => "Rpc",
         HostError::WorkerUnresponsive(_) => "WorkerUnresponsive",
+        HostError::WorkerStart { .. } => "WorkerStart",
         HostError::LinkHeld => "LinkHeld",
         HostError::EventStreamEnded => "EventStreamEnded",
         HostError::NoResponse => "NoResponse",
@@ -2344,6 +2477,9 @@ impl crate::oplog::LogSafe for HostError {
         match self {
             HostError::Rpc { status, .. } if !status.message().is_empty() => {
                 Some(crate::oplog::external(status.message()))
+            }
+            HostError::WorkerStart { reason, .. } if !reason.is_empty() => {
+                Some(crate::oplog::external(reason))
             }
             _ => None,
         }
@@ -4321,6 +4457,7 @@ mod tests {
                     negative: progress.negative.clone(),
                 },
                 seq: Some(1),
+                exchange: Some(1),
                 response: None,
                 response_times: VciTimes::default(),
                 error: None,

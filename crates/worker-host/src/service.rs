@@ -236,6 +236,23 @@ impl WorkerProcess {
         self.child.id()
     }
 
+    /// Whether the worker has exited, without waiting: `Ok(None)` while it runs, and the exit
+    /// status once it has, which reaps the child. A later call gives the same status again.
+    /// `Err` when the system cannot say.
+    pub fn try_wait(&mut self) -> std::io::Result<Option<std::process::ExitStatus>> {
+        self.child.try_wait()
+    }
+
+    /// Ends the worker at once, without asking it to stop, and waits until the child is reaped.
+    /// For a worker that does not answer; the process stays here, exited, so a later
+    /// [`WorkerProcess::stop`] finds it gone. `Err` when the kill or the wait failed, so the
+    /// child's state is unknown.
+    pub async fn kill(&mut self) -> Result<(), ServiceError> {
+        // Tokio's `kill` also waits for the child, so it is reaped when this returns.
+        self.child.kill().await?;
+        Ok(())
+    }
+
     /// Per-instance key for minting bearer tokens for the gRPC listener.
     pub fn auth_key(&self) -> &[u8; 32] {
         &self.auth_key

@@ -3799,6 +3799,96 @@ def main():
         assert_eq!(calls, [(false, false), (true, true)]);
     }
 
+    /// The first variant's program of `main.star` lowered against the example ECU, which declares
+    /// flash session 1, and the plan it holds.
+    fn lowered_example_plan(main: &str) -> (Program, FlashRecovery) {
+        use diag_frontend::convert::lower_procedures;
+        use diag_frontend::tables::{read_files, resolve};
+        let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../diag-frontend/examples/example-ecu");
+        let mut files: Vec<(String, Vec<u8>)> = std::fs::read_dir(&dir)
+            .expect("the example directory")
+            .map(|entry| {
+                let entry = entry.expect("an entry");
+                let name = entry.file_name().into_string().expect("a UTF-8 name");
+                // A Windows checkout may have CRLF line ends.
+                let text = std::fs::read_to_string(entry.path())
+                    .expect("a text file")
+                    .replace("\r\n", "\n");
+                (name, text.into_bytes())
+            })
+            .collect();
+        files.retain(|(name, _)| name != "main.star");
+        files.push(("main.star".to_owned(), main.as_bytes().to_vec()));
+        files.sort();
+        let definition = resolve(read_files(files).expect("reads")).expect("resolves");
+        let procedures = lower_procedures(&definition).expect("lowers");
+        let program: Program = postcard::from_bytes(&procedures[0].programs[0]).expect("a program");
+        program.validate().expect("valid");
+        let [plan] = &program.flash[..] else {
+            panic!("one plan: {program:#?}");
+        };
+        let plan = plan.clone();
+        (program, plan)
+    }
+
+    /// A flash plan of the example ECU's session 1, then the `after` statements in `main`.
+    fn plan_then(after: &str) -> String {
+        format!(
+            "\
+# @section uninterruptible expected=180000
+# @flashPlan session=1
+def write():
+    diag.request(0x10, {{\"sub\": 0x02}})
+    # @erase
+    diag.routine(0xFF00, 0x01, {{}})
+    res = diag.flash_transfer(1)
+
+# @preconditions voltage externalSupply ignition
+def main():
+    write()
+{after}"
+        )
+    }
+
+    /// The pc of the first `ServiceRequest` of `service` after the plan.
+    fn request_after_plan(program: &Program, plan: &FlashRecovery, service: u16) -> u32 {
+        (plan.boundaries.post_transfer_end_pc..program.code.len() as u32)
+            .find(|&pc| matches!(program.code[pc as usize], Op::ServiceRequest { service: s } if s == service))
+            .unwrap_or_else(|| panic!("no request {service:#x} after the plan: {program:#?}"))
+    }
+
+    /// ADR-332 item 1 on the restart's continuation check: a read after a lowered flash plan that
+    /// carries no `@idempotency` is a covered `Safe` primitive, so `unsafe_continuation` passes it.
+    #[test]
+    fn a_lowered_unannotated_read_after_a_plan_is_a_safe_continuation() {
+        let (program, plan) =
+            lowered_example_plan(&plan_then("    diag.request(0x22, {\"did\": 0xF190})\n"));
+        let read = request_after_plan(&program, &plan, 0x22);
+        assert!(safe_to_repeat(&program, read), "{program:#?}");
+        assert_eq!(unsafe_continuation(&program, &plan), None, "{program:#?}");
+    }
+
+    /// A primitive after the plan that is marked `@idempotency unsafe` is the continuation's
+    /// refusal, and the unannotated read before it is not.
+    #[test]
+    fn a_lowered_unsafe_annotated_request_after_a_plan_is_an_unsafe_continuation() {
+        let (program, plan) = lowered_example_plan(&plan_then(
+            "    diag.request(0x22, {\"did\": 0xF190})\n    \
+             # @idempotency unsafe\n    diag.request(0x11, {\"reset\": 1})\n",
+        ));
+        let read = request_after_plan(&program, &plan, 0x22);
+        let reset = request_after_plan(&program, &plan, 0x11);
+        assert!(read < reset);
+        assert!(safe_to_repeat(&program, read), "{program:#?}");
+        assert!(!safe_to_repeat(&program, reset), "{program:#?}");
+        assert_eq!(
+            unsafe_continuation(&program, &plan),
+            Some(reset),
+            "{program:#?}"
+        );
+    }
+
     // ------------------------------------------------ a plain procedure (ADR-335 item 3)
 
     const VIN: &str = "WDB12345678901234";

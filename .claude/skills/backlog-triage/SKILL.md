@@ -28,7 +28,8 @@ the user named, if any.
      (`work/README.md`).
    - **Blocked**: an item lowered only because it waits on something gets
      its real priority back plus a `Blocked on:` clause; a resolved blocker
-     is removed.
+     is removed. An item another item is blocked on goes up to the highest
+     priority of the items it blocks (`work/README.md`, ADR-388).
    - **Vague**: add "Done when" and the paths or sections it concerns.
    - **Keep**: no change.
    Check the code for "Done" with targeted reads; do not mark an item done

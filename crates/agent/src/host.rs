@@ -172,6 +172,11 @@ impl HostError {
     /// Whether the request of the send-receive that failed with this error may have reached the
     /// ECU. `NotSent` only when a refusal before the start proves nothing was sent; every other
     /// error, and any error added later, is `MayHaveReached` until it is judged otherwise.
+    ///
+    /// It judges the errors of a request to the ECU (`service_request`, `send_receive`,
+    /// `routine_control`, `flash_transfer` and the other primitives). An error of another
+    /// step, such as opening the link or reading a runtime input, sent no request whatever this
+    /// says.
     pub fn send_state(&self) -> SendState {
         match self {
             // The agent refused before the start RPC.
@@ -1332,6 +1337,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         error: &HostError,
         caused_by: Option<u64>,
     ) {
+        // The log's `not_sent` and `send_state` are one judgement (ADR-389).
+        debug_assert_eq!(error.send_state(), SendState::NotSent, "{error:?}");
         let end = End::NotSent(refusal_cause(request, error));
         let detail = Detail {
             host_error: Some(host_error_name(error)),
@@ -4990,18 +4997,6 @@ mod tests {
                 error.send_state() == SendState::NotSent,
                 "{error:?}: {end:?}"
             );
-        }
-    }
-
-    /// Everything `log_refused` logs as `not_sent` is `NotSent` by `send_state`, whichever cause
-    /// `refusal_cause` gives it.
-    #[test]
-    fn every_logged_refusal_is_not_sent() {
-        for error in agent_refusals() {
-            for request in [&[][..], &[0x22][..], &[0x36, 0x01][..]] {
-                let _ = refusal_cause(request, &error);
-            }
-            assert_eq!(error.send_state(), SendState::NotSent, "{error:?}");
         }
     }
 }

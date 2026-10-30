@@ -65,5 +65,5 @@ confirmed by the module disconnect and retried once, and the rest of this decisi
 - A VCI that drops again and again is bounded by the reopen limit and by the plain procedure's
   resume limit.
 - A run with no journal re-reads no VIN after a reopen, since it names none.
-- A crashed worker still ends the run until the agent restarts workers within a run (ADR-394).
+- A crashed worker no longer ends the run: the agent starts a new worker within the run (ADR-394).
 - Design 8.11 no longer says that the agent does not reconnect within a run.

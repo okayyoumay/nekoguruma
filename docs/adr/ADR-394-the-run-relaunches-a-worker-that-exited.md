@@ -41,8 +41,9 @@ no longer exists (ADR-258).
    error. When the process starts but does not become ready, or the agent cannot connect to
    it, the attempt is "not yet": the run polls until `vci_return_wait` as it does for a VCI
    that is away.
-5. **The bound is shared.** A start of a worker is one attempt inside a reopen, so it counts
-   against `JobLimits::max_link_reopens` with the reopens a lost VCI causes.
+5. **The bound is shared.** A start of a worker belongs to a reopen, and the reopen counts
+   against `JobLimits::max_link_reopens` with the reopens a lost VCI causes. Several starts
+   within one reopen (a worker that is not ready yet is tried again at each poll) count once.
 6. **A run that ends reaps a dead worker too.** A run that ends after its path was lost, on
    site or in the host error, asks for the worker's exit before it closes its link. A worker
    that exited is reaped there: the log gets its exit, the final close through it is not made,
@@ -67,6 +68,14 @@ reaping at the run's end (2026-10-30).
 - ADR-393 item 2's "a worker that crashed is not restarted" no longer holds; the rest of the
   item stands.
 - A crash and a lost VCI in one run are both counted by `max_link_reopens`, which stays 2.
+- A cancel is taken at each poll, so one start of a worker can delay it by up to the launch's
+  startup timeout plus the connect timeout.
+- A worker's exit is told by its process, which can be reaped a moment after its sockets
+  closed. A close that got no answer from a worker still reported alive therefore asks again
+  for up to one second before the worker is taken as alive; one that is alive and does not
+  answer is then ended, the kill's reap bounded by 5 s.
+- The agent starts a new worker only after it found the exit (or ended the worker) itself, so
+  every exit is in the log; the first client of a run never starts one.
 - A worker the agent cannot tell is alive (a source that cannot say) is closed through, as
   before. A worker that is alive but whose connection fails with a status of its own
   (not a timeout) keeps ADR-258's mark and ends the run.

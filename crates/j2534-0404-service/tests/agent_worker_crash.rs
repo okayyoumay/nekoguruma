@@ -21,8 +21,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use agent::guards::{GuardSetup, JobGuards};
 use agent::launch::{LaunchRecipe, RelaunchingWorker, WorkerSlot};
 use agent::{
-    CommLogSetup, CommLogStatus, Job, JobError, JobLimits, JobRun, LinkConfig, VciFacts,
-    run_program,
+    CommLogSetup, CommLogStatus, HostError, Job, JobError, JobLimits, JobRun, LinkConfig, VciFacts,
+    WorkerSource, WorkerStatus, run_program,
 };
 use diag_ir::{IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, Program, Section, Value};
 use worker_host::client::ConnectOptions;
@@ -308,6 +308,108 @@ fn a_run_starts_a_worker_that_crashed_again() {
 async fn flow(paths: &TempPaths, setup: GuardSetup) {
     safe_reads_go_on(paths, &setup).await;
     unsafe_reads_end_on_site(paths, &setup).await;
+    a_worker_dead_before_the_run_ends_it_in_the_link_error(&setup).await;
+    a_start_the_system_refuses_is_a_spawn_failure().await;
+}
+
+/// Waits until the process in `slot` has exited, which is when its status can be read.
+async fn exited_in(slot: &WorkerSlot) {
+    wait_for("the worker's exit", || {
+        slot.lock()
+            .unwrap()
+            .as_mut()
+            .is_some_and(|process| matches!(process.try_wait(), Ok(Some(_))))
+    })
+    .await;
+}
+
+/// A worker that died before the run asked for its first client: the source does not start a
+/// new one there (it cannot, in async context, and the log would not tell the exit), so the
+/// run ends in the link error with nothing to close, and no panic.
+async fn a_worker_dead_before_the_run_ends_it_in_the_link_error(setup: &GuardSetup) {
+    let (source, slot) = launch_source().await;
+    let pid = slot
+        .lock()
+        .unwrap()
+        .as_ref()
+        .and_then(|p| p.id())
+        .expect("it runs");
+    kill_worker(pid);
+    exited_in(&slot).await;
+    let run = run_program(
+        source,
+        &LinkConfig::iso15765(0x7E0, 0x7E8),
+        Job::from(waiting_program(Idempotency::Safe)),
+        limits(),
+        take_guards(setup),
+    )
+    .await;
+    assert!(
+        matches!(&run.result, Err(JobError::Link(_))),
+        "{:?}",
+        run.result
+    );
+    assert!(!run.guards.link_unconfirmed());
+    drop(run.guards);
+    let process = slot
+        .lock()
+        .unwrap()
+        .take()
+        .expect("the slot holds a worker");
+    assert_eq!(
+        process
+            .stop(Duration::from_secs(5))
+            .await
+            .expect("worker should stop"),
+        Stopped::Exited
+    );
+}
+
+/// A recipe whose binary does not exist: once the worker has exited, the source's start fails
+/// as a start the system refuses, which the run takes as the end of the attempts.
+async fn a_start_the_system_refuses_is_a_spawn_failure() {
+    let good = LaunchRecipe {
+        binary: Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")).to_owned(),
+        kind: ServiceKind::J2534V0404,
+        vci: LIBRARY_NAME.to_owned(),
+        mode: OperatingMode::User,
+        options: launch_options(),
+        connect: ConnectOptions::default(),
+    };
+    let (process, client) = good.launch().await.expect("worker should launch");
+    let pid = process.id().expect("it runs");
+    // The same worker, under a recipe that names no binary.
+    let recipe = LaunchRecipe {
+        binary: PathBuf::from("/nonexistent/j2534-0404-service"),
+        kind: ServiceKind::J2534V0404,
+        vci: LIBRARY_NAME.to_owned(),
+        mode: OperatingMode::User,
+        options: launch_options(),
+        connect: ConnectOptions::default(),
+    };
+    let source = RelaunchingWorker::new(recipe, process, client);
+    let slot = source.slot();
+    kill_worker(pid);
+    exited_in(&slot).await;
+    let (error, process) = tokio::task::spawn_blocking(move || {
+        let mut source = source;
+        assert!(matches!(source.status(), WorkerStatus::Exited(_)));
+        let error = source.client().expect_err("no worker can be started");
+        (error, slot.lock().unwrap().take())
+    })
+    .await
+    .expect("no panic");
+    assert!(
+        matches!(
+            error,
+            HostError::WorkerStart {
+                spawn_failed: true,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+    drop(process);
 }
 
 /// Runs the waiting program, kills the worker during the wait, and returns the run's end, the

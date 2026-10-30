@@ -1188,6 +1188,9 @@ async fn run_checked<C: WorkerApi>(
     Ok(run)
 }
 
+/// How long a close that got no answer waits for a killed worker's exit to show (ADR-394).
+const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
+
 /// The whole job, on the blocking thread: open, run, close.
 #[expect(
     clippy::too_many_arguments,
@@ -1335,6 +1338,7 @@ fn run_job<C: WorkerApi>(
         old_open: true,
         path_lost: Arc::clone(&path_lost),
         worker_ended: false,
+        exit_grace: WORKER_EXIT_GRACE,
     });
     if let Err(error) = refused {
         drop(host);
@@ -20294,6 +20298,8 @@ def main():
         gone: bool,
         pid: u32,
         calls: SourceCalls,
+        /// The nth question about the process (from 1) panics.
+        panic_on_status: Option<usize>,
     }
 
     fn scripted<C: WorkerApi>(
@@ -20311,6 +20317,7 @@ def main():
             gone: false,
             pid: 100,
             calls: Arc::clone(&calls),
+            panic_on_status: None,
         };
         (source, calls)
     }
@@ -20343,6 +20350,9 @@ def main():
 
         fn status(&mut self) -> WorkerStatus {
             self.calls.lock().unwrap().push("status");
+            if self.panic_on_status == Some(asked(&self.calls, "status")) {
+                panic!("the script panics at this question");
+            }
             let status = self.statuses.pop_front().unwrap_or(WorkerStatus::Alive);
             self.gone |= matches!(status, WorkerStatus::Exited(_));
             status
@@ -20665,10 +20675,14 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_worker_that_does_not_answer_the_close_is_ended_and_started_again() {
         use std::sync::atomic::AtomicU32;
-        // (tag, what ending it gives, the attempt, marks, clears, workers started)
+        // (tag, the process's answers, grace, what ending it gives, the attempt, marks, clears,
+        // workers started, questions about the process, asks to end it)
+        let alive = || vec![WorkerStatus::Alive, WorkerStatus::Alive];
         let cases = [
             (
                 "ended",
+                alive(),
+                Duration::ZERO,
                 Ok(WorkerExit {
                     pid: Some(100),
                     how: ExitHow::KilledByAgent,
@@ -20677,17 +20691,59 @@ def main():
                 0,
                 1,
                 1,
+                2,
+                1,
             ),
             (
                 "not-ended",
+                alive(),
+                Duration::ZERO,
                 Err(HostError::Setup("not ended")),
                 ReopenAttempt::Cannot,
                 1,
                 0,
                 0,
+                2,
+                1,
+            ),
+            // A killed process closes its sockets before it can be reaped: the exit shows at
+            // the third question, within the grace, and nobody ends the worker.
+            (
+                "late-exit",
+                vec![
+                    WorkerStatus::Alive,
+                    WorkerStatus::Alive,
+                    exited(ExitHow::Signal(9)),
+                ],
+                Duration::from_secs(5),
+                Err(HostError::Setup("not asked")),
+                ReopenAttempt::Opened,
+                0,
+                1,
+                1,
+                3,
+                0,
+            ),
+            // The exit does not show within the grace: the worker is ended.
+            (
+                "no-exit-in-grace",
+                alive(),
+                Duration::from_millis(50),
+                Ok(WorkerExit {
+                    pid: Some(100),
+                    how: ExitHow::KilledByAgent,
+                }),
+                ReopenAttempt::Opened,
+                0,
+                1,
+                1,
+                3,
+                1,
             ),
         ];
-        for (tag, ending, expected, marks, clears, started) in cases {
+        for (tag, statuses, grace, ending, expected, marks, clears, started, questions, ends) in
+            cases
+        {
             let dir = journal_dir(tag);
             let (first, _) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
             let (second, second_calls) =
@@ -20728,12 +20784,8 @@ def main():
             host.set_comm_log(Some(log));
             let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
             // The process answers alive before the close and after it hung.
-            let (source, asked_of) = scripted(
-                hung.clone(),
-                vec![Ok(Hung(second))],
-                vec![WorkerStatus::Alive, WorkerStatus::Alive],
-                vec![ending],
-            );
+            let (source, asked_of) =
+                scripted(hung.clone(), vec![Ok(Hung(second))], statuses, vec![ending]);
             host.set_relink(Relink {
                 source: Box::new(source),
                 config,
@@ -20757,6 +20809,7 @@ def main():
                 old_open: true,
                 path_lost: Arc::new(AtomicBool::new(false)),
                 worker_ended: false,
+                exit_grace: grace,
             });
             let (attempt, host) = tokio::task::spawn_blocking(move || {
                 let attempt = host.reopen_link();
@@ -20768,8 +20821,8 @@ def main():
             assert_eq!(attempt, expected, "{tag}");
             assert_eq!(counts.0.load(Ordering::Relaxed), marks, "{tag}");
             assert_eq!(counts.1.load(Ordering::Relaxed), clears, "{tag}");
-            assert_eq!(asked(&asked_of, "status"), 2, "{tag}");
-            assert_eq!(asked(&asked_of, "end"), 1, "{tag}");
+            assert_eq!(asked(&asked_of, "status"), questions, "{tag}");
+            assert_eq!(asked(&asked_of, "end"), ends, "{tag}");
             assert_eq!(asked(&asked_of, "launch"), started, "{tag}");
             let connects = second_calls
                 .lock()
@@ -20779,7 +20832,7 @@ def main():
                 .count();
             assert_eq!(connects, started, "{tag}");
             let events = worker_events(&dir);
-            if tag == "ended" {
+            if started == 1 {
                 assert_eq!(
                     events,
                     [
@@ -20792,7 +20845,12 @@ def main():
                 );
                 assert_eq!(
                     of_event(&comm_log_lines(&dir), "worker_exit")[0]["exit"],
-                    serde_json::json!("killed_by_agent")
+                    if tag == "late-exit" {
+                        serde_json::json!({"signal": 9})
+                    } else {
+                        serde_json::json!("killed_by_agent")
+                    },
+                    "{tag}"
                 );
             } else {
                 assert_eq!(events, Vec::<String>::new(), "{tag}");
@@ -21094,5 +21152,114 @@ def main():
             "{calls:?}"
         );
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: a VCI lost under a read, and then the worker's exit: the log tells the loss, the
+    /// exit, the restart and then the new connection, which settles the loss. The crash adds no
+    /// loss record of its own.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_vci_loss_followed_by_a_worker_exit_is_settled_by_the_new_connection() {
+        const LOSE: &[Step] = &[Step::Transmit(1_000), Step::LostVci(2_000)];
+        let dir = journal_dir("loss-then-crash");
+        let (first, first_started) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            false,
+            vec![(When::After(Duration::ZERO), StartEvent::Script(LOSE))],
+        )
+        .await;
+        let (second, _) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            false,
+            vec![(When::After(Duration::ZERO), StartEvent::Respond)],
+        )
+        .await;
+        let (source, asked_of) = scripted(
+            first,
+            vec![Ok(second)],
+            vec![exited(ExitHow::Code(1))],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            Some(&dir),
+            after_loss_limits(),
+            "loss-then-crash",
+        )
+        .await;
+        run.result.expect("the run goes on");
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        assert_eq!(closes(&first_started.calls), Vec::<&str>::new());
+        assert_eq!(asked(&asked_of, "launch"), 1);
+        assert_eq!(
+            worker_events(&dir),
+            [
+                "vci_connected",
+                "link_opened",
+                "vci_loss",
+                "worker_exit",
+                "worker_restart",
+                "vci_connected",
+                "vci_loss_settled",
+                "link_opened"
+            ]
+        );
+        let lines = comm_log_lines(&dir);
+        assert_eq!(of_event(&lines, "vci_loss_settled").len(), 1);
+        assert_eq!(
+            of_event(&lines, "worker_exit")[0]["exit"],
+            serde_json::json!({"code": 1})
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: a panic after a worker was started again closes the link on the new worker, the
+    /// one that holds it, and leaves the guards unmarked.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_panic_after_a_restart_closes_the_link_on_the_new_worker() {
+        let (first, first_calls) =
+            fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        let (second, second_calls) =
+            fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        let (mut source, _) = scripted(
+            first,
+            vec![Ok(second)],
+            vec![exited(ExitHow::Signal(9))],
+            Vec::new(),
+        );
+        // The first question restarts the worker; the new worker fails the read again, and the
+        // second question, at the next reopen, panics.
+        source.panic_on_status = Some(2);
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            None,
+            JobLimits {
+                max_primitive_repeats: 5,
+                ..after_loss_limits()
+            },
+            "panic-after-restart",
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::Panicked)),
+            "{:?}",
+            run.result
+        );
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(closes(&first_calls), Vec::<&str>::new());
+        assert_eq!(
+            closes(&second_calls),
+            [
+                "DisconnectComLogicalLink",
+                "DestroyComLogicalLink",
+                "ModuleDisconnect"
+            ]
+        );
     }
 }

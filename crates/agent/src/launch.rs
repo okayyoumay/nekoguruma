@@ -16,6 +16,7 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use j2534_0404_registry::RegistryViewMode;
 use ngr_library_resolver::{RegistryView, iso22900, j2534_0404};
@@ -250,7 +251,14 @@ pub struct RelaunchingWorker {
     client: WorkerClient,
     /// The current process's ID, which the process no longer gives once it was reaped.
     pid: Option<u32>,
+    /// The run found the process exited, or ended it ([`WorkerSource::status`],
+    /// [`WorkerSource::end`]), and no worker was started since: the next client is a new worker's.
+    /// A process the run was never told about is not started again, so the log tells every exit.
+    gone: bool,
 }
+
+/// How long [`WorkerSource::end`] waits for a worker it killed to be reaped.
+const END_GRACE: Duration = Duration::from_secs(5);
 
 impl RelaunchingWorker {
     /// Takes `process` started by `recipe`, with its `client`. Must be called inside the runtime
@@ -262,6 +270,7 @@ impl RelaunchingWorker {
             pid: process.id(),
             slot: Arc::new(Mutex::new(Some(process))),
             client,
+            gone: false,
         }
     }
 
@@ -279,12 +288,10 @@ impl WorkerSource for RelaunchingWorker {
     type Client = WorkerClient;
 
     fn client(&mut self) -> Result<WorkerClient, HostError> {
-        // The worker that runs carries the link; the system failing to say is taken as running.
-        let gone = self
-            .lock()
-            .as_mut()
-            .is_none_or(|process| matches!(process.try_wait(), Ok(Some(_))));
-        if !gone {
+        // Only an exit the run was told about is followed by a new worker. Until then the client
+        // is the current worker's, whose calls fail as a lost path if its process is gone; the
+        // first client of a run, asked for in async context, never launches.
+        if !self.gone {
             return Ok(self.client.clone());
         }
         match self.handle.block_on(self.recipe.launch()) {
@@ -293,6 +300,7 @@ impl WorkerSource for RelaunchingWorker {
                 // The gone process is dropped here, already reaped.
                 *self.lock() = Some(process);
                 self.client = client.clone();
+                self.gone = false;
                 Ok(client)
             }
             Err(error) => Err(HostError::WorkerStart {
@@ -304,29 +312,44 @@ impl WorkerSource for RelaunchingWorker {
 
     fn status(&mut self) -> WorkerStatus {
         let pid = self.pid;
-        let mut slot = self.lock();
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         let Some(process) = slot.as_mut() else {
             return WorkerStatus::Unknown;
         };
         match process.try_wait() {
             Ok(None) => WorkerStatus::Alive,
-            Ok(Some(status)) => WorkerStatus::Exited(WorkerExit {
-                pid,
-                how: ExitHow::of(status),
-            }),
+            Ok(Some(status)) => {
+                self.gone = true;
+                WorkerStatus::Exited(WorkerExit {
+                    pid,
+                    how: ExitHow::of(status),
+                })
+            }
             Err(_) => WorkerStatus::Unknown,
         }
     }
 
     fn end(&mut self) -> Result<WorkerExit, HostError> {
         let pid = self.pid;
-        let mut slot = self.lock();
+        let mut slot = self.slot.lock().unwrap_or_else(|e| e.into_inner());
         let Some(process) = slot.as_mut() else {
             return Err(HostError::Setup("the source holds no worker process"));
         };
-        self.handle
-            .block_on(process.kill())
-            .map_err(|_| HostError::Setup("the worker could not be ended"))?;
+        // A worker that exited on its own is reported with its own end.
+        if let Ok(Some(status)) = process.try_wait() {
+            self.gone = true;
+            return Ok(WorkerExit {
+                pid,
+                how: ExitHow::of(status),
+            });
+        }
+        let killed = self
+            .handle
+            .block_on(tokio::time::timeout(END_GRACE, process.kill()));
+        if !matches!(killed, Ok(Ok(()))) {
+            return Err(HostError::Setup("the worker could not be ended"));
+        }
+        self.gone = true;
         Ok(WorkerExit {
             pid,
             how: ExitHow::KilledByAgent,

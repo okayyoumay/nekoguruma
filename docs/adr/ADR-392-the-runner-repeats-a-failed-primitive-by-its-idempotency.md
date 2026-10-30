@@ -70,5 +70,6 @@ the rest of this decision (2026-10-30).
 - A request marker withdrawn at the first primitive of a recovery-required section leaves the
   section's intent behind, so a resume still ends in on-site intervention for the section,
   although nothing in it was sent. That errs toward the safe side.
-- A worker crash or a lost VCI still ends the run, and the VM state is resumed only through the
-  journal (ADR-393 continues within the run after a lost VCI, ADR-394 after a worker crash).
+- A worker crash or a lost VCI continues within the run where ADR-393 (a lost VCI) and ADR-394
+  (a worker crash) allow it; where they do not, the run ends and the VM state is resumed only
+  through the journal.

@@ -622,7 +622,13 @@ pub(crate) struct Relink<C: WorkerApi> {
     /// (ADR-394): the process is not asked about again, and the next client written to the log
     /// is a restart.
     pub(crate) worker_ended: bool,
+    /// How long a close that got no answer from a worker still reported alive waits for its
+    /// exit to show before the worker is taken as alive (ADR-394).
+    pub(crate) exit_grace: Duration,
 }
+
+/// How often the worker's process is asked about within [`Relink::exit_grace`].
+const EXIT_POLL: Duration = Duration::from_millis(50);
 
 impl<C: WorkerApi> WorkerHost<C> {
     pub fn new(handle: Handle, client: C, link: Link, timings: Timings) -> Self {
@@ -696,6 +702,8 @@ impl<C: WorkerApi> WorkerHost<C> {
             // A primitive the loss left is settled first, then the lost link is closed: the
             // worker takes the module again only after it was disconnected. The event stream
             // goes before the link is closed.
+            // The exchange whose primitive was left running, for the worker's exit if it ends.
+            let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
             self.settle_at_end();
             self.link.events = None;
             // The path is lost: a module disconnect that succeeds confirms the link closed even
@@ -716,9 +724,22 @@ impl<C: WorkerApi> WorkerHost<C> {
                     // The close got no answer, or the worker ended while it ran. A worker that
                     // exited is reaped; one that is alive and does not answer is ended by the
                     // agent (ADR-394). Either way no process of it holds the link.
-                    let ended = match relink.source.status() {
+                    let mut status = relink.source.status();
+                    // A process that was killed closes its sockets before it can be reaped, so
+                    // a close that got no answer from a worker still reported alive is asked
+                    // about again for a short while before the worker is given up as alive.
+                    if matches!(status, WorkerStatus::Alive)
+                        && !crate::link::is_workers_answer(&error)
+                    {
+                        let until = Instant::now() + relink.exit_grace;
+                        while matches!(status, WorkerStatus::Alive) && Instant::now() < until {
+                            std::thread::sleep(EXIT_POLL.min(relink.exit_grace));
+                            status = relink.source.status();
+                        }
+                    }
+                    let ended = match status {
                         WorkerStatus::Exited(exit) => {
-                            self.worker_ends(relink, exit);
+                            self.worker_ends(relink, exit, in_flight);
                             true
                         }
                         WorkerStatus::Alive
@@ -726,7 +747,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                         {
                             match relink.source.end() {
                                 Ok(exit) => {
-                                    self.worker_ends(relink, exit);
+                                    self.worker_ends(relink, exit, in_flight);
                                     true
                                 }
                                 Err(end_error) => {
@@ -827,7 +848,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         }
         match relink.source.status() {
             WorkerStatus::Exited(exit) => {
-                self.worker_ends(relink, exit);
+                let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
+                self.worker_ends(relink, exit, in_flight);
                 true
             }
             WorkerStatus::Alive | WorkerStatus::Unknown => false,
@@ -839,13 +861,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// through it, and the guards' mark is cleared, since a process that no longer exists holds
     /// no link (ADR-258 item 3). The primitive the host was settling is dropped: its end cannot be
     /// read, and its exchange stays as it was written.
-    fn worker_ends(&mut self, relink: &mut Relink<C>, exit: WorkerExit) {
-        let in_flight: Vec<u64> = self
-            .stray
-            .take()
-            .and_then(|stray| stray.exchange)
-            .into_iter()
-            .collect();
+    fn worker_ends(&mut self, relink: &mut Relink<C>, exit: WorkerExit, in_flight: Option<u64>) {
+        self.stray = None;
+        let in_flight: Vec<u64> = in_flight.into_iter().collect();
         self.link.events = None;
         if let Some(log) = &self.comm_log {
             log.worker_exit(exit, &in_flight);

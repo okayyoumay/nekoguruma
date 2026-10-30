@@ -806,8 +806,14 @@ again only after a client of a new worker was given):
   `HostError::WorkerStart { spawn_failed: true }` and gives `Cannot` (the log has the exit and no
   restart; the run ends in the original host error). Any other failure to start or to connect
   (`spawn_failed: false`) gives `NotYet`: the poll starts again until `vci_return_wait`.
-- A start of a worker is one attempt inside the reopen, so it counts against
-  `JobLimits::max_link_reopens` with the reopens of a lost VCI.
+- The reopen a start belongs to counts against `JobLimits::max_link_reopens` with the reopens
+  of a lost VCI; several starts within one reopen (tried again at each poll) count once.
+- A close that got no answer from a worker still reported alive asks `status` again every
+  50 ms for up to `Relink::exit_grace` (1 s), since a killed process closes its sockets before
+  it can be reaped; `end` kills a worker still alive after that, waiting at most 5 s for the
+  reap, and reports the worker's own exit when it had exited on its own. The source starts a
+  new worker only after `status` or `end` recorded the exit, never at the run's first client.
+- One start can delay a cancel by up to the launch's startup and connect timeouts.
 
 At the run's end, when the run's path was lost (`path_lost`, whatever ending followed),
 `run_job` asks `WorkerHost::reap_exited_worker` before it settles the stray primitive and closes

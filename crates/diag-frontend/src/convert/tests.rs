@@ -5,6 +5,7 @@ use diag_ir::declaration::{EcuDocumentT, load_ecu_document};
 use super::*;
 use crate::tables::{read_directory, read_files, resolve};
 
+mod dry_run;
 mod dtcs_and_flash;
 mod flash_plan;
 mod idempotency;
@@ -1009,10 +1010,11 @@ fn each_dtc_record_reads_its_code_and_status() {
 /// The records and a record keep their type through a function's argument and result.
 #[test]
 fn dtc_records_pass_through_functions() {
+    // Guarded by the length: the conversion's dry run builds an answer with no records (ADR-391).
     let source = "def first(d):\n    return d[0]\n\ndef records():\n    \
                   return diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n\ndef main():\n    \
-                  dtc = first(records())\n    if dtc[\"code\"] == 0x123456:\n        \
-                  diag.log(1, \"first\")\n";
+                  rs = records()\n    if len(rs) > 0:\n        dtc = first(rs)\n        \
+                  if dtc[\"code\"] == 0x123456:\n            diag.log(1, \"first\")\n";
     assert_eq!(
         answered(source, &[&[0x59, 0x02, 0xFF, 0x12, 0x34, 0x56, 0x09]]).unwrap(),
         ["first"]
@@ -1024,7 +1026,8 @@ fn a_dtc_index_outside_the_records_stops_the_run() {
     let at = |index: &str| {
         format!(
             "def main():\n    dtcs = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n    \
-             if dtcs[{index}][\"status\"] == 9:\n        diag.log(1, \"read\")\n"
+             if len(dtcs) > 0 and dtcs[{index}][\"status\"] == 9:\n        \
+             diag.log(1, \"read\")\n"
         )
     };
     let two: &[u8] = &[
@@ -1042,10 +1045,17 @@ fn dtc_records_are_checked_at_ingestion() {
     let codes = |body: &str| -> Vec<crate::star::StarCode> {
         let source =
             format!("def main():\n    dtcs = diag.read_dtc(8)[\"fields\"][\"dtcs\"]\n{body}");
+        // The records indexed here are none in the conversion's dry run (ADR-391), whose
+        // refusal is not what this test is about.
         procedures(with(example(), "main.star", &source))
             .err()
             .map_or_else(Vec::new, |rejected| {
-                rejected.errors.iter().map(|e| e.code).collect()
+                rejected
+                    .errors
+                    .iter()
+                    .map(|e| e.code)
+                    .filter(|code| *code != crate::star::StarCode::DryRunStopped)
+                    .collect()
             })
     };
     use crate::star::StarCode::*;

@@ -50,6 +50,16 @@ pub const PROFILE_KEY_REQUEST: &str = "profile:security_access_key";
 /// the ECU is already unlocked.
 const BUILT_SEED: [u8; 4] = [1, 2, 3, 4];
 
+/// Every [`RuntimeInput`]; [`Script::built_defaults`] gives each a value, and its `match` fails to
+/// compile when a new input is added without one.
+const ALL_INPUTS: [RuntimeInput; 5] = [
+    RuntimeInput::SupplyVoltageMillivolts,
+    RuntimeInput::ExternalSupplyConnected,
+    RuntimeInput::IgnitionOn,
+    RuntimeInput::EngineRunning,
+    RuntimeInput::VehicleSpeedKmh,
+];
+
 /// The answers a dry run gives. Each list is answered in order, and its last answer again once
 /// the list is used up, so a procedure that polls gets a steady answer.
 ///
@@ -69,6 +79,30 @@ pub struct Script {
 impl Script {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    /// The script for a run on answers built from the declarations alone, as the conversion
+    /// dry-runs a procedure (ADR-391): a key of four zero bytes, the empty positive answer to
+    /// every HMI form and record template, and 0 for every [`RuntimeInput`]. Nothing is scripted
+    /// for a service, so each request is answered from its declaration. Like the zero answers of
+    /// ADR-328 item 3, the values are placeholders that make no claim about a vehicle.
+    pub fn built_defaults() -> Self {
+        let script = Self::new()
+            .key([0u8; 4])
+            .form(hmi::answered(""))
+            .record(hmi::answered(""));
+        // Exhaustive, so a new input must be given its value here.
+        let inputs = |input: RuntimeInput| match input {
+            RuntimeInput::SupplyVoltageMillivolts
+            | RuntimeInput::ExternalSupplyConnected
+            | RuntimeInput::IgnitionOn
+            | RuntimeInput::EngineRunning
+            | RuntimeInput::VehicleSpeedKmh => (input, 0),
+        };
+        Self {
+            inputs: ALL_INPUTS.into_iter().map(inputs).collect(),
+            ..script
+        }
     }
 
     /// Adds a whole response, starting with its SID, to the answers to the service named
@@ -285,6 +319,10 @@ pub struct DryRunReport {
     pub end: DryRunEnd,
     /// Instructions executed.
     pub steps: u64,
+    /// The pc the run ended at. The VM leaves it on the instruction that failed or stopped the
+    /// run, so it locates the end in the source through [`Program::source_map`]; 0 when the
+    /// program was refused before it ran.
+    pub pc: u32,
 }
 
 /// Runs `program` on `variant` with vehicle access mocked by `script`, for at most `max_steps`
@@ -310,6 +348,7 @@ pub fn dry_run(
             events: Vec::new(),
             end: DryRunEnd::Invalid(error),
             steps: 0,
+            pc: 0,
         };
     }
     let mut vm = Vm::new(program);
@@ -335,6 +374,7 @@ pub fn dry_run(
         events: host.events,
         end,
         steps: vm.state.steps,
+        pc: vm.state.pc,
     }
 }
 

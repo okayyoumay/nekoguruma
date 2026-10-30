@@ -64,7 +64,10 @@ def main():
     confirm = diag.hmi("confirm_session", {"title": "Confirm the session", "session": session["fields"]["session"]})
     if not confirm["ok"]:
         diag.fail("OPERATOR_DECLINED", "the operator did not confirm the session")
-    frame = write_uint(b"\x00\x00\x00", session["fields"]["session"] - 3, 16, 0x1234)
+    offset = session["fields"]["session"] - 3
+    if offset < 0:
+        offset = 0
+    frame = write_uint(b"\x00\x00\x00", offset, 16, 0x1234)
     if read_uint(frame, 0, 16) == 0x1234:
         diag.log(1, "uint round trip")
     diag.request(0x19, {"sub": 0x02, "statusMask": session["fields"]["session"] + 6})

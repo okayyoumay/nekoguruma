@@ -20,11 +20,12 @@ mod services;
 use std::collections::HashMap;
 use std::fmt::Write as _;
 
-use diag_ir::IR_SCHEMA_VERSION;
 use diag_ir::declaration::{
     ComParamT, EcuDocumentT, EcuVariant, EcuVariantT, NegativeShapeT, ProtocolT,
     encode_ecu_document, load_ecu_document,
 };
+use diag_ir::dry_run::{DryRunEnd, DryRunEvent, DryRunReport, Script, dry_run};
+use diag_ir::{DEFAULT_MAX_STEPS, IR_SCHEMA_VERSION, Program, VmError};
 use sha2::{Digest, Sha256};
 
 use crate::star::{self, RequestIndex, StarError};
@@ -126,6 +127,8 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
                 continue;
             }
         };
+        // Lowering needs the source to be UTF-8, so nothing is replaced here.
+        let text = String::from_utf8_lossy(source);
         let mut programs = Vec::with_capacity(variants.len());
         let mut file_errors = Vec::new();
         let mut file_warnings = Vec::new();
@@ -133,6 +136,14 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
             let name = *name;
             match star::lower(file, &checked, *variant, requests) {
                 Ok(lowered) => {
+                    let script = Script::built_defaults();
+                    let report = dry_run(&lowered.program, variant, &script, DEFAULT_MAX_STEPS);
+                    if let Err(error) =
+                        dry_run_verdict(file, &text, &lowered.program, variant, &report)
+                    {
+                        file_errors.push((name, vec![error]));
+                        continue;
+                    }
                     programs.push(
                         postcard::to_allocvec(&lowered.program)
                             .expect("a program serializes into memory"),
@@ -162,6 +173,73 @@ pub fn lower_procedures(definition: &Definition) -> Result<Vec<Procedure>, Proce
             warnings: procedures.into_iter().flat_map(|p| p.warnings).collect(),
         })
     }
+}
+
+/// Whether the dry run of a lowered procedure on built answers (`report`) ended in a way the
+/// conversion accepts (ADR-391); the one place that decides. It accepts the procedure's own end
+/// (`Finished`), every `Failed` (the author's `diag.fail` and the lowering's own failures, such
+/// as a loop past its limit), and an `Undecodable` response that was built from the declaration
+/// of the service named, since the answer built from a declaration need not decode into the
+/// shape a procedure's later reads expect. Everything else is refused as `STAR_DRY_RUN_STOPPED`
+/// at the source of the instruction the run stopped on (`report.pc`); a new `VmError` or
+/// `DryRunError` variant is refused until this function is told otherwise.
+fn dry_run_verdict(
+    file: &str,
+    source: &str,
+    program: &Program,
+    variant: &EcuVariant<'_>,
+    report: &DryRunReport,
+) -> Result<(), StarError> {
+    let reason = match &report.end {
+        DryRunEnd::Finished | DryRunEnd::Failed(_) => return Ok(()),
+        DryRunEnd::Vm(VmError::Undecodable { service })
+            if built_answer_undecodable(variant, report, *service) =>
+        {
+            return Ok(());
+        }
+        DryRunEnd::Vm(error) => error.to_string(),
+        DryRunEnd::Host(error) => error.to_string(),
+        DryRunEnd::Invalid(error) => error.to_string(),
+        DryRunEnd::Waiting(on) => {
+            format!("the procedure waits on {on:?} although the host answers")
+        }
+        DryRunEnd::StepLimit => {
+            format!("did not end within {DEFAULT_MAX_STEPS} instructions")
+        }
+    };
+    // The entry covering `pc` is the last one at or before it.
+    let at = program
+        .source_map
+        .iter()
+        .take_while(|span| span.pc <= report.pc)
+        .last();
+    let (line, column) = at.map_or((1, 1), |span| (span.line, span.column));
+    Err(star::at_position(
+        star::StarCode::DryRunStopped,
+        file,
+        source,
+        line,
+        column,
+        format!("the dry run on answers built from the declarations stopped: {reason}"),
+    ))
+}
+
+/// Whether the report holds a built answer to service `service` (by id) that did not decode.
+fn built_answer_undecodable(variant: &EcuVariant<'_>, report: &DryRunReport, service: u32) -> bool {
+    let Some(name) = variant
+        .services()
+        .and_then(|services| services.iter().find(|s| s.id() == service))
+        .and_then(|s| s.short_name())
+    else {
+        return false;
+    };
+    report.events.iter().any(|event| {
+        matches!(
+            event,
+            DryRunEvent::Request { service: s, built: true, decoded: Some(Err(_)), .. }
+                if s == name
+        )
+    })
 }
 
 /// The errors or warnings that lowering one file for each of `variants` variants gave, by the

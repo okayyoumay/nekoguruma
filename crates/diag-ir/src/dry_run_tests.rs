@@ -1092,3 +1092,34 @@ fn a_decoded_form_is_charged_what_it_holds() {
         1 + size_of::<(String, HmiValue)>() + 1 + 1000
     );
 }
+
+// ---------------------------------------------------------------- Built defaults (ADR-391)
+
+#[test]
+fn the_built_defaults_answer_with_zeros_and_empty_positive_answers() {
+    let script = Script::built_defaults();
+    assert_eq!(script.keys, [vec![0u8; 4]]);
+    assert_eq!(script.forms, [hmi::answered("")]);
+    assert_eq!(script.records, [hmi::answered("")]);
+    assert!(script.responses.is_empty() && script.seeds.is_empty());
+    // Every input has the value 0, once.
+    assert_eq!(script.inputs.len(), ALL_INPUTS.len());
+    for input in ALL_INPUTS {
+        assert!(script.inputs.contains(&(input, 0)), "{input:?}");
+    }
+}
+
+#[test]
+fn a_run_on_the_built_defaults_reads_every_input() {
+    let buf = document(Vec::new(), Vec::new());
+    let code = ALL_INPUTS
+        .into_iter()
+        .map(|input| Op::ReadInput { input })
+        .collect::<Vec<_>>();
+    let steps = code.len() as u64;
+    let report = run(&buf, &program(code, Vec::new()), &Script::built_defaults());
+    assert_eq!(report.end, DryRunEnd::Finished);
+    assert_eq!(report.steps, steps);
+    // The run ended on the instruction after the last (the pc of the finish).
+    assert_eq!(u64::from(report.pc), steps);
+}

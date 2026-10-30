@@ -58,6 +58,11 @@ use crate::declaration::{EcuVariant, Shape};
 /// definition names (ADR-363); a document of version 19 has none.
 pub const IR_SCHEMA_VERSION: u32 = 20;
 
+/// The step budget of one run of a procedure, shared by the agent's default job limit and the
+/// conversion's dry run (ADR-391), so a procedure the conversion accepts does not run out of
+/// steps on a vehicle that answers the same way.
+pub const DEFAULT_MAX_STEPS: u64 = 1_000_000;
+
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
 

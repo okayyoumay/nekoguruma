@@ -220,6 +220,11 @@ pub enum StarCode {
     /// the default limit applies (4.2).
     #[serde(rename = "STAR_LOOP_LIMIT_DEFAULTED")]
     LoopLimitDefaulted,
+    /// The conversion's dry run of a lowered procedure, on answers built from the declarations,
+    /// stopped for a reason other than the procedure's own end, at the instruction's source
+    /// (6, ADR-391).
+    #[serde(rename = "STAR_DRY_RUN_STOPPED")]
+    DryRunStopped,
 }
 
 impl StarCode {
@@ -254,6 +259,7 @@ impl StarCode {
             Self::NotInProfile => "STAR_NOT_IN_PROFILE",
             Self::SecretInText => "STAR_SECRET_IN_TEXT",
             Self::LoopLimitDefaulted => "STAR_LOOP_LIMIT_DEFAULTED",
+            Self::DryRunStopped => "STAR_DRY_RUN_STOPPED",
         }
     }
 }
@@ -628,6 +634,37 @@ fn located(code: StarCode, file: &str, source: &str, at: usize, hint: String) ->
         snippet: snippet(text, at - line_start),
         hint,
     }
+}
+
+/// An error at the 1-based `line` and `column` (in characters) of `source`, the position the
+/// source map of a lowered program gives. A position past the source is clamped to its end.
+pub(crate) fn at_position(
+    code: StarCode,
+    file: &str,
+    source: &str,
+    line: u32,
+    column: u32,
+    hint: String,
+) -> StarError {
+    let mut start = 0;
+    for _ in 1..line {
+        match source[start..].find('\n') {
+            Some(n) => start += n + 1,
+            None => {
+                start = source.len();
+                break;
+            }
+        }
+    }
+    let line_end = source[start..]
+        .find('\n')
+        .map_or(source.len(), |n| start + n);
+    let text = &source[start..line_end];
+    let offset = text
+        .char_indices()
+        .nth(column.saturating_sub(1) as usize)
+        .map_or(text.len(), |(at, _)| at);
+    located(code, file, source, start + offset, hint)
 }
 
 /// The one error of a file that does not parse. `while` is a reserved word that the parser

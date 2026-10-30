@@ -1,7 +1,7 @@
 # ADR-358: The Job-End Wait Is the Link's Worst Case for a Response
 
 **Date:** 2026-10-26
-**Status:** Accepted
+**Status:** Accepted (item 5's items read but not logged now logged, ADR-386)
 **Affects:** `agent` link (`link.rs` `LinkConfig::job_end_wait`), host (`host.rs`
 `WorkerHost::settle_at_end`, `ends_primitive`), runner (the job's end, before the link
 closes), `crates/agent/docs/ngr-agent.md`; design 8.11 ("Settlement")

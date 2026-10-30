@@ -1,7 +1,7 @@
 # ADR-372: A Late Link Error Settles the Exchanges It May Have Come During
 
 **Date:** 2026-10-28
-**Status:** Accepted (item 2's exchange with only end-side times, and item 3's late answer counted after an error and window left unreclassified by an error before it, revised by ADR-384; item 2's answer of an exchange taken as after the error, and item 3's recount by position, revised by ADR-385)
+**Status:** Accepted (item 2's exchange with only end-side times, and item 3's late answer counted after an error and window left unreclassified by an error before it, revised by ADR-384; item 2's answer of an exchange taken as after the error, and item 3's recount by position, revised by ADR-385; the Consequences' job-end gap closed by ADR-386)
 **Affects:** `agent` communication log (`comm_log.rs` `CommLog::exchange_with`,
 `Inner::late_link_error`, `Inner::read_since`, `Inner::note_reads`, `Settled::after_link_error`;
 `comm_log/exchange.rs` `ErrorPoint`, `LinkState::place_error`, `LinkState::written_since`,
@@ -93,9 +93,8 @@ for a late reset.
   `seq` with it (`UnattachedItem.owner`), and the log takes it as a fault seen in that exchange
   on its own link (the maintainer's decision, 2026-10-27), while it still holds that exchange in
   its window or kept beyond it; one whose exchange has left both is placed by its time. This
-  came in a later change than the rest of this ADR. At job end the host still does not pass the
-  link errors of no primitive, or of an earlier primitive, to the log. That work is left to a
-  later change.
+  came in a later change than the rest of this ADR. At job end the host passes the link errors
+  of no primitive, and of an earlier primitive, since ADR-386.
 - An exchange with no VCI time on the error's clock is taken as after it, so it may lose matched
   answers from before an error that came after it. A target whose exchanges share no clock with
   the error is taken the same way. Both err towards `undetermined`.

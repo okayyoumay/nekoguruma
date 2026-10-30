@@ -14401,6 +14401,42 @@ def main():
         released: Arc<tokio::sync::Semaphore>,
         /// The sender of the link's event stream, once subscribed.
         events: Arc<Mutex<Option<EventSender>>>,
+        /// The items it gives name the device clock (`timestamp_clock`), as a J2534 worker's
+        /// frames do (ADR-353); otherwise they name none.
+        device_clock: bool,
+    }
+
+    /// How a scripted item of a [`FakeWorker`] is bound (design 8.11 "Link settings for the
+    /// log").
+    #[derive(Clone, Copy)]
+    enum Bound {
+        /// To the started primitive.
+        Own,
+        /// To no primitive.
+        None,
+        /// To an earlier primitive.
+        Earlier,
+    }
+
+    /// One step of a [`StartEvent::Script`]. Every item takes its VCI time in microseconds.
+    #[derive(Clone, Copy)]
+    enum Step {
+        /// Waits for the test's release, which comes after the agent's deadline.
+        Release,
+        /// A receive error with the binding.
+        Error(Bound, u32),
+        /// A transmit indication bound to the primitive.
+        Transmit(u32),
+        /// A positive response to `22 F1 90`, with the transmit done time its item carries.
+        Respond(u32, Option<u32>),
+        /// A pending (`7F 22 78`) bound to the primitive.
+        Pending(u32),
+        /// A receive timeout bound to the primitive.
+        TimeOut(u32),
+        /// The primitive's finished status.
+        Finish,
+        /// The worker reports the VCI lost: an error of no primitive.
+        LostVci(u32),
     }
 
     /// When a [`FakeWorker`] gives a start's event.
@@ -14444,6 +14480,9 @@ def main():
         /// The receive error of [`StartEvent::FailThenFinishLater`], and no finished status: the
         /// primitive runs until the agent cancels it.
         FailNeverFinish,
+        /// The items in order: a no-primitive or earlier-primitive error before or after the
+        /// response, and so on.
+        Script(&'static [Step]),
     }
 
     /// How a [`FakeWorker`] answers CancelComPrimitive.
@@ -14681,6 +14720,7 @@ def main():
                 let sender = self.events.lock().unwrap().clone();
                 let (released, cancelled) =
                     (Arc::clone(&self.released), Arc::clone(&self.cancelled));
+                let device_clock = self.device_clock;
                 tokio::spawn(async move {
                     match when {
                         When::After(after) => tokio::time::sleep(after).await,
@@ -14692,6 +14732,102 @@ def main():
                         cll_handle: 1,
                         cop_handle,
                     };
+                    if let StartEvent::Script(steps) = event {
+                        use vci_service_interface::event_item::Data;
+                        let clock = if device_clock {
+                            vci_service_interface::TimestampClock::Device
+                        } else {
+                            vci_service_interface::TimestampClock::Unspecified
+                        };
+                        for step in steps {
+                            let error = |event| {
+                                Data::ErrorData(vci_service_interface::ErrorData {
+                                    error_event: event as i32,
+                                    ..Default::default()
+                                })
+                            };
+                            let (bound, at, data) = match *step {
+                                Step::Release => {
+                                    released.acquire().await.unwrap().forget();
+                                    continue;
+                                }
+                                Step::Error(bound, at) => (
+                                    bound,
+                                    at,
+                                    error(vci_service_interface::PduErrorEvent::PduErrEvtRxError),
+                                ),
+                                Step::TimeOut(at) => (
+                                    Bound::Own,
+                                    at,
+                                    error(vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout),
+                                ),
+                                Step::Transmit(at) => (
+                                    Bound::Own,
+                                    at,
+                                    Data::ResultData(vci_service_interface::ResultData {
+                                        rx_flag: vec![0, 0, 0, 0x08],
+                                        data_bytes: vec![0x22, 0xF1, 0x90],
+                                        ..Default::default()
+                                    }),
+                                ),
+                                Step::Respond(at, tx_done) => (
+                                    Bound::Own,
+                                    at,
+                                    Data::ResultData(vci_service_interface::ResultData {
+                                        data_bytes: vec![0x62, 0xF1, 0x90, 0x41],
+                                        tx_msg_done_timestamp: tx_done,
+                                        ..Default::default()
+                                    }),
+                                ),
+                                Step::Pending(at) => (
+                                    Bound::Own,
+                                    at,
+                                    Data::ResultData(vci_service_interface::ResultData {
+                                        data_bytes: vec![0x7F, 0x22, 0x78],
+                                        ..Default::default()
+                                    }),
+                                ),
+                                Step::LostVci(at) => (
+                                    Bound::None,
+                                    at,
+                                    error(
+                                        vci_service_interface::PduErrorEvent::PduErrEvtLostCommToVci,
+                                    ),
+                                ),
+                                Step::Finish => (
+                                    Bound::Own,
+                                    0,
+                                    Data::CopStatus(
+                                        vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
+                                            as i32,
+                                    ),
+                                ),
+                            };
+                            let cop_handle = match bound {
+                                Bound::Own => Some(handle),
+                                Bound::None => None,
+                                Bound::Earlier => Some(vci_service_interface::ComPrimitiveHandle {
+                                    cop_handle: cop_handle + 100,
+                                    ..handle
+                                }),
+                            };
+                            if let Some(sender) = &sender {
+                                let _ = sender.send(Ok(vci_service_interface::EventNotification {
+                                    event_data: Some(EventData::Item(
+                                        vci_service_interface::EventItem {
+                                            cop_handle,
+                                            timestamp: at,
+                                            timestamp_clock: clock as i32,
+                                            data: Some(data),
+                                            ..Default::default()
+                                        },
+                                    )),
+                                    ..Default::default()
+                                }));
+                            }
+                        }
+                        return;
+                    }
                     if let StartEvent::Respond | StartEvent::RespondThenFinishLater = event
                         && let Some(sender) = &sender
                     {
@@ -14808,6 +14944,7 @@ def main():
                             })
                         }
                         StartEvent::Lose => EventData::Lost(Default::default()),
+                        StartEvent::Script(_) => unreachable!("a script returned above"),
                     };
                     if let Some(sender) = sender {
                         let _ = sender.send(Ok(vci_service_interface::EventNotification {
@@ -14959,6 +15096,7 @@ def main():
             on_start: None,
             released: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
+            device_clock: false,
         };
         serve(service, calls, set).await
     }
@@ -15000,6 +15138,15 @@ def main():
         cancel: CancelAnswer,
         on_start: Option<(When, StartEvent)>,
     ) -> (WorkerClient, Started) {
+        fake_worker_with_clock(cancel, on_start, false).await
+    }
+
+    /// [`fake_worker_starting_with`], whose items name the device clock when `device_clock`.
+    async fn fake_worker_with_clock(
+        cancel: CancelAnswer,
+        on_start: Option<(When, StartEvent)>,
+        device_clock: bool,
+    ) -> (WorkerClient, Started) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let (started, cancelled) = (Arc::default(), Arc::default());
@@ -15018,6 +15165,7 @@ def main():
             on_start,
             released: Arc::clone(&released),
             events: Arc::default(),
+            device_clock,
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (
@@ -15279,6 +15427,399 @@ def main():
             assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// Runs one read on a fake worker that gives `script`'s items, the ones after a
+    /// [`Step::Release`] once the agent's deadline has passed, so the job end reads them
+    /// (ADR-366, ADR-372), then settles the job's end; returns the log's lines. `cancel` is how
+    /// the worker answers the job end's cancel. The items name the device clock when
+    /// `device_clock`.
+    async fn job_end_script_run(
+        script: &'static [Step],
+        device_clock: bool,
+        cancel: CancelAnswer,
+    ) -> Vec<serde_json::Value> {
+        let dir = journal_dir("job-end-script");
+        let (mut client, fake) = fake_worker_with_clock(
+            cancel,
+            Some((When::After(Duration::ZERO), StartEvent::Script(script))),
+            device_clock,
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: PAST_DEADLINE,
+        };
+        let released = Arc::clone(&fake.released);
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(JOB_END_WAIT);
+            let result = host.service_request(0x22, &[0xF1, 0x90]);
+            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            released.add_permits(1);
+            host.settle_at_end();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// ADR-386: a link error of no primitive read at job end, while the host waits for the
+    /// primitive past its deadline, reaches the log as a `late_item` (design 8.11 `late_item`).
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_error_of_no_primitive_read_at_job_end_reaches_the_log() {
+        let lines = job_end_script_run(
+            &[Step::Release, Step::Error(Bound::None, 5_000), Step::Finish],
+            false,
+            CancelAnswer::Done,
+        )
+        .await;
+        let exchange = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .expect("the read has an entry");
+        let late = lines
+            .iter()
+            .find(|line| line["event"] == "late_item")
+            .unwrap_or_else(|| panic!("a late_item in {lines:#?}"));
+        assert_eq!(late["primitive"], "none", "{late}");
+        assert_eq!(late["error_event"], "PDU_ERR_EVT_RX_ERROR", "{late}");
+        assert_eq!(
+            late["refers_to"],
+            serde_json::json!([exchange["seq"]]),
+            "{late}"
+        );
+    }
+
+    /// The lines of `event` in `lines`.
+    fn of_event(lines: &[serde_json::Value], event: &str) -> Vec<serde_json::Value> {
+        lines
+            .iter()
+            .filter(|line| line["event"] == event)
+            .cloned()
+            .collect()
+    }
+
+    fn position_of(lines: &[serde_json::Value], event: &str) -> usize {
+        lines
+            .iter()
+            .position(|line| line["event"] == event)
+            .unwrap_or_else(|| panic!("no {event} in {lines:#?}"))
+    }
+
+    /// Whether a `late_item` is the stray exchange's own error of no primitive, taken as the
+    /// exchange in flight would (ADR-386).
+    fn is_owned_error_of_no_primitive(late: &serde_json::Value, seq: &serde_json::Value) -> bool {
+        late["refers_to"][0] == *seq
+            && late["text"].as_str().unwrap().contains(
+                "A link error of no primitive was read while the primitive of the exchange",
+            )
+    }
+
+    /// ADR-386 (design 8.11 `late_item`, "Link error"): the exchange the agent's deadline ended
+    /// takes the link errors of no primitive that the job end reads while it waits for the
+    /// primitive, as the exchange in flight would: one at or after its earliest placed start,
+    /// before or after its answer, and one whose time cannot be set against its starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_error_of_no_primitive_at_job_end_is_the_stray_exchange_s_own() {
+        const BEFORE_ANSWER: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::None, 4_500),
+            Step::Respond(5_000, None),
+            Step::Finish,
+        ];
+        const AFTER_ANSWER: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Respond(5_000, None),
+            Step::Error(Bound::None, 5_100),
+            Step::Finish,
+        ];
+        // The error comes first without a clock too (no time to set against a start).
+        for (script, device_clock) in [
+            (BEFORE_ANSWER, true),
+            (AFTER_ANSWER, true),
+            (BEFORE_ANSWER, false),
+        ] {
+            let lines = job_end_script_run(script, device_clock, CancelAnswer::Done).await;
+            let exchange = &of_event(&lines, "exchange")[0];
+            let ended = position_of(&lines, "primitive_ended");
+            let late = position_of(&lines, "late_item");
+            assert!(ended < late, "the error follows the entry: {lines:#?}");
+            assert_eq!(of_event(&lines, "late_item").len(), 1, "{lines:#?}");
+            assert!(
+                is_owned_error_of_no_primitive(&lines[late], &exchange["seq"]),
+                "{}",
+                lines[late]
+            );
+            assert_eq!(lines[late]["primitive"], "none", "{}", lines[late]);
+            assert_eq!(lines[ended]["outcome"]["result"], "positive");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+            // The epochs the placements open come before any entry of the job end.
+            if device_clock {
+                let last_epoch = lines
+                    .iter()
+                    .rposition(|line| line["event"] == "clock_epoch")
+                    .unwrap();
+                assert!(last_epoch < ended, "{lines:#?}");
+                // The entry's own starts survive its end's times.
+                assert_eq!(
+                    lines[ended]["vci"]["tx_done"]["us"], 3_000,
+                    "{}",
+                    lines[ended]
+                );
+                assert_eq!(
+                    lines[ended]["vci"]["rx_end"]["us"], 5_000,
+                    "{}",
+                    lines[ended]
+                );
+            }
+        }
+    }
+
+    /// ADR-386: an error of no primitive whose time comes before the stray exchange's earliest
+    /// start, within the clock margin, is not the exchange's: it is placed by its time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_error_of_no_primitive_before_the_stray_exchange_s_start_is_placed_by_its_time()
+    {
+        let lines = job_end_script_run(
+            &[
+                Step::Transmit(4_000),
+                Step::Release,
+                Step::Error(Bound::None, 3_500),
+                Step::Respond(5_000, None),
+                Step::Finish,
+            ],
+            true,
+            CancelAnswer::Done,
+        )
+        .await;
+        let exchange = &of_event(&lines, "exchange")[0];
+        let late = &of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert!(
+            !is_owned_error_of_no_primitive(&late[0], &exchange["seq"]),
+            "{}",
+            late[0]
+        );
+        assert!(
+            late[0]["text"]
+                .as_str()
+                .unwrap()
+                .contains("between exchanges"),
+            "{}",
+            late[0]
+        );
+        assert!(
+            position_of(&lines, "primitive_ended") < position_of(&lines, "late_item"),
+            "{lines:#?}"
+        );
+    }
+
+    /// ADR-386: an error of an earlier primitive read at job end is placed by its time (a
+    /// `late_item`) or, with no time to set against the exchanges, `unattached`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_link_error_of_an_earlier_primitive_at_job_end_is_placed_by_its_time() {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::Earlier, 4_500),
+            Step::Respond(5_000, None),
+            Step::Finish,
+        ];
+        for (device_clock, event, other) in [
+            (true, "late_item", "unattached"),
+            (false, "unattached", "late_item"),
+        ] {
+            let lines = job_end_script_run(SCRIPT, device_clock, CancelAnswer::Done).await;
+            let exchange = &of_event(&lines, "exchange")[0];
+            let items = of_event(&lines, event);
+            assert_eq!(items.len(), 1, "{lines:#?}");
+            assert_eq!(items[0]["primitive"], "earlier", "{}", items[0]);
+            assert!(of_event(&lines, other).is_empty(), "{lines:#?}");
+            assert!(
+                !is_owned_error_of_no_primitive(&items[0], &exchange["seq"]),
+                "{}",
+                items[0]
+            );
+            assert!(
+                position_of(&lines, "primitive_ended") < position_of(&lines, event),
+                "{lines:#?}"
+            );
+        }
+    }
+
+    /// ADR-386: a stray the agent cancels at job end still gets the errors it read: its own
+    /// bound error and one of no primitive are its exchange's, written after the cancel entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_errors_read_before_a_job_end_cancel_follow_the_cancel_entry() {
+        const NO_PRIMITIVE: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::None, 4_500),
+        ];
+        const OWN: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::Own, 4_500),
+        ];
+        for (script, device_clock) in [(NO_PRIMITIVE, true), (OWN, true), (NO_PRIMITIVE, false)] {
+            let lines = job_end_script_run(script, device_clock, CancelAnswer::Done).await;
+            let exchange = &of_event(&lines, "exchange")[0];
+            let ended = &of_event(&lines, "primitive_ended")[0];
+            assert_eq!(ended["cancelled_by_agent"], true, "{ended}");
+            let late = of_event(&lines, "late_item");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"][0], exchange["seq"], "{}", late[0]);
+            assert!(
+                position_of(&lines, "primitive_ended") < position_of(&lines, "late_item"),
+                "{lines:#?}"
+            );
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// ADR-386: with no entry to write (the handle was invalid when the job end cancelled it),
+    /// the errors read go to the log alone: placed by their time, or `unattached`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_errors_read_with_no_entry_to_write_are_placed_by_their_time() {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::Release,
+            Step::Error(Bound::None, 4_500),
+        ];
+        for (device_clock, event) in [(true, "late_item"), (false, "unattached")] {
+            let lines = job_end_script_run(SCRIPT, device_clock, CancelAnswer::InvalidHandle).await;
+            assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+            let items = of_event(&lines, event);
+            assert_eq!(items.len(), 1, "{lines:#?}");
+            assert_eq!(items[0]["primitive"], "none", "{}", items[0]);
+            // Taken by no exchange as its own.
+            assert!(
+                !items[0]["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("while the primitive of the exchange"),
+                "{}",
+                items[0]
+            );
+        }
+    }
+
+    /// ADR-386: the primitive's own items are placed once at their read: its pending is
+    /// read after the exchange's entry, its receive timeout names the entry's error time.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_primitive_s_own_items_are_placed_at_their_read() {
+        let lines = job_end_script_run(
+            &[
+                Step::Transmit(3_000),
+                Step::Release,
+                Step::Pending(4_300),
+                Step::TimeOut(5_000),
+                Step::Finish,
+            ],
+            true,
+            CancelAnswer::Done,
+        )
+        .await;
+        let exchange = &of_event(&lines, "exchange")[0];
+        let ended = &of_event(&lines, "primitive_ended")[0];
+        assert_eq!(ended["vci"]["tx_done"]["us"], 3_000, "{ended}");
+        assert_eq!(ended["vci"]["error"]["us"], 5_000, "{ended}");
+        assert_eq!(ended["pending"][0]["vci_us"], 4_300, "{ended}");
+        // Read after the entry that the agent's deadline wrote.
+        assert!(
+            ended["pending"][0]["agent_us"].as_u64().unwrap()
+                > exchange["times"]["agent"]["end_us"].as_u64().unwrap(),
+            "{ended}"
+        );
+        assert_eq!(ended["pending"][0]["epoch"], 0, "{ended}");
+        // The device clock's epochs are its first alone: nothing placed twice or backwards.
+        assert_eq!(of_event(&lines, "clock_epoch").len(), 1, "{lines:#?}");
+    }
+
+    /// ADR-386: a final response the wait read before the agent's deadline is not in its
+    /// exchange's entry; the end places it at its read, and the entry's transmit done stays.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_response_read_before_the_deadline_is_placed_by_the_end() {
+        let lines = job_end_script_run(
+            &[
+                Step::Transmit(3_000),
+                Step::Respond(3_800, None),
+                Step::Release,
+                Step::Finish,
+            ],
+            true,
+            CancelAnswer::Done,
+        )
+        .await;
+        let exchange = &of_event(&lines, "exchange")[0];
+        assert_eq!(exchange["outcome"]["result"], "vci_did_not_end");
+        let ended = &of_event(&lines, "primitive_ended")[0];
+        assert_eq!(ended["outcome"]["result"], "positive", "{ended}");
+        assert_eq!(ended["vci"]["rx_end"]["us"], 3_800, "{ended}");
+        assert_eq!(ended["vci"]["tx_done"]["us"], 3_000, "{ended}");
+        assert_eq!(ended["vci"]["rx_end"]["epoch"], 0, "{ended}");
+        assert_eq!(of_event(&lines, "clock_epoch").len(), 1, "{lines:#?}");
+    }
+
+    /// ADR-386: a lost VCI that ends the primitive at job end, with an error of no primitive
+    /// read before it: the entry, the error's `late_item`, then the loss record, which gives the
+    /// exchange's classification as it stands.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_loss_record_follows_the_job_end_s_late_items() {
+        let lines = job_end_script_run(
+            &[
+                Step::Transmit(3_000),
+                Step::Release,
+                Step::Error(Bound::None, 4_500),
+                Step::LostVci(4_600),
+            ],
+            true,
+            CancelAnswer::Done,
+        )
+        .await;
+        let exchange = &of_event(&lines, "exchange")[0];
+        let ended = position_of(&lines, "primitive_ended");
+        let late = position_of(&lines, "late_item");
+        let loss = lines
+            .iter()
+            .rposition(|line| line["event"] == "vci_loss")
+            .expect("the loss is recorded");
+        assert!(ended < late && late < loss, "{lines:#?}");
+        assert_eq!(
+            lines[ended]["outcome"]["result"], "vci_lost",
+            "{}",
+            lines[ended]
+        );
+        let standing = lines[late]["exchanges"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|settled| settled["seq"] == exchange["seq"])
+            .map(|settled| settled["classification"].clone())
+            .expect("the error settles the exchange the loss ended");
+        assert_eq!(
+            lines[loss]["ended"][0]["classification"], standing,
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[loss]["ended"][0]["seq"], exchange["seq"],
+            "{lines:#?}"
+        );
     }
 
     /// Runs `requests` reads (`send_recv` each) on a fake worker whose primitives each give a

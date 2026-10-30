@@ -150,6 +150,10 @@ pub struct RecoveryFacts {
     pub first_request: Option<StepRef>,
     /// The newest such request.
     pub last_request: Option<StepRef>,
+    /// The request named by the newest `RequestNotSent` record: the run that committed it
+    /// ended with the request provably unsent (ADR-392). It names `last_request` or is `None`;
+    /// a newer request is not withdrawn by it.
+    pub last_request_unsent: Option<StepRef>,
 }
 
 /// Why a run stopped without reaching the program's end or a `Fail` (ADR-288).
@@ -199,7 +203,14 @@ impl RecoveryFacts {
             run_stopped: None,
             first_request: None,
             last_request: None,
+            last_request_unsent: None,
         }
+    }
+
+    /// Whether the newest request is withdrawn: its run ended with it provably unsent
+    /// (ADR-392), so it counts as no request at all.
+    pub fn last_request_withdrawn(&self) -> bool {
+        self.last_request.is_some() && self.last_request_unsent == self.last_request
     }
 
     /// The resumes made in `stage`.
@@ -388,6 +399,18 @@ impl RecoveryFacts {
                 self.first_request.get_or_insert(*at);
                 self.last_request = Some(*at);
             }
+            Record::RequestNotSent { at } => {
+                if self.last_request != Some(*at) {
+                    return Err("a withdrawn request must be the last request");
+                }
+                if self.last_request_unsent == Some(*at) {
+                    return Err("the request is withdrawn already");
+                }
+                if !after_last_step(at, self) {
+                    return Err("a withdrawn request must come after the last step");
+                }
+                self.last_request_unsent = Some(*at);
+            }
             Record::PostTransferComplete => {
                 let exit = self.open_transfer().and_then(|t| t.exit.as_mut()).ok_or(
                     "post-transfer completion needs RequestTransferExit in an open transfer",
@@ -565,6 +588,12 @@ enum Record {
     /// target VIN and the intended software version when there are any. Appended last: the
     /// variant index is part of the encoding.
     ArtifactSha256([u8; 32]),
+    /// The run ended with the request marker at `at` committed and the request provably unsent
+    /// (ADR-392): a refusal before the start, or a cancel before the send. Changes no fact but
+    /// `last_request_unsent`. Appended last: the variant index is part of the encoding.
+    RequestNotSent {
+        at: StepRef,
+    },
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -1012,6 +1041,13 @@ impl<S: Store> Journal<S> {
     /// (ADR-335 item 2).
     pub fn commit_request(&mut self, at: StepRef) -> Result<(), JournalError> {
         self.commit(Record::Request { at })
+    }
+
+    /// Withdraws the request marker at `at`, the newest, because the run ended with its request
+    /// provably unsent (ADR-392): the marker then counts as no request, as the restart reads it.
+    /// Never committed for a request that may have reached the ECU.
+    pub fn commit_request_not_sent(&mut self, at: StepRef) -> Result<(), JournalError> {
+        self.commit(Record::RequestNotSent { at })
     }
 
     fn commit(&mut self, record: Record) -> Result<(), JournalError> {
@@ -1489,6 +1525,68 @@ mod tests {
         assert_eq!(state.facts.last_request, Some(at(9, 31)));
         // The second attempt's step carries a newer state than the checkpoints.
         assert_eq!(state.latest_checkpoint, Some((at(3, 30), b"vm-2".to_vec())));
+    }
+
+    /// The withdrawal of a request (ADR-392) names the newest request and nothing else; a record
+    /// that does not is refused and changes nothing. It changes no other fact, survives a reopen,
+    /// and a newer request is not withdrawn by it.
+    #[test]
+    fn folds_a_withdrawn_request_and_asserts_it_is_the_last() {
+        let dir = TempDir::new();
+        let mut journal = Journal::create(&dir.0, &key(), None, None, None).expect("create");
+        journal.commit_run_start(at(0, 0), b"init").unwrap();
+        // None to withdraw.
+        assert!(matches!(
+            journal.commit_request_not_sent(at(1, 1)),
+            Err(JournalError::Invariant(_))
+        ));
+        journal.commit_request(at(1, 1)).unwrap();
+        journal.commit_request(at(3, 3)).unwrap();
+        let before = journal.state().clone();
+        // Not the last request.
+        assert!(matches!(
+            journal.commit_request_not_sent(at(1, 1)),
+            Err(JournalError::Invariant(_))
+        ));
+        assert!(matches!(
+            journal.commit_request_not_sent(at(2, 2)),
+            Err(JournalError::Invariant(_))
+        ));
+        assert_eq!(journal.state(), &before);
+        assert!(!journal.state().facts.last_request_withdrawn());
+
+        journal.commit_request_not_sent(at(3, 3)).unwrap();
+        let facts = &journal.state().facts;
+        assert_eq!(facts.last_request_unsent, Some(at(3, 3)));
+        assert!(facts.last_request_withdrawn());
+        assert_eq!(
+            (facts.first_request, facts.last_request),
+            (Some(at(1, 1)), Some(at(3, 3)))
+        );
+        assert_eq!(journal.state().records, before.records + 1);
+        // Once only.
+        assert!(matches!(
+            journal.commit_request_not_sent(at(3, 3)),
+            Err(JournalError::Invariant(_))
+        ));
+        // A completed step after the request makes the withdrawal late.
+        let mut late = Journal::on_store(NullStore, key());
+        late.commit_request(at(1, 1)).unwrap();
+        late.commit_step(at(2, 2), None).unwrap();
+        assert!(matches!(
+            late.commit_request_not_sent(at(1, 1)),
+            Err(JournalError::Invariant(_))
+        ));
+        // A newer request is its own.
+        journal.commit_request(at(5, 5)).unwrap();
+        assert!(!journal.state().facts.last_request_withdrawn());
+        journal.commit_request_not_sent(at(5, 5)).unwrap();
+
+        let state = journal.state().clone();
+        drop(journal);
+        let reopened = Journal::open(&dir.0, &key()).expect("open");
+        assert_eq!(reopened.state(), &state);
+        assert_eq!(state.facts.last_request_unsent, Some(at(5, 5)));
     }
 
     /// The new records add facts and change none of the flash plan's (ADR-335 item 2): the
@@ -3179,6 +3277,7 @@ mod tests {
             },
             Record::Request { at: at(0, 0) },
             Record::ArtifactSha256([0; 32]),
+            Record::RequestNotSent { at: at(0, 0) },
         ];
         for (index, record) in records.iter().enumerate() {
             assert_eq!(

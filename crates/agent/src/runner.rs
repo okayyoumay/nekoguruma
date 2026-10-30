@@ -32,14 +32,16 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
-use crate::host::{HostError, OwnRead, ProcedurePosition, Timings, TransferProgress, WorkerHost};
+use crate::host::{
+    HostError, OwnRead, ProcedurePosition, SendState, Timings, TransferProgress, WorkerHost,
+};
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
 use crate::journaling::{JobJournal, JournalSetup};
 use crate::link::{self, LinkConfig};
 use crate::oplog::LogSafe;
 use crate::policy::{self, Permission};
-use crate::restart::{self, OnSiteReason, RestartDecision};
+use crate::restart::{self, OnSiteReason, RepeatDecision, RestartDecision};
 
 /// Bounds of a job.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +62,11 @@ pub struct JobLimits {
     /// this is the agent's policy and not in the IR (ADR-335 item 6). At the limit the job ends
     /// in on-site intervention (`ProcedureResumeLimitReached`) with nothing sent.
     pub max_procedure_resumes: u16,
+    /// How often the request of a diagnostic primitive that failed in the host is sent again in
+    /// the run, per arrival at the instruction, so a primitive is sent `1 + max_primitive_repeats`
+    /// times at most (design 8.2.5, ADR-392). The count is kept in memory and starts over at the
+    /// next arrival. A resend waits `wait_poll` first.
+    pub max_primitive_repeats: u8,
 }
 
 impl Default for JobLimits {
@@ -68,6 +75,7 @@ impl Default for JobLimits {
             max_steps: diag_ir::DEFAULT_MAX_STEPS,
             wait_poll: Duration::from_millis(10),
             max_procedure_resumes: 3,
+            max_primitive_repeats: 2,
         }
     }
 }
@@ -2086,6 +2094,12 @@ where
     let holds = cancel_held_at(program);
     let held = AtomicBool::new(false);
     let mut entry = cancel_at_entry;
+    // The primitive's failed attempts at the arrival `.0` (`VmState::steps` before the
+    // instruction), counted in memory (ADR-392).
+    let mut failed: (u64, u8) = (vm.state.steps, 0);
+    // The request marker committed for this arrival, while no attempt may have reached the
+    // ECU: ending the run then withdraws it (ADR-392).
+    let mut unsent: Option<StepRef> = None;
     loop {
         let cancelled = if !std::mem::take(&mut entry) && holds_cancel(program, &holds, vm.state.pc)
         {
@@ -2094,7 +2108,11 @@ where
             cancelled
         };
         if cancelled.load(Ordering::Relaxed) {
-            return Err(JobError::Cancelled);
+            return Err(withdraw_unsent(
+                journal.as_deref_mut(),
+                unsent.take(),
+                JobError::Cancelled,
+            ));
         }
         if arrived && stop_before == Some(vm.state.pc) {
             return Ok(RunEnd::Stopped(vm));
@@ -2132,8 +2150,18 @@ where
             })?;
             // The identity reads at a boundary take time; a cancel during them stops the job
             // before the boundary's instruction runs.
+            let marker = StepRef {
+                pc: vm.state.pc,
+                steps: vm.state.steps,
+            };
+            unsent = journal.holds_request(marker).then_some(marker);
             if cancelled.load(Ordering::Relaxed) {
-                return Err(JobError::Cancelled);
+                // The marker was committed and nothing sent (ADR-392).
+                return Err(withdraw_unsent(
+                    Some(journal),
+                    unsent.take(),
+                    JobError::Cancelled,
+                ));
             }
         }
         let pc = vm.state.pc;
@@ -2141,12 +2169,20 @@ where
             pc,
             steps: vm.state.steps,
         };
-        // The requests the step sends are the procedure's, at this position (design 8.11).
+        if failed.0 != at.steps {
+            failed = (at.steps, 0);
+        }
+        // The requests the step sends are the procedure's, at this position (design 8.11), or
+        // the resend of an attempt that failed.
         host.step_begins(program, pc, at.steps);
+        if failed.1 > 0 {
+            host.step_resends();
+        }
         let outcome = vm.step_with_declarations(program, variant.as_ref(), host);
         host.step_ends();
         if vm.state.steps > at.steps {
             // The instruction completed.
+            unsent = None;
             if let Some(journal) = journal.as_deref_mut() {
                 journal.completed(program, at, &vm.state, host)?;
             }
@@ -2194,7 +2230,60 @@ where
                 };
                 return Err(stop_run(journal, at, RunStop::Vm(source), error));
             }
-            Err(StepError::Host(source)) => return Err(JobError::Host { pc, source }),
+            Err(StepError::Host(source)) => {
+                if source.send_state() == SendState::MayHaveReached
+                    || !restart::is_exchange(program, pc)
+                {
+                    unsent = None;
+                }
+                let decision = restart::repeat_decision(
+                    program,
+                    at,
+                    &source,
+                    failed.1,
+                    &limits,
+                    journal.as_deref().map(JobJournal::facts),
+                );
+                match decision {
+                    RepeatDecision::Repeat => {
+                        // The same arrival sends again: no `arrive`, so no second marker.
+                        failed.1 += 1;
+                        tracing::debug!(pc, attempt = failed.1, error = %source, "resending the request");
+                        std::thread::sleep(wait_poll);
+                    }
+                    RepeatDecision::OnSite(reason) => {
+                        return Err(JobError::OnSiteInterventionRequired(reason));
+                    }
+                    RepeatDecision::End => {
+                        let error = JobError::Host { pc, source };
+                        return Err(withdraw_unsent(
+                            journal.as_deref_mut(),
+                            unsent.take(),
+                            error,
+                        ));
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Ends the run in `error` with the request marker at `unsent`, if there is one, withdrawn: the
+/// run's attempts did not reach the ECU (ADR-392). A commit that fails is the run's error
+/// instead.
+fn withdraw_unsent<S: Store>(
+    journal: Option<&mut JobJournal<S>>,
+    unsent: Option<StepRef>,
+    error: JobError,
+) -> JobError {
+    let (Some(journal), Some(at)) = (journal, unsent) else {
+        return error;
+    };
+    match journal.withdraw_request(at) {
+        Ok(()) => error,
+        Err(commit_error) => {
+            tracing::warn!(pc = at.pc, error = %commit_error.log_text(), "could not withdraw the unsent request marker");
+            commit_error
         }
     }
 }
@@ -2615,10 +2704,11 @@ mod tests {
         let mut host = FakeHost::default();
         assert!(matches!(
             run(vec![Op::PushI64(1), Op::ReadDtc { mask: 8 }], 10, &mut host),
-            Err(JobError::Host {
-                pc: 1,
-                source: HostError::NoResponse
-            })
+            Err(JobError::OnSiteInterventionRequired(
+                OnSiteReason::UnconfirmedRequest {
+                    at: StepRef { pc: 1, steps: 1 }
+                }
+            ))
         ));
         assert!(matches!(
             run(
@@ -3053,6 +3143,10 @@ def main():
         cancel_on_read: Option<([u8; 2], Arc<AtomicBool>)>,
         /// A routine whose response is lost.
         lose_routine: Option<u16>,
+        /// A lost response (`lose_service`, `lose_routine`) is the link's failure
+        /// (`EventStreamEnded`) and not an ECU that stayed silent: the request may have been
+        /// sent, and the repeat policy ends the run in the host error (ADR-392).
+        link_loss: bool,
         /// The ECU stays in its default session and refuses the erase (routine 0xFF00) and
         /// RequestDownload there with a negative response, as an ECU that accepts them only in
         /// its programming session would.
@@ -3095,6 +3189,9 @@ def main():
         reset: ResetAnswer,
         /// A service whose response is lost.
         lose_service: Option<u16>,
+        /// The errors the next requests for a service fail with, one per request, in order;
+        /// later requests succeed (ADR-392).
+        fail_service: Option<(u16, std::collections::VecDeque<HostError>)>,
         /// Set when a request for this service arrives, as a dropped job future would.
         cancel_on_service: Option<(u16, Arc<AtomicBool>)>,
         /// The answers to the first reads of F186, one per read; later reads get `session`.
@@ -3147,6 +3244,7 @@ def main():
                 software_version: Some(b"SW01".to_vec()),
                 cancel_on_read: None,
                 lose_routine: None,
+                link_loss: false,
                 default_session_only: false,
                 refuse_erase_only: false,
                 voltage: None,
@@ -3165,6 +3263,7 @@ def main():
                 cancel_on_vin_read: None,
                 reset: ResetAnswer::Positive,
                 lose_service: None,
+                fail_service: None,
                 cancel_on_service: None,
                 session_script: std::collections::VecDeque::new(),
                 session: SessionAnswer::Default,
@@ -3178,6 +3277,15 @@ def main():
                 wait_polls: 0,
                 input_scripts: Vec::new(),
                 document: None,
+            }
+        }
+
+        /// The error of a lost response.
+        fn loss(&self) -> HostError {
+            if self.link_loss {
+                HostError::EventStreamEnded
+            } else {
+                HostError::NoResponse
             }
         }
 
@@ -3278,11 +3386,17 @@ def main():
             {
                 flag.store(true, Ordering::Relaxed);
             }
+            if let Some((id, errors)) = &mut self.fail_service
+                && service == *id
+                && let Some(error) = errors.pop_front()
+            {
+                return Err(error);
+            }
             if service == 0x22 && self.fail_reads.iter().any(|did| payload == did) {
                 return Err(HostError::NoResponse);
             }
             if self.lose_service == Some(service) {
-                return Err(HostError::NoResponse);
+                return Err(self.loss());
             }
             match (service, payload) {
                 (0x11, _) => {
@@ -3358,7 +3472,7 @@ def main():
         fn routine_control(&mut self, routine: u16, _: u8, _: &[u8]) -> Result<Vec<u8>, HostError> {
             self.log.push((Sent::Routine(routine), self.commits.get()));
             if self.lose_routine == Some(routine) {
-                return Err(HostError::NoResponse);
+                return Err(self.loss());
             }
             if (self.default_session_only || self.refuse_erase_only) && routine == 0xFF00 {
                 return Ok(vec![0x7F, 0x31, 0x7F]);
@@ -4221,18 +4335,28 @@ def main():
         // The first or the second routine of the section loses its response.
         for (routine, pc) in [(0xFF02, 4), (0xFF03, 7)] {
             let (result, _, _, journal) = run(Some(routine));
+            // The section's reason names the pass's intent, at the first routine (pc 4), also
+            // when the second one (pc 7) is the one that failed; `pc` is where the request is.
             assert!(
-                matches!(result, Err(JobError::Host { pc: at, .. }) if at == pc),
-                "{result:?}"
+                matches!(
+                    &result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::RecoveryRequiredSection { section: 0, at }
+                    )) if at.pc == 4
+                ),
+                "routine {routine:#x} at {pc}: {result:?}"
             );
             assert!(refused(&journal), "routine {routine:#x}");
         }
         // After the section, before the next record: the point is still the section's intent,
         // and a plain start would repeat the section.
         let (result, _, _, journal) = run(Some(0xFF04));
-        assert!(
-            matches!(result, Err(JobError::Host { pc: 10, .. })),
-            "{result:?}"
+        // Outside the section and not safe to repeat: the request is unconfirmed.
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnconfirmedRequest {
+                at: StepRef { pc: 10, steps: 10 }
+            }
         );
         assert!(refused(&journal));
         // At the plan's entry, after the step into it: the identity read before the erase fails.
@@ -5708,13 +5832,19 @@ def main():
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
     }
 
-    /// A first run whose response to `service` is lost.
+    /// A first run that the link's failure ends at the request for `service`, which may have
+    /// been sent: a crash after it. A link failure is not sent again (ADR-392), whatever the
+    /// request's idempotency, so the run ends in the host error.
     fn lost_response(program: &Program, dir: &std::path::Path, service: u16, pc: u32) {
         let result = first_run(program, dir, JobLimits::default(), |host| {
             host.lose_service = Some(service);
+            host.link_loss = true;
         });
         assert!(
-            matches!(&result, Err(JobError::Host { pc: at, .. }) if *at == pc),
+            matches!(
+                &result,
+                Err(JobError::Host { pc: at, source: HostError::EventStreamEnded }) if *at == pc
+            ),
             "{result:?}"
         );
     }
@@ -5845,10 +5975,21 @@ def main():
                 // The repeat runs the program again from its start and fails the same way.
                 let result = resume_limited(&program, &dir, &mut host, limits, Some(TARGET_VIN));
                 assert!(
-                    matches!(result, Err(JobError::Host { pc: 4, .. })),
+                    matches!(
+                        result,
+                        Err(JobError::Host {
+                            pc: 4,
+                            source: HostError::NoResponse
+                        })
+                    ),
                     "{max} {count}: {result:?}"
                 );
-                assert_eq!(host.sent().len(), 2, "the read and the lost request");
+                // The request is `Safe`: sent three times (ADR-392).
+                assert_eq!(
+                    host.sent().len(),
+                    4,
+                    "the read and the lost request, sent 3 times"
+                );
                 assert_eq!(plain_resumes(&dir), count);
             }
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -6024,10 +6165,17 @@ def main():
             Some(TARGET_VIN),
         );
         assert!(
-            matches!(result, Err(JobError::Host { pc: 10, .. })),
+            matches!(
+                result,
+                Err(JobError::Host {
+                    pc: 10,
+                    source: HostError::NoResponse
+                })
+            ),
             "{result:?}"
         );
-        assert_eq!(services_without_vin_read(&host), [0x3E, 0x2F]);
+        // The lost `Safe` request is sent 3 times (ADR-392).
+        assert_eq!(services_without_vin_read(&host), [0x3E, 0x2F, 0x2F, 0x2F]);
         assert_eq!(plain_resumes(&dir), 1);
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         resume_limited(
@@ -7752,7 +7900,12 @@ def main():
         prepare_restart: impl FnOnce(&mut FlashHost),
     ) -> (Result<VmState, JobError>, FlashHost, Duration) {
         let dir = journal_dir("resume-teardown");
-        let result = first_run(program, &dir, JobLimits::default(), prepare_first);
+        // The first run is a crash after a request that may not be safe to repeat: the link
+        // fails, which the repeat policy ends in the host error (ADR-392).
+        let result = first_run(program, &dir, JobLimits::default(), |host| {
+            prepare_first(host);
+            host.link_loss = true;
+        });
         assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
         prepare_restart(&mut host);
@@ -8336,6 +8489,7 @@ def main():
         let dir = journal_dir("resume-startup-wait");
         let result = first_run(&program, &dir, JobLimits::default(), |host| {
             host.lose_service = Some(0x11);
+            host.link_loss = true;
         });
         assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
         let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -9692,6 +9846,8 @@ def main():
             setup.intended_software_version = intended.map(<[u8]>::to_vec);
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
             prepare_first(&mut host);
+            // A crash after a request that may not be safe to repeat: the link fails (ADR-392).
+            host.link_loss = true;
             let mut journal = JobJournal::create(setup, None).unwrap();
             let result = run_on(
                 program,
@@ -9731,6 +9887,9 @@ def main():
     /// [`completed_path_program`]: the post-transfer steps are journaled complete.
     fn lose_after_plan(host: &mut FlashHost) {
         host.lose_routine = Some(0xFF02);
+        // A crash after a request that is not safe to repeat: the link fails, which the repeat
+        // policy ends in the host error, as before (ADR-392).
+        host.link_loss = true;
     }
 
     /// The state check a restart ended in. A restart that passed the read-back verification but
@@ -9986,9 +10145,15 @@ def main():
         let dir = journal_dir("replay-after-completed");
         let result = first_run(&program, &dir, JobLimits::default(), |host| {
             host.lose_routine = Some(0xFF04);
+            // A crash after a request that is not safe to repeat: a link failure ends the run
+            // in the host error (ADR-392).
+            host.link_loss = true;
         });
         assert!(
-            matches!(result, Err(JobError::Host { pc, .. }) if pc == after_plan),
+            matches!(
+                result,
+                Err(JobError::Host { pc, source: HostError::EventStreamEnded }) if pc == after_plan
+            ),
             "{result:?}"
         );
         let first_point = restart_point(&program, &dir);
@@ -10021,9 +10186,15 @@ def main():
         let dir = journal_dir("replay-after-completed-teardown");
         let result = first_run(&program, &dir, JobLimits::default(), |host| {
             host.lose_routine = Some(0xFF04);
+            // A crash after a request that is not safe to repeat: a link failure ends the run
+            // in the host error (ADR-392).
+            host.link_loss = true;
         });
         assert!(
-            matches!(result, Err(JobError::Host { pc, .. }) if pc == after_plan),
+            matches!(
+                result,
+                Err(JobError::Host { pc, source: HostError::EventStreamEnded }) if pc == after_plan
+            ),
             "{result:?}"
         );
         let completed = Journal::read(&dir, &job_key()).unwrap();
@@ -10065,9 +10236,15 @@ def main():
         let dir = journal_dir("replay-run-start-only");
         let result = first_run(&program, &dir, JobLimits::default(), |host| {
             host.lose_routine = Some(0xFF04);
+            // A crash after a request that is not safe to repeat: a link failure ends the run
+            // in the host error (ADR-392).
+            host.link_loss = true;
         });
         assert!(
-            matches!(result, Err(JobError::Host { pc, .. }) if pc == after_plan),
+            matches!(
+                result,
+                Err(JobError::Host { pc, source: HostError::EventStreamEnded }) if pc == after_plan
+            ),
             "{result:?}"
         );
         let first_point = restart_point(&program, &dir);
@@ -11680,11 +11857,16 @@ def main():
             host.lose_routine = Some(0xFF03);
         });
         assert!(
-            matches!(result, Err(JobError::Host { pc, .. }) if pc == tail_routine),
+            matches!(
+                result,
+                Err(JobError::Host { pc, source: HostError::NoResponse }) if pc == tail_routine
+            ),
             "{result:?}"
         );
         let mut expected = verification_reads().to_vec();
+        // The lost routine is `Safe`: sent 3 times (ADR-392).
         expected.extend([Sent::Routine(0xFF02), Sent::Routine(0xFF03)]);
+        expected.extend([Sent::Routine(0xFF03), Sent::Routine(0xFF03)]);
         assert_eq!(full_log(&host), expected);
         std::fs::remove_dir_all(&dir).unwrap();
     }
@@ -14003,6 +14185,8 @@ def main():
             let dir = journal_dir(&format!("no-plan-section-{tag}"));
             let result = first_run(&program, &dir, JobLimits::default(), |host| {
                 host.lose_routine = Some(routine);
+                // A crash after the request: a link failure is not sent again (ADR-392).
+                host.link_loss = true;
             });
             assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
@@ -15427,6 +15611,60 @@ def main():
             assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A resend of a step's request (ADR-392) is logged with the origin `repeat` and the step's
+    /// position, the first send of the step with `procedure`; the next step starts as a
+    /// procedure's again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_resent_request_is_logged_with_the_origin_repeat() {
+        let dir = journal_dir("origin-repeat");
+        let (mut client, _fake) = fake_worker_starting_with(
+            CancelAnswer::Done,
+            Some((When::After(Duration::ZERO), StartEvent::Respond)),
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_secs(5),
+        };
+        let program = program(request_step(0x22).to_vec());
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            // The first send of the step, a resend of it, and the next step's first send.
+            host.step_begins(&program, 1, 1);
+            host.service_request(0x22, &[0xF1, 0x90]).expect("answered");
+            host.step_ends();
+            host.step_begins(&program, 1, 1);
+            host.step_resends();
+            host.service_request(0x22, &[0xF1, 0x90]).expect("answered");
+            host.step_ends();
+            host.step_begins(&program, 1, 2);
+            host.service_request(0x22, &[0xF1, 0x90]).expect("answered");
+            host.step_ends();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        let exchanges = of_event(&lines, "exchange");
+        let origins: Vec<_> = exchanges
+            .iter()
+            .map(|line| line["origin"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(origins, ["procedure", "repeat", "procedure"], "{lines:?}");
+        // The resend carries the position of the step it repeats.
+        assert_eq!(exchanges[1]["at"], exchanges[0]["at"], "{exchanges:?}");
+        assert!(!exchanges[1]["at"].is_null(), "{exchanges:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// Runs one read on a fake worker that gives `script`'s items, the ones after a
@@ -17902,5 +18140,441 @@ def main():
         assert_eq!(run.comm_log, CommLogStatus::None);
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    // ------------------------------------------------ the repeat policy (ADR-392)
+
+    /// A refusal of the start with the reason QUEUE_FULL.
+    fn queue_full() -> HostError {
+        use vci_service_interface::{ErrorDetail, PduError, RefusalReason};
+        HostError::Rpc {
+            rpc: "StartComPrimitive",
+            status: Box::new(vci_service_interface::status_with_error_detail(
+                tonic::Code::ResourceExhausted,
+                "queue full",
+                ErrorDetail {
+                    pdu_error: PduError::PduErrInvalidParameters as i32,
+                    error_event_data: None,
+                    detail_text: None,
+                    refusal: Some(RefusalReason::QueueFull as i32),
+                },
+            )),
+        }
+    }
+
+    /// A program of one request per `(service, idempotency)` whose sections have `interruptible`.
+    fn repeat_program(
+        steps: &[(u16, diag_ir::Idempotency)],
+        interruptible: diag_ir::Interruptible,
+    ) -> Program {
+        let mut program = plain_steps(steps);
+        for section in &mut program.sections {
+            section.interruptible = interruptible;
+        }
+        program.validate().expect("the fixture is a valid program");
+        program
+    }
+
+    /// Runs `program` on a [`FlashHost`] that `prepare` sets up, against a counting journal.
+    fn run_repeating(
+        program: &Program,
+        limits: JobLimits,
+        cancelled: &AtomicBool,
+        prepare: impl FnOnce(&mut FlashHost),
+    ) -> (
+        Result<VmState, JobError>,
+        FlashHost,
+        JobJournal<CountingStore>,
+    ) {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        prepare(&mut host);
+        let mut journal = counting_journal(&commits, None);
+        let limits = JobLimits {
+            wait_poll: Duration::ZERO,
+            ..limits
+        };
+        let result = run_on(program, &mut host, limits, cancelled, Some(&mut journal));
+        (result, host, journal)
+    }
+
+    /// How many requests for `service` the host saw.
+    fn sends_of(host: &FlashHost, service: u16) -> usize {
+        host.sent()
+            .iter()
+            .filter(|sent| matches!(sent, Sent::Service(id, _) if *id == service))
+            .count()
+    }
+
+    /// A lost response of a `Safe` read outside every plan is sent again in place, and the job
+    /// goes on to its end.
+    #[test]
+    fn a_lost_response_of_a_safe_read_is_resent_and_the_job_completes() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let (result, host, journal) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x22, [HostError::NoResponse].into()));
+            },
+        );
+        result.expect("the job completes");
+        assert_eq!(sends_of(&host, 0x22), 2);
+        assert_eq!(sends_of(&host, 0x3E), 1);
+        // A `Safe` read has no marker.
+        assert_eq!(journal.journal().state().facts.last_request, None);
+    }
+
+    /// The bound is `max_primitive_repeats` resends per arrival: with the default, exactly three
+    /// sends, and then the run ends in the host error as before. The count starts over at the
+    /// next arrival.
+    #[test]
+    fn the_bound_exhausted_ends_the_run_in_the_host_error_after_three_sends() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.lose_service = Some(0x3E);
+            },
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    pc: 4,
+                    source: HostError::NoResponse
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x3E), 3);
+        // No resend at all with a bound of 0.
+        let none = JobLimits {
+            max_primitive_repeats: 0,
+            ..JobLimits::default()
+        };
+        let (result, host, _) = run_repeating(&program, none, &AtomicBool::new(false), |host| {
+            host.lose_service = Some(0x3E);
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x3E), 1);
+        // Two failures at each of two arrivals: each has the whole bound.
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service =
+                    Some((0x22, [HostError::NoResponse, HostError::EventsLost].into()));
+            },
+        );
+        result.expect("the third send succeeds");
+        assert_eq!(sends_of(&host, 0x22), 3);
+    }
+
+    /// An `Unsafe` request that may have reached the ECU is not sent again: the run ends in
+    /// on-site intervention with the request unconfirmed, as the next resume finds it, and the
+    /// ending itself is not journaled.
+    #[test]
+    fn a_lost_response_of_an_unsafe_request_ends_on_site() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        for error in [
+            HostError::NoResponse,
+            HostError::EventsLost,
+            HostError::PrimitiveFailed(1),
+        ] {
+            let (result, host, journal) = run_repeating(
+                &program,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                |host| host.fail_service = Some((0x10, [error].into())),
+            );
+            let at = StepRef { pc: 4, steps: 4 };
+            assert_eq!(reason_of(&result), &OnSiteReason::UnconfirmedRequest { at });
+            assert_eq!(sends_of(&host, 0x10), 1);
+            let state = journal.journal().state();
+            assert_eq!(state.facts.last_request, Some(at));
+            assert_eq!(state.facts.last_request_unsent, None);
+            // The same reason as a resume of that journal derives.
+            assert_eq!(
+                restart::classify(&program, Ok(state)),
+                RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
+                    at
+                })
+            );
+        }
+    }
+
+    /// A routine that is `CheckState` counts as not safe to repeat, as does one under no section.
+    #[test]
+    fn a_lost_response_of_a_check_state_or_an_uncovered_request_ends_on_site() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, diag_ir::Idempotency::CheckState)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.lose_service = Some(0x10);
+            },
+        );
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnconfirmedRequest {
+                at: StepRef { pc: 4, steps: 4 }
+            }
+        );
+        assert_eq!(sends_of(&host, 0x10), 1);
+        let mut uncovered = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
+        uncovered.sections.truncate(1);
+        let (result, host, _) = run_repeating(
+            &uncovered,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.lose_service = Some(0x10);
+            },
+        );
+        assert!(matches!(
+            reason_of(&result),
+            OnSiteReason::UnconfirmedRequest { .. }
+        ));
+        assert_eq!(sends_of(&host, 0x10), 1);
+    }
+
+    /// A refusal before the start that passes (a held link, a full queue) is sent again whatever
+    /// the idempotency, and the resend does not arrive again: one request marker.
+    #[test]
+    fn a_transient_refusal_is_resent_without_a_second_request_marker() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        for error in [HostError::LinkHeld, queue_full()] {
+            let (result, host, journal) = run_repeating(
+                &program,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                |host| {
+                    host.fail_service = Some((0x10, [error, HostError::LinkHeld].into()));
+                },
+            );
+            result.expect("the third send succeeds");
+            assert_eq!(sends_of(&host, 0x10), 3);
+            let facts = &journal.journal().state().facts;
+            assert_eq!(facts.first_request, Some(StepRef { pc: 4, steps: 4 }));
+            assert_eq!(facts.first_request, facts.last_request);
+            assert_eq!(facts.last_request_unsent, None);
+            // The commits: run start, the marker, three checkpoints.
+            assert_eq!(journal.journal().state().records, 5);
+        }
+    }
+
+    /// A transient refusal that outlasts the bound ends the run in the host error with the
+    /// marker withdrawn: nothing reached the ECU.
+    #[test]
+    fn a_transient_refusal_beyond_the_bound_withdraws_the_request() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
+        let (result, host, journal) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x10, [queue_full(), queue_full(), queue_full()].into()));
+            },
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x10), 3);
+        let facts = &journal.journal().state().facts;
+        assert!(facts.last_request_withdrawn(), "{facts:?}");
+    }
+
+    /// A refusal that does not pass, on a request with a marker, commits the withdrawal before
+    /// the run ends, and a later resume makes a plain start instead of ending on an unconfirmed
+    /// request. A request that may have reached the ECU earlier in the arrival is never
+    /// withdrawn.
+    #[test]
+    fn a_request_refused_before_the_start_is_withdrawn_and_a_resume_starts_plain() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let dir = journal_dir("repeat-withdrawn");
+        let result = first_run(&program, &dir, JobLimits::default(), |host| {
+            host.fail_service = Some((0x10, [HostError::NotAllowed(0x10)].into()));
+        });
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    pc: 4,
+                    source: HostError::NotAllowed(0x10)
+                })
+            ),
+            "{result:?}"
+        );
+        let state = Journal::read(&dir, &job_key()).unwrap();
+        assert!(state.facts.last_request_withdrawn(), "{:?}", state.facts);
+        assert_eq!(
+            restart::classify(&program, Ok(&state)),
+            RestartDecision::PlainStart
+        );
+        let (result, host) = resume_plain_job(&program, &dir, |_| {});
+        result.expect("the plain start completes");
+        assert_eq!(plain_resumes(&dir), 1);
+        assert_eq!(sends_of(&host, 0x10), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+
+        // A transient refusal after a lost response of the same arrival: no withdrawal.
+        let (result, _, journal) = run_repeating(
+            &repeat_program(&[(0x22, Safe), (0x10, Safe)], diag_ir::Interruptible::Yes),
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((
+                    0x10,
+                    [HostError::NoResponse, HostError::NotAllowed(0x10)].into(),
+                ));
+            },
+        );
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        assert_eq!(journal.journal().state().facts.last_request_unsent, None);
+    }
+
+    /// An `Unsafe` request that was sent and lost, then refused before a start, is not withdrawn:
+    /// an earlier attempt may have reached the ECU. (The decision ends the earlier attempt in
+    /// on-site intervention, so this holds for the transient resend path only.)
+    #[test]
+    fn a_withdrawal_follows_only_attempts_that_did_not_reach_the_ecu() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
+        let (result, _, journal) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((
+                    0x10,
+                    [HostError::LinkHeld, HostError::NotAllowed(0x10)].into(),
+                ));
+            },
+        );
+        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+        assert!(journal.journal().state().facts.last_request_withdrawn());
+    }
+
+    /// A cancel taken after the marker was committed and before the request was sent withdraws
+    /// the marker.
+    #[test]
+    fn a_cancel_after_the_request_marker_withdraws_it() {
+        struct CancelOnCommit {
+            commits: u64,
+            marker: u64,
+            cancelled: Arc<AtomicBool>,
+        }
+        impl Store for CancelOnCommit {
+            fn append_sync(&mut self, _: &[u8]) -> std::io::Result<()> {
+                self.commits += 1;
+                if self.commits == self.marker {
+                    self.cancelled.store(true, Ordering::Relaxed);
+                }
+                Ok(())
+            }
+        }
+        let program = plain_steps(&[(0x10, Unsafe), (0x3E, Safe)]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        // Commit 1 is the run start, commit 2 the marker.
+        let store = CancelOnCommit {
+            commits: 0,
+            marker: 2,
+            cancelled: Arc::clone(&cancelled),
+        };
+        let mut journal = JobJournal::new(
+            crate::journal::Journal::on_store(store, job_key()),
+            identity_sources(),
+        );
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &cancelled,
+            Some(&mut journal),
+        );
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.sent(), []);
+        let facts = &journal.journal().state().facts;
+        assert_eq!(facts.last_request, Some(StepRef { pc: 1, steps: 1 }));
+        assert!(facts.last_request_withdrawn(), "{facts:?}");
+    }
+
+    /// A failure inside a flash plan's range ends the run as before: sent once, no resend.
+    #[test]
+    fn a_failure_inside_a_flash_plan_is_not_resent() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.lose_routine = Some(0xFF00);
+        let mut journal = counting_journal(&commits, None);
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(result, Err(JobError::Host { pc: ERASE, .. })),
+            "{result:?}"
+        );
+        let erases = host
+            .sent()
+            .iter()
+            .filter(|sent| **sent == Sent::Routine(0xFF00))
+            .count();
+        assert_eq!(erases, 1);
+    }
+
+    /// Link and worker failures, and requests that are not one exchange, end the run as before.
+    #[test]
+    fn link_level_errors_are_not_resent() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        for error in [
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+            HostError::EventStreamEnded,
+            HostError::Setup("link"),
+            HostError::VciLost {
+                refused_after_loss: false,
+            },
+            HostError::VciLost {
+                refused_after_loss: true,
+            },
+        ] {
+            let (result, host, _) = run_repeating(
+                &program,
+                JobLimits::default(),
+                &AtomicBool::new(false),
+                |host| host.fail_service = Some((0x3E, [error].into())),
+            );
+            assert!(
+                matches!(result, Err(JobError::Host { pc: 4, .. })),
+                "{result:?}"
+            );
+            assert_eq!(sends_of(&host, 0x3E), 1);
+        }
+    }
+
+    /// The repeat also works inside an uninterruptible section outside the plans, where a
+    /// cancel stays held: it is taken after the section.
+    #[test]
+    fn a_request_is_resent_inside_an_uninterruptible_section_and_the_held_cancel_stays_held() {
+        let mut program = plain_steps(&[(0x3E, Safe), (0x22, Safe)]);
+        program.sections[0].interruptible = diag_ir::Interruptible::No;
+        program.validate().unwrap();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (result, host, _) = run_repeating(&program, JobLimits::default(), &cancelled, |host| {
+            host.fail_service = Some((0x3E, [HostError::NoResponse].into()));
+            host.cancel_on_service = Some((0x3E, Arc::clone(&cancelled)));
+        });
+        // The cancel arrived with the first send and waited out the resend; it is taken at the
+        // first interruptible point after the section, before the second request.
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(sends_of(&host, 0x3E), 2);
+        assert_eq!(sends_of(&host, 0x22), 0);
     }
 }

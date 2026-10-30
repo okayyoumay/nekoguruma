@@ -41,7 +41,7 @@ use diag_ir::{
     Source, Vm, VmError, VmState,
 };
 
-use crate::host::{HostError, OwnRead, ProcedurePosition};
+use crate::host::{HostError, OwnRead, ProcedurePosition, ResendClass, SendState};
 use crate::inputs::{FieldBytes, Reading, RuntimeInputs, ServiceSources};
 use crate::inputs::{read_identity_bytes, resolve_identity, resolve_source};
 use crate::journal::Vin;
@@ -49,7 +49,7 @@ use crate::journal::{
     Journal, JournalError, JournalState, RecoveryFacts, StageId, StepRef, StoppedRun, Store,
 };
 use crate::oplog::LogSafe;
-use crate::runner::JobError;
+use crate::runner::{JobError, JobLimits};
 
 /// How a job whose journal exists goes on.
 #[derive(Debug, Clone, PartialEq)]
@@ -513,6 +513,9 @@ pub fn classify(
 /// and checkpoints (ADR-335 item 2). In this order:
 /// - no request ever recorded: [`RestartDecision::PlainStart`], on the same journal, whatever
 ///   the journal's states (a plain start needs none). The caller counts it (ADR-335 item 6);
+/// - a withdrawn `Request` (its run ended with the request provably unsent, ADR-392) counts as no
+///   request: when it is the only one, the answer is [`RestartDecision::PlainStart`]; otherwise
+///   the next point does not apply to it, and the checks after it still do;
 /// - a `Request` newer than the newest state record is [`OnSiteReason::UnconfirmedRequest`]: the
 ///   primitive it guards may have reached the ECU, and the VM state after it was never journaled.
 ///   The newest state record is the latest checkpoint, whose own step count says which step runs
@@ -520,7 +523,7 @@ pub fn classify(
 ///   step, so its count is one past the record's, and a run start's is the step about to run.
 ///   Comparing the request with that count therefore needs no case per kind. A cancel while a
 ///   request's marker was committed leaves a marker with no later state, which reads as
-///   unconfirmed too, and so does a journal that holds a request and no checkpoint;
+///   unconfirmed too unless the runner withdrew the marker, and so does a journal that holds a request and no checkpoint;
 /// - a latest checkpoint state that does not decode, or fails `Vm::check_state` with its step
 ///   count set to [`next_steps`], is [`OnSiteReason::InvalidEntryState`]. It is checked before
 ///   the conditions below, which read the state's pc and call stack;
@@ -544,9 +547,15 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
     let not_resumable = |cause| on_site(OnSiteReason::NotResumable { cause });
     let facts = &state.facts;
     // The first request is recorded with the last, so none of either means none was sent.
-    let (Some(_), Some(request)) = (facts.first_request, facts.last_request) else {
+    let (Some(first), Some(request)) = (facts.first_request, facts.last_request) else {
         return RestartDecision::PlainStart;
     };
+    // A request whose run ended with it provably unsent never reached the ECU (ADR-392): when
+    // it is the only one, none was sent.
+    let withdrawn = facts.last_request_withdrawn();
+    if withdrawn && first == request {
+        return RestartDecision::PlainStart;
+    }
     let Some((at, bytes)) = &state.latest_checkpoint else {
         return on_site(OnSiteReason::UnconfirmedRequest { at: request });
     };
@@ -558,7 +567,9 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
             return on_site(OnSiteReason::UnconfirmedRequest { at: request });
         }
     };
-    if request.steps >= resumed.steps {
+    // A withdrawn request is not unconfirmed; the requests before it are confirmed by the
+    // checkpoint's order, and the checks below still apply.
+    if !withdrawn && request.steps >= resumed.steps {
         return on_site(OnSiteReason::UnconfirmedRequest { at: request });
     }
     // A damaged state is refused before the checks below read its pc and call stack.
@@ -1681,6 +1692,93 @@ pub(crate) fn safe_to_repeat(program: &Program, pc: u32) -> bool {
         .peekable();
     covering.peek().is_some()
         && covering.all(|section| matches!(section.idempotency, Idempotency::Safe))
+}
+
+/// What the runner does with a host error of the diagnostic primitive it just ran (ADR-392).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) enum RepeatDecision {
+    /// Send the same request again in place, without arriving at the instruction again.
+    Repeat,
+    /// The run ends in the host error.
+    End,
+    /// The run ends in on-site intervention with this reason, the one the next resume of the
+    /// journal derives. Nothing is journaled for the ending (ADR-290).
+    OnSite(OnSiteReason),
+}
+
+/// The one place that decides whether a host error of the primitive at `at` is sent again in
+/// the run (ADR-392). `attempts` is how many times this arrival's request failed before this
+/// error (0 for the first), `facts` the job's journal facts, or `None` without a journal.
+///
+/// - Only a request to the ECU outside every plan's range is considered: `ServiceRequest`,
+///   `ReadDtc`, `RoutineControl` and `SendReceive`. Everything else ends the run.
+/// - A refusal before the start that passes (`ResendClass::Transient`) is sent again whatever
+///   the idempotency, as nothing was sent.
+/// - An ECU- or bus-level error of a request that may have reached the ECU
+///   (`ResendClass::EcuLevel`) is sent again only when [`safe_to_repeat`] says so. Otherwise it
+///   is on-site intervention, as the next resume would find it: the section's reason inside a
+///   `RecoveryRequired` section, else an unconfirmed request. Without a journal the program's
+///   sections alone decide between the two (the pass's intent is then the primitive itself).
+/// - Every send counts against `JobLimits::max_primitive_repeats`; the error after the last
+///   one ends the run.
+pub(crate) fn repeat_decision(
+    program: &Program,
+    at: StepRef,
+    error: &HostError,
+    attempts: u8,
+    limits: &JobLimits,
+    facts: Option<&RecoveryFacts>,
+) -> RepeatDecision {
+    if !is_exchange(program, at.pc) || in_plan(program, at.pc) {
+        return RepeatDecision::End;
+    }
+    let within_bound = attempts < limits.max_primitive_repeats;
+    match (error.send_state(), error.resend_class()) {
+        (SendState::NotSent, ResendClass::Transient) if within_bound => RepeatDecision::Repeat,
+        (SendState::MayHaveReached, ResendClass::EcuLevel) if safe_to_repeat(program, at.pc) => {
+            if within_bound {
+                RepeatDecision::Repeat
+            } else {
+                RepeatDecision::End
+            }
+        }
+        (SendState::MayHaveReached, ResendClass::EcuLevel) => {
+            RepeatDecision::OnSite(unsent_reason(program, at, facts))
+        }
+        _ => RepeatDecision::End,
+    }
+}
+
+/// Whether the instruction at `pc` is one request to the ECU and its answer (`ServiceRequest`,
+/// `ReadDtc`, `RoutineControl`, `SendReceive`): the primitives whose failed attempt can be sent
+/// again, or withdrawn when it never left (ADR-392). `SecurityAccess` is two exchanges and
+/// `FlashTransfer` a sequence of blocks, so neither is one.
+pub(crate) fn is_exchange(program: &Program, pc: u32) -> bool {
+    matches!(
+        program.code.get(pc as usize),
+        Some(
+            Op::ServiceRequest { .. }
+                | Op::ReadDtc { .. }
+                | Op::RoutineControl { .. }
+                | Op::SendReceive { .. }
+        )
+    )
+}
+
+/// The reason the next resume derives for the request marker at `at` that may have reached the
+/// ECU: the `RecoveryRequired` section's, from the pass's intent as `classify` reads it, or an
+/// unconfirmed request.
+fn unsent_reason(program: &Program, at: StepRef, facts: Option<&RecoveryFacts>) -> OnSiteReason {
+    if in_section_outside_plans(program, at.pc) {
+        let intent = facts
+            .and_then(|facts| facts.last_intent)
+            .filter(|intent| in_section_outside_plans(program, intent.pc))
+            .unwrap_or(at);
+        if let Some(reason) = recovery_required(program, intent) {
+            return reason;
+        }
+    }
+    OnSiteReason::UnconfirmedRequest { at }
 }
 
 /// Whether `pc` lies inside a flash recovery plan's range (`entry_pc` up to, not including,
@@ -3995,6 +4093,159 @@ def main():
             decide(&program, &journal),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
                 at: at(8)
+            })
+        );
+    }
+
+    /// A withdrawn request (its run ended with it provably unsent, ADR-392) counts as no request:
+    /// alone it is a plain start; with an earlier confirmed request it is not unconfirmed, and the
+    /// checks after that point still apply; a newer request that is not withdrawn is unconfirmed
+    /// again.
+    #[test]
+    fn a_withdrawn_request_counts_as_none() {
+        let program = plain_program();
+        let mut alone = Journal::on_store(Memory, plain_key());
+        alone
+            .commit_run_start(at(0), &state_bytes(&state_at_pc(&program, 0, 0)))
+            .unwrap();
+        alone.commit_request(at(4)).unwrap();
+        assert!(matches!(
+            decide(&program, &alone),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest { .. })
+        ));
+        alone.commit_request_not_sent(at(4)).unwrap();
+        assert_eq!(decide(&program, &alone), RestartDecision::PlainStart);
+
+        // After a confirmed request at step 2 (the checkpoint's state is step 3), a request at
+        // step 8 that is withdrawn is no longer unconfirmed.
+        let mut journal = plain_journal(&program, true, &state_at_pc(&program, 5, 3));
+        journal.commit_request(at(8)).unwrap();
+        journal.commit_request_not_sent(at(8)).unwrap();
+        let decision = decide(&program, &journal);
+        assert!(
+            !matches!(
+                decision,
+                RestartDecision::OnSiteInterventionRequired(
+                    OnSiteReason::UnconfirmedRequest { .. }
+                )
+            ),
+            "{decision:?}"
+        );
+        // A newer request is not covered by the older withdrawal.
+        journal.commit_request(at(9)).unwrap();
+        assert_eq!(
+            decide(&program, &journal),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
+                at: at(9)
+            })
+        );
+    }
+
+    /// The repeat decision (ADR-392), arm by arm. The program: requests at 1 (`Safe`), 4 (under
+    /// no section) and 7 (`Safe`, in a `RecoveryRequired` section); a `Wait` at 9.
+    #[test]
+    fn the_repeat_decision_by_error_and_idempotency() {
+        use crate::runner::JobLimits;
+        let mut program = plain_program();
+        program.sections[1].interruptible = Interruptible::RecoveryRequired;
+        program.code.extend([Op::Wait { millis: 1 }]);
+        let limits = JobLimits::default();
+        let facts = |intent: Option<StepRef>| {
+            let mut facts = Journal::on_store(Memory, plain_key()).summary();
+            facts.last_intent = intent;
+            facts
+        };
+        let decide = |pc: u32, error: &HostError, attempts: u8, facts: Option<&RecoveryFacts>| {
+            repeat_decision(&program, at_pc(pc), error, attempts, &limits, facts)
+        };
+        let some = facts(None);
+        // `Safe`: an ECU-level error is sent again until the bound, then ends.
+        for error in [
+            HostError::NoResponse,
+            HostError::EventsLost,
+            HostError::PrimitiveFailed(3),
+        ] {
+            assert_eq!(decide(1, &error, 0, Some(&some)), RepeatDecision::Repeat);
+            assert_eq!(decide(1, &error, 1, None), RepeatDecision::Repeat);
+            assert_eq!(decide(1, &error, 2, Some(&some)), RepeatDecision::End);
+        }
+        // Not safe: on site with the reason a resume derives; without a journal the program's
+        // sections alone decide.
+        assert_eq!(
+            decide(4, &HostError::NoResponse, 0, Some(&some)),
+            RepeatDecision::OnSite(OnSiteReason::UnconfirmedRequest { at: at_pc(4) })
+        );
+        assert_eq!(
+            decide(4, &HostError::NoResponse, 0, None),
+            RepeatDecision::OnSite(OnSiteReason::UnconfirmedRequest { at: at_pc(4) })
+        );
+        // `Safe` inside a `RecoveryRequired` section outside the plans is sent again too.
+        assert_eq!(
+            decide(7, &HostError::NoResponse, 0, Some(&some)),
+            RepeatDecision::Repeat
+        );
+        // A transient refusal is sent again whatever the idempotency, within the bound.
+        assert_eq!(
+            decide(4, &HostError::LinkHeld, 1, Some(&some)),
+            RepeatDecision::Repeat
+        );
+        assert_eq!(
+            decide(4, &HostError::LinkHeld, 2, Some(&some)),
+            RepeatDecision::End
+        );
+        // Link-level errors, refusals that do not pass, and other primitives end the run.
+        for error in [
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+            HostError::EventStreamEnded,
+            HostError::Setup("link"),
+            HostError::NotAllowed(0x10),
+            HostError::VciLost {
+                refused_after_loss: false,
+            },
+        ] {
+            assert_eq!(
+                decide(1, &error, 0, Some(&some)),
+                RepeatDecision::End,
+                "{error:?}"
+            );
+        }
+        assert_eq!(
+            decide(9, &HostError::NoResponse, 0, Some(&some)),
+            RepeatDecision::End
+        );
+    }
+
+    fn at_pc(pc: u32) -> StepRef {
+        at_step(pc, u64::from(pc))
+    }
+
+    fn at_step(pc: u32, steps: u64) -> StepRef {
+        StepRef { pc, steps }
+    }
+
+    /// Inside a `RecoveryRequired` section outside the plans, an `Unsafe` request that may have
+    /// reached the ECU ends in the section's reason, naming the pass's intent as `classify` does.
+    #[test]
+    fn the_repeat_decision_names_the_recovery_required_section() {
+        use crate::runner::JobLimits;
+        let mut program = plain_program();
+        program.sections[1] =
+            plain_section(6, 9, Idempotency::Unsafe, Interruptible::RecoveryRequired);
+        let mut journal = Journal::on_store(Memory, plain_key());
+        journal.commit_intent(at(6)).unwrap();
+        let decision = repeat_decision(
+            &program,
+            at_step(7, 7),
+            &HostError::NoResponse,
+            0,
+            &JobLimits::default(),
+            Some(&journal.state().facts),
+        );
+        assert_eq!(
+            decision,
+            RepeatDecision::OnSite(OnSiteReason::RecoveryRequiredSection {
+                section: 1,
+                at: at(6)
             })
         );
     }

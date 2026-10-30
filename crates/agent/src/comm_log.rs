@@ -12799,6 +12799,244 @@ mod tests {
         assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
     }
 
+    /// Opens a log on the link of `stray_log` and logs `exchanges` (each with its unbound
+    /// items) on it.
+    fn log_of(
+        exchanges: Vec<(exchange::Evidence, Vec<UnattachedItem>)>,
+    ) -> (PathBuf, CommLogSetup, CommLog, Vec<u64>) {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        let seqs = exchanges
+            .into_iter()
+            .map(|(evidence, unbound)| log.exchange_with(evidence, unbound).unwrap())
+            .collect();
+        (dir, setup, log, seqs)
+    }
+
+    /// A silent read of `did` the VCI ended, sent at `at_us` with its transmit confirmed.
+    fn silent_read(did: u8, at_us: u64) -> (exchange::Evidence, Vec<UnattachedItem>) {
+        let mut evidence = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, did],
+            exchange::End::NoResponse,
+        );
+        evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+        evidence.vci_ended = true;
+        evidence.times.agent.before_us = at_us;
+        evidence.times.agent.end_us = at_us + 1_001_000;
+        evidence.times.vci = Some(exchange::VciTimes {
+            rx_timeout: Some(dev(at_us + 1_000_000)),
+            error: Some(dev(at_us + 1_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        let transmit = UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: at_us + 100,
+                wall_unix_ms: 0,
+            }),
+            ..tx_done(0x7E0)
+        };
+        (evidence, vec![transmit])
+    }
+
+    /// The classification of `seq`, and of it in the last `vci_loss` record.
+    fn standing_and_recorded(
+        log: &CommLog,
+        setup: &CommLogSetup,
+        seq: u64,
+    ) -> (exchange::Classification, Option<serde_json::Value>) {
+        let standing = log
+            .lock()
+            .links
+            .iter()
+            .find_map(|(_, state)| state.standing(seq))
+            .unwrap();
+        let recorded = of_event(&lines(setup), "vci_loss")
+            .last()
+            .and_then(|record| {
+                record["ended"]
+                    .as_array()?
+                    .iter()
+                    .find(|taken| taken["seq"] == seq)
+                    .map(|taken| taken["classification"].clone())
+            });
+        (standing, recorded)
+    }
+
+    /// An exchange the run's lost VCI ended and that is still owed gets an ambiguous late
+    /// response, or an ambiguous indication, which raises it; the loss record then carries the
+    /// raised classification (design 8.11 "Settlement", ADR-373).
+    #[test]
+    fn an_ambiguous_late_item_rewrites_the_loss_record_of_the_exchange_it_raises() {
+        let response = UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            owner: None,
+            vci_us: 6_000_500,
+            clock: Some(exchange::Clock::Device),
+            read: Some(read_at(0)),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x62, 0xF1, 0x90, 0x41],
+            },
+        };
+        let start = UnattachedItem {
+            vci_us: 6_000_500,
+            read: Some(read_at(0)),
+            ..start_of_message(0x7E8)
+        };
+        for (item, late_event) in [(response, "late_response"), (start, "late_item")] {
+            // An answered read, then two silent reads of the same request, both still owed; the
+            // first has a matched answer before it, so it is `vehicle`.
+            let mut answered = evidence(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90],
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+            );
+            answered.pending_visibility = exchange::PendingVisibility::Forwarded;
+            answered.times.agent.before_us = 500_000;
+            answered.times.agent.end_us = 600_000;
+            let transmit = UnattachedItem {
+                vci_us: 500_000,
+                read: Some(AgentNow {
+                    epoch: 0,
+                    monotonic_us: 500_100,
+                    wall_unix_ms: 0,
+                }),
+                ..tx_done(0x7E0)
+            };
+            let (dir, setup, log, seqs) = log_of(vec![
+                (answered, vec![transmit]),
+                silent_read(0x90, 2_000_000),
+                silent_read(0x90, 4_000_000),
+            ]);
+            let first = seqs[1];
+            // The lost VCI ended the first of them.
+            let (before, _) = standing_and_recorded(&log, &setup, first);
+            assert!(
+                before < exchange::Classification::Undetermined,
+                "{before:?}"
+            );
+            log.lock().note_loss(first, before, false).unwrap();
+            // Read during a third exchange, the item could be either one's.
+            let (third, mut unbound) = silent_read(0x92, 6_000_000);
+            unbound.push(item);
+            log.exchange_with(third, unbound).unwrap();
+            let (standing, recorded) = standing_and_recorded(&log, &setup, first);
+            assert_eq!(standing, exchange::Classification::Undetermined);
+            let lines = finished(&log, &setup, &dir);
+            assert!(
+                !of_event(&lines, late_event).is_empty(),
+                "{late_event}: {lines:#?}"
+            );
+            assert_eq!(
+                recorded.unwrap(),
+                serde_json::json!("undetermined"),
+                "{late_event}: the last record gives the raised classification"
+            );
+        }
+    }
+
+    /// At job end the loss record comes after the `late_item` lines, with the classification a
+    /// later exchange has after them (ADR-386).
+    #[test]
+    fn the_loss_record_comes_after_the_job_end_s_late_items() {
+        // A read answered, so that a silent read after it is `vehicle`; an ECUReset the agent's
+        // deadline ended (its accepted response ends the answers from before it); and a silent
+        // read of the first request after it, which the lost VCI ended.
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+        );
+        answered.pending_visibility = exchange::PendingVisibility::Forwarded;
+        answered.times.agent.before_us = 500_000;
+        answered.times.agent.end_us = 600_000;
+        let transmit = |at_us: u64| UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: at_us + 100,
+                wall_unix_ms: 0,
+            }),
+            ..tx_done(0x7E0)
+        };
+        let mut reset = evidence(endpoint(0x7E0), &[0x11, 0x01], exchange::End::VciDidNotEnd);
+        reset.pending_visibility = exchange::PendingVisibility::Forwarded;
+        reset.times.agent.before_us = 2_000_000;
+        reset.times.agent.end_us = 3_000_000;
+        let (silent, silent_items) = silent_read(0x90, 6_000_000);
+        let (dir, setup, log, seqs) = log_of(vec![
+            (answered, vec![transmit(500_000)]),
+            (reset, vec![transmit(2_000_000)]),
+            (silent, silent_items),
+        ]);
+        let (stray, later) = (seqs[1], seqs[2]);
+        let (before, _) = standing_and_recorded(&log, &setup, later);
+        assert!(
+            before < exchange::Classification::Undetermined,
+            "{before:?}"
+        );
+        log.lock().note_loss(later, before, false).unwrap();
+        // The reset's accepted response, and a link error of no primitive read before it.
+        log.primitive_ended(
+            stray,
+            ended_with(
+                Some(exchange::End::Positive(vec![0x51, 0x01])),
+                vec![
+                    unattached_error(400_000, 7_900_000, Some(exchange::Clock::Device), false),
+                    response_read(500_000, 8_000_000),
+                ],
+            ),
+        )
+        .unwrap();
+        let (standing, _) = standing_and_recorded(&log, &setup, later);
+        assert_eq!(standing, exchange::Classification::Undetermined);
+        let lines = finished(&log, &setup, &dir);
+        let ended = index_of(&lines, "primitive_ended");
+        assert_eq!(lines[ended]["refers_to"], serde_json::json!([stray, later]));
+        let last_late = lines
+            .iter()
+            .rposition(|line| line["event"] == "late_item")
+            .expect("a late_item");
+        assert!(ended < last_late, "{lines:#?}");
+        let records: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(at, line)| line["event"] == "vci_loss" && *at > ended)
+            .map(|(at, _)| at)
+            .collect();
+        assert!(!records.is_empty(), "{lines:#?}");
+        assert!(
+            records.iter().all(|at| *at > last_late),
+            "no loss record between the entry and its late items: {lines:#?}"
+        );
+        let recorded = lines[*records.last().unwrap()]["ended"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|taken| taken["seq"] == later)
+            .unwrap()["classification"]
+            .clone();
+        assert_eq!(recorded, serde_json::to_value(standing).unwrap());
+    }
+
     /// A link error bound to the primitive is before the answer by read order: the evidence
     /// holds the flag the ordinal gives (design 8.11 "Link error").
     #[test]

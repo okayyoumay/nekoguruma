@@ -1,7 +1,7 @@
 # ADR-372: A Late Link Error Settles the Exchanges It May Have Come During
 
 **Date:** 2026-10-28
-**Status:** Accepted (item 2's exchange with only end-side times, and item 3's late answer counted after an error and window left unreclassified by an error before it, revised by ADR-384)
+**Status:** Accepted (item 2's exchange with only end-side times, and item 3's late answer counted after an error and window left unreclassified by an error before it, revised by ADR-384; item 2's answer of an exchange taken as after the error, and item 3's recount by position, revised by ADR-385)
 **Affects:** `agent` communication log (`comm_log.rs` `CommLog::exchange_with`,
 `Inner::late_link_error`, `Inner::read_since`, `Inner::note_reads`, `Settled::after_link_error`;
 `comm_log/exchange.rs` `ErrorPoint`, `LinkState::place_error`, `LinkState::written_since`,

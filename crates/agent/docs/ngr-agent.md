@@ -509,8 +509,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   link, H3 on another. An exchange with only end-side times may have held one no later than
   its latest time while no exchange has left the window, and takes it as H3 only. Between exchanges, it settles the exchanges after
   it alone. Either way, the matched answers and the answers since an error from before it end
-  for every target, and the later exchanges are reclassified; a late answer counts as matched
-  since the error only when its time is shown after the error's (ADR-384). Before the window,
+  for every target, and the later exchanges are reclassified. An answer counts as matched, and
+  as an answer since a late error, only when its answering item's time, which every exchange
+  keeps, is shown after the error's on one clock and epoch, or its exchange was logged after
+  the error was read: the settling entries, the error's recount and an answer freed through
+  its owners all use that test; the stored time does not place a later error (ADR-384,
+  ADR-385). Before the window,
   every window exchange is reclassified from the window alone.
   One that cannot be placed on one clock with the exchanges is a possible link error (H3) during
   each exchange written since the link's items were last read before it; with none, it stays
@@ -635,7 +639,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   acceptance, without the owed requests from before it as owners. A link error ends the matched answers too, but a final response that came after
   every link error of its exchange, in the order the host read the link's items, counts as an answer
   since the error (VCI times are not compared); an error after it, or from another link of the
-  channel, ends it. A reopened link, a worker
+  channel, ends it. A late link error read afterwards tests that answer's time as above. A reopened link, a worker
   restart or a VCI reconnect (`LinkState::reopened`) ends the matched answers and keeps the owed
   requests. The other rows stand as comments where the table puts them, and evidence only they
   could classify falls to the last row, `undetermined`, at the place in the table where that row

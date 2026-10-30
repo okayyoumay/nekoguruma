@@ -370,12 +370,13 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-378](ADR-378-a-loss-is-judged-only-on-clock-tolerances-a-profile-gives.md) | A Loss Is Judged Only on Clock Tolerances a Profile Gives | Accepted (the placement it left open settled by ADR-383) | `agent` communication log (`Inner::settle_loss`); design 8.11 `vci_loss_settled`, "Drift bound"; ADR-357; ADR-373 item 4 |
 | [ADR-379](ADR-379-a-gap-across-runs-is-not-judged-on-a-suspend-count.md) | A Gap Across Runs Is Not Judged on a Suspend Count | Accepted | `agent` communication log (`CommLog::round_trip_us`, `Inner::note_loss`, `Inner::settle_loss`, `Inner::sample_boot_at`, `Inner::boot_at`); design 8.11 `vci_loss_settled`; ADR-374 items 2, 4 and 5 and Consequences |
 | [ADR-380](ADR-380-the-review-loops-wake-themselves-with-a-timer.md) | The Review Loops Wake Themselves with a Timer | Accepted | `.claude/skills/pr-review-loop` (Step 0, Step 5), `.claude/skills/backlog-loop` (step 6); ADR-360 item 2 |
-| [ADR-381](ADR-381-enumerate-the-cases-before-coding-and-pause-long-code-review-loops.md) | Enumerate the Cases Before Coding, and Pause Long Code Review Loops | Accepted | `.claude/README.md` (gates), `.claude/skills/backlog-loop` (step 4), `.claude/skills/pr-review-loop` (Steps 3-4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-349 items 1 and 4 |
+| [ADR-381](ADR-381-enumerate-the-cases-before-coding-and-pause-long-code-review-loops.md) | Enumerate the Cases Before Coding, and Pause Long Code Review Loops | Accepted (item 1 extended by ADR-387: one row per path that writes the value the rule decides) | `.claude/README.md` (gates), `.claude/skills/backlog-loop` (step 4), `.claude/skills/pr-review-loop` (Steps 3-4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-349 items 1 and 4 |
 | [ADR-382](ADR-382-the-backlog-loop-prepares-the-next-item-while-a-pr-waits-for-merge.md) | The Backlog Loop Prepares the Next Item While a PR Waits for Merge | Accepted | `.claude/skills/backlog-loop`, `.claude/skills/next-task`, `CLAUDE.md`; ADR-230 |
 | [ADR-383](ADR-383-half-a-wrap-of-silence-opens-a-clock-epoch.md) | Half a Wrap of Silence Opens a Clock Epoch | Accepted | `agent` communication log (`comm_log/clocks.rs` `VciClocks::read`, `near_latest`, `latest`; `comm_log.rs` order anchor, `place_read`, `place_unread`); design 8.11 "Drift bound", "Window", "Order", `clock_epoch`; ADR-361 items 2 and 3; ADR-375; ADR-378 |
 | [ADR-384](ADR-384-late-attribution-judges-only-what-its-times-show.md) | Late Attribution Judges Only What Its Times Show | Accepted (item 2's stored answered-only flag, and the Consequences' recount by position, revised by ADR-385) | `agent` communication log (`comm_log/exchange.rs` `ErrorPoint`, `place_error`, `error_after`, `SettledAnswer`; `comm_log.rs` `late_link_error`, `late_item_unowned`); design 8.11 "Settlement", `late_item`; ADR-368; ADR-370 item 4; ADR-372 items 2 and 3; ADR-375; ADR-376 |
 | [ADR-385](ADR-385-every-count-since-a-late-error-tests-the-answers-stored-time.md) | Every Count Since a Late Error Tests the Answer's Stored Time | Accepted | `agent` communication log (`comm_log/exchange.rs` `answer_at`, `answer_time`, `judge_answer`, `since_late_error`, `error_after`, `reclassify_one`; `comm_log.rs` settling paths); design 8.11 "Settlement", `late_item`; ADR-372 items 2 and 3; ADR-384 |
 | [ADR-386](ADR-386-a-primitive-s-end-is-placed-in-one-pass-in-read-order.md) | A Primitive's End Is Placed in One Pass, in Read Order | Accepted | `agent` host (`settle_at_end`, `Progress`, `log_primitive_end`), communication log (`PrimitiveEnded`, `primitive_ended`, `late_link_errors`, `late_link_error`, `refresh_loss`); design 8.11 "Order", "Link error", `primitive_ended`, `late_item`; ADR-358; ADR-366; ADR-367; ADR-372; ADR-373 |
+| [ADR-387](ADR-387-a-case-table-lists-every-path-that-writes-the-value-it-decides.md) | A Case Table Lists Every Path That Writes the Value It Decides | Accepted | `.claude/README.md` (gates); ADR-381 item 1 |
 
 ## Status Legend
 
@@ -735,8 +736,9 @@ the predecessor repository these ADRs came from.
 - ADR-356
 - ADR-360 (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer)
 - ADR-380
-- ADR-381
+- ADR-381 (item 1 extended by ADR-387: one row per path that writes the value the rule decides)
 - ADR-382
+- ADR-387
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

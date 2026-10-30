@@ -766,7 +766,7 @@ started transfer keeps the flash path. `restart::classify_plain_procedure` decid
 | Journal | Decision |
 |---|---|
 | no `Request` was ever recorded, whatever the journal's states | plain start on the same journal, counted (below) |
-| the only `Request` is withdrawn (`RecoveryFacts::last_request_withdrawn`, ADR-392) | the same plain start: the request never left. With earlier requests, a withdrawn newest one is not unconfirmed, and the checks below still apply |
+| every `Request` is withdrawn (`RecoveryFacts::standing_request` is `None`, ADR-392) | the same plain start: no request ever left. Otherwise the newest request that is not withdrawn is the one judged by the rows below |
 | the last `Request` is not older than the state of the latest checkpoint (the newest record that carries a VM state), or there is no such state | `OnSiteInterventionRequired(UnconfirmedRequest { at })`: the unsafe primitive may have reached the ECU. It holds at every later resume until a person acts |
 | the latest checkpoint's state does not decode, or fails `Vm::check_state` with its step count set to `restart::next_steps` | `OnSiteInterventionRequired(InvalidEntryState)`, before the conditions below read the state |
 | otherwise, from the latest checkpoint's state, one of the conditions below fails | `OnSiteInterventionRequired(NotResumable { cause })` |

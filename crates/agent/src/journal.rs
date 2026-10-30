@@ -154,6 +154,12 @@ pub struct RecoveryFacts {
     /// ended with the request provably unsent (ADR-392). It names `last_request` or is `None`;
     /// a newer request is not withdrawn by it.
     pub last_request_unsent: Option<StepRef>,
+    /// The newest request marker that is not withdrawn (ADR-392): the one a restart judges.
+    /// `None` when there is no marker or every marker was withdrawn.
+    pub standing_request: Option<StepRef>,
+    /// `standing_request` as it was when `last_request` was committed, which a withdrawal of
+    /// `last_request` brings back.
+    pub standing_before_last_request: Option<StepRef>,
 }
 
 /// Why a run stopped without reaching the program's end or a `Fail` (ADR-288).
@@ -204,6 +210,8 @@ impl RecoveryFacts {
             first_request: None,
             last_request: None,
             last_request_unsent: None,
+            standing_request: None,
+            standing_before_last_request: None,
         }
     }
 
@@ -398,6 +406,8 @@ impl RecoveryFacts {
                 }
                 self.first_request.get_or_insert(*at);
                 self.last_request = Some(*at);
+                self.standing_before_last_request = self.standing_request;
+                self.standing_request = Some(*at);
             }
             Record::RequestNotSent { at } => {
                 if self.last_request != Some(*at) {
@@ -410,6 +420,7 @@ impl RecoveryFacts {
                     return Err("a withdrawn request must come after the last step");
                 }
                 self.last_request_unsent = Some(*at);
+                self.standing_request = self.standing_before_last_request;
             }
             Record::PostTransferComplete => {
                 let exit = self.open_transfer().and_then(|t| t.exit.as_mut()).ok_or(
@@ -1614,6 +1625,8 @@ mod tests {
             let mut view = state.clone();
             view.facts.first_request = None;
             view.facts.last_request = None;
+            view.facts.standing_request = None;
+            view.facts.standing_before_last_request = None;
             view.latest_checkpoint = None;
             view.records = 0;
             view

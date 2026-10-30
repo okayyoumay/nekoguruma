@@ -511,11 +511,12 @@ pub fn classify(
 /// The classification of a job whose journal holds no transfer-start marker (ADR-335 items 3 to
 /// 5), after the checks `classify` makes first. The journal holds a plain procedure's requests
 /// and checkpoints (ADR-335 item 2). In this order:
-/// - no request ever recorded: [`RestartDecision::PlainStart`], on the same journal, whatever
+/// - no request ever recorded, or every one withdrawn: [`RestartDecision::PlainStart`], on the same journal, whatever
 ///   the journal's states (a plain start needs none). The caller counts it (ADR-335 item 6);
 /// - a withdrawn `Request` (its run ended with the request provably unsent, ADR-392) counts as no
-///   request: when it is the only one, the answer is [`RestartDecision::PlainStart`]; otherwise
-///   the next point does not apply to it, and the checks after it still do;
+///   request: the request judged below is the newest one that is not withdrawn
+///   (`RecoveryFacts::standing_request`), and when there is none the answer is
+///   [`RestartDecision::PlainStart`];
 /// - a `Request` newer than the newest state record is [`OnSiteReason::UnconfirmedRequest`]: the
 ///   primitive it guards may have reached the ECU, and the VM state after it was never journaled.
 ///   The newest state record is the latest checkpoint, whose own step count says which step runs
@@ -546,16 +547,11 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
     let on_site = |reason| RestartDecision::OnSiteInterventionRequired(reason);
     let not_resumable = |cause| on_site(OnSiteReason::NotResumable { cause });
     let facts = &state.facts;
-    // The first request is recorded with the last, so none of either means none was sent.
-    let (Some(first), Some(request)) = (facts.first_request, facts.last_request) else {
+    // The newest request that is not withdrawn (ADR-392): a request whose run ended with it
+    // provably unsent never reached the ECU, so none standing means none was sent.
+    let Some(request) = facts.standing_request else {
         return RestartDecision::PlainStart;
     };
-    // A request whose run ended with it provably unsent never reached the ECU (ADR-392): when
-    // it is the only one, none was sent.
-    let withdrawn = facts.last_request_withdrawn();
-    if withdrawn && first == request {
-        return RestartDecision::PlainStart;
-    }
     let Some((at, bytes)) = &state.latest_checkpoint else {
         return on_site(OnSiteReason::UnconfirmedRequest { at: request });
     };
@@ -567,9 +563,7 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
             return on_site(OnSiteReason::UnconfirmedRequest { at: request });
         }
     };
-    // A withdrawn request is not unconfirmed; the requests before it are confirmed by the
-    // checkpoint's order, and the checks below still apply.
-    if !withdrawn && request.steps >= resumed.steps {
+    if request.steps >= resumed.steps {
         return on_site(OnSiteReason::UnconfirmedRequest { at: request });
     }
     // A damaged state is refused before the checks below read its pc and call stack.
@@ -4132,6 +4126,54 @@ def main():
             decide(&program, &journal),
             RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
                 at: at(9)
+            })
+        );
+    }
+
+    /// Two withdrawn requests in a row (a first run and a resume, each refused before the send)
+    /// are no request: the next resume starts plain. A withdrawal after a confirmed request
+    /// leaves the verdict that request gave; one after an unconfirmed request (a crash) leaves
+    /// the earlier one unconfirmed.
+    #[test]
+    fn withdrawn_requests_leave_the_verdict_of_the_one_that_stands() {
+        let program = plain_program();
+        let start = state_bytes(&state_at_pc(&program, 0, 0));
+        let mut twice = Journal::on_store(Memory, plain_key());
+        twice.commit_run_start(at(0), &start).unwrap();
+        twice.commit_request(at(4)).unwrap();
+        twice.commit_request_not_sent(at(4)).unwrap();
+        twice.commit_run_start(at(5), &start).unwrap();
+        twice.commit_request(at(9)).unwrap();
+        twice.commit_request_not_sent(at(9)).unwrap();
+        assert_eq!(twice.state().facts.standing_request, None);
+        assert_eq!(decide(&program, &twice), RestartDecision::PlainStart);
+
+        let confirmed = plain_journal(&program, true, &state_at_pc(&program, 5, 3));
+        let before = decide(&program, &confirmed);
+        let mut withdrawn = confirmed;
+        withdrawn.commit_request(at(8)).unwrap();
+        withdrawn.commit_request_not_sent(at(8)).unwrap();
+        // The same verdict; the resumed state's step count moves on past the withdrawn marker.
+        match (before, decide(&program, &withdrawn)) {
+            (
+                RestartDecision::ResumeFromCheckpoint(a),
+                RestartDecision::ResumeFromCheckpoint(b),
+            ) => {
+                assert_eq!((a.at, a.state.pc), (b.at, b.state.pc));
+                assert!(b.state.steps > a.state.steps);
+            }
+            (a, b) => panic!("{a:?} then {b:?}"),
+        }
+
+        let mut crashed = Journal::on_store(Memory, plain_key());
+        crashed.commit_run_start(at(0), &start).unwrap();
+        crashed.commit_request(at(4)).unwrap();
+        crashed.commit_request(at(8)).unwrap();
+        crashed.commit_request_not_sent(at(8)).unwrap();
+        assert_eq!(
+            decide(&program, &crashed),
+            RestartDecision::OnSiteInterventionRequired(OnSiteReason::UnconfirmedRequest {
+                at: at(4)
             })
         );
     }

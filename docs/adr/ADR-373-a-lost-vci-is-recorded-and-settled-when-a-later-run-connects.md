@@ -1,7 +1,7 @@
 # ADR-373: A Lost VCI Is Recorded and Settled When a Later Run Connects
 
 **Date:** 2026-10-28
-**Status:** Accepted (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374; item 4's comparison judged only on a drift bound and clock margin a profile gives, by ADR-378; item 2's record rewritten after every settling entry that changes a listed exchange, by ADR-386)
+**Status:** Accepted (first Consequence's gap between two runs of one boot measured and recorded, not judged, by ADR-374; item 4's comparison judged only on a drift bound and clock margin a profile gives, by ADR-378; item 2's record rewritten after every settling entry that changes a listed exchange, by ADR-386; item 3's loss settled within the run when the VCI comes back in it, by ADR-393)
 **Affects:** `agent` communication log (`comm_log.rs` `VciLoss`, `Inner::note_loss`,
 `Inner::settle_loss`, `CommLog::vci_connected`, `CommLog::loss_to_settle`, `scan`;
 `comm_log/clocks.rs` `VciClocks::last`, `loss_fit`), `agent` runner (`run_job`) and host

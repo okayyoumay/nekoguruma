@@ -1,7 +1,7 @@
 # ADR-392: The Runner Repeats a Failed Primitive by Its Idempotency
 
 **Date:** 2026-10-30
-**Status:** Accepted
+**Status:** Accepted (item 6's lost VCI continues within the run by ADR-393)
 **Affects:** `agent` runner (`runner.rs` `run_vm`, `JobLimits::max_primitive_repeats`),
 restart (`restart.rs` repeat decision, plain-procedure classification), journal (`journal.rs`
 `Record::RequestNotSent`), host and communication log (`origin: repeat`); design 5.6, 8.2.5,

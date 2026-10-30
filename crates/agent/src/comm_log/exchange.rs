@@ -3090,6 +3090,25 @@ pub(crate) fn sent_of(evidence: &Evidence, history: &LinkHistory) -> (Sent, Sent
     (Sent::Unknown, SentEvidence::None)
 }
 
+/// The `sent` value of an exchange that ended as `end` with nothing else known, for a test
+/// that holds another module's classification to the log's.
+#[cfg(test)]
+pub(crate) fn sent_of_end(request: &[u8], end: End) -> Sent {
+    let evidence = Evidence::new(
+        Origin::Procedure,
+        Target::Endpoint {
+            link: 1,
+            tx_id: 0x7E0,
+            rx_id: 0x7E8,
+        },
+        1,
+        0x7E8,
+        request.to_vec(),
+        end,
+    );
+    sent_of(&evidence, &LinkHistory::empty()).0
+}
+
 /// The entry's text: one sentence in vehicle-communication terms.
 pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
     let (sent, sent_evidence) = sent_of(evidence, history);

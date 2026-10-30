@@ -1707,12 +1707,12 @@ worker. The rows are checked in order; the first that matches is the reading.
 
 | The answer | Reading | The agent's use |
 |---|---|---|
-| The client's own deadline for the call passed (no answer) | The worker does not answer: neither a refusal nor a success | `HostError::WorkerUnresponsive` |
+| The client's own deadline for the call passed (no answer) | The worker does not answer: neither a refusal nor a success | `HostError::WorkerUnresponsive`; a `StartComPrimitive` so answered is `SendState::MayHaveReached` |
 | Code `UNAVAILABLE`, `CANCELLED` or `UNKNOWN` | The connection to the worker failed: the call may not have reached the library, so this is no answer of the library's | Never read as a refusal (`agent::link`'s `refused`; the guarded handle's `refuses_indication` in `ngr-hw-checks` keeps its own copy) |
-| Code `FAILED_PRECONDITION` with `error_event_data.error_event` `PDU_ERR_EVT_LOST_COMM_TO_VCI` | The VCI is lost; the link is offline and the worker ended its primitives. A `StartComPrimitive` answered so was not sent (ADR-294) | `HostError::VciLost` |
+| Code `FAILED_PRECONDITION` with `error_event_data.error_event` `PDU_ERR_EVT_LOST_COMM_TO_VCI` | The VCI is lost; the link is offline and the worker ended its primitives. A `StartComPrimitive` answered so was not sent (ADR-294) | `HostError::VciLost { refused_after_loss: true }`, `SendState::NotSent` |
 | `ErrorDetail.pdu_error` `PDU_ERR_INVALID_HANDLE`, whatever the code | The worker knows no object with the handle given (ISO 22900-2:2022 D.3). For a `CancelComPrimitive`, the primitive had already ended, which counts as cancelled | The host's stray-primitive cancel (`names_invalid_handle`); the guarded handle's `cancel_maybe_ended` |
-| A `StartComPrimitive` whose `ErrorDetail.refusal` is set | Refused before anything was sent, for the reason named (ADR-350) | The entry is `not_sent` |
-| Any other failure (`INTERNAL` included) | The worker or the library answered and did not do what was asked. For an optional setting, such as an indication ComParam, that is the library refusing it; for a required step, a failure of that step. Whether the request reached the bus is unknown unless a row above says so | An optional setting is left off; a required step's failure is `HostError::Rpc` |
+| A `StartComPrimitive` whose `ErrorDetail.refusal` is set | Refused before anything was sent, for the reason named (ADR-350) | The entry is `not_sent`; `SendState::NotSent` |
+| Any other failure (`INTERNAL` included) | The worker or the library answered and did not do what was asked. For an optional setting, such as an indication ComParam, that is the library refusing it; for a required step, a failure of that step. Whether the request reached the bus is unknown unless a row above says so | An optional setting is left off; a required step's failure is `HostError::Rpc`; a `StartComPrimitive` so answered is `SendState::MayHaveReached` |
 
 ---
 

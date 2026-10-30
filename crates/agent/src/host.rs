@@ -57,8 +57,10 @@ pub enum HostError {
     ///   or may not have reached the ECU;
     /// - the loss came before the primitive, and the worker refused to start it on the link it
     ///   had taken offline (ADR-294): the request was not sent.
+    ///
+    /// `refused_after_loss` tells them apart: `true` for the second.
     #[error("the VCI was lost")]
-    VciLost,
+    VciLost { refused_after_loss: bool },
     /// The primitive ended without a response after the worker reported this error event
     /// for it (for example a transmit error), so the request may not have been sent.
     #[error("the primitive failed: {}", error_event_name(*.0))]
@@ -153,6 +155,77 @@ pub enum HostError {
     InputNotEstablished(diag_ir::RuntimeInput),
 }
 
+/// Whether a failed send-receive's request may have reached the ECU.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SendState {
+    /// A refusal before the primitive started proves nothing was sent: the agent refused the
+    /// request itself, an earlier primitive still held the link, or the worker refused the start
+    /// with a reason or because the VCI was already lost (ADR-294, ADR-350 item 2). Only proof
+    /// gives this state.
+    NotSent,
+    /// The request may have been sent: the primitive started, or the start's outcome is unknown
+    /// (a start that timed out or failed without a refusal). Not a promise that it was sent.
+    MayHaveReached,
+}
+
+impl HostError {
+    /// Whether the request of the send-receive that failed with this error may have reached the
+    /// ECU. `NotSent` only when a refusal before the start proves nothing was sent; every other
+    /// error, and any error added later, is `MayHaveReached` until it is judged otherwise.
+    ///
+    /// It judges the errors of a request to the ECU (`service_request`, `send_receive`,
+    /// `routine_control`, `flash_transfer` and the other primitives). An error of another
+    /// step, such as opening the link or reading a runtime input, sent no request whatever this
+    /// says.
+    pub fn send_state(&self) -> SendState {
+        match self {
+            // The agent refused before the start RPC.
+            HostError::LinkHeld
+            | HostError::BadService(_)
+            | HostError::NotAllowed(_)
+            | HostError::EmptyRequest
+            | HostError::UndeclaredService(_)
+            | HostError::WrongService { .. }
+            | HostError::BadNegativeShape(_)
+            | HostError::DownloadBySendReceive(_)
+            | HostError::UseFlashTransfer
+            | HostError::TransferInterrupted(_)
+            | HostError::NoTransferActive
+            | HostError::BlockTooLong { .. }
+            | HostError::NoBlockLength { .. }
+            | HostError::NoArtifact
+            | HostError::ArtifactRange { .. }
+            | HostError::Unsupported(_)
+            | HostError::DeclaredLink(_)
+            | HostError::InputNotEstablished(_) => SendState::NotSent,
+            // The worker refused the start after a lost VCI (ADR-294).
+            HostError::VciLost {
+                refused_after_loss: true,
+            } => SendState::NotSent,
+            // The worker refused the start and named a reason (ADR-350 item 2).
+            HostError::Rpc { rpc, status }
+                if *rpc == "StartComPrimitive" && refusal_reason(status).is_some() =>
+            {
+                SendState::NotSent
+            }
+            // A start that timed out or failed without a refusal: neither a refusal nor a
+            // success was seen (rpc-api-guide "Reading a Worker's Answer").
+            HostError::Rpc { .. }
+            | HostError::WorkerUnresponsive(_)
+            | HostError::Setup(_)
+            | HostError::VciLost {
+                refused_after_loss: false,
+            }
+            | HostError::NoResponse
+            | HostError::EventsLost
+            | HostError::EventStreamEnded
+            | HostError::PrimitiveFailed(_)
+            | HostError::TransferRefused { .. }
+            | HostError::TransferEchoMismatch { .. } => SendState::MayHaveReached,
+        }
+    }
+}
+
 /// The name of an error event, or its code when it is not one the interface lists (a
 /// vendor's), as an error message and the communication log's `detail` give it.
 fn error_event_name(code: i32) -> String {
@@ -175,7 +248,10 @@ fn lost_vci_between_primitives(error: HostError) -> HostError {
                         data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
                     }) =>
         {
-            HostError::VciLost
+            // The start was refused after the loss (ADR-294).
+            HostError::VciLost {
+                refused_after_loss: true,
+            }
         }
         _ => error,
     }
@@ -585,7 +661,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 self.log_primitive_end(&stray, &mut progress, StrayEnd::Cancelled)
             }
             Ok(_) => {}
-            Err(HostError::VciLost) => {}
+            Err(HostError::VciLost { .. }) => {}
             Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => {}
             Err(error) => tracing::warn!(
                 error = %crate::oplog::LogSafe::log_text(&error),
@@ -707,13 +783,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         };
         let primitive = match ended {
             StrayEnd::Ended(result) => {
-                let (end, mut detail) = sent_end(
-                    &stray.request,
-                    result,
-                    &progress.negative,
-                    progress.sid,
-                    true,
-                );
+                let (end, mut detail) =
+                    sent_end(&stray.request, result, &progress.negative, progress.sid);
                 // The event named and its extra error information, as for an exchange, from
                 // every error the primitive reported: the one that ended it may have been read
                 // before the deadline.
@@ -855,7 +926,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let handle = self.handle.clone();
         let sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
         if let Some((request, expected, negative, sid)) = logged {
-            let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid, sent.started);
+            let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid);
             let end = deadline_end(end, sent.agent_deadline);
             let end = unanswered_end(end, &sent);
             let end_rejected = matches!(end, End::PositiveUnusable(_)) && sent.result.is_err();
@@ -962,7 +1033,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             .map_err(lost_vci_between_primitives);
             let carried_out = match cancelled {
                 Ok(_) => true,
-                Err(HostError::VciLost) => false,
+                Err(HostError::VciLost { .. }) => false,
                 Err(HostError::Rpc { status, .. }) if names_invalid_handle(&status) => false,
                 Err(_) => {
                     self.stray = Some(Stray {
@@ -1144,7 +1215,6 @@ impl<C: WorkerApi> WorkerHost<C> {
             .and_then(|outcome| outcome);
         Sent {
             result,
-            started: true,
             error_events: std::mem::take(&mut progress.errors),
             errors_before_response: progress.errors_before_response.take(),
             rx_timeout: progress.rx_timeout.take(),
@@ -1267,6 +1337,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         error: &HostError,
         caused_by: Option<u64>,
     ) {
+        // The log's `not_sent` and `send_state` are one judgement (ADR-389).
+        debug_assert_eq!(error.send_state(), SendState::NotSent, "{error:?}");
         let end = End::NotSent(refusal_cause(request, error));
         let detail = Detail {
             host_error: Some(host_error_name(error)),
@@ -1695,13 +1767,11 @@ fn vci_time(item: &EventItem) -> VciTime {
     VciTime::new(u64::from(item.timestamp), clock_of(item))
 }
 
-/// How a primitive ended: its outcome, whether it started (a failure to start it sent
-/// nothing), the error events it reported before it ended, in order, the receive timeout if the
+/// How a primitive ended: its outcome, the error events it reported before it ended, in order, the receive timeout if the
 /// worker reported one, the lost VCI if the event stream reported it, and the items of no
 /// primitive or of an earlier one read meanwhile.
 struct Sent {
     result: Result<Vec<u8>, HostError>,
-    started: bool,
     error_events: Vec<ErrorSeen>,
     /// How many of `error_events` were read before the final response, when there was one.
     errors_before_response: Option<usize>,
@@ -1736,7 +1806,6 @@ impl Sent {
     fn not_started(result: Result<Vec<u8>, HostError>) -> Self {
         Self {
             result,
-            started: false,
             error_events: Vec::new(),
             errors_before_response: None,
             rx_timeout: None,
@@ -1837,7 +1906,7 @@ fn named_events(
     // The event `sent_end` named, when it named one: the one that ended the exchange.
     let named = match result {
         Err(HostError::PrimitiveFailed(_)) => error_events.last(),
-        Err(HostError::VciLost) => vci_lost,
+        Err(HostError::VciLost { .. }) => vci_lost,
         _ => None,
     };
     let named = if detail.error_event.is_some() {
@@ -1872,7 +1941,7 @@ fn suppresses_positive_response(request: &[u8]) -> bool {
 }
 
 /// How a sent request ended, as its exchange entry gives it (design 8.11, `outcome`), and the
-/// internal names behind it. `started` tells a primitive that could not start from one that ran.
+/// internal names behind it. Whether the request was sent comes from [`HostError::send_state`].
 ///
 /// A positive response the agent cannot use is `positive_unusable`: a TransferData answer that
 /// does not echo the block's counter, and a RequestDownload answer with no readable
@@ -1882,7 +1951,6 @@ fn sent_end(
     result: &Result<Vec<u8>, HostError>,
     negative: &NegativeShape,
     sid: u8,
-    started: bool,
 ) -> (End, Detail) {
     let error = match result {
         Ok(response) if negative.is_negative(sid, response) => {
@@ -1915,28 +1983,28 @@ fn sent_end(
         HostError::EventsLost => End::Unknown(UnknownCause::EventsLost),
         HostError::EventStreamEnded => End::Unknown(UnknownCause::EventsEnded),
         HostError::WorkerUnresponsive(_) => End::Unknown(UnknownCause::WorkerNotAnswering),
-        HostError::Rpc { status, .. } => {
+        HostError::Rpc { rpc, status } => {
             detail.grpc_status = Some(grpc_code_name(status.code()));
             // A start the worker refused and names a reason for was not sent (ADR-350 item 2):
             // the worker's own reasons, `system`. Without a reason the send stays unknown.
-            if !started && let Some(reason) = refusal_reason(status) {
-                detail.worker_detail = Some(reason.as_str_name().to_owned());
+            if error.send_state() == SendState::NotSent {
+                detail.worker_detail = refusal_reason(status).map(|r| r.as_str_name().to_owned());
                 return (End::NotSent(RefusalCause::SystemOwnReasons), detail);
             }
-            End::Unknown(if started {
-                UnknownCause::RpcFailure
-            } else {
+            End::Unknown(if *rpc == "StartComPrimitive" {
                 UnknownCause::PrimitiveFailedToStart
+            } else {
+                UnknownCause::RpcFailure
             })
         }
         HostError::Setup(_) => End::Unknown(UnknownCause::PrimitiveFailedToStart),
-        HostError::VciLost => {
+        HostError::VciLost { refused_after_loss } => {
             // Both cases of `VciLost` come from this event.
             detail.error_event = Some(error_event_name(
                 PduErrorEvent::PduErrEvtLostCommToVci as i32,
             ));
             End::VciLost {
-                refused_after_loss: !started,
+                refused_after_loss: *refused_after_loss,
             }
         }
         HostError::PrimitiveFailed(code) => {
@@ -2005,7 +2073,7 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::EventStreamEnded => "EventStreamEnded",
         HostError::NoResponse => "NoResponse",
         HostError::EventsLost => "EventsLost",
-        HostError::VciLost => "VciLost",
+        HostError::VciLost { .. } => "VciLost",
         HostError::PrimitiveFailed(_) => "PrimitiveFailed",
         HostError::BadService(_) => "BadService",
         HostError::NotAllowed(_) => "NotAllowed",
@@ -2429,7 +2497,9 @@ impl Progress {
                 self.new_items
                     .push(EndItem::Error(end_error(data, vci_time(&item), None)));
             }
-            return Some(Err(HostError::VciLost));
+            return Some(Err(HostError::VciLost {
+                refused_after_loss: false,
+            }));
         }
         // Events of earlier primitives, and of none, are not this request's; their results and
         // errors are kept for the communication log.
@@ -2816,26 +2886,30 @@ mod tests {
 
     // ---- exchange entries (design 8.11 "Exchange entry") ----
 
-    fn end_of(request: &[u8], result: Result<Vec<u8>, HostError>, started: bool) -> (End, Detail) {
-        sent_end(request, &result, &NegativeShape::uds(), request[0], started)
+    fn end_of(request: &[u8], result: Result<Vec<u8>, HostError>) -> (End, Detail) {
+        sent_end(request, &result, &NegativeShape::uds(), request[0])
     }
 
     fn rpc(code: tonic::Code) -> HostError {
+        rpc_of("StartComPrimitive", code)
+    }
+
+    fn rpc_of(rpc: &'static str, code: tonic::Code) -> HostError {
         HostError::Rpc {
-            rpc: "StartComPrimitive",
+            rpc,
             status: Box::new(tonic::Status::new(code, "x")),
         }
     }
 
     /// A start the worker refused with a reason was not sent, refused by the worker for its own
     /// reasons (ADR-350 item 2, design 8.11 `not_sent`), the reason in `detail`. A refusal
-    /// without a reason, and a reason on a primitive that started, keep the send unknown.
+    /// without a reason, and a reason on a call after the start, keep the send unknown.
     #[test]
     fn a_refusal_that_names_its_reason_is_not_sent() {
         use vci_service_interface::{ErrorDetail, PduError, RefusalReason};
-        let refused = |reason: Option<RefusalReason>| {
+        let refused_on = |rpc: &'static str, reason: Option<RefusalReason>| {
             Err(HostError::Rpc {
-                rpc: "StartComPrimitive",
+                rpc,
                 status: Box::new(vci_service_interface::status_with_error_detail(
                     tonic::Code::InvalidArgument,
                     "refused",
@@ -2848,13 +2922,14 @@ mod tests {
                 )),
             })
         };
+        let refused = |reason: Option<RefusalReason>| refused_on("StartComPrimitive", reason);
         let read = [0x22, 0xF1, 0x90];
         for reason in [
             RefusalReason::InvalidParameters,
             RefusalReason::QueueFull,
             RefusalReason::ProtocolCannotCarry,
         ] {
-            let (end, detail) = end_of(&read, refused(Some(reason)), false);
+            let (end, detail) = end_of(&read, refused(Some(reason)));
             assert!(
                 matches!(end, End::NotSent(RefusalCause::SystemOwnReasons)),
                 "{reason:?}: {end:?}"
@@ -2863,13 +2938,17 @@ mod tests {
             assert_eq!(detail.grpc_status, Some("InvalidArgument"));
         }
         for result in [refused(None), refused(Some(RefusalReason::Unspecified))] {
-            let end = end_of(&read, result, false).0;
+            let end = end_of(&read, result).0;
             assert!(
                 matches!(end, End::Unknown(UnknownCause::PrimitiveFailedToStart)),
                 "{end:?}"
             );
         }
-        let end = end_of(&read, refused(Some(RefusalReason::QueueFull)), true).0;
+        let end = end_of(
+            &read,
+            refused_on("SubscribeEvent", Some(RefusalReason::QueueFull)),
+        )
+        .0;
         assert!(
             matches!(end, End::Unknown(UnknownCause::RpcFailure)),
             "{end:?}"
@@ -2880,18 +2959,18 @@ mod tests {
     fn a_sent_request_ends_as_the_host_saw_it() {
         let read = [0x22, 0xF1, 0x90];
         assert!(matches!(
-            end_of(&read, Ok(vec![0x62, 0xF1, 0x90]), true).0,
+            end_of(&read, Ok(vec![0x62, 0xF1, 0x90])).0,
             End::Positive(_)
         ));
         assert!(matches!(
-            end_of(&read, Ok(vec![0x7F, 0x22, 0x31]), true).0,
+            end_of(&read, Ok(vec![0x7F, 0x22, 0x31])).0,
             End::Negative(_)
         ));
-        let (end, detail) = end_of(&read, Err(HostError::NoResponse), true);
+        let (end, detail) = end_of(&read, Err(HostError::NoResponse));
         assert!(matches!(end, End::NoResponse));
         assert_eq!(detail.host_error, Some("NoResponse"));
-        for (started, refused_after_loss) in [(false, true), (true, false)] {
-            let (end, detail) = end_of(&read, Err(HostError::VciLost), started);
+        for refused_after_loss in [true, false] {
+            let (end, detail) = end_of(&read, Err(HostError::VciLost { refused_after_loss }));
             assert!(
                 matches!(end, End::VciLost { refused_after_loss: r } if r == refused_after_loss),
                 "{end:?}"
@@ -2901,13 +2980,13 @@ mod tests {
                 Some("PDU_ERR_EVT_LOST_COMM_TO_VCI")
             );
         }
-        let (end, detail) = end_of(&read, Err(rpc(tonic::Code::Unavailable)), false);
+        let (end, detail) = end_of(&read, Err(rpc(tonic::Code::Unavailable)));
         assert!(
             matches!(end, End::Unknown(UnknownCause::PrimitiveFailedToStart)),
             "{end:?}"
         );
         assert_eq!(detail.grpc_status, Some("Unavailable"));
-        let end = end_of(&read, Err(rpc(tonic::Code::Internal)), true).0;
+        let end = end_of(&read, Err(rpc_of("SubscribeEvent", tonic::Code::Internal))).0;
         assert!(
             matches!(end, End::Unknown(UnknownCause::RpcFailure)),
             "{end:?}"
@@ -2917,7 +2996,6 @@ mod tests {
             Err(HostError::PrimitiveFailed(
                 PduErrorEvent::PduErrEvtTxError as i32,
             )),
-            true,
         );
         assert!(
             matches!(end, End::LinkError(LinkErrorKind::Transmit)),
@@ -2925,24 +3003,23 @@ mod tests {
         );
         assert_eq!(detail.error_event.as_deref(), Some("PDU_ERR_EVT_TX_ERROR"));
         assert!(matches!(
-            end_of(&read, Err(HostError::EventsLost), true).0,
+            end_of(&read, Err(HostError::EventsLost)).0,
             End::Unknown(UnknownCause::EventsLost)
         ));
         assert!(matches!(
-            end_of(&read, Err(HostError::EventStreamEnded), true).0,
+            end_of(&read, Err(HostError::EventStreamEnded)).0,
             End::Unknown(UnknownCause::EventsEnded)
         ));
         assert!(matches!(
             end_of(
                 &read,
-                Err(HostError::WorkerUnresponsive("StartComPrimitive")),
-                false
+                Err(HostError::WorkerUnresponsive("StartComPrimitive"))
             )
             .0,
             End::Unknown(UnknownCause::WorkerNotAnswering)
         ));
         assert!(matches!(
-            end_of(&read, Err(HostError::Setup("no handle")), false).0,
+            end_of(&read, Err(HostError::Setup("no handle"))).0,
             End::Unknown(UnknownCause::PrimitiveFailedToStart)
         ));
     }
@@ -2951,13 +3028,13 @@ mod tests {
     fn a_positive_response_the_agent_cannot_use_is_unusable() {
         let block = [0x36, 0x01, 0xAA];
         assert!(matches!(
-            end_of(&block, Ok(vec![0x76, 0x01]), true).0,
+            end_of(&block, Ok(vec![0x76, 0x01])).0,
             End::Positive(_)
         ));
         for wrong in [vec![0x76, 0x02], vec![0x76]] {
             assert!(
                 matches!(
-                    end_of(&block, Ok(wrong.clone()), true).0,
+                    end_of(&block, Ok(wrong.clone())).0,
                     End::PositiveUnusable(_)
                 ),
                 "{wrong:02X?}"
@@ -2965,11 +3042,11 @@ mod tests {
         }
         let download = [0x34, 0x00, 0x44, 0, 0, 0, 0, 0, 0, 1, 0];
         assert!(matches!(
-            end_of(&download, Ok(vec![0x74, 0x20, 0x01, 0x02]), true).0,
+            end_of(&download, Ok(vec![0x74, 0x20, 0x01, 0x02])).0,
             End::Positive(_)
         ));
         assert!(matches!(
-            end_of(&download, Ok(vec![0x74, 0x20, 0x01]), true).0,
+            end_of(&download, Ok(vec![0x74, 0x20, 0x01])).0,
             End::PositiveUnusable(_)
         ));
     }
@@ -3063,7 +3140,6 @@ mod tests {
         let frame = PduErrorEvent::PduErrEvtFrameStruct as i32;
         let sent = |result, error_events: &[i32], rx_timeout: bool| Sent {
             result,
-            started: true,
             error_events: error_events.iter().copied().map(seen).collect(),
             errors_before_response: None,
             rx_timeout: rx_timeout.then(|| seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
@@ -3080,8 +3156,7 @@ mod tests {
             deadline_reading: None,
         };
         let detail_of = |sent: &Sent| {
-            let (_, mut detail) =
-                sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
+            let (_, mut detail) = sent_end(&read, &sent.result, &NegativeShape::uds(), read[0]);
             let (link_errors, _) = events_seen(sent, &mut detail);
             assert_eq!(detail.extra_error_info, None);
             assert_eq!(detail.extra_error_info_name, None);
@@ -3090,7 +3165,13 @@ mod tests {
         let name = |name: &str| Some(name.to_owned());
         // A lost VCI after another error event: the loss is named, the other is a link error.
         assert_eq!(
-            detail_of(&sent(Err(HostError::VciLost), &[tx], false)),
+            detail_of(&sent(
+                Err(HostError::VciLost {
+                    refused_after_loss: false
+                }),
+                &[tx],
+                false
+            )),
             (
                 name("PDU_ERR_EVT_LOST_COMM_TO_VCI"),
                 vec![LinkErrorKind::Transmit]
@@ -3154,7 +3235,6 @@ mod tests {
         let lost = |extra| event(PduErrorEvent::PduErrEvtLostCommToVci, extra, None);
         let base = |result| Sent {
             result,
-            started: true,
             error_events: Vec::new(),
             errors_before_response: None,
             rx_timeout: None,
@@ -3171,8 +3251,7 @@ mod tests {
             deadline_reading: None,
         };
         let given = |sent: Sent| {
-            let (_, mut detail) =
-                sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
+            let (_, mut detail) = sent_end(&read, &sent.result, &NegativeShape::uds(), read[0]);
             events_seen(&sent, &mut detail);
             (
                 detail.error_event,
@@ -3224,7 +3303,9 @@ mod tests {
         let gone = Sent {
             error_events: vec![tx(Some(0x101), None)],
             vci_lost: Some(lost(Some(0xFFFF_FFFF))),
-            ..base(Err(HostError::VciLost))
+            ..base(Err(HostError::VciLost {
+                refused_after_loss: false,
+            }))
         };
         assert_eq!(
             given(gone),
@@ -3236,7 +3317,9 @@ mod tests {
         );
         // A lost VCI the start refused carries no event of the stream, so no information.
         assert_eq!(
-            given(base(Err(HostError::VciLost))),
+            given(base(Err(HostError::VciLost {
+                refused_after_loss: false
+            }))),
             (name("PDU_ERR_EVT_LOST_COMM_TO_VCI"), None, None)
         );
     }
@@ -3775,7 +3858,6 @@ mod tests {
             &Err(HostError::LinkHeld),
             &NegativeShape::uds(),
             read[0],
-            false,
         );
         assert!(
             matches!(end, End::NotSent(RefusalCause::LinkHeld)),
@@ -4169,7 +4251,6 @@ mod tests {
         assert!(silent.on_event(timeout, COP).is_none());
         let sent = |progress: &mut Progress, result| Sent {
             result,
-            started: true,
             error_events: std::mem::take(&mut progress.errors),
             errors_before_response: None,
             rx_timeout: progress.rx_timeout.take(),
@@ -4187,8 +4268,7 @@ mod tests {
         };
         let read = [0x22, 0xF1, 0x90];
         let named = |sent: &Sent| {
-            let (_, mut detail) =
-                sent_end(&read, &sent.result, &NegativeShape::uds(), read[0], true);
+            let (_, mut detail) = sent_end(&read, &sent.result, &NegativeShape::uds(), read[0]);
             events_seen(sent, &mut detail).1
         };
         let timed_out = sent(&mut silent, Err(HostError::NoResponse));
@@ -4229,7 +4309,6 @@ mod tests {
                 .unwrap();
             Sent {
                 result,
-                started: true,
                 error_events: std::mem::take(&mut progress.errors),
                 errors_before_response: progress.errors_before_response.take(),
                 rx_timeout: None,
@@ -4311,7 +4390,12 @@ mod tests {
             event(None, error(PduErrorEvent::PduErrEvtLostCommToVci)),
             COP,
         );
-        assert!(matches!(lost, Some(Err(HostError::VciLost))));
+        assert!(matches!(
+            lost,
+            Some(Err(HostError::VciLost {
+                refused_after_loss: false
+            }))
+        ));
         assert!(progress.unbound.is_empty());
     }
 
@@ -4601,7 +4685,9 @@ mod tests {
                     extra_error_info_name: None,
                 })
             )]),
-            Some(Err(HostError::VciLost))
+            Some(Err(HostError::VciLost {
+                refused_after_loss: false
+            }))
         ));
         assert!(matches!(
             outcome(vec![
@@ -4615,7 +4701,9 @@ mod tests {
                 ),
                 event(Some(COP), status(PduComPrimitiveStatus::PduCopstCancelled)),
             ]),
-            Some(Err(HostError::VciLost))
+            Some(Err(HostError::VciLost {
+                refused_after_loss: false
+            }))
         ));
         // Bound to the primitive it counts the same, also after a response pending.
         assert!(matches!(
@@ -4630,7 +4718,9 @@ mod tests {
                     })
                 ),
             ]),
-            Some(Err(HostError::VciLost))
+            Some(Err(HostError::VciLost {
+                refused_after_loss: false
+            }))
         ));
         // One bound to an earlier primitive is not this request's: the primitive goes on.
         assert!(
@@ -4696,7 +4786,9 @@ mod tests {
                 tonic::Code::FailedPrecondition,
                 Some(PduErrorEvent::PduErrEvtLostCommToVci)
             )),
-            HostError::VciLost
+            HostError::VciLost {
+                refused_after_loss: true
+            }
         ));
         for error in [
             refused(tonic::Code::FailedPrecondition, None),
@@ -4716,6 +4808,195 @@ mod tests {
         ] {
             let kept = format!("{error:?}");
             assert_eq!(format!("{:?}", lost_vci_between_primitives(error)), kept);
+        }
+    }
+
+    /// One error of each variant group, for the `send_state` tests.
+    fn refused_start(reason: Option<vci_service_interface::RefusalReason>) -> HostError {
+        use vci_service_interface::{ErrorDetail, PduError};
+        HostError::Rpc {
+            rpc: "StartComPrimitive",
+            status: Box::new(vci_service_interface::status_with_error_detail(
+                tonic::Code::InvalidArgument,
+                "refused",
+                ErrorDetail {
+                    pdu_error: PduError::PduErrInvalidParameters as i32,
+                    error_event_data: None,
+                    detail_text: None,
+                    refusal: reason.map(|reason| reason as i32),
+                },
+            )),
+        }
+    }
+
+    /// Every agent-side refusal, with the request it would be logged with.
+    fn agent_refusals() -> Vec<HostError> {
+        vec![
+            HostError::LinkHeld,
+            HostError::BadService(0x1FF),
+            HostError::NotAllowed(0x2E),
+            HostError::EmptyRequest,
+            HostError::UndeclaredService(7),
+            HostError::WrongService {
+                service: 1,
+                declared: 0x22,
+                sent: 0x2E,
+            },
+            HostError::BadNegativeShape("x"),
+            HostError::DownloadBySendReceive(0x34),
+            HostError::UseFlashTransfer,
+            HostError::TransferInterrupted(0x11),
+            HostError::NoTransferActive,
+            HostError::BlockTooLong {
+                block: 1,
+                length: 9,
+                max: 8,
+            },
+            HostError::NoBlockLength {
+                block: 1,
+                response: vec![0x74],
+            },
+            HostError::NoArtifact,
+            HostError::ArtifactRange { offset: 1, len: 2 },
+            HostError::Unsupported("ReadDtc"),
+            HostError::DeclaredLink("x".to_owned()),
+            HostError::InputNotEstablished(diag_ir::RuntimeInput::IgnitionOn),
+        ]
+    }
+
+    /// Errors that leave the send open.
+    fn open_sends() -> Vec<HostError> {
+        use vci_service_interface::RefusalReason;
+        vec![
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+            HostError::WorkerUnresponsive("CancelComPrimitive"),
+            rpc(tonic::Code::Unavailable),
+            rpc(tonic::Code::Cancelled),
+            rpc(tonic::Code::Unknown),
+            rpc_of("SubscribeEvent", tonic::Code::Unavailable),
+            refused_start(None),
+            refused_start(Some(RefusalReason::Unspecified)),
+            // A reason on a call after the start proves nothing.
+            HostError::Rpc {
+                rpc: "SubscribeEvent",
+                status: match refused_start(Some(RefusalReason::QueueFull)) {
+                    HostError::Rpc { status, .. } => status,
+                    _ => unreachable!(),
+                },
+            },
+            HostError::Setup("StartComPrimitive returned no primitive handle"),
+            HostError::VciLost {
+                refused_after_loss: false,
+            },
+            HostError::NoResponse,
+            HostError::EventsLost,
+            HostError::EventStreamEnded,
+            HostError::PrimitiveFailed(PduErrorEvent::PduErrEvtTxError as i32),
+            HostError::TransferRefused {
+                block: 1,
+                response: vec![0x7F, 0x36, 0x73],
+            },
+            HostError::TransferEchoMismatch {
+                block: 1,
+                counter: 1,
+                response: vec![0x76, 0x02],
+            },
+        ]
+    }
+
+    #[test]
+    fn send_state_is_not_sent_only_on_a_refusal_before_the_start() {
+        use vci_service_interface::RefusalReason;
+        for error in agent_refusals() {
+            assert_eq!(error.send_state(), SendState::NotSent, "{error:?}");
+        }
+        for reason in [
+            RefusalReason::InvalidParameters,
+            RefusalReason::QueueFull,
+            RefusalReason::ProtocolCannotCarry,
+        ] {
+            assert_eq!(
+                refused_start(Some(reason)).send_state(),
+                SendState::NotSent,
+                "{reason:?}"
+            );
+        }
+        assert_eq!(
+            HostError::VciLost {
+                refused_after_loss: true
+            }
+            .send_state(),
+            SendState::NotSent
+        );
+        for error in open_sends() {
+            assert_eq!(error.send_state(), SendState::MayHaveReached, "{error:?}");
+        }
+    }
+
+    /// A start that timed out is neither a refusal nor a success (rpc-api-guide "Reading a
+    /// Worker's Answer"): the request may have reached the ECU.
+    #[test]
+    fn a_timed_out_start_may_have_reached_the_ecu() {
+        let error = HostError::WorkerUnresponsive("StartComPrimitive");
+        assert_eq!(error.send_state(), SendState::MayHaveReached);
+        let (end, _) = end_of(&[0x22, 0xF1, 0x90], Err(error));
+        assert!(matches!(
+            end,
+            End::Unknown(UnknownCause::WorkerNotAnswering)
+        ));
+    }
+
+    /// The error `unary` gives for a start the worker never answered is `MayHaveReached`.
+    #[test]
+    fn a_start_that_times_out_in_unary_may_have_reached_the_ecu() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        let error = runtime
+            .block_on(unary(
+                Duration::from_millis(10),
+                "StartComPrimitive",
+                std::future::pending::<Result<tonic::Response<()>, tonic::Status>>(),
+            ))
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            HostError::WorkerUnresponsive("StartComPrimitive")
+        ));
+        assert_eq!(error.send_state(), SendState::MayHaveReached);
+    }
+
+    /// The log's `sent` is `not_sent` exactly when `send_state` says `NotSent`.
+    #[test]
+    fn the_log_agrees_with_send_state() {
+        use crate::comm_log::exchange::{Sent as Logged, sent_of_end};
+        let read = [0x22, 0xF1, 0x90];
+        // An agent-side refusal is logged by `log_refused`; the others by `sent_end`.
+        let refused = agent_refusals().into_iter().map(|error| {
+            let end = End::NotSent(refusal_cause(&read, &error));
+            (error, end)
+        });
+        let sent = open_sends()
+            .into_iter()
+            .chain([
+                refused_start(Some(vci_service_interface::RefusalReason::QueueFull)),
+                HostError::VciLost {
+                    refused_after_loss: true,
+                },
+            ])
+            .map(|error| {
+                let result: Result<Vec<u8>, HostError> = Err(error);
+                let end = sent_end(&read, &result, &NegativeShape::uds(), read[0]).0;
+                let Err(error) = result else { unreachable!() };
+                (error, end)
+            });
+        for (error, end) in refused.chain(sent) {
+            assert_eq!(
+                sent_of_end(&read, end.clone()) == Logged::NotSent,
+                error.send_state() == SendState::NotSent,
+                "{error:?}: {end:?}"
+            );
         }
     }
 }

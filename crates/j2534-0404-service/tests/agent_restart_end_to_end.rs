@@ -974,7 +974,7 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
         // The worker's receive poll met the lost device and took the link offline, so the
         // transfer finds no connected link; the worker's refusal carries the lost VCI, which
         // the host reports as such (ADR-294).
-        matches!(cause, HostError::VciLost)
+        matches!(cause, HostError::VciLost { .. })
     });
     // The probe loads the library in a process of its own, with the VCI present: the
     // disconnect belonged to the stopped worker's process.
@@ -1089,7 +1089,7 @@ fn a_vci_crash_mid_transfer_is_restarted_once_the_vci_answers_again() {
         // The worker's receive poll met the failing VCI and took the link offline, as for a lost
         // device, so the transfer finds no connected link and the host reports the lost VCI
         // (ADR-294).
-        matches!(cause, HostError::VciLost)
+        matches!(cause, HostError::VciLost { .. })
     });
     let before = env.probe();
     assert_eq!(
@@ -1663,7 +1663,7 @@ fn a_next_run_with_the_vci_still_unplugged_keeps_the_job_for_a_later_run() {
     );
     assert!(env.commands_applied(), "the disconnect should be applied");
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
-        matches!(cause, HostError::VciLost)
+        matches!(cause, HostError::VciLost { .. })
     });
     let before = env.probe();
     let journal_before =

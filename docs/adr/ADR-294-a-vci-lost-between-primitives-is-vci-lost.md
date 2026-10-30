@@ -1,7 +1,7 @@
 # ADR-294: A VCI Lost between Two Primitives Is Reported as `HostError::VciLost`
 
 **Date:** 2026-10-14
-**Status:** Accepted
+**Status:** Accepted (item 1's variant carries `refused_after_loss`, ADR-389)
 **Affects:** `agent` (`src/host.rs`), `j2534-0404-service` (`src/service/events.rs`,
 `tests/agent_restart_end_to_end.rs`), `docs/system-architecture.md` 8.2.4; ADR-105, ADR-289,
 ADR-292

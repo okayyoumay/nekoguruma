@@ -28,6 +28,28 @@ use vci_service_interface::{
 };
 use worker_host::client::WorkerClient;
 
+/// Where a job gets its worker client: for the link it opens first, and for a link it opens
+/// again after the path to the VCI was lost (design 8.2.5, ADR-393).
+///
+/// Every [`WorkerApi`] client is a source of itself: it hands out clones, so the same worker
+/// carries the new link. A source that starts a new worker for the new link would give the
+/// client of the worker it started; the run entry points take either.
+pub trait WorkerSource: Send + 'static {
+    /// The client the source gives.
+    type Client: WorkerApi;
+
+    /// The client for the next link. An error is a worker that cannot be reached (yet).
+    fn client(&mut self) -> Result<Self::Client, crate::host::HostError>;
+}
+
+impl<C: WorkerApi> WorkerSource for C {
+    type Client = C;
+
+    fn client(&mut self) -> Result<C, crate::host::HostError> {
+        Ok(self.clone())
+    }
+}
+
 /// What the runner's calls to one RPC return.
 pub type Reply<T> = Result<tonic::Response<T>, tonic::Status>;
 

@@ -336,7 +336,8 @@ const RC_BYTE_OFFSET: u32 = 2;
 pub struct Link {
     pub module_handle: ModuleHandle,
     pub cll_handle: ComLogicalLinkHandle,
-    pub events: Streaming<EventNotification>,
+    /// `None` once the host dropped the stream to close the link for a reopen (ADR-393).
+    pub events: Option<Streaming<EventNotification>>,
     /// What the job may send on this link: decided from the VCI the module reports (ADR-247).
     /// Not public: only [`open`] may decide it, so a library caller cannot grant a link to a
     /// real VCI the simulator permission.
@@ -533,7 +534,7 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
         Ok((events, indications)) => Ok(Link {
             module_handle,
             cll_handle,
-            events,
+            events: Some(events),
             permission,
             application_layer: config.application_layer(),
             indications,

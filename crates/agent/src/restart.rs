@@ -580,27 +580,8 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
         .iter()
         .map(|frame| frame.return_pc)
         .collect();
-    let reachable = program.reachable_from(pc, &return_pcs);
-    for ahead in (0..program.code.len() as u32).filter(|&ahead| reachable[ahead as usize]) {
-        if let Some(plan) = program.flash.iter().find(|plan| {
-            (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&ahead)
-        }) {
-            return not_resumable(NotResumableCause::PlanAhead {
-                flash_session: plan.flash_session,
-            });
-        }
-        if !program.code[ahead as usize].is_diagnostic_primitive() {
-            continue;
-        }
-        if let Some(section) = program.sections.iter().position(|section| {
-            matches!(section.interruptible, Interruptible::RecoveryRequired)
-                && (section.start_pc..section.end_pc).contains(&ahead)
-        }) {
-            return not_resumable(NotResumableCause::RecoveryRequiredAhead { section, pc: ahead });
-        }
-        if !safe_to_repeat(program, ahead) {
-            return not_resumable(NotResumableCause::UnsafePrimitiveAhead { pc: ahead });
-        }
+    if let Some(cause) = continuation_hazard(program, pc, &return_pcs) {
+        return not_resumable(cause);
     }
     // A target VIN that is not well-formed could never match a VIN read, so it is no identity.
     if !facts
@@ -615,6 +596,64 @@ fn classify_plain_procedure(program: &Program, state: &JournalState) -> RestartD
         at: *at,
         state: resumed,
     }))
+}
+
+/// Condition (S) of a continuation from `pc` (ADR-335 item 3): the first hazard among the
+/// instructions reachable from `pc` with the suspended callers `return_pcs`
+/// ([`Program::reachable_from`]), the lowest pc first. A hazard is an instruction in a plan's
+/// range, a diagnostic primitive in a `RecoveryRequired` section, or a diagnostic primitive that
+/// is not safe to repeat ([`safe_to_repeat`]; one outside every section is not). `None` when the
+/// program can go on from there with every request safe to send again.
+fn continuation_hazard(
+    program: &Program,
+    pc: u32,
+    return_pcs: &[u32],
+) -> Option<NotResumableCause> {
+    let reachable = program.reachable_from(pc, return_pcs);
+    for ahead in (0..program.code.len() as u32).filter(|&ahead| reachable[ahead as usize]) {
+        if let Some(plan) = program.flash.iter().find(|plan| {
+            (plan.boundaries.entry_pc..plan.boundaries.post_transfer_end_pc).contains(&ahead)
+        }) {
+            return Some(NotResumableCause::PlanAhead {
+                flash_session: plan.flash_session,
+            });
+        }
+        if !program.code[ahead as usize].is_diagnostic_primitive() {
+            continue;
+        }
+        if let Some(section) = program.sections.iter().position(|section| {
+            matches!(section.interruptible, Interruptible::RecoveryRequired)
+                && (section.start_pc..section.end_pc).contains(&ahead)
+        }) {
+            return Some(NotResumableCause::RecoveryRequiredAhead { section, pc: ahead });
+        }
+        if !safe_to_repeat(program, ahead) {
+            return Some(NotResumableCause::UnsafePrimitiveAhead { pc: ahead });
+        }
+    }
+    None
+}
+
+/// Whether a run whose link was lost goes on in the same run on a new one, as far as the
+/// program decides (design 8.2.5, ADR-393): ADR-335 item 3's conditions, judged at the VM's
+/// current pc. (I) the pc is an interruptible point ([`interruptible_point`]), and (S) nothing
+/// reachable from it is a hazard ([`continuation_hazard`]). `state` is the VM's state, whose pc is
+/// the primitive that failed. A primitive whose request provably never left (`unsent`) is
+/// sent whatever its idempotency, so (S) looks from the instruction after it (an exchange falls
+/// through; a loop back to it is a hazard again). The identity (the third condition) is read
+/// from the ECU by the caller, and only for a job with a journal.
+pub(crate) fn continues_after_loss(program: &Program, state: &VmState, unsent: bool) -> bool {
+    let pc = state.pc;
+    if !interruptible_point(program, pc) {
+        return false;
+    }
+    let return_pcs: Vec<u32> = state
+        .call_stack
+        .iter()
+        .map(|frame| frame.return_pc)
+        .collect();
+    let from = if unsent { pc + 1 } else { pc };
+    continuation_hazard(program, from, &return_pcs).is_none()
 }
 
 /// The checks of ADR-229 item 2 step 1 that need no ECU service, then the resume count, for an
@@ -1693,6 +1732,10 @@ pub(crate) fn safe_to_repeat(program: &Program, pc: u32) -> bool {
 pub(crate) enum RepeatDecision {
     /// Send the same request again in place, without arriving at the instruction again.
     Repeat,
+    /// The path to the VCI was lost (`ResendClass::PathLost`): send the request again, but on a
+    /// link opened again, if the runner can continue there (`continues_after_loss`, ADR-393);
+    /// otherwise the run ends in the host error.
+    ReopenThenRepeat,
     /// The run ends in the host error.
     End,
     /// The run ends in on-site intervention with this reason, the one the next resume of the
@@ -1714,6 +1757,10 @@ pub(crate) enum RepeatDecision {
 ///   when it refuses a resume, else the run ends in the host error (a completed flash transfer
 ///   resumes by ADR-229's restart). Without a journal, which no resume reads, it is an
 ///   unconfirmed request.
+/// - A lost path to the VCI (`ResendClass::PathLost`, ADR-393) is the same decision with a link to
+///   open first: a request provably not sent is [`RepeatDecision::ReopenThenRepeat`] whatever the
+///   idempotency, one that may have reached the ECU only when [`safe_to_repeat`] says so, and
+///   otherwise the verdict above applies, without a new link.
 /// - Every send counts against `JobLimits::max_primitive_repeats`; the error after the last
 ///   one ends the run.
 pub(crate) fn repeat_decision(
@@ -1730,14 +1777,20 @@ pub(crate) fn repeat_decision(
     let within_bound = attempts < limits.max_primitive_repeats;
     match (error.send_state(), error.resend_class()) {
         (SendState::NotSent, ResendClass::Transient) if within_bound => RepeatDecision::Repeat,
-        (SendState::MayHaveReached, ResendClass::EcuLevel) if safe_to_repeat(program, at.pc) => {
-            if within_bound {
-                RepeatDecision::Repeat
-            } else {
-                RepeatDecision::End
+        (SendState::NotSent, ResendClass::PathLost) if within_bound => {
+            RepeatDecision::ReopenThenRepeat
+        }
+        (SendState::MayHaveReached, class @ (ResendClass::EcuLevel | ResendClass::PathLost))
+            if safe_to_repeat(program, at.pc) =>
+        {
+            match (within_bound, class) {
+                (false, _) => RepeatDecision::End,
+                (true, ResendClass::PathLost) => RepeatDecision::ReopenThenRepeat,
+                (true, _) => RepeatDecision::Repeat,
             }
         }
-        (SendState::MayHaveReached, ResendClass::EcuLevel) => match journal {
+        (SendState::MayHaveReached, ResendClass::EcuLevel | ResendClass::PathLost) => match journal
+        {
             // The verdict of the restart's classification on the journal as it stands; where
             // it would not refuse a resume (a completed flash transfer takes ADR-229's
             // restart), the run ends as before.
@@ -4231,26 +4284,98 @@ def main():
             decide(4, &HostError::LinkHeld, 2, Some(&some)),
             RepeatDecision::End
         );
-        // Link-level errors, refusals that do not pass, and other primitives end the run.
-        for error in [
-            HostError::WorkerUnresponsive("StartComPrimitive"),
-            HostError::EventStreamEnded,
-            HostError::Setup("link"),
-            HostError::NotAllowed(0x10),
-            HostError::VciLost {
-                refused_after_loss: false,
-            },
-        ] {
+        // Refusals that do not pass, and errors of the link's set-up, end the run.
+        for error in [HostError::Setup("link"), HostError::NotAllowed(0x10)] {
             assert_eq!(
                 decide(1, &error, 0, Some(&some)),
                 RepeatDecision::End,
                 "{error:?}"
             );
         }
+        // A lost path to the VCI (ADR-393): a request that may have reached the ECU is sent
+        // again, on a new link, only when it is safe to repeat, within the bound.
+        for error in [
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+            HostError::EventStreamEnded,
+            HostError::VciLost {
+                refused_after_loss: false,
+            },
+        ] {
+            assert_eq!(
+                decide(1, &error, 0, Some(&some)),
+                RepeatDecision::ReopenThenRepeat,
+                "{error:?}"
+            );
+            assert_eq!(
+                decide(1, &error, 1, None),
+                RepeatDecision::ReopenThenRepeat,
+                "{error:?}"
+            );
+            assert_eq!(
+                decide(1, &error, 2, Some(&some)),
+                RepeatDecision::End,
+                "{error:?}"
+            );
+            // Not safe: the verdict of the restart's classification, as for an ECU-level error.
+            assert_eq!(
+                decide(4, &error, 0, Some(&some)),
+                RepeatDecision::OnSite(OnSiteReason::UnconfirmedRequest { at: at_pc(4) }),
+                "{error:?}"
+            );
+            assert_eq!(
+                decide(4, &error, 0, None),
+                RepeatDecision::OnSite(OnSiteReason::UnconfirmedRequest { at: at_pc(4) }),
+                "{error:?}"
+            );
+        }
+        // A request the worker refused after the loss was never sent: sent again whatever the
+        // idempotency, within the bound.
+        let refused = HostError::VciLost {
+            refused_after_loss: true,
+        };
+        for pc in [1, 4, 7] {
+            assert_eq!(
+                decide(pc, &refused, 1, Some(&some)),
+                RepeatDecision::ReopenThenRepeat,
+                "pc {pc}"
+            );
+            assert_eq!(
+                decide(pc, &refused, 2, Some(&some)),
+                RepeatDecision::End,
+                "pc {pc}"
+            );
+        }
         assert_eq!(
             decide(9, &HostError::NoResponse, 0, Some(&some)),
             RepeatDecision::End
         );
+    }
+
+    /// ADR-393: the program's part of a continuation after a lost path, judged at the VM's
+    /// current pc. `plain_program`: requests at 1 and 7 are `Safe` in their sections, the one at
+    /// 4 is under no section and so not safe to repeat.
+    #[test]
+    fn a_continuation_after_a_loss_needs_an_interruptible_point_and_nothing_unsafe_ahead() {
+        let program = plain_program();
+        let at = |pc| state_at_pc(&program, pc, u64::from(pc));
+        // From the last step, only `Safe` code lies ahead.
+        assert!(continues_after_loss(&program, &at(7), false));
+        assert!(continues_after_loss(&program, &at(7), true));
+        // The first step reaches the request at 4, which is not safe to repeat.
+        assert!(!continues_after_loss(&program, &at(1), false));
+        assert!(!continues_after_loss(&program, &at(1), true));
+        // The unsafe request itself: sent again only when it never left, as its successors are
+        // safe; one that may have reached the ECU rules the continuation out.
+        assert!(!continues_after_loss(&program, &at(4), false));
+        assert!(continues_after_loss(&program, &at(4), true));
+        // A section that is not interruptible, or recovery-required, is no point to continue at.
+        for interruptible in [Interruptible::No, Interruptible::RecoveryRequired] {
+            let mut program = plain_program();
+            program.sections[1].interruptible = interruptible;
+            let state = state_at_pc(&program, 7, 7);
+            assert!(!continues_after_loss(&program, &state, false));
+            assert!(!continues_after_loss(&program, &state, true));
+        }
     }
 
     fn at_pc(pc: u32) -> StepRef {

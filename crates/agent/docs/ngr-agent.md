@@ -86,7 +86,7 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    ComParams by their ISO 22900-2 (2022) short names (Annex B.3). A run with `--api dpdu` is
    tested end to end on `iso22900-mock` with a simulated ECU attached (ADR-299,
    `crates/iso22900-service/tests/ngr_agent_dpdu_end_to_end.rs`).
-6. Run the program under the request policy and the default job limits (ADR-235; a request that fails at the ECU or the bus and is safe to repeat is sent again up to `JobLimits::max_primitive_repeats` times, "Repeating a failed primitive" below), then stop
+6. Run the program under the request policy and the default job limits (ADR-235; a request that fails at the ECU or the bus and is safe to repeat is sent again up to `JobLimits::max_primitive_repeats` times, "Repeating a failed primitive" below, and a lost path to the VCI continues on a new link under the conditions of "Continuing after a lost path"), then stop
    the worker and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker
    cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
@@ -693,9 +693,12 @@ and `HostError::resend_class`, the program's idempotency (`restart::safe_to_repe
 count of failed sends of the arrival, which the runner keeps in memory and starts over at every
 arrival at an instruction (`VmState::steps` before it). Only `ServiceRequest`, `ReadDtc`,
 `RoutineControl` and `SendReceive` outside every plan's range are considered; every other
-instruction, anything in a plan's range and a link or worker failure (`WorkerUnresponsive`, `Rpc`
-without a refusal, `EventStreamEnded`, `Setup`, `VciLost` that was not a refusal after the loss)
-end the run in `JobError::Host` as before.
+instruction, anything in a plan's range and an error that is neither a refusal that passes nor
+a lost path to the VCI (`Setup`, a refusal that does not pass) end the run in `JobError::Host`
+as before. A lost path to the VCI (`ResendClass::PathLost`: `VciLost` of either kind,
+`EventStreamEnded`, `WorkerUnresponsive`, and an `Rpc` that failed in transport with
+`Unavailable`, `Cancelled` or `Unknown` and no refusal) is decided too, with a link to open first
+("Continuing after a lost path" below, ADR-393).
 
 | Error | Primitive | Decision |
 |---|---|---|
@@ -703,6 +706,9 @@ end the run in `JobError::Host` as before.
 | the same | safe to repeat, `JobLimits::max_primitive_repeats` resends used (default 2, three sends) | the run ends in `JobError::Host` |
 | the same | not safe to repeat (unsafe, `CheckState`, uncovered, or covered by a safe and a non-safe section) | the verdict of `classify` on the journal as it now stands: when it refuses a resume, `OnSiteInterventionRequired` with its reason (`RecoveryRequiredSection` from the pass's intent, also for a request after the section; else `UnconfirmedRequest { at }`); when it would not (after a completed flash transfer a resume takes ADR-229's restart), the run ends in `JobError::Host`. The `Request` record stays unconfirmed and the ending is not journaled. Without a journal, which no resume reads, `UnconfirmedRequest { at }` |
 | `LinkHeld`, or a start refused with the reason QUEUE_FULL (nothing was sent) | any, bound not used up | resend as the first row, whatever the idempotency; at the bound the run ends in `JobError::Host` |
+| a lost path with `send_state` `MayHaveReached` (`VciLost { refused_after_loss: false }`, `EventStreamEnded`, `WorkerUnresponsive`, a transport `Rpc`) | safe to repeat, bound not used up | `RepeatDecision::ReopenThenRepeat`: continue on a new link when the conditions below hold, else the run ends in `JobError::Host`; at the bound the run ends in `JobError::Host` |
+| the same | not safe to repeat | the verdict of the third row, with no new link |
+| `VciLost { refused_after_loss: true }` (the worker refused the start on the offline link; nothing was sent) | any, bound not used up | `ReopenThenRepeat` whatever the idempotency |
 | any other error with `send_state` `NotSent` | any | the run ends in `JobError::Host` |
 
 The first arrival's `Request` record is written once. When a run ends with it provably unsent (an
@@ -712,6 +718,54 @@ the runner first commits `RequestNotSent { at }` (`JobJournal::withdraw_request`
 written when a send may have reached the ECU. The classification of a plain procedure reads it as
 no request ("A plain procedure" below). A cancel held by an uninterruptible or recovery-required
 section stays held through the resends.
+
+## Continuing after a lost path
+
+On `RepeatDecision::ReopenThenRepeat` the runner (`continue_on_new_link`) goes on in the same run,
+on a link opened again, when the checkpoint resume's conditions (ADR-335 item 3) hold at the VM's
+current pc (ADR-393). The program decides first, contacting nothing
+(`restart::continues_after_loss`): (I) the pc is an interruptible point
+(`restart::interruptible_point`), and (S) nothing reachable from it, with the suspended callers
+of the VM's call stack, is a hazard (`restart::continuation_hazard`, the check
+`classify_plain_procedure` makes: a flash plan, a diagnostic primitive in a `RecoveryRequired`
+section, or one not safe to repeat). A request that was never sent is not counted itself; the
+search starts at the instruction after it. If a condition fails, `max_link_reopens` reopens have
+been made already, or the host cannot reopen, the run ends in `JobError::Host`, which a later
+resume handles as before.
+
+The host trait `ProcedurePosition` has the method `reopen_link`, whose default is
+`ReopenAttempt::Cannot` (a test host and the flash tests' host need not implement it).
+`WorkerHost` implements it from a `Relink` the runner gives it: the job's `WorkerSource`, the link
+configuration and the handles of the open link, which the runner's link guard shares. An attempt
+settles a primitive left by the loss, drops the event stream and closes the lost link
+(`link::teardown`): a close that fails marks the guards (ADR-258, they stay marked) and gives
+`Cannot`, so the run ends in `JobError::Host`. The J2534 worker's disconnect of a link on a lost
+device fails, so this is that worker's ending until the worker is replaced. The host then takes
+a client from the source (every `WorkerApi` client is a source of itself, giving clones, so the
+entry points `run_program`, `run_program_journaled` and `resume_program_journaled` take either),
+opens the link (`link::open_tracked`) and `WorkerHost::reopen` puts the new link in place of the
+old: the document, artifact, communication log and link identifiers stay, the waits, the
+transfer counter, the runtime input ids and the settling state start over. An open that fails
+and was cleaned up is `NotYet`; one whose cleanup failed marks the guards and is `Cannot`.
+
+The runner repeats the attempt every `JobLimits::reopen_poll` (default 1 s) until
+`JobLimits::vci_return_wait` (default 60 s) has passed, taking a cancel before each attempt
+(the run's cancel, which a section that holds the cancel keeps held): `JobError::Cancelled`. Each
+continuation counts one against `JobLimits::max_link_reopens` (default 2) in memory, whether or
+not the VCI came back. A VCI that does not come back ends the run in the original `JobError::Host`.
+With a journal, once the link is open and before any request on it, the continuation is counted as a resume
+under the plain procedure's stage (`count_procedure_resume`, `JobLimits::max_procedure_resumes`:
+at the limit `OnSiteInterventionRequired(ProcedureResumeLimitReached)`), and when the journal
+names a target VIN it is read again through the program's source
+(`restart::check_procedure_identity`, logged as an identification read): another VIN is
+`JobError::IdentityMismatch`, journaled first and terminal (ADR-286), one that cannot be
+established `OnSiteInterventionRequired(ProcedureIdentityNotEstablished)` with the resume counted
+(ADR-290). The per-vehicle lock is not taken (no restart is made). A run without a journal
+(`run_program`) counts nothing and reads no VIN. No new `RunStart` is written, the step budget is
+the run's, no session is entered again (ADR-335 item 8), and the resend counts against
+`max_primitive_repeats` and is logged with `origin: repeat`. The communication log writes
+`vci_connected` for the new link (the run's own loss is settled right after it) and
+`link_opened` again (design 8.11).
 
 ## Restart classification
 

@@ -4,8 +4,10 @@
 //! only at an interruptible point (ADR-330), and a `RecoveryRequired` section is journaled
 //! (ADR-291, ADR-293). Idempotency decides which primitives outside the flash plans get a
 //! request marker and how a restart classifies a plain procedure (ADR-335); a primitive that
-//! fails is not repeated within the run. A host error ends the job; the VM state then still
-//! points at the failed primitive (ADR-233 item 1). [`run_program_journaled`] also writes the
+//! fails in the host is sent again in the run when `restart::repeat_decision` allows it
+//! (ADR-392), after the link is opened again when the path to the VCI was lost (ADR-393). Any
+//! other host error ends the job; the VM state then still points at the failed primitive
+//! (ADR-233 item 1). [`run_program_journaled`] also writes the
 //! write-job journal at a flash recovery plan's boundaries (`journaling`, ADR-252), and
 //! [`resume_program_journaled`] goes on with a job whose journal exists (`restart`, ADR-255).
 //! A [`Job`] is a program and, when its program decodes response fields, the variant's
@@ -19,7 +21,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::artifact::{Artifact, SHA256_LEN, to_hex};
-use crate::client::WorkerApi;
+use crate::client::{WorkerApi, WorkerSource};
 use crate::comm_log::{
     CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciFacts, VciMargins,
 };
@@ -33,7 +35,8 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
 use crate::host::{
-    HostError, OwnRead, ProcedurePosition, SendState, Timings, TransferProgress, WorkerHost,
+    HostError, OpenHandles, OwnRead, ProcedurePosition, Relink, ReopenAttempt, SendState, Timings,
+    TransferProgress, WorkerHost,
 };
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
@@ -67,6 +70,16 @@ pub struct JobLimits {
     /// times at most (design 8.2.5, ADR-392). The count is kept in memory and starts over at the
     /// next arrival. A resend waits `wait_poll` first.
     pub max_primitive_repeats: u8,
+    /// Pause between the attempts to open the link again after the path to the VCI was lost,
+    /// which also bounds how late the wait sees a cancel; at least 1 ms is used (design 8.2.5,
+    /// ADR-393).
+    pub reopen_poll: Duration,
+    /// How long a run waits for the VCI to come back, from its first attempt to open the link
+    /// again; a VCI not back by then ends the run in the host error it lost the link with.
+    pub vci_return_wait: Duration,
+    /// How often a run opens its link again after the path to the VCI was lost, counted in
+    /// memory per run; a run that lost it once more than this ends in the host error.
+    pub max_link_reopens: u8,
 }
 
 impl Default for JobLimits {
@@ -76,6 +89,9 @@ impl Default for JobLimits {
             wait_poll: Duration::from_millis(10),
             max_procedure_resumes: 3,
             max_primitive_repeats: 2,
+            reopen_poll: Duration::from_secs(1),
+            vci_return_wait: Duration::from_secs(60),
+            max_link_reopens: 2,
         }
     }
 }
@@ -717,23 +733,14 @@ fn refuse_beyond(
 /// A [`Job`] given [`Job::with_comm_log`] writes its communication log (design 8.11, ADR-347);
 /// without one the run writes none. How the log ended comes back in [`JobRun::comm_log`], and
 /// the log never changes the result.
-pub async fn run_program<C: WorkerApi>(
-    client: C,
+pub async fn run_program<W: WorkerSource>(
+    source: W,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
     guards: JobGuards,
 ) -> JobRun {
-    run_guarded(
-        client,
-        config,
-        program,
-        limits,
-        policy::build_ceiling(),
-        None,
-        guards,
-    )
-    .await
+    run_from_source(source, config, program, limits, None, guards).await
 }
 
 /// [`run_program`] that also writes the job's journal (ADR-244, ADR-252, ADR-335): the journal of
@@ -745,20 +752,19 @@ pub async fn run_program<C: WorkerApi>(
 /// is sent. `guards` are taken and returned as for [`run_program`]; a program that writes needs
 /// the reprogramming slot (`JobGuards::take`). The job's communication log goes beside the
 /// journal, under the same key (ADR-347).
-pub async fn run_program_journaled<C: WorkerApi>(
-    client: C,
+pub async fn run_program_journaled<W: WorkerSource>(
+    source: W,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
 ) -> JobRun {
-    run_guarded(
-        client,
+    run_from_source(
+        source,
         config,
         program,
         limits,
-        policy::build_ceiling(),
         Some(JournalMode::Create(journal)),
         guards,
     )
@@ -880,30 +886,67 @@ pub async fn run_program_journaled<C: WorkerApi>(
 /// `JobError::Journal(JournalError::InUse)` with nothing sent (ADR-255). The start deadline and
 /// a server reservation are not taken here. The log of the job's earlier runs is appended to
 /// (ADR-347).
-pub async fn resume_program_journaled<C: WorkerApi>(
-    client: C,
+pub async fn resume_program_journaled<W: WorkerSource>(
+    source: W,
     config: &LinkConfig,
     program: impl Into<Job>,
     limits: JobLimits,
     journal: JournalSetup,
     guards: JobGuards,
 ) -> JobRun {
-    run_guarded(
-        client,
+    run_from_source(
+        source,
         config,
         program,
         limits,
-        policy::build_ceiling(),
         Some(JournalMode::Resume(journal)),
         guards,
     )
     .await
 }
 
+/// Takes the first client from `source` and runs the job on it, the source kept to open the link
+/// again after the path to the VCI was lost (ADR-393). A source with no client ends the job in
+/// [`JobError::Link`] with the guards returned untouched and no log.
+async fn run_from_source<W: WorkerSource>(
+    mut source: W,
+    config: &LinkConfig,
+    job: impl Into<Job>,
+    limits: JobLimits,
+    journal: Option<JournalMode>,
+    guards: JobGuards,
+) -> JobRun {
+    match source.client() {
+        Ok(client) => {
+            run_guarded(
+                client,
+                Box::new(source),
+                config,
+                job,
+                limits,
+                policy::build_ceiling(),
+                journal,
+                guards,
+            )
+            .await
+        }
+        Err(error) => JobRun {
+            result: Err(JobError::Link(error)),
+            guards,
+            comm_log: CommLogStatus::None,
+        },
+    }
+}
+
 /// Puts `guards` in a slot, runs the job with it and takes the guards back, so every entry
 /// point returns them with its result and its log's status.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
 async fn run_guarded<C: WorkerApi>(
     client: C,
+    source: Box<dyn WorkerSource<Client = C>>,
     config: &LinkConfig,
     job: impl Into<Job>,
     limits: JobLimits,
@@ -914,6 +957,7 @@ async fn run_guarded<C: WorkerApi>(
     let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
     let (result, comm_log) = run_program_within(
         client,
+        source,
         config,
         job.into(),
         limits,
@@ -936,8 +980,13 @@ async fn run_guarded<C: WorkerApi>(
 
 /// [`run_program`] with the build's ceiling given, so tests can run under a lower one. A job
 /// refused before its thread starts has no communication log.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
 async fn run_program_within<C: WorkerApi>(
     client: C,
+    source: Box<dyn WorkerSource<Client = C>>,
     config: &LinkConfig,
     job: Job,
     limits: JobLimits,
@@ -945,7 +994,11 @@ async fn run_program_within<C: WorkerApi>(
     journal: Option<JournalMode>,
     guards: GuardSlot,
 ) -> (Result<VmState, JobError>, CommLogStatus) {
-    match run_checked(client, config, job, limits, ceiling, journal, guards).await {
+    match run_checked(
+        client, source, config, job, limits, ceiling, journal, guards,
+    )
+    .await
+    {
         Ok(run) => run,
         Err(refused) => (Err(refused), CommLogStatus::None),
     }
@@ -1018,8 +1071,13 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
 }
 
 /// [`run_program_within`] up to the checks that refuse a job: those are its `Err`.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
 async fn run_checked<C: WorkerApi>(
     client: C,
+    source: Box<dyn WorkerSource<Client = C>>,
     config: &LinkConfig,
     mut job: Job,
     limits: JobLimits,
@@ -1095,6 +1153,7 @@ async fn run_checked<C: WorkerApi>(
             run_job(
                 handle,
                 client,
+                source,
                 &config,
                 &program,
                 document,
@@ -1137,6 +1196,7 @@ async fn run_checked<C: WorkerApi>(
 fn run_job<C: WorkerApi>(
     handle: Handle,
     mut client: C,
+    source: Box<dyn WorkerSource<Client = C>>,
     config: &LinkConfig,
     program: &Program,
     document: Option<JobDocument>,
@@ -1216,11 +1276,12 @@ fn run_job<C: WorkerApi>(
     let permission = link.permission;
     // Declared before the host, which owns the link's event stream: on a panic the stream is
     // dropped first, then the link is closed.
+    let open_handles: OpenHandles =
+        Arc::new(Mutex::new(Some((link.module_handle, link.cll_handle))));
     let open_link = OpenLink {
         handle: handle.clone(),
         client: client.clone(),
-        module_handle: link.module_handle,
-        cll_handle: link.cll_handle,
+        handles: Arc::clone(&open_handles),
         deadline: timings.unary,
         guards: Arc::clone(&guards),
         closed: false,
@@ -1234,38 +1295,14 @@ fn run_job<C: WorkerApi>(
     );
     // The VCI, then what the link has in force, before anything is sent on it (design 8.11).
     if let Some(log) = &comm_log {
-        // A loss an earlier run recorded is settled against the first reading of the VCI's
-        // clock after it connected (design 8.11 `vci_loss_settled`, ADR-373).
-        let reading = if log.loss_to_settle() {
-            let asked = log.now();
-            handle
-                .block_on(crate::host::read_vci_clock(
-                    &mut client,
-                    link.module_handle,
-                    timings.unary,
-                ))
-                .map(|time| {
-                    let read = log.now();
-                    crate::comm_log::ConnectReading {
-                        time,
-                        read,
-                        round_trip_us: log.round_trip_us(asked, read),
-                    }
-                })
-        } else {
-            None
-        };
-        log.vci_connected(link.version.as_ref(), reading);
-        let valued_by_document = document
-            .as_ref()
-            .map(|document| link::valued_by_document(&document.variant()))
-            .unwrap_or_default();
-        log.link_opened(
-            crate::host::LOG_LINK,
+        crate::host::log_connected(
+            &handle,
+            &mut client,
+            log,
             config,
-            &valued_by_document,
-            link.indications,
-            link.forwards_pendings,
+            document.as_ref(),
+            &link,
+            timings.unary,
         );
     }
     let mut host = WorkerHost::new(handle.clone(), client, link, timings);
@@ -1276,6 +1313,17 @@ fn run_job<C: WorkerApi>(
     host.set_comm_log(comm_log);
     host.set_link_ids(config.tx_id, config.rx_id);
     host.set_job_end_wait(config.job_end_wait());
+    // What opens the link again after the path to the VCI was lost (ADR-393).
+    host.set_relink(Relink {
+        source,
+        config: config.clone(),
+        open: open_handles,
+        mark_unconfirmed: {
+            let guards = Arc::clone(&guards);
+            Box::new(move || mark_link_unconfirmed(&guards))
+        },
+        old_open: true,
+    });
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -1328,8 +1376,9 @@ fn run_job<C: WorkerApi>(
 struct OpenLink<C: WorkerApi> {
     handle: Handle,
     client: C,
-    module_handle: vci_service_interface::ModuleHandle,
-    cll_handle: vci_service_interface::ComLogicalLinkHandle,
+    /// The handles of the link open now, which the host replaces when it opens the link again
+    /// (ADR-393) and empties once it has closed the lost one.
+    handles: OpenHandles,
     deadline: Duration,
     guards: GuardSlot,
     closed: bool,
@@ -1345,12 +1394,17 @@ impl<C: WorkerApi> OpenLink<C> {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
+        let open = *self.handles.lock().unwrap_or_else(|e| e.into_inner());
+        let Some((module_handle, cll_handle)) = open else {
+            // The host closed the lost link and opened no other.
+            return;
+        };
         // Closing on a runtime that is shutting down can panic.
         let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.handle.block_on(link::teardown(
                 &mut self.client,
-                self.module_handle,
-                self.cll_handle,
+                module_handle,
+                cll_handle,
                 self.deadline,
             ))
         }));
@@ -2100,6 +2154,8 @@ where
     // The request marker committed for this arrival, while no attempt may have reached the
     // ECU: ending the run then withdraws it (ADR-392).
     let mut unsent: Option<StepRef> = None;
+    // How often the run opened its link again, counted in memory (ADR-393).
+    let mut reopens: u8 = 0;
     loop {
         let cancelled = if !std::mem::take(&mut entry) && holds_cancel(program, &holds, vm.state.pc)
         {
@@ -2251,6 +2307,42 @@ where
                         tracing::debug!(pc, attempt = failed.1, error = %source, "resending the request");
                         std::thread::sleep(wait_poll);
                     }
+                    RepeatDecision::ReopenThenRepeat => {
+                        let unsent_request = source.send_state() == SendState::NotSent;
+                        match continue_on_new_link(
+                            program,
+                            host,
+                            &limits,
+                            cancelled,
+                            journal.as_deref_mut(),
+                            &vm.state,
+                            unsent_request,
+                            &mut reopens,
+                        ) {
+                            // The same arrival sends again on the new link: no `arrive`, no
+                            // second marker, and the entry of the resend has the origin
+                            // `repeat`.
+                            Ok(true) => {
+                                failed.1 += 1;
+                                tracing::debug!(pc, attempt = failed.1, error = %source, "resending the request on a new link");
+                            }
+                            Ok(false) => {
+                                let error = JobError::Host { pc, source };
+                                return Err(withdraw_unsent(
+                                    journal.as_deref_mut(),
+                                    unsent.take(),
+                                    error,
+                                ));
+                            }
+                            Err(error) => {
+                                return Err(withdraw_unsent(
+                                    journal.as_deref_mut(),
+                                    unsent.take(),
+                                    error,
+                                ));
+                            }
+                        }
+                    }
                     RepeatDecision::OnSite(reason) => {
                         return Err(JobError::OnSiteInterventionRequired(reason));
                     }
@@ -2266,6 +2358,95 @@ where
             }
         }
     }
+}
+
+/// Goes on in the run after the path to the VCI was lost, on a link opened again (design 8.2.5,
+/// ADR-393), for the primitive at `state`'s pc that `repeat_decision` allows to send again.
+/// `Ok(true)` means the link is open and the identity checks passed, so the caller sends the
+/// request again; `Ok(false)` means the run ends in the host error as it did before (the program
+/// does not allow a continuation, the run opened its link `JobLimits::max_link_reopens` times
+/// already, the host cannot open it, or the VCI did not come back within
+/// `JobLimits::vci_return_wait`); an error ends the run in it.
+///
+/// - The program decides first, with nothing contacted: `restart::continues_after_loss`
+///   (conditions I and S of ADR-335 item 3 at the current pc).
+/// - Then the host opens the link every `JobLimits::reopen_poll` until `vci_return_wait` has
+///   passed; a cancel taken at a poll is [`JobError::Cancelled`]. The cancel is the run's, which
+///   is held where the run holds it.
+/// - With a journal the continuation counts as a resume under the plain procedure's stage
+///   (`count_procedure_resume`, so at the limit it is on-site intervention), before the first
+///   request on the new link, and the VIN the journal names is read again
+///   (`restart::check_procedure_identity`): another VIN is [`JobError::IdentityMismatch`],
+///   journaled and terminal (ADR-286), one that cannot be established is on-site intervention
+///   (ADR-290). The per-vehicle lock is not taken: no restart is made. A job without a
+///   journal counts nothing and reads no VIN. A job whose journal names no VIN reads none.
+///
+/// No session is entered again: a primitive safe to repeat does not depend on the session
+/// (ADR-335 item 8).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn continue_on_new_link<H, S>(
+    program: &Program,
+    host: &mut H,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    journal: Option<&mut JobJournal<S>>,
+    state: &VmState,
+    unsent: bool,
+    reopens: &mut u8,
+) -> Result<bool, JobError>
+where
+    H: DiagHost<Error = HostError>
+        + RuntimeInputs
+        + TransferProgress
+        + Declarations
+        + ProcedurePosition,
+    S: Store,
+{
+    if *reopens >= limits.max_link_reopens || !restart::continues_after_loss(program, state, unsent)
+    {
+        return Ok(false);
+    }
+    *reopens += 1;
+    let poll = limits.reopen_poll.max(Duration::from_millis(1));
+    let until = std::time::Instant::now() + limits.vci_return_wait;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        match host.reopen_link() {
+            ReopenAttempt::Opened => break,
+            ReopenAttempt::Cannot => return Ok(false),
+            ReopenAttempt::NotYet => {}
+        }
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(poll.min(remaining));
+    }
+    let Some(journal) = journal else {
+        return Ok(true);
+    };
+    count_procedure_resume(journal.journal_mut(), *limits, cancelled)?;
+    let target_vin = journal.state().facts.target_vin.clone();
+    if target_vin.is_some() {
+        let sources = journal.sources().clone();
+        own_reads(host, OwnRead::Identification, |host| {
+            restart::check_procedure_identity(
+                program,
+                target_vin.as_ref(),
+                &sources,
+                host,
+                cancelled,
+                |_| Ok(()),
+            )
+        })
+        .map_err(|error| journal_identity_abort(journal.journal_mut(), error))?;
+    }
+    Ok(true)
 }
 
 /// Ends the run in `error` with the request marker at `unsent`, if there is one, withdrawn: the
@@ -3149,6 +3330,14 @@ def main():
         link_loss: bool,
         /// How often the runner announced a resend ([`ProcedurePosition::step_resends`]).
         resent: u32,
+        /// What the first attempts to open the link again give, one per attempt (ADR-393).
+        reopen_script: std::collections::VecDeque<ReopenAttempt>,
+        /// What an attempt gives when the script is used up.
+        reopen_after: ReopenAttempt,
+        /// Attempts to open the link again so far.
+        reopen_calls: u32,
+        /// Set at the first attempt, as a dropped job future would during the wait.
+        cancel_on_reopen: Option<Arc<AtomicBool>>,
         /// The ECU stays in its default session and refuses the erase (routine 0xFF00) and
         /// RequestDownload there with a negative response, as an ECU that accepts them only in
         /// its programming session would.
@@ -3248,6 +3437,10 @@ def main():
                 lose_routine: None,
                 link_loss: false,
                 resent: 0,
+                reopen_script: std::collections::VecDeque::new(),
+                reopen_after: ReopenAttempt::Cannot,
+                reopen_calls: 0,
+                cancel_on_reopen: None,
                 default_session_only: false,
                 refuse_erase_only: false,
                 voltage: None,
@@ -3367,6 +3560,14 @@ def main():
     impl ProcedurePosition for FlashHost {
         fn step_resends(&mut self) {
             self.resent += 1;
+        }
+
+        fn reopen_link(&mut self) -> ReopenAttempt {
+            self.reopen_calls += 1;
+            if let Some(flag) = &self.cancel_on_reopen {
+                flag.store(true, Ordering::Relaxed);
+            }
+            self.reopen_script.pop_front().unwrap_or(self.reopen_after)
         }
     }
 
@@ -4904,6 +5105,7 @@ def main():
                     run_job(
                         handle,
                         unreachable_client(),
+                        Box::new(unreachable_client()),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &flash_program(),
                         None,
@@ -5037,6 +5239,7 @@ def main():
                     run_job(
                         handle,
                         unreachable_client(),
+                        Box::new(unreachable_client()),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program,
                         None,
@@ -5553,6 +5756,7 @@ def main():
                     run_job(
                         handle,
                         unreachable_client(),
+                        Box::new(unreachable_client()),
                         &LinkConfig::iso15765(0x7E0, 0x7E8),
                         &program(two_requests()),
                         None,
@@ -5850,20 +6054,33 @@ def main():
     }
 
     /// A first run that the link's failure ends at the request for `service`, which may have
-    /// been sent: a crash after it. A link failure is not sent again (ADR-392), whatever the
-    /// request's idempotency, so the run ends in the host error.
+    /// been sent: a crash after it. The fake host cannot open its link again, so a request that
+    /// is safe to repeat ends the run in the host error (ADR-393), and one that is not ends it in
+    /// the on-site verdict a resume derives (ADR-392 item 3), the request unconfirmed.
     fn lost_response(program: &Program, dir: &std::path::Path, service: u16, pc: u32) {
         let result = first_run(program, dir, JobLimits::default(), |host| {
             host.lose_service = Some(service);
             host.link_loss = true;
         });
-        assert!(
-            matches!(
-                &result,
-                Err(JobError::Host { pc: at, source: HostError::EventStreamEnded }) if *at == pc
-            ),
-            "{result:?}"
-        );
+        if restart::safe_to_repeat(program, pc) {
+            assert!(
+                matches!(
+                    &result,
+                    Err(JobError::Host { pc: at, source: HostError::EventStreamEnded }) if *at == pc
+                ),
+                "{result:?}"
+            );
+        } else {
+            assert!(
+                matches!(
+                    &result,
+                    Err(JobError::OnSiteInterventionRequired(
+                        OnSiteReason::UnconfirmedRequest { at }
+                    )) if at.pc == pc
+                ),
+                "{result:?}"
+            );
+        }
     }
 
     /// [`resume`] with the job's limits given.
@@ -10852,6 +11069,7 @@ def main():
             ..
         } = run_guarded(
             unreachable_client(),
+            Box::new(unreachable_client()),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             decoding_program(),
             JobLimits::default(),
@@ -11178,6 +11396,7 @@ def main():
                 ..
             } = run_guarded(
                 unreachable_client(),
+                Box::new(unreachable_client()),
                 &LinkConfig::iso15765(0x7E0, 0x7E8),
                 job,
                 JobLimits::default(),
@@ -14202,10 +14421,11 @@ def main():
             let dir = journal_dir(&format!("no-plan-section-{tag}"));
             let result = first_run(&program, &dir, JobLimits::default(), |host| {
                 host.lose_routine = Some(routine);
-                // A crash after the request: a link failure is not sent again (ADR-392).
+                // A crash after the request: a link failure is not sent again, and ends the run
+                // in the verdict the resume derives (ADR-392, ADR-393).
                 host.link_loss = true;
             });
-            assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
+            assert!(refused(&result), "{tag}: {result:?}");
             let mut host = FlashHost::new(Rc::new(Cell::new(0)));
             let result = resume(&program, &dir, &mut host, false);
             assert!(refused(&result), "{tag}: {result:?}");
@@ -14365,6 +14585,7 @@ def main():
             ..
         } = run_guarded(
             unreachable_client(),
+            Box::new(unreachable_client()),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code.clone()),
             JobLimits::default(),
@@ -14390,6 +14611,7 @@ def main():
             ..
         } = run_guarded(
             unreachable_client(),
+            Box::new(unreachable_client()),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(two_requests()[..2].to_vec()),
             JobLimits::default(),
@@ -14418,6 +14640,7 @@ def main():
             ..
         } = run_guarded(
             unreachable_client(),
+            Box::new(unreachable_client()),
             &LinkConfig::iso15765(0x7E0, 0x7E8),
             program(code.clone()),
             JobLimits::default(),
@@ -14526,6 +14749,7 @@ def main():
             run_job(
                 handle,
                 unreachable_client(),
+                Box::new(unreachable_client()),
                 &config,
                 &program,
                 None,
@@ -14598,6 +14822,8 @@ def main():
         cancel: CancelAnswer,
         /// What the link's events give after each start, and when.
         on_start: Option<(When, StartEvent)>,
+        /// What the first starts give, one per start, ahead of `on_start`.
+        start_script: Mutex<std::collections::VecDeque<(When, StartEvent)>>,
         /// One permit per primitive whose events the test has released ([`When::Released`]).
         released: Arc<tokio::sync::Semaphore>,
         /// The sender of the link's event stream, once subscribed.
@@ -14917,7 +15143,8 @@ def main():
                 started.push(next);
                 next
             };
-            if let Some((when, event)) = self.on_start {
+            let scripted = self.start_script.lock().unwrap().pop_front();
+            if let Some((when, event)) = scripted.or(self.on_start) {
                 let sender = self.events.lock().unwrap().clone();
                 let (released, cancelled) =
                     (Arc::clone(&self.released), Arc::clone(&self.cancelled));
@@ -15295,6 +15522,7 @@ def main():
             cancelled: Arc::default(),
             cancel: CancelAnswer::Done,
             on_start: None,
+            start_script: Mutex::default(),
             released: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
             device_clock: false,
@@ -15348,12 +15576,23 @@ def main():
         on_start: Option<(When, StartEvent)>,
         device_clock: bool,
     ) -> (WorkerClient, Started) {
+        fake_worker_scripted(cancel, on_start, device_clock, false, Vec::new()).await
+    }
+
+    /// [`fake_worker_with_clock`] whose first starts give `script`'s events, one each.
+    async fn fake_worker_scripted(
+        cancel: CancelAnswer,
+        on_start: Option<(When, StartEvent)>,
+        device_clock: bool,
+        fail_disconnect: bool,
+        script: Vec<(When, StartEvent)>,
+    ) -> (WorkerClient, Started) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let (started, cancelled) = (Arc::default(), Arc::default());
         let released = Arc::new(tokio::sync::Semaphore::new(0));
         let service = FakeWorker {
-            fail_disconnect: false,
+            fail_disconnect,
             fail_open: false,
             calls: Arc::clone(&calls),
             comparams: Mutex::new(Vec::new()),
@@ -15364,6 +15603,7 @@ def main():
             cancelled: Arc::clone(&cancelled),
             cancel,
             on_start,
+            start_script: Mutex::new(script.into()),
             released: Arc::clone(&released),
             events: Arc::default(),
             device_clock,
@@ -18463,15 +18703,11 @@ def main():
                 ));
             },
         );
-        assert!(
-            matches!(
-                result,
-                Err(JobError::Host {
-                    pc: 4,
-                    source: HostError::EventStreamEnded
-                })
-            ),
-            "{result:?}"
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnconfirmedRequest {
+                at: StepRef { pc: 4, steps: 4 }
+            }
         );
         assert_eq!(sends_of(&host, 0x10), 2);
         let facts = &journal.journal().state().facts;
@@ -18646,9 +18882,10 @@ def main():
         assert_eq!(erases, 1);
     }
 
-    /// Link and worker failures, and requests that are not one exchange, end the run as before.
+    /// Link and worker failures, and requests that are not one exchange, end the run as before
+    /// when the host cannot open its link again (ADR-393).
     #[test]
-    fn link_level_errors_are_not_resent() {
+    fn link_level_errors_end_the_run_when_the_host_cannot_open_its_link_again() {
         let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
         for error in [
             HostError::WorkerUnresponsive("StartComPrimitive"),
@@ -18692,5 +18929,759 @@ def main():
         assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
         assert_eq!(sends_of(&host, 0x3E), 2);
         assert_eq!(sends_of(&host, 0x22), 0);
+    }
+
+    // ------------------------------------------- continuing on a new link (ADR-393)
+
+    /// The limits of the tests below: no pause before a resend, a poll of 1 ms, and a wait of
+    /// ten seconds, which only a test that wants the wait to run out shortens.
+    fn after_loss_limits() -> JobLimits {
+        JobLimits {
+            wait_poll: Duration::ZERO,
+            reopen_poll: Duration::from_millis(1),
+            vci_return_wait: Duration::from_secs(10),
+            ..JobLimits::default()
+        }
+    }
+
+    /// The errors of a lost path to the VCI.
+    fn lost_path_errors() -> Vec<HostError> {
+        vec![
+            HostError::VciLost {
+                refused_after_loss: false,
+            },
+            HostError::EventStreamEnded,
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+            HostError::Rpc {
+                rpc: "StartComPrimitive",
+                status: Box::new(tonic::Status::unavailable("gone")),
+            },
+        ]
+    }
+
+    /// The vci lost error of a request that may have reached the ECU.
+    fn vci_lost() -> HostError {
+        HostError::VciLost {
+            refused_after_loss: false,
+        }
+    }
+
+    /// How often the plain procedure's stage was resumed in `journal`.
+    fn counted_resumes<S: Store>(journal: &JobJournal<S>) -> u16 {
+        journal
+            .journal()
+            .state()
+            .facts
+            .resume_count(crate::journal::StageId(diag_ir::PLAIN_PROCEDURE_STAGE))
+    }
+
+    /// A `Safe` read whose path to the VCI is lost mid-primitive, outside every plan, is sent
+    /// again on a link opened again, and the job completes in the same run (design 8.2.5).
+    #[test]
+    fn a_safe_request_whose_vci_is_lost_is_sent_again_on_a_new_link() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        for index in 0..lost_path_errors().len() {
+            let error = format!("{:?}", lost_path_errors()[index]);
+            let (result, host, journal) = run_repeating(
+                &program,
+                after_loss_limits(),
+                &AtomicBool::new(false),
+                |host| {
+                    host.fail_service = Some((0x3E, [lost_path_errors().remove(index)].into()));
+                    host.reopen_script = [ReopenAttempt::Opened].into();
+                },
+            );
+            result.unwrap_or_else(|e| panic!("{error:?}: {e:?}"));
+            assert_eq!(sends_of(&host, 0x3E), 2, "{error:?}");
+            assert_eq!(sends_of(&host, 0x22), 1, "{error:?}");
+            assert_eq!(host.reopen_calls, 1, "{error:?}");
+            // The second send is announced as a resend.
+            assert_eq!(host.resent, 1, "{error:?}");
+            // The continuation is one resume of the plain procedure.
+            assert_eq!(counted_resumes(&journal), 1, "{error:?}");
+        }
+    }
+
+    /// Without a journal nothing is counted and no VIN is read; the run goes on all the same.
+    #[test]
+    fn a_run_without_a_journal_continues_without_counting_or_reading_a_vin() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.fail_service = Some((0x3E, [vci_lost()].into()));
+        host.reopen_script = [ReopenAttempt::Opened].into();
+        let result = run_on(
+            &program,
+            &mut host,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            None::<&mut JobJournal>,
+        );
+        result.expect("the run completes");
+        assert_eq!(sends_of(&host, 0x3E), 2);
+        assert_eq!(host.vin_reads, 0);
+        assert_eq!(host.reopen_calls, 1);
+    }
+
+    /// No session is entered again: an earlier session change of the program stays where it
+    /// ran, and the request after it is the only one sent twice.
+    #[test]
+    fn a_continuation_after_a_session_change_does_not_enter_the_session_again() {
+        let program = plain_steps(&[(0x10, Safe), (0x3E, Safe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x3E, [vci_lost()].into()));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        result.expect("the run completes");
+        assert_eq!(sends_of(&host, 0x10), 1);
+        assert_eq!(sends_of(&host, 0x3E), 2);
+    }
+
+    /// An `Unsafe` request reachable ahead rules the continuation out (condition S): the run
+    /// ends in the host error, no link is opened, and the journal's restart judges it.
+    #[test]
+    fn an_unsafe_request_ahead_ends_the_run_in_the_host_error() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x22, [vci_lost()].into()));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    pc: 1,
+                    source: HostError::VciLost {
+                        refused_after_loss: false
+                    }
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 0);
+        assert_eq!(sends_of(&host, 0x22), 1);
+    }
+
+    /// An `Unsafe` request that may have reached the ECU is on-site intervention, the verdict of
+    /// the classification on the journal, and no link is opened.
+    #[test]
+    fn an_unsafe_request_in_flight_when_the_vci_is_lost_ends_on_site_without_a_new_link() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let (result, host, journal) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x10, [vci_lost()].into()));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::UnconfirmedRequest {
+                at: StepRef { pc: 4, steps: 4 }
+            }
+        );
+        assert_eq!(
+            restart::classify(&program, Ok(journal.journal().state())),
+            RestartDecision::OnSiteInterventionRequired(reason_of(&result).clone())
+        );
+        assert_eq!(host.reopen_calls, 0);
+        assert_eq!(sends_of(&host, 0x10), 1);
+    }
+
+    /// A request the worker refused after the loss was never sent: it is sent again on the new
+    /// link whatever its idempotency, with its one request marker.
+    #[test]
+    fn a_request_refused_after_the_loss_is_sent_again_whatever_its_idempotency() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let (result, host, journal) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((
+                    0x10,
+                    [HostError::VciLost {
+                        refused_after_loss: true,
+                    }]
+                    .into(),
+                ));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        result.expect("the run completes");
+        assert_eq!(sends_of(&host, 0x10), 2);
+        assert_eq!(host.resent, 1);
+        assert_eq!(counted_resumes(&journal), 1);
+        // The marker was written once, for the arrival, and the request completed.
+        assert_eq!(
+            journal.journal().state().facts.last_request,
+            Some(StepRef { pc: 4, steps: 4 })
+        );
+        assert!(!journal.journal().state().facts.last_request_withdrawn());
+    }
+
+    /// A request that was never sent but is followed by another `Unsafe` one is no continuation
+    /// (condition S looks ahead of it): the run ends in the host error with the marker withdrawn.
+    #[test]
+    fn an_unsent_request_followed_by_an_unsafe_one_ends_in_the_host_error() {
+        let program = plain_steps(&[(0x10, Unsafe), (0x14, Unsafe)]);
+        let (result, host, journal) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((
+                    0x10,
+                    [HostError::VciLost {
+                        refused_after_loss: true,
+                    }]
+                    .into(),
+                ));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    pc: 1,
+                    source: HostError::VciLost {
+                        refused_after_loss: true
+                    }
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 0);
+        assert!(journal.journal().state().facts.last_request_withdrawn());
+    }
+
+    /// A VCI that is not back when `vci_return_wait` has passed ends the run in the error it
+    /// lost the link with; with a wait of zero the host is asked once.
+    #[test]
+    fn a_vci_that_does_not_come_back_ends_the_run_in_the_original_error() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let limits = JobLimits {
+            vci_return_wait: Duration::ZERO,
+            ..after_loss_limits()
+        };
+        let (result, host, journal) =
+            run_repeating(&program, limits, &AtomicBool::new(false), |host| {
+                host.fail_service = Some((0x3E, [vci_lost()].into()));
+                host.reopen_after = ReopenAttempt::NotYet;
+            });
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    pc: 4,
+                    source: HostError::VciLost {
+                        refused_after_loss: false
+                    }
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 1);
+        assert_eq!(sends_of(&host, 0x3E), 1);
+        // Nothing was resumed, since no request followed.
+        assert_eq!(counted_resumes(&journal), 0);
+        // A host that cannot open a link ends the run the same way, asked once.
+        let (result, host, _) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x3E, [vci_lost()].into()));
+                host.reopen_after = ReopenAttempt::Cannot;
+            },
+        );
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 1);
+    }
+
+    /// A VCI that comes back at the third attempt, within the wait, continues the run.
+    #[test]
+    fn a_vci_that_comes_back_within_the_wait_continues_the_run() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x3E, [vci_lost()].into()));
+                host.reopen_script = [
+                    ReopenAttempt::NotYet,
+                    ReopenAttempt::NotYet,
+                    ReopenAttempt::Opened,
+                ]
+                .into();
+            },
+        );
+        result.expect("the run completes");
+        assert_eq!(host.reopen_calls, 3);
+        assert_eq!(sends_of(&host, 0x3E), 2);
+    }
+
+    /// A cancel taken during the wait for the VCI ends the run cancelled, and no request is
+    /// sent after it.
+    #[test]
+    fn a_cancel_during_the_wait_for_the_vci_ends_the_run_cancelled() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (result, host, _) = run_repeating(&program, after_loss_limits(), &cancelled, |host| {
+            host.fail_service = Some((0x3E, [vci_lost()].into()));
+            host.reopen_after = ReopenAttempt::NotYet;
+            host.cancel_on_reopen = Some(Arc::clone(&cancelled));
+        });
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(host.reopen_calls, 1);
+        assert_eq!(sends_of(&host, 0x3E), 1);
+    }
+
+    /// A run opens its link again at most `max_link_reopens` times, counted over the whole run.
+    #[test]
+    fn the_link_is_opened_again_at_most_max_link_reopens_times_per_run() {
+        // The VCI is lost at the first two sends of the request.
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let lose_twice = |host: &mut FlashHost| {
+            host.fail_service = Some((0x3E, [vci_lost(), vci_lost()].into()));
+            host.reopen_after = ReopenAttempt::Opened;
+        };
+        let one = JobLimits {
+            max_link_reopens: 1,
+            ..after_loss_limits()
+        };
+        let (result, host, _) = run_repeating(&program, one, &AtomicBool::new(false), lose_twice);
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    pc: 4,
+                    source: HostError::VciLost { .. }
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 1);
+        assert_eq!(sends_of(&host, 0x3E), 2);
+        let (result, host, _) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            lose_twice,
+        );
+        result.expect("two reopens are within the default bound");
+        assert_eq!(host.reopen_calls, 2);
+        assert_eq!(sends_of(&host, 0x3E), 3);
+        let none = JobLimits {
+            max_link_reopens: 0,
+            ..after_loss_limits()
+        };
+        let (result, host, _) = run_repeating(&program, none, &AtomicBool::new(false), lose_twice);
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 0);
+        assert_eq!(sends_of(&host, 0x3E), 1);
+    }
+
+    /// The resends of a continuation count against `max_primitive_repeats` like any other.
+    #[test]
+    fn a_continuation_is_a_send_within_max_primitive_repeats() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let limits = JobLimits {
+            max_primitive_repeats: 0,
+            ..after_loss_limits()
+        };
+        let (result, host, _) = run_repeating(&program, limits, &AtomicBool::new(false), |host| {
+            host.fail_service = Some((0x3E, [vci_lost()].into()));
+            host.reopen_after = ReopenAttempt::Opened;
+        });
+        assert!(
+            matches!(result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 0);
+    }
+
+    /// Inside a flash plan a lost path ends the run as before, whatever the host could do.
+    #[test]
+    fn a_lost_path_inside_a_flash_plan_does_not_open_a_new_link() {
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.lose_routine = Some(0xFF00);
+        host.link_loss = true;
+        host.reopen_after = ReopenAttempt::Opened;
+        let mut journal = counting_journal(&commits, None);
+        let result = run_flash(&mut host, &mut journal);
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Host {
+                    pc: ERASE,
+                    source: HostError::EventStreamEnded
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 0);
+    }
+
+    /// A section that is not interruptible (condition I) ends the run in the host error with no
+    /// new link: the section's requests go on only through a restart's rules.
+    #[test]
+    fn a_lost_path_in_a_section_that_is_not_interruptible_does_not_open_a_new_link() {
+        for interruptible in [
+            diag_ir::Interruptible::No,
+            diag_ir::Interruptible::RecoveryRequired,
+        ] {
+            let mut program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+            program.sections[1].interruptible = interruptible;
+            program.validate().unwrap();
+            let (result, host, _) = run_repeating(
+                &program,
+                after_loss_limits(),
+                &AtomicBool::new(false),
+                |host| {
+                    host.fail_service = Some((0x3E, [vci_lost()].into()));
+                    host.reopen_after = ReopenAttempt::Opened;
+                },
+            );
+            assert!(
+                matches!(&result, Err(JobError::Host { pc: 4, .. })),
+                "{interruptible:?}: {result:?}"
+            );
+            assert_eq!(host.reopen_calls, 0, "{interruptible:?}");
+        }
+    }
+
+    /// A journaled continuation counts one resume under the plain stage and reads the VIN again
+    /// on the new link, before the request is sent again.
+    #[test]
+    fn a_journaled_continuation_is_counted_and_reads_the_vin_before_the_resend() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let dir = journal_dir("loss-continues");
+        let result = first_run(&program, &dir, after_loss_limits(), |host| {
+            host.fail_service = Some((0x3E, [vci_lost()].into()));
+            host.reopen_script = [ReopenAttempt::Opened].into();
+        });
+        result.expect("the run completes");
+        assert_eq!(plain_resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // The order of what the host saw, on a host the test keeps.
+        let dir = journal_dir("loss-continues-order");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.fail_service = Some((0x3E, [vci_lost()].into()));
+        host.reopen_script = [ReopenAttempt::Opened].into();
+        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        run_on(
+            &program,
+            &mut host,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        )
+        .expect("the run completes");
+        let services: Vec<(u16, Vec<u8>)> = host
+            .sent()
+            .into_iter()
+            .map(|sent| match sent {
+                Sent::Service(id, payload) => (id, payload),
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            services,
+            [
+                (0x22, vec![1]),
+                (0x3E, vec![1]),
+                // The VIN, read through the program's source on the new link.
+                (0x22, vec![0xF1, 0x90]),
+                (0x3E, vec![1]),
+            ]
+        );
+        assert_eq!(host.vin_reads, 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A journal that names no VIN reads none, and the run goes on.
+    #[test]
+    fn a_continuation_of_a_job_with_no_vin_reads_none() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let dir = journal_dir("loss-no-vin");
+        let result = first_run_for(&program, &dir, after_loss_limits(), None, |host| {
+            host.fail_service = Some((0x3E, [vci_lost()].into()));
+            host.reopen_script = [ReopenAttempt::Opened].into();
+        });
+        result.expect("the run completes");
+        assert_eq!(plain_resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Another vehicle's VIN on the new link aborts the job for good, journaled (ADR-286), with
+    /// the request not sent again.
+    #[test]
+    fn another_vin_on_the_new_link_ends_the_job_for_good() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let dir = journal_dir("loss-vin-mismatch");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.fail_service = Some((0x3E, [vci_lost()].into()));
+        host.reopen_script = [ReopenAttempt::Opened].into();
+        host.vin_script = [IdAnswer::value("WDB99999999999999")].into();
+        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let result = run_on(
+            &program,
+            &mut host,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x3E), 1);
+        let facts = Journal::read(&dir, &job_key()).unwrap().facts;
+        assert_eq!(facts.identity_mismatch, Some(IdentityKind::Vin));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VIN that cannot be established on the new link is on-site intervention, the resume
+    /// counted (ADR-290), the request not sent again.
+    #[test]
+    fn a_vin_that_cannot_be_read_on_the_new_link_ends_on_site() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let dir = journal_dir("loss-vin-unread");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.fail_service = Some((0x3E, [vci_lost()].into()));
+        host.reopen_script = [ReopenAttempt::Opened].into();
+        host.vin_script = [IdAnswer::Refuse].into();
+        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let result = run_on(
+            &program,
+            &mut host,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::ProcedureIdentityNotEstablished
+        );
+        assert_eq!(sends_of(&host, 0x3E), 1);
+        assert_eq!(plain_resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// At the plain stage's resume limit a continuation is on-site intervention, with nothing
+    /// sent on the new link.
+    #[test]
+    fn a_continuation_at_the_resume_limit_ends_on_site() {
+        let program = plain_steps(&[(0x3E, Safe), (0x3E, Safe)]);
+        let dir = journal_dir("loss-resume-limit");
+        let limits = JobLimits {
+            max_procedure_resumes: 1,
+            ..after_loss_limits()
+        };
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.fail_service = Some((0x3E, [vci_lost(), vci_lost()].into()));
+        host.reopen_after = ReopenAttempt::Opened;
+        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let result = run_on(
+            &program,
+            &mut host,
+            limits,
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert_eq!(
+            reason_of(&result),
+            &OnSiteReason::ProcedureResumeLimitReached { resumes: 1, max: 1 }
+        );
+        // The first continuation read the VIN and sent again, the send failed again, and the
+        // second continuation sent nothing.
+        assert_eq!(host.vin_reads, 1);
+        assert_eq!(sends_of(&host, 0x3E), 2);
+        assert_eq!(host.reopen_calls, 2);
+        assert_eq!(plain_resumes(&dir), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-393: a job whose VCI is lost in a `Safe` read, outside every plan, goes on in the same
+    /// run once the link opens again on the worker. The lost link is closed (the module
+    /// disconnected) before the new one opens, the resend is logged with the origin `repeat`, and
+    /// the log shows the loss, the reconnect, its settlement and the new link, so a later run has
+    /// no loss left to settle.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_vci_is_reconnected_and_settled_within_the_run() {
+        const LOSE: &[Step] = &[Step::Transmit(1_000), Step::LostVci(2_000)];
+        let dir = journal_dir("loss-in-run");
+        let (client, fake) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            false,
+            vec![
+                (When::After(Duration::ZERO), StartEvent::Script(LOSE)),
+                (When::After(Duration::ZERO), StartEvent::Respond),
+            ],
+        )
+        .await;
+        let setup = comm_log_setup_in(&dir);
+        let run = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(plain_steps(&[(0x22, Safe)])).with_comm_log(setup.clone()),
+            JobLimits {
+                reopen_poll: Duration::from_millis(1),
+                ..JobLimits::default()
+            },
+            vci_only_guards("loss-in-run"),
+        )
+        .await;
+        run.result.expect("the run completes");
+        assert_eq!(run.comm_log, CommLogStatus::Complete);
+        let lines = comm_log_lines(&dir);
+        let exchanges = of_event(&lines, "exchange");
+        let origins: Vec<_> = exchanges
+            .iter()
+            .map(|line| line["origin"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(origins, ["procedure", "repeat"], "{lines:#?}");
+        assert_eq!(exchanges[1]["at"], exchanges[0]["at"], "{exchanges:#?}");
+        // The loss, the reconnect, its settlement, the new link, the resend.
+        let last = |event: &str| {
+            lines
+                .iter()
+                .rposition(|line| line["event"] == event)
+                .unwrap_or_else(|| panic!("no {event} in {lines:#?}"))
+        };
+        assert_eq!(of_event(&lines, "vci_connected").len(), 2, "{lines:#?}");
+        assert_eq!(of_event(&lines, "link_opened").len(), 2, "{lines:#?}");
+        assert_eq!(of_event(&lines, "vci_loss_settled").len(), 1, "{lines:#?}");
+        let (loss, connected, settled, opened, resend) = (
+            last("vci_loss"),
+            last("vci_connected"),
+            last("vci_loss_settled"),
+            last("link_opened"),
+            lines
+                .iter()
+                .rposition(|line| line["event"] == "exchange")
+                .unwrap(),
+        );
+        assert!(
+            loss < connected && connected < settled && settled < opened && opened < resend,
+            "{lines:#?}"
+        );
+        assert_eq!(
+            lines[settled]["loss"], lines[loss]["loss"],
+            "{}",
+            lines[settled]
+        );
+        assert_eq!(
+            lines[settled]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{}",
+            lines[settled]
+        );
+        // The lost link was closed, the module disconnected, before the module connected again.
+        let calls = fake.calls.lock().unwrap().clone();
+        let positions = |call: &str| -> Vec<usize> {
+            calls
+                .iter()
+                .enumerate()
+                .filter(|(_, name)| **name == call)
+                .map(|(at, _)| at)
+                .collect()
+        };
+        let (connects, disconnects) = (positions("ModuleConnect"), positions("ModuleDisconnect"));
+        assert_eq!(connects.len(), 2, "{calls:?}");
+        assert_eq!(disconnects.len(), 2, "{calls:?}");
+        assert!(
+            connects[0] < disconnects[0]
+                && disconnects[0] < connects[1]
+                && connects[1] < disconnects[1],
+            "{calls:?}"
+        );
+        // No loss is left for the next run to settle.
+        let reopened = crate::comm_log::CommLog::open(&setup).expect("the log opens again");
+        assert!(!reopened.loss_to_settle());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-258: a lost link the worker cannot close (the J2534 worker's disconnect of a lost
+    /// device fails) is not confirmed closed, so it is not opened again: the run ends in the
+    /// host error, the guards stay marked, and the worker saw no second connect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_link_that_cannot_be_closed_is_not_opened_again() {
+        const LOSE: &[Step] = &[Step::Transmit(1_000), Step::LostVci(2_000)];
+        let (client, fake) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            true,
+            vec![
+                (When::After(Duration::ZERO), StartEvent::Script(LOSE)),
+                (When::After(Duration::ZERO), StartEvent::Respond),
+            ],
+        )
+        .await;
+        let run = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(plain_steps(&[(0x22, Safe)])),
+            JobLimits {
+                reopen_poll: Duration::from_millis(1),
+                ..JobLimits::default()
+            },
+            vci_only_guards("loss-unconfirmed"),
+        )
+        .await;
+        assert!(
+            matches!(
+                &run.result,
+                Err(JobError::Host {
+                    pc: 1,
+                    source: HostError::VciLost {
+                        refused_after_loss: false
+                    }
+                })
+            ),
+            "{:?}",
+            run.result
+        );
+        assert!(run.guards.link_unconfirmed());
+        let calls = fake.calls.lock().unwrap().clone();
+        assert_eq!(
+            calls
+                .iter()
+                .filter(|call| **call == "ModuleConnect")
+                .count(),
+            1,
+            "{calls:?}"
+        );
+        let mut guards = run.guards;
+        guards.worker_gone();
     }
 }

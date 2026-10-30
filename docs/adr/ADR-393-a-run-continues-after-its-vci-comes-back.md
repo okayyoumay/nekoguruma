@@ -5,8 +5,8 @@
 **Affects:** `agent` host (`HostError::resend_class`, `WorkerHost::reopen`), runner (`run_vm`,
 `JobLimits::vci_return_wait`, `reopen_poll`, `max_link_reopens`), restart (`repeat_decision`),
 communication log (`settle_loss`, `vci_connected`, `link_opened`); design 8.2.5, 8.11;
-`crates/agent/docs/ngr-agent.md`; ADR-289 item 4; ADR-294 item 4; ADR-335 item 3; ADR-373 item 3;
-ADR-392 item 6
+`crates/agent/docs/ngr-agent.md`; ADR-258 item 1; ADR-289 item 4; ADR-294 item 4; ADR-335 item 3; ADR-373
+item 3; ADR-392 item 6
 
 ## Context
 
@@ -27,7 +27,10 @@ definition correct in any session the procedure can leave the ECU in (ADR-335 it
    path was lost opens its link again through the worker it has, every `reopen_poll` (1 s),
    until `vci_return_wait` (60 s), taking a cancel while it waits as during a wait, at most
    `max_link_reopens` (2) times per run. A worker that crashed is not restarted yet, so such a
-   run ends as before.
+   run ends as before. Before it opens the link again, the run closes the lost one. On this path
+   alone, a successful module disconnect confirms the link closed even when the link's own
+   disconnect failed because the device was gone: disconnecting the module releases every link
+   on it. Every other failed close stays unconfirmed (ADR-258).
 3. **It continues only where ADR-335 item 3 would.** At the current instruction, everything
    ahead must be safe to repeat with no flash plan and no recovery-required section ahead, the
    point must be interruptible, and a VIN the job names must read back the same. No diagnostic

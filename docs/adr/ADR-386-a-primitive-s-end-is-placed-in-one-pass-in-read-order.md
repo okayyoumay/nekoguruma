@@ -49,7 +49,8 @@ one microsecond, and which exchange stands in for the exchange in flight.
 
 4. **Order decides "before the answer".** A link error the exchange holds counts as before its
    answer only when its read ordinal is below the answer's (the maintainer's choice,
-   2026-10-30). This replaces the rule that an error in no known order ended the answer.
+   2026-10-30). For a primitive's end, this replaces ADR-366's rule that an error in no known
+   order with the answer ended it. An answer freed later keeps ADR-368's rule.
 
 5. **Every link error read meanwhile goes to `late_link_error`, after the entry.** In read
    order, each is its own `late_item` (the maintainer's choice, 2026-10-30):

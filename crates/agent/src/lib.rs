@@ -41,7 +41,7 @@ pub mod runner;
 pub mod send_receive;
 
 pub use artifact::Artifact;
-pub use client::WorkerApi;
+pub use client::{WorkerApi, WorkerSource};
 pub use comm_log::{
     CommLog, CommLogIncomplete, CommLogSetup, CommLogStatus, VciFacts, VciMargins, run_key,
 };

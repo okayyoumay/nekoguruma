@@ -236,6 +236,11 @@ pub enum ResendClass {
     /// The worker refused the start for a reason that passes (a held link, a full transmit
     /// queue), so nothing was sent and the same request can be started again.
     Transient,
+    /// The path to the VCI is gone: the VCI was lost, the worker's event stream ended, the
+    /// worker did not answer, or the call to it failed in transport with no refusal. The ECU
+    /// said nothing about the request. A new link may carry it again (design 8.2.5, ADR-393);
+    /// whether the request may have reached the ECU is [`HostError::send_state`].
+    PathLost,
     /// Anything else: a link or worker failure, or a refusal that does not pass.
     Other,
 }
@@ -254,6 +259,19 @@ impl HostError {
                         == Some(vci_service_interface::RefusalReason::QueueFull) =>
             {
                 ResendClass::Transient
+            }
+            HostError::VciLost { .. }
+            | HostError::EventStreamEnded
+            | HostError::WorkerUnresponsive(_) => ResendClass::PathLost,
+            // The connection to the worker failed: no status of the worker's own, and no
+            // refusal it gave.
+            HostError::Rpc { status, .. }
+                if matches!(
+                    status.code(),
+                    tonic::Code::Unavailable | tonic::Code::Cancelled | tonic::Code::Unknown
+                ) && refusal_reason(status).is_none() =>
+            {
+                ResendClass::PathLost
             }
             _ => ResendClass::Other,
         }
@@ -293,7 +311,7 @@ fn lost_vci_between_primitives(error: HostError) -> HostError {
 
 /// Whether the worker refused a call because it knows no object with the handle given
 /// (`PDU_ERR_INVALID_HANDLE`, ISO 22900-2:2022 D.3): for a cancel, a primitive that has ended.
-fn names_invalid_handle(status: &tonic::Status) -> bool {
+pub(crate) fn names_invalid_handle(status: &tonic::Status) -> bool {
     vci_service_interface::error_detail_from_status(status).is_some_and(|detail| {
         detail.pdu_error == vci_service_interface::PduError::PduErrInvalidHandle as i32
     })
@@ -555,6 +573,41 @@ pub struct WorkerHost<C: WorkerApi> {
     /// How long [`WorkerHost::settle_at_end`] keeps the link open for such a primitive
     /// (`LinkConfig::job_end_wait`, ADR-358).
     job_end_wait: Duration,
+    /// What opens the link again after the path to the VCI was lost (ADR-393); without it the
+    /// host cannot.
+    relink: Option<Relink<C>>,
+}
+
+/// The link that is open on the worker: the client it was opened on and its handles.
+#[derive(Clone)]
+pub(crate) struct OpenOn<C> {
+    pub(crate) client: C,
+    pub(crate) module_handle: vci_service_interface::ModuleHandle,
+    pub(crate) cll_handle: vci_service_interface::ComLogicalLinkHandle,
+}
+
+/// The link that is open on the worker, shared with the runner's closing of it, so the runner
+/// closes the link the host opened last, on the client that opened it, and none after the host
+/// closed it.
+pub(crate) type OpenHandles<C> = std::sync::Arc<std::sync::Mutex<Option<OpenOn<C>>>>;
+
+/// What [`WorkerHost`] needs to open its link again (ADR-393).
+pub(crate) struct Relink<C: WorkerApi> {
+    /// Gives the client of the new link.
+    pub(crate) source: Box<dyn crate::client::WorkerSource<Client = C>>,
+    /// The link to open: the job's, as it opened first.
+    pub(crate) config: LinkConfig,
+    /// The open link's handles, shared with the runner.
+    pub(crate) open: OpenHandles<C>,
+    /// Marks the job's guards: the worker may still hold the link (ADR-258).
+    pub(crate) mark_unconfirmed: Box<dyn Fn() + Send>,
+    /// Whether the link the host holds is still open on the worker.
+    pub(crate) old_open: bool,
+    /// Whether the path to the VCI is lost now (ADR-393): set when a failure of the run says so
+    /// ([`ProcedurePosition::path_lost`]) and cleared when the link is open again; shared with
+    /// the runner, whose final close then follows the same rule as the host's. A link that
+    /// opened again is healthy, so a later failure to close it stays unconfirmed.
+    pub(crate) path_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -577,6 +630,127 @@ impl<C: WorkerApi> WorkerHost<C> {
             download_seq: None,
             stray: None,
             job_end_wait: crate::link::JOB_END_WAIT_MAX,
+            relink: None,
+        }
+    }
+
+    /// Lets the host open its link again after the path to the VCI was lost
+    /// ([`ProcedurePosition::reopen_link`], ADR-393).
+    pub(crate) fn set_relink(&mut self, relink: Relink<C>) {
+        self.relink = Some(relink);
+    }
+
+    /// Takes `link`, opened on `client` for `config`, in place of the host's own: the VCI came
+    /// back (ADR-393). The document, the artifact, the communication log and the link's
+    /// identifiers stay; everything that belongs to the old link starts over (the waits in
+    /// progress, the transfer counter, the primitive the host was settling, the runtime input
+    /// ids). The log gets the new connection: `vci_connected`, which settles the run's own
+    /// loss, then `link_opened`, on the link number the log used before.
+    pub(crate) fn reopen(&mut self, mut client: C, link: Link, config: &LinkConfig) {
+        if let Some(log) = &self.comm_log {
+            log_connected(
+                &self.handle,
+                &mut client,
+                log,
+                config,
+                self.document.as_ref(),
+                &link,
+                self.timings.unary,
+            );
+        }
+        self.client = client;
+        self.link = link;
+        self.waits.clear();
+        self.vbatt_id = crate::inputs::VbattId::Unknown;
+        self.transfer = TransferCounter::default();
+        self.at = None;
+        self.resends = false;
+        self.own = None;
+        self.download_seq = None;
+        self.stray = None;
+    }
+
+    /// One attempt of [`ProcedurePosition::reopen_link`].
+    fn try_reopen(&mut self, relink: &mut Relink<C>) -> ReopenAttempt {
+        // The runner asks to open the link again only after the path was lost.
+        relink
+            .path_lost
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        if relink.old_open {
+            // A primitive the loss left is settled first, then the lost link is closed: the
+            // worker takes the module again only after it was disconnected. The event stream
+            // goes before the link is closed.
+            self.settle_at_end();
+            self.link.events = None;
+            // The path is lost: a module disconnect that succeeds confirms the link closed even
+            // if the link's own disconnect failed (ADR-393).
+            let closed = self.handle.block_on(crate::link::teardown(
+                &mut self.client,
+                self.link.module_handle,
+                self.link.cll_handle,
+                self.timings.unary,
+                true,
+            ));
+            match closed {
+                Ok(()) => {
+                    relink.old_open = false;
+                    *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = None;
+                }
+                Err(error) => {
+                    // The worker may still hold the lost link (ADR-258); the runner's own
+                    // close at the end tries again.
+                    tracing::warn!(
+                        error = %crate::oplog::LogSafe::log_text(&error),
+                        "could not close the lost link before opening it again"
+                    );
+                    (relink.mark_unconfirmed)();
+                    return ReopenAttempt::Cannot;
+                }
+            }
+        }
+        let mut client = match relink.source.client() {
+            Ok(client) => client,
+            Err(error) => {
+                tracing::debug!(
+                    error = %crate::oplog::LogSafe::log_text(&error),
+                    "no worker client to open the link again"
+                );
+                return ReopenAttempt::NotYet;
+            }
+        };
+        let opened = self.handle.block_on(crate::link::open_tracked(
+            &mut client,
+            &relink.config,
+            self.timings.unary,
+        ));
+        match opened {
+            Ok(link) => {
+                *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = Some(OpenOn {
+                    client: client.clone(),
+                    module_handle: link.module_handle,
+                    cll_handle: link.cll_handle,
+                });
+                relink.old_open = true;
+                // The new link is healthy: the path is not lost until a failure says so again.
+                relink
+                    .path_lost
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
+                self.reopen(client, link, &relink.config);
+                ReopenAttempt::Opened
+            }
+            Err(failure) => {
+                tracing::debug!(
+                    error = %crate::oplog::LogSafe::log_text(&failure.error),
+                    "the link did not open again"
+                );
+                if failure.cleaned_up {
+                    ReopenAttempt::NotYet
+                } else {
+                    // The worker may hold what the open left (ADR-258).
+                    (relink.mark_unconfirmed)();
+                    ReopenAttempt::Cannot
+                }
+            }
         }
     }
 
@@ -606,7 +780,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let until = stray.deadline.max(tokio::time::Instant::now()) + self.job_end_wait;
         let cop = stray.cop;
         let log = self.comm_log.as_ref().filter(|log| log.is_open());
-        let events = &mut self.link.events;
+        let mut events = self.link.events.as_mut();
         // Its items are read as its exchange's were, so its end is the one the exchange would
         // have had (design 8.11 `primitive_ended`).
         let mut progress = stray.progress();
@@ -617,6 +791,9 @@ impl<C: WorkerApi> WorkerHost<C> {
             handle.block_on(async {
                 tokio::time::timeout_at(until, async {
                     loop {
+                        let Some(events) = events.as_mut() else {
+                            return Some(None);
+                        };
                         match events.message().await {
                             Ok(Some(notification)) => {
                                 // A lost-events notice ends the wait as it does an exchange's.
@@ -1133,13 +1310,15 @@ impl<C: WorkerApi> WorkerHost<C> {
             .as_ref()
             .and_then(|settling| Some((settling.stray.cop, settling.stray.seq?)));
 
-        let events = &mut self.link.events;
+        let mut events = self.link.events.as_mut();
         let log = self.comm_log.as_ref();
         let progress = &mut progress;
         let settling_ref = &mut settling;
         let wait = async {
             loop {
                 let notification = events
+                    .as_mut()
+                    .ok_or(HostError::EventStreamEnded)?
                     .message()
                     .await
                     .map_err(|status| HostError::Rpc {
@@ -2207,6 +2386,29 @@ pub trait ProcedurePosition {
     /// The step that began is a resend of the request an earlier attempt of the same arrival
     /// sent (ADR-392): what the host sends until the step ends has the origin `repeat`.
     fn step_resends(&mut self) {}
+    /// Makes one attempt to open the link again after the path to the VCI was lost, closing the
+    /// lost one first (design 8.2.5, ADR-393). A host that cannot (the default) ends the
+    /// run in the error as before.
+    fn reopen_link(&mut self) -> ReopenAttempt {
+        ReopenAttempt::Cannot
+    }
+    /// The step failed with an error that says the path to the VCI is lost
+    /// ([`HostError::resend_class`]), whatever follows: the run's final close then follows the
+    /// lost path's rule (ADR-393).
+    fn path_lost(&mut self) {}
+}
+
+/// How [`ProcedurePosition::reopen_link`] ended.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReopenAttempt {
+    /// The link is open again, with the host's document, artifact, communication log and link
+    /// identifiers kept.
+    Opened,
+    /// The VCI is not back or the worker did not open the link; another attempt may succeed.
+    NotYet,
+    /// The host cannot open a link again, or the lost link could not be confirmed closed (the
+    /// guards are marked, ADR-258): the run ends.
+    Cannot,
 }
 
 /// Reads the runner and the restart send on their own, outside the VM's steps, by the origin
@@ -2257,6 +2459,66 @@ impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
     fn step_resends(&mut self) {
         self.resends = true;
     }
+
+    fn path_lost(&mut self) {
+        if let Some(relink) = &self.relink {
+            relink
+                .path_lost
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+
+    fn reopen_link(&mut self) -> ReopenAttempt {
+        let Some(mut relink) = self.relink.take() else {
+            return ReopenAttempt::Cannot;
+        };
+        let attempt = self.try_reopen(&mut relink);
+        self.relink = Some(relink);
+        attempt
+    }
+}
+
+/// Writes the log's record of a VCI connected and a link opened on it (design 8.11 "Header"):
+/// `vci_connected`, which settles a loss the log holds first against the VCI's clock read now,
+/// then `link_opened`. The runner makes it at the job's start, and the host again when the link
+/// is opened again (ADR-393).
+pub(crate) fn log_connected<C: WorkerApi>(
+    handle: &Handle,
+    client: &mut C,
+    log: &crate::comm_log::CommLog,
+    config: &LinkConfig,
+    document: Option<&crate::document::JobDocument>,
+    link: &Link,
+    deadline: Duration,
+) {
+    // A loss is settled against the first reading of the VCI's clock after it connected
+    // (design 8.11 `vci_loss_settled`, ADR-373).
+    let reading = if log.loss_to_settle() {
+        let asked = log.now();
+        handle
+            .block_on(read_vci_clock(client, link.module_handle, deadline))
+            .map(|time| {
+                let read = log.now();
+                crate::comm_log::ConnectReading {
+                    time,
+                    read,
+                    round_trip_us: log.round_trip_us(asked, read),
+                }
+            })
+    } else {
+        None
+    };
+    log.vci_connected(link.version.as_ref(), reading);
+    let valued_by_document = document
+        .map(|document| crate::link::valued_by_document(&document.variant()))
+        .unwrap_or_default();
+    log.link_opened(
+        LOG_LINK,
+        config,
+        &valued_by_document,
+        link.indications,
+        link.forwards_pendings,
+    );
 }
 
 /// The `at` of the instruction at `pc`: its source position, from the source map entry that
@@ -5017,17 +5279,76 @@ mod tests {
             refused_start(Some(RefusalReason::InvalidParameters)),
             refused_start(None),
             HostError::NotAllowed(0x2E),
-            HostError::WorkerUnresponsive("StartComPrimitive"),
-            HostError::EventStreamEnded,
             HostError::Setup("link"),
-            HostError::VciLost {
-                refused_after_loss: false,
-            },
-            HostError::VciLost {
-                refused_after_loss: true,
-            },
+            transport_failure("StartComPrimitive", tonic::Code::DeadlineExceeded),
+            transport_failure("StartComPrimitive", tonic::Code::Internal),
         ] {
             assert_eq!(error.resend_class(), ResendClass::Other, "{error:?}");
+        }
+    }
+
+    /// ADR-393: a lost VCI, a worker that does not answer, an event stream that ended and a
+    /// failed connection to the worker are one class, the path to the VCI; the send state still
+    /// tells whether the request may have gone.
+    #[test]
+    fn the_resend_class_names_the_lost_path() {
+        use vci_service_interface::RefusalReason;
+        for (error, sent) in [
+            (
+                HostError::VciLost {
+                    refused_after_loss: false,
+                },
+                SendState::MayHaveReached,
+            ),
+            (
+                HostError::VciLost {
+                    refused_after_loss: true,
+                },
+                SendState::NotSent,
+            ),
+            (HostError::EventStreamEnded, SendState::MayHaveReached),
+            (
+                HostError::WorkerUnresponsive("StartComPrimitive"),
+                SendState::MayHaveReached,
+            ),
+            (
+                transport_failure("StartComPrimitive", tonic::Code::Unavailable),
+                SendState::MayHaveReached,
+            ),
+            (
+                transport_failure("StartComPrimitive", tonic::Code::Cancelled),
+                SendState::MayHaveReached,
+            ),
+            (
+                transport_failure("CancelComPrimitive", tonic::Code::Unknown),
+                SendState::MayHaveReached,
+            ),
+        ] {
+            assert_eq!(error.resend_class(), ResendClass::PathLost, "{error:?}");
+            assert_eq!(error.send_state(), sent, "{error:?}");
+        }
+        // A refusal the worker gave is a refusal, whatever the status code.
+        let refused = HostError::Rpc {
+            rpc: "StartComPrimitive",
+            status: Box::new(vci_service_interface::status_with_error_detail(
+                tonic::Code::Unavailable,
+                "refused",
+                vci_service_interface::ErrorDetail {
+                    pdu_error: vci_service_interface::PduError::PduErrInvalidParameters as i32,
+                    error_event_data: None,
+                    detail_text: None,
+                    refusal: Some(RefusalReason::InvalidParameters as i32),
+                },
+            )),
+        };
+        assert_eq!(refused.resend_class(), ResendClass::Other);
+    }
+
+    /// An RPC that failed with `code` and no detail from the worker.
+    fn transport_failure(rpc: &'static str, code: tonic::Code) -> HostError {
+        HostError::Rpc {
+            rpc,
+            status: Box::new(tonic::Status::new(code, "transport")),
         }
     }
 

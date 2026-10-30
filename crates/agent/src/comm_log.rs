@@ -3126,17 +3126,22 @@ impl CommLog {
             .filter(|&number| number != 0);
         let connected = inner
             .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
-        // A loss an earlier run recorded is settled at once (ADR-373).
-        if let Some(loss) = inner.unsettled.take() {
+        // A loss an earlier run recorded is settled at once (ADR-373), and so is the run's own
+        // when the link was opened again within the run (ADR-393): its record is then taken
+        // out of the run, so a later run does not settle it again. The run's own loss is
+        // the newer of the two; an earlier run's was settled at the run's first connection.
+        if let Some(loss) = inner.loss.take().or_else(|| inner.unsettled.take()) {
             inner.settle_loss(loss, reading)?;
         }
         Some(connected)
     }
 
-    /// Whether the log holds a loss an earlier run recorded that the next `vci_connected`
-    /// settles, so the runner reads the VCI's clock for it first (ADR-373).
+    /// Whether the log holds a loss, an earlier run's or this run's own, that the next
+    /// `vci_connected` settles, so the runner reads the VCI's clock for it first (ADR-373,
+    /// ADR-393).
     pub(crate) fn loss_to_settle(&self) -> bool {
-        self.lock().unsettled.is_some()
+        let inner = self.lock();
+        inner.unsettled.is_some() || inner.loss.is_some()
     }
 
     /// Writes an `identity` event for the value of `kind` the runner read (design 8.11
@@ -4483,10 +4488,20 @@ impl Inner {
                 ),
             )
         } else if readings && on_boot && fit.is_some() {
+            // The run's own reconnect (ADR-393) lies in the agent epoch of the loss.
+            let when = if last
+                .as_ref()
+                .zip(device)
+                .is_some_and(|(last, reading)| last.agent_epoch == reading.agent_epoch)
+            {
+                "within the run that lost it"
+            } else {
+                "in a later run of the agent"
+            };
             (
                 PowerKept::Unknown,
                 format!(
-                    "The VCI reconnected in a later run of the agent; the time since the loss was measured on the boot clock and is recorded with the comparison it gives, but the log does not judge a loss from it, since a suspend of the PC can put it off;{SUPPLY_NOT_EXCLUDED}"
+                    "The VCI reconnected {when}; the time since the loss was measured on the boot clock and is recorded with the comparison it gives, but the log does not judge a loss from it, since a suspend of the PC can put it off;{SUPPLY_NOT_EXCLUDED}"
                 ),
             )
         } else if readings
@@ -11840,6 +11855,108 @@ mod tests {
         );
 
         // Settled once: a later run finds nothing to settle.
+        let log = CommLog::open(&setup).unwrap();
+        assert!(!log.loss_to_settle());
+        drop(log);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-393: a loss within the run is settled by the run's own next `vci_connected`, against
+    /// the reading of the VCI's clock, with the gap measured on the agent's clock in the one
+    /// agent epoch. It is taken out of the run's state, so a later run finds nothing to settle.
+    #[test]
+    fn a_loss_within_the_run_is_settled_by_the_run_s_next_connection() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let log = CommLog::open(&setup).unwrap();
+        log.boot_as(None);
+        log.begin(&dpdu_facts(), RunKind::First);
+        log.vci_connected(Some(&serial(77)), None).unwrap();
+        assert!(!log.loss_to_settle());
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1]),
+        );
+        answered.times.vci = Some(exchange::VciTimes {
+            rx_end: Some(device(1_835_511_040)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange_with(answered, Vec::new()).unwrap();
+        let ended = log
+            .exchange_with(
+                evidence(
+                    endpoint(0x7E0),
+                    &[0x22, 0xF1, 0x90],
+                    exchange::End::VciLost {
+                        refused_after_loss: false,
+                    },
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+        assert!(log.loss_to_settle());
+        let read = AgentNow {
+            monotonic_us: 31_209_200,
+            ..log.now()
+        };
+        let reading = ConnectReading {
+            time: device(1_835_511_040 + 31_209_200 + 3_000),
+            read,
+            round_trip_us: Some(0),
+        };
+        log.vci_connected(Some(&serial(77)), Some(reading)).unwrap();
+        assert!(!log.loss_to_settle());
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications::default(),
+            None,
+        )
+        .unwrap();
+        log.end("ok");
+        drop(log);
+        let lines = self::lines(&setup);
+        assert_consecutive(&lines);
+        let settled = of_event(&lines, "vci_loss_settled");
+        assert_eq!(settled.len(), 1, "{lines:?}");
+        let settled = &settled[0];
+        assert_eq!(settled["loss"], ended + 1, "{settled}");
+        assert_eq!(
+            settled["refers_to"],
+            serde_json::json!([ended]),
+            "{settled}"
+        );
+        assert_eq!(settled["clock"]["gap_from"], "agent", "{settled}");
+        assert_eq!(settled["clock"]["gap_us"], 31_209_200, "{settled}");
+        assert_eq!(settled["power_kept"], true, "{settled}");
+        assert_eq!(settled["classification"], "system", "{settled}");
+        // The loss, the reconnect, the settlement, and then the link.
+        let order: Vec<&str> = events(&lines)
+            .into_iter()
+            .filter(|event| {
+                [
+                    "vci_loss",
+                    "vci_connected",
+                    "vci_loss_settled",
+                    "link_opened",
+                ]
+                .contains(event)
+            })
+            .collect();
+        assert_eq!(
+            order,
+            [
+                "vci_connected",
+                "vci_loss",
+                "vci_connected",
+                "vci_loss_settled",
+                "link_opened"
+            ]
+        );
+        // Settled once: the next run finds nothing to settle.
         let log = CommLog::open(&setup).unwrap();
         assert!(!log.loss_to_settle());
         drop(log);

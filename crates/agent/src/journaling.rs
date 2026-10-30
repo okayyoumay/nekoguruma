@@ -134,6 +134,16 @@ impl<S: Store> JobJournal<S> {
         }
     }
 
+    /// The journal, for the commits of a run that goes on after its link was lost (ADR-393).
+    pub(crate) fn journal_mut(&mut self) -> &mut Journal<S> {
+        &mut self.journal
+    }
+
+    /// The table that maps the program's identity sources to requests.
+    pub(crate) fn sources(&self) -> &ServiceSources {
+        &self.sources
+    }
+
     #[cfg(test)]
     pub(crate) fn journal(&self) -> &Journal<S> {
         &self.journal

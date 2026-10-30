@@ -1,7 +1,7 @@
 # ADR-258: A Failed Link Close Keeps the Job Guards
 
 **Date:** 2026-10-09
-**Status:** Accepted
+**Status:** Accepted (item 1's close of a link on a lost path, at the reopen or at the run's end, confirmed by a successful module disconnect, retried once, by ADR-393)
 **Affects:** `agent` (`src/guards.rs`, `src/runner.rs`, `src/link.rs`, `src/main.rs`), `worker-host` (`WorkerProcess::stop`), ADR-256 (the failed-close consequence)
 
 ## Context

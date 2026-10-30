@@ -1,13 +1,15 @@
 // Relies on the debug-only runtime VCI_CONFIG_PATH override; see ADR-073.
 #![cfg(debug_assertions)]
-//! A link that cannot be confirmed closed keeps the job's guards (ADR-258): `worker-host`
-//! launches the real `j2534-0404-service` binary against the `sim-vci` cdylib, a job runs a
-//! program that waits between two requests, and this test unplugs the simulated VCI during the
-//! wait. The second request fails, and so do the disconnects of the job's close, so the returned
-//! guards are marked. Another job on the same VCI keeps waiting for the lock until the worker
-//! has been stopped and `worker_gone` is called; then it takes the guards and reads the VIN
-//! from a fresh worker. Both jobs write one communication log: the first records the loss, and
-//! the second settles it after its VCI connected (design 8.11 `vci_loss_settled`, ADR-373).
+//! A link on a lost device is confirmed closed (ADR-393, which narrows ADR-258's mark for a lost
+//! path): `worker-host` launches the real `j2534-0404-service` binary against the `sim-vci`
+//! cdylib, a job runs a program that waits between two requests, and this test unplugs the
+//! simulated VCI during the wait. The second request fails and the VCI does not return in time;
+//! the job's close gets the library's failure from the first close of the lost device, the
+//! second finds the link gone and the module's disconnect succeeds, so the returned guards are
+//! unmarked. Another job takes them at once and reads the VIN from a fresh worker. Both jobs
+//! write one communication log: the first records the loss, and the second settles it after its
+//! VCI connected (design 8.11 `vci_loss_settled`, ADR-373). The unit tests of `agent`'s runner
+//! cover a close that stays unconfirmed.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -153,7 +155,7 @@ fn take_guards(setup: &GuardSetup) -> JobGuards {
 }
 
 #[test]
-fn a_link_that_cannot_be_closed_keeps_the_guards_until_the_worker_is_gone() {
+fn a_link_on_a_lost_device_is_confirmed_closed_and_the_loss_settles_in_the_next_job() {
     let nanos = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
@@ -268,7 +270,10 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup, comm_log:
                 client,
                 &link_config(),
                 logged(waiting_program(), &log_dir),
-                JobLimits::default(),
+                JobLimits {
+                    vci_return_wait: Duration::from_secs(2),
+                    ..JobLimits::default()
+                },
                 guards,
             )
             .await
@@ -296,28 +301,20 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup, comm_log:
         ),
         "{result:?}"
     );
+    // The path was lost: the first close gets the library's failure, the second finds the link
+    // gone, and the module's disconnect succeeds, so the close is confirmed (ADR-393).
     assert!(
-        guards.link_unconfirmed(),
-        "the close of a lost device is not confirmed"
+        !guards.link_unconfirmed(),
+        "the close of a lost device is confirmed"
     );
-
-    // Another job on this VCI keeps waiting, although the first one is over.
-    let waiter = {
-        let setup = setup.clone();
-        std::thread::spawn(move || take_guards(&setup))
-    };
-    tokio::time::sleep(Duration::from_millis(300)).await;
-    assert!(!waiter.is_finished(), "the marked guards must stay held");
-
     let stopped = worker.stop(Duration::from_secs(5)).await;
     assert!(stopped.is_ok(), "{stopped:?}");
-    assert!(!waiter.is_finished(), "stopping the worker is not enough");
     guards.worker_gone();
     drop(guards);
-    let guards = waiter.join().expect("the waiter should take the guards");
+    let guards = take_guards(&setup);
 
-    // The VCI is plugged back in for the fresh worker, which reads the VIN on the waiter's
-    // guards.
+    // The VCI is plugged back in for the fresh worker, which reads the VIN on the guards
+    // the first job released.
     send(control_dir, "002", r#"{"command": "connect_vci"}"#);
     let (worker, client) = launch_worker().await;
     let JobRun {

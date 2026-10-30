@@ -1708,17 +1708,18 @@ pub(crate) enum RepeatDecision {
 
 /// The one place that decides whether a host error of the primitive at `at` is sent again in
 /// the run (ADR-392). `attempts` is how many times this arrival's request failed before this
-/// error (0 for the first), `facts` the job's journal facts, or `None` without a journal.
+/// error (0 for the first), `journal` the job's journal as it now stands, or `None` without one.
 ///
 /// - Only a request to the ECU outside every plan's range is considered: `ServiceRequest`,
 ///   `ReadDtc`, `RoutineControl` and `SendReceive`. Everything else ends the run.
 /// - A refusal before the start that passes (`ResendClass::Transient`) is sent again whatever
 ///   the idempotency, as nothing was sent.
 /// - An ECU- or bus-level error of a request that may have reached the ECU
-///   (`ResendClass::EcuLevel`) is sent again only when [`safe_to_repeat`] says so. Otherwise it
-///   is on-site intervention, as the next resume would find it: the section's reason inside a
-///   `RecoveryRequired` section, else an unconfirmed request. Without a journal the program's
-///   sections alone decide between the two (the pass's intent is then the primitive itself).
+///   (`ResendClass::EcuLevel`) is sent again only when [`safe_to_repeat`] says so. Otherwise the
+///   verdict is [`classify`]'s on the journal as it stands: on-site intervention with its reason
+///   when it refuses a resume, else the run ends in the host error (a completed flash transfer
+///   resumes by ADR-229's restart). Without a journal, which no resume reads, it is an
+///   unconfirmed request.
 /// - Every send counts against `JobLimits::max_primitive_repeats`; the error after the last
 ///   one ends the run.
 pub(crate) fn repeat_decision(
@@ -1727,7 +1728,7 @@ pub(crate) fn repeat_decision(
     error: &HostError,
     attempts: u8,
     limits: &JobLimits,
-    facts: Option<&RecoveryFacts>,
+    journal: Option<&JournalState>,
 ) -> RepeatDecision {
     if !is_exchange(program, at.pc) || in_plan(program, at.pc) {
         return RepeatDecision::End;
@@ -1742,9 +1743,19 @@ pub(crate) fn repeat_decision(
                 RepeatDecision::End
             }
         }
-        (SendState::MayHaveReached, ResendClass::EcuLevel) => {
-            RepeatDecision::OnSite(unsent_reason(program, at, facts))
-        }
+        (SendState::MayHaveReached, ResendClass::EcuLevel) => match journal {
+            // The verdict of the restart's classification on the journal as it stands; where
+            // it would not refuse a resume (a completed flash transfer takes ADR-229's
+            // restart), the run ends as before.
+            Some(state) => match classify(program, Ok(state)) {
+                RestartDecision::OnSiteInterventionRequired(reason) => {
+                    RepeatDecision::OnSite(reason)
+                }
+                _ => RepeatDecision::End,
+            },
+            // No journal, which no resume reads: the request is unconfirmed.
+            None => RepeatDecision::OnSite(OnSiteReason::UnconfirmedRequest { at }),
+        },
         _ => RepeatDecision::End,
     }
 }
@@ -1763,22 +1774,6 @@ pub(crate) fn is_exchange(program: &Program, pc: u32) -> bool {
                 | Op::SendReceive { .. }
         )
     )
-}
-
-/// The reason the next resume derives for the request marker at `at` that may have reached the
-/// ECU: the `RecoveryRequired` section's, from the pass's intent as `classify` reads it, or an
-/// unconfirmed request.
-fn unsent_reason(program: &Program, at: StepRef, facts: Option<&RecoveryFacts>) -> OnSiteReason {
-    if in_section_outside_plans(program, at.pc) {
-        let intent = facts
-            .and_then(|facts| facts.last_intent)
-            .filter(|intent| in_section_outside_plans(program, intent.pc))
-            .unwrap_or(at);
-        if let Some(reason) = recovery_required(program, intent) {
-            return reason;
-        }
-    }
-    OnSiteReason::UnconfirmedRequest { at }
 }
 
 /// Whether `pc` lies inside a flash recovery plan's range (`entry_pc` up to, not including,
@@ -4150,15 +4145,16 @@ def main():
         program.sections[1].interruptible = Interruptible::RecoveryRequired;
         program.code.extend([Op::Wait { millis: 1 }]);
         let limits = JobLimits::default();
-        let facts = |intent: Option<StepRef>| {
-            let mut facts = Journal::on_store(Memory, plain_key()).summary();
-            facts.last_intent = intent;
-            facts
+        // A journal with the request at pc 4 committed and no state after it.
+        let mut journal = Journal::on_store(Memory, plain_key());
+        journal
+            .commit_run_start(at(0), &state_bytes(&state_at_pc(&program, 0, 0)))
+            .unwrap();
+        journal.commit_request(at(4)).unwrap();
+        let some = journal.state().clone();
+        let decide = |pc: u32, error: &HostError, attempts: u8, state: Option<&JournalState>| {
+            repeat_decision(&program, at_pc(pc), error, attempts, &limits, state)
         };
-        let decide = |pc: u32, error: &HostError, attempts: u8, facts: Option<&RecoveryFacts>| {
-            repeat_decision(&program, at_pc(pc), error, attempts, &limits, facts)
-        };
-        let some = facts(None);
         // `Safe`: an ECU-level error is sent again until the bound, then ends.
         for error in [
             HostError::NoResponse,
@@ -4169,8 +4165,8 @@ def main():
             assert_eq!(decide(1, &error, 1, None), RepeatDecision::Repeat);
             assert_eq!(decide(1, &error, 2, Some(&some)), RepeatDecision::End);
         }
-        // Not safe: on site with the reason a resume derives; without a journal the program's
-        // sections alone decide.
+        // Not safe: on site with the reason a resume derives; without a journal, an
+        // unconfirmed request.
         assert_eq!(
             decide(4, &HostError::NoResponse, 0, Some(&some)),
             RepeatDecision::OnSite(OnSiteReason::UnconfirmedRequest { at: at_pc(4) })
@@ -4239,7 +4235,7 @@ def main():
             &HostError::NoResponse,
             0,
             &JobLimits::default(),
-            Some(&journal.state().facts),
+            Some(journal.state()),
         );
         assert_eq!(
             decision,

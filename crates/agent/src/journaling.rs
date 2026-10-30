@@ -57,7 +57,7 @@ use diag_ir::{
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_identity_bytes};
 use crate::journal::{
-    FileStore, JobKey, Journal, JournalError, RecoveryFacts, RunStop, StageId, StepRef, Store, Vin,
+    FileStore, JobKey, Journal, JournalError, JournalState, RunStop, StageId, StepRef, Store, Vin,
 };
 use crate::restart::{in_section_outside_plans, needs_request_marker};
 use crate::runner::JobError;
@@ -267,9 +267,9 @@ impl<S: Store> JobJournal<S> {
         Ok(())
     }
 
-    /// The journal's facts as folded so far.
-    pub(crate) fn facts(&self) -> &RecoveryFacts {
-        &self.journal.state().facts
+    /// The journal as folded so far.
+    pub(crate) fn state(&self) -> &JournalState {
+        self.journal.state()
     }
 
     /// Whether the journal's newest request marker is the one at `at`, and not withdrawn: the

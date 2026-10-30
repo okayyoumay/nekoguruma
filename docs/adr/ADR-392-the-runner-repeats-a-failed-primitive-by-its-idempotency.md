@@ -28,10 +28,14 @@ primitive has nothing to check its state with.
    (default 2), with the poll interval of a wait between sends, during which a cancel is taken
    as during a wait. This holds inside an uninterruptible or recovery-required section too, whose
    held cancel stays held. When the bound is reached, the run ends as before.
-3. **One not safe to repeat ends in on-site intervention at once.** The same failure of an
-   `Unsafe` primitive, of a `CheckState` one, or of one no section covers ends the run in
-   on-site intervention, with the reason a resume would give. `CheckState` counts as `Unsafe`
-   until an ADR adds a state query.
+3. **One not safe to repeat ends as a resume would.** The same failure of an `Unsafe`
+   primitive, of a `CheckState` one, or of one no section covers ends the run with the verdict
+   the restart's classification gives on the journal as it now stands: in on-site intervention
+   with that classification's reason when it refuses a resume, and as before (the run ends and
+   a resume follows that classification) when it does not, for example after a completed flash
+   transfer, whose restart order is ADR-229's. Without a journal, which no resume reads, the
+   run ends in on-site intervention for the unconfirmed request. `CheckState` counts as
+   `Unsafe` until an ADR adds a state query.
 4. **A request not sent is sent again whatever its idempotency, when the cause passes.** A
    request refused before it was sent because an earlier primitive held the link or the queue
    was full is sent again within the same bound. No second request marker is journaled.
@@ -43,7 +47,12 @@ primitive has nothing to check its state with.
    inside a flash plan (whose restart order is ADR-229's), and a failure of a step that sends
    nothing to the ECU end the run as they did. Continuing within the run after reopening the
    link is separate work.
-7. **A resend is logged as a repeat.** Its communication-log entry has `origin: repeat`.
+7. **A resend is logged as a repeat.** Every attempt after the first of one arrival at the
+   primitive has `origin: repeat` in the communication log, also when the first was refused
+   before it was sent.
+8. **An older agent refuses the new record.** `RequestNotSent` is appended to the journal's
+   record set as ADR-244 allows; an agent that does not know it reads the journal as
+   unreadable and ends in on-site intervention, as for any record it cannot read (ADR-344).
 
 The maintainer chose `CheckState` as `Unsafe` for now, two repeats with the poll interval, and
 the rest of this decision (2026-10-30).
@@ -58,5 +67,8 @@ the rest of this decision (2026-10-30).
   end in on-site intervention for a request that never went out.
 - A `CheckState` routine outside a flash plan ends on site when its answer is lost, until a
   state query exists (backlog).
+- A request marker withdrawn at the first primitive of a recovery-required section leaves the
+  section's intent behind, so a resume still ends in on-site intervention for the section,
+  although nothing in it was sent. That errs toward the safe side.
 - A worker crash or a lost VCI still ends the run, and the VM state is resumed only through the
   journal (backlog).

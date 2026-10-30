@@ -2242,7 +2242,7 @@ where
                     &source,
                     failed.1,
                     &limits,
-                    journal.as_deref().map(JobJournal::facts),
+                    journal.as_deref().map(JobJournal::state),
                 );
                 match decision {
                     RepeatDecision::Repeat => {
@@ -3147,6 +3147,8 @@ def main():
         /// (`EventStreamEnded`) and not an ECU that stayed silent: the request may have been
         /// sent, and the repeat policy ends the run in the host error (ADR-392).
         link_loss: bool,
+        /// How often the runner announced a resend ([`ProcedurePosition::step_resends`]).
+        resent: u32,
         /// The ECU stays in its default session and refuses the erase (routine 0xFF00) and
         /// RequestDownload there with a negative response, as an ECU that accepts them only in
         /// its programming session would.
@@ -3245,6 +3247,7 @@ def main():
                 cancel_on_read: None,
                 lose_routine: None,
                 link_loss: false,
+                resent: 0,
                 default_session_only: false,
                 refuse_erase_only: false,
                 voltage: None,
@@ -3361,7 +3364,11 @@ def main():
         }
     }
 
-    impl ProcedurePosition for FlashHost {}
+    impl ProcedurePosition for FlashHost {
+        fn step_resends(&mut self) {
+            self.resent += 1;
+        }
+    }
 
     impl DiagHost for FlashHost {
         type Error = HostError;
@@ -4335,28 +4342,38 @@ def main():
         // The first or the second routine of the section loses its response.
         for (routine, pc) in [(0xFF02, 4), (0xFF03, 7)] {
             let (result, _, _, journal) = run(Some(routine));
-            // The section's reason names the pass's intent, at the first routine (pc 4), also
-            // when the second one (pc 7) is the one that failed; `pc` is where the request is.
-            assert!(
-                matches!(
-                    &result,
-                    Err(JobError::OnSiteInterventionRequired(
-                        OnSiteReason::RecoveryRequiredSection { section: 0, at }
-                    )) if at.pc == 4
-                ),
-                "routine {routine:#x} at {pc}: {result:?}"
+            // The ending is the classification's verdict on the journal as it stands: the
+            // section's reason names the pass's intent, at the first routine (pc 4), also when
+            // the second one (pc 7) is the one that failed (`pc` is where the request is).
+            assert_eq!(
+                reason_of(&result),
+                &OnSiteReason::RecoveryRequiredSection {
+                    section: 0,
+                    at: StepRef { pc: 4, steps: 4 }
+                },
+                "routine {routine:#x} at {pc}"
+            );
+            assert_eq!(
+                classify(&program, Ok(journal.journal().state())),
+                RestartDecision::OnSiteInterventionRequired(reason_of(&result).clone())
             );
             assert!(refused(&journal), "routine {routine:#x}");
         }
         // After the section, before the next record: the point is still the section's intent,
         // and a plain start would repeat the section.
         let (result, _, _, journal) = run(Some(0xFF04));
-        // Outside the section and not safe to repeat: the request is unconfirmed.
+        // After the section the point is still the section's intent, which `classify` reads
+        // before the request: the run ends with that verdict, not an unconfirmed request.
         assert_eq!(
             reason_of(&result),
-            &OnSiteReason::UnconfirmedRequest {
-                at: StepRef { pc: 10, steps: 10 }
+            &OnSiteReason::RecoveryRequiredSection {
+                section: 0,
+                at: StepRef { pc: 4, steps: 4 }
             }
+        );
+        assert_eq!(
+            classify(&program, Ok(journal.journal().state())),
+            RestartDecision::OnSiteInterventionRequired(reason_of(&result).clone())
         );
         assert!(refused(&journal));
         // At the plan's entry, after the step into it: the identity read before the erase fails.
@@ -18162,19 +18179,6 @@ def main():
         }
     }
 
-    /// A program of one request per `(service, idempotency)` whose sections have `interruptible`.
-    fn repeat_program(
-        steps: &[(u16, diag_ir::Idempotency)],
-        interruptible: diag_ir::Interruptible,
-    ) -> Program {
-        let mut program = plain_steps(steps);
-        for section in &mut program.sections {
-            section.interruptible = interruptible;
-        }
-        program.validate().expect("the fixture is a valid program");
-        program
-    }
-
     /// Runs `program` on a [`FlashHost`] that `prepare` sets up, against a counting journal.
     fn run_repeating(
         program: &Program,
@@ -18397,8 +18401,7 @@ def main():
 
     /// A refusal that does not pass, on a request with a marker, commits the withdrawal before
     /// the run ends, and a later resume makes a plain start instead of ending on an unconfirmed
-    /// request. A request that may have reached the ECU earlier in the arrival is never
-    /// withdrawn.
+    /// request.
     #[test]
     fn a_request_refused_before_the_start_is_withdrawn_and_a_resume_starts_plain() {
         let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
@@ -18427,26 +18430,11 @@ def main():
         assert_eq!(plain_resumes(&dir), 1);
         assert_eq!(sends_of(&host, 0x10), 1);
         std::fs::remove_dir_all(&dir).unwrap();
-
-        // A transient refusal after a lost response of the same arrival: no withdrawal.
-        let (result, _, journal) = run_repeating(
-            &repeat_program(&[(0x22, Safe), (0x10, Safe)], diag_ir::Interruptible::Yes),
-            JobLimits::default(),
-            &AtomicBool::new(false),
-            |host| {
-                host.fail_service = Some((
-                    0x10,
-                    [HostError::NoResponse, HostError::NotAllowed(0x10)].into(),
-                ));
-            },
-        );
-        assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
-        assert_eq!(journal.journal().state().facts.last_request_unsent, None);
     }
 
-    /// An `Unsafe` request that was sent and lost, then refused before a start, is not withdrawn:
-    /// an earlier attempt may have reached the ECU. (The decision ends the earlier attempt in
-    /// on-site intervention, so this holds for the transient resend path only.)
+    /// An `Unsafe` request refused with a held link and then with a refusal that does not pass
+    /// never reached the ECU in any attempt, so its marker is withdrawn; one whose second
+    /// attempt may have reached it (the link failed after the start) is not.
     #[test]
     fn a_withdrawal_follows_only_attempts_that_did_not_reach_the_ecu() {
         let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
@@ -18463,6 +18451,85 @@ def main():
         );
         assert!(matches!(result, Err(JobError::Host { .. })), "{result:?}");
         assert!(journal.journal().state().facts.last_request_withdrawn());
+        // A held link, then a failure after the start: the second attempt may have been sent.
+        let (result, host, journal) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((
+                    0x10,
+                    [HostError::LinkHeld, HostError::EventStreamEnded].into(),
+                ));
+            },
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::Host {
+                    pc: 4,
+                    source: HostError::EventStreamEnded
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x10), 2);
+        let facts = &journal.journal().state().facts;
+        assert!(facts.last_request.is_some());
+        assert_eq!(facts.last_request_unsent, None);
+    }
+
+    /// A cancel that arrives while a request is being sent is taken in the wait before the
+    /// resend, in an interruptible section: the run ends `Cancelled` after one send. For an
+    /// `Unsafe` request refused with a held link, nothing was sent, so its marker is withdrawn.
+    #[test]
+    fn a_cancel_during_the_wait_before_a_resend_ends_the_run_after_one_send() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (result, host, _) = run_repeating(&program, JobLimits::default(), &cancelled, |host| {
+            host.fail_service = Some((0x3E, [HostError::NoResponse].into()));
+            host.cancel_on_service = Some((0x3E, Arc::clone(&cancelled)));
+        });
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(sends_of(&host, 0x3E), 1);
+
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let (result, host, journal) =
+            run_repeating(&program, JobLimits::default(), &cancelled, |host| {
+                host.fail_service = Some((0x10, [HostError::LinkHeld].into()));
+                host.cancel_on_service = Some((0x10, Arc::clone(&cancelled)));
+            });
+        assert!(matches!(result, Err(JobError::Cancelled)), "{result:?}");
+        assert_eq!(sends_of(&host, 0x10), 1);
+        assert!(journal.journal().state().facts.last_request_withdrawn());
+    }
+
+    /// Each resend of a step is announced to the host (`step_resends`), which is what gives its
+    /// exchange the origin `repeat`: two failures, two announcements, none for the first send
+    /// or the next arrival.
+    #[test]
+    fn the_runner_announces_each_resend_to_the_host() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service =
+                    Some((0x22, [HostError::NoResponse, HostError::NoResponse].into()));
+            },
+        );
+        result.expect("the third send succeeds");
+        assert_eq!(host.resent, 2);
+        let (result, host, _) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |_| {},
+        );
+        result.unwrap();
+        assert_eq!(host.resent, 0);
     }
 
     /// A cancel taken after the marker was committed and before the request was sent withdraws
@@ -18511,6 +18578,55 @@ def main():
     }
 
     /// A failure inside a flash plan's range ends the run as before: sent once, no resend.
+    /// After a completed flash transfer the classification takes ADR-229's restart, which a
+    /// resume follows, so a lost answer of an unsafe request after the plan ends in the host
+    /// error and not on site (ADR-392 item 3).
+    #[test]
+    fn a_lost_answer_after_a_completed_plan_ends_as_the_classification_does() {
+        let (program, after_plan) = replay_program_with_end();
+        let commits = Rc::new(Cell::new(0));
+        let mut host = FlashHost::new(Rc::clone(&commits));
+        host.lose_routine = Some(0xFF04);
+        let mut journal = counting_journal(&commits, None);
+        let result = run_on(
+            &program,
+            &mut host,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host { pc, source: HostError::NoResponse }) if *pc == after_plan
+            ),
+            "{result:?}"
+        );
+        assert!(matches!(
+            restart::classify(&program, Ok(journal.journal().state())),
+            RestartDecision::Restart(_)
+        ));
+    }
+
+    /// Outside any plan, the ending of an unsafe request's lost answer equals the
+    /// classification's verdict on the resulting journal.
+    #[test]
+    fn a_lost_answer_ends_as_the_classification_on_the_journal_does() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let (result, _, journal) = run_repeating(
+            &program,
+            JobLimits::default(),
+            &AtomicBool::new(false),
+            |host| {
+                host.lose_service = Some(0x10);
+            },
+        );
+        assert_eq!(
+            restart::classify(&program, Ok(journal.journal().state())),
+            RestartDecision::OnSiteInterventionRequired(reason_of(&result).clone())
+        );
+    }
+
     #[test]
     fn a_failure_inside_a_flash_plan_is_not_resent() {
         let commits = Rc::new(Cell::new(0));

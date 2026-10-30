@@ -2465,6 +2465,11 @@ where
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
         }
+        // Every attempt after the first needs time left: the sleep may have used it up, and a
+        // VCI that returns after the wait does not resume the job.
+        if until.is_some_and(|until| std::time::Instant::now() >= until) {
+            return Ok(false);
+        }
         match host.reopen_link() {
             ReopenAttempt::Opened => break,
             ReopenAttempt::Cannot => return Ok(false),
@@ -3349,6 +3354,8 @@ def main():
         Refuse,
         /// The worker fails, as one that cannot be reached would.
         Fail,
+        /// The VCI is lost ([`HostError::VciLost`]).
+        Lost,
         /// No answer is scripted: the standing answer.
         Standing,
     }
@@ -3396,6 +3403,8 @@ def main():
         reopen_after: ReopenAttempt,
         /// Attempts to open the link again so far.
         reopen_calls: u32,
+        /// How often the runner recorded a lost path ([`ProcedurePosition::path_lost`]).
+        path_lost_calls: u32,
         /// Set at the first attempt, as a dropped job future would during the wait.
         cancel_on_reopen: Option<Arc<AtomicBool>>,
         /// The ECU stays in its default session and refuses the erase (routine 0xFF00) and
@@ -3498,6 +3507,7 @@ def main():
                 link_loss: false,
                 resent: 0,
                 reopen_script: std::collections::VecDeque::new(),
+                path_lost_calls: 0,
                 reopen_after: ReopenAttempt::Cannot,
                 reopen_calls: 0,
                 cancel_on_reopen: None,
@@ -3620,6 +3630,10 @@ def main():
     impl ProcedurePosition for FlashHost {
         fn step_resends(&mut self) {
             self.resent += 1;
+        }
+
+        fn path_lost(&mut self) {
+            self.path_lost_calls += 1;
         }
 
         fn reopen_link(&mut self) -> ReopenAttempt {
@@ -3800,6 +3814,7 @@ def main():
             (IdAnswer::Value(bytes), _) => positive(&bytes),
             (IdAnswer::Refuse, _) | (IdAnswer::Standing, None) => Ok(vec![0x7F, 0x22, 0x31]),
             (IdAnswer::Fail, _) => Err(HostError::NoResponse),
+            (IdAnswer::Lost, _) => Err(vci_lost()),
             (IdAnswer::Standing, Some(bytes)) => positive(bytes),
         }
     }
@@ -14896,6 +14911,8 @@ def main():
         disconnect_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
         /// The same for ModuleDisconnect, ahead of `fail_open`.
         module_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
+        /// The same for DestroyComLogicalLink.
+        destroy_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
         /// What the first StartComPrimitive calls fail with, one per call.
         start_failures: Mutex<std::collections::VecDeque<tonic::Status>>,
     }
@@ -15134,6 +15151,9 @@ def main():
             _: tonic::Request<vci_service_interface::DestroyComLogicalLinkRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
             self.note("DestroyComLogicalLink");
+            if let Some(answer) = self.destroy_script.lock().unwrap().pop_front() {
+                return answer.map_or_else(|| Ok(tonic::Response::new(Default::default())), Err);
+            }
             Ok(tonic::Response::new(Default::default()))
         }
         async fn connect_com_logical_link(
@@ -15573,6 +15593,15 @@ def main():
         disconnects: Vec<Option<tonic::Status>>,
         modules: Vec<Option<tonic::Status>>,
     ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        fake_worker_closing_all(disconnects, Vec::new(), modules).await
+    }
+
+    /// [`fake_worker_closing`] whose first destroys of the link answer as `destroys` say too.
+    async fn fake_worker_closing_all(
+        disconnects: Vec<Option<tonic::Status>>,
+        destroys: Vec<Option<tonic::Status>>,
+        modules: Vec<Option<tonic::Status>>,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let service = FakeWorker {
@@ -15593,6 +15622,7 @@ def main():
             device_clock: false,
             disconnect_script: Mutex::new(disconnects.into()),
             module_script: Mutex::new(modules.into()),
+            destroy_script: Mutex::new(destroys.into()),
             start_failures: Mutex::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
@@ -15627,6 +15657,7 @@ def main():
             device_clock: false,
             disconnect_script: Mutex::new(disconnects.into()),
             module_script: Mutex::new(modules.into()),
+            destroy_script: Mutex::default(),
             start_failures: Mutex::new(starts.into()),
         };
         let (client, calls, _) = serve(service, calls, set).await;
@@ -15670,6 +15701,7 @@ def main():
             device_clock: false,
             disconnect_script: Mutex::default(),
             module_script: Mutex::default(),
+            destroy_script: Mutex::default(),
             start_failures: Mutex::default(),
         };
         serve(service, calls, set).await
@@ -15754,6 +15786,7 @@ def main():
             device_clock,
             disconnect_script: Mutex::default(),
             module_script: Mutex::default(),
+            destroy_script: Mutex::default(),
             start_failures: Mutex::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
@@ -17620,6 +17653,58 @@ def main():
                 handles.1,
                 Duration::from_secs(5),
                 path_lost,
+            )
+            .await;
+            assert_eq!(closed.is_ok(), confirmed, "{tag}: {closed:?}");
+            let calls = calls.lock().unwrap().clone();
+            let made = calls
+                .iter()
+                .filter(|call| **call == "DisconnectComLogicalLink")
+                .count();
+            assert_eq!(made, closes, "{tag}: {calls:?}");
+        }
+    }
+
+    /// ADR-393: the link's disconnect and destroy are judged apart on a lost path. A destroy that
+    /// got no answer is not hidden by a disconnect the worker refused: the close stays
+    /// unconfirmed and is not closed again; a destroy that names an unknown handle confirms with
+    /// the module's disconnect.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_paths_unanswered_destroy_is_not_hidden_by_a_refused_disconnect() {
+        let handles = (
+            ModuleHandle { module_handle: 1 },
+            vci_service_interface::ComLogicalLinkHandle {
+                module_handle: 1,
+                cll_handle: 1,
+            },
+        );
+        let invalid_handle = Some(vci_service_interface::status_with_error_detail(
+            tonic::Code::NotFound,
+            "PDU_ERR_INVALID_HANDLE",
+            vci_service_interface::ErrorDetail {
+                pdu_error: vci_service_interface::PduError::PduErrInvalidHandle as i32,
+                ..Default::default()
+            },
+        ));
+        let internal = Some(tonic::Status::internal("library"));
+        // (tag, destroy answer, confirmed, closes made)
+        for (tag, destroy, confirmed, closes) in [
+            (
+                "destroy-timed-out",
+                Some(tonic::Status::unavailable("transport")),
+                false,
+                1,
+            ),
+            ("destroy-invalid-handle", invalid_handle, true, 1),
+        ] {
+            let (mut client, calls) =
+                fake_worker_closing_all(vec![internal.clone()], vec![destroy], Vec::new()).await;
+            let closed = link::teardown(
+                &mut client,
+                handles.0,
+                handles.1,
+                Duration::from_secs(5),
+                true,
             )
             .await;
             assert_eq!(closed.is_ok(), confirmed, "{tag}: {closed:?}");
@@ -19914,6 +19999,68 @@ def main():
         assert_eq!(sends_of(&host, 0x3E), 1);
         assert_eq!(plain_resumes(&dir), 1);
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A VCI lost again during the continuation's VIN read is on-site intervention, and the host
+    /// is told the path is lost: the reopen cleared its flag, and the final close needs the
+    /// lost-path rule to confirm the close (ADR-393). A VIN that fails for another cause does
+    /// not set it.
+    #[test]
+    fn a_vci_lost_during_the_continuations_vin_read_is_recorded() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        for (tag, answer, recorded) in [
+            ("lost", IdAnswer::Lost, 1),
+            ("no-response", IdAnswer::Fail, 0),
+        ] {
+            let dir = journal_dir(&format!("loss-vin-lost-{tag}"));
+            let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+            host.fail_service = Some((0x3E, [vci_lost()].into()));
+            host.reopen_script = [ReopenAttempt::Opened].into();
+            host.vin_script = [answer].into();
+            let mut journal =
+                JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+            let result = run_on(
+                &program,
+                &mut host,
+                after_loss_limits(),
+                &AtomicBool::new(false),
+                Some(&mut journal),
+            );
+            assert_eq!(
+                reason_of(&result),
+                &OnSiteReason::ProcedureIdentityNotEstablished,
+                "{tag}"
+            );
+            // The loss of the send itself is recorded by `run_vm`; the VIN read adds one.
+            assert_eq!(host.path_lost_calls, 1 + recorded, "{tag}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// A VCI that returns after `vci_return_wait` does not resume the job: a sleep that used up
+    /// the remaining time is followed by no attempt (ADR-393).
+    #[test]
+    fn no_attempt_to_open_the_link_is_made_after_the_wait_has_passed() {
+        let program = plain_steps(&[(0x22, Safe), (0x3E, Safe)]);
+        let limits = JobLimits {
+            vci_return_wait: Duration::from_millis(20),
+            reopen_poll: Duration::from_secs(5),
+            ..after_loss_limits()
+        };
+        let started = std::time::Instant::now();
+        let (result, host, _) = run_repeating(&program, limits, &AtomicBool::new(false), |host| {
+            host.fail_service = Some((0x3E, [vci_lost()].into()));
+            // The VCI would be back at the second attempt.
+            host.reopen_script = [ReopenAttempt::NotYet, ReopenAttempt::Opened].into();
+        });
+        assert!(
+            matches!(&result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 1);
+        assert_eq!(sends_of(&host, 0x3E), 1);
+        // The sleep was cut to the remaining time, not the poll.
+        assert!(started.elapsed() < Duration::from_secs(4));
     }
 
     /// At the plain stage's resume limit a continuation is on-site intervention, with nothing

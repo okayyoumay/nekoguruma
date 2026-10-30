@@ -949,52 +949,80 @@ pub(crate) async fn teardown<C: WorkerApi>(
     path_lost: bool,
 ) -> Result<(), HostError> {
     let first = close_steps(client, module_handle, cll_handle, deadline).await;
-    if !path_lost || (first.0.is_ok() && first.1.is_ok()) {
-        return first.0.and(first.1);
+    if !path_lost || first.all_ok() {
+        return first.first_failure();
     }
     if lost_path_confirmed(client, &first) {
         return Ok(());
     }
     // A second close is for a worker that answered every step of the first: one that did not
     // answer (a deadline that passed, a connection that failed) would cost another full pass.
-    let answered = |step: &Result<(), HostError>| step.as_ref().err().is_none_or(is_workers_answer);
-    if !(answered(&first.0) && answered(&first.1)) || client.held_module().is_some() {
-        return first.0.and(first.1);
+    if !first.all_answered() || client.held_module().is_some() {
+        return first.first_failure();
     }
     let second = close_steps(client, module_handle, cll_handle, deadline).await;
     if lost_path_confirmed(client, &second) {
         return Ok(());
     }
     // The first failure of the last close, after every step was tried.
-    second.0.and(second.1)
+    second.first_failure()
 }
 
-/// The outcomes of one close: the link's disconnect and destroy, then the module's disconnect.
-type CloseOutcome = (Result<(), HostError>, Result<(), HostError>);
+/// The outcomes of one close, kept apart: the link's disconnect, the link's destroy and the
+/// module's disconnect. The confirmation and the retry both look at each step, so a step's
+/// failure is never hidden behind an earlier one.
+struct CloseOutcome {
+    disconnect: Result<(), HostError>,
+    destroy: Result<(), HostError>,
+    module: Result<(), HostError>,
+}
+
+impl CloseOutcome {
+    fn all_ok(&self) -> bool {
+        self.disconnect.is_ok() && self.destroy.is_ok() && self.module.is_ok()
+    }
+
+    /// Whether the worker answered every step: none failed for want of an answer (a deadline
+    /// that passed, a connection that failed).
+    fn all_answered(&self) -> bool {
+        [&self.disconnect, &self.destroy, &self.module]
+            .into_iter()
+            .all(|step| step.as_ref().err().is_none_or(is_workers_answer))
+    }
+
+    /// The first failure in the order of the steps.
+    fn first_failure(self) -> Result<(), HostError> {
+        self.disconnect.and(self.destroy).and(self.module)
+    }
+}
 
 /// Whether a close on a lost path counts as confirmed: the module's disconnect succeeded here,
 /// and the link's failure, if any, is the worker's answer (or names an unknown handle).
-fn lost_path_confirmed<C: WorkerApi>(client: &C, (link, module): &CloseOutcome) -> bool {
-    if module.is_err() || client.held_module().is_some() {
+fn lost_path_confirmed<C: WorkerApi>(client: &C, outcome: &CloseOutcome) -> bool {
+    if outcome.module.is_err() || client.held_module().is_some() {
         return false;
     }
-    match link {
-        Ok(()) => true,
-        Err(error) => {
-            let unknown_handle = matches!(
-                error,
-                HostError::Rpc { status, .. } if crate::host::names_invalid_handle(status)
-            );
-            let confirmed = unknown_handle || is_workers_answer(error);
-            if confirmed {
-                tracing::info!(
-                    error = %error.log_text(),
-                    "the link did not close on the lost VCI, but the module's disconnect released it"
+    // Each of the link's steps is judged on its own: an unanswered destroy is not hidden by a
+    // disconnect that failed with the worker's answer.
+    [&outcome.disconnect, &outcome.destroy]
+        .into_iter()
+        .all(|step| match step {
+            Ok(()) => true,
+            Err(error) => {
+                let unknown_handle = matches!(
+                    error,
+                    HostError::Rpc { status, .. } if crate::host::names_invalid_handle(status)
                 );
+                let confirmed = unknown_handle || is_workers_answer(error);
+                if confirmed {
+                    tracing::info!(
+                        error = %error.log_text(),
+                        "the link did not close on the lost VCI, but the module's disconnect released it"
+                    );
+                }
+                confirmed
             }
-            confirmed
-        }
-    }
+        })
 }
 
 /// One pass over the close's steps, each tried even after one fails.
@@ -1024,7 +1052,11 @@ async fn close_steps<C: WorkerApi>(
     .await
     .map(drop);
     let module_disconnected = disconnect_module(client, module_handle, deadline).await;
-    (disconnected.and(destroyed), module_disconnected)
+    CloseOutcome {
+        disconnect: disconnected,
+        destroy: destroyed,
+        module: module_disconnected,
+    }
 }
 
 async fn disconnect_module<C: WorkerApi>(

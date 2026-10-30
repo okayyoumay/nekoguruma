@@ -1007,7 +1007,7 @@ pub(crate) fn check_procedure_identity<H>(
     promote: impl FnOnce(&Vin) -> Result<(), JobError>,
 ) -> Result<(), JobError>
 where
-    H: DiagHost<Error = HostError> + RuntimeInputs,
+    H: DiagHost<Error = HostError> + RuntimeInputs + ProcedurePosition,
 {
     let not_established = || {
         Err(JobError::OnSiteInterventionRequired(
@@ -1043,6 +1043,11 @@ where
                 external = error.log_external(),
                 "the ECU's VIN could not be read for a checkpoint resume"
             );
+            // The verdict below is on-site whatever the cause, but the run's final close needs
+            // to know that the path to the VCI was lost again (ADR-393).
+            if error.resend_class() == ResendClass::PathLost {
+                host.path_lost();
+            }
             not_established()
         }
     }

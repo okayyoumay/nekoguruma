@@ -15,6 +15,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::{Arc, Mutex};
 
 use j2534_0404_registry::RegistryViewMode;
 use ngr_library_resolver::{RegistryView, iso22900, j2534_0404};
@@ -23,6 +24,9 @@ use worker_host::client::{ConnectError, ConnectOptions, WorkerClient};
 use worker_host::service::{
     LaunchOptions, OperatingMode, ServiceError, ServiceKind, WorkerLayout, WorkerProcess,
 };
+
+use crate::client::{ExitHow, WorkerExit, WorkerSource, WorkerStatus};
+use crate::host::HostError;
 
 /// The API a VCI's library implements, which decides the worker service that loads it. The
 /// names are those of a VCI profile's `standard.kind` (`schemas/vci-profile.schema.json`).
@@ -134,6 +138,31 @@ struct Library {
     long_size: Option<u8>,
 }
 
+/// What it takes to start a job's worker again (ADR-394): the binary the first launch chose and
+/// the arguments it was started with.
+#[derive(Debug, Clone)]
+pub struct LaunchRecipe {
+    pub binary: PathBuf,
+    pub kind: ServiceKind,
+    /// The VCI's library name, as the worker's startup argument gives it.
+    pub vci: String,
+    pub mode: OperatingMode,
+    pub options: LaunchOptions,
+    pub connect: ConnectOptions,
+}
+
+impl LaunchRecipe {
+    /// Starts a worker by the recipe and connects a client to it. The process is killed when the
+    /// connection fails.
+    pub async fn launch(&self) -> Result<(WorkerProcess, WorkerClient), LaunchError> {
+        let process =
+            WorkerProcess::launch(&self.binary, self.kind, &self.vci, self.mode, &self.options)
+                .await?;
+        let client = process.connect(&self.connect).await?;
+        Ok((process, client))
+    }
+}
+
 /// A running worker and a client connected to it.
 pub struct LaunchedWorker {
     pub abi: Abi,
@@ -145,6 +174,8 @@ pub struct LaunchedWorker {
     pub long_size: u8,
     pub process: WorkerProcess,
     pub client: WorkerClient,
+    /// How the worker was started, to start it again ([`RelaunchingWorker`]).
+    pub recipe: LaunchRecipe,
 }
 
 /// Launches the worker of `api` that matches the ABI of `vci`'s library in the device's
@@ -181,15 +212,130 @@ pub async fn launch_worker(
         }
     };
     let binary = workers.find(api.service(), abi)?;
-    let process = WorkerProcess::launch(&binary, api.service(), vci, mode, &options).await?;
-    let client = process.connect(&ConnectOptions::default()).await?;
+    let recipe = LaunchRecipe {
+        binary,
+        kind: api.service(),
+        vci: vci.to_owned(),
+        mode,
+        options,
+        connect: ConnectOptions::default(),
+    };
+    let (process, client) = recipe.launch().await?;
     Ok(LaunchedWorker {
         abi,
         library,
         long_size,
         process,
         client,
+        recipe,
     })
+}
+
+/// The current worker process of a [`RelaunchingWorker`], shared with whoever stops it when the
+/// job is over.
+pub type WorkerSlot = Arc<Mutex<Option<WorkerProcess>>>;
+
+/// The [`WorkerSource`] of a job that owns its worker's process (design 8.2.5, ADR-394): it tells
+/// whether the process has exited, ends one that does not answer, and starts a new worker by the
+/// launch recipe when the current one is gone, so the run can open its link on it.
+///
+/// The process stays in the [`WorkerSlot`], which the caller keeps a clone of ([`Self::slot`]) and
+/// stops the process of when the run is over: the slot holds the current worker, a new one
+/// replacing a gone one. The source blocks on the runtime for a launch, so the run calls it from
+/// its blocking thread, as it calls the host.
+pub struct RelaunchingWorker {
+    recipe: LaunchRecipe,
+    handle: tokio::runtime::Handle,
+    slot: WorkerSlot,
+    client: WorkerClient,
+    /// The current process's ID, which the process no longer gives once it was reaped.
+    pid: Option<u32>,
+}
+
+impl RelaunchingWorker {
+    /// Takes `process` started by `recipe`, with its `client`. Must be called inside the runtime
+    /// the job runs on.
+    pub fn new(recipe: LaunchRecipe, process: WorkerProcess, client: WorkerClient) -> Self {
+        Self {
+            recipe,
+            handle: tokio::runtime::Handle::current(),
+            pid: process.id(),
+            slot: Arc::new(Mutex::new(Some(process))),
+            client,
+        }
+    }
+
+    /// The slot with the current worker's process.
+    pub fn slot(&self) -> WorkerSlot {
+        Arc::clone(&self.slot)
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, Option<WorkerProcess>> {
+        self.slot.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+impl WorkerSource for RelaunchingWorker {
+    type Client = WorkerClient;
+
+    fn client(&mut self) -> Result<WorkerClient, HostError> {
+        // The worker that runs carries the link; the system failing to say is taken as running.
+        let gone = self
+            .lock()
+            .as_mut()
+            .is_none_or(|process| matches!(process.try_wait(), Ok(Some(_))));
+        if !gone {
+            return Ok(self.client.clone());
+        }
+        match self.handle.block_on(self.recipe.launch()) {
+            Ok((process, client)) => {
+                self.pid = process.id();
+                // The gone process is dropped here, already reaped.
+                *self.lock() = Some(process);
+                self.client = client.clone();
+                Ok(client)
+            }
+            Err(error) => Err(HostError::WorkerStart {
+                spawn_failed: matches!(error, LaunchError::Service(ServiceError::Spawn(_))),
+                reason: error.to_string(),
+            }),
+        }
+    }
+
+    fn status(&mut self) -> WorkerStatus {
+        let pid = self.pid;
+        let mut slot = self.lock();
+        let Some(process) = slot.as_mut() else {
+            return WorkerStatus::Unknown;
+        };
+        match process.try_wait() {
+            Ok(None) => WorkerStatus::Alive,
+            Ok(Some(status)) => WorkerStatus::Exited(WorkerExit {
+                pid,
+                how: ExitHow::of(status),
+            }),
+            Err(_) => WorkerStatus::Unknown,
+        }
+    }
+
+    fn end(&mut self) -> Result<WorkerExit, HostError> {
+        let pid = self.pid;
+        let mut slot = self.lock();
+        let Some(process) = slot.as_mut() else {
+            return Err(HostError::Setup("the source holds no worker process"));
+        };
+        self.handle
+            .block_on(process.kill())
+            .map_err(|_| HostError::Setup("the worker could not be ended"))?;
+        Ok(WorkerExit {
+            pid,
+            how: ExitHow::KilledByAgent,
+        })
+    }
+
+    fn pid(&self) -> Option<u32> {
+        self.pid
+    }
 }
 
 /// The width a J2534 worker for `library` is launched with: `requested` (the caller's override),

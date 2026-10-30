@@ -202,6 +202,39 @@ enum Event<'a> {
     ClockEpoch(clocks::ClockEpoch),
     VciLoss(VciLoss),
     VciLossSettled(Box<VciLossSettledEntry>),
+    WorkerExit(WorkerExitEntry),
+    WorkerRestart(WorkerRestartEntry),
+}
+
+/// A worker's process ended (`worker_exit`, design 8.11, ADR-394): it crashed, or the agent ended
+/// it because it did not answer. It names the exchanges that were in flight, whose ends are
+/// unknown; the entry settles none of them.
+#[derive(Serialize)]
+struct WorkerExitEntry {
+    /// The worker's process ID, when the agent knew it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
+    exit: WorkerExitHow,
+    /// The `seq` of each exchange in flight when the worker ended.
+    refers_to: Vec<u64>,
+}
+
+/// How the worker ended: by its exit code, by a signal, or by the agent.
+#[derive(Serialize)]
+#[serde(rename_all = "snake_case")]
+enum WorkerExitHow {
+    Code(i32),
+    Signal(i32),
+    KilledByAgent,
+    Unknown,
+}
+
+/// The agent started a worker again after one ended (`worker_restart`, design 8.11, ADR-394).
+#[derive(Serialize)]
+struct WorkerRestartEntry {
+    /// The new worker's process ID, when the agent knew it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pid: Option<u32>,
 }
 
 /// What the agent knows of the VCI it launched the job's worker for: the API its library
@@ -3136,6 +3169,39 @@ impl CommLog {
         Some(connected)
     }
 
+    /// Writes the `worker_exit` event of a worker that ended (design 8.11, ADR-394), naming the
+    /// exchanges in flight when it did (`in_flight`, by `seq`). It records no loss: a VCI loss
+    /// has its own record, and the exchanges keep the classification they were written with.
+    /// The event's `seq`; `None` once the log has failed.
+    pub(crate) fn worker_exit(
+        &self,
+        exit: crate::client::WorkerExit,
+        in_flight: &[u64],
+    ) -> Option<u64> {
+        use crate::client::ExitHow;
+        let event = Event::WorkerExit(WorkerExitEntry {
+            pid: exit.pid,
+            exit: match exit.how {
+                ExitHow::Code(code) => WorkerExitHow::Code(code),
+                ExitHow::Signal(signal) => WorkerExitHow::Signal(signal),
+                ExitHow::KilledByAgent => WorkerExitHow::KilledByAgent,
+                ExitHow::Unknown => WorkerExitHow::Unknown,
+            },
+            refers_to: in_flight.to_vec(),
+        });
+        let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
+    /// Writes the `worker_restart` event of a worker the agent started again (design 8.11,
+    /// ADR-394), before the new connection's `vci_connected`. The event's `seq`; `None` once the
+    /// log has failed.
+    pub(crate) fn worker_restart(&self, pid: Option<u32>) -> Option<u64> {
+        let event = Event::WorkerRestart(WorkerRestartEntry { pid });
+        let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
     /// Whether the log holds a loss, an earlier run's or this run's own, that the next
     /// `vci_connected` settles, so the runner reads the VCI's clock for it first (ADR-373,
     /// ADR-393).
@@ -5356,6 +5422,73 @@ mod tests {
                     "outcome": "unreadable"}),
             ]
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: a worker's end is a `worker_exit` event with its process ID, how it ended and the
+    /// exchanges in flight, and the new worker a `worker_restart` event with its own process ID.
+    /// Neither settles anything: the exchange keeps its entry, and the log holds no `vci_loss`.
+    #[test]
+    fn a_worker_s_exit_and_restart_are_events_of_their_own() {
+        use crate::client::{ExitHow, WorkerExit};
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        let exchange = log
+            .exchange_with(
+                evidence(
+                    endpoint(0x7E0),
+                    &[0x22, 0xF1, 0x90],
+                    exchange::End::Unknown(exchange::UnknownCause::RpcFailure),
+                ),
+                Vec::new(),
+            )
+            .unwrap();
+        for (pid, how, in_flight) in [
+            (Some(41), ExitHow::Signal(9), vec![exchange]),
+            (Some(42), ExitHow::Code(3), Vec::new()),
+            (Some(43), ExitHow::KilledByAgent, vec![exchange]),
+            (None, ExitHow::Unknown, Vec::new()),
+        ] {
+            log.worker_exit(WorkerExit { pid, how }, &in_flight)
+                .unwrap();
+        }
+        log.worker_restart(Some(44)).unwrap();
+        log.worker_restart(None).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        let without_seq = |line: &serde_json::Value| {
+            let mut line = line.clone();
+            line.as_object_mut().unwrap().remove("seq");
+            line
+        };
+        let events: Vec<_> = lines
+            .iter()
+            .filter(|line| {
+                line["event"]
+                    .as_str()
+                    .is_some_and(|event| event.starts_with("worker_"))
+            })
+            .map(without_seq)
+            .collect();
+        assert_eq!(
+            events,
+            [
+                serde_json::json!({"event": "worker_exit", "pid": 41, "exit": {"signal": 9},
+                    "refers_to": [exchange]}),
+                serde_json::json!({"event": "worker_exit", "pid": 42, "exit": {"code": 3},
+                    "refers_to": []}),
+                serde_json::json!({"event": "worker_exit", "pid": 43, "exit": "killed_by_agent",
+                    "refers_to": [exchange]}),
+                serde_json::json!({"event": "worker_exit", "exit": "unknown", "refers_to": []}),
+                serde_json::json!({"event": "worker_restart", "pid": 44}),
+                serde_json::json!({"event": "worker_restart"}),
+            ]
+        );
+        assert!(lines.iter().all(|line| line["event"] != "vci_loss"));
+        assert!(!log.loss_to_settle());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

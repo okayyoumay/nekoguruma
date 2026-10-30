@@ -1,7 +1,7 @@
 # ADR-393: A Run Continues After Its VCI Comes Back
 
 **Date:** 2026-10-30
-**Status:** Accepted
+**Status:** Accepted (item 2's "a worker that crashed is not restarted" superseded by ADR-394)
 **Affects:** `agent` host (`HostError::resend_class`, `WorkerHost::reopen`), runner (`run_vm`,
 `JobLimits::vci_return_wait`, `reopen_poll`, `max_link_reopens`), restart (`repeat_decision`),
 communication log (`settle_loss`, `vci_connected`, `link_opened`); design 8.2.5, 8.11;
@@ -65,5 +65,5 @@ confirmed by the module disconnect and retried once, and the rest of this decisi
 - A VCI that drops again and again is bounded by the reopen limit and by the plain procedure's
   resume limit.
 - A run with no journal re-reads no VIN after a reopen, since it names none.
-- A crashed worker still ends the run until the agent restarts workers within a run (backlog).
+- A crashed worker still ends the run until the agent restarts workers within a run (ADR-394).
 - Design 8.11 no longer says that the agent does not reconnect within a run.

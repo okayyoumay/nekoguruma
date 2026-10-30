@@ -86,8 +86,8 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    ComParams by their ISO 22900-2 (2022) short names (Annex B.3). A run with `--api dpdu` is
    tested end to end on `iso22900-mock` with a simulated ECU attached (ADR-299,
    `crates/iso22900-service/tests/ngr_agent_dpdu_end_to_end.rs`).
-6. Run the program under the request policy and the default job limits (ADR-235; a request that fails at the ECU or the bus and is safe to repeat is sent again up to `JobLimits::max_primitive_repeats` times, "Repeating a failed primitive" below, and a lost path to the VCI continues on a new link under the conditions of "Continuing after a lost path"), then stop
-   the worker and release the guards. The stop request may take up to 2 s to be answered; a
+6. Run the program under the request policy and the default job limits (ADR-235; a request that fails at the ECU or the bus and is safe to repeat is sent again up to `JobLimits::max_primitive_repeats` times, "Repeating a failed primitive" below, and a lost path to the VCI continues on a new link under the conditions of "Continuing after a lost path"). The run takes its worker through `launch::RelaunchingWorker`, which owns the worker's process and starts a new worker by the launch recipe of step 5 if the process exits during the run (ADR-394, "A worker that exited" below). Then stop
+   the worker in the source's process slot, which holds the current one, and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker
    cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
    locks stay held until the process exits (ADR-258). The policy is read-only, except that a debug build may send any request once
@@ -774,6 +774,47 @@ the run's, no session is entered again (ADR-335 item 8), and the resend counts a
 `vci_connected` for the new link (the run's own loss is settled right after it) and
 `link_opened` again (design 8.11).
 
+### A worker that exited
+
+A lost path may be a worker that crashed, which only the worker's process tells from a lost VCI
+(ADR-394); the repeat decision and the conditions above are the same. `WorkerSource` has three
+methods besides `client`: `status` (`Alive`, `Exited(WorkerExit)` with the process ID and how it
+ended, or `Unknown`, the default of every bare client), `end` (ends a worker that is alive and
+does not answer, reaping it; an error by default) and `pid`. `launch::RelaunchingWorker`
+implements them over the process of `launch_worker`'s worker, kept in a `WorkerSlot`
+(`Arc<Mutex<Option<WorkerProcess>>>`) that `main.rs` stops at the end; it is built from a
+`LaunchRecipe` (the binary, service kind, VCI, mode and the launch and connect options of the
+first launch, which `LaunchedWorker::recipe` returns), so a test can build one for
+`CARGO_BIN_EXE_j2534-0404-service`. `WorkerProcess::try_wait` reaps a child that has exited
+without waiting, and `kill` ends one that does not answer.
+
+An attempt of `reopen_link` asks `status` first (once the worker's end was taken in, it asks
+again only after a client of a new worker was given):
+
+- `Exited`: the log gets `worker_exit` (design 8.11 "Worker events") naming the exchange the
+  host had left running, the stream and the primitive in settlement are dropped, the link counts
+  as closed and the shared handles are emptied, with no close made through the dead worker, and
+  the guards' mark is cleared (`Relink::worker_gone`, ADR-258 item 3: a reaped process holds no
+  link). `client` then starts a new worker from the recipe; the log gets `worker_restart` before
+  the link opens (`vci_connected` and `link_opened`, as after a lost VCI).
+- `Alive` or `Unknown`: the lost link is closed through the worker as above. If the close fails
+  and the process has exited meanwhile it is taken in as `Exited`. If the close got no answer
+  (`HostError::WorkerUnresponsive`) and the process is alive, `end` ends it (`worker_exit` with
+  `killed_by_agent`) and a new worker is started. If `end` fails, or the close failed in any
+  other way, the guards are marked and the attempt is `Cannot`, as before.
+- A start that fails because the system will not create the process is
+  `HostError::WorkerStart { spawn_failed: true }` and gives `Cannot` (the log has the exit and no
+  restart; the run ends in the original host error). Any other failure to start or to connect
+  (`spawn_failed: false`) gives `NotYet`: the poll starts again until `vci_return_wait`.
+- A start of a worker is one attempt inside the reopen, so it counts against
+  `JobLimits::max_link_reopens` with the reopens of a lost VCI.
+
+At the run's end, when the run's path was lost (`path_lost`, whatever ending followed),
+`run_job` asks `WorkerHost::reap_exited_worker` before it settles the stray primitive and closes
+the link: a worker that exited is taken in as above, so the final close through it is not made
+and does not mark the guards. The process stays in the slot, and `main.rs`'s stop finds it gone
+(`Stopped::Exited`). A bare client says `Unknown`, so a run on one behaves as it did before.
+
 ## Restart classification
 
 `agent::restart::classify` reads a job's journal with the program and decides, without
@@ -1171,6 +1212,11 @@ The restart order up to the erase is `runner::restart_order`; `resume_on` contin
 stopped. In test builds `OnSiteReason::StoppedBeforeErase` reports a restart that the tests
 stopped before the erase, with the teardown's outcome, the confirmation and the state check; a
 job never ends in it.
+
+A worker killed during a run is started again by the run, tested end to end in
+`j2534-0404-service` (`tests/agent_worker_crash.rs`, ADR-394): a `Safe` read finishes on a new
+worker, with `worker_exit`, `worker_restart` and the new connection in the communication log and
+the guards unmarked; an `Unsafe` one ends on site with the dead worker reaped at the run's end.
 
 The restart order is tested end to end against `sim-ecu` in `j2534-0404-service`
 (`tests/agent_restart_end_to_end.rs`): the agent runs as a child process that is killed after a

@@ -63,7 +63,7 @@ const NO_ERASE_STEPS: &str = "enter-programming-session;security-access;request-
                               transfer-data;transfer-exit";
 
 /// The example's `flash_segments.csv` with a segment of `length` bytes in blocks of `block_size`.
-fn with_segment(
+pub(super) fn with_segment(
     files: Vec<(String, Vec<u8>)>,
     start: &str,
     length: &str,
@@ -647,9 +647,13 @@ def main():
         .events
         .iter()
         .filter_map(|event| match event {
-            DryRunEvent::FlashTransfer { data, .. } => {
-                assert!(data.iter().all(|&byte| byte == 0));
-                Some(data.len())
+            DryRunEvent::FlashTransfer { len, digest, .. } => {
+                // The blocks are zeros, so the digest is that of `len` zero bytes.
+                assert_eq!(
+                    *digest,
+                    diag_ir::dry_run::block_digest(&vec![0; *len as usize])
+                );
+                Some(*len as usize)
             }
             _ => None,
         })

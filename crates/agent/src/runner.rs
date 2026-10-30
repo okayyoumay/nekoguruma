@@ -65,7 +65,7 @@ pub struct JobLimits {
 impl Default for JobLimits {
     fn default() -> Self {
         Self {
-            max_steps: 1_000_000,
+            max_steps: diag_ir::DEFAULT_MAX_STEPS,
             wait_poll: Duration::from_millis(10),
             max_procedure_resumes: 3,
         }

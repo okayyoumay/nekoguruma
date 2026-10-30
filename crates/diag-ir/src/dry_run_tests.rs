@@ -979,23 +979,85 @@ fn a_flash_block_outside_the_declarations_ends_the_run_with_the_vms_error() {
 }
 
 #[test]
-fn flash_blocks_count_toward_the_budget() {
+fn flash_blocks_are_not_charged_to_the_report() {
+    // Eight blocks of the most one block holds are 128 MiB, twice the report's budget.
     let buf = flash_document(crate::declaration::FlashSegmentT {
-        length: 1 << 20,
-        block_size: 1 << 20,
+        length: (crate::MAX_BYTES_LEN * 8) as u64,
+        block_size: crate::MAX_BYTES_LEN as u32,
         ..Default::default()
     });
-    let program = in_plan(vec![
-        Op::PushI64(0),
-        Op::FlashBlock {
-            session: 2,
-            segment: 0,
-        },
-        Op::Pop,
-        Op::Jump(0),
-    ]);
-    let report = run(&buf, &program, &Script::new());
+    let mut code = Vec::new();
+    for index in 0..8 {
+        code.extend([
+            Op::PushI64(index),
+            Op::FlashBlock {
+                session: 2,
+                segment: 0,
+            },
+            Op::Pop,
+        ]);
+    }
+    let report = run(&buf, &in_plan(code), &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+}
+
+#[test]
+fn a_flash_transfer_event_holds_the_blocks_length_and_digest() {
+    assert_eq!(block_digest(&[]), 0xcbf2_9ce4_8422_2325);
+    // FNV-1a of "a", a published test vector.
+    assert_eq!(block_digest(b"a"), 0xaf63_dc4c_8601_ec8c);
+    let buf = document(Vec::new(), Vec::new());
+    let loaded = load_ecu_document(&buf).expect("loads");
+    let variant = loaded.variant().expect("a variant");
+    let script = Script::new();
+    let mut host = ScriptedHost {
+        variant: &variant,
+        script: &script,
+        used: HashMap::new(),
+        marks: HashMap::new(),
+        pc: 0,
+        events: Vec::new(),
+        report_bytes: 0,
+        over_budget: None,
+    };
+    host.flash_transfer(3, &[1, 2, 3]).expect("fits");
+    assert_eq!(
+        host.events,
+        [DryRunEvent::FlashTransfer {
+            block: 3,
+            len: 3,
+            digest: block_digest(&[1, 2, 3])
+        }]
+    );
+    assert_eq!(host.report_bytes, EVENT_COST);
+}
+
+#[test]
+fn a_log_past_the_budget_leaves_the_report_pc_on_the_log() {
+    let buf = document(Vec::new(), Vec::new());
+    let message = "x".repeat(crate::MAX_BYTES_LEN);
+    let mut code = Vec::new();
+    for _ in 0..8 {
+        code.extend([Op::PushBytes(0), Op::LogFromStack { level: 1 }]);
+    }
+    let report = run(
+        &buf,
+        &program(code, vec![message.into_bytes()]),
+        &Script::new(),
+    );
     assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    // The over-budget log is the instruction at an odd pc.
+    assert_eq!(report.pc % 2, 1, "{report:?}");
+    assert_eq!(report.pc as usize, report.events.len() * 2 + 1);
+}
+
+#[test]
+fn every_runtime_input_is_in_the_list_the_built_defaults_cover() {
+    // A unit variant decodes from its one-byte tag; the tags that decode are the variants.
+    let decoded: Vec<RuntimeInput> = (0..=255u8)
+        .filter_map(|tag| postcard::from_bytes::<RuntimeInput>(&[tag]).ok())
+        .collect();
+    assert_eq!(decoded, ALL_INPUTS);
 }
 
 #[test]
@@ -1091,4 +1153,35 @@ fn a_decoded_form_is_charged_what_it_holds() {
         form_cost(&text),
         1 + size_of::<(String, HmiValue)>() + 1 + 1000
     );
+}
+
+// ---------------------------------------------------------------- Built defaults (ADR-391)
+
+#[test]
+fn the_built_defaults_answer_with_zeros_and_empty_positive_answers() {
+    let script = Script::built_defaults();
+    assert_eq!(script.keys, [vec![0u8; 4]]);
+    assert_eq!(script.forms, [hmi::answered("")]);
+    assert_eq!(script.records, [hmi::answered("")]);
+    assert!(script.responses.is_empty() && script.seeds.is_empty());
+    // Every input has the value 0, once.
+    assert_eq!(script.inputs.len(), ALL_INPUTS.len());
+    for input in ALL_INPUTS {
+        assert!(script.inputs.contains(&(input, 0)), "{input:?}");
+    }
+}
+
+#[test]
+fn a_run_on_the_built_defaults_reads_every_input() {
+    let buf = document(Vec::new(), Vec::new());
+    let code = ALL_INPUTS
+        .into_iter()
+        .map(|input| Op::ReadInput { input })
+        .collect::<Vec<_>>();
+    let steps = code.len() as u64;
+    let report = run(&buf, &program(code, Vec::new()), &Script::built_defaults());
+    assert_eq!(report.end, DryRunEnd::Finished);
+    assert_eq!(report.steps, steps);
+    // The run ended on the instruction after the last (the pc of the finish).
+    assert_eq!(u64::from(report.pc), steps);
 }

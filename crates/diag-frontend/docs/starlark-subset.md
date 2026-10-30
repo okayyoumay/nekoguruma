@@ -975,6 +975,12 @@ The lowering also reports this code (3.1):
 |---|---|
 | `STAR_SECRET_IN_TEXT` | a `diag.log` message or `diag.fail` detail is built from a value read from a SecurityAccess or Authentication response: a `diag.security_access` result, or a `diag.request` of SID 0x27 or 0x29 (reported at the message or detail; ADR-348 item 6) |
 
+The conversion reports this code after lowering (6, ADR-391):
+
+| Code | Meaning |
+|---|---|
+| `STAR_DRY_RUN_STOPPED` | the dry run of the lowered procedure on answers built from the variant's declarations stopped for a reason other than the procedure's own end: an instruction failed (an index outside a list, a division by zero, a response that was not built from a declaration and does not decode, and the like), the host could not answer, or the run did not end within the step budget. Located at the source of the instruction the run stopped on; the hint gives the reason, or `did not end within N instructions`. A run that finishes, one that ends in `diag.fail` or in the lowering's own failure (such as a loop past its limit), and one that stops on a built answer that does not decode as its service's declaration are accepted |
+
 ---
 
 ## 6. Implementation Notes
@@ -1056,6 +1062,7 @@ The lowering also reports this code (3.1):
   lacks) is checked by the lowering
 - Constant folding is done during bytecode generation
 - After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1): `diag_ir::dry_run` with a script of answers, or with answers built from the declaration part (ADR-328). The dry run also answers the profile's seed and send-key requests of `diag.security_access`, which no declared service answers: it finds them by their place around the `SecurityAccess` step and answers a seed request with a scripted or a built seed and the send-key request with a built positive response, so a variant that declares no SecurityAccess service still runs (ADR-390)
+- The conversion runs this dry run on every lowered procedure for each variant (ADR-391), with `Script::built_defaults()` (a key of four zero bytes, the empty positive answer to every form and record template, and 0 for every runtime input, so a procedure that uses `diag.security_access`, `diag.hmi`, `diag.record` or a precondition runs) and `diag_ir::DEFAULT_MAX_STEPS` instructions, the agent's default step budget. One function decides the end: `Finished`, any `Failed` and an `Undecodable` response of a built answer are accepted, and everything else (another VM error, a host error, the step limit, a wait, an invalid program) is `STAR_DRY_RUN_STOPPED` at `DryRunReport::pc`, merged across variants as in ADR-311. Built answers are zeros, so a procedure must also guard a value that is out of range when the vehicle's data is zero (an index into a list that is empty, a negative offset)
 
 ## 7. Verification
 

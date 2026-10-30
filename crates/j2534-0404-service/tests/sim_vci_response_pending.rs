@@ -16,7 +16,7 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{HostError, JobError, JobLimits, JobRun, LinkConfig, run_program};
+use agent::{JobError, JobLimits, JobRun, LinkConfig, run_program};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value, VmState};
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -240,10 +240,11 @@ async fn jobs(control_dir: &Path) {
     assert!(
         matches!(
             timed_out,
-            Err(JobError::Host {
-                pc: 1,
-                source: HostError::NoResponse
-            })
+            Err(JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
         ),
         "{timed_out:?}"
     );
@@ -268,10 +269,11 @@ async fn jobs(control_dir: &Path) {
     assert!(
         matches!(
             timed_out,
-            Err(JobError::Host {
-                pc: 1,
-                source: HostError::NoResponse
-            })
+            Err(JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
         ),
         "{timed_out:?}"
     );

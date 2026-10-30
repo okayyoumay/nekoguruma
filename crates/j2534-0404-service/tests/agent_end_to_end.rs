@@ -509,7 +509,14 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     )
     .await;
     assert!(
-        matches!(state, Err(agent::JobError::Host { .. })),
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 5, steps: 5 }
+                }
+            ))
+        ),
         "the dropped response ends the job: {state:?}"
     );
     assert_eq!(comm_log, CommLogStatus::Complete);
@@ -607,7 +614,14 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     )
     .await;
     assert!(
-        matches!(state, Err(agent::JobError::Host { .. })),
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
         "the read gets no answer: {state:?}"
     );
     assert_eq!(comm_log, CommLogStatus::Complete);

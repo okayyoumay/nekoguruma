@@ -36,6 +36,10 @@
 //!   step record carries that state already. A state too large for a frame leaves no checkpoint
 //!   and does not end the job.
 //!
+//! When a run ends with the request marker it committed provably unsent (a refusal before the
+//! start, or a cancel before the send), the marker is withdrawn: a request-not-sent record
+//! ([`JobJournal::withdraw_request`], ADR-392).
+//!
 //! When the procedure ends itself as failed (`Op::Fail`): a procedure-failure record, the job's
 //! last ([`JobJournal::procedure_failed`], ADR-280). A restart's identity abort is committed by
 //! the runner on the journal itself (`Journal::commit_identity_mismatch`, ADR-286).
@@ -53,7 +57,7 @@ use diag_ir::{
 use crate::host::{HostError, TransferProgress};
 use crate::inputs::{FieldBytes, ServiceSources, read_identity_bytes};
 use crate::journal::{
-    FileStore, JobKey, Journal, JournalError, RunStop, StageId, StepRef, Store, Vin,
+    FileStore, JobKey, Journal, JournalError, JournalState, RunStop, StageId, StepRef, Store, Vin,
 };
 use crate::restart::{in_section_outside_plans, needs_request_marker};
 use crate::runner::JobError;
@@ -260,6 +264,25 @@ impl<S: Store> JobJournal<S> {
             return Err(JobError::Cancelled);
         }
         self.journal.commit_request(at)?;
+        Ok(())
+    }
+
+    /// The journal as folded so far.
+    pub(crate) fn state(&self) -> &JournalState {
+        self.journal.state()
+    }
+
+    /// Whether the journal's newest request marker is the one at `at`, and not withdrawn: the
+    /// run is at a request it committed.
+    pub(crate) fn holds_request(&self, at: StepRef) -> bool {
+        let facts = &self.journal.state().facts;
+        facts.last_request == Some(at) && facts.last_request_unsent != Some(at)
+    }
+
+    /// Withdraws the request marker at `at`, because the run ends with its request provably
+    /// unsent (ADR-392). The caller knows that no attempt may have reached the ECU.
+    pub(crate) fn withdraw_request(&mut self, at: StepRef) -> Result<(), JobError> {
+        self.journal.commit_request_not_sent(at)?;
         Ok(())
     }
 

@@ -86,7 +86,7 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    ComParams by their ISO 22900-2 (2022) short names (Annex B.3). A run with `--api dpdu` is
    tested end to end on `iso22900-mock` with a simulated ECU attached (ADR-299,
    `crates/iso22900-service/tests/ngr_agent_dpdu_end_to_end.rs`).
-6. Run the program under the request policy and the default job limits (ADR-235), then stop
+6. Run the program under the request policy and the default job limits (ADR-235; a request that fails at the ECU or the bus and is safe to repeat is sent again up to `JobLimits::max_primitive_repeats` times, "Repeating a failed primitive" below), then stop
    the worker and release the guards. The stop request may take up to 2 s to be answered; a
    worker that has not exited 5 s after that is killed and reported on stderr. When the job's link was not confirmed closed and the worker
    cannot be stopped either, the run fails with "the worker may still hold the VCI", and the
@@ -288,10 +288,11 @@ share one step count:
 |---|---|---|
 | `Checkpoint { at, vm_state }` | after a diagnostic primitive outside every plan's range, with the VM state after it; not where the step carries a boundary state | `JournalState::latest_checkpoint` only |
 | `Request { at }` | before a diagnostic primitive outside the plans that is not safe to repeat | `RecoveryFacts::first_request` and `last_request` |
+| `RequestNotSent { at }` | when a run ends with the newest `Request` provably unsent (ADR-392, "Repeating a failed primitive" below) | `RecoveryFacts::last_request_unsent`; `last_request_withdrawn()` says it names `last_request` |
 
 The checkpoint must come after the last step and not before the last request or the latest
 checkpoint (it may share their step count), and a request after the last step and after the
-previous request. A VM state whose record would not fit in a frame (`MAX_FRAME`) leaves no
+previous request. A request-not-sent record must name the newest request, once, and come after the last step; the record is appended to the format like the others, with no version change. A VM state whose record would not fit in a frame (`MAX_FRAME`) leaves no
 checkpoint and does not end the job: the commit is refused before anything is appended, the
 journal is unchanged, and the run goes on. A missing checkpoint only makes a restart more
 conservative (ADR-335): the latest checkpoint stays an older one, and a completed request that is
@@ -684,6 +685,34 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   the job starts it over, since the log is not read back. A link error an entry carries is handed
   to every other target's state too. Writing an entry never reaches the job, a panic included.
 
+## Repeating a failed primitive
+
+`restart::repeat_decision` is the one place that decides what the runner (`run_vm`) does with a
+host error of a diagnostic primitive (ADR-392). It reads the error's `HostError::send_state`
+and `HostError::resend_class`, the program's idempotency (`restart::safe_to_repeat`) and the
+count of failed sends of the arrival, which the runner keeps in memory and starts over at every
+arrival at an instruction (`VmState::steps` before it). Only `ServiceRequest`, `ReadDtc`,
+`RoutineControl` and `SendReceive` outside every plan's range are considered; every other
+instruction, anything in a plan's range and a link or worker failure (`WorkerUnresponsive`, `Rpc`
+without a refusal, `EventStreamEnded`, `Setup`, `VciLost` that was not a refusal after the loss)
+end the run in `JobError::Host` as before.
+
+| Error | Primitive | Decision |
+|---|---|---|
+| `NoResponse`, `PrimitiveFailed`, `EventsLost` (the request may have reached the ECU) | safe to repeat, bound not used up | send the same request again after `JobLimits::wait_poll`, with a cancel check, in place: the arrival is not repeated, so no second `Request` record; every attempt after the first of the arrival is logged with `origin: repeat` (design 8.11), also when the first was refused before it was sent |
+| the same | safe to repeat, `JobLimits::max_primitive_repeats` resends used (default 2, three sends) | the run ends in `JobError::Host` |
+| the same | not safe to repeat (unsafe, `CheckState`, uncovered, or covered by a safe and a non-safe section) | the verdict of `classify` on the journal as it now stands: when it refuses a resume, `OnSiteInterventionRequired` with its reason (`RecoveryRequiredSection` from the pass's intent, also for a request after the section; else `UnconfirmedRequest { at }`); when it would not (after a completed flash transfer a resume takes ADR-229's restart), the run ends in `JobError::Host`. The `Request` record stays unconfirmed and the ending is not journaled. Without a journal, which no resume reads, `UnconfirmedRequest { at }` |
+| `LinkHeld`, or a start refused with the reason QUEUE_FULL (nothing was sent) | any, bound not used up | resend as the first row, whatever the idempotency; at the bound the run ends in `JobError::Host` |
+| any other error with `send_state` `NotSent` | any | the run ends in `JobError::Host` |
+
+The first arrival's `Request` record is written once. When a run ends with it provably unsent (an
+error whose `send_state` is `NotSent`, with no earlier send of the arrival that may have reached
+the ECU; or a cancel taken after `arrive` committed the record and before the request was sent),
+the runner first commits `RequestNotSent { at }` (`JobJournal::withdraw_request`). It is never
+written when a send may have reached the ECU. The classification of a plain procedure reads it as
+no request ("A plain procedure" below). A cancel held by an uninterruptible or recovery-required
+section stays held through the resends.
+
 ## Restart classification
 
 `agent::restart::classify` reads a job's journal with the program and decides, without
@@ -737,6 +766,7 @@ started transfer keeps the flash path. `restart::classify_plain_procedure` decid
 | Journal | Decision |
 |---|---|
 | no `Request` was ever recorded, whatever the journal's states | plain start on the same journal, counted (below) |
+| every `Request` is withdrawn (`RecoveryFacts::standing_request` is `None`, ADR-392) | the same plain start: no request ever left. Otherwise the newest request that is not withdrawn is the one judged by the rows below |
 | the last `Request` is not older than the state of the latest checkpoint (the newest record that carries a VM state), or there is no such state | `OnSiteInterventionRequired(UnconfirmedRequest { at })`: the unsafe primitive may have reached the ECU. It holds at every later resume until a person acts |
 | the latest checkpoint's state does not decode, or fails `Vm::check_state` with its step count set to `restart::next_steps` | `OnSiteInterventionRequired(InvalidEntryState)`, before the conditions below read the state |
 | otherwise, from the latest checkpoint's state, one of the conditions below fails | `OnSiteInterventionRequired(NotResumable { cause })` |
@@ -745,7 +775,7 @@ started transfer keeps the flash path. `restart::classify_plain_procedure` decid
 The comparison of the request is with the state's own step count: a checkpoint or a step state is
 taken after the completed step, so its count is one past its record's, and a run start's is the
 step about to run. A cancel while a request's marker was committed leaves a marker with no later
-state, which reads as unconfirmed too. The conditions of the checkpoint resume are checked in this
+state, which reads as unconfirmed too unless the runner withdrew the marker (ADR-392). The conditions of the checkpoint resume are checked in this
 order, and the first that fails is the cause:
 
 1. the checkpoint's pc is an interruptible point (`restart::interruptible_point`, the rule the

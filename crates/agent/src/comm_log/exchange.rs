@@ -40,7 +40,7 @@ pub(crate) const NRC_PENDING: u8 = 0x78;
 #[serde(rename_all = "snake_case")]
 pub(crate) enum Origin {
     Procedure,
-    /// A request re-sent after a resume (8.2.5).
+    /// A request re-sent after a resume (8.2.5), or within a run after a failed attempt (ADR-392).
     Repeat,
     Identification,
     /// The write guard's reads (8.9.1).

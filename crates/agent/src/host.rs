@@ -226,6 +226,40 @@ impl HostError {
     }
 }
 
+/// How a failed primitive's error bears on sending it again in the same run (ADR-392). The
+/// runner's repeat policy reads this and [`HostError::send_state`], nothing else of the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ResendClass {
+    /// The ECU or the bus failed the exchange: no response, the link's error event for it, or
+    /// lost events. The request may have reached the ECU.
+    EcuLevel,
+    /// The worker refused the start for a reason that passes (a held link, a full transmit
+    /// queue), so nothing was sent and the same request can be started again.
+    Transient,
+    /// Anything else: a link or worker failure, or a refusal that does not pass.
+    Other,
+}
+
+impl HostError {
+    /// The class of this error for a resend (ADR-392).
+    pub fn resend_class(&self) -> ResendClass {
+        match self {
+            HostError::NoResponse | HostError::PrimitiveFailed(_) | HostError::EventsLost => {
+                ResendClass::EcuLevel
+            }
+            HostError::LinkHeld => ResendClass::Transient,
+            HostError::Rpc { rpc, status }
+                if *rpc == "StartComPrimitive"
+                    && refusal_reason(status)
+                        == Some(vci_service_interface::RefusalReason::QueueFull) =>
+            {
+                ResendClass::Transient
+            }
+            _ => ResendClass::Other,
+        }
+    }
+}
+
 /// The name of an error event, or its code when it is not one the interface lists (a
 /// vendor's), as an error message and the communication log's `detail` give it.
 fn error_event_name(code: i32) -> String {
@@ -504,6 +538,9 @@ pub struct WorkerHost<C: WorkerApi> {
     /// The VM position of the step running ([`ProcedurePosition`]): a request sent during a
     /// step gets an entry with `origin` `procedure` at this position.
     at: Option<At>,
+    /// The step running is a resend of its request ([`ProcedurePosition::step_resends`]): the
+    /// entries get the origin `repeat`.
+    resends: bool,
     /// The runner's or the restart's own reads running ([`ProcedurePosition::own_reads`]): a
     /// request sent outside a step gets an entry with their origin, and none without one.
     own: Option<OwnRead>,
@@ -535,6 +572,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             comm_log: None,
             link_ids: None,
             at: None,
+            resends: false,
             own: None,
             download_seq: None,
             stray: None,
@@ -1263,6 +1301,7 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// agent's own reads running, if any.
     fn origin(&self) -> Option<Origin> {
         match (&self.at, self.own) {
+            (Some(_), _) if self.resends => Some(Origin::Repeat),
             (Some(_), _) => Some(Origin::Procedure),
             (None, Some(own)) => Some(own.origin()),
             (None, None) => None,
@@ -2165,6 +2204,9 @@ pub trait ProcedurePosition {
     /// The runner or the restart begins reads of its own, outside a step (`Some`), or ends
     /// them (`None`): what the host sends meanwhile has that origin.
     fn own_reads(&mut self, _reads: Option<OwnRead>) {}
+    /// The step that began is a resend of the request an earlier attempt of the same arrival
+    /// sent (ADR-392): what the host sends until the step ends has the origin `repeat`.
+    fn step_resends(&mut self) {}
 }
 
 /// Reads the runner and the restart send on their own, outside the VM's steps, by the origin
@@ -2205,10 +2247,15 @@ impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
 
     fn step_ends(&mut self) {
         self.at = None;
+        self.resends = false;
     }
 
     fn own_reads(&mut self, reads: Option<OwnRead>) {
         self.own = reads;
+    }
+
+    fn step_resends(&mut self) {
+        self.resends = true;
     }
 }
 
@@ -4944,6 +4991,44 @@ mod tests {
             end,
             End::Unknown(UnknownCause::WorkerNotAnswering)
         ));
+    }
+
+    /// Only a held link and a start refused for a full queue pass (ADR-392); the ECU- and
+    /// bus-level errors are their own class; the rest, including other refusals, is neither.
+    #[test]
+    fn the_resend_class_separates_transient_refusals_from_ecu_level_errors() {
+        use vci_service_interface::RefusalReason;
+        for error in [
+            HostError::LinkHeld,
+            refused_start(Some(RefusalReason::QueueFull)),
+        ] {
+            assert_eq!(error.resend_class(), ResendClass::Transient, "{error:?}");
+            assert_eq!(error.send_state(), SendState::NotSent, "{error:?}");
+        }
+        for error in [
+            HostError::NoResponse,
+            HostError::EventsLost,
+            HostError::PrimitiveFailed(1),
+        ] {
+            assert_eq!(error.resend_class(), ResendClass::EcuLevel, "{error:?}");
+            assert_eq!(error.send_state(), SendState::MayHaveReached, "{error:?}");
+        }
+        for error in [
+            refused_start(Some(RefusalReason::InvalidParameters)),
+            refused_start(None),
+            HostError::NotAllowed(0x2E),
+            HostError::WorkerUnresponsive("StartComPrimitive"),
+            HostError::EventStreamEnded,
+            HostError::Setup("link"),
+            HostError::VciLost {
+                refused_after_loss: false,
+            },
+            HostError::VciLost {
+                refused_after_loss: true,
+            },
+        ] {
+            assert_eq!(error.resend_class(), ResendClass::Other, "{error:?}");
+        }
     }
 
     /// The error `unary` gives for a start the worker never answered is `MayHaveReached`.

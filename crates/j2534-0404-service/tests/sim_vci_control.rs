@@ -271,7 +271,14 @@ async fn inject(control_dir: &Path) {
     );
     let silent = run(&client).await;
     assert!(
-        matches!(silent, Err(JobError::Host { pc: 1, .. })),
+        matches!(
+            silent,
+            Err(JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
         "{silent:?}"
     );
     send(control_dir, "002", r#"{"command": "reconnect_ecu"}"#);

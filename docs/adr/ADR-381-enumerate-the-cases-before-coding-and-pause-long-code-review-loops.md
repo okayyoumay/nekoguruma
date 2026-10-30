@@ -1,7 +1,7 @@
 # ADR-381: Enumerate the Cases Before Coding, and Pause Long Code Review Loops
 
 **Date:** 2026-10-29
-**Status:** Accepted
+**Status:** Accepted (item 1 extended by ADR-387: one row per path that writes the value the rule decides)
 **Affects:** `.claude/README.md` ("Gates for the analysis agents"), `.claude/skills/backlog-loop/SKILL.md` (step 4), `.claude/skills/pr-review-loop/SKILL.md` (Steps 3 and 4), `CLAUDE.md` ("Pull requests"), `.github/copilot-instructions.md`; ADR-349 Decision items 1 and 4; ADR-251's Status note
 
 ## Context

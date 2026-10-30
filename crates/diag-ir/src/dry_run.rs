@@ -6,6 +6,15 @@
 //! service's declaration, and decoded through that declaration. The [`DryRunReport`] lists the
 //! requests with their answers and decoded values, the other primitives the procedure reached,
 //! and how the run ended.
+//!
+//! A variant that declares no SecurityAccess service still lets `diag.security_access` run: the
+//! requests the frontend lowers it to are the UDS profile's, not a declared service's (ADR-390).
+//! They are found by their place around an `Op::SecurityAccess`: the nearest `ServiceRequest`
+//! before it is the seed request and the nearest one after it is the send-key request, each only
+//! when no other host-facing instruction, call or return lies between. When such a request
+//! belongs to no declared service, the dry run answers it in the profile's shape and reports it
+//! under [`PROFILE_SEED_REQUEST`] or [`PROFILE_KEY_REQUEST`]; a declared service still answers
+//! first, and any other undeclared request ends the run.
 
 use std::collections::HashMap;
 
@@ -16,8 +25,8 @@ use crate::declaration::{
 use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_positive_response};
 use crate::hmi::{self, HmiForm};
 use crate::{
-    DiagHost, Failure, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm, VmError,
-    WaitingOn,
+    DiagHost, Failure, Op, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm,
+    VmError, WaitingOn,
 };
 
 /// The most bytes of requests, answers, transfer data, forms and messages one report holds,
@@ -29,11 +38,31 @@ pub const MAX_REPORT_BYTES: usize = 64 << 20;
 /// events list, since the list's storage can grow to twice its length.
 pub const EVENT_COST: usize = 2 * size_of::<DryRunEvent>();
 
+/// The `service` of a [`DryRunEvent::Request`] for a seed request the dry run answered as the UDS
+/// profile's, with no declared service (ADR-390). The colon keeps it from being any
+/// `Service.short_name`.
+pub const PROFILE_SEED_REQUEST: &str = "profile:security_access_seed";
+
+/// Like [`PROFILE_SEED_REQUEST`], for the send-key request.
+pub const PROFILE_KEY_REQUEST: &str = "profile:security_access_key";
+
+/// The seed a built answer to the profile's seed request carries; not zero, which on UDS means
+/// the ECU is already unlocked.
+const BUILT_SEED: [u8; 4] = [1, 2, 3, 4];
+
+/// The SID of a positive response to the profile's SecurityAccess requests.
+const SECURITY_ACCESS_POSITIVE_SID: u8 = 0x67;
+
 /// The answers a dry run gives. Each list is answered in order, and its last answer again once
 /// the list is used up, so a procedure that polls gets a steady answer.
+///
+/// The profile's SecurityAccess requests (module docs) are answered from [`Script::seed`] and
+/// [`Script::key`]; a scripted response for the send-key request itself is out of scope: its
+/// answer is always built.
 #[derive(Debug, Clone, Default)]
 pub struct Script {
     responses: HashMap<String, Vec<Vec<u8>>>,
+    seeds: Vec<Vec<u8>>,
     keys: Vec<Vec<u8>>,
     forms: Vec<Vec<u8>>,
     records: Vec<Vec<u8>>,
@@ -54,6 +83,15 @@ impl Script {
             .entry(service.to_owned())
             .or_default()
             .push(bytes.into());
+        self
+    }
+
+    /// Adds a whole response, SID included, to the answers to the profile's seed request, in
+    /// place of the built `positive, level, 01 02 03 04` answer. A negative response may be
+    /// scripted; the call then ends as it would on a vehicle. It applies only when no declared
+    /// service answers the request (use [`Script::response`] for one that does).
+    pub fn seed(mut self, bytes: impl Into<Vec<u8>>) -> Self {
+        self.seeds.push(bytes.into());
         self
     }
 
@@ -118,13 +156,15 @@ pub enum DryRunEvent {
     /// whole request starting with its SID.
     Request {
         request: Vec<u8>,
-        /// `Service.short_name` of the declared service the request belongs to.
+        /// `Service.short_name` of the declared service the request belongs to, or
+        /// [`PROFILE_SEED_REQUEST`] / [`PROFILE_KEY_REQUEST`] for the profile's SecurityAccess
+        /// requests.
         service: String,
         answer: Vec<u8>,
         /// Whether the answer was built from the declaration rather than scripted.
         built: bool,
         /// The answer decoded through the service's positive response; `None` when the service
-        /// declares none.
+        /// declares none, and for the profile's requests, which have no declaration.
         decoded: Option<Result<Vec<DecodedField>, DecodeError>>,
     },
     SecurityAccess {
@@ -261,6 +301,8 @@ pub fn dry_run(
         variant,
         script,
         used: HashMap::new(),
+        marks: profile_requests(program),
+        pc: 0,
         events: Vec::new(),
         report_bytes: 0,
         over_budget: false,
@@ -277,6 +319,7 @@ pub fn dry_run(
         if vm.state.steps >= max_steps {
             break DryRunEnd::StepLimit;
         }
+        host.pc = vm.state.pc;
         let outcome = vm.step_with_declarations(program, Some(variant), &mut host);
         if host.over_budget {
             break DryRunEnd::Host(DryRunError::ReportTooLarge);
@@ -297,10 +340,74 @@ pub fn dry_run(
     }
 }
 
+/// A request of the UDS profile's SecurityAccess call, and its level (the odd seed level).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ProfileRequest {
+    Seed(u8),
+    Key(u8),
+}
+
+/// Whether `op` ends a scan from a `SecurityAccess` for its requests: any instruction that
+/// reaches the host, and a call or return, which leaves the straight-line code of one function.
+fn ends_profile_scan(op: &Op) -> bool {
+    matches!(
+        op,
+        Op::ServiceRequest { .. }
+            | Op::SendReceive { .. }
+            | Op::ReadDtc { .. }
+            | Op::RoutineControl { .. }
+            | Op::SecurityAccess { .. }
+            | Op::FlashTransfer { .. }
+            | Op::Wait { .. }
+            | Op::WaitFromStack
+            | Op::HmiRequest { .. }
+            | Op::HmiRequestFromStack { .. }
+            | Op::RecordInput { .. }
+            | Op::MonitorCapture { .. }
+            | Op::Log { .. }
+            | Op::LogFromStack { .. }
+            | Op::Fail { .. }
+            | Op::FlashBlock { .. }
+            | Op::ReadInput { .. }
+            | Op::Call(_)
+            | Op::Ret
+    )
+}
+
+/// The seed and send-key requests of `program`'s `SecurityAccess` steps, by pc (ADR-390): for
+/// each, the nearest `ServiceRequest` before it and the nearest after it, when
+/// [`ends_profile_scan`] holds for no instruction between.
+fn profile_requests(program: &Program) -> HashMap<u32, ProfileRequest> {
+    let mut marks = HashMap::new();
+    let code = &program.code;
+    for (at, op) in code.iter().enumerate() {
+        let Op::SecurityAccess { level } = op else {
+            continue;
+        };
+        let near = |mut range: Box<dyn Iterator<Item = usize>>| {
+            range
+                .find(|&pc| ends_profile_scan(&code[pc]))
+                .filter(|&pc| matches!(code[pc], Op::ServiceRequest { .. }))
+        };
+        let seed = near(Box::new((0..at).rev()));
+        let key = near(Box::new(at + 1..code.len()));
+        for (pc, request) in [
+            (seed, ProfileRequest::Seed(*level)),
+            (key, ProfileRequest::Key(*level)),
+        ] {
+            if let Some(pc) = pc.and_then(|pc| u32::try_from(pc).ok()) {
+                marks.entry(pc).or_insert(request);
+            }
+        }
+    }
+    marks
+}
+
 /// Which list of the script an answer comes from, for the count of answers used.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 enum Answers {
     Response(String),
+    Seed,
     Key,
     Form,
     Record,
@@ -310,6 +417,10 @@ struct ScriptedHost<'s, 'v> {
     variant: &'s EcuVariant<'v>,
     script: &'s Script,
     used: HashMap<Answers, usize>,
+    /// The profile's SecurityAccess requests by the pc of their `ServiceRequest`.
+    marks: HashMap<u32, ProfileRequest>,
+    /// The pc of the instruction being stepped.
+    pc: u32,
     events: Vec<DryRunEvent>,
     /// What the events count toward [`MAX_REPORT_BYTES`].
     report_bytes: usize,
@@ -383,6 +494,49 @@ impl ScriptedHost<'_, '_> {
             answer: answer.clone(),
             built,
             decoded,
+        });
+        Ok(answer)
+    }
+
+    /// Answers `request`, the profile's `kind` of SecurityAccess request that no declared
+    /// service answers, and records it.
+    fn answer_profile(
+        &mut self,
+        request: &[u8],
+        kind: ProfileRequest,
+    ) -> Result<Vec<u8>, DryRunError> {
+        let script = self.script;
+        let (name, scripted, built_answer) = match kind {
+            ProfileRequest::Seed(level) => {
+                let mut built = vec![SECURITY_ACCESS_POSITIVE_SID, level];
+                built.extend_from_slice(&BUILT_SEED);
+                (
+                    PROFILE_SEED_REQUEST,
+                    self.next(Answers::Seed, &script.seeds),
+                    built,
+                )
+            }
+            // Its scripted response is out of scope (`Script`): always built.
+            ProfileRequest::Key(level) => (
+                PROFILE_KEY_REQUEST,
+                None,
+                vec![SECURITY_ACCESS_POSITIVE_SID, level.saturating_add(1)],
+            ),
+        };
+        let built = scripted.is_none();
+        let answer = scripted.unwrap_or(built_answer);
+        self.charge(
+            request
+                .len()
+                .saturating_add(answer.len())
+                .saturating_add(name.len()),
+        )?;
+        self.events.push(DryRunEvent::Request {
+            request: request.to_vec(),
+            service: name.to_owned(),
+            answer: answer.clone(),
+            built,
+            decoded: None,
         });
         Ok(answer)
     }
@@ -638,7 +792,14 @@ impl DiagHost for ScriptedHost<'_, '_> {
         let mut request =
             vec![u8::try_from(service).map_err(|_| DryRunError::NotASid { service })?];
         request.extend_from_slice(payload);
-        self.send(request)
+        match resolve(*self.variant, &request) {
+            Err(DryRunError::Undeclared { .. }) if self.marks.contains_key(&self.pc) => {
+                let kind = self.marks[&self.pc];
+                self.answer_profile(&request, kind)
+            }
+            Ok(service) => self.answer(&request, service),
+            Err(error) => Err(error),
+        }
     }
 
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, DryRunError> {

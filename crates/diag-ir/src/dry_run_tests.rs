@@ -402,6 +402,187 @@ fn keys_and_records_come_from_the_script() {
     );
 }
 
+// ---------------------------------------------------------------- Profile SecurityAccess
+
+/// The code `diag.security_access(1)` lowers to, less the response check (a compare with the
+/// negative response `constants[1]` that skips the key step), then a `Pop`. Constants: the seed
+/// payload and a negative seed response.
+fn security_access_program() -> Program {
+    program(
+        vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x27 },
+            Op::StoreLocal(0),
+            Op::LoadLocal(0),
+            Op::PushBytes(1),
+            Op::CmpEq,
+            Op::JumpIfFalse(8),
+            Op::Jump(15),
+            Op::LoadLocal(0),
+            Op::PushI64(2),
+            Op::PushI64(i64::MAX),
+            Op::Slice,
+            Op::SecurityAccess { level: 1 },
+            Op::ServiceRequest { service: 0x27 },
+            Op::Pop,
+            Op::PushI64(0),
+            Op::Pop,
+        ],
+        vec![vec![1], vec![0x7F, 0x27, 0x37]],
+    )
+}
+
+fn profile_request(event: &DryRunEvent) -> (&str, &[u8], bool, bool) {
+    let DryRunEvent::Request {
+        service,
+        answer,
+        built,
+        decoded,
+        ..
+    } = event
+    else {
+        panic!("not a request: {event:?}");
+    };
+    (service, answer, *built, decoded.is_none())
+}
+
+#[test]
+fn the_profiles_seed_and_send_key_requests_are_answered_without_a_declared_service() {
+    let buf = document(vec![], vec![]);
+    let script = Script::new().key(vec![0xAA]);
+    let report = run(&buf, &security_access_program(), &script);
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    let [seed, access, key] = &report.events[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!(
+        profile_request(seed),
+        (PROFILE_SEED_REQUEST, &[0x67, 1, 1, 2, 3, 4][..], true, true)
+    );
+    assert_eq!(
+        access,
+        &DryRunEvent::SecurityAccess {
+            level: 1,
+            seed: vec![1, 2, 3, 4],
+            key: vec![0xAA]
+        }
+    );
+    assert_eq!(
+        profile_request(key),
+        (PROFILE_KEY_REQUEST, &[0x67, 2][..], true, true)
+    );
+}
+
+#[test]
+fn a_scripted_negative_seed_skips_the_key_step() {
+    let buf = document(vec![], vec![]);
+    // No key is scripted: reaching `SecurityAccess` would end the run.
+    let script = Script::new().seed(vec![0x7F, 0x27, 0x37]);
+    let report = run(&buf, &security_access_program(), &script);
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    let [seed] = &report.events[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!(
+        profile_request(seed),
+        (PROFILE_SEED_REQUEST, &[0x7F, 0x27, 0x37][..], false, true)
+    );
+}
+
+#[test]
+fn a_scripted_seed_reaches_the_security_access_step() {
+    let buf = document(vec![], vec![]);
+    let script = Script::new().seed(vec![0x67, 1, 9, 8]).key(vec![0x55]);
+    let report = run(&buf, &security_access_program(), &script);
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(
+        report.events[1],
+        DryRunEvent::SecurityAccess {
+            level: 1,
+            seed: vec![9, 8],
+            key: vec![0x55]
+        }
+    );
+    assert!(!profile_request(&report.events[0]).2);
+}
+
+#[test]
+fn a_declared_security_access_service_still_answers_the_profiles_requests() {
+    let buf = document(vec![service(7, "sec", 0x27, &[], vec![])], vec![]);
+    let report = run(
+        &buf,
+        &security_access_program(),
+        &Script::new().key(vec![0xAA]),
+    );
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    for index in [0, 2] {
+        let DryRunEvent::Request {
+            service,
+            built,
+            answer,
+            decoded,
+            ..
+        } = &report.events[index]
+        else {
+            panic!("{report:?}");
+        };
+        assert_eq!((service.as_str(), *built), ("sec", true));
+        assert_eq!(answer, &[0x67]);
+        assert!(decoded.is_some());
+    }
+}
+
+#[test]
+fn an_undeclared_request_outside_a_security_access_step_ends_the_run() {
+    let buf = document(vec![], vec![]);
+    let alone = program(
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x27 }],
+        vec![vec![1]],
+    );
+    let undeclared = DryRunEnd::Host(DryRunError::Undeclared {
+        request: vec![0x27, 1],
+    });
+    assert_eq!(run(&buf, &alone, &Script::new()).end, undeclared);
+
+    // Another host request lies between the request and the `SecurityAccess` step.
+    let buf = document(vec![service(7, "vin", 0x22, &[], vec![])], vec![]);
+    let apart = program(
+        vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x27 },
+            Op::Pop,
+            Op::PushBytes(1),
+            Op::SendReceive { service: 7 },
+            Op::SecurityAccess { level: 1 },
+            Op::Pop,
+        ],
+        vec![vec![1], vec![0x22]],
+    );
+    let report = run(&buf, &apart, &Script::new().key(vec![0xAA]));
+    assert_eq!(report.end, undeclared);
+    assert!(report.events.is_empty());
+
+    // The same on the send-key side: the request after the step is not the one next to it.
+    let after = program(
+        vec![
+            Op::PushBytes(0),
+            Op::SecurityAccess { level: 1 },
+            Op::PushBytes(1),
+            Op::SendReceive { service: 7 },
+            Op::Pop,
+            Op::ServiceRequest { service: 0x27 },
+        ],
+        vec![vec![1], vec![0x22]],
+    );
+    let report = run(&buf, &after, &Script::new().key(vec![0xAA]));
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::Undeclared {
+            request: vec![0x27, 0xAA]
+        })
+    );
+}
+
 #[test]
 fn the_report_stops_growing_at_its_budget() {
     let buf = document(vec![service(7, "big", 0x2E, &[], vec![])], vec![]);

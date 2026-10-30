@@ -4,7 +4,7 @@
 **Status:** Accepted
 **Affects:** `diag-frontend` conversion (`convert.rs` `lower_procedures`, `dry_run_verdict`;
 `StarCode::DryRunStopped`), `diag-ir` dry run (`Script::built_defaults`, `DryRunReport::pc`,
-`DEFAULT_MAX_STEPS`), `agent` (`JobLimits::default`); `crates/diag-frontend/docs/starlark-subset.md`
+`DEFAULT_MAX_STEPS`, `DryRunEvent::FlashTransfer`), `agent` (`JobLimits::default`); `crates/diag-frontend/docs/starlark-subset.md`
 5 and 6; design 12.1; ADR-328 Consequences
 
 ## Context
@@ -37,6 +37,9 @@ answer, and a loop needs a bound.
 4. **The step budget is the agent's.** A run is bounded by the step budget the agent's job
    limits use by default, one million instructions. A run that reaches it is refused: every
    loop is bounded, and the agent would stop it too.
+5. **Transfer data does not fill the report.** A flash transfer event holds the block's length
+   and a digest of its bytes, not the bytes, so the report's budget (ADR-328 item 7) does not
+   bound the size of an image the dry run serves. The step budget still does.
 
 The maintainer chose zero answers over nominal values, refusing at the step budget over passing
 as inconclusive, and the rest of this decision (2026-10-30).
@@ -44,10 +47,14 @@ as inconclusive, and the rest of this decision (2026-10-30).
 ## Consequences
 
 - A definition that sends an undeclared request, or that indexes, divides or converts a value
-  read from the vehicle without guarding it, is refused at conversion. Built answers are zeros,
-  so such code must guard its reads.
-- A path behind a value check, such as a flash plan behind a voltage precondition, is not
-  exercised at conversion, since the zero value takes the procedure's own failure.
-- The report holds every block of transfer data, so an image that fills the report's budget is
-  refused, though the agent could run it (backlog).
-- ADR-328's open pass criterion is decided here.
+  read from the vehicle without guarding it into a VM error, is refused at conversion. Built
+  answers are zeros, so such code must guard its reads.
+- A value out of range for a parameter or an unsigned field ends in a failure the lowering
+  emits, and so passes, as it would end the procedure on a vehicle. Only a stop that is no end
+  of the procedure refuses.
+- A flash plan's body runs at conversion: its preconditions are checked by the agent before the
+  run, not by the program, so the zero inputs do not stop it. A path behind a check of a value
+  read from the vehicle takes the procedure's own failure under the zero answers and is not
+  exercised.
+- ADR-328's open pass criterion is decided here, and its item 7's transfer data is held as a
+  length and a digest.

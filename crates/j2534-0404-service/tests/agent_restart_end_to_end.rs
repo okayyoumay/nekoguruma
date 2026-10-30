@@ -950,7 +950,8 @@ fn an_ecu_power_loss_mid_transfer_is_restarted_once_power_returns() {
 
 /// The VCI is unplugged while the agent waits after block 4 (design 5.6, 8.2.5; ADR-229 item 1,
 /// ADR-238): the next block's transfer fails on the lost device and the run ends there, keeping
-/// its guards and its journal; the link cannot be confirmed closed on a lost device (ADR-258).
+/// its guards and its journal; the link's first close fails on the lost device, and the second
+/// finds it gone and confirms it (ADR-393).
 /// The ECU, untouched, stays in its programming session with the transfer running. The agent's
 /// next run, on a new worker with the VCI plugged back in, takes the same restart order as after
 /// an agent kill and completes, with the restart's ECUReset the only power cycle.
@@ -967,8 +968,8 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
     );
     assert!(env.commands_applied(), "the disconnect should be applied");
     assert!(
-        run.link_unconfirmed,
-        "a link on a lost device cannot be confirmed closed"
+        !run.link_unconfirmed,
+        "the lost path's second close finds the link gone and the module's disconnect succeeds"
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the lost device and took the link offline, so the
@@ -1082,8 +1083,8 @@ fn a_vci_crash_mid_transfer_is_restarted_once_the_vci_answers_again() {
     );
     assert!(env.commands_applied(), "the crash should be applied");
     assert!(
-        run.link_unconfirmed,
-        "the crashed VCI fails the close, so the link cannot be confirmed closed"
+        !run.link_unconfirmed,
+        "the lost path's second close finds the link gone and the module's disconnect succeeds"
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the failing VCI and took the link offline, as for a lost

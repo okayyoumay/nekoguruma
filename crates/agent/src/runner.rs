@@ -1278,12 +1278,16 @@ fn run_job<C: WorkerApi>(
     // dropped first, then the link is closed.
     let open_handles: OpenHandles =
         Arc::new(Mutex::new(Some((link.module_handle, link.cll_handle))));
+    // Whether the run's path to the VCI was lost (ADR-393): set by the host when it tries to open
+    // the link again, and below when the run ended on a lost path.
+    let path_lost = Arc::new(AtomicBool::new(false));
     let open_link = OpenLink {
         handle: handle.clone(),
         client: client.clone(),
         handles: Arc::clone(&open_handles),
         deadline: timings.unary,
         guards: Arc::clone(&guards),
+        path_lost: Arc::clone(&path_lost),
         closed: false,
     };
     // The VCI is known now. Nothing has been sent to the ECU yet, so a program that needs more
@@ -1323,6 +1327,7 @@ fn run_job<C: WorkerApi>(
             Box::new(move || mark_link_unconfirmed(&guards))
         },
         old_open: true,
+        path_lost: Arc::clone(&path_lost),
     });
     if let Err(error) = refused {
         drop(host);
@@ -1363,10 +1368,30 @@ fn run_job<C: WorkerApi>(
     if std::panic::catch_unwind(AssertUnwindSafe(|| host.settle_at_end())).is_err() {
         tracing::warn!("settling a primitive past its deadline at job end panicked");
     }
+    // A run that ended because the path to the VCI was lost closes its link by the same rule as
+    // the host's reopen does (ADR-393).
+    if ended_on_lost_path(&result) {
+        path_lost.store(true, Ordering::Relaxed);
+    }
     // The event stream goes before the link is closed.
     drop(host);
     open_link.close();
     result
+}
+
+/// Whether the run ended on an error that says the path to the VCI was lost
+/// ([`HostError::resend_class`], ADR-392).
+fn ended_on_lost_path(result: &Result<VmState, JobError>) -> bool {
+    use crate::host::ResendClass;
+    match result {
+        Err(
+            JobError::Link(source)
+            | JobError::Host { source, .. }
+            | JobError::Refused { source, .. }
+            | JobError::IdentityRead { source, .. },
+        ) => source.resend_class() == ResendClass::PathLost,
+        _ => false,
+    }
 }
 
 /// A link that is open on the worker. It is closed exactly once, by [`OpenLink::close`] or, when
@@ -1381,6 +1406,9 @@ struct OpenLink<C: WorkerApi> {
     handles: OpenHandles,
     deadline: Duration,
     guards: GuardSlot,
+    /// Whether the run's path to the VCI was lost, which lets a module disconnect confirm the
+    /// link closed (ADR-393).
+    path_lost: Arc<AtomicBool>,
     closed: bool,
 }
 
@@ -1406,6 +1434,7 @@ impl<C: WorkerApi> OpenLink<C> {
                 module_handle,
                 cll_handle,
                 self.deadline,
+                self.path_lost.load(Ordering::Relaxed),
             ))
         }));
         match closed {
@@ -14831,6 +14860,11 @@ def main():
         /// The items it gives name the device clock (`timestamp_clock`), as a J2534 worker's
         /// frames do (ADR-353); otherwise they name none.
         device_clock: bool,
+        /// What the first DisconnectComLogicalLink calls answer (`None`: success), one per call,
+        /// ahead of `fail_disconnect`.
+        disconnect_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
+        /// The same for ModuleDisconnect, ahead of `fail_open`.
+        module_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
     }
 
     /// How a scripted item of a [`FakeWorker`] is bound (design 8.11 "Link settings for the
@@ -14978,6 +15012,9 @@ def main():
             _: tonic::Request<vci_service_interface::ModuleDisconnectRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
             self.note("ModuleDisconnect");
+            if let Some(answer) = self.module_script.lock().unwrap().pop_front() {
+                return answer.map_or_else(|| Ok(tonic::Response::new(Default::default())), Err);
+            }
             if self.fail_open {
                 return Err(tonic::Status::failed_precondition("device not connected"));
             }
@@ -15081,6 +15118,9 @@ def main():
             _: tonic::Request<vci_service_interface::DisconnectComLogicalLinkRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
             self.note("DisconnectComLogicalLink");
+            if let Some(answer) = self.disconnect_script.lock().unwrap().pop_front() {
+                return answer.map_or_else(|| Ok(tonic::Response::new(Default::default())), Err);
+            }
             if self.fail_disconnect {
                 return Err(tonic::Status::failed_precondition("device not connected"));
             }
@@ -15491,6 +15531,37 @@ def main():
         (client, calls)
     }
 
+    /// A [`FakeWorker`] whose first disconnects of the link and of the module answer as the
+    /// scripts say (`None`: success), one per call.
+    async fn fake_worker_closing(
+        disconnects: Vec<Option<tonic::Status>>,
+        modules: Vec<Option<tonic::Status>>,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let service = FakeWorker {
+            fail_disconnect: false,
+            fail_open: false,
+            calls: Arc::clone(&calls),
+            comparams: Mutex::new(Vec::new()),
+            set: Arc::clone(&set),
+            refuse_set: None,
+            starts: false,
+            started: Arc::default(),
+            cancelled: Arc::default(),
+            cancel: CancelAnswer::Done,
+            on_start: None,
+            start_script: Mutex::default(),
+            released: Arc::new(tokio::sync::Semaphore::new(0)),
+            events: Arc::default(),
+            device_clock: false,
+            disconnect_script: Mutex::new(disconnects.into()),
+            module_script: Mutex::new(modules.into()),
+        };
+        let (client, calls, _) = serve(service, calls, set).await;
+        (client, calls)
+    }
+
     /// The ComParams a [`FakeWorker`] was given: name, value and class.
     type SetComParams = Arc<Mutex<Vec<(String, u32, i32)>>>;
 
@@ -15526,6 +15597,8 @@ def main():
             released: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
             device_clock: false,
+            disconnect_script: Mutex::default(),
+            module_script: Mutex::default(),
         };
         serve(service, calls, set).await
     }
@@ -15607,6 +15680,8 @@ def main():
             released: Arc::clone(&released),
             events: Arc::default(),
             device_clock,
+            disconnect_script: Mutex::default(),
+            module_script: Mutex::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (
@@ -17312,6 +17387,159 @@ def main():
             let calls = calls.lock().unwrap().clone();
             assert!(!calls.contains(&"ModuleDisconnect"), "{tag}: {calls:?}");
             guards.worker_gone();
+        }
+    }
+
+    /// ADR-393: after a lost path, a link whose own disconnect the worker answered with a
+    /// failure is confirmed closed by a successful module disconnect. Any other case keeps
+    /// ADR-258's failure: the module disconnect failing too, a path that was not lost, a
+    /// failure that is no answer of the worker, and a module the client holds.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_module_disconnect_confirms_a_link_closed_only_on_a_lost_path() {
+        let handles = (
+            ModuleHandle { module_handle: 1 },
+            vci_service_interface::ComLogicalLinkHandle {
+                module_handle: 1,
+                cll_handle: 1,
+            },
+        );
+        // (tag, link disconnect fails, module disconnect fails, path lost, confirmed)
+        for (tag, fail_disconnect, fail_module, path_lost, confirmed) in [
+            ("lost-module-ok", true, false, true, true),
+            ("lost-module-fails", true, true, true, false),
+            ("not-lost", true, false, false, false),
+            ("lost-clean", false, false, true, true),
+        ] {
+            let (mut client, calls) = fake_worker_with(fail_disconnect, fail_module).await;
+            let closed = link::teardown(
+                &mut client,
+                handles.0,
+                handles.1,
+                Duration::from_secs(5),
+                path_lost,
+            )
+            .await;
+            assert_eq!(closed.is_ok(), confirmed, "{tag}: {closed:?}");
+            let calls = calls.lock().unwrap().clone();
+            assert!(calls.contains(&"ModuleDisconnect"), "{tag}: {calls:?}");
+        }
+        // The link's disconnect got no answer from the worker: the connection failed.
+        let error = HostError::Rpc {
+            rpc: "DisconnectComLogicalLink",
+            status: Box::new(tonic::Status::unavailable("transport")),
+        };
+        assert!(!link::is_workers_answer(&error));
+        assert!(!link::is_workers_answer(&HostError::WorkerUnresponsive(
+            "DisconnectComLogicalLink"
+        )));
+        // A module the client holds is closed by its owner: nothing here disconnected it.
+        let (client, _calls) = fake_worker(true).await;
+        let mut held = Held(client, None);
+        let closed = link::teardown(
+            &mut held,
+            handles.0,
+            handles.1,
+            Duration::from_secs(5),
+            true,
+        )
+        .await;
+        assert!(closed.is_err(), "{closed:?}");
+    }
+
+    /// ADR-393: a lost path's close that fails is closed once more, and only once. The second
+    /// close confirms when the link answers that no object has its handle (or its disconnect
+    /// fails with a worker's answer) and the module's disconnect succeeded; a second close that
+    /// fails too, a module disconnect that fails, and a path that was not lost stay unconfirmed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_paths_failed_close_is_closed_once_more() {
+        let handles = (
+            ModuleHandle { module_handle: 1 },
+            vci_service_interface::ComLogicalLinkHandle {
+                module_handle: 1,
+                cll_handle: 1,
+            },
+        );
+        let internal = || Some(tonic::Status::internal("library"));
+        let invalid_handle = || {
+            Some(vci_service_interface::status_with_error_detail(
+                tonic::Code::NotFound,
+                "PDU_ERR_INVALID_HANDLE",
+                vci_service_interface::ErrorDetail {
+                    pdu_error: vci_service_interface::PduError::PduErrInvalidHandle as i32,
+                    ..Default::default()
+                },
+            ))
+        };
+        let unavailable = || Some(tonic::Status::unavailable("transport"));
+        type Script = Vec<Option<tonic::Status>>;
+        // (tag, link disconnects, module disconnects, path lost, confirmed, closes made)
+        let cases: Vec<(&str, Script, Script, bool, bool, usize)> = vec![
+            (
+                "second-invalid-handle",
+                vec![internal(), invalid_handle()],
+                vec![internal(), None],
+                true,
+                true,
+                2,
+            ),
+            (
+                "second-link-answers-failure",
+                vec![unavailable(), internal()],
+                vec![internal(), None],
+                true,
+                true,
+                2,
+            ),
+            (
+                "second-link-no-answer",
+                vec![internal(), unavailable()],
+                vec![internal(), None],
+                true,
+                false,
+                2,
+            ),
+            (
+                "second-module-fails",
+                vec![internal(), invalid_handle()],
+                vec![internal(), internal()],
+                true,
+                false,
+                2,
+            ),
+            (
+                "not-lost",
+                vec![internal(), invalid_handle()],
+                vec![internal(), None],
+                false,
+                false,
+                1,
+            ),
+            (
+                "first-confirms-no-retry",
+                vec![internal(), invalid_handle()],
+                vec![None, None],
+                true,
+                true,
+                1,
+            ),
+        ];
+        for (tag, disconnects, modules, path_lost, confirmed, closes) in cases {
+            let (mut client, calls) = fake_worker_closing(disconnects, modules).await;
+            let closed = link::teardown(
+                &mut client,
+                handles.0,
+                handles.1,
+                Duration::from_secs(5),
+                path_lost,
+            )
+            .await;
+            assert_eq!(closed.is_ok(), confirmed, "{tag}: {closed:?}");
+            let calls = calls.lock().unwrap().clone();
+            let made = calls
+                .iter()
+                .filter(|call| **call == "DisconnectComLogicalLink")
+                .count();
+            assert_eq!(made, closes, "{tag}: {calls:?}");
         }
     }
 
@@ -19630,11 +19858,13 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// ADR-258: a lost link the worker cannot close (the J2534 worker's disconnect of a lost
-    /// device fails) is not confirmed closed, so it is not opened again: the run ends in the
-    /// host error, the guards stay marked, and the worker saw no second connect.
+    /// ADR-393: a lost link whose own disconnect the worker answers with a failure (the J2534
+    /// worker's does on a lost device) is confirmed closed by the module's disconnect, so the
+    /// run opens a new link and goes on; the final close follows the same rule, so the guards
+    /// stay unmarked. (A module disconnect that fails too stays unconfirmed:
+    /// `a_module_disconnect_confirms_a_link_closed_only_on_a_lost_path`.)
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_lost_link_that_cannot_be_closed_is_not_opened_again() {
+    async fn a_lost_link_whose_disconnect_fails_is_confirmed_closed_by_the_module() {
         const LOSE: &[Step] = &[Step::Transmit(1_000), Step::LostVci(2_000)];
         let (client, fake) = fake_worker_scripted(
             CancelAnswer::Done,
@@ -19655,30 +19885,18 @@ def main():
                 reopen_poll: Duration::from_millis(1),
                 ..JobLimits::default()
             },
-            vci_only_guards("loss-unconfirmed"),
+            vci_only_guards("loss-confirmed-by-module"),
         )
         .await;
-        assert!(
-            matches!(
-                &run.result,
-                Err(JobError::Host {
-                    pc: 1,
-                    source: HostError::VciLost {
-                        refused_after_loss: false
-                    }
-                })
-            ),
-            "{:?}",
-            run.result
-        );
-        assert!(run.guards.link_unconfirmed());
+        run.result.as_ref().expect("the run goes on");
+        assert!(!run.guards.link_unconfirmed());
         let calls = fake.calls.lock().unwrap().clone();
         assert_eq!(
             calls
                 .iter()
                 .filter(|call| **call == "ModuleConnect")
                 .count(),
-            1,
+            2,
             "{calls:?}"
         );
         let mut guards = run.guards;

@@ -30,7 +30,10 @@ definition correct in any session the procedure can leave the ECU in (ADR-335 it
    run ends as before. Before it opens the link again, the run closes the lost one. On this path
    alone, a successful module disconnect confirms the link closed even when the link's own
    disconnect failed because the device was gone: disconnecting the module releases every link
-   on it. Every other failed close stays unconfirmed (ADR-258).
+   on it. When that close fails, the run closes once more, and the second close confirms the
+   link closed when the worker answers that it knows no link of that handle, or again that its
+   disconnect failed, and the module disconnect succeeds. Every other failed close stays
+   unconfirmed (ADR-258).
 3. **It continues only where ADR-335 item 3 would.** At the current instruction, everything
    ahead must be safe to repeat with no flash plan and no recovery-required section ahead, the
    point must be interruptible, and a VIN the job names must read back the same. No diagnostic
@@ -50,8 +53,8 @@ definition correct in any session the procedure can leave the ECU in (ADR-335 it
    design 8.9.1 again are not done, since neither exists in the agent yet; the reopen is where
    they join.
 
-The maintainer chose this split, these conditions and bounds, no session re-entry, and the rest
-of this decision (2026-10-30).
+The maintainer chose this split, these conditions and bounds, no session re-entry, the close
+confirmed by the module disconnect and retried once, and the rest of this decision (2026-10-30).
 
 ## Consequences
 

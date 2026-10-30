@@ -311,7 +311,7 @@ fn lost_vci_between_primitives(error: HostError) -> HostError {
 
 /// Whether the worker refused a call because it knows no object with the handle given
 /// (`PDU_ERR_INVALID_HANDLE`, ISO 22900-2:2022 D.3): for a cancel, a primitive that has ended.
-fn names_invalid_handle(status: &tonic::Status) -> bool {
+pub(crate) fn names_invalid_handle(status: &tonic::Status) -> bool {
     vci_service_interface::error_detail_from_status(status).is_some_and(|detail| {
         detail.pdu_error == vci_service_interface::PduError::PduErrInvalidHandle as i32
     })
@@ -601,6 +601,10 @@ pub(crate) struct Relink<C: WorkerApi> {
     pub(crate) mark_unconfirmed: Box<dyn Fn() + Send>,
     /// Whether the link the host holds is still open on the worker.
     pub(crate) old_open: bool,
+    /// Set once the host tries to open the link again, which it does only after the path to the
+    /// VCI was lost; shared with the runner, whose final close then follows the same rule as
+    /// the host's (ADR-393).
+    pub(crate) path_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl<C: WorkerApi> WorkerHost<C> {
@@ -665,17 +669,24 @@ impl<C: WorkerApi> WorkerHost<C> {
 
     /// One attempt of [`ProcedurePosition::reopen_link`].
     fn try_reopen(&mut self, relink: &mut Relink<C>) -> ReopenAttempt {
+        // The runner asks to open the link again only after the path was lost.
+        relink
+            .path_lost
+            .store(true, std::sync::atomic::Ordering::Relaxed);
         if relink.old_open {
             // A primitive the loss left is settled first, then the lost link is closed: the
             // worker takes the module again only after it was disconnected. The event stream
             // goes before the link is closed.
             self.settle_at_end();
             self.link.events = None;
+            // The path is lost: a module disconnect that succeeds confirms the link closed even
+            // if the link's own disconnect failed (ADR-393).
             let closed = self.handle.block_on(crate::link::teardown(
                 &mut self.client,
                 self.link.module_handle,
                 self.link.cll_handle,
                 self.timings.unary,
+                true,
             ));
             match closed {
                 Ok(()) => {

@@ -738,9 +738,16 @@ The host trait `ProcedurePosition` has the method `reopen_link`, whose default i
 `WorkerHost` implements it from a `Relink` the runner gives it: the job's `WorkerSource`, the link
 configuration and the handles of the open link, which the runner's link guard shares. An attempt
 settles a primitive left by the loss, drops the event stream and closes the lost link
-(`link::teardown`): a close that fails marks the guards (ADR-258, they stay marked) and gives
-`Cannot`, so the run ends in `JobError::Host`. The J2534 worker's disconnect of a link on a lost
-device fails, so this is that worker's ending until the worker is replaced. The host then takes
+(`link::teardown`, told the path was lost): a close that fails marks the guards (ADR-258, they
+stay marked) and gives `Cannot`, so the run ends in `JobError::Host`. On this path alone a
+successful module disconnect confirms the close even when the link's own disconnect failed, if
+the worker answered that failure (any failure status but a transport one, never read from which
+worker answered) and the client does not hold the module, since disconnecting the module
+releases every link on it (ADR-393). A lost path's close that still fails is made once more,
+and only once: the second close confirms when the link answers that no object has its handle (or
+its disconnect fails with a worker's answer) and the module's disconnect succeeds, since a J2534
+library releases the device on the first close yet may report the loss from it (ADR-393). The
+runner's final close follows the same rule when the host tried to reopen or the run ended in an error that lost the path. The host then takes
 a client from the source (every `WorkerApi` client is a source of itself, giving clones, so the
 entry points `run_program`, `run_program_journaled` and `resume_program_journaled` take either),
 opens the link (`link::open_tracked`) and `WorkerHost::reopen` puts the new link in place of the
@@ -1175,8 +1182,9 @@ and the next run resumes on those guards with a new worker and takes the same re
 more interrupt the run at the same point without killing anything: the ECU loses power
 (`sim_ecu::Fault::PowerLoss`) or the VCI is unplugged (`disconnect_vci`, ADR-238). The next
 block's transfer gets no answer, or finds the link offline because the worker met the lost device,
-and the run ends there, keeping its guards and its journal; after the disconnect the guards' link is
-unconfirmed as after a worker crash. The next run, once power is back or on a new worker that finds
+and the run ends there, keeping its guards and its journal; after the disconnect the run's close of
+its lost link is confirmed by the module disconnect, retried once (ADR-393), so the guards are given
+back unmarked. The next run, once power is back or on a new worker that finds
 the VCI plugged in again, takes the same restart order and completes. When the VCI is still
 unplugged at the next run, its worker cannot open the device (`ERR_DEVICE_NOT_CONNECTED`), so the
 run ends in `JobError::Link` before its link opens: nothing is sent, no resume is counted, the

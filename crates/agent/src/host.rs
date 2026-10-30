@@ -22,7 +22,7 @@ use crate::comm_log::exchange::{
     LinkErrorKind, Origin, Pending, PendingVisibility, RefusalCause, Rejected, RejectedReason,
     SectionAttrs, SourcePos, Target, TransmitEvidence, UnknownCause, VciTime, VciTimes,
 };
-use crate::comm_log::{AgentNow, UnattachedData, UnattachedItem};
+use crate::comm_log::{AgentNow, EndError, EndItem, EndRead, UnattachedData, UnattachedItem};
 use crate::link::{Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
 
@@ -482,6 +482,8 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// cancel before a request already failed (the worker may not answer). A failed cancel is
     /// logged and does not change the job's result. The primitive's end, or the agent's cancel,
     /// is written as its exchange's `primitive_ended` entry ([`WorkerHost::log_primitive_end`]).
+    /// Every result and error item of the link read meanwhile, of the primitive, of none or of an
+    /// earlier one, goes to the log with it, in read order (ADR-386).
     pub(crate) fn settle_at_end(&mut self) {
         let Some(stray) = self.stray.take() else {
             return;
@@ -489,6 +491,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let handle = self.handle.clone();
         let until = stray.deadline.max(tokio::time::Instant::now()) + self.job_end_wait;
         let cop = stray.cop;
+        let log = self.comm_log.as_ref().filter(|log| log.is_open());
         let events = &mut self.link.events;
         // Its items are read as its exchange's were, so its end is the one the exchange would
         // have had (design 8.11 `primitive_ended`).
@@ -507,23 +510,31 @@ impl<C: WorkerApi> WorkerHost<C> {
                                     notification.event_data,
                                     Some(event_notification::EventData::Lost(_))
                                 );
-                                // An indication of no primitive may be the exchange's
-                                // (`Progress::on_event` keeps it as unbound).
+                                // Every result and error item of the link is read, whatever
+                                // primitive it names or none: an indication of no primitive may
+                                // be the exchange's, and a link error of none or of an earlier
+                                // one reaches the log (ADR-386). The status of another
+                                // primitive is not (`Progress::on_event` keeps the rest as
+                                // unbound).
                                 let ours = matches!(
                                     &notification.event_data,
                                     Some(event_notification::EventData::Item(item))
                                         if item.cop_handle == Some(cop)
                                             || ends_primitive(item, cop)
-                                            || (item.cop_handle.is_none()
-                                                && matches!(
-                                                    &item.data,
-                                                    Some(event_item::Data::ResultData(result))
-                                                        if is_indication(result)
-                                                ))
+                                            || matches!(
+                                                &item.data,
+                                                Some(
+                                                    event_item::Data::ResultData(_)
+                                                        | event_item::Data::ErrorData(_)
+                                                )
+                                            )
                                 );
                                 if (lost || ours)
-                                    && let Some(result) =
-                                        progress.on_notification(notification.event_data, cop)
+                                    && let Some(result) = progress.on_read(
+                                        notification.event_data,
+                                        cop,
+                                        log.map(|log| log.now()),
+                                    )
                                 {
                                     return Some(Some(result));
                                 }
@@ -539,24 +550,24 @@ impl<C: WorkerApi> WorkerHost<C> {
         match &ended {
             // Lost events leave the primitive's end unknown, and it may still run.
             Some(Some(result @ Err(HostError::EventsLost))) => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                self.log_primitive_end(&stray, &mut progress, StrayEnd::Ended(result));
             }
             Some(Some(result)) => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                self.log_primitive_end(&stray, &mut progress, StrayEnd::Ended(result));
                 return;
             }
             // The stream failed or ended before it did: its end is unknown, with every item read
             // before that carried as for any other end.
             Some(None) => self.log_primitive_end(
                 &stray,
-                &progress,
+                &mut progress,
                 StrayEnd::Ended(&Err(HostError::EventStreamEnded)),
             ),
             // The wait passed after the primitive's end was read, before its finished status:
             // that end settles it, and the primitive is still cancelled.
             None => {
                 if let Some(result) = progress.end_read() {
-                    self.log_primitive_end(&stray, &progress, StrayEnd::Ended(&result));
+                    self.log_primitive_end(&stray, &mut progress, StrayEnd::Ended(&result));
                 }
             }
         }
@@ -571,7 +582,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             // Only a cancel the worker carried out is the agent's: one whose handle had ended,
             // or that failed, leaves the end unknown and the exchange as it was.
             Ok(_) if ended.is_none() && progress.end_read().is_none() => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled)
+                self.log_primitive_end(&stray, &mut progress, StrayEnd::Cancelled)
             }
             Ok(_) => {}
             Err(HostError::VciLost) => {}
@@ -580,6 +591,51 @@ impl<C: WorkerApi> WorkerHost<C> {
                 error = %crate::oplog::LogSafe::log_text(&error),
                 "could not cancel a primitive past its deadline at job end"
             ),
+        }
+        // What was read and no entry carries, because the primitive has none to write: its
+        // handle was invalid, or the cancel failed with no end read.
+        let rest = progress.take_reads(0, None);
+        self.log_unattached(&rest, stray.seq);
+    }
+
+    /// Hands the link errors among `reads` to the log, for a job end that has no
+    /// `primitive_ended` entry to write (design 8.11 `late_item`, ADR-386): those of no primitive
+    /// or of an earlier one, and the primitive's own, which are its exchange's `seq` (the
+    /// exchange the entry of the cancel would have followed), or no exchange's without one.
+    /// Anything else read stays unwritten, as the entry of a primitive that has none takes it.
+    fn log_unattached(&self, reads: &[EndRead], seq: Option<u64>) {
+        let Some(log) = &self.comm_log else {
+            return;
+        };
+        let items: Vec<UnattachedItem> = reads
+            .iter()
+            .filter_map(|read| match &read.item {
+                EndItem::Unattached(item) => Some(item.clone()),
+                // A lost VCI, which ends the primitive, is no link error.
+                EndItem::Error(error) => Some(UnattachedItem {
+                    link: LOG_LINK,
+                    earlier_primitive: true,
+                    owner: seq,
+                    vci_us: u32::try_from(error.time.us).unwrap_or(u32::MAX),
+                    clock: error.time.clock,
+                    read: Some(read.read),
+                    data: UnattachedData::Error {
+                        event: error.event.clone(),
+                        extra_error_info: error.extra_error_info,
+                        extra_error_info_name: error.extra_error_info_name.clone(),
+                        link_error: error.kind,
+                    },
+                }),
+                _ => None,
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        let logged =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.late_link_errors(items)));
+        if logged.is_err() {
+            tracing::warn!("writing late link errors panicked");
         }
     }
 
@@ -596,7 +652,7 @@ impl<C: WorkerApi> WorkerHost<C> {
     fn settle_cancelled(&self, settling: Settling, stream_failed: bool) -> Vec<Unbound> {
         let Settling {
             stray,
-            progress,
+            mut progress,
             carried_out,
             end,
             items,
@@ -612,11 +668,16 @@ impl<C: WorkerApi> WorkerHost<C> {
         };
         let left = match &end {
             Some(SettlingEnd::Ended(result)) => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Ended(result));
+                self.log_primitive_end(&stray, &mut progress, StrayEnd::Ended(result));
                 Vec::new()
             }
             Some(SettlingEnd::Cancelled) => {
-                self.log_primitive_end(&stray, &progress, StrayEnd::Cancelled);
+                // The errors it read go on in `items`, to the exchange in flight as its own
+                // (ADR-372): the cancel entry does not write them too.
+                progress
+                    .reads
+                    .retain(|read| !matches!(read.item, EndItem::Error(_)));
+                self.log_primitive_end(&stray, &mut progress, StrayEnd::Cancelled);
                 items
             }
             None => items,
@@ -628,10 +689,20 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 
     /// Writes the `primitive_ended` entry of `stray`'s exchange, when its entry was written: its
-    /// end as `progress` read it, or the agent's cancel when `ended` is `None` (design 8.11
-    /// "Settlement", ADR-366).
-    fn log_primitive_end(&self, stray: &Stray, progress: &Progress, ended: StrayEnd<'_>) {
-        let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) else {
+    /// end as `progress` read it, or the agent's cancel when `ended` is `Cancelled` (design 8.11
+    /// "Settlement", ADR-366), with every item read for it after the exchange's entry, in read
+    /// order (ADR-386): the log places each once and writes the link errors of no primitive and
+    /// of earlier primitives beside the entry. Both the job end and the wait of the next request
+    /// (ADR-367) come through here. A primitive whose exchange has no entry has no entry to
+    /// write: the link errors read are handed to the log alone.
+    fn log_primitive_end(&self, stray: &Stray, progress: &mut Progress, ended: StrayEnd<'_>) {
+        let Some(log) = &self.comm_log else {
+            return;
+        };
+        let epoch = log.now().epoch;
+        let Some(seq) = stray.seq else {
+            let reads = progress.take_reads(epoch, None);
+            self.log_unattached(&reads, None);
             return;
         };
         let primitive = match ended {
@@ -643,76 +714,40 @@ impl<C: WorkerApi> WorkerHost<C> {
                     progress.sid,
                     true,
                 );
-                // The event named, its extra error information and its time, as for an
-                // exchange, from every error the primitive reported: the one that ended it may
-                // have been read before the deadline.
-                let (_, error_at) = named_events(
+                // The event named and its extra error information, as for an exchange, from
+                // every error the primitive reported: the one that ended it may have been read
+                // before the deadline.
+                named_events(
                     result,
                     &progress.errors,
                     progress.vci_lost.as_ref(),
                     progress.rx_timeout.as_ref(),
                     &mut detail,
                 );
-                // Every link error read at job end beside the one that ended it, so the
-                // classification takes the most severe (design 8.11 "Link error"); the
-                // exchange's evidence has those read before.
-                let read_late = progress
-                    .errors
-                    .get(stray.errors.len()..)
-                    .unwrap_or_default();
-                let link_errors = also_seen(result, read_late)
-                    .iter()
-                    .map(|seen| link_error_kind(seen.event))
-                    .collect();
-                let response_times = if result.is_ok() {
-                    progress.response_times
-                } else {
-                    VciTimes::default()
-                };
-                let vci = VciTimes {
-                    error: error_at,
-                    rx_timeout: progress.rx_timeout.as_ref().and_then(|timeout| timeout.at),
-                    ..response_times
-                };
-                let now = log.now();
-                let pending = progress
-                    .pendings
-                    .iter()
-                    .map(|pending| Pending {
-                        vci_us: Some(pending.vci_us),
-                        clock: pending.clock,
-                        epoch: None,
-                        agent_us: now.monotonic_us,
-                        since_previous_ms: None,
-                    })
-                    .collect();
                 crate::comm_log::PrimitiveEnded {
                     end: Some(end),
                     detail,
-                    pending,
-                    vci,
                     vci_ended: progress.rx_timeout.is_some(),
-                    link_errors,
-                    indications: unattached_items(&progress.unbound),
-                    tx_indication: progress.bound_tx,
+                    reads: progress.take_reads(epoch, Some(result)),
                 }
             }
             StrayEnd::Cancelled => crate::comm_log::PrimitiveEnded {
                 end: None,
                 detail: Detail::default(),
-                pending: Vec::new(),
-                vci: VciTimes::default(),
                 vci_ended: false,
-                link_errors: Vec::new(),
-                indications: unattached_items(&progress.unbound),
-                tx_indication: None,
+                reads: progress.take_reads(epoch, None),
             },
         };
+        let reads = primitive.reads.clone();
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             log.primitive_ended(seq, primitive)
         }));
-        if logged.is_err() {
-            tracing::warn!("writing a primitive_ended entry panicked");
+        match logged {
+            Err(_) => tracing::warn!("writing a primitive_ended entry panicked"),
+            // The log keeps no such exchange: the link errors read for it are not lost
+            // (ADR-386).
+            Ok(None) if log.is_open() => self.log_unattached(&reads, Some(seq)),
+            Ok(_) => {}
         }
     }
 
@@ -1319,42 +1354,56 @@ fn pendings_of(pendings: &[PendingRead]) -> Vec<Pending> {
         .collect()
 }
 
+/// An error event bound to a primitive in the form of a `primitive_ended` read (ADR-386):
+/// `kind` is the link error it adds beside the end, if it adds one.
+fn end_error(data: &ErrorData, time: VciTime, kind: Option<LinkErrorKind>) -> EndError {
+    EndError {
+        kind,
+        time,
+        named: false,
+        event: error_event_name(data.error_event),
+        extra_error_info: data.extra_error_info,
+        extra_error_info_name: data.extra_error_info_name.clone(),
+    }
+}
+
 /// The communication log's form of the link's `unbound` items: the result and error items, with
 /// a result's CAN identifier taken from its header (four bytes, most significant first), where
 /// the worker split one off.
 fn unattached_items(unbound: &[Unbound]) -> Vec<UnattachedItem> {
-    unbound
-        .iter()
-        .filter_map(|Unbound { item, read, owner }| {
-            let data = match &item.data {
-                Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
-                    rx_flag: result.rx_flag.clone(),
-                    identifier: header_identifier(result),
-                    bytes: result.data_bytes.clone(),
-                },
-                Some(event_item::Data::ErrorData(error)) => UnattachedData::Error {
-                    event: error_event_name(error.error_event),
-                    extra_error_info: error.extra_error_info,
-                    extra_error_info_name: error.extra_error_info_name.clone(),
-                    // A receive timeout is an outcome, and a lost VCI ends the link: neither is
-                    // a link error (design 8.11 "Link error").
-                    link_error: (error.error_event != PduErrorEvent::PduErrEvtRxTimeout as i32
-                        && error.error_event != PduErrorEvent::PduErrEvtLostCommToVci as i32)
-                        .then(|| link_error_kind(error.error_event)),
-                },
-                _ => return None,
-            };
-            Some(UnattachedItem {
-                link: LOG_LINK,
-                earlier_primitive: item.cop_handle.is_some(),
-                owner: *owner,
-                vci_us: item.timestamp,
-                clock: clock_of(item),
-                read: *read,
-                data,
-            })
-        })
-        .collect()
+    unbound.iter().filter_map(unattached_item).collect()
+}
+
+/// [`unattached_items`] for one item.
+fn unattached_item(unbound: &Unbound) -> Option<UnattachedItem> {
+    let Unbound { item, read, owner } = unbound;
+    let data = match &item.data {
+        Some(event_item::Data::ResultData(result)) => UnattachedData::Result {
+            rx_flag: result.rx_flag.clone(),
+            identifier: header_identifier(result),
+            bytes: result.data_bytes.clone(),
+        },
+        Some(event_item::Data::ErrorData(error)) => UnattachedData::Error {
+            event: error_event_name(error.error_event),
+            extra_error_info: error.extra_error_info,
+            extra_error_info_name: error.extra_error_info_name.clone(),
+            // A receive timeout is an outcome, and a lost VCI ends the link: neither is
+            // a link error (design 8.11 "Link error").
+            link_error: (error.error_event != PduErrorEvent::PduErrEvtRxTimeout as i32
+                && error.error_event != PduErrorEvent::PduErrEvtLostCommToVci as i32)
+                .then(|| link_error_kind(error.error_event)),
+        },
+        _ => return None,
+    };
+    Some(UnattachedItem {
+        link: LOG_LINK,
+        earlier_primitive: item.cop_handle.is_some(),
+        owner: *owner,
+        vci_us: item.timestamp,
+        clock: clock_of(item),
+        read: *read,
+        data,
+    })
 }
 
 /// A result's CAN identifier from its header (four bytes, most significant first), where the
@@ -1435,6 +1484,24 @@ impl Stray {
         progress.response_times = self.response_times;
         progress.error = self.error;
         progress.errors.clone_from(&self.errors);
+        // Its end is read for its exchange's `primitive_ended` entry (ADR-386). A final response
+        // read before the deadline is not in the exchange's entry: it is the first read.
+        progress.track_reads = true;
+        progress.early_response = self
+            .response_times
+            .rx_end
+            .filter(|_| self.response.is_some())
+            .zip(self.response_times.response_read_us)
+            .map(|(end, read_us)| {
+                (
+                    EndItem::Response {
+                        end,
+                        tx_done: self.response_times.tx_done,
+                        rx_start: self.response_times.rx_start,
+                    },
+                    read_us,
+                )
+            });
         progress
     }
 }
@@ -1504,7 +1571,7 @@ impl Settling {
             })) if *status == PduComPrimitiveStatus::PduCopstCancelled as i32
         );
         let read_before = self.progress.end_read();
-        if let Some(result) = self.progress.on_notification(data, self.stray.cop) {
+        if let Some(result) = self.progress.on_read(data, self.stray.cop, read) {
             self.end = Some(match (cancelled, read_before) {
                 (true, Some(result)) => SettlingEnd::Ended(result),
                 (true, None) if self.carried_out => SettlingEnd::Cancelled,
@@ -2174,6 +2241,18 @@ struct Progress {
     response_times: VciTimes,
     /// The primitive's end (finished or cancelled) was read.
     ended: bool,
+    /// Whether the items read are kept for the communication log's `primitive_ended` entry
+    /// (a stray primitive's wait, ADR-386).
+    track_reads: bool,
+    /// The items the last notification added, which [`Progress::on_read`] stamps and moves to
+    /// `reads`.
+    new_items: Vec<EndItem>,
+    /// Every item read for the primitive's end after its exchange's entry, in read order, each
+    /// with when the host read it.
+    reads: Vec<EndRead>,
+    /// The final response read before the agent's deadline, which its exchange's entry does not
+    /// carry: the first read of the end, with the agent's monotonic time it was read at.
+    early_response: Option<(EndItem, u64)>,
 }
 
 impl Progress {
@@ -2189,6 +2268,64 @@ impl Progress {
             (None, None) if self.rx_timeout.is_some() => Some(Err(HostError::NoResponse)),
             _ => None,
         }
+    }
+
+    /// [`Progress::on_notification`] for a wait that keeps what it reads for the log's
+    /// `primitive_ended` entry (ADR-386): each item the notification adds is read at `read`, the
+    /// agent's clocks when the host read it. With no log (`read` `None`) nothing is kept.
+    fn on_read(
+        &mut self,
+        data: Option<event_notification::EventData>,
+        cop: ComPrimitiveHandle,
+        read: Option<AgentNow>,
+    ) -> Option<Result<Vec<u8>, HostError>> {
+        let done = self.on_notification(data, cop);
+        let items = std::mem::take(&mut self.new_items);
+        if let Some(read) = read {
+            self.reads.extend(items.into_iter().map(|mut item| {
+                if let EndItem::Unattached(unattached) = &mut item {
+                    unattached.read = Some(read);
+                }
+                EndRead { read, item }
+            }));
+        }
+        done
+    }
+
+    /// Takes every item read for the end, in read order, as the end `result` has them: the
+    /// final response read before the deadline first, with `epoch` the agent's. The last error
+    /// read is the one the entry names; the last of a failed primitive's is that end itself,
+    /// not a link error beside it. A cancelled primitive (`result` `None`) has no end to
+    /// carry them, so its errors stay link errors.
+    fn take_reads(
+        &mut self,
+        epoch: u32,
+        result: Option<&Result<Vec<u8>, HostError>>,
+    ) -> Vec<EndRead> {
+        let mut reads = Vec::new();
+        if let Some((item, read_us)) = self.early_response.take() {
+            reads.push(EndRead {
+                read: AgentNow {
+                    epoch,
+                    monotonic_us: read_us,
+                    wall_unix_ms: 0,
+                },
+                item,
+            });
+        }
+        reads.append(&mut self.reads);
+        if let Some(result) = result
+            && let Some(EndItem::Error(error)) = reads
+                .iter_mut()
+                .rev()
+                .find_map(|read| matches!(read.item, EndItem::Error(_)).then_some(&mut read.item))
+        {
+            error.named = true;
+            if matches!(result, Err(HostError::PrimitiveFailed(_))) {
+                error.kind = None;
+            }
+        }
+        reads
     }
 
     fn for_request(request: &[u8]) -> Result<Self, HostError> {
@@ -2212,6 +2349,10 @@ impl Progress {
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
+            track_reads: false,
+            new_items: Vec::new(),
+            reads: Vec::new(),
+            early_response: None,
         })
     }
 
@@ -2236,6 +2377,10 @@ impl Progress {
             events_lost: None,
             response_times: VciTimes::default(),
             ended: false,
+            track_reads: false,
+            new_items: Vec::new(),
+            reads: Vec::new(),
+            early_response: None,
         }
     }
 
@@ -2279,6 +2424,11 @@ impl Progress {
             && data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
         {
             self.vci_lost = Some(ErrorSeen::of(data, vci_time(&item)));
+            if self.track_reads {
+                // The event that ends the primitive: no link error beside its end.
+                self.new_items
+                    .push(EndItem::Error(end_error(data, vci_time(&item), None)));
+            }
             return Some(Err(HostError::VciLost));
         }
         // Events of earlier primitives, and of none, are not this request's; their results and
@@ -2288,11 +2438,17 @@ impl Progress {
                 item.data,
                 Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_))
             ) {
-                self.unbound.push(Unbound {
+                let unbound = Unbound {
                     item,
                     read: None,
                     owner: None,
-                });
+                };
+                if self.track_reads
+                    && let Some(unattached) = unattached_item(&unbound)
+                {
+                    self.new_items.push(EndItem::Unattached(unattached));
+                }
+                self.unbound.push(unbound);
             }
             return None;
         }
@@ -2330,6 +2486,9 @@ impl Progress {
             && is_tx_indication(result)
         {
             self.bound_tx = Some(vci_time(&item));
+            if self.track_reads {
+                self.new_items.push(EndItem::TxIndication(vci_time(&item)));
+            }
         }
         // A response pending the worker passed on is kept for the log (design 8.11 `pending`),
         // with the item's time and clock as the worker gave them (ADR-353).
@@ -2342,6 +2501,16 @@ impl Progress {
                 clock: clock_of(&item),
                 read: None,
             });
+            if self.track_reads {
+                // Its agent time is when the host read it, which the log takes.
+                self.new_items.push(EndItem::Pending(Pending {
+                    vci_us: Some(u64::from(item.timestamp)),
+                    clock: clock_of(&item),
+                    epoch: None,
+                    agent_us: 0,
+                    since_previous_ms: None,
+                }));
+            }
         }
         let at = vci_time(&item);
         match item.data {
@@ -2363,6 +2532,15 @@ impl Progress {
                     response_read_us: None,
                     rx_timeout: None,
                 };
+                if self.track_reads
+                    && let Some(end) = self.response_times.rx_end
+                {
+                    self.new_items.push(EndItem::Response {
+                        end,
+                        tx_done: self.response_times.tx_done,
+                        rx_start: self.response_times.rx_start,
+                    });
+                }
                 self.response = Some(result.data_bytes);
                 self.errors_before_response = Some(self.errors.len());
             }
@@ -2372,10 +2550,20 @@ impl Progress {
                 if data.error_event == PduErrorEvent::PduErrEvtRxTimeout as i32 =>
             {
                 self.rx_timeout = Some(ErrorSeen::of(&data, at));
+                if self.track_reads {
+                    self.new_items.push(EndItem::RxTimeout(at));
+                }
             }
             Some(event_item::Data::ErrorData(data)) => {
                 self.error = Some(data.error_event);
                 self.errors.push(ErrorSeen::of(&data, at));
+                if self.track_reads {
+                    self.new_items.push(EndItem::Error(end_error(
+                        &data,
+                        at,
+                        Some(link_error_kind(data.error_event)),
+                    )));
+                }
             }
             Some(event_item::Data::CopStatus(status))
                 if status == PduComPrimitiveStatus::PduCopstFinished as i32

@@ -448,9 +448,18 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   plus a 4095-byte response at `CP_STmin`, capped at 10 s), then cancels it; one whose cancel
   before a request already failed, or whose event stream fails, is cancelled at once; a failed cancel is logged and leaves
   the job's result as it was. The host reads what the primitive gives meanwhile as its exchange
-  would have (a fresh `Progress` for its request's answer), and the log writes the end, or the
-  agent's cancel, as a `primitive_ended` settling entry of the exchange
-  (`WorkerHost::log_primitive_end`, `CommLog::primitive_ended`, ADR-366): it gives the end as an
+  would have (a fresh `Progress` for its request's answer), and hands the log every item it read
+  for the end, in read order with the agent's clocks at each read: the primitive's own and the
+  link's result and error items of no primitive or of an earlier one, at job end and on the
+  next request's wait alike. The log places each once, in that order, keeps the exchange's own
+  VCI times and overlays the end's, and writes the end, or the agent's cancel, as a
+  `primitive_ended` settling entry of the exchange
+  (`WorkerHost::log_primitive_end`, `CommLog::primitive_ended`, ADR-366, ADR-386): a link error
+  counts as before its answer only when it was read before it. Each link error read meanwhile
+  then goes through `late_item`: one of no primitive at or after the exchange's earliest placed
+  start, or not set against its starts, is that exchange's own; the rest are placed by their
+  time. A settling entry that changes an exchange a `vci_loss` record lists rewrites the record.
+  The `primitive_ended` entry gives the end as an
   exchange entry does, classified by the exchange rows as if the agent had waited, except that a
   final response or a receive timeout at the limit is `system`; a cancel by the agent, written
   only when the cancel succeeds, settles nothing, and a failed event stream is `unknown`.

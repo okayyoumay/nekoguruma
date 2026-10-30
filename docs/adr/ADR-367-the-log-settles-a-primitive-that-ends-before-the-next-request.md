@@ -1,7 +1,7 @@
 # ADR-367: The Log Settles a Primitive That Ends Before the Next Request
 
 **Date:** 2026-10-27
-**Status:** Accepted
+**Status:** Accepted (the end's items placed in one pass in read order, ADR-386)
 **Affects:** `agent` host (`WorkerHost::send_recv_async`, `WorkerHost::settle_cancelled`,
 `Settling`, `Stray::progress`) and communication log (`CommLog::primitive_ended`); design 8.11
 ("Settlement", `primitive_ended`); ADR-346, ADR-358, ADR-366

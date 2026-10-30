@@ -2309,6 +2309,16 @@ impl LinkState {
         self.window.iter().any(|logged| logged.seq == seq) || self.kept(seq).is_some()
     }
 
+    /// The classification the exchange logged as `seq` stands at now, in the window or kept
+    /// beyond it.
+    pub(crate) fn standing(&self, seq: u64) -> Option<Classification> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .map(|logged| logged.classification)
+            .or_else(|| self.kept(seq).map(|kept| kept.classification))
+    }
+
     /// The window's newest exchange.
     pub(crate) fn window_last(&self) -> Option<u64> {
         self.window.back().map(|logged| logged.seq)
@@ -2322,18 +2332,25 @@ impl LinkState {
     /// Gives it with its classification and reason, and whether the error changed them. The
     /// error was on link `link`, at a time placed within the exchange (`placed`); one that may
     /// only have come during it is H3 evidence wherever it was.
+    ///
+    /// `before_answer`: the host read the error before the exchange's final response (ADR-386;
+    /// an error read after the exchange's entry is otherwise read after its answer), so the
+    /// answer still counts as one since the error, as an error the exchange saw before its
+    /// response does ([`LinkState::record`]), when every link error the evidence holds is.
     pub(crate) fn error_in(
         &mut self,
         seq: u64,
         kind: LinkErrorKind,
         link: u32,
         placed: bool,
+        before_answer: bool,
     ) -> Option<(Reclassified, bool)> {
         let add = |evidence: &mut Evidence| {
             if placed && evidence.link == link {
+                // Read after the exchange's answer, it ends that answer (`record`).
+                evidence.link_errors_before_answer = before_answer
+                    && (evidence.link_errors.is_empty() || evidence.link_errors_before_answer);
                 evidence.link_errors.push(kind);
-                // Read after the exchange's answer: it ends that answer (`record`).
-                evidence.link_errors_before_answer = false;
             } else {
                 evidence.channel_link_errors.push(kind);
             }
@@ -2805,6 +2822,16 @@ impl LinkState {
     #[cfg(test)]
     fn last_reset(&self) -> Option<u64> {
         self.last_reset
+    }
+
+    /// The evidence the window or the kept exchanges hold for the exchange logged as `seq`.
+    #[cfg(test)]
+    pub(crate) fn evidence_of(&self, seq: u64) -> Option<&Evidence> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .map(|logged| &logged.evidence)
+            .or_else(|| self.kept(seq).map(|kept| &kept.evidence))
     }
 }
 
@@ -4860,12 +4887,12 @@ mod tests {
             ErrorPoint::After(seq) => Some(seq),
             ErrorPoint::Within(seq) | ErrorPoint::MaybeWithin(seq) => {
                 let placed = matches!(point, ErrorPoint::Within(_));
-                state.error_in(seq, LinkErrorKind::Receive, 1, placed);
+                state.error_in(seq, LinkErrorKind::Receive, 1, placed, false);
                 Some(seq)
             }
             ErrorPoint::BeforeWindow { within } => {
                 if let Some(within) = within {
-                    state.error_in(within, LinkErrorKind::Receive, 1, true);
+                    state.error_in(within, LinkErrorKind::Receive, 1, true, false);
                 }
                 None
             }

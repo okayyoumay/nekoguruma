@@ -935,7 +935,8 @@ pub(crate) fn is_workers_answer(error: &HostError) -> bool {
 /// module disconnect that fails, a module the client holds (its owner closes it, so nothing was
 /// disconnected here) and a path that was not lost keep the failure.
 ///
-/// A lost path whose close still fails is closed once more, and only once (ADR-393): a J2534
+/// A lost path whose close still fails is closed once more, and only once, when the worker
+/// answered every step of the first (ADR-393): a J2534
 /// library releases the device on the first close yet may report the loss from it, so the
 /// second close finds the link gone. The second close confirms when the link answers that no
 /// object has its handle, or its disconnect fails with a worker's answer, and the module's
@@ -953,6 +954,12 @@ pub(crate) async fn teardown<C: WorkerApi>(
     }
     if lost_path_confirmed(client, &first) {
         return Ok(());
+    }
+    // A second close is for a worker that answered every step of the first: one that did not
+    // answer (a deadline that passed, a connection that failed) would cost another full pass.
+    let answered = |step: &Result<(), HostError>| step.as_ref().err().is_none_or(is_workers_answer);
+    if !(answered(&first.0) && answered(&first.1)) || client.held_module().is_some() {
+        return first.0.and(first.1);
     }
     let second = close_steps(client, module_handle, cll_handle, deadline).await;
     if lost_path_confirmed(client, &second) {

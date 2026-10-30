@@ -27,13 +27,15 @@ definition correct in any session the procedure can leave the ECU in (ADR-335 it
    path was lost opens its link again through the worker it has, every `reopen_poll` (1 s),
    until `vci_return_wait` (60 s), taking a cancel while it waits as during a wait, at most
    `max_link_reopens` (2) times per run. A worker that crashed is not restarted yet, so such a
-   run ends as before. Before it opens the link again, the run closes the lost one. On this path
-   alone, a successful module disconnect confirms the link closed even when the link's own
+   run ends as before. Before it opens the link again, the run closes the lost one, and a run
+   that ends after its path was lost, wherever it ends, closes its link the same way at the end.
+   On a lost path alone, a successful module disconnect confirms the link closed even when the link's own
    disconnect failed because the device was gone: disconnecting the module releases every link
    on it. When that close fails, the run closes once more, and the second close confirms the
    link closed when the worker answers that it knows no link of that handle, or again that its
-   disconnect failed, and the module disconnect succeeds. Every other failed close stays
-   unconfirmed (ADR-258).
+   disconnect failed, and the module disconnect succeeds; a first close that got no answer is
+   not repeated. A link opened again is no longer on a lost path, and its close is judged as any
+   other. Every other failed close stays unconfirmed (ADR-258).
 3. **It continues only where ADR-335 item 3 would.** At the current instruction, everything
    ahead must be safe to repeat with no flash plan and no recovery-required section ahead, the
    point must be interruptible, and a VIN the job names must read back the same. No diagnostic

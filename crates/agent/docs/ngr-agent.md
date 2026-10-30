@@ -747,7 +747,7 @@ releases every link on it (ADR-393). A lost path's close that still fails is mad
 and only once: the second close confirms when the link answers that no object has its handle (or
 its disconnect fails with a worker's answer) and the module's disconnect succeeds, since a J2534
 library releases the device on the first close yet may report the loss from it (ADR-393). The
-runner's final close follows the same rule when the host tried to reopen or the run ended in an error that lost the path. The host then takes
+runner's final close follows the same rule when a step of the run failed on a lost path, whatever ending followed (the host error, on-site intervention), and the link has not opened again since; a link that opened again is healthy, so a later failure to close it stays unconfirmed. The second close is made only when the worker answered every step of the first. The host then takes
 a client from the source (every `WorkerApi` client is a source of itself, giving clones, so the
 entry points `run_program`, `run_program_journaled` and `resume_program_journaled` take either),
 opens the link (`link::open_tracked`) and `WorkerHost::reopen` puts the new link in place of the
@@ -756,7 +756,7 @@ transfer counter, the runtime input ids and the settling state start over. An op
 and was cleaned up is `NotYet`; one whose cleanup failed marks the guards and is `Cannot`.
 
 The runner repeats the attempt every `JobLimits::reopen_poll` (default 1 s) until
-`JobLimits::vci_return_wait` (default 60 s) has passed, taking a cancel before each attempt
+`JobLimits::vci_return_wait` (default 60 s), counted from the end of the first attempt (which closes the lost link), has passed, taking a cancel before each attempt
 (the run's cancel, which a section that holds the cancel keeps held): `JobError::Cancelled`. Each
 continuation counts one against `JobLimits::max_link_reopens` (default 2) in memory, whether or
 not the VCI came back. A VCI that does not come back ends the run in the original `JobError::Host`.

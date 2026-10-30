@@ -35,14 +35,11 @@ const LIBRARY_NAME: &str = "sim-vci";
 const VIN: &[u8] = b"NGRSIMECU00000001";
 /// How long the program waits between its two reads.
 const WAIT: Duration = Duration::from_secs(6);
-/// How long after the ECU exists the VCI is unplugged: long enough for the rest of the open and
-/// the first read, well inside [`WAIT`].
-const UNPLUG_AFTER: Duration = Duration::from_secs(2);
-/// How long after the program's wait ends the VCI is unplugged in the `Unsafe` scenario: inside the
-/// delay the ECU is told to put on its answer.
-const UNPLUG_IN_READ: Duration = Duration::from_millis(1_500);
-/// The ECU's delay of the second read's answer in the `Unsafe` scenario.
-const ANSWER_DELAY_MS: u32 = 5_000;
+/// The ECU's delay of the second read's answer in the `Unsafe` scenario: far past the read's timeout, so the
+/// read stays pending until the VCI is unplugged, which the test does as soon as the request reached the ECU.
+const ANSWER_DELAY_MS: u32 = 20_000;
+/// The longest the test waits for an event it observes (a log line, a control file taken).
+const EVENT_TIMEOUT: Duration = Duration::from_secs(60);
 /// The longest the test waits for the run to end: the run itself waits at most
 /// [`RETURN_WAIT`] for the VCI.
 const GENEROUS: Duration = Duration::from_secs(60);
@@ -208,13 +205,35 @@ fn log_lines(dir: &Path) -> Vec<serde_json::Value> {
         .collect()
 }
 
-/// Waits until the job's open has created the ECU (`sim-vci` writes its state file then), and
-/// [`UNPLUG_AFTER`] more.
-async fn wait_for_first_read(ecu_state: &Path) {
-    while !ecu_state.exists() {
+/// Polls `condition` until it holds, and panics with `what` after [`EVENT_TIMEOUT`].
+async fn wait_for(what: &str, mut condition: impl FnMut() -> bool) {
+    let started = std::time::Instant::now();
+    while !condition() {
+        assert!(
+            started.elapsed() < EVENT_TIMEOUT,
+            "gave up waiting for {what}"
+        );
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    tokio::time::sleep(UNPLUG_AFTER).await;
+}
+
+/// How many exchanges the log in `dir` holds: the first read is over when it holds one.
+fn exchanges(dir: &Path) -> usize {
+    log_lines(dir)
+        .iter()
+        .filter(|line| line["event"] == "exchange")
+        .count()
+}
+
+/// Waits until the ECU's state file differs from `previous`, and returns its new content.
+async fn changed_from(ecu_state: &Path, previous: Vec<u8>) -> Vec<u8> {
+    let mut now = previous.clone();
+    wait_for("the ECU's state to change", || {
+        now = std::fs::read(ecu_state).unwrap_or_default();
+        !now.is_empty() && now != previous
+    })
+    .await;
+    now
 }
 
 #[test]
@@ -275,8 +294,9 @@ async fn flow(paths: &TempPaths, setup: GuardSetup) {
     unsafe_reads_end_on_site(paths, &setup).await;
 }
 
-/// Unplugs the VCI during the wait, plugs it back in, and returns the run's end, the log's
-/// lines and the worker.
+/// Unplugs the VCI during the wait (`in_read`: while the second read is pending), plugs it back
+/// in, and returns the run's end, the log's lines and the worker. Every step waits on an event
+/// the test observes, never on a pause.
 async fn lose_and_return(
     paths: &TempPaths,
     setup: &GuardSetup,
@@ -302,10 +322,13 @@ async fn lose_and_return(
             .await
         }
     });
-    wait_for_first_read(&paths.ecu_state).await;
+    // The first read is over when its exchange is in the log: the program is then in its wait.
+    wait_for("the first read's exchange", || exchanges(&log_dir) >= 1).await;
     if in_read {
-        // The ECU delays the answer of the next read, the second; the VCI is lost while the
-        // read is pending, so the request may have reached the ECU.
+        // The ECU holds back the answer of the next read, the second, beyond the read's
+        // timeout; the VCI is lost while that read is pending, so the request may have reached
+        // the ECU.
+        let before = std::fs::read(&paths.ecu_state).expect("the ECU state file");
         send(
             &paths.control_dir,
             &format!("{command_prefix}-0"),
@@ -313,9 +336,10 @@ async fn lose_and_return(
                 r#"{{"command": "inject_fault", "service": 34, "fault": {{"delay_response": {{"ms": {ANSWER_DELAY_MS}}}}}}}"#
             ),
         );
-        // Not a bare pause: the second read starts when the program's wait ends, then the loss
-        // must fall inside the delay.
-        tokio::time::sleep(WAIT - UNPLUG_AFTER + UNPLUG_IN_READ).await;
+        // `sim-vci` saves the ECU's state when it takes the fault (the fault is armed in it),
+        // and again when the second read's request reaches the ECU and consumes the fault.
+        let armed = changed_from(&paths.ecu_state, before).await;
+        changed_from(&paths.ecu_state, armed).await;
     }
     send(
         &paths.control_dir,
@@ -401,10 +425,7 @@ async fn unsafe_reads_end_on_site(paths: &TempPaths, setup: &GuardSetup) {
     } = run;
     let text = || format!("{lines:#?}");
     assert!(
-        matches!(
-            &result,
-            Err(JobError::Host { .. } | JobError::OnSiteInterventionRequired(_))
-        ),
+        matches!(&result, Err(JobError::OnSiteInterventionRequired(_))),
         "{result:?}\n{}",
         text()
     );

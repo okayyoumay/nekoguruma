@@ -578,16 +578,18 @@ pub struct WorkerHost<C: WorkerApi> {
     relink: Option<Relink<C>>,
 }
 
-/// The handles of the link that is open on the worker, shared with the runner's closing of it,
-/// so the runner closes the link the host opened last, and none after the host closed it.
-pub(crate) type OpenHandles = std::sync::Arc<
-    std::sync::Mutex<
-        Option<(
-            vci_service_interface::ModuleHandle,
-            vci_service_interface::ComLogicalLinkHandle,
-        )>,
-    >,
->;
+/// The link that is open on the worker: the client it was opened on and its handles.
+#[derive(Clone)]
+pub(crate) struct OpenOn<C> {
+    pub(crate) client: C,
+    pub(crate) module_handle: vci_service_interface::ModuleHandle,
+    pub(crate) cll_handle: vci_service_interface::ComLogicalLinkHandle,
+}
+
+/// The link that is open on the worker, shared with the runner's closing of it, so the runner
+/// closes the link the host opened last, on the client that opened it, and none after the host
+/// closed it.
+pub(crate) type OpenHandles<C> = std::sync::Arc<std::sync::Mutex<Option<OpenOn<C>>>>;
 
 /// What [`WorkerHost`] needs to open its link again (ADR-393).
 pub(crate) struct Relink<C: WorkerApi> {
@@ -596,14 +598,15 @@ pub(crate) struct Relink<C: WorkerApi> {
     /// The link to open: the job's, as it opened first.
     pub(crate) config: LinkConfig,
     /// The open link's handles, shared with the runner.
-    pub(crate) open: OpenHandles,
+    pub(crate) open: OpenHandles<C>,
     /// Marks the job's guards: the worker may still hold the link (ADR-258).
     pub(crate) mark_unconfirmed: Box<dyn Fn() + Send>,
     /// Whether the link the host holds is still open on the worker.
     pub(crate) old_open: bool,
-    /// Set once the host tries to open the link again, which it does only after the path to the
-    /// VCI was lost; shared with the runner, whose final close then follows the same rule as
-    /// the host's (ADR-393).
+    /// Whether the path to the VCI is lost now (ADR-393): set when a failure of the run says so
+    /// ([`ProcedurePosition::path_lost`]) and cleared when the link is open again; shared with
+    /// the runner, whose final close then follows the same rule as the host's. A link that
+    /// opened again is healthy, so a later failure to close it stays unconfirmed.
     pub(crate) path_lost: std::sync::Arc<std::sync::atomic::AtomicBool>,
 }
 
@@ -722,9 +725,16 @@ impl<C: WorkerApi> WorkerHost<C> {
         ));
         match opened {
             Ok(link) => {
-                *relink.open.lock().unwrap_or_else(|e| e.into_inner()) =
-                    Some((link.module_handle, link.cll_handle));
+                *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = Some(OpenOn {
+                    client: client.clone(),
+                    module_handle: link.module_handle,
+                    cll_handle: link.cll_handle,
+                });
                 relink.old_open = true;
+                // The new link is healthy: the path is not lost until a failure says so again.
+                relink
+                    .path_lost
+                    .store(false, std::sync::atomic::Ordering::Relaxed);
                 self.reopen(client, link, &relink.config);
                 ReopenAttempt::Opened
             }
@@ -2382,6 +2392,10 @@ pub trait ProcedurePosition {
     fn reopen_link(&mut self) -> ReopenAttempt {
         ReopenAttempt::Cannot
     }
+    /// The step failed with an error that says the path to the VCI is lost
+    /// ([`HostError::resend_class`]), whatever follows: the run's final close then follows the
+    /// lost path's rule (ADR-393).
+    fn path_lost(&mut self) {}
 }
 
 /// How [`ProcedurePosition::reopen_link`] ended.
@@ -2444,6 +2458,14 @@ impl<C: WorkerApi> ProcedurePosition for WorkerHost<C> {
 
     fn step_resends(&mut self) {
         self.resends = true;
+    }
+
+    fn path_lost(&mut self) {
+        if let Some(relink) = &self.relink {
+            relink
+                .path_lost
+                .store(true, std::sync::atomic::Ordering::Relaxed);
+        }
     }
 
     fn reopen_link(&mut self) -> ReopenAttempt {

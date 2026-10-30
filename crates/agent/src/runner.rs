@@ -35,8 +35,8 @@ use tokio::runtime::{Handle, RuntimeFlavor};
 use crate::document::{Declarations, JobDocument};
 use crate::guards::{GuardError, JobGuards};
 use crate::host::{
-    HostError, OpenHandles, OwnRead, ProcedurePosition, Relink, ReopenAttempt, SendState, Timings,
-    TransferProgress, WorkerHost,
+    HostError, OpenHandles, OpenOn, OwnRead, ProcedurePosition, Relink, ReopenAttempt, ResendClass,
+    SendState, Timings, TransferProgress, WorkerHost,
 };
 use crate::inputs::RuntimeInputs;
 use crate::journal::{Journal, JournalError, RunStop, StepRef, StoppedRun, Store};
@@ -1276,14 +1276,16 @@ fn run_job<C: WorkerApi>(
     let permission = link.permission;
     // Declared before the host, which owns the link's event stream: on a panic the stream is
     // dropped first, then the link is closed.
-    let open_handles: OpenHandles =
-        Arc::new(Mutex::new(Some((link.module_handle, link.cll_handle))));
+    let open_handles: OpenHandles<C> = Arc::new(Mutex::new(Some(OpenOn {
+        client: client.clone(),
+        module_handle: link.module_handle,
+        cll_handle: link.cll_handle,
+    })));
     // Whether the run's path to the VCI was lost (ADR-393): set by the host when it tries to open
     // the link again, and below when the run ended on a lost path.
     let path_lost = Arc::new(AtomicBool::new(false));
     let open_link = OpenLink {
         handle: handle.clone(),
-        client: client.clone(),
         handles: Arc::clone(&open_handles),
         deadline: timings.unary,
         guards: Arc::clone(&guards),
@@ -1369,7 +1371,8 @@ fn run_job<C: WorkerApi>(
         tracing::warn!("settling a primitive past its deadline at job end panicked");
     }
     // A run that ended because the path to the VCI was lost closes its link by the same rule as
-    // the host's reopen does (ADR-393).
+    // the host's reopen does (ADR-393). The host's flag follows the cause, set in `run_vm` whatever
+    // ending followed; the errors that did not come from a step add to it here.
     if ended_on_lost_path(&result) {
         path_lost.store(true, Ordering::Relaxed);
     }
@@ -1382,7 +1385,6 @@ fn run_job<C: WorkerApi>(
 /// Whether the run ended on an error that says the path to the VCI was lost
 /// ([`HostError::resend_class`], ADR-392).
 fn ended_on_lost_path(result: &Result<VmState, JobError>) -> bool {
-    use crate::host::ResendClass;
     match result {
         Err(
             JobError::Link(source)
@@ -1400,10 +1402,9 @@ fn ended_on_lost_path(result: &Result<VmState, JobError>) -> bool {
 /// worker may then still hold the VCI.
 struct OpenLink<C: WorkerApi> {
     handle: Handle,
-    client: C,
-    /// The handles of the link open now, which the host replaces when it opens the link again
-    /// (ADR-393) and empties once it has closed the lost one.
-    handles: OpenHandles,
+    /// The link open now and the client it was opened on, which the host replaces when it
+    /// opens the link again (ADR-393) and empties once it has closed the lost one.
+    handles: OpenHandles<C>,
     deadline: Duration,
     guards: GuardSlot,
     /// Whether the run's path to the VCI was lost, which lets a module disconnect confirm the
@@ -1422,15 +1423,24 @@ impl<C: WorkerApi> OpenLink<C> {
         if std::mem::replace(&mut self.closed, true) {
             return;
         }
-        let open = *self.handles.lock().unwrap_or_else(|e| e.into_inner());
-        let Some((module_handle, cll_handle)) = open else {
+        let open = self
+            .handles
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        let Some(OpenOn {
+            mut client,
+            module_handle,
+            cll_handle,
+        }) = open
+        else {
             // The host closed the lost link and opened no other.
             return;
         };
         // Closing on a runtime that is shutting down can panic.
         let closed = std::panic::catch_unwind(AssertUnwindSafe(|| {
             self.handle.block_on(link::teardown(
-                &mut self.client,
+                &mut client,
                 module_handle,
                 cll_handle,
                 self.deadline,
@@ -2316,6 +2326,11 @@ where
                 return Err(stop_run(journal, at, RunStop::Vm(source), error));
             }
             Err(StepError::Host(source)) => {
+                // The cause, not the ending that follows, decides how the final close judges
+                // the link (ADR-393).
+                if source.resend_class() == ResendClass::PathLost {
+                    host.path_lost();
+                }
                 if source.send_state() == SendState::MayHaveReached
                     || !restart::is_exchange(program, pc)
                 {
@@ -2346,6 +2361,7 @@ where
                             journal.as_deref_mut(),
                             &vm.state,
                             unsent_request,
+                            &mut unsent,
                             &mut reopens,
                         ) {
                             // The same arrival sends again on the new link: no `arrive`, no
@@ -2424,6 +2440,7 @@ fn continue_on_new_link<H, S>(
     journal: Option<&mut JobJournal<S>>,
     state: &VmState,
     unsent: bool,
+    marker: &mut Option<StepRef>,
     reopens: &mut u8,
 ) -> Result<bool, JobError>
 where
@@ -2440,7 +2457,10 @@ where
     }
     *reopens += 1;
     let poll = limits.reopen_poll.max(Duration::from_millis(1));
-    let until = std::time::Instant::now() + limits.vci_return_wait;
+    // `vci_return_wait` counts from the end of the first attempt, which closes the lost link
+    // first: a close that takes several deadlines does not use up the time the VCI has to come
+    // back.
+    let mut until = None;
     loop {
         if cancelled.load(Ordering::Relaxed) {
             return Err(JobError::Cancelled);
@@ -2450,6 +2470,8 @@ where
             ReopenAttempt::Cannot => return Ok(false),
             ReopenAttempt::NotYet => {}
         }
+        let until =
+            *until.get_or_insert_with(|| std::time::Instant::now() + limits.vci_return_wait);
         let remaining = until.saturating_duration_since(std::time::Instant::now());
         if remaining.is_zero() {
             return Ok(false);
@@ -2473,7 +2495,16 @@ where
                 |_| Ok(()),
             )
         })
-        .map_err(|error| journal_identity_abort(journal.journal_mut(), error))?;
+        .map_err(|error| {
+            // The abort is the journal's last record, so the unsent request's marker is
+            // withdrawn before it: the request is provably unsent here (ADR-392).
+            let error = if matches!(error, JobError::IdentityMismatch { .. }) {
+                withdraw_unsent(Some(&mut *journal), marker.take(), error)
+            } else {
+                error
+            };
+            journal_identity_abort(journal.journal_mut(), error)
+        })?;
     }
     Ok(true)
 }
@@ -14865,6 +14896,8 @@ def main():
         disconnect_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
         /// The same for ModuleDisconnect, ahead of `fail_open`.
         module_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
+        /// What the first StartComPrimitive calls fail with, one per call.
+        start_failures: Mutex<std::collections::VecDeque<tonic::Status>>,
     }
 
     /// How a scripted item of a [`FakeWorker`] is bound (design 8.11 "Link settings for the
@@ -15176,6 +15209,9 @@ def main():
             self.note("StartComPrimitive");
             if !self.starts {
                 return unimplemented();
+            }
+            if let Some(status) = self.start_failures.lock().unwrap().pop_front() {
+                return Err(status);
             }
             let cop_handle = {
                 let mut started = self.started.lock().unwrap();
@@ -15557,6 +15593,41 @@ def main():
             device_clock: false,
             disconnect_script: Mutex::new(disconnects.into()),
             module_script: Mutex::new(modules.into()),
+            start_failures: Mutex::default(),
+        };
+        let (client, calls, _) = serve(service, calls, set).await;
+        (client, calls)
+    }
+
+    /// A [`FakeWorker`] whose primitives start and answer `22 F1 90`, whose first starts fail with
+    /// `starts`' statuses, and whose first disconnects of the link and of the module answer as the
+    /// scripts say (`None`: success), one per call.
+    async fn fake_worker_losing(
+        starts: Vec<tonic::Status>,
+        disconnects: Vec<Option<tonic::Status>>,
+        modules: Vec<Option<tonic::Status>>,
+    ) -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let service = FakeWorker {
+            fail_disconnect: false,
+            fail_open: false,
+            calls: Arc::clone(&calls),
+            comparams: Mutex::new(Vec::new()),
+            set: Arc::clone(&set),
+            refuse_set: None,
+            starts: true,
+            started: Arc::default(),
+            cancelled: Arc::default(),
+            cancel: CancelAnswer::Done,
+            on_start: Some((When::After(Duration::ZERO), StartEvent::Respond)),
+            start_script: Mutex::default(),
+            released: Arc::new(tokio::sync::Semaphore::new(0)),
+            events: Arc::default(),
+            device_clock: false,
+            disconnect_script: Mutex::new(disconnects.into()),
+            module_script: Mutex::new(modules.into()),
+            start_failures: Mutex::new(starts.into()),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (client, calls)
@@ -15599,6 +15670,7 @@ def main():
             device_clock: false,
             disconnect_script: Mutex::default(),
             module_script: Mutex::default(),
+            start_failures: Mutex::default(),
         };
         serve(service, calls, set).await
     }
@@ -15682,6 +15754,7 @@ def main():
             device_clock,
             disconnect_script: Mutex::default(),
             module_script: Mutex::default(),
+            start_failures: Mutex::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (
@@ -17484,7 +17557,7 @@ def main():
             ),
             (
                 "second-link-answers-failure",
-                vec![unavailable(), internal()],
+                vec![internal(), internal()],
                 vec![internal(), None],
                 true,
                 true,
@@ -17505,6 +17578,22 @@ def main():
                 true,
                 false,
                 2,
+            ),
+            (
+                "first-no-answer-no-retry",
+                vec![unavailable(), invalid_handle()],
+                vec![internal(), None],
+                true,
+                false,
+                1,
+            ),
+            (
+                "first-module-no-answer-no-retry",
+                vec![internal(), invalid_handle()],
+                vec![unavailable(), None],
+                true,
+                false,
+                1,
             ),
             (
                 "not-lost",
@@ -17540,6 +17629,70 @@ def main():
                 .filter(|call| **call == "DisconnectComLogicalLink")
                 .count();
             assert_eq!(made, closes, "{tag}: {calls:?}");
+        }
+    }
+
+    /// ADR-393: the lost-path flag follows the cause. A run that ends on site after a lost path
+    /// (a request that may have reached the ECU and is not safe to repeat) closes its link by the
+    /// lost path's rule, so a module disconnect confirms the failed link disconnect; a link that
+    /// opened again is healthy, so after the run goes on and ends well the same failure of its
+    /// close stays unconfirmed.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_lost_path_flag_follows_the_cause_and_clears_on_a_reopen() {
+        let internal = || Some(tonic::Status::internal("library"));
+        // One request step, with no VIN to read.
+        let one_step = |service, idempotency| {
+            let mut program = program(request_step(service).to_vec());
+            program.sections = vec![plain_section(0, 3, idempotency)];
+            program.validate().expect("the fixture is a valid program");
+            program
+        };
+        // (tag, program, closes of the link that fail, ended on site, confirmed)
+        let cases = [
+            (
+                "onsite-after-loss",
+                one_step(0x22, Unsafe),
+                vec![internal()],
+                true,
+                true,
+            ),
+            (
+                "reopened-then-healthy",
+                one_step(0x22, Safe),
+                // The lost link's close at the reopen succeeds; the final close fails.
+                vec![None, internal()],
+                false,
+                false,
+            ),
+        ];
+        for (tag, program, disconnects, on_site, confirmed) in cases {
+            let (client, calls) = fake_worker_losing(
+                vec![tonic::Status::unavailable("gone")],
+                disconnects,
+                Vec::new(),
+            )
+            .await;
+            let JobRun {
+                result, mut guards, ..
+            } = run_program(
+                client,
+                &LinkConfig::iso15765(0x7E0, 0x7E8),
+                program,
+                after_loss_limits(),
+                vci_only_guards(tag),
+            )
+            .await;
+            if on_site {
+                assert!(
+                    matches!(result, Err(JobError::OnSiteInterventionRequired(_))),
+                    "{tag}: {result:?}"
+                );
+            } else {
+                result.unwrap_or_else(|error| panic!("{tag}: {error}"));
+            }
+            let calls = calls.lock().unwrap().clone();
+            assert_eq!(guards.link_unconfirmed(), !confirmed, "{tag}: {calls:?}");
+            guards.worker_gone();
         }
     }
 
@@ -19695,6 +19848,47 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// The same abort after a request the worker refused after the loss (never sent, `Unsafe`):
+    /// the unsent marker is withdrawn before the abort, which no record follows, so the job ends
+    /// in the mismatch and not in a journal error.
+    #[test]
+    fn another_vin_after_an_unsent_unsafe_request_withdraws_it_before_the_abort() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe)]);
+        let dir = journal_dir("loss-vin-mismatch-unsent");
+        let mut host = FlashHost::new(Rc::new(Cell::new(0)));
+        host.fail_service = Some((
+            0x10,
+            [HostError::VciLost {
+                refused_after_loss: true,
+            }]
+            .into(),
+        ));
+        host.reopen_script = [ReopenAttempt::Opened].into();
+        host.vin_script = [IdAnswer::value("WDB99999999999999")].into();
+        let mut journal = JobJournal::create(file_setup_for(&dir, Some(TARGET_VIN)), None).unwrap();
+        let result = run_on(
+            &program,
+            &mut host,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            Some(&mut journal),
+        );
+        assert!(
+            matches!(
+                result,
+                Err(JobError::IdentityMismatch {
+                    identity: IdentityKind::Vin
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x10), 1);
+        let facts = Journal::read(&dir, &job_key()).unwrap().facts;
+        assert_eq!(facts.identity_mismatch, Some(IdentityKind::Vin));
+        assert!(facts.last_request_withdrawn(), "{facts:?}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A VIN that cannot be established on the new link is on-site intervention, the resume
     /// counted (ADR-290), the request not sent again.
     #[test]
@@ -19860,8 +20054,9 @@ def main():
 
     /// ADR-393: a lost link whose own disconnect the worker answers with a failure (the J2534
     /// worker's does on a lost device) is confirmed closed by the module's disconnect, so the
-    /// run opens a new link and goes on; the final close follows the same rule, so the guards
-    /// stay unmarked. (A module disconnect that fails too stays unconfirmed:
+    /// run opens a new link and goes on. The new link is healthy, so the final close of it, whose
+    /// disconnect fails the same way, stays unconfirmed and marks the guards. (A module
+    /// disconnect that fails too stays unconfirmed:
     /// `a_module_disconnect_confirms_a_link_closed_only_on_a_lost_path`.)
     #[tokio::test(flavor = "multi_thread")]
     async fn a_lost_link_whose_disconnect_fails_is_confirmed_closed_by_the_module() {
@@ -19889,7 +20084,7 @@ def main():
         )
         .await;
         run.result.as_ref().expect("the run goes on");
-        assert!(!run.guards.link_unconfirmed());
+        assert!(run.guards.link_unconfirmed());
         let calls = fake.calls.lock().unwrap().clone();
         assert_eq!(
             calls

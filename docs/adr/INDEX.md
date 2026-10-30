@@ -377,6 +377,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-385](ADR-385-every-count-since-a-late-error-tests-the-answers-stored-time.md) | Every Count Since a Late Error Tests the Answer's Stored Time | Accepted | `agent` communication log (`comm_log/exchange.rs` `answer_at`, `answer_time`, `judge_answer`, `since_late_error`, `error_after`, `reclassify_one`; `comm_log.rs` settling paths); design 8.11 "Settlement", `late_item`; ADR-372 items 2 and 3; ADR-384 |
 | [ADR-386](ADR-386-a-primitive-s-end-is-placed-in-one-pass-in-read-order.md) | A Primitive's End Is Placed in One Pass, in Read Order | Accepted | `agent` host (`settle_at_end`, `Progress`, `log_primitive_end`), communication log (`PrimitiveEnded`, `primitive_ended`, `late_link_errors`, `late_link_error`, `refresh_loss`); design 8.11 "Order", "Link error", `primitive_ended`, `late_item`; ADR-358; ADR-366; ADR-367; ADR-372; ADR-373 |
 | [ADR-387](ADR-387-a-case-table-lists-every-path-that-writes-the-value-it-decides.md) | A Case Table Lists Every Path That Writes the Value It Decides | Accepted | `.claude/README.md` (gates); ADR-381 item 1 |
+| [ADR-388](ADR-388-an-item-another-is-blocked-on-takes-its-priority.md) | An Item Another Is Blocked On Takes Its Priority | Accepted | `work/README.md` (priorities), `.claude/skills/backlog`, `.claude/skills/backlog-triage` |
 
 ## Status Legend
 
@@ -739,6 +740,7 @@ the predecessor repository these ADRs came from.
 - ADR-381 (item 1 extended by ADR-387: one row per path that writes the value the rule decides)
 - ADR-382
 - ADR-387
+- ADR-388
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

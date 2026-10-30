@@ -32,7 +32,9 @@ format" section first. Permanent files never name a backlog file or item.
    current milestone named in the project-wide backlog's Status section.
    Priority is how much it matters once it can be done: if it waits on a
    decision, a vendor, real data or another item, add a `Blocked on:` clause
-   instead of lowering the priority. P0 is only for real harm (ECU or
+   instead of lowering the priority. When the clause names another item,
+   raise that item to this item's priority if it is lower, and move it to
+   keep its section sorted (`work/README.md`, ADR-388). P0 is only for real harm (ECU or
    vehicle damage, lost write or journal state, a broken trust boundary) or
    work that stops everything else. A development-process item (backlog
    and priority rules, documentation and ADR conventions, `CLAUDE.md`,
@@ -46,7 +48,11 @@ format" section first. Permanent files never name a backlog file or item.
 
 ## Update an item
 
-Re-prioritize, sharpen the "Done when", or add new evidence in place. Move
+Re-prioritize, sharpen the "Done when", or add new evidence in place. An
+item another item is blocked on keeps at least that item's priority
+(`work/README.md`): raising a blocked item raises its blocker, and a
+blocker is judged on its own again only when nothing it blocks needs the
+higher level. Move
 the item if its priority changes so the section stays sorted. Do not append
 a dated history of changes; the item states the current understanding.
 
@@ -64,7 +70,9 @@ When the work is done (in this PR or found already done):
    list.
 4. **Fix references** to it. Search `work/` for the item's identifiers
    (other items may depend on it; search line-wrap aware, e.g.
-   `rg -U` or flatten whitespace first). Permanent files must not
+   `rg -U` or flatten whitespace first). An item this one was blocked on
+   and was raised for is judged on its own priority again, unless another
+   item it blocks still needs it. Permanent files must not
    reference backlog items, but check them too in case one slipped in.
 5. **Remove empties.** Delete a section with no items left, and a file with
    no sections left; then update the file table in `work/README.md`.

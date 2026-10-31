@@ -11,7 +11,7 @@ use diag_ir::plan::{IdentificationPlan, PlanError, Selection, Sha256, hex};
 use sha2::Digest;
 
 use crate::document::{DocumentError, JobDocument};
-use crate::link::{BUS_TYPE_DWCAN, LinkConfig};
+use crate::link::{BUS_TYPE_DWCAN, LinkConfig, MAX_CAN_ID};
 use crate::policy::ApplicationLayer;
 use crate::send_receive::declared_sid;
 
@@ -41,9 +41,21 @@ pub enum PlanRefused {
         service: u32,
         field: u32,
     },
-    /// Declared links on one bus that differ in a ComParam other than a timing (ADR-395 item 6).
-    #[error("documents {first} and {second} are on one bus and declare different ComParams")]
+    /// Declared links in one presence group (a bus and a functional identifier) that differ in
+    /// a ComParam other than a timing (ADR-395 item 6).
+    #[error(
+        "documents {first} and {second} are in one presence group and declare different ComParams"
+    )]
     ComParamsDiffer { first: String, second: String },
+    /// One resource (the same protocol, bus type and pins) declared at two baud rates.
+    #[error("documents {first} and {second} declare one resource at two baud rates")]
+    BaudRatesDiffer { first: String, second: String },
+    #[error("document {document} declares functional identifier {functional_id:#x}: {why}")]
+    BadFunctionalId {
+        document: String,
+        functional_id: u32,
+        why: &'static str,
+    },
 }
 
 /// The bus a link is on: the resource the agent resolves for it (protocol short name and bus
@@ -87,9 +99,34 @@ pub struct EndpointEntry {
 pub struct PresenceGroup {
     pub bus: BusKey,
     pub functional_id: u32,
-    /// `CP_P2Max` of the presence link, in milliseconds: the longest over the declared links
-    /// of the bus (ADR-395 item 5). Not used for traffic yet.
+    /// `CP_P2Max` of the presence link, in milliseconds: the longest over the declared links of
+    /// the group (ADR-395 item 5). Not used for traffic yet.
     pub p2_max_ms: u32,
+    /// `CP_P2Star` and `CP_RC78CompletionTimeout`, in milliseconds: the largest of the group.
+    pub p2_star_ms: u32,
+    pub rc78_completion_ms: u32,
+    /// The other timing ComParams the group's links declare (`TIMING_PARAMS`), by lowercase
+    /// name in a fixed order, each with its largest value in the ComParam's own unit
+    /// (ADR-395 item 6).
+    pub timings: Vec<(String, u32)>,
+}
+
+impl PresenceGroup {
+    /// Raises each timing of the group to `link`'s when that is larger: a larger value only
+    /// makes the tester wait longer or send later (ADR-395 item 6).
+    fn take_largest(&mut self, link: &LinkConfig) {
+        self.p2_max_ms = self.p2_max_ms.max(link.p2_max_ms);
+        self.p2_star_ms = self.p2_star_ms.max(link.p2_star_ms);
+        self.rc78_completion_ms = self.rc78_completion_ms.max(link.rc78_completion_ms);
+        for (name, value) in link.params.iter().filter(|(name, _)| is_timing(name)) {
+            let name = name.to_ascii_lowercase();
+            match self.timings.iter_mut().find(|(known, _)| *known == name) {
+                Some((_, largest)) => *largest = (*largest).max(*value),
+                None => self.timings.push((name, *value)),
+            }
+        }
+        self.timings.sort();
+    }
 }
 
 /// A presence answer: the bus and the response identifier that answered (ADR-327 item 2).
@@ -215,14 +252,34 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
                     .protocols()
                     .and_then(|protocols| protocols.iter().next())
                     .map_or(0, |protocol| protocol.functional_id());
-                if let Some(other) = links.iter().find(|other| {
-                    BusKey::of(&other.link) == BusKey::of(&link)
-                        && comparams(&other.link) != comparams(&link)
-                }) {
-                    return Err(PlanRefused::ComParamsDiffer {
-                        first: hex(&other.document),
-                        second: hex(hash),
+                if functional_id > MAX_CAN_ID {
+                    return Err(PlanRefused::BadFunctionalId {
+                        document: hex(hash),
+                        functional_id,
+                        why: "only 11-bit identifiers are supported, as for the physical ones",
                     });
+                }
+                let new_bus = BusKey::of(&link);
+                for other in &links {
+                    let bus = BusKey::of(&other.link);
+                    let same_resource =
+                        bus.protocol == new_bus.protocol && bus.bus_type == new_bus.bus_type;
+                    if same_resource && bus.baud_rate != new_bus.baud_rate {
+                        return Err(PlanRefused::BaudRatesDiffer {
+                            first: hex(&other.document),
+                            second: hex(hash),
+                        });
+                    }
+                    // Only links that send one functional request together must agree.
+                    let grouped = bus == new_bus
+                        && functional_id != 0
+                        && other.functional_id == functional_id;
+                    if grouped && comparams(&other.link) != comparams(&link) {
+                        return Err(PlanRefused::ComParamsDiffer {
+                            first: hex(&other.document),
+                            second: hex(hash),
+                        });
+                    }
                 }
                 links.push(DocumentLink {
                     document: *hash,
@@ -234,6 +291,19 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
                 document: *hash,
                 reason: error.to_string(),
             }),
+        }
+    }
+    for link in links.iter().filter(|link| link.functional_id != 0) {
+        let clash = links.iter().any(|other| {
+            BusKey::of(&other.link) == BusKey::of(&link.link)
+                && [other.link.tx_id, other.link.rx_id].contains(&link.functional_id)
+        });
+        if clash {
+            return Err(PlanRefused::BadFunctionalId {
+                document: hex(&link.document),
+                functional_id: link.functional_id,
+                why: "it equals a physical request or response identifier on the same bus",
+            });
         }
     }
     let candidates = loaded
@@ -269,11 +339,31 @@ fn check_read_only(
         })
 }
 
+/// The timing ComParams that `LinkConfig` keeps in its params (the three it models as fields,
+/// `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout`, are timings too). This is the
+/// agent's own list of the timings the repository deals with (ADR-395 item 6); a name that is
+/// not on it counts as a non-timing ComParam, which the links of a group must agree on.
+const TIMING_PARAMS: [&str; 8] = [
+    "CP_P2Min",
+    "CP_P3Func",
+    "CP_As",
+    "CP_Ar",
+    "CP_Bs",
+    "CP_Br",
+    "CP_Cr",
+    "CP_Cs",
+];
+
+fn is_timing(name: &str) -> bool {
+    TIMING_PARAMS.iter().any(|t| t.eq_ignore_ascii_case(name))
+}
+
 /// A link's ComParams other than the timings, by lowercase name, in a fixed order.
 fn comparams(link: &LinkConfig) -> Vec<(String, u32)> {
     let mut params: Vec<_> = link
         .params
         .iter()
+        .filter(|(name, _)| !is_timing(name))
         .map(|(name, value)| (name.to_ascii_lowercase(), *value))
         .collect();
     params.sort();
@@ -326,8 +416,8 @@ impl CheckedPlan {
     /// Derives the endpoints and presence groups (ADR-327 item 2, ADR-395 items 4 and 5).
     pub fn report(&self) -> IdentificationReport {
         let mut endpoints: Vec<EndpointEntry> = Vec::new();
-        let mut buses: Vec<(BusKey, u32)> = Vec::new();
-        let mut groups: Vec<(BusKey, u32)> = Vec::new();
+        let mut buses: Vec<BusKey> = Vec::new();
+        let mut groups: Vec<PresenceGroup> = Vec::new();
         for DocumentLink {
             document,
             link,
@@ -347,33 +437,38 @@ impl CheckedPlan {
                     documents: vec![*document],
                 }),
             }
-            match buses.iter_mut().find(|(known, _)| *known == bus) {
-                Some((_, p2)) => *p2 = (*p2).max(link.p2_max_ms),
-                None => buses.push((bus.clone(), link.p2_max_ms)),
+            if !buses.contains(&bus) {
+                buses.push(bus.clone());
             }
-            let group = (bus, *functional_id);
-            if *functional_id != 0 && !groups.contains(&group) {
-                groups.push(group);
+            if *functional_id != 0 {
+                let known =
+                    |g: &&mut PresenceGroup| g.bus == bus && g.functional_id == *functional_id;
+                match groups.iter_mut().find(known) {
+                    Some(group) => group.take_largest(link),
+                    None => {
+                        let mut group = PresenceGroup {
+                            bus,
+                            functional_id: *functional_id,
+                            p2_max_ms: 0,
+                            p2_star_ms: 0,
+                            rc78_completion_ms: 0,
+                            timings: Vec::new(),
+                        };
+                        group.take_largest(link);
+                        groups.push(group);
+                    }
+                }
             }
         }
-        let p2_of = |bus: &BusKey| buses.iter().find(|(known, _)| known == bus).map(|b| b.1);
         IdentificationReport {
             selection: self.selection,
             candidates: self.candidates.clone(),
             endpoints,
-            presence_groups: groups
-                .iter()
-                .map(|(bus, functional_id)| PresenceGroup {
-                    bus: bus.clone(),
-                    functional_id: *functional_id,
-                    p2_max_ms: p2_of(bus).expect("a group's bus has a link"),
-                })
-                .collect(),
             buses_without_presence: buses
-                .iter()
-                .map(|(bus, _)| bus.clone())
-                .filter(|bus| !groups.iter().any(|(grouped, _)| grouped == bus))
+                .into_iter()
+                .filter(|bus| !groups.iter().any(|group| group.bus == *bus))
                 .collect(),
+            presence_groups: groups,
             refused_links: self.refused_links.clone(),
             presence: Vec::new(),
         }
@@ -428,6 +523,28 @@ mod tests {
         document.source_digest = Some("00".into());
         document.variant = Some(Box::new(variant));
         encode_ecu_document(&document)
+    }
+
+    /// `bytes` with its variant changed by `edit`.
+    fn edited(bytes: &[u8], edit: impl FnOnce(&mut EcuVariantT)) -> Vec<u8> {
+        let mut variant = diag_ir::declaration::load_ecu_document(bytes)
+            .unwrap()
+            .variant()
+            .unwrap()
+            .unpack();
+        edit(&mut variant);
+        let mut document = EcuDocumentT::default();
+        document.schema_version = IR_SCHEMA_VERSION;
+        document.source_format = Some("csv-starlark".into());
+        document.source_digest = Some("00".into());
+        document.variant = Some(Box::new(variant));
+        encode_ecu_document(&document)
+    }
+
+    /// Makes service 1's request a WriteDataByIdentifier (0x2E).
+    fn write_service(variant: &mut EcuVariantT) {
+        let service: &mut ServiceT = &mut variant.services.as_mut().unwrap()[0];
+        service.request.as_mut().unwrap().sid = 0x2E;
     }
 
     fn named(bytes: Vec<u8>) -> (Sha256, Vec<u8>) {
@@ -536,39 +653,37 @@ mod tests {
 
     #[test]
     fn a_service_outside_the_read_only_set_is_refused() {
-        // Service 1 of this document is a WriteDataByIdentifier (0x2E), named by its pattern
-        // and by the candidate's VIN rule.
-        let mut write = EcuDocumentT::default();
-        let bytes = document(0x90, 0x7E0, 0x7E8, |_| {});
-        let loaded = diag_ir::declaration::load_ecu_document(&bytes).unwrap();
-        write.schema_version = IR_SCHEMA_VERSION;
-        write.source_format = Some("csv-starlark".into());
-        write.source_digest = Some("00".into());
-        let mut variant = loaded.variant().unwrap().unpack();
-        let service: &mut ServiceT = &mut variant.services.as_mut().unwrap()[0];
-        service.request.as_mut().unwrap().sid = 0x2E;
-        write.variant = Some(Box::new(variant));
-        let write = named(encode_ecu_document(&write));
-        let refused = checked(std::slice::from_ref(&write)).unwrap_err();
+        // Service 1 is a WriteDataByIdentifier (0x2E), named by the pattern and by the rule.
+        let base = document(0x90, 0x7E0, 0x7E8, |_| {});
+        let write = named(edited(&base, write_service));
         assert!(matches!(
-            refused,
-            PlanRefused::NotReadOnly { document, service: 1 } if document == hex(&write.0)
+            checked(std::slice::from_ref(&write)),
+            Err(PlanRefused::NotReadOnly { document, service: 1 }) if document == hex(&write.0)
         ));
-        // A pattern-free document is refused through the rule's source alone.
-        let mut variant = diag_ir::declaration::load_ecu_document(&write.1)
-            .unwrap()
-            .variant()
-            .unwrap()
-            .unpack();
-        variant.patterns = None;
-        let mut only_rule = EcuDocumentT::default();
-        only_rule.schema_version = IR_SCHEMA_VERSION;
-        only_rule.source_format = Some("csv-starlark".into());
-        only_rule.source_digest = Some("00".into());
-        only_rule.variant = Some(Box::new(variant));
-        let only_rule = named(encode_ecu_document(&only_rule));
+        // Through the rule's source alone.
+        let only_rule = named(edited(&write.1, |v| v.patterns = None));
         assert!(matches!(
             checked(&[only_rule]),
+            Err(PlanRefused::NotReadOnly { service: 1, .. })
+        ));
+        // Through a pattern alone, in a second document no source names.
+        let ok = named(base);
+        let pattern_only = named(edited(&document(0x91, 0x7E1, 0x7E9, |_| {}), write_service));
+        assert!(matches!(
+            checked(&[ok, pattern_only.clone()]),
+            Err(PlanRefused::NotReadOnly { document, service: 1 }) if document == hex(&pattern_only.0)
+        ));
+    }
+
+    #[test]
+    fn a_variant_without_a_protocol_names_no_read_only_service() {
+        // `ApplicationLayer::of_job` gives it no list, so its pattern is refused as a service
+        // outside the read-only set, not reported as a refused link (ADR-395 item 3).
+        let bare = named(edited(&document(0x90, 0x7E0, 0x7E8, |_| {}), |v| {
+            v.protocols = None
+        }));
+        assert!(matches!(
+            checked(&[bare]),
             Err(PlanRefused::NotReadOnly { service: 1, .. })
         ));
     }
@@ -608,53 +723,164 @@ mod tests {
     }
 
     #[test]
-    fn links_of_one_bus_that_differ_in_a_comparam_other_than_timing_are_refused() {
-        let first = named(document(0x90, 0x7E0, 0x7E8, with_param("CP_BlockSize", 8)));
-        let second = named(document(0x91, 0x7E1, 0x7E9, with_param("CP_BlockSize", 16)));
+    fn links_of_one_presence_group_that_differ_in_a_comparam_other_than_timing_are_refused() {
+        let grouped = |param: &'static str, value: i64| {
+            move |p: &mut ProtocolT| {
+                p.functional_id = 0x7DF;
+                with_param(param, value)(p);
+            }
+        };
+        let first = named(document(0x90, 0x7E0, 0x7E8, grouped("CP_BlockSize", 8)));
+        let second = named(document(0x91, 0x7E1, 0x7E9, grouped("CP_BlockSize", 16)));
         assert!(matches!(
             checked(&[first.clone(), second.clone()]),
             Err(PlanRefused::ComParamsDiffer { first: a, second: b })
                 if a == hex(&first.0) && b == hex(&second.0)
         ));
-        // One that lacks the ComParam differs too; the same value on another bus does not.
-        let bare = named(document(0x92, 0x7E2, 0x7EA, |_| {}));
+        // A ComParam declared on one link and missing on the other differs.
+        let bare = named(document(0x92, 0x7E2, 0x7EA, |p| p.functional_id = 0x7DF));
         assert!(matches!(
             checked(&[first.clone(), bare]),
             Err(PlanRefused::ComParamsDiffer { .. })
         ));
-        let other_bus = named(document(0x93, 0x7E1, 0x7E9, |p| {
-            p.baud_rate = 250_000;
+        // Names are compared ignoring case, as the workers resolve them (ADR-324 item 3).
+        let lower = named(document(0x93, 0x7E3, 0x7EB, grouped("cp_blocksize", 8)));
+        assert!(checked(&[first.clone(), lower]).is_ok());
+        let lower = named(document(0x93, 0x7E3, 0x7EB, grouped("cp_blocksize", 9)));
+        assert!(matches!(
+            checked(&[first.clone(), lower]),
+            Err(PlanRefused::ComParamsDiffer { .. })
+        ));
+        // Other presence groups of the bus, and links without a group, are not compared.
+        let other_group = named(document(0x94, 0x7E4, 0x7EC, |p| {
+            p.functional_id = 0x7DE;
             with_param("CP_BlockSize", 16)(p);
         }));
-        assert!(checked(&[first, other_bus]).is_ok());
+        let no_group = named(document(0x95, 0x7E5, 0x7ED, with_param("CP_BlockSize", 32)));
+        assert!(checked(&[first, other_group, no_group]).is_ok());
     }
 
     #[test]
-    fn the_presence_p2_is_the_longest_of_the_buss_links() {
+    fn differing_listed_timings_are_not_refused_and_the_largest_of_each_is_taken() {
+        let timed = |values: [(&'static str, i64); 4]| {
+            move |p: &mut ProtocolT| {
+                p.functional_id = 0x7DF;
+                for (name, value) in values {
+                    with_param(name, value)(p);
+                }
+            }
+        };
+        let first = named(document(
+            0x90,
+            0x7E0,
+            0x7E8,
+            timed([
+                ("CP_P2Max", 50_000),
+                ("CP_P2Star", 3_000_000),
+                ("CP_Cr", 1_000_000),
+                ("cp_p3func", 5_000),
+            ]),
+        ));
+        let second = named(document(
+            0x91,
+            0x7E1,
+            0x7E9,
+            timed([
+                ("CP_P2Max", 60_000),
+                ("CP_RC78CompletionTimeout", 30_000_000),
+                ("CP_Cr", 2_000_000),
+                ("CP_P3Func", 4_000),
+            ]),
+        ));
+        let group = &checked(&[first, second])
+            .unwrap()
+            .report()
+            .presence_groups()[0]
+            .clone();
+        assert_eq!(
+            (group.p2_max_ms, group.p2_star_ms, group.rc78_completion_ms),
+            (60, 5_000, 30_000)
+        );
+        assert_eq!(
+            group.timings,
+            [
+                ("cp_cr".to_owned(), 2_000_000),
+                ("cp_p3func".to_owned(), 5_000)
+            ]
+        );
+    }
+
+    #[test]
+    fn one_resource_at_two_baud_rates_is_refused_before_any_link_opens() {
+        let first = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        let second = named(document(0x91, 0x7E1, 0x7E9, |p| p.baud_rate = 250_000));
+        assert!(matches!(
+            checked(&[first.clone(), second.clone()]),
+            Err(PlanRefused::BaudRatesDiffer { first: a, second: b })
+                if a == hex(&first.0) && b == hex(&second.0)
+        ));
+    }
+
+    #[test]
+    fn the_presence_p2_is_the_longest_of_the_groups_links_whatever_their_order() {
         let timing = |p2_us: i64, functional_id: u32| {
             move |p: &mut ProtocolT| {
                 p.functional_id = functional_id;
                 with_param("CP_P2Max", p2_us)(p);
             }
         };
-        let fast = named(document(0x90, 0x7E0, 0x7E8, timing(50_000, 0x7DF)));
+        let group = |p2_max_ms| PresenceGroup {
+            bus: bus(500_000),
+            functional_id: 0x7DF,
+            p2_max_ms,
+            p2_star_ms: 5_000,
+            rc78_completion_ms: 25_000,
+            timings: Vec::new(),
+        };
         let slow = named(document(0x91, 0x7E1, 0x7E9, timing(100_001, 0x7DF)));
-        let report = checked(&[fast, slow]).unwrap().report();
-        // 100001 microseconds round up to 101 ms (ADR-324 item 3).
-        assert_eq!(
-            report.presence_groups(),
-            [PresenceGroup {
-                bus: bus(500_000),
-                functional_id: 0x7DF,
-                p2_max_ms: 101
-            }]
-        );
-        // A link without a functional identifier still counts for the bus's P2.
-        let slower = named(document(0x92, 0x7E2, 0x7EA, timing(200_000, 0)));
         let fast = named(document(0x90, 0x7E0, 0x7E8, timing(50_000, 0x7DF)));
-        let report = checked(&[fast, slower]).unwrap().report();
-        assert_eq!(report.presence_groups()[0].p2_max_ms, 200);
-        assert!(report.buses_without_presence().is_empty());
+        // 100001 microseconds round up to 101 ms (ADR-324 item 3).
+        let report = checked(&[slow.clone(), fast.clone()]).unwrap().report();
+        assert_eq!(report.presence_groups(), [group(101)]);
+        let report = checked(&[fast.clone(), slow]).unwrap().report();
+        assert_eq!(report.presence_groups(), [group(101)]);
+        // A link of another group or without one does not lengthen this group's window.
+        let other = named(document(0x92, 0x7E2, 0x7EA, timing(200_000, 0x7DE)));
+        let none = named(document(0x93, 0x7E3, 0x7EB, timing(300_000, 0)));
+        let report = checked(&[fast, other, none]).unwrap().report();
+        assert_eq!(report.presence_groups()[0], group(50));
+        assert_eq!(report.presence_groups()[1].p2_max_ms, 200);
+    }
+
+    #[test]
+    fn a_functional_id_is_as_wide_as_the_physical_ones_and_none_of_them() {
+        let wide = named(document(0x90, 0x7E0, 0x7E8, |p| p.functional_id = 0x800));
+        assert!(matches!(
+            checked(&[wide]),
+            Err(PlanRefused::BadFunctionalId {
+                functional_id: 0x800,
+                ..
+            })
+        ));
+        // The same value as another link's response identifier on the bus.
+        let first = named(document(0x90, 0x7E0, 0x7E8, |p| p.functional_id = 0x7E9));
+        let second = named(document(0x91, 0x7E1, 0x7E9, |_| {}));
+        assert!(matches!(
+            checked(&[first, second.clone()]),
+            Err(PlanRefused::BadFunctionalId {
+                functional_id: 0x7E9,
+                ..
+            })
+        ));
+        // And as its own request identifier.
+        let own = named(document(0x92, 0x7E0, 0x7E8, |p| p.functional_id = 0x7E0));
+        assert!(matches!(
+            checked(&[own]),
+            Err(PlanRefused::BadFunctionalId {
+                functional_id: 0x7E0,
+                ..
+            })
+        ));
     }
 
     #[test]
@@ -680,12 +906,15 @@ mod tests {
     #[test]
     fn a_bus_without_a_functional_id_has_no_presence_group_and_is_reported() {
         let first = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
-        let second = named(document(0x91, 0x7E1, 0x7E9, |p| p.functional_id = 0x7DF));
-        let third = named(document(0x92, 0x7E2, 0x7EA, |p| p.baud_rate = 250_000));
-        let report = checked(&[first, second, third]).unwrap().report();
+        let second = named(document(0x91, 0x7E1, 0x7E9, |_| {}));
+        let report = checked(&[first.clone(), second]).unwrap().report();
+        assert!(report.presence_groups().is_empty());
+        assert_eq!(report.buses_without_presence(), [bus(500_000)]);
+        // One link with a functional identifier gives the bus a group.
+        let third = named(document(0x92, 0x7E2, 0x7EA, |p| p.functional_id = 0x7DF));
+        let report = checked(&[first, third]).unwrap().report();
         assert_eq!(report.presence_groups().len(), 1);
-        assert_eq!(report.presence_groups()[0].bus, bus(500_000));
-        assert_eq!(report.buses_without_presence(), [bus(250_000)]);
+        assert!(report.buses_without_presence().is_empty());
     }
 
     #[test]

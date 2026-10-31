@@ -16,6 +16,9 @@ use thiserror::Error;
 /// changes with the vehicle definitions, a document with the declaration schema (ADR-395).
 pub const PLAN_SCHEMA_VERSION: u32 = 1;
 
+/// The characters of a VIN (ADR-261 item 3).
+pub const VIN_LEN: u8 = 17;
+
 /// The SHA-256 of a document's bytes.
 pub type Sha256 = [u8; 32];
 
@@ -49,7 +52,7 @@ pub struct IdentificationValue {
 pub struct VinRule {
     pub component: Component,
     pub value: String,
-    /// The first and last VIN position compared, from 1.
+    /// The first and last VIN position compared, from 1, both included.
     pub start: u8,
     pub end: u8,
     pub expected: String,
@@ -119,7 +122,6 @@ impl Selection {
 /// The plan. `schema_version` stays the first field: [`IdentificationPlan::decode`] reads it
 /// alone first, so a plan of another version is refused as such, not as a misparse.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct IdentificationPlan {
     pub schema_version: u32,
     pub selection: Selection,
@@ -142,6 +144,10 @@ pub enum PlanError {
         found: usize,
         expected: usize,
     },
+    #[error("{what}: {why}")]
+    Invalid { what: String, why: &'static str },
+    #[error("document {0} is listed under two definitions")]
+    SharedDocument(String),
     #[error("candidate id {0:?} is used twice")]
     DuplicateCandidate(String),
     #[error("definition id {0:?} is used twice")]
@@ -195,7 +201,14 @@ impl IdentificationPlan {
                 expected: PLAN_SCHEMA_VERSION,
             });
         }
+        let invalid = |what: String, why: &'static str| PlanError::Invalid { what, why };
         let expected = match self.selection {
+            Selection::Candidates if self.candidates.is_empty() => {
+                return Err(invalid(
+                    "candidates".to_owned(),
+                    "a Candidates plan holds none",
+                ));
+            }
             Selection::Candidates => self.candidates.len(),
             Selection::ChosenDefinition => 1,
             Selection::EveryEcu => 0,
@@ -208,28 +221,84 @@ impl IdentificationPlan {
             });
         }
         let mut definitions = HashSet::new();
+        let mut documents: HashSet<&Sha256> = HashSet::new();
         for definition in &self.definitions {
+            if definition.id.is_empty() {
+                return Err(invalid("a definition".to_owned(), "its id is empty"));
+            }
             if !definitions.insert(definition.id.as_str()) {
                 return Err(PlanError::DuplicateDefinition(definition.id.clone()));
             }
+            if definition.documents.is_empty() {
+                return Err(invalid(
+                    format!("definition {:?}", definition.id),
+                    "it lists no document",
+                ));
+            }
+            // Listing a document twice under one definition is harmless.
+            let own: HashSet<&Sha256> = definition.documents.iter().collect();
+            if let Some(shared) = own.iter().find(|hash| documents.contains(**hash)) {
+                return Err(PlanError::SharedDocument(hex(*shared)));
+            }
+            documents.extend(own);
         }
-        let documents: HashSet<&Sha256> = self
-            .definitions
-            .iter()
-            .flat_map(|definition| &definition.documents)
-            .collect();
         let mut candidates = HashSet::new();
         for candidate in &self.candidates {
+            if candidate.id.is_empty() {
+                return Err(invalid("a candidate".to_owned(), "its id is empty"));
+            }
             if !candidates.insert(candidate.id.as_str()) {
                 return Err(PlanError::DuplicateCandidate(candidate.id.clone()));
             }
-            let named = candidate.entries.iter().flat_map(|e| &e.alternatives);
-            for definition in named {
-                if !definitions.contains(definition.as_str()) {
-                    return Err(PlanError::UnknownDefinition {
-                        candidate: candidate.id.clone(),
-                        definition: definition.clone(),
-                    });
+            let at = |what: &str| format!("candidate {:?} {what}", candidate.id);
+            let mut roles = HashSet::new();
+            for entry in &candidate.entries {
+                if entry.role.is_empty() {
+                    return Err(invalid(at("entry"), "its role is empty"));
+                }
+                if !roles.insert(entry.role.as_str()) {
+                    return Err(invalid(
+                        at(&format!("role {:?}", entry.role)),
+                        "it is used twice",
+                    ));
+                }
+                if entry.alternatives.is_empty() {
+                    return Err(invalid(
+                        at(&format!("role {:?}", entry.role)),
+                        "it has no alternative",
+                    ));
+                }
+                for definition in &entry.alternatives {
+                    if !definitions.contains(definition.as_str()) {
+                        return Err(PlanError::UnknownDefinition {
+                            candidate: candidate.id.clone(),
+                            definition: definition.clone(),
+                        });
+                    }
+                }
+            }
+            for entry in &candidate.entries {
+                let Some(gateway) = &entry.gateway else {
+                    continue;
+                };
+                if *gateway == entry.role || !roles.contains(gateway.as_str()) {
+                    return Err(invalid(
+                        at(&format!("role {:?}", entry.role)),
+                        "its gateway is itself or names no role",
+                    ));
+                }
+            }
+            for rule in &candidate.vin_rules {
+                let length = u8::try_from(rule.expected.len());
+                if rule.start == 0
+                    || rule.start > rule.end
+                    || rule.end > VIN_LEN
+                    || length != Ok(rule.end - rule.start + 1)
+                {
+                    return Err(invalid(
+                        at(&format!("VIN rule {}..{}", rule.start, rule.end)),
+                        "the range is not within positions 1 to 17 or does not match the expected text",
+                    ));
                 }
             }
             let sources = candidate
@@ -436,5 +505,124 @@ mod tests {
                 document: "cc".repeat(32)
             })
         );
+    }
+
+    #[test]
+    fn the_version_is_read_before_the_rest_of_the_plan() {
+        // Version 2 followed by bytes that do not parse as version 1.
+        assert_eq!(
+            IdentificationPlan::decode(&[0x02, 0xFF, 0xFF]),
+            Err(PlanError::SchemaVersion {
+                found: 2,
+                expected: PLAN_SCHEMA_VERSION
+            })
+        );
+    }
+
+    fn invalid(what: &str, why: &'static str) -> Result<(), PlanError> {
+        Err(PlanError::Invalid {
+            what: what.to_owned(),
+            why,
+        })
+    }
+
+    #[test]
+    fn vin_rule_ranges_are_checked_against_positions_1_to_17_and_the_expected_text() {
+        let why = "the range is not within positions 1 to 17 or does not match the expected text";
+        for (start, end, expected) in [
+            (0, 1, "L"),
+            (3, 2, ""),
+            (17, 18, "LL"),
+            (10, 11, "L"),
+            (10, 10, "LL"),
+        ] {
+            let mut bad = plan();
+            let rule = &mut bad.candidates[0].vin_rules[0];
+            (rule.start, rule.end, rule.expected) = (start, end, expected.to_owned());
+            assert_eq!(
+                bad.validate(),
+                invalid(&format!("candidate \"c1\" VIN rule {start}..{end}"), why),
+                "{start}..{end} {expected:?}"
+            );
+        }
+        let mut last = plan();
+        let rule = &mut last.candidates[0].vin_rules[0];
+        (rule.start, rule.end, rule.expected) = (16, 17, "AB".to_owned());
+        assert_eq!(last.validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_document_listed_under_two_definitions_is_refused() {
+        let mut shared = plan();
+        shared.definitions.push(PlanDefinition {
+            id: "other".to_owned(),
+            documents: vec![DOC_B],
+        });
+        assert_eq!(
+            shared.validate(),
+            Err(PlanError::SharedDocument("bb".repeat(32)))
+        );
+        // Twice under one definition is harmless (`plan()` lists DOC_A twice).
+        assert_eq!(plan().validate(), Ok(()));
+    }
+
+    #[test]
+    fn a_plan_that_names_nothing_usable_is_refused() {
+        let mut none = plan();
+        none.candidates.clear();
+        assert_eq!(
+            none.validate(),
+            invalid("candidates", "a Candidates plan holds none")
+        );
+        let mut empty = plan();
+        empty.candidates[0].id.clear();
+        assert_eq!(empty.validate(), invalid("a candidate", "its id is empty"));
+        let mut empty = plan();
+        empty.definitions[0].id.clear();
+        assert_eq!(empty.validate(), invalid("a definition", "its id is empty"));
+        let mut empty = plan();
+        empty.definitions[0].documents.clear();
+        assert_eq!(
+            empty.validate(),
+            invalid("definition \"ecu\"", "it lists no document")
+        );
+        let mut empty = plan();
+        empty.candidates[0].entries[0].role.clear();
+        assert_eq!(
+            empty.validate(),
+            invalid("candidate \"c1\" entry", "its role is empty")
+        );
+        let mut empty = plan();
+        empty.candidates[0].entries[0].alternatives.clear();
+        assert_eq!(
+            empty.validate(),
+            invalid("candidate \"c1\" role \"engine\"", "it has no alternative")
+        );
+    }
+
+    #[test]
+    fn roles_are_unique_and_a_gateway_names_another_role() {
+        let mut twice = plan();
+        let first = twice.candidates[0].entries[0].clone();
+        twice.candidates[0].entries.push(first);
+        assert_eq!(
+            twice.validate(),
+            invalid("candidate \"c1\" role \"engine\"", "it is used twice")
+        );
+        let why = "its gateway is itself or names no role";
+        for gateway in ["engine", "gone"] {
+            let mut bad = plan();
+            bad.candidates[0].entries[0].gateway = Some(gateway.to_owned());
+            assert_eq!(
+                bad.validate(),
+                invalid("candidate \"c1\" role \"engine\"", why)
+            );
+        }
+        let mut good = plan();
+        let mut behind = good.candidates[0].entries[0].clone();
+        behind.role = "gateway".to_owned();
+        good.candidates[0].entries[0].gateway = Some("gateway".to_owned());
+        good.candidates[0].entries.push(behind);
+        assert_eq!(good.validate(), Ok(()));
     }
 }

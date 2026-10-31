@@ -1445,13 +1445,16 @@ it yet.
   each given with the hash it is named by. A missing document, a document whose bytes hash to
   something else and a document that does not load refuse the plan.
 - `check_plan` refuses a plan that names, in a variant pattern or a rule source, a service that
-  is not declared or not in the read-only set of the variant's layer, or a field the response
-  lacks, and a plan whose declared links on one bus differ in a ComParam other than the three
-  timings. A declared link that ADR-324 refuses is reported, not refused.
+  is not declared or not in the read-only set of the variant's layer (a variant with no protocol
+  or layer judges nothing read-only), or a field the response lacks; one resource at two baud
+  rates; a functional identifier wider than 11 bits or equal to a physical identifier of the bus;
+  and declared links of one presence group (bus and functional identifier) that differ in a
+  ComParam other than the listed timings (ADR-395 item 6), which are not compared. A declared link that ADR-324 refuses is reported, not
+  refused. `load_plan` also refuses the structural errors listed in ADR-395 item 3.
 - `CheckedPlan::report` derives the `IdentificationReport`: the plan's selection (candidates, a definition chosen by
   hand, or every ECU; only the first narrows), the candidate ids, one entry per
   endpoint (bus, request and response identifier) with the documents on it, the presence groups
-  (bus and functional identifier) with the bus's longest P2, the buses that have no group, the
+  (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
   documents whose link is refused, and an empty presence section.
 
 The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two

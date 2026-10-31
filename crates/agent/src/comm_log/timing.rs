@@ -39,6 +39,12 @@ pub(crate) type At = Option<(Clock, Placed)>;
 #[derive(Debug, Clone, Copy, Default)]
 pub(crate) struct Times<'a> {
     pub transmit: At,
+    /// The point the limit in force runs from; `None` is the transmit, `Some(None)` a point
+    /// whose place is not known. A request that collects every answer restarts its window at
+    /// each answer, so an answer after the first is judged from the end of the one before it
+    /// (ADR-400). The response time and the interval from the latest pending stay measured from
+    /// the transmit; the pendings, the start, the end and the timeout are those of this window.
+    pub window_from: Option<At>,
     /// The pendings seen, in order.
     pub pendings: &'a [At],
     pub start: At,
@@ -112,10 +118,25 @@ pub(crate) fn judge(limits: Limits, absorbing: bool, times: Times<'_>) -> Timing
     };
     // The pendings seen, in microseconds from the transmit, up to the first that is not on the
     // transmit's clock and epoch: the limit in force is known only up to that one.
-    let known: Vec<i64> = times.pendings.iter().map_while(|at| since(*at)).collect();
-    let start = since(times.start);
-    let end = since(times.end);
-    let timeout = since(times.timeout);
+    // The limit in force runs from the window's start: the transmit, or where `window_from` is.
+    // A window start on another clock or epoch leaves every comparison open.
+    let from = match times.window_from {
+        None => Some(0),
+        Some(at) => since(at),
+    };
+    let Some(from) = from else {
+        not_judged(&mut timing, NotJudgedReason::OtherClock);
+        return timing;
+    };
+    let in_window = |at: At| since(at).map(|us| us - from);
+    let known: Vec<i64> = times
+        .pendings
+        .iter()
+        .map_while(|at| in_window(*at))
+        .collect();
+    let start = in_window(times.start);
+    let end = in_window(times.end);
+    let timeout = in_window(times.timeout);
     if [start, end, timeout]
         .into_iter()
         .flatten()
@@ -1109,6 +1130,93 @@ mod tests {
         assert_eq!(
             judged(false, nothing).2,
             Some(NotJudgedReason::NoTimeToJudge)
+        );
+    }
+
+    /// ADR-400: a window restarted at an earlier answer's end judges an answer from that point,
+    /// while its response time stays measured from the transmit.
+    #[test]
+    fn an_answer_is_judged_from_the_window_it_closes() {
+        // The first answer ended 30 ms after the transmit; the second starts 1 s after the
+        // transmit, 970 ms after it: within P2 of 50 ms only measured from the first.
+        let from = at(30_000);
+        let second = |window_from, start| Times {
+            transmit: transmit(),
+            window_from,
+            start: at(start),
+            ..Times::default()
+        };
+        let timing = judge(LIMITS, false, second(Some(from), 79_000));
+        assert_eq!(timing.window, Window::WithinP2);
+        assert_eq!(timing.response_ms, Some(79.0));
+        assert_eq!(
+            judged(false, second(Some(from), 82_001)),
+            (Window::Late, Some(2.001), None)
+        );
+        // From the transmit the same start is late already.
+        assert_eq!(judged(false, second(None, 79_000)).0, Window::Late);
+        // A window start whose place is not known judges nothing; the response time stays.
+        let timing = judge(LIMITS, false, second(Some(None), 79_000));
+        assert_eq!(timing.window, Window::NotJudged);
+        assert_eq!(timing.not_judged_reason, Some(NotJudgedReason::OtherClock));
+        assert_eq!(timing.response_ms, Some(79.0));
+        // On another clock or epoch it is not known either.
+        assert_eq!(
+            judged(false, second(Some(on(1, 1_030_000)), 79_000)).2,
+            Some(NotJudgedReason::OtherClock)
+        );
+    }
+
+    /// The pendings of a restarted window run from its start, and the window's end is a timeout
+    /// at the limit from the last answer.
+    #[test]
+    fn a_restarted_window_counts_its_pendings_and_its_timeout_from_its_start() {
+        let pendings = [at(40_000)];
+        let times = |timeout| Times {
+            transmit: transmit(),
+            window_from: Some(at(30_000)),
+            pendings: &pendings,
+            timeout: at(timeout),
+            ..Times::default()
+        };
+        // P2* (5 s) from the pending, which came 10 ms into the window.
+        assert_eq!(judged(false, times(5_040_000)).0, Window::TimeoutAtLimit);
+        assert_eq!(judged(false, times(100_000)).0, Window::TimeoutEarly);
+        // A pending later than P2 into its window is late whatever follows.
+        let late = [at(30_000 + 53_000)];
+        let timing = judge(
+            LIMITS,
+            false,
+            Times {
+                pendings: &late,
+                ..times(5_000_000)
+            },
+        );
+        assert_eq!(timing.window, Window::Late);
+        assert_eq!(timing.late_pending, Some(0));
+    }
+
+    /// A start is judged both ways and an end only as proof of being on time, also in a
+    /// restarted window.
+    #[test]
+    fn a_start_is_judged_by_itself_in_a_restarted_window() {
+        let times = |start: At, end: At| Times {
+            transmit: transmit(),
+            window_from: Some(at(1_000_000)),
+            start,
+            end,
+            end_len: Some(20),
+            ..Times::default()
+        };
+        // The end alone, 100 ms into the window, proves nothing about a multi-frame response.
+        assert_eq!(
+            judged(false, times(None, at(1_100_000))).2,
+            Some(NotJudgedReason::EndAfterLimit)
+        );
+        // Its start, within P2 of the window's start, does.
+        assert_eq!(
+            judged(false, times(at(1_040_000), at(1_100_000))).0,
+            Window::WithinP2
         );
     }
 }

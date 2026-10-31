@@ -449,7 +449,17 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   neither the classification nor `link_history`, except that a primitive that ended with no answer
   after a rejected result of positive form gives that response as the entry's outcome,
   `positive_unusable` (`unanswered_end`, `Evidence::end_rejected`), redacted as a rejected result
-  and counted for no answer in `link_history`; the job still gets no answer. Lost events end the wait at the worker's first
+  and counted for no answer in `link_history`; the job still gets no answer. An ordinary
+  primitive keeps its first answering result as its response and its times; when the worker
+  binds more than one answering result to it, the entry lists all of them in `answers` (ADR-400).
+  A collecting request (the presence request) takes no response times for its entry and lists
+  every answer: each is placed on its clock (`clock`, `epoch`), judged from the end of the answer
+  before it, with its pendings kept per response identifier, and classified as an exchange of its
+  own (`Evidence::as_answer`) against its own link history, with its response time from the
+  transmit. The entry's classification is the most severe of its answers' (design 8.11
+  `answers`); its `timing` judges where the window ended, by the primitive's finished item when
+  that is on the clock the answers are, and its transmit done comes from the first answer that
+  carries one. Lost events end the wait at the worker's first
   report, which the entry records in `events_lost` with the agent time it was read. When the
   agent's own deadline, not the
   worker's receive timeout, ends an exchange with no response, the entry's outcome is

@@ -1,7 +1,7 @@
 # ADR-345: The Agent Builds Its Source Table From the Job's Document
 
 **Date:** 2026-10-22
-**Status:** Accepted
+**Status:** Accepted (item 3's VIN shape is also the check of an identification plan's VIN sources, by ADR-399)
 **Affects:** `agent` (`inputs.rs`: `ServiceSources::from_document`, `TableError::Document`;
 `runner.rs`: `check_job`, `JobError::Sources`, the journal setup's table; `journaling.rs`:
 `JournalSetup::sources`), design 8.9; ADR-245, ADR-336, ADR-338

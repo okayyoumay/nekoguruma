@@ -2,7 +2,7 @@
 //! the link's RPCs, refuses what a test tells it to, and gives each started primitive the
 //! events its script lists (ADR-396).
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -16,7 +16,7 @@ use vci_service_interface::{
 };
 use worker_host::client::WorkerClient;
 
-use super::tests::{checked, document, named};
+use super::tests::{checked, checked_vin, document, document_reading, named};
 use super::*;
 use crate::comm_log::{CommLogSetup, VciFacts};
 use crate::guards::GuardSetup;
@@ -28,6 +28,12 @@ enum Item {
     Answer(u32, &'static [u8]),
     /// A result bound to an earlier primitive: a late answer.
     Late(u32, &'static [u8]),
+    /// A result bound to the primitive, on the response identifier, with owned bytes.
+    Reply(u32, Vec<u8>),
+    /// Answer the primitive as the simulated ECU of the link's request identifier would, if the
+    /// fake has ECUs (`State::ecus`); the script of a primitive that has none is this when the
+    /// script queue is empty and the link is physical.
+    Routed,
     /// The primitive's finished status.
     Finish,
     /// The worker reports lost events.
@@ -71,6 +77,47 @@ struct State {
     max_open_links: usize,
     cops: u32,
     events: Option<Sender>,
+    /// Simulated ECUs by physical request identifier (the link's table of one pair). Each physical primitive whose script is
+    /// [`Item::Routed`] (or that has none, once the script queue is empty) is answered by the
+    /// ECU of the link's request identifier, with the response identifier the link was set to;
+    /// a link of an identifier without an ECU, and a functional link, get no answer.
+    ecus: HashMap<u32, sim_ecu::SimEcu>,
+    /// The request identifiers and the requests the ECUs were given, in order.
+    served: Vec<(u32, Vec<u8>)>,
+    /// What the link being opened was set to.
+    current: LinkIds,
+    /// Sets the flag when the n-th primitive (from 1) starts.
+    cancel_at_start: Option<(u32, Arc<AtomicBool>)>,
+}
+
+/// What the link being opened was set to: the pair of its receive table when it has one, and
+/// whether it is functional.
+#[derive(Default)]
+struct LinkIds {
+    request: Option<u32>,
+    response: Option<u32>,
+    functional: bool,
+}
+
+impl State {
+    /// The events of the simulated ECU's answer to `request` on the current link, if it is a
+    /// physical link of an identifier that has an ECU.
+    fn route(&mut self, request: &[u8]) -> Option<Vec<Item>> {
+        let (tx, rx) = (self.current.request?, self.current.response?);
+        if self.current.functional {
+            return None;
+        }
+        let ecu = self.ecus.get_mut(&tx)?;
+        self.served.push((tx, request.to_vec()));
+        let answer = ecu.request_with(sim_ecu::Addressing::Physical, request);
+        let mut items: Vec<Item> = answer
+            .to_bytes()
+            .map(|bytes| Item::Reply(rx, bytes))
+            .into_iter()
+            .collect();
+        items.push(Item::Finish);
+        Some(items)
+    }
 }
 
 #[derive(Clone, Default)]
@@ -202,6 +249,7 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         }
         state.open_links += 1;
         state.max_open_links = state.max_open_links.max(state.open_links);
+        state.current = LinkIds::default();
         Ok(tonic::Response::new(
             vci_service_interface::ComLogicalLinkResponse {
                 cll_handle: Some(ComLogicalLinkHandle {
@@ -269,6 +317,9 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         {
             let mut state = self.state();
             let name = state.comparams[usize::try_from(id - 1).unwrap()].clone();
+            if name == "cp_canfuncreqid" {
+                state.current.functional = true;
+            }
             state.set.push((name, value));
         }
         ok()
@@ -283,13 +334,20 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         let cycles = request
             .cop_ctrl_data
             .map_or(0, |ctrl| ctrl.num_receive_cycles);
-        state.starts.push((request.cop_data, cycles));
+        state.starts.push((request.cop_data.clone(), cycles));
         state.cops += 1;
         let cop_handle = 100 + state.cops;
-        let script = state
-            .scripts
-            .pop_front()
-            .unwrap_or_else(|| vec![Item::Finish]);
+        if let Some((nth, flag)) = &state.cancel_at_start
+            && *nth == state.cops
+        {
+            flag.store(true, std::sync::atomic::Ordering::Relaxed);
+        }
+        let script = match state.scripts.pop_front() {
+            Some(script) if !matches!(script.as_slice(), [Item::Routed]) => script,
+            _ => state
+                .route(&request.cop_data)
+                .unwrap_or_else(|| vec![Item::Finish]),
+        };
         let handle = ComPrimitiveHandle {
             module_handle: 1,
             cll_handle: 1,
@@ -299,6 +357,8 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         for item in script {
             let (cop, data) = match item {
                 Item::Answer(id, bytes) => (Some(handle), result(id, bytes)),
+                Item::Reply(id, bytes) => (Some(handle), result(id, &bytes)),
+                Item::Routed => continue,
                 Item::Late(id, bytes) => (
                     Some(ComPrimitiveHandle {
                         cop_handle: cop_handle - 1,
@@ -434,6 +494,11 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
             .collect();
         let mut state = self.state();
         let len = table.len();
+        // A physical link's table is its one pair, which routes its primitives to an ECU.
+        if let [(request, response)] = table[..] {
+            state.current.request = Some(request);
+            state.current.response = Some(response);
+        }
         state.tables.push(table);
         if let Some(status) = state.table_script.pop_front() {
             return Err(status);
@@ -516,7 +581,25 @@ struct Ran {
 }
 
 async fn run_with(plan: CheckedPlan, fake: Fake, limits: JobLimits, cancel: bool) -> Ran {
-    let dir = tempfile::tempdir().unwrap();
+    run_shared(
+        plan,
+        fake,
+        limits,
+        Arc::new(AtomicBool::new(cancel)),
+        tempfile::tempdir().unwrap(),
+    )
+    .await
+}
+
+/// [`run_with`] with a cancel flag the caller keeps and a directory it may take locks in
+/// (`dir/locks`).
+async fn run_shared(
+    plan: CheckedPlan,
+    fake: Fake,
+    limits: JobLimits,
+    cancel: Arc<AtomicBool>,
+    dir: tempfile::TempDir,
+) -> Ran {
     let setup = CommLogSetup::for_run(dir.path().join("log")).unwrap();
     let guards = JobGuards::take_vci_only(
         &GuardSetup {
@@ -537,7 +620,7 @@ async fn run_with(plan: CheckedPlan, fake: Fake, limits: JobLimits, cancel: bool
             api: crate::launch::Api::J2534,
             long_size: 8,
         }),
-        Arc::new(AtomicBool::new(cancel)),
+        cancel,
     )
     .await;
     let log = std::fs::read_to_string(setup.path().unwrap())
@@ -1396,4 +1479,522 @@ async fn a_hung_worker_that_cannot_be_ended_ends_the_run_with_the_guards_marked(
     );
     assert!(run.guards.link_unconfirmed());
     assert!(events.is_empty(), "{events:?}");
+}
+
+// ---------------------------------------------------------------- The VIN phase (ADR-399)
+
+const VIN_A: &str = "WVWZZZ1JZ3W386752";
+const VIN_B: &str = "1HGCM82633A004352";
+
+/// A fake whose physical primitives are answered by simulated ECUs, one per request identifier,
+/// each with its VIN.
+fn fake_with(ecus: &[(u32, &str)]) -> Fake {
+    let fake = Fake::default();
+    for &(tx, vin) in ecus {
+        fake.state().ecus.insert(
+            tx,
+            sim_ecu::SimEcu::new(sim_ecu::EcuConfig {
+                vin: vin.to_owned(),
+                ..Default::default()
+            }),
+        );
+    }
+    fake
+}
+
+/// A document on `endpoint` (with the functional identifier of the presence tests) whose
+/// service 1 reads data identifier F1`did` as 17 bytes of text. F190 is the simulated ECU's VIN.
+fn reader(did: u8, endpoint: (u32, u32)) -> (Sha256, Vec<u8>) {
+    named(document_reading(did, 17, endpoint.0, endpoint.1, |p| {
+        p.functional_id = 0x7DF
+    }))
+}
+
+/// A plan of `Candidates` over `documents`, with a VIN rule for the first position of each
+/// document listed in `rules`, expecting the text given.
+fn vin_plan_of(documents: &[(Sha256, Vec<u8>)], rules: &[(usize, &str)]) -> CheckedPlan {
+    let rules: Vec<(usize, u8, u8, &str)> = rules
+        .iter()
+        .map(|&(at, expected)| (at, 1, 1, expected))
+        .collect();
+    checked_vin(documents, Selection::Candidates, &rules).expect("a valid plan")
+}
+
+/// A plan reading the VIN of each document, whatever the first character is.
+fn reading_all(documents: &[(Sha256, Vec<u8>)]) -> CheckedPlan {
+    let rules: Vec<(usize, &str)> = (0..documents.len()).map(|at| (at, "W")).collect();
+    vin_plan_of(documents, &rules)
+}
+
+fn vin(text: &str) -> crate::journal::Vin {
+    crate::journal::Vin::new(text.to_owned())
+}
+
+fn outcomes(report: &IdentificationReport) -> Vec<Vec<VinOutcome>> {
+    report
+        .vin_reads()
+        .iter()
+        .map(|read| read.sources.iter().map(|s| s.outcome.clone()).collect())
+        .collect()
+}
+
+fn origins(ran: &Ran) -> Vec<&str> {
+    ran.exchanges()
+        .iter()
+        .map(|exchange| exchange["origin"].as_str().unwrap())
+        .collect()
+}
+
+/// ADR-399: a plan that names no VIN rule opens no VIN link and sends no VIN request, and
+/// establishes nothing (no lock is taken).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_without_a_vin_rule_reads_no_vin() {
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    let ran = run(plan_of(&[A, B], Some(0x7DF)), fake.clone()).await;
+    let report = ran.report();
+    assert!(report.vin_reads().is_empty() && report.vin().is_none());
+    assert!(report.vins_seen().is_empty() && report.vin_rules().is_empty());
+    assert!(!report.vin_interrupted() && !report.vehicle_lock_held());
+    assert!(fake.state().served.is_empty());
+    assert_eq!(fake.state().starts.len(), 1, "only the presence request");
+    assert_eq!(fake.count("ModuleConnect"), 1);
+    assert!(!ran.run.guards.holds_vehicle());
+}
+
+/// ADR-399 items 1 and 3: a first read that does not decode does not block a second that does:
+/// the VIN is the second's, each read had its own link (one open at a time), the VIN went to the
+/// communication log's `identity` event as it was read, the rules stand to it as the report
+/// says, and the job holds the vehicle's lock when it returns.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_second_read_that_decodes_gives_the_vin_when_the_first_does_not() {
+    // F186 answers one byte, which a 17-byte field does not decode from.
+    let documents = [reader(0x86, A), reader(0x90, B)];
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_B)]);
+    let plan = vin_plan_of(&documents, &[(0, "W"), (1, "1")]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.vin(), Some(&vin(VIN_B)));
+    assert_eq!(report.vins_seen(), [vin(VIN_B)]);
+    assert_eq!(
+        outcomes(report),
+        [
+            vec![VinOutcome::Undecodable],
+            vec![VinOutcome::Decoded(vin(VIN_B))]
+        ]
+    );
+    assert_eq!(report.vin_reads()[0].accepted, None);
+    assert_eq!(report.vin_reads()[1].accepted, Some(vin(VIN_B)));
+    assert_eq!(
+        report.vin_reads()[1].endpoint.as_ref().map(|e| e.tx_id),
+        Some(B.0)
+    );
+    let results: Vec<_> = report.vin_rules().iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        results,
+        [VinRuleOutcome::NotMatched, VinRuleOutcome::Matched],
+        "reported, and nothing dropped"
+    );
+    assert_eq!(report.candidates(), ["c1"]);
+    assert!(!report.vin_interrupted() && report.vehicle_lock_held());
+    assert!(ran.run.guards.holds_vehicle());
+    let state = fake.state();
+    assert_eq!(
+        state.served,
+        [(A.0, vec![0x22, 0xF1, 0x86]), (B.0, vec![0x22, 0xF1, 0x90])]
+    );
+    assert_eq!(state.max_open_links, 1);
+    assert_eq!(state.open_links, 0);
+    drop(state);
+    assert_eq!(fake.count("ModuleConnect"), 3);
+    assert_eq!(origins(&ran), ["identification"; 3]);
+    let identities: Vec<_> = ran
+        .log
+        .iter()
+        .filter(|line| line["event"] == "identity")
+        .collect();
+    assert_eq!(identities.len(), 2, "{:#?}", ran.log);
+    assert_eq!(identities[0]["outcome"], "unreadable");
+    assert_eq!(identities[1]["kind"], "vin");
+    assert_eq!(identities[1]["text"], VIN_B);
+    let json = serde_json::to_value(report).unwrap();
+    assert_eq!(json["vin"], VIN_B);
+    assert_eq!(json["vehicle_lock_held"], true);
+}
+
+/// ADR-399 item 3: two reads that give different well-formed VINs establish none, both are
+/// reported, no lock is taken, and the rules are not evaluated.
+#[tokio::test(flavor = "multi_thread")]
+async fn reads_that_give_different_vins_establish_none() {
+    let documents = [reader(0x90, A), reader(0x90, B)];
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_B)]);
+    let ran = run(reading_all(&documents), fake).await;
+    let report = ran.report();
+    assert_eq!(report.vin(), None);
+    assert_eq!(report.vins_seen(), [vin(VIN_A), vin(VIN_B)]);
+    assert_eq!(
+        outcomes(report),
+        [
+            vec![VinOutcome::Decoded(vin(VIN_A))],
+            vec![VinOutcome::Decoded(vin(VIN_B))]
+        ]
+    );
+    assert!(!report.vin_interrupted() && !report.vehicle_lock_held());
+    assert!(
+        report
+            .vin_rules()
+            .iter()
+            .all(|r| r.outcome == VinRuleOutcome::Unevaluated)
+    );
+    assert!(!ran.run.guards.holds_vehicle());
+}
+
+/// ADR-399 item 1: the one response of a read is decoded with every declaration of it, sent once,
+/// and the read is accepted when all give one well-formed VIN. (The ADR-345 table admits only a
+/// 17-byte text field that ends the response, so declarations of one request read the same bytes
+/// and cannot disagree; `accepted_vin`'s test covers the disagreement the rule guards against.)
+#[tokio::test(flavor = "multi_thread")]
+async fn one_response_is_decoded_with_every_declaration_of_its_read() {
+    let first = reader(0x90, A);
+    let second = named(super::tests::edited(&first.1, |variant| {
+        variant.short_name = Some("other".into())
+    }));
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    let ran = run(reading_all(&[first, second]), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.vin_reads().len(), 1, "one request, one read");
+    assert_eq!(
+        outcomes(report),
+        [vec![
+            VinOutcome::Decoded(vin(VIN_A)),
+            VinOutcome::Decoded(vin(VIN_A))
+        ]]
+    );
+    assert_eq!(report.vin_reads()[0].accepted, Some(vin(VIN_A)));
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert_eq!(
+        fake.state().served.len(),
+        1,
+        "sent once for both declarations"
+    );
+    let identities = ran
+        .log
+        .iter()
+        .filter(|line| line["event"] == "identity")
+        .count();
+    assert_eq!(identities, 2, "each declaration's reading is noted");
+}
+
+#[test]
+fn a_read_is_accepted_when_all_its_sources_gave_one_vin() {
+    let decoded = |text| VinOutcome::Decoded(vin(text));
+    assert_eq!(accepted_vin(&[]), None);
+    assert_eq!(accepted_vin(&[decoded(VIN_A)]), Some(vin(VIN_A)));
+    assert_eq!(
+        accepted_vin(&[decoded(VIN_A), decoded(VIN_A)]),
+        Some(vin(VIN_A))
+    );
+    assert_eq!(accepted_vin(&[decoded(VIN_A), decoded(VIN_B)]), None);
+    assert_eq!(
+        accepted_vin(&[decoded(VIN_A), VinOutcome::NotWellFormed]),
+        None
+    );
+    assert_eq!(accepted_vin(&[VinOutcome::NoAnswer, decoded(VIN_A)]), None);
+}
+
+/// ADR-399 item 4: a source whose document declares a link ADR-324 refuses is reported
+/// `LinkRefused`, no link is opened for it, and the other sources decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_link_is_reported_and_the_other_sources_decide() {
+    let refused = named(document_reading(0x90, 17, B.0, B.1, |p| {
+        p.functional_id = 0x7DF;
+        p.extended_addressing = true;
+    }));
+    let documents = [refused, reader(0x90, A)];
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_B)]);
+    let ran = run(reading_all(&documents), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(
+        outcomes(report),
+        [
+            vec![VinOutcome::LinkRefused],
+            vec![VinOutcome::Decoded(vin(VIN_A))]
+        ]
+    );
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert_eq!(report.vin_reads()[0].endpoint, None);
+    assert_eq!(
+        fake.count("ModuleConnect"),
+        2,
+        "the presence link and one read"
+    );
+    assert_eq!(fake.state().served.len(), 1);
+    assert!(report.vehicle_lock_held());
+}
+
+/// ADR-399 item 1 and ADR-392: a request nobody answers is sent again within
+/// `max_primitive_repeats` (origin `repeat`) and reported `NoAnswer`; a negative response is
+/// reported with its code; neither blocks the read that decodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn no_answer_and_a_negative_response_do_not_block_the_read_that_decodes() {
+    // No ECU answers on A; B has no such data identifier; C has the VIN.
+    let documents = [reader(0x90, A), reader(0x77, B), reader(0x90, C)];
+    let fake = fake_with(&[(B.0, VIN_B), (C.0, VIN_A)]);
+    let ran = run(reading_all(&documents), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(
+        outcomes(report),
+        [
+            vec![VinOutcome::NoAnswer],
+            vec![VinOutcome::Negative(0x31)],
+            vec![VinOutcome::Decoded(vin(VIN_A))]
+        ]
+    );
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert!(!report.vin_interrupted());
+    // The presence request, three sends to A (the limit's two repeats), one each to B and C.
+    assert_eq!(fake.state().starts.len(), 6);
+    assert_eq!(
+        origins(&ran),
+        [
+            "identification",
+            "identification",
+            "repeat",
+            "repeat",
+            "identification",
+            "identification"
+        ]
+    );
+}
+
+/// ADR-399 and ADR-396 item 6: a presence phase whose bounds ran out leaves the VIN phase not
+/// run: no VIN link, every source `NotRead`, `vin_interrupted`, nothing established.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_presence_phase_leaves_the_vin_phase_unrun() {
+    let documents = [reader(0x90, A), reader(0x90, B)];
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_A)]);
+    fake.state().scripts = (0..5)
+        .map(|_| vec![Item::Answer(A.1, POSITIVE), Item::LostEvents, Item::Finish])
+        .collect();
+    let limits = JobLimits {
+        max_primitive_repeats: 1,
+        ..limits()
+    };
+    let ran = run_with(reading_all(&documents), fake.clone(), limits, false).await;
+    let report = ran.report();
+    assert!(report.presence_interrupted() && report.vin_interrupted());
+    assert_eq!(
+        outcomes(report),
+        [vec![VinOutcome::NotRead], vec![VinOutcome::NotRead]]
+    );
+    assert!(report.vin().is_none() && !report.vehicle_lock_held());
+    assert!(fake.state().served.is_empty());
+    assert_eq!(fake.count("ModuleConnect"), 1);
+}
+
+/// ADR-399 item 3: the bounds running out in a VIN read (the VCI lost again after the request
+/// was sent again) leaves that read and the ones after it `NotRead`, establishes no VIN even
+/// though an earlier read accepted one, and takes no lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounds_that_run_out_in_a_vin_read_establish_nothing() {
+    let documents = [reader(0x90, A), reader(0x90, B), reader(0x90, C)];
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_A), (C.0, VIN_A)]);
+    // The presence request; the first read, served by its ECU; the second read, whose VCI is lost
+    // on the request and again on the one sent again.
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Finish],
+        vec![Item::Routed],
+        vec![Item::VciLost],
+        vec![Item::VciLost],
+    ]);
+    let limits = JobLimits {
+        max_primitive_repeats: 1,
+        ..limits()
+    };
+    let ran = run_with(reading_all(&documents), fake.clone(), limits, false).await;
+    let report = ran.report();
+    assert_eq!(
+        outcomes(report),
+        [
+            vec![VinOutcome::Decoded(vin(VIN_A))],
+            vec![VinOutcome::NotRead],
+            vec![VinOutcome::NotRead]
+        ]
+    );
+    assert_eq!(report.vins_seen(), [vin(VIN_A)]);
+    assert!(report.vin().is_none() && report.vin_interrupted());
+    assert!(!report.presence_interrupted() && !report.vehicle_lock_held());
+    assert!(!ran.run.guards.holds_vehicle());
+    assert_eq!(fake.state().served.len(), 1, "the third read was not made");
+    assert_eq!(fake.state().open_links, 0);
+}
+
+/// ADR-399 and ADR-393: a VCI lost in a VIN read opens the link again and sends the request
+/// again with the origin `repeat`, and the read then decodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vci_lost_in_a_vin_read_reopens_the_link_and_sends_it_again() {
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    fake.state().scripts =
+        VecDeque::from([vec![Item::Finish], vec![Item::VciLost], vec![Item::Routed]]);
+    let ran = run(reading_all(&[reader(0x90, A)]), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert_eq!(fake.count("ModuleConnect"), 3, "the link was opened again");
+    assert_eq!(fake.state().max_open_links, 1);
+    assert_eq!(
+        origins(&ran),
+        ["identification", "identification", "repeat"]
+    );
+}
+
+/// ADR-396 item 6 and ADR-399: the link reopens are counted over the run, not per phase: a limit
+/// of one, used by the presence phase, leaves none for a VIN read that loses the VCI.
+#[tokio::test(flavor = "multi_thread")]
+async fn link_reopens_are_counted_over_the_presence_and_the_vin_phases() {
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    fake.state().scripts = VecDeque::from([
+        vec![Item::VciLost],
+        vec![Item::Finish],
+        vec![Item::VciLost],
+        vec![Item::Routed],
+    ]);
+    let limits = JobLimits {
+        max_link_reopens: 1,
+        ..limits()
+    };
+    let ran = run_with(reading_all(&[reader(0x90, A)]), fake.clone(), limits, false).await;
+    let report = ran.report();
+    assert!(
+        !report.presence_interrupted(),
+        "the presence phase reopened once"
+    );
+    assert!(report.vin_interrupted() && report.vin().is_none());
+    assert_eq!(outcomes(report), [vec![VinOutcome::NotRead]]);
+    assert!(fake.state().served.is_empty());
+}
+
+/// ADR-399: a cancel that comes in once the presence phase has sent ends the run in
+/// `Cancelled` before any VIN link opens, and no lock is held.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_before_the_vin_phase_ends_the_run_with_no_vin_link() {
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    let cancel = Arc::new(AtomicBool::new(false));
+    fake.state().cancel_at_start = Some((1, Arc::clone(&cancel)));
+    let ran = run_shared(
+        reading_all(&[reader(0x90, A)]),
+        fake.clone(),
+        limits(),
+        cancel,
+        tempfile::tempdir().unwrap(),
+    )
+    .await;
+    assert!(matches!(ran.run.result, Err(JobError::Cancelled)));
+    assert_eq!(fake.count("ModuleConnect"), 1);
+    assert!(fake.state().served.is_empty());
+    assert!(!ran.run.guards.holds_vehicle());
+}
+
+/// ADR-399 and design 8.8.2: a definition the operator chose by hand reads the VIN its rule names
+/// like any plan: read, reported, and the vehicle's lock taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_plan_with_a_vin_rule_reads_reports_and_takes_the_lock() {
+    let documents = [reader(0x90, A)];
+    let plan = checked_vin(
+        &documents,
+        Selection::ChosenDefinition,
+        &[(0, 10, 10, "3"), (0, 1, 3, "WVX")],
+    )
+    .unwrap();
+    let ran = run(plan, fake_with(&[(A.0, VIN_A)])).await;
+    let report = ran.report();
+    assert_eq!(report.selection(), Selection::ChosenDefinition);
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    let results: Vec<_> = report.vin_rules().iter().map(|r| r.outcome).collect();
+    assert_eq!(
+        results,
+        [VinRuleOutcome::Matched, VinRuleOutcome::NotMatched]
+    );
+    assert!(report.vehicle_lock_held() && ran.run.guards.holds_vehicle());
+}
+
+/// A run that reads the VIN while another job (of another VCI) holds the vehicle's lock, stopped
+/// at the wait: the other job's guards, the run's task, its cancel flag and the fake.
+struct Waiting {
+    holder: JobGuards,
+    task: tokio::task::JoinHandle<Ran>,
+    cancel: Arc<AtomicBool>,
+    fake: Fake,
+}
+
+async fn waiting_for_the_vehicle() -> Waiting {
+    let dir = tempfile::tempdir().unwrap();
+    let never = AtomicBool::new(false);
+    let poll = Duration::from_millis(1);
+    let mut holder = JobGuards::take_vci_only(
+        &GuardSetup {
+            dir: dir.path().join("locks"),
+            vci: "other".to_owned(),
+        },
+        poll,
+        &never,
+    )
+    .unwrap();
+    holder.take_vehicle(&vin(VIN_A), poll, &never).unwrap();
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    let cancel = Arc::new(AtomicBool::new(false));
+    let task = tokio::spawn(run_shared(
+        reading_all(&[reader(0x90, A)]),
+        fake.clone(),
+        limits(),
+        Arc::clone(&cancel),
+        dir,
+    ));
+    // The read is made and its link closed, then the run waits.
+    for _ in 0..1000 {
+        if !fake.state().served.is_empty() && fake.state().open_links == 0 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert!(!task.is_finished(), "the run waits for the holder");
+    assert_eq!(fake.state().open_links, 0, "no link is open while it waits");
+    Waiting {
+        holder,
+        task,
+        cancel,
+        fake,
+    }
+}
+
+/// ADR-399 item 3 and design 8.8.1: a vehicle another job holds is waited for, with no VCI link
+/// open, and the lock is taken once the holder lets go.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_vehicle_lock_another_job_holds_is_waited_for() {
+    let waiting = waiting_for_the_vehicle().await;
+    drop(waiting.holder);
+    let ran = tokio::time::timeout(Duration::from_secs(10), waiting.task)
+        .await
+        .expect("the run goes on once the holder let go")
+        .unwrap();
+    assert_eq!(ran.report().vin(), Some(&vin(VIN_A)));
+    assert!(ran.report().vehicle_lock_held() && ran.run.guards.holds_vehicle());
+    assert_eq!(waiting.fake.state().open_links, 0);
+}
+
+/// ADR-399 item 3: a cancel during the wait for the vehicle's lock ends the run in `Cancelled`,
+/// and the guards come back without the lock.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_during_the_wait_for_the_vehicle_ends_the_run() {
+    let waiting = waiting_for_the_vehicle().await;
+    waiting
+        .cancel
+        .store(true, std::sync::atomic::Ordering::Relaxed);
+    let ran = tokio::time::timeout(Duration::from_secs(10), waiting.task)
+        .await
+        .expect("the wait sees the cancel")
+        .unwrap();
+    assert!(matches!(ran.run.result, Err(JobError::Cancelled)));
+    assert!(!ran.run.guards.holds_vehicle());
+    assert!(!ran.run.guards.link_unconfirmed());
+    drop(waiting.holder);
 }

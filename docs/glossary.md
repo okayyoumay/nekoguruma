@@ -190,6 +190,9 @@ An ECU's physical address as the identification job keys it: the bus (the resour
 **Presence group** (ADR-395)  
 A bus and a functional identifier that the declared links of an identification plan give; the job sends one functional presence request for each group. A bus on which no declared link has a functional identifier has no group and is reported. The request's window is the longest `CP_P2Max` of the group's declared links. The group's other listed timing ComParams (ADR-395 item 6) likewise take their largest value across its links, while any other ComParam must agree.
 
+**VIN read** (ADR-399)  
+One read of the VIN by an identification job: one endpoint, the declared link's ComParams other than the timings and one request, shared by every VIN rule source that names them, whose single response is decoded with the declaration of each source. A read is accepted when every declaration decodes it to the same well-formed VIN; the job establishes the VIN when at least one read is accepted and every accepted read gives the same one, and an established VIN takes the per-vehicle lock. Each source's outcome (decoded, not well-formed, undecodable, negative, no answer, link refused, not read) is part of the job's report.
+
 **ISO 15765-2** (ISO-TP)  
 Transport protocol that provides segmentation and reassembly of large diagnostic messages over CAN. Used by most modern OBD-II and UDS diagnostics.
 

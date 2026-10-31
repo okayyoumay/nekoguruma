@@ -57,7 +57,7 @@ handling of a refused table entry are separate steps.
    row keys an answer on.
 5. **Halving trigger.** The agent halves the receive table (ADR-395 item 6) when the worker
    answered with a refusal at `SetUniqueRespIdTable` or `ConnectComLogicalLink`: a status the
-   worker gave that is not a lost path and not a loss of the connection. A deadline that passed
+   worker gave that is not a lost path and not a loss of the connection, and whose link was closed again. A deadline that passed
    at either step, a failed connection and a link refused as lost are never a refusal. The halves
    go to the front of the group's queue in declaration order, the first half the larger, each
    with a link and a request of its own, one link open at a time; a single pair still refused
@@ -68,7 +68,11 @@ handling of a refused table entry are separate steps.
    is opened again by ADR-393 and ADR-394 under the run's bounds (`JobLimits::reopen_poll`,
    `vci_return_wait`, `max_link_reopens`, counted over the whole run), and the part's request is
    sent again, as many times as `JobLimits::max_primitive_repeats` allows (ADR-392), with the
-   origin `repeat`. TesterPresent with sub-function zero changes nothing on the ECU, so a
+   origin `repeat`. A VCI lost while the link opens (the worker's refusal naming the loss,
+   ADR-294) is a lost path too. Before each link opens the run checks for a cancel and for
+   guards marked by a link that did not close (ADR-258): a refusal whose link did not close
+   is not halved, and no further link opens. A worker that exited between two parts is logged
+   (`worker_exit`, `worker_restart`) as ADR-394 has it. TesterPresent with sub-function zero changes nothing on the ECU, so a
    resend needs no idempotency check. Lost events, which end the primitive but not the link,
    and a start refused for a reason that passes, are resent on the same link within the same
    bound. The answers received before the failure count and are not discarded by the resend. A

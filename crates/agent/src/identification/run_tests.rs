@@ -44,6 +44,10 @@ struct State {
     refuse_tables_over: Option<usize>,
     /// The status every table call fails with, a refusal or not.
     table_status: Option<tonic::Status>,
+    /// The statuses the first table calls fail with, one per call, ahead of `table_status`.
+    table_script: VecDeque<tonic::Status>,
+    /// What the first `DestroyComLogicalLink` calls answer (`None`: success), one per call.
+    destroy_script: VecDeque<Option<tonic::Status>>,
     /// The status `CreateComLogicalLink` fails with.
     create_status: Option<tonic::Status>,
     /// The events of the n-th started primitive; one that has no script finishes at once.
@@ -186,7 +190,10 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         self.note("DestroyComLogicalLink");
         let mut state = self.state();
         state.open_links = state.open_links.saturating_sub(1);
-        ok()
+        match state.destroy_script.pop_front().flatten() {
+            Some(status) => Err(status),
+            None => ok(),
+        }
     }
     async fn connect_com_logical_link(
         &self,
@@ -389,6 +396,9 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         let mut state = self.state();
         let len = table.len();
         state.tables.push(table);
+        if let Some(status) = state.table_script.pop_front() {
+            return Err(status);
+        }
         if let Some(status) = state.table_status.clone() {
             return Err(status);
         }
@@ -681,7 +691,8 @@ async fn a_table_that_gets_no_answer_is_not_halved() {
     let report = ran.report();
     assert!(report.presence_interrupted());
     assert!(report.refused_tables().is_empty());
-    assert_eq!(report.presence_links_opened(), 1);
+    // No link ever opened.
+    assert_eq!(report.presence_links_opened(), 0);
     let tables = fake.state().tables.clone();
     assert!(tables.len() > 1, "the open was tried again");
     assert!(
@@ -890,4 +901,176 @@ async fn only_the_presence_request_sends_tester_present() {
     assert!(checks.2.is_ok(), "{:?}", checks.2);
     assert_eq!(fake.state().starts, [(vec![0x3E, 0x00], -2)]);
     assert_eq!(fake.count("StartComPrimitive"), 1);
+}
+
+/// A table refusal whose link then fails to close leaves the guards marked (ADR-258): the table
+/// is not halved and nothing more opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refusal_whose_link_does_not_close_ends_the_job() {
+    let fake = Fake::default();
+    {
+        let mut state = fake.state();
+        state.refuse_tables_over = Some(1);
+        state.destroy_script = VecDeque::from([Some(tonic::Status::internal("stuck"))]);
+    }
+    let ran = run(plan_of(&[A, B], Some(0x7DF)), fake.clone()).await;
+    assert!(
+        matches!(
+            &ran.run.result,
+            Err(JobError::Link(HostError::Rpc {
+                rpc: "SetUniqueRespIdTable",
+                ..
+            }))
+        ),
+        "{:?}",
+        ran.run.result
+    );
+    assert!(ran.run.guards.link_unconfirmed());
+    assert_eq!(fake.state().tables, [vec![A, B]]);
+}
+
+/// A part whose link does not close marks the guards, and the next part does not open.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_part_whose_link_does_not_close_ends_the_run() {
+    let fake = Fake::default();
+    {
+        let mut state = fake.state();
+        state.refuse_tables_over = Some(2);
+        // The refused table's link closes; the first part's does not.
+        state.destroy_script = VecDeque::from([None, Some(tonic::Status::internal("stuck"))]);
+    }
+    let ran = run(plan_of(&[A, B, C, D], Some(0x7DF)), fake.clone()).await;
+    assert!(
+        matches!(ran.run.result, Err(JobError::LinkUnconfirmed)),
+        "{:?}",
+        ran.run.result
+    );
+    assert!(ran.run.guards.link_unconfirmed());
+    assert_eq!(fake.state().tables, [vec![A, B, C, D], vec![A, B]]);
+}
+
+/// ADR-294's form of a VCI lost while the link opens (a refusal naming the lost VCI) is a lost
+/// path, not a refusal: the link is opened again, and the table is not halved.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vci_lost_while_the_link_opens_opens_it_again() {
+    use vci_service_interface::{ErrorDetail, ErrorEventData, PduError};
+    let fake = Fake::default();
+    {
+        let mut state = fake.state();
+        state.table_script = VecDeque::from([vci_service_interface::status_with_error_detail(
+            tonic::Code::FailedPrecondition,
+            "the VCI is lost",
+            ErrorDetail {
+                pdu_error: PduError::PduErrCllNotConnected as i32,
+                error_event_data: Some(ErrorEventData {
+                    error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+                    cop_handle: None,
+                    timestamp: 1,
+                    extra_error_info: 0,
+                }),
+                detail_text: None,
+                refusal: None,
+            },
+        )]);
+        state.scripts = VecDeque::from([vec![Item::Answer(A.1, POSITIVE), Item::Finish]]);
+    }
+    let ran = run(plan_of(&[A, B], Some(0x7DF)), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(fake.state().tables, [vec![A, B], vec![A, B]]);
+    assert!(report.refused_tables().is_empty() && !report.presence_interrupted());
+    assert_eq!(report.presence_links_opened(), 1);
+    assert_eq!(ran.heard(), [(A.1, POSITIVE.to_vec())]);
+}
+
+/// Only a response identifier of the receive table marks presence; the log lists every result.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_answer_outside_the_table_is_listed_but_marks_nothing() {
+    let fake = Fake::default();
+    fake.state().scripts = VecDeque::from([vec![
+        Item::Answer(0x6FF, POSITIVE),
+        Item::Answer(A.1, POSITIVE),
+        Item::Finish,
+    ]]);
+    let ran = run(plan_of(&[A, B], Some(0x7DF)), fake).await;
+    assert_eq!(ran.heard(), [(A.1, POSITIVE.to_vec())]);
+    let ids: Vec<u64> = ran.exchanges()[0]["answers"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|answer| answer["rx_id"].as_u64().unwrap())
+        .collect();
+    assert_eq!(ids, [0x6FF, u64::from(A.1)]);
+}
+
+/// A source that tells the second link's open that the worker has exited, as a launcher that
+/// owns the process does (ADR-394).
+#[derive(Clone)]
+struct ExitsOnce(WorkerClient, Arc<Mutex<u32>>);
+
+impl WorkerSource for ExitsOnce {
+    type Client = WorkerClient;
+    fn client(&mut self) -> Result<WorkerClient, HostError> {
+        Ok(self.0.clone())
+    }
+    fn status(&mut self) -> WorkerStatus {
+        let mut calls = self.1.lock().unwrap();
+        *calls += 1;
+        if *calls == 2 {
+            WorkerStatus::Exited(WorkerExit {
+                pid: Some(7),
+                how: crate::client::ExitHow::Code(1),
+            })
+        } else {
+            WorkerStatus::Alive
+        }
+    }
+    fn pid(&self) -> Option<u32> {
+        Some(8)
+    }
+}
+
+/// A worker that exited between two parts is logged (`worker_exit`, then `worker_restart`)
+/// before the next part opens, not started again silently (ADR-394).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_exits_between_parts_is_logged() {
+    let fake = Fake::default();
+    fake.state().refuse_tables_over = Some(1);
+    let dir = tempfile::tempdir().unwrap();
+    let setup = CommLogSetup::for_run(dir.path().join("log")).unwrap();
+    let guards = JobGuards::take_vci_only(
+        &GuardSetup {
+            dir: dir.path().join("locks"),
+            vci: "fake".to_owned(),
+        },
+        Duration::from_millis(1),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let source = ExitsOnce(serve(fake).await, Arc::new(Mutex::new(0)));
+    let run = run_identification(
+        source,
+        plan_of(&[A, B], Some(0x7DF)),
+        limits(),
+        guards,
+        Some(setup.clone()),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    assert!(run.result.is_ok(), "{:?}", run.result);
+    let events: Vec<String> = std::fs::read_to_string(setup.path().unwrap())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["event"].as_str().map(str::to_owned))
+        .filter(|event| event.starts_with("worker_") || event == "link_opened")
+        .collect();
+    assert_eq!(
+        events,
+        [
+            "worker_exit",
+            "worker_restart",
+            "link_opened",
+            "link_opened"
+        ]
+    );
 }

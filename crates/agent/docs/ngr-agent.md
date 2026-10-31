@@ -1471,10 +1471,16 @@ identification job, derives its endpoints and sends its functional presence requ
     `ConnectComLogicalLink` is halved in declaration order, each half with a link and a request
     of its own; a single pair still refused fails the job. A timeout or a lost path is never a
     refusal.
-  - A lost VCI, a worker that exited or lost events reopens the link within the run's bounds
-    (`JobLimits::reopen_poll`, `vci_return_wait`, `max_link_reopens`) and sends the request again
-    within `max_primitive_repeats`, logged with the origin `repeat`; the answers heard before
-    count, and bounds that run out set `presence_interrupted`.
+  - A lost VCI (also while the link opens), a worker that exited or an event stream that failed
+    reopens the link within the run's bounds (`JobLimits::reopen_poll`, `vci_return_wait`,
+    `max_link_reopens`) and sends the request again within `max_primitive_repeats`, logged with
+    the origin `repeat`; lost events send it again on the same link. The answers heard before
+    count, and bounds that run out set `presence_interrupted`. A worker that exited between two
+    links is logged (`worker_exit`, `worker_restart`) and the next link opens on a new one
+    (ADR-394). Before each link opens the run checks for a cancel and for guards marked by a
+    link that did not close (ADR-258); a table refusal whose link did not close is not halved.
+  - Only response identifiers of the link's receive table mark presence; the exchange entry
+    lists every result.
 
 The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two
 spellings of UDS on CAN that ADR-324 item 2 accepts are one bus.

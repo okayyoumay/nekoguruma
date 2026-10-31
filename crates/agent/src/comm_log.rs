@@ -156,7 +156,7 @@ pub(crate) enum RunKind {
 
 /// What the job knows of itself when its log starts: the header's content, and a run's facts
 /// for its `job_start`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RunFacts {
     pub job_id: String,
     pub generation: u64,
@@ -1290,38 +1290,36 @@ pub(crate) fn outcome_name(result: &Result<VmState, JobError>) -> &'static str {
 
 /// The `outcome` a failed job writes to `job_end`: the name of the [`JobError`] variant.
 pub(crate) fn error_outcome_name(error: &JobError) -> &'static str {
-    {
-        match error {
-            JobError::CurrentThreadRuntime => "CurrentThreadRuntime",
-            JobError::Link(_) => "Link",
-            JobError::Vm { .. } => "Vm",
-            JobError::Program(_) => "Program",
-            JobError::Host { .. } => "Host",
-            JobError::Unanswerable(_) => "Unanswerable",
-            JobError::StepLimit(_) => "StepLimit",
-            JobError::Refused { .. } => "Refused",
-            JobError::Cancelled => "Cancelled",
-            JobError::Journal(_) => "Journal",
-            JobError::IdentityUnreadable { .. } => "IdentityUnreadable",
-            JobError::IdentityRead { .. } => "IdentityRead",
-            JobError::IdentityMismatch { .. } => "IdentityMismatch",
-            JobError::OnSiteInterventionRequired(_) => "OnSiteInterventionRequired",
-            JobError::ProcedureFailed { .. } => "ProcedureFailed",
-            JobError::NoReprogrammingSlot => "NoReprogrammingSlot",
-            JobError::LinkUnconfirmed => "LinkUnconfirmed",
-            JobError::Panicked => "Panicked",
-            JobError::NoDeclarations => "NoDeclarations",
-            JobError::Sources(_) => "Sources",
-            JobError::NoArtifact => "NoArtifact",
-            JobError::ArtifactDiffersFromJournal => "ArtifactDiffersFromJournal",
-            JobError::ArtifactMismatch { .. } => "ArtifactMismatch",
-            JobError::SegmentOutsideArtifact { .. } => "SegmentOutsideArtifact",
-            JobError::Undeclared { .. } => "Undeclared",
-            JobError::VehicleLock(_) => "VehicleLock",
-            JobError::GuardsMissing => "GuardsMissing",
-            JobError::CommLogMismatch => "CommLogMismatch",
-            JobError::NoCommLogDir => "NoCommLogDir",
-        }
+    match error {
+        JobError::CurrentThreadRuntime => "CurrentThreadRuntime",
+        JobError::Link(_) => "Link",
+        JobError::Vm { .. } => "Vm",
+        JobError::Program(_) => "Program",
+        JobError::Host { .. } => "Host",
+        JobError::Unanswerable(_) => "Unanswerable",
+        JobError::StepLimit(_) => "StepLimit",
+        JobError::Refused { .. } => "Refused",
+        JobError::Cancelled => "Cancelled",
+        JobError::Journal(_) => "Journal",
+        JobError::IdentityUnreadable { .. } => "IdentityUnreadable",
+        JobError::IdentityRead { .. } => "IdentityRead",
+        JobError::IdentityMismatch { .. } => "IdentityMismatch",
+        JobError::OnSiteInterventionRequired(_) => "OnSiteInterventionRequired",
+        JobError::ProcedureFailed { .. } => "ProcedureFailed",
+        JobError::NoReprogrammingSlot => "NoReprogrammingSlot",
+        JobError::LinkUnconfirmed => "LinkUnconfirmed",
+        JobError::Panicked => "Panicked",
+        JobError::NoDeclarations => "NoDeclarations",
+        JobError::Sources(_) => "Sources",
+        JobError::NoArtifact => "NoArtifact",
+        JobError::ArtifactDiffersFromJournal => "ArtifactDiffersFromJournal",
+        JobError::ArtifactMismatch { .. } => "ArtifactMismatch",
+        JobError::SegmentOutsideArtifact { .. } => "SegmentOutsideArtifact",
+        JobError::Undeclared { .. } => "Undeclared",
+        JobError::VehicleLock(_) => "VehicleLock",
+        JobError::GuardsMissing => "GuardsMissing",
+        JobError::CommLogMismatch => "CommLogMismatch",
+        JobError::NoCommLogDir => "NoCommLogDir",
     }
 }
 

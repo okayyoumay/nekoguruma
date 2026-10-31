@@ -175,7 +175,7 @@ pub fn check_request(
 }
 
 /// The one request an identification job's functional presence request may be (ADR-327 item 2,
-/// ADR-396): TesterPresent (ISO 14229-1:2026 clause 9.2 service 0x3E) with sub-function zero and
+/// ADR-396): TesterPresent (ISO 14229-1:2026 clause 9.7 service 0x3E) with sub-function zero and
 /// the positive response suppressed bit clear, so every ECU that is there answers it.
 pub const PRESENCE_REQUEST: [u8; 2] = [0x3E, 0x00];
 

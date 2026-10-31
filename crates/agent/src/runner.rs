@@ -1143,31 +1143,36 @@ async fn run_checked<C: WorkerApi>(
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = Arc::clone(&cancel.0);
-    // The job's span, so what the VM's thread logs is in it (ADR-348 item 3).
+    let run = on_job_thread(
+        comm_log,
+        move |comm_log| {
+            run_job(
+                handle, client, source, &config, &program, document, artifact, limits, &cancelled,
+                journal, guards, comm_log,
+            )
+        },
+        |log, result| log.finish(result),
+    )
+    .await;
+    Ok(run)
+}
+
+/// Runs `job` on a blocking thread in the caller's span (ADR-348 item 3) and ends `comm_log`
+/// with `finish`, so a panic in either is the job's `Panicked` or an incomplete log, and the log
+/// never changes the result (ADR-347). A runtime that is shutting down cancels the job.
+pub(crate) async fn on_job_thread<T: Send + 'static>(
+    comm_log: JobLog,
+    job: impl FnOnce(&mut JobLog) -> Result<T, JobError> + Send + 'static,
+    finish: impl FnOnce(JobLog, &Result<T, JobError>) -> CommLogStatus + Send + 'static,
+) -> (Result<T, JobError>, CommLogStatus) {
     let span = tracing::Span::current();
-    let run = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _span = span.entered();
         // Declared outside the unwind guard, so a panic still ends the log.
         let mut comm_log = comm_log;
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_job(
-                handle,
-                client,
-                source,
-                &config,
-                &program,
-                document,
-                artifact,
-                limits,
-                &cancelled,
-                journal,
-                guards,
-                &mut comm_log,
-            )
-        }))
-        .unwrap_or(Err(JobError::Panicked));
-        // The log never changes the result, a panic while ending it included.
-        let status = std::panic::catch_unwind(AssertUnwindSafe(|| comm_log.finish(&result)))
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut comm_log)))
+            .unwrap_or(Err(JobError::Panicked));
+        let status = std::panic::catch_unwind(AssertUnwindSafe(|| finish(comm_log, &result)))
             .unwrap_or(CommLogStatus::Incomplete(CommLogIncomplete::CloseFailed(
                 std::io::ErrorKind::Other,
             )));
@@ -1184,8 +1189,7 @@ async fn run_checked<C: WorkerApi>(
             }),
             CommLogStatus::None,
         )
-    });
-    Ok(run)
+    })
 }
 
 /// How long a close that got no answer waits for a killed worker's exit to show (ADR-394).

@@ -7,6 +7,7 @@
 //! [`run_identification`] then sends the plan's functional presence requests and is the only
 //! writer of the report's presence section (ADR-396); it sends nothing else yet.
 
+use std::cell::Cell;
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -18,15 +19,17 @@ use sha2::Digest;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::client::{WorkerExit, WorkerSource, WorkerStatus};
-use crate::comm_log::{CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciMargins};
+use crate::comm_log::{CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind};
 use crate::document::{DocumentError, JobDocument};
 use crate::guards::JobGuards;
-use crate::host::{HostError, OwnRead, ProcedurePosition, ReopenAttempt, ResendClass, Timings};
+use crate::host::{
+    HostError, OwnRead, ProcedurePosition, ReopenAttempt, ResendClass, Timings, names_lost_vci,
+};
 use crate::link::{BUS_TYPE_DWCAN, LinkConfig, MAX_CAN_ID};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, close_job_link, open_job_link,
-    reopen_attempts,
+    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, close_job_link, on_job_thread,
+    open_job_link, reopen_attempts,
 };
 use crate::send_receive::declared_sid;
 
@@ -109,17 +112,13 @@ pub struct EndpointEntry {
     pub documents: Vec<Sha256>,
 }
 
-/// A hash as the lowercase hex a report shows it in.
-fn hash_as_hex<S: Serializer>(hash: &Sha256, serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&hex(hash))
+/// Bytes (a hash among them) as the lowercase hex a report shows them in.
+fn as_hex<T: AsRef<[u8]>, S: Serializer>(bytes: &T, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex(bytes.as_ref()))
 }
 
 fn hashes_as_hex<S: Serializer>(hashes: &[Sha256], serializer: S) -> Result<S::Ok, S::Error> {
     serializer.collect_seq(hashes.iter().map(|hash| hex(hash)))
-}
-
-fn bytes_as_hex<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
-    serializer.serialize_str(&hex(bytes))
 }
 
 /// The links that send one functional presence request together: a bus and a functional
@@ -164,7 +163,7 @@ impl PresenceGroup {
 pub struct PresenceAnswer {
     pub bus: BusKey,
     pub rx_id: u32,
-    #[serde(serialize_with = "bytes_as_hex")]
+    #[serde(serialize_with = "as_hex")]
     pub bytes: Vec<u8>,
 }
 
@@ -181,7 +180,7 @@ pub struct RefusedTable {
 /// definition inconclusive at read time (ADR-327 item 3), and the plan stays valid.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefusedLink {
-    #[serde(serialize_with = "hash_as_hex")]
+    #[serde(serialize_with = "as_hex")]
     pub document: Sha256,
     pub reason: String,
 }
@@ -622,36 +621,19 @@ pub async fn run_identification<W: WorkerSource>(
     if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
         return refused(&slot, JobError::CurrentThreadRuntime);
     }
-    let unconfirmed = slot
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .as_ref()
-        .is_some_and(JobGuards::link_unconfirmed);
-    if unconfirmed {
+    if link_unconfirmed(&slot) {
         return refused(&slot, JobError::LinkUnconfirmed);
     }
     // A worker that cannot give its first client ends the job before any link or log.
     if let Err(error) = source.client() {
         return refused(&slot, JobError::Link(error));
     }
-    let facts = RunFacts {
-        job_id: String::new(),
-        generation: 0,
-        document_sha256: None,
-        variant_name: None,
-        target_vin: None,
-        writes: false,
-        vci: None,
-        margins: VciMargins::default(),
-    };
-    let log = JobLog::new(comm_log, facts);
+    let log = JobLog::new(comm_log, RunFacts::default());
     let cancelled = CancelOnDrop(Arc::clone(&cancel));
     let job_slot = Arc::clone(&slot);
-    let span = tracing::Span::current();
-    let run = tokio::task::spawn_blocking(move || {
-        let _span = span.entered();
-        let mut log = log;
-        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    let (result, comm_log) = on_job_thread(
+        log,
+        move |log| {
             identify(
                 &handle,
                 Arc::new(Mutex::new(source)),
@@ -659,36 +641,30 @@ pub async fn run_identification<W: WorkerSource>(
                 &limits,
                 &cancel,
                 &job_slot,
-                &mut log,
+                log,
             )
-        }))
-        .unwrap_or(Err(JobError::Panicked));
-        let outcome = match &result {
-            Ok(_) => "ok",
-            Err(error) => crate::comm_log::error_outcome_name(error),
-        };
-        let status =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.finish_as(outcome)))
-                .unwrap_or(CommLogStatus::None);
-        (result, status)
-    })
-    .await
-    .unwrap_or_else(|error| {
-        let error = if error.is_cancelled() {
-            JobError::Cancelled
-        } else {
-            JobError::Panicked
-        };
-        (Err(error), CommLogStatus::None)
-    });
+        },
+        |log, result| {
+            log.finish_as(match result {
+                Ok(_) => "ok",
+                Err(error) => crate::comm_log::error_outcome_name(error),
+            })
+        },
+    )
+    .await;
     drop(cancelled);
-    let (result, comm_log) = run;
     let guards = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
     IdentificationRun {
         result,
         guards: guards.expect("nothing else takes the guards out of the slot"),
         comm_log,
     }
+}
+
+/// Whether the guards in `slot` are marked: the worker may still hold a link (ADR-258).
+fn link_unconfirmed(slot: &GuardSlot) -> bool {
+    let held = slot.lock().unwrap_or_else(|e| e.into_inner());
+    held.as_ref().is_some_and(JobGuards::link_unconfirmed)
 }
 
 /// A worker source shared by the links of one run: each link gets its client from the one source,
@@ -720,11 +696,12 @@ impl<W: WorkerSource> WorkerSource for SharedSource<W> {
 /// How one part of a group's table ended.
 enum PartEnd {
     /// The window ended; the answers heard.
-    Done(Vec<crate::host::HeardAnswer>),
+    Done(Vec<(u32, Vec<u8>)>),
     /// The worker answered, refusing the table or the connect, with its error (ADR-396).
     Refused(JobError),
-    /// The path to the VCI was lost and the bounds ran out; the answers heard before.
-    Interrupted(Vec<crate::host::HeardAnswer>),
+    /// The path to the VCI was lost and the bounds ran out; the answers heard before, and
+    /// whether a link had opened.
+    Interrupted(Vec<(u32, Vec<u8>)>, bool),
 }
 
 /// The run on the job's blocking thread.
@@ -745,6 +722,7 @@ fn identify<W: WorkerSource>(
     let mut report = plan.report();
     let comm_log = log.open(RunKind::First);
     let mut reopens = 0u8;
+    let worker_ended = Cell::new(false);
     'groups: for group in report.presence_groups.clone() {
         let base = plan.presence_link(&group);
         let mut queue = VecDeque::from([plan.bus_table(&group.bus)]);
@@ -759,10 +737,11 @@ fn identify<W: WorkerSource>(
                 cancelled,
                 guards,
                 &mut reopens,
+                &worker_ended,
             )?;
-            let (heard, interrupted) = match part {
-                PartEnd::Done(heard) => (heard, false),
-                PartEnd::Interrupted(heard) => (heard, true),
+            let (heard, interrupted, opened) = match part {
+                PartEnd::Done(heard) => (heard, false, true),
+                PartEnd::Interrupted(heard, opened) => (heard, true, opened),
                 PartEnd::Refused(error) => {
                     // The halves go to the front, the first half first, so one link is open at a
                     // time and the order stays the declaration order (ADR-395 item 6). A single
@@ -778,12 +757,12 @@ fn identify<W: WorkerSource>(
                     continue;
                 }
             };
-            report.presence_links_opened += 1;
-            for answer in heard {
+            report.presence_links_opened += u32::from(opened);
+            for (rx_id, bytes) in heard {
                 let answer = PresenceAnswer {
                     bus: group.bus.clone(),
-                    rx_id: answer.rx_id,
-                    bytes: answer.bytes,
+                    rx_id,
+                    bytes,
                 };
                 if !report.presence.contains(&answer) {
                     report.presence.push(answer);
@@ -822,16 +801,45 @@ fn presence_part<W: WorkerSource>(
     cancelled: &AtomicBool,
     guards: &GuardSlot,
     reopens: &mut u8,
+    worker_ended: &Cell<bool>,
 ) -> Result<PartEnd, JobError> {
     let timings = Timings::for_link(config);
     let try_open = || {
-        let client = SharedSource(Arc::clone(source))
+        let stop = |error| LinkRefused {
+            error,
+            cleaned_up: true,
+            table_refused: false,
+        };
+        // A cancel, a worker that exited and the guards' mark are judged before each open: a
+        // link the worker may still hold ends the job (ADR-258).
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(stop(JobError::Cancelled));
+        }
+        let mut shared = SharedSource(Arc::clone(source));
+        if !worker_ended.get()
+            && let WorkerStatus::Exited(exit) = shared.status()
+        {
+            // The worker ended between links: its exit is logged and the mark cleared, as a
+            // host does when it opens the link again (ADR-394); `client` starts a new one.
+            if let Some(log) = &comm_log {
+                log.worker_exit(exit, &[]);
+            }
+            worker_ended.set(true);
+            if let Some(held) = guards.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                held.worker_gone();
+            }
+        }
+        if link_unconfirmed(guards) {
+            return Err(stop(JobError::LinkUnconfirmed));
+        }
+        let client = shared
             .client()
-            .map_err(|error| LinkRefused {
-                error: JobError::Link(error),
-                cleaned_up: true,
-                table_refused: false,
-            })?;
+            .map_err(|error| stop(JobError::Link(error)))?;
+        if worker_ended.replace(false)
+            && let Some(log) = &comm_log
+        {
+            log.worker_restart(shared.pid());
+        }
         open_job_link(
             handle,
             client,
@@ -868,12 +876,15 @@ fn presence_part<W: WorkerSource>(
             (Some(link), _) => Ok(link),
             (None, Some(refused)) => Err(refused),
             // The VCI did not come back within the bounds.
-            (None, None) => return Ok(PartEnd::Interrupted(Vec::new())),
+            (None, None) => return Ok(PartEnd::Interrupted(Vec::new(), false)),
         };
     }
     let link = match opened {
         Ok(link) => link,
-        Err(refused) if refused.table_refused => return Ok(PartEnd::Refused(refused.error)),
+        // A refusal whose teardown failed left the guards marked: nothing more opens (ADR-258).
+        Err(refused) if refused.table_refused && refused.cleaned_up => {
+            return Ok(PartEnd::Refused(refused.error));
+        }
         Err(refused) => return Err(refused.error),
     };
     let crate::runner::JobLink {
@@ -882,14 +893,6 @@ fn presence_part<W: WorkerSource>(
         path_lost,
         ..
     } = link;
-    host.set_receive_table(
-        config
-            .functional
-            .iter()
-            .flat_map(|f| f.table.clone())
-            .collect(),
-    );
-    host.set_link_ids(config.tx_id, config.rx_id);
     let mut heard = Vec::new();
     let mut attempts = 0u8;
     let ended = loop {
@@ -921,12 +924,12 @@ fn presence_part<W: WorkerSource>(
             ResendClass::PathLost if again => {
                 match reopen_attempts(|| host.reopen_link(), limits, cancelled, reopens) {
                     Ok(true) => {}
-                    Ok(false) => break Ok(PartEnd::Interrupted(heard)),
+                    Ok(false) => break Ok(PartEnd::Interrupted(heard, true)),
                     Err(error) => break Err(error),
                 }
             }
             ResendClass::EcuLevel | ResendClass::PathLost | ResendClass::Transient => {
-                break Ok(PartEnd::Interrupted(heard));
+                break Ok(PartEnd::Interrupted(heard, true));
             }
             ResendClass::Other => break Err(JobError::Link(error)),
         }
@@ -944,6 +947,7 @@ fn is_path_loss(refused: &LinkRefused) -> bool {
             JobError::Link(error) => {
                 !refused.table_refused
                     && (error.resend_class() == ResendClass::PathLost
+                        || matches!(error, HostError::Rpc { status, .. } if names_lost_vci(status))
                         || matches!(
                             error,
                             HostError::WorkerStart {

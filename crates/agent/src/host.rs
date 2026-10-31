@@ -1409,13 +1409,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             Err(HostError::NoResponse) if !sent.agent_deadline => Ok(()),
             Err(error) => Err(error),
         };
+        // Only an identifier of the table marks presence (ADR-396); the log lists every result.
         let answers = collected_answers(&sent.collected, &self.receive_table)
             .into_iter()
             .filter_map(|(rx_id, read)| {
-                Some(HeardAnswer {
-                    rx_id: rx_id?,
-                    bytes: read.bytes.clone(),
-                })
+                let rx_id =
+                    rx_id.filter(|id| self.receive_table.iter().any(|&(_, rx)| rx == *id))?;
+                Some((rx_id, read.bytes.clone()))
             })
             .collect();
         Presence { answers, end }
@@ -2311,18 +2311,12 @@ struct CollectedRead {
     read: Option<AgentNow>,
 }
 
-/// An answer of the presence request: the response identifier and the bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct HeardAnswer {
-    pub(crate) rx_id: u32,
-    pub(crate) bytes: Vec<u8>,
-}
-
 /// How a presence request ended: the answers read, whatever the end, and the failure if the
 /// window did not end on its own (ADR-396).
 #[derive(Debug)]
 pub(crate) struct Presence {
-    pub(crate) answers: Vec<HeardAnswer>,
+    /// The response identifier and bytes of each answer on an identifier of the receive table.
+    pub(crate) answers: Vec<(u32, Vec<u8>)>,
     pub(crate) end: Result<(), HostError>,
 }
 

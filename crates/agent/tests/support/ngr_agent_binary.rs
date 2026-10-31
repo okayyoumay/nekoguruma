@@ -9,13 +9,17 @@
 //! build left. That binary can predate the sources the test was built from, and a test then fails
 //! on what the older agent does rather than on the change.
 //!
-//! The lookup therefore checks the binary against the sources it is built from: the Rust files
-//! under `src` and the build script of the `agent` package and of every workspace crate it
-//! depends on (its `[dependencies]`, target-specific ones and `[build-dependencies]`, followed
-//! through the crates' manifests; not its dev-dependencies, which the binary does not link). A
-//! file newer than the binary is one cargo would rebuild it for, so building the binary clears
-//! the failure. A test build writes no dep-info file for the binary that lists the library's
-//! sources, so the crates are found from the manifests instead.
+//! The lookup therefore checks the binary against the files it is compiled from: those the
+//! compiler's dep-info files list for the binary (`deps/ngr_agent-<hash>.d`) and for the library
+//! of the `agent` package and of every workspace crate it depends on (its `[dependencies]`,
+//! target-specific ones and `[build-dependencies]`, followed through the crates' manifests; not
+//! its dev-dependencies, which the binary does not link), with each crate's build script. A
+//! library's dep-info is the one whose rules name its `.rlib`, so a file only a test build
+//! compiles (a `#[cfg(test)]` module) or another binary's source is not counted; of several
+//! builds of one library, the newest is read. A listed file newer than the binary is one cargo
+//! would rebuild it for, so building the binary clears the failure. A test build writes no
+//! top-level dep-info file for the binary (`target/debug/ngr-agent.d`, which only `cargo build`
+//! writes), and the binary's own one lists none of the library's files, hence the libraries'.
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
@@ -43,8 +47,15 @@ pub fn ngr_agent_path(package: &str) -> PathBuf {
         path.display()
     );
     let built = modified(&path).expect("the binary's modification time");
-    let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("../..");
-    let stale = newer_than(&sources(&root, "agent"), built);
+    let root = workspace_root();
+    let deps = exe.parent().expect("the deps directory");
+    let files = sources(&root, deps, "agent");
+    assert!(
+        !files.is_empty(),
+        "no dep-info file in {} lists the agent's sources: {rebuild}",
+        deps.display()
+    );
+    let stale = newer_than(&files, built);
     assert!(
         stale.is_empty(),
         "{} is older than its sources ({}): {rebuild}",
@@ -57,6 +68,30 @@ pub fn ngr_agent_path(package: &str) -> PathBuf {
             .join(", ")
     );
     path
+}
+
+/// The workspace's root directory, from the including package's `crates/<package>`.
+fn workspace_root() -> PathBuf {
+    normalized(&Path::new(env!("CARGO_MANIFEST_DIR")).join("../.."))
+}
+
+/// `path` with its `.` and `..` components resolved without the file system. Not
+/// `canonicalize`, whose Windows form (`\\?\`) takes no `/` in a path joined to it.
+fn normalized(path: &Path) -> PathBuf {
+    use std::path::Component;
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !out.pop() {
+                    out.push("..");
+                }
+            }
+            other => out.push(other),
+        }
+    }
+    out
 }
 
 fn modified(path: &Path) -> Option<SystemTime> {
@@ -72,18 +107,86 @@ fn newer_than(files: &[PathBuf], built: SystemTime) -> Vec<PathBuf> {
         .collect()
 }
 
-/// The source files of `crates/<package>` under `root` and of the workspace crates it depends on:
-/// each crate's `build.rs` and the `.rs` files under its `src`.
-fn sources(root: &Path, package: &str) -> Vec<PathBuf> {
+/// The files the binary `ngr-agent` and the libraries of `crates/<package>` under `root` and of
+/// the workspace crates it depends on were compiled from, by the newest dep-info of each in
+/// `deps`, with each crate's `build.rs`. A relative path is taken from `root`, where cargo runs the
+/// compiler for workspace members.
+fn sources(root: &Path, deps: &Path, package: &str) -> Vec<PathBuf> {
     let mut files = Vec::new();
+    let mut add = |listed: Vec<PathBuf>| {
+        files.extend(listed.into_iter().map(|path| {
+            if path.is_absolute() {
+                path
+            } else {
+                root.join(path)
+            }
+        }));
+    };
+    add(newest_dep_info(deps, "ngr_agent", None));
     for dir in crates(root, package) {
         let build = dir.join("build.rs");
         if build.is_file() {
-            files.push(build);
+            add(vec![build]);
         }
-        rust_files(&dir.join("src"), &mut files);
+        let name = dir
+            .file_name()
+            .map(|name| name.to_string_lossy().replace('-', "_"))
+            .unwrap_or_default();
+        add(newest_dep_info(deps, &name, Some("rlib")));
     }
     files
+}
+
+/// The sources the newest `deps/<name>-<hash>.d` lists. With `artifact`, only a dep-info whose
+/// rules name `lib<name>-<hash>.<artifact>` counts: a library's, not a test build's of it.
+fn newest_dep_info(deps: &Path, name: &str, artifact: Option<&str>) -> Vec<PathBuf> {
+    let Ok(entries) = std::fs::read_dir(deps) else {
+        return Vec::new();
+    };
+    let mut newest: Option<(SystemTime, String)> = None;
+    for entry in entries.flatten() {
+        let file = entry.file_name().to_string_lossy().into_owned();
+        let Some(hash) = file
+            .strip_prefix(name)
+            .and_then(|rest| rest.strip_prefix('-'))
+            .and_then(|rest| rest.strip_suffix(".d"))
+        else {
+            continue;
+        };
+        if !hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            continue;
+        }
+        let Ok(text) = std::fs::read_to_string(entry.path()) else {
+            continue;
+        };
+        if let Some(artifact) = artifact {
+            let target = format!("lib{name}-{hash}.{artifact}:");
+            if !text.lines().any(|line| line.contains(&target)) {
+                continue;
+            }
+        }
+        let Some(time) = modified(&entry.path()) else {
+            continue;
+        };
+        if newest.as_ref().is_none_or(|(best, _)| time > *best) {
+            newest = Some((time, text));
+        }
+    }
+    newest
+        .map(|(_, text)| listed_sources(&text))
+        .unwrap_or_default()
+}
+
+/// The sources a dep-info file lists: the compiler writes an empty rule (`path:`) for each, after
+/// the rules that name its outputs. A Windows path's drive letter is followed by no space.
+fn listed_sources(text: &str) -> Vec<PathBuf> {
+    text.lines()
+        .map(str::trim_end)
+        .filter(|line| !line.starts_with('#') && !line.contains(": "))
+        .filter_map(|line| line.strip_suffix(':'))
+        .filter(|path| !path.is_empty())
+        .map(|path| PathBuf::from(path.replace("\\ ", " ")))
+        .collect()
 }
 
 /// The directories of `crates/<package>` and of every workspace crate its manifest's linked
@@ -94,9 +197,7 @@ fn crates(root: &Path, package: &str) -> BTreeSet<PathBuf> {
     let mut found = BTreeSet::new();
     let mut pending = vec![root.join("crates").join(package)];
     while let Some(dir) = pending.pop() {
-        let Ok(dir) = dir.canonicalize() else {
-            continue;
-        };
+        let dir = normalized(&dir);
         if !found.insert(dir.clone()) {
             continue;
         }
@@ -150,26 +251,13 @@ fn linked_dependencies(manifest: &str) -> Vec<(String, Option<String>)> {
     found
 }
 
-fn rust_files(dir: &Path, files: &mut Vec<PathBuf>) {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-    for entry in entries.flatten() {
-        let path = entry.path();
-        if path.is_dir() {
-            rust_files(&path, files);
-        } else if path.extension().is_some_and(|ext| ext == "rs") {
-            files.push(path);
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::time::Duration;
 
     fn root() -> PathBuf {
-        Path::new(env!("CARGO_MANIFEST_DIR")).join("../..")
+        workspace_root()
     }
 
     #[test]
@@ -204,9 +292,87 @@ mod tests {
         for name in ["sim-ecu", "diag-frontend"] {
             assert!(!names.contains(name), "{name} in {names:?}");
         }
-        let files = sources(&root(), "agent");
-        assert!(files.iter().any(|file| file.ends_with("agent/src/main.rs")));
-        assert!(files.iter().any(|file| file.ends_with("diag-ir/build.rs")));
+    }
+
+    #[test]
+    fn the_listed_sources_are_the_empty_rules() {
+        let text = "/t/deps/agent-0a.d: crates/agent/src/lib.rs crates/agent/src/a.rs\n\n\
+                    /t/deps/libagent-0a.rlib: crates/agent/src/lib.rs crates/agent/src/a.rs\n\n\
+                    crates/agent/src/lib.rs:\ncrates/agent/src/a.rs:\n\n\
+                    # env-dep:CARGO_PKG_VERSION=0.1.0\n";
+        assert_eq!(
+            listed_sources(text),
+            [
+                PathBuf::from("crates/agent/src/lib.rs"),
+                PathBuf::from("crates/agent/src/a.rs")
+            ]
+        );
+        assert_eq!(
+            listed_sources("D:\\t\\deps\\agent-0a.d: D:\\w\\a.rs\n\nD:\\w\\a.rs:\n"),
+            [PathBuf::from("D:\\w\\a.rs")]
+        );
+    }
+
+    #[test]
+    fn a_library_is_read_from_its_rlibs_dep_info_not_a_test_builds() {
+        let dir = std::env::temp_dir().join(format!("ngr-agent-dep-info-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("a temporary directory");
+        std::fs::write(
+            dir.join("agent-0a.d"),
+            "/t/deps/libagent-0a.rlib: src/lib.rs\n\nsrc/lib.rs:\n",
+        )
+        .expect("the library's dep-info");
+        // A test build of the library, written later, lists its test-only module too.
+        std::fs::write(
+            dir.join("agent-1b.d"),
+            "/t/deps/agent-1b: src/lib.rs src/tests.rs\n\nsrc/lib.rs:\nsrc/tests.rs:\n",
+        )
+        .expect("the test build's dep-info");
+        let later = modified(&dir.join("agent-0a.d")).expect("a time") + Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(dir.join("agent-1b.d"))
+            .and_then(|file| file.set_modified(later))
+            .expect("the test build's dep-info is the newer");
+        assert_eq!(
+            newest_dep_info(&dir, "agent", Some("rlib")),
+            [PathBuf::from("src/lib.rs")]
+        );
+        assert_eq!(
+            newest_dep_info(&dir, "agent", None).len(),
+            2,
+            "without an artifact the newest counts"
+        );
+        // Another crate whose name starts with this one's is not read.
+        assert!(newest_dep_info(&dir, "agen", Some("rlib")).is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_binarys_sources_are_found_in_this_build() {
+        let exe = std::env::current_exe().expect("test executable path");
+        let files = sources(&root(), exe.parent().unwrap(), "agent");
+        assert!(
+            files
+                .iter()
+                .any(|file| file.ends_with("crates/agent/src/main.rs"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file.ends_with("crates/agent/src/comm_log.rs"))
+        );
+        assert!(
+            files
+                .iter()
+                .any(|file| file.ends_with("crates/diag-ir/build.rs"))
+        );
+        // A module only the library's own tests compile.
+        assert!(
+            !files
+                .iter()
+                .any(|file| file.ends_with("identification/run_tests.rs"))
+        );
     }
 
     #[test]

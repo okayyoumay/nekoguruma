@@ -228,11 +228,12 @@ fn the_presence_request_collects_what_the_simulated_ecu_answers() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let root = tempfile::tempdir().expect("temporary directory");
     let temp = std::env::temp_dir();
-    let config = temp.join(format!("sim-vci-presence-{nanos}.toml"));
-    let control_dir = temp.join(format!("sim-vci-presence-{nanos}"));
-    let definitions = temp.join(format!("sim-vci-presence-definitions-{nanos}"));
+    let config = temp.join(format!("sim-vci-presence-{pid}-{nanos}.toml"));
+    let control_dir = temp.join(format!("sim-vci-presence-{pid}-{nanos}"));
+    let definitions = temp.join(format!("sim-vci-presence-definitions-{pid}-{nanos}"));
     std::fs::write(&config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).

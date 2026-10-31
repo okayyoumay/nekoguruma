@@ -252,16 +252,17 @@ fn agent_job_reads_the_vin_from_sim_vci() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let config_path = std::env::temp_dir().join(format!("agent-e2e-{nanos}-sim-vci.toml"));
+    let pid = std::process::id();
+    let config_path = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-sim-vci.toml"));
     let config = TempFile(config_path.clone());
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
-    let definition_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-definitions"));
+    let definition_dir = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-definitions"));
     // The control directory `sim-vci` takes faults from (`crates/sim-vci/docs/simulated-vci.md`),
     // and the fifth job's communication log.
-    let control_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-control"));
-    let comm_log_dir = std::env::temp_dir().join(format!("agent-e2e-{nanos}-commlog"));
+    let control_dir = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-control"));
+    let comm_log_dir = std::env::temp_dir().join(format!("agent-e2e-{pid}-{nanos}-commlog"));
     for dir in [&control_dir, &comm_log_dir] {
         let _ = std::fs::remove_dir_all(dir);
         std::fs::create_dir_all(dir).expect("test directory");

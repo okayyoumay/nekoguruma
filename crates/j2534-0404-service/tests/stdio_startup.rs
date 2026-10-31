@@ -34,7 +34,8 @@ fn unique_temp_path(file_name: &str) -> PathBuf {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    std::env::temp_dir().join(format!("j2534-0404-service-{nanos}-{file_name}"))
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("j2534-0404-service-{pid}-{nanos}-{file_name}"))
 }
 
 /// The registration-definition directory that goes with `config_path` (ADR-282): the same

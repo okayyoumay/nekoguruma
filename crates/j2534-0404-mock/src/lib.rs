@@ -7093,7 +7093,8 @@ mod tests {
         }
 
         let root = std::env::temp_dir().join(format!(
-            "j2534-0404-mock-search-test-{}",
+            "j2534-0404-mock-search-test-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

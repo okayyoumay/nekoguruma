@@ -122,7 +122,8 @@ fn ngr_agent_runs_a_document_on_sim_vci() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let root = std::env::temp_dir().join(format!("ngr-agent-e2e-{nanos}"));
+    let pid = std::process::id();
+    let root = std::env::temp_dir().join(format!("ngr-agent-e2e-{pid}-{nanos}"));
     std::fs::create_dir_all(&root).expect("temporary directory should be writable");
     let temp = TempDir(root.clone());
 

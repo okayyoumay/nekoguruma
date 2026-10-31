@@ -1644,7 +1644,8 @@ impl StateDir {
             .duration_since(UNIX_EPOCH)
             .expect("system clock should be after unix epoch")
             .as_nanos();
-        let dir = std::env::temp_dir().join(format!("sim-vci-state-{name}-{nanos}"));
+        let pid = std::process::id();
+        let dir = std::env::temp_dir().join(format!("sim-vci-state-{name}-{pid}-{nanos}"));
         std::fs::create_dir_all(&dir).expect("temporary directory should be writable");
         Self(dir)
     }

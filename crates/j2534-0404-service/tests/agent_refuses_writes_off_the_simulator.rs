@@ -61,12 +61,14 @@ fn agent_refuses_a_write_on_a_vci_that_is_not_the_simulator() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let config_path = std::env::temp_dir().join(format!("agent-refuses-{nanos}-mock.toml"));
+    let pid = std::process::id();
+    let config_path = std::env::temp_dir().join(format!("agent-refuses-{pid}-{nanos}-mock.toml"));
     let config = TempFile(config_path.clone());
     std::fs::write(&config_path, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
-    let definition_dir = std::env::temp_dir().join(format!("agent-refuses-{nanos}-definitions"));
+    let definition_dir =
+        std::env::temp_dir().join(format!("agent-refuses-{pid}-{nanos}-definitions"));
     let _ = std::fs::remove_dir_all(&definition_dir);
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     j2534_0404_mock::write_definition(&definition_dir, LIBRARY_NAME, &mock_library)

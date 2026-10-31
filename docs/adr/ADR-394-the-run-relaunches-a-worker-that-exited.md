@@ -1,7 +1,7 @@
 # ADR-394: The Run Starts a Worker That Exited Again
 
 **Date:** 2026-10-30
-**Status:** Accepted
+**Status:** Accepted (the settle step of item 3 also runs after a link fails to open and to close again, in both runners, by ADR-396)
 **Affects:** `agent` source of the worker (`WorkerSource::status`, `end`, `pid`;
 `launch::RelaunchingWorker`, `LaunchRecipe`), host (`WorkerHost::try_reopen`, `Relink`,
 `HostError::WorkerStart`), runner (`run_job`'s end), `main.rs`; `worker-host`

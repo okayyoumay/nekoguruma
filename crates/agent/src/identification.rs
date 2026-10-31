@@ -24,12 +24,13 @@ use crate::document::{DocumentError, JobDocument};
 use crate::guards::JobGuards;
 use crate::host::{
     HostError, OwnRead, ProcedurePosition, ReopenAttempt, ResendClass, Timings, names_lost_vci,
+    settle_worker,
 };
-use crate::link::{BUS_TYPE_DWCAN, LinkConfig, MAX_CAN_ID};
+use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig, MAX_CAN_ID};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, close_job_link, on_job_thread,
-    open_job_link, reopen_attempts,
+    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, WORKER_EXIT_GRACE, close_job_link,
+    on_job_thread, open_job_link, reopen_attempts,
 };
 use crate::send_receive::declared_sid;
 
@@ -661,23 +662,21 @@ pub async fn run_identification<W: WorkerSource>(
     }
 }
 
-/// Asks the source whether the worker has exited since it was last asked; if it has, logs its
-/// exit, clears the guards' mark (a reaped process holds no link, ADR-258 item 3) and notes that
-/// the next client is a restart (ADR-394). Returns whether the worker was found exited.
-fn probe_worker<W: WorkerSource>(
-    source: &mut SharedSource<W>,
+/// Settles the worker after a link failed to open, or before one opens (`evidence` empty), by
+/// the rule a host follows when it opens a link again (ADR-394, [`settle_worker`]): a worker that
+/// exited or was ended is logged and the guards' mark cleared, since it holds no link (ADR-258
+/// item 3), and the next client is a restart. Returns whether the worker was found gone.
+fn settle(
+    source: &mut impl WorkerSource,
+    evidence: CloseEvidence,
     comm_log: &Option<crate::comm_log::CommLog>,
     guards: &GuardSlot,
     worker_ended: &Cell<bool>,
 ) -> bool {
-    if worker_ended.get() {
+    if worker_ended.get()
+        || !settle_worker(source, evidence, WORKER_EXIT_GRACE, comm_log.as_ref(), &[])
+    {
         return false;
-    }
-    let WorkerStatus::Exited(exit) = source.status() else {
-        return false;
-    };
-    if let Some(log) = comm_log {
-        log.worker_exit(exit, &[]);
     }
     worker_ended.set(true);
     if let Some(held) = guards.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
@@ -834,6 +833,7 @@ fn presence_part<W: WorkerSource>(
             error,
             cleaned_up: true,
             table_refused: false,
+            evidence: CloseEvidence::default(),
         };
         // A cancel, a worker that exited and the guards' mark are judged before each open: a
         // link the worker may still hold ends the job (ADR-258).
@@ -841,7 +841,13 @@ fn presence_part<W: WorkerSource>(
             return Err(stop(JobError::Cancelled));
         }
         let mut shared = SharedSource(Arc::clone(source));
-        probe_worker(&mut shared, &comm_log, guards, worker_ended);
+        settle(
+            &mut shared,
+            CloseEvidence::default(),
+            &comm_log,
+            guards,
+            worker_ended,
+        );
         if link_unconfirmed(guards) {
             return Err(stop(JobError::LinkUnconfirmed));
         }
@@ -870,8 +876,14 @@ fn presence_part<W: WorkerSource>(
         opened.map_err(|mut refused| {
             let lost = matches!(&refused.error, JobError::Link(error)
                 if error.resend_class() == ResendClass::PathLost);
-            if !refused.cleaned_up && lost {
-                refused.cleaned_up = probe_worker(&mut shared, &comm_log, guards, worker_ended);
+            if !refused.cleaned_up && lost && refused.evidence.silent() {
+                refused.cleaned_up = settle(
+                    &mut shared,
+                    refused.evidence,
+                    &comm_log,
+                    guards,
+                    worker_ended,
+                );
             }
             refused
         })

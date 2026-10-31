@@ -8,7 +8,7 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::time::{Duration, Instant};
 
-use crate::client::{WorkerApi, WorkerExit, WorkerStatus};
+use crate::client::{WorkerApi, WorkerStatus};
 use diag_ir::DiagHost;
 use tokio::runtime::Handle;
 use vci_service_interface::{
@@ -23,7 +23,7 @@ use crate::comm_log::exchange::{
     SectionAttrs, SourcePos, Target, TransmitEvidence, UnknownCause, VciTime, VciTimes,
 };
 use crate::comm_log::{AgentNow, EndError, EndItem, EndRead, UnattachedData, UnattachedItem};
-use crate::link::{Link, LinkConfig};
+use crate::link::{CloseEvidence, Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
 
 /// The `link` of the host's exchange entries and of the log's `link_opened`: a job has one
@@ -636,6 +636,48 @@ pub(crate) struct Relink<C: WorkerApi> {
 /// How often the worker's process is asked about within [`Relink::exit_grace`].
 const EXIT_POLL: Duration = Duration::from_millis(50);
 
+/// Settles a worker after a step of closing or opening a link got no answer (ADR-394): asks the
+/// source whether its process has exited, asks again for a short while (`exit_grace`) when a step
+/// went unanswered, since a killed process closes its sockets before it can be reaped, and ends a
+/// worker that is alive when a step hung. When the worker is gone, its exit is written to `log`
+/// with the exchanges in flight, and the result is true: no process of it holds the link. A
+/// source that does not own the process, or a worker that cannot be ended, gives false.
+pub(crate) fn settle_worker<S: crate::client::WorkerSource + ?Sized>(
+    source: &mut S,
+    evidence: CloseEvidence,
+    exit_grace: Duration,
+    log: Option<&crate::comm_log::CommLog>,
+    in_flight: &[u64],
+) -> bool {
+    let mut status = source.status();
+    if matches!(status, WorkerStatus::Alive) && evidence.unanswered {
+        let until = Instant::now() + exit_grace;
+        while matches!(status, WorkerStatus::Alive) && Instant::now() < until {
+            std::thread::sleep(EXIT_POLL.min(exit_grace));
+            status = source.status();
+        }
+    }
+    let exit = match status {
+        WorkerStatus::Exited(exit) => exit,
+        // Any step of the close may be the one that hung.
+        WorkerStatus::Alive if evidence.hung => match source.end() {
+            Ok(exit) => exit,
+            Err(end_error) => {
+                tracing::warn!(
+                    error = %crate::oplog::LogSafe::log_text(&end_error),
+                    "could not end the worker that did not answer"
+                );
+                return false;
+            }
+        },
+        _ => return false,
+    };
+    if let Some(log) = log {
+        log.worker_exit(exit, in_flight);
+    }
+    true
+}
+
 impl<C: WorkerApi> WorkerHost<C> {
     pub fn new(handle: Handle, client: C, link: Link, timings: Timings) -> Self {
         Self {
@@ -728,43 +770,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                     *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
                 Err(error) => {
-                    // The close got no answer, or the worker ended while it ran. A worker that
-                    // exited is reaped; one that is alive and does not answer is ended by the
-                    // agent (ADR-394). Either way no process of it holds the link.
-                    let mut status = relink.source.status();
-                    // A process that was killed closes its sockets before it can be reaped, so
-                    // a close that got no answer from a worker still reported alive is asked
-                    // about again for a short while before the worker is given up as alive.
-                    if matches!(status, WorkerStatus::Alive) && evidence.unanswered {
-                        let until = Instant::now() + relink.exit_grace;
-                        while matches!(status, WorkerStatus::Alive) && Instant::now() < until {
-                            std::thread::sleep(EXIT_POLL.min(relink.exit_grace));
-                            status = relink.source.status();
-                        }
-                    }
-                    let ended = match status {
-                        WorkerStatus::Exited(exit) => {
-                            self.worker_ends(relink, exit, in_flight);
-                            true
-                        }
-                        // Any step of the close may be the one that hung: the error is the
-                        // first failure, which a worker's refusal can hide it behind.
-                        WorkerStatus::Alive if evidence.hung => match relink.source.end() {
-                            Ok(exit) => {
-                                self.worker_ends(relink, exit, in_flight);
-                                true
-                            }
-                            Err(end_error) => {
-                                tracing::warn!(
-                                    error = %crate::oplog::LogSafe::log_text(&end_error),
-                                    "could not end the worker that did not answer"
-                                );
-                                false
-                            }
-                        },
-                        _ => false,
-                    };
-                    if !ended {
+                    // The close got no answer, or the worker ended while it ran: a worker that
+                    // exited is reaped, and a live one that hung is ended (ADR-394). Either way
+                    // no process of it holds the link.
+                    if !self.worker_gone(relink, evidence, in_flight) {
                         // The worker may still hold the lost link (ADR-258); the runner's own
                         // close at the end tries again.
                         tracing::warn!(
@@ -830,7 +839,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                     error = %crate::oplog::LogSafe::log_text(&failure.error),
                     "the link did not open again"
                 );
-                if failure.cleaned_up {
+                if failure.cleaned_up
+                    || (failure.evidence.silent()
+                        && self.worker_gone(relink, failure.evidence, None))
+                {
                     ReopenAttempt::NotYet
                 } else {
                     // The worker may hold what the open left (ADR-258).
@@ -842,43 +854,50 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 
     /// Whether the worker's process has exited since the last time this was asked, and if it has,
-    /// takes the end in ([`WorkerHost::worker_ends`]). A source that does not own the process
+    /// takes the end in ([`WorkerHost::worker_gone`]). A source that does not own the process
     /// never says so, and neither does one whose worker's end was taken in already, until a
     /// client of a new worker is given (ADR-394).
     fn worker_exited(&mut self, relink: &mut Relink<C>) -> bool {
         if relink.worker_ended {
             return false;
         }
-        match relink.source.status() {
-            WorkerStatus::Exited(exit) => {
-                let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
-                self.worker_ends(relink, exit, in_flight);
-                true
-            }
-            WorkerStatus::Alive | WorkerStatus::Unknown => false,
-        }
+        let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
+        self.worker_gone(relink, CloseEvidence::default(), in_flight)
     }
 
-    /// Takes in that the worker's process is gone (ADR-394): the log gets its `worker_exit` with
-    /// the exchange that was in flight, the link it held counts as closed, with no close made
-    /// through it, and the guards' mark is cleared, since a process that no longer exists holds
-    /// no link (ADR-258 item 3). The primitive the host was settling is dropped: its end cannot be
-    /// read, and its exchange stays as it was written.
-    fn worker_ends(&mut self, relink: &mut Relink<C>, exit: WorkerExit, in_flight: Option<u64>) {
-        self.stray = None;
+    /// Settles the worker after a step of closing or opening a link got no answer
+    /// ([`settle_worker`]), and if it is gone takes that in (ADR-394): the log got its
+    /// `worker_exit` with the exchange that was in flight, the link it held counts as closed,
+    /// with no close made through it, and the guards' mark is cleared, since a process that no
+    /// longer exists holds no link (ADR-258 item 3). The primitive the host was settling is
+    /// dropped: its end cannot be read, and its exchange stays as it was written.
+    fn worker_gone(
+        &mut self,
+        relink: &mut Relink<C>,
+        evidence: CloseEvidence,
+        in_flight: Option<u64>,
+    ) -> bool {
         let in_flight: Vec<u64> = in_flight.into_iter().collect();
-        self.link.events = None;
-        if let Some(log) = &self.comm_log {
-            log.worker_exit(exit, &in_flight);
+        let gone = settle_worker(
+            &mut *relink.source,
+            evidence,
+            relink.exit_grace,
+            self.comm_log.as_ref(),
+            &in_flight,
+        );
+        if gone {
+            self.stray = None;
+            self.link.events = None;
+            relink.old_open = false;
+            *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = None;
+            relink.worker_ended = true;
+            (relink.worker_gone)();
         }
-        relink.old_open = false;
-        *relink.open.lock().unwrap_or_else(|e| e.into_inner()) = None;
-        relink.worker_ended = true;
-        (relink.worker_gone)();
+        gone
     }
 
     /// At the end of a run that ended on a lost path: whether the worker's process has exited,
-    /// which is then taken in ([`WorkerHost::worker_ends`]) so that the final close, which would
+    /// which is then taken in ([`WorkerHost::worker_gone`]) so that the final close, which would
     /// go through a dead worker, is not made and does not mark the guards (ADR-394).
     pub(crate) fn reap_exited_worker(&mut self) -> bool {
         let Some(mut relink) = self.relink.take() else {

@@ -1193,7 +1193,7 @@ pub(crate) async fn on_job_thread<T: Send + 'static>(
 }
 
 /// How long a close that got no answer waits for a killed worker's exit to show (ADR-394).
-const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
 
 /// The whole job, on the blocking thread: open, run, close.
 #[expect(
@@ -1352,6 +1352,8 @@ pub(crate) struct LinkRefused {
     pub(crate) cleaned_up: bool,
     /// The worker answered, refusing the receive table or the connect (ADR-396).
     pub(crate) table_refused: bool,
+    /// What the failed open showed of the worker (ADR-394).
+    pub(crate) evidence: link::CloseEvidence,
 }
 
 /// Opens the job's link on `client`, logs the VCI and the link, and builds the host that sends on
@@ -1387,6 +1389,7 @@ pub(crate) fn open_job_link<C: WorkerApi>(
                 error: JobError::Link(failure.error),
                 cleaned_up: failure.cleaned_up,
                 table_refused: failure.table_refused,
+                evidence: failure.evidence,
             });
         }
         Err(_) => {
@@ -1395,6 +1398,7 @@ pub(crate) fn open_job_link<C: WorkerApi>(
                 error: JobError::Panicked,
                 cleaned_up: false,
                 table_refused: false,
+                evidence: link::CloseEvidence::default(),
             });
         }
     };
@@ -15745,6 +15749,36 @@ def main():
         fake_worker_closing_all(disconnects, Vec::new(), modules).await
     }
 
+    /// A [`FakeWorker`] whose link set-up fails and whose module disconnect then gets no answer
+    /// (`Unavailable`), as a worker whose process is gone does.
+    async fn fake_worker_gone_in_setup() -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let service = FakeWorker {
+            fail_disconnect: false,
+            fail_open: true,
+            calls: Arc::clone(&calls),
+            comparams: Mutex::new(Vec::new()),
+            set: Arc::clone(&set),
+            refuse_set: None,
+            starts: false,
+            started: Arc::default(),
+            cancelled: Arc::default(),
+            cancel: CancelAnswer::Done,
+            on_start: None,
+            start_script: Mutex::default(),
+            released: Arc::new(tokio::sync::Semaphore::new(0)),
+            events: Arc::default(),
+            device_clock: false,
+            disconnect_script: Mutex::default(),
+            module_script: Mutex::new([Some(unavailable())].into()),
+            destroy_script: Mutex::default(),
+            start_failures: Mutex::default(),
+        };
+        let (client, calls, _) = serve(service, calls, set).await;
+        (client, calls)
+    }
+
     /// [`fake_worker_closing`] whose first destroys of the link answer as `destroys` say too.
     async fn fake_worker_closing_all(
         disconnects: Vec<Option<tonic::Status>>,
@@ -20691,6 +20725,61 @@ def main():
             assert_eq!(of_event(&lines, "worker_restart")[0]["pid"], 101, "{tag}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// ADR-394: a worker that exited while the reopened link was set up leaves the open failed
+    /// and its cleanup failed too (the module's disconnect gets no answer). The process, found
+    /// exited, confirms nothing is held: its exit is logged, the guards stay unmarked, a worker is
+    /// started again and the read is sent again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_exits_while_the_reopened_link_is_set_up_is_started_again() {
+        let tag = "exit-in-setup";
+        let dir = journal_dir(tag);
+        let (first, _) = fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        // The worker started for the reopen fails the link's connect and gives the module's
+        // disconnect no answer, as a process that is gone does.
+        let (second, _) = fake_worker_gone_in_setup().await;
+        let (third, third_calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let (source, asked_of) = scripted(
+            first,
+            vec![Ok(second), Ok(third)],
+            vec![exited(ExitHow::Signal(9)), exited(ExitHow::Signal(9))],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            Some(dir.as_path()),
+            after_loss_limits(),
+            tag,
+        )
+        .await;
+        run.result.unwrap_or_else(|error| panic!("{error}"));
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(asked(&asked_of, "launch"), 2);
+        assert_eq!(asked(&asked_of, "end"), 0);
+        assert_eq!(
+            closes(&third_calls),
+            [
+                "DisconnectComLogicalLink",
+                "DestroyComLogicalLink",
+                "ModuleDisconnect"
+            ]
+        );
+        assert_eq!(
+            worker_events(&dir),
+            [
+                "vci_connected",
+                "link_opened",
+                "worker_exit",
+                "worker_restart",
+                "worker_exit",
+                "worker_restart",
+                "vci_connected",
+                "link_opened"
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// ADR-394: when the run cannot go on after a worker exited (a request not safe to repeat

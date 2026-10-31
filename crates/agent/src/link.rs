@@ -573,6 +573,9 @@ pub(crate) struct OpenFailure {
     /// The worker answered, refusing the receive table or the connect of the link: not a
     /// timeout, not a lost path (ADR-396, the halving's trigger).
     pub(crate) table_refused: bool,
+    /// What the failing step and the cleanup showed of the worker, for settling it when the
+    /// cleanup failed (ADR-394).
+    pub(crate) evidence: CloseEvidence,
 }
 
 impl OpenFailure {
@@ -582,15 +585,28 @@ impl OpenFailure {
             error,
             cleaned_up: true,
             table_refused: false,
+            evidence: CloseEvidence::default(),
         }
     }
 
-    fn unclean(error: HostError, cleaned_up: bool) -> Self {
+    /// A failure whose cleanup left `cleaned_up` and showed `evidence` of the worker.
+    fn unclean(error: HostError, cleaned_up: bool, mut evidence: CloseEvidence) -> Self {
+        evidence.note_error(&error);
         Self {
             error,
             cleaned_up,
             table_refused: false,
+            evidence,
         }
+    }
+
+    /// [`OpenFailure::unclean`] after the module's disconnect, whose result is `closed`.
+    fn after_disconnect(error: HostError, closed: Result<(), HostError>) -> Self {
+        let mut evidence = CloseEvidence::default();
+        if let Err(cleanup) = &closed {
+            evidence.note_error(cleanup);
+        }
+        Self::unclean(error, closed.is_ok(), evidence)
     }
 }
 
@@ -630,14 +646,16 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
                 // failed create left nothing behind only when the worker refused it. A create that
                 // timed out or failed otherwise may have made a link nobody holds a handle for
                 // (ADR-258).
-                let cleaned_up = if client.held_module().is_some() {
-                    nothing_created(&error)
-                } else {
-                    disconnect_module(client, module_handle, deadline)
-                        .await
-                        .is_ok()
-                };
-                return Err(OpenFailure::unclean(error, cleaned_up));
+                if client.held_module().is_some() {
+                    let cleaned_up = nothing_created(&error);
+                    return Err(OpenFailure::unclean(
+                        error,
+                        cleaned_up,
+                        CloseEvidence::default(),
+                    ));
+                }
+                let closed = disconnect_module(client, module_handle, deadline).await;
+                return Err(OpenFailure::after_disconnect(error, closed));
             }
         };
     match set_up_link(client, config, deadline, cll_handle).await {
@@ -652,12 +670,11 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
             forwards_pendings,
         }),
         Err(error) => {
-            let cleaned_up = teardown(client, module_handle, cll_handle, deadline, false)
-                .await
-                .is_ok();
+            let (closed, evidence) =
+                teardown_observed(client, module_handle, cll_handle, deadline, false).await;
             Err(OpenFailure {
                 table_refused: refuses_receive_table(&error),
-                ..OpenFailure::unclean(error, cleaned_up)
+                ..OpenFailure::unclean(error, closed.is_ok(), evidence)
             })
         }
     }
@@ -710,10 +727,8 @@ async fn open_module<C: WorkerApi>(
         // The connect may have completed on the worker after the deadline. Disconnecting a
         // module that is not connected changes nothing; when that disconnect fails too, the
         // module is not known to be disconnected.
-        let cleaned_up = disconnect_module(client, module_handle, deadline)
-            .await
-            .is_ok();
-        return Err(OpenFailure::unclean(error, cleaned_up));
+        let closed = disconnect_module(client, module_handle, deadline).await;
+        return Err(OpenFailure::after_disconnect(error, closed));
     }
     Ok(module_handle)
 }
@@ -1093,11 +1108,21 @@ pub(crate) struct CloseEvidence {
 }
 
 impl CloseEvidence {
+    /// Whether some step showed the worker silent: a worker that answered every step is alive.
+    pub(crate) fn silent(&self) -> bool {
+        self.unanswered || self.hung
+    }
+
+    /// Takes in a step that failed with `error`.
+    pub(crate) fn note_error(&mut self, error: &HostError) {
+        self.unanswered |= !is_workers_answer(error);
+        self.hung |= matches!(error, HostError::WorkerUnresponsive(_));
+    }
+
     fn note(&mut self, outcome: &CloseOutcome) {
         for step in [&outcome.disconnect, &outcome.destroy, &outcome.module] {
             if let Err(error) = step {
-                self.unanswered |= !is_workers_answer(error);
-                self.hung |= matches!(error, HostError::WorkerUnresponsive(_));
+                self.note_error(error);
             }
         }
     }

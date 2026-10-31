@@ -4426,7 +4426,10 @@ impl J2534Service {
         // note for `dual_channel`). `effective_can_mode` is read once and
         // reused for all three locals below, rather than calling
         // `effective_can_channel_mode()` again, since it is an async call
-        // that locks `resolved_can_channel_mode`.
+        // that locks `resolved_can_channel_mode`. This snapshot only drives
+        // the connect-time native-mixed channel setup, which an explicit
+        // mode fixes and `auto` never resolves to; the ISO15765 filter
+        // install re-reads the mode at install time (see below).
         //
         // - `native_mixed_applies`: `true` iff this link's primary channel
         //   is ISO15765-family, not FD-substituted (ADR-159's own fallback
@@ -5091,16 +5094,26 @@ impl J2534Service {
         // filter counts and this link's keys change together, and no
         // disconnect or join can see the link half-installed.
         if base_proto_id == j2534_0404::ISO15765 {
-            // Auto mode: the first ISO15765-family CLL to establish a *new*
-            // physical ISO15765 channel decides, once, whether this device is
-            // dual-channel-capable (ADR-046 addendum, ADR-047). The mode is
-            // resolved BEFORE the strict install below, because the filters
-            // depend on it: under `DualChannel` a UUDT response id is served
-            // by the companion channel and gets no flow-control filter, while
-            // under `SingleChannel` it gets the flow-control workaround that
-            // an adapter enforcing unique flow-control ids refuses when the
-            // USDT filter shares the request id. A no-op for every other mode
-            // and for joining CLLs (whose channel's creator already probed).
+            // Auto mode (ADR-046 addendum, ADR-047): the strict install below
+            // must use the mode as resolved for this device NOW, never the
+            // snapshot taken before the channel was created or joined, which
+            // in `auto` is only the pre-probe fallback. The filters depend on
+            // it: under `DualChannel` a UUDT response id is served by the
+            // companion channel and gets no flow-control filter, while under
+            // `SingleChannel` it gets the flow-control workaround that an
+            // adapter enforcing unique flow-control ids refuses when the USDT
+            // filter shares the request id.
+            //
+            // So EVERY unqualified, non-FD ISO15765 connect (creator or
+            // joiner) runs `probe_can_channel_mode` and then re-reads the
+            // mode, after giving up `chans`. The probe is a no-op once the
+            // mode is resolved; while another connect's probe is still in
+            // flight, it waits on `resolved_can_channel_mode`'s lock, which
+            // the probe holds across its work, so this connect installs only
+            // after the result exists. If nothing has probed yet, this
+            // connect does. No lock is held across the probe except that
+            // cache's own (ADR-080). A non-`auto` mode is fixed, so its
+            // snapshot is already final and `chans` stays held.
             // ADR-157 accepted residual, widened to `_CHx` by ADR-156
             // Decision 3 addendum/Phase 2b: also skipped for a qualified
             // (`_PS` or `_CHx`) link -- an `ISO15765_PS`/`ISO15765_CHx` link
@@ -5115,8 +5128,7 @@ impl J2534Service {
             // the gap has taken it offline, and nothing is installed for it.
             let mut effective_can_mode = effective_can_mode;
             let mut still_online = true;
-            if is_new_channel
-                && link_pin_select.is_none()
+            if link_pin_select.is_none()
                 && link_channel_index.is_none()
                 && !resources::is_fd_protocol_id(j2534_proto_id)
                 && self.can_channel_mode == CanChannelMode::Auto

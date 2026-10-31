@@ -93,10 +93,15 @@ adapter refuses (ADR-129) and a native-mixed identifier collision (ADR-162).
    to halve. Any other error fails the connect as `Code::Unknown` with `PDU_ERR_FCT_FAILED`:
    the agent's `refused` never reads `UNKNOWN` as the worker's answer, so such an error is not
    a refusal and the table is not halved, with no change to the agent. The three are told apart
-   in `error::map_connect_filter_failure`. In `auto` CAN channel mode the probe of ADR-047 runs
-   before this install, outside the `shared_channels` guard, so the filters installed are the
-   resolved mode's: an adapter with a companion channel is not refused the UUDT workaround's
-   second flow-control filter that a single-channel table would need.
+   in `error::map_connect_filter_failure`. In `auto` CAN channel mode every unqualified
+   connect, the channel's creator or a joiner, runs the probe of ADR-047 (a no-op once the mode
+   is resolved) and then reads the mode again, outside the `shared_channels` guard and
+   immediately before the install; the mode read on entry to the connect is never used for the
+   filters. A joiner that reaches the install while another connect's probe is in flight waits
+   on the probe's own lock (`resolved_can_channel_mode`, which the probe holds across its work
+   and which is taken after, never inside, the `shared_channels` guard), so the filters
+   installed are the resolved mode's: an adapter with a companion channel is not refused the
+   UUDT workaround's second flow-control filter that a single-channel table would need.
 10. **One offline teardown (ADR-397).** `DisconnectComLogicalLink` and the rollback of a
     refused connect run one function, `take_link_offline`, under the `shared_channels` guard
     the caller holds: client filters, point-to-point filters (item 8), repeat messages, the

@@ -2018,6 +2018,15 @@ struct BecomeMasterHoldState {
     released: bool,
 }
 
+/// One-shot hold on a `PassThruConnect` call (`MockState::connect_hold`).
+struct ConnectHold {
+    /// Number of connects that must have succeeded before the held one.
+    after: usize,
+    /// Set once a connect has taken the hold.
+    taken: bool,
+    rendezvous: Arc<BecomeMasterHold>,
+}
+
 // ── Global mock state ─────────────────────────────────────────────────────────
 
 #[derive(Default)]
@@ -2166,6 +2175,14 @@ struct MockState {
     /// backdoor was added. See [`BecomeMasterHold`]'s own doc comment for
     /// the rendezvous mechanism.
     become_master_hold: Option<Arc<BecomeMasterHold>>,
+    /// Armed via `__mock_arm_connect_hold(after)`: the first `PassThruConnect`
+    /// made once `after` connects have succeeded blocks (outside `state()`'s
+    /// lock) until `__mock_release_connect_hold`, using the same rendezvous as
+    /// `become_master_hold`. Lets a test hold a `can_channel_mode = "auto"`
+    /// capability probe (the connect after the primary one) while another
+    /// connect proceeds. One-shot: later connects are not held. Cleared by
+    /// `__mock_reset`.
+    connect_hold: Option<ConnectHold>,
     /// Raw J2534 error code `PassThruReadMsgs` returns instead of its normal
     /// success/`ERR_BUFFER_EMPTY` behavior, set via
     /// `__mock_set_read_msgs_error`. `None` (the default after
@@ -2600,6 +2617,27 @@ exported_fn!(PassThruConnect(
 ) -> c_long {
     if p_channel_id.is_null() {
         return err_null();
+    }
+    // `__mock_arm_connect_hold`: block here, with `state()` released, until
+    // the test releases the hold.
+    let connect_hold = {
+        let mut guard = state().lock().expect("mock state poisoned");
+        let connected = guard.counters.connect;
+        match guard.connect_hold.as_mut() {
+            Some(hold) if !hold.taken && connected >= hold.after => {
+                hold.taken = true;
+                Some(hold.rendezvous.clone())
+            }
+            _ => None,
+        }
+    };
+    if let Some(hold) = connect_hold {
+        let mut hstate = hold.state.lock().expect("connect hold state poisoned");
+        hstate.engaged = true;
+        hold.condvar.notify_all();
+        while !hstate.released {
+            hstate = hold.condvar.wait(hstate).expect("connect hold condvar poisoned");
+        }
     }
     let mut guard = state().lock().expect("mock state poisoned");
     if guard.max_channels != 0 && guard.channels.len() >= guard.max_channels {
@@ -5521,6 +5559,57 @@ exported_fn!(
         let mut hstate = hold.state.lock().expect("become_master hold state poisoned");
         hstate.released = true;
         hold.condvar.notify_all();
+    }
+    no_error()
+});
+
+exported_fn!(
+    /// Arms a one-shot hold on `PassThruConnect`: the first connect made after
+    /// `after` connects have succeeded blocks until
+    /// `__mock_release_connect_hold`. With `after = 1`, an `auto`-mode
+    /// capability probe's connect is the held one. See
+    /// `MockState::connect_hold`.
+    __mock_arm_connect_hold(after: u32) -> c_long {
+    let mut guard = state().lock().expect("mock state poisoned");
+    guard.connect_hold = Some(ConnectHold {
+        after: after as usize,
+        taken: false,
+        rendezvous: Arc::new(BecomeMasterHold {
+            state: Mutex::new(BecomeMasterHoldState::default()),
+            condvar: Condvar::new(),
+        }),
+    });
+    no_error()
+});
+
+exported_fn!(
+    /// `1` once a `PassThruConnect` is blocked in the armed connect hold,
+    /// `0` otherwise (nothing armed, or no connect has reached it yet).
+    __mock_connect_hold_engaged() -> u32 {
+    let guard = state().lock().expect("mock state poisoned");
+    let engaged = guard.connect_hold.as_ref().is_some_and(|hold| {
+        hold.rendezvous
+            .state
+            .lock()
+            .expect("connect hold state poisoned")
+            .engaged
+    });
+    engaged as u32
+});
+
+exported_fn!(
+    /// Releases the armed connect hold. A no-op when none is armed; a connect
+    /// that has not reached the hold yet passes it straight through.
+    __mock_release_connect_hold() -> c_long {
+    let guard = state().lock().expect("mock state poisoned");
+    if let Some(hold) = guard.connect_hold.as_ref() {
+        let mut hstate = hold
+            .rendezvous
+            .state
+            .lock()
+            .expect("connect hold state poisoned");
+        hstate.released = true;
+        hold.rendezvous.condvar.notify_all();
     }
     no_error()
 });

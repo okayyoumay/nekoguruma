@@ -1444,6 +1444,41 @@ impl MockBackdoor {
         }
     }
 
+    /// Holds the first `PassThruConnect` made after `after` connects have
+    /// succeeded until [`Self::release_connect_hold`]. With `after = 1` that is
+    /// an `auto`-mode capability probe's connect.
+    pub(crate) fn arm_connect_hold(&self, after: u32) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(u32) -> c_long> = self
+                .lib
+                .get(b"__mock_arm_connect_hold\0")
+                .expect("__mock_arm_connect_hold should be exported");
+            assert_eq!(f(after), NC, "__mock_arm_connect_hold should succeed");
+        }
+    }
+
+    /// `true` once a connect is blocked in the hold [`Self::arm_connect_hold`] armed.
+    pub(crate) fn connect_hold_engaged(&self) -> bool {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> u32> = self
+                .lib
+                .get(b"__mock_connect_hold_engaged\0")
+                .expect("__mock_connect_hold_engaged should be exported");
+            f() != 0
+        }
+    }
+
+    /// Releases the connect hold; a no-op when none is armed.
+    pub(crate) fn release_connect_hold(&self) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn() -> c_long> = self
+                .lib
+                .get(b"__mock_release_connect_hold\0")
+                .expect("__mock_release_connect_hold should be exported");
+            assert_eq!(f(), NC, "__mock_release_connect_hold should succeed");
+        }
+    }
+
     /// SAE J2534-2 clause 11 GM UART Protocol (ADR-189/Phase 8): the bytes
     /// most recently staged via a successful `IOCTL_SET_POLL_RESPONSE` on
     /// `channel_id`; empty before any such call. Mirrors `written_data`'s own

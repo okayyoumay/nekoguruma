@@ -286,6 +286,96 @@ async fn auto_mode_probes_before_the_strict_install_and_connects_dual_channel() 
     server.shutdown().await;
 }
 
+/// ADR-047 with ADR-398: a connect that joins a channel whose creator's `auto` probe is still
+/// in flight gets the probe's result, so it installs through the companion channel. Both
+/// tables share a request id between a USDT and a UUDT response id, which the adapter (unique
+/// flow-control ids on) refuses as soon as a UUDT id gets the flow-control workaround, so both
+/// connects succeed only with the dual-channel mode.
+///
+/// A's probe channel (the connect after its primary one) is held. B then connects onto A's
+/// channel, and must not finish before the probe does. The native connect blocks its thread
+/// while held, hence the multi-thread runtime.
+///
+/// The mock cannot hold B between its first read of the mode and its install: B waits for
+/// A's device guard before that read, and once A's probe runs, the read itself waits on the
+/// probe. A joiner holding the pre-probe mode is therefore a race window of a few awaits,
+/// which the install-time re-read closes by construction (no snapshot is used for the
+/// install), not a state this test can pin.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[serial]
+async fn auto_mode_joiner_waits_for_the_creators_probe_before_installing() {
+    struct ReleaseOnDrop<'a>(&'a TestServer);
+    impl Drop for ReleaseOnDrop<'_> {
+        fn drop(&mut self) {
+            self.0.backdoor.release_connect_hold();
+        }
+    }
+
+    let server = TestServer::start_with_can_mode(Some("auto")).await;
+    server.backdoor.set_flow_control_filter_checks(10);
+    let mut client = server.client().await;
+    let mut client_a = server.client().await;
+    let mut client_b = server.client().await;
+
+    let table_b = vec![ecu_entry(
+        1,
+        vec![
+            unum32_param(CP_CAN_RESP_USDT_ID, 0x7E9),
+            unum32_param(CP_CAN_RESP_UUDT_ID, 0x5E9),
+            unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E1),
+        ],
+    )];
+    let cll_a = staged_link(&mut client, shared_request_id_table()).await;
+    let cll_b = create_cll(&mut client, j2534_0404::ISO15765, 2).await;
+    set_com_param_unum32(&mut client, cll_b, j2534_0404::DATA_RATE, 500_000).await;
+    set_unique_resp_table(&mut client, cll_b, table_b).await;
+
+    // The connect after the primary one is A's probe channel: hold it.
+    server.backdoor.arm_connect_hold(1);
+    let release = ReleaseOnDrop(&server);
+    let connect_a = tokio::spawn(async move { connect(&mut client_a, cll_a).await });
+    for _ in 0..200 {
+        if server.backdoor.connect_hold_engaged() {
+            break;
+        }
+        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+    }
+    assert!(
+        server.backdoor.connect_hold_engaged(),
+        "A's probe was never reached"
+    );
+
+    let mut connect_b = tokio::spawn(async move { connect(&mut client_b, cll_b).await });
+    assert!(
+        tokio::time::timeout(tokio::time::Duration::from_millis(500), &mut connect_b)
+            .await
+            .is_err(),
+        "B finished while A's probe was held"
+    );
+
+    server.backdoor.release_connect_hold();
+    connect_a
+        .await
+        .expect("A's task")
+        .expect("A connects dual-channel");
+    connect_b
+        .await
+        .expect("B's task")
+        .expect("B connects dual-channel through the companion channel");
+    drop(release);
+
+    // Primary, the probe's channel (released again), and one shared UUDT companion.
+    assert_eq!(server.backdoor.connect_count(), 3);
+    assert_eq!(server.backdoor.disconnect_count(), 1, "the probe's channel");
+    assert_eq!(
+        server.backdoor.filter_count(MOCK_CHANNEL_ID),
+        2,
+        "one USDT flow-control filter per link on the primary channel"
+    );
+
+    server.shutdown().await;
+}
+
 /// ADR-047 with ADR-398: when the probe finds no second channel, `auto` is single-channel,
 /// the UUDT id gets the flow-control workaround as with an explicit `single-channel`, and
 /// an adapter that refuses the repeated request id fails the connect like any other

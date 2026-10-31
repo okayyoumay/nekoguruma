@@ -915,6 +915,11 @@ fn presence_part<W: WorkerSource>(
             host.path_lost();
         }
         let again = attempts < limits.max_primitive_repeats;
+        // A receive error that ended the window is not a clean window, and sending the request
+        // again would not tell more: the part is interrupted with its answers (ADR-396).
+        if matches!(error, HostError::PrimitiveFailed(_)) {
+            break Ok(PartEnd::Interrupted(heard, true));
+        }
         match error.resend_class() {
             // The ECU, the bus or the events failed the window, or the start was refused for a
             // reason that passes: the same link carries the request again.

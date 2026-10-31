@@ -76,6 +76,8 @@ handling of a refused table entry are separate steps.
    resend needs no idempotency check. Lost events, which end the primitive but not the link,
    and a start refused for a reason that passes, are resent on the same link within the same
    bound. The answers received before the failure count and are not discarded by the resend. A
+   window that a receive error ends, with or without answers before it, is not a clean window:
+   the part is reported interrupted with its answers and is not sent again. A
    part whose bounds run out ends the presence phase: the report keeps what was heard and sets
    `presence_interrupted`; a cancel ends the run as cancelled; any other failure of the request
    fails the job.

@@ -32,6 +32,8 @@ enum Item {
     Finish,
     /// The worker reports lost events.
     LostEvents,
+    /// A receive error bound to the primitive.
+    RxError,
     /// The worker reports the VCI lost: an error of no primitive.
     VciLost,
 }
@@ -277,6 +279,13 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
                 Item::Finish => (
                     Some(handle),
                     Data::CopStatus(PduComPrimitiveStatus::PduCopstFinished as i32),
+                ),
+                Item::RxError => (
+                    Some(handle),
+                    Data::ErrorData(vci_service_interface::ErrorData {
+                        error_event: PduErrorEvent::PduErrEvtRxError as i32,
+                        ..Default::default()
+                    }),
                 ),
                 Item::VciLost => (
                     None,
@@ -1072,5 +1081,26 @@ async fn a_worker_that_exits_between_parts_is_logged() {
             "link_opened",
             "link_opened"
         ]
+    );
+}
+
+/// ADR-396: a receive error that ends the window after an answer is not a clean window: the part
+/// is interrupted with its answer, and the request is not sent again.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receive_error_after_an_answer_interrupts_the_part_and_keeps_the_answer() {
+    let fake = Fake::default();
+    fake.state().scripts = VecDeque::from([vec![
+        Item::Answer(A.1, POSITIVE),
+        Item::RxError,
+        Item::Finish,
+    ]]);
+    let ran = run(plan_of(&[A, B], Some(0x7DF)), fake.clone()).await;
+    assert_eq!(ran.heard(), [(A.1, POSITIVE.to_vec())]);
+    assert!(ran.report().presence_interrupted());
+    assert_eq!(ran.report().presence_links_opened(), 1);
+    assert_eq!(fake.state().starts.len(), 1);
+    assert_eq!(
+        ran.exchanges()[0]["answers"].as_array().map(Vec::len),
+        Some(1)
     );
 }

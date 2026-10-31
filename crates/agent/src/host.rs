@@ -3303,6 +3303,9 @@ impl Progress {
             {
                 self.ended = true;
                 return Some(match (self.response.take(), self.error) {
+                    // A collecting window ends in the error that failed it, whatever it had
+                    // collected (ADR-396): the answers are in `collected`.
+                    (_, Some(code)) if self.collecting => Err(HostError::PrimitiveFailed(code)),
                     (Some(response), _) => Ok(response),
                     (None, Some(code)) => Err(HostError::PrimitiveFailed(code)),
                     (None, None) => Err(HostError::NoResponse),
@@ -5925,5 +5928,31 @@ mod tests {
         let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
         let _ = progress.on_event(answer_on(Some(0x7E8), 1, &[0x62, 0xF1, 0x90, 0x41]), COP);
         assert!(progress.collected.is_empty());
+    }
+
+    /// ADR-396: an error that fails a collecting window ends it as that error even when answers
+    /// came before, which stay in `collected`; an ordinary primitive keeps its response.
+    #[test]
+    fn a_receive_error_after_an_answer_fails_a_collecting_window() {
+        let error = event(
+            Some(COP),
+            event_item::Data::ErrorData(vci_service_interface::ErrorData {
+                error_event: PduErrorEvent::PduErrEvtRxError as i32,
+                ..Default::default()
+            }),
+        );
+        let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        let events = |first: EventItem| vec![first, error.clone(), finished.clone()];
+        let (progress, done) = collect(events(answer_on(Some(0x7E8), 1, &[0x7E, 0x00])));
+        assert!(
+            matches!(done, Some(Err(HostError::PrimitiveFailed(code))) if code == PduErrorEvent::PduErrEvtRxError as i32),
+            "{done:?}"
+        );
+        assert_eq!(progress.collected.len(), 1);
+        let mut ordinary = Progress::for_request(&[0x3E, 0x00]).unwrap();
+        let done = events(answer_on(Some(0x7E8), 1, &[0x7E, 0x00]))
+            .into_iter()
+            .find_map(|item| ordinary.on_event(item, COP));
+        assert!(matches!(done, Some(Ok(_))), "{done:?}");
     }
 }

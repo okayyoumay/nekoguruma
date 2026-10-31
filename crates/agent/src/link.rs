@@ -327,7 +327,7 @@ pub const DWCAN_PINS: [(u32, &str); 2] = [(6, "HI"), (14, "LOW")];
 pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;
 /// 11-bit IDs only: a 29-bit ID needs `CP_CanPhysReqFormat` / `CP_CanRespUSDTFormat`, which
 /// `open` does not set yet.
-const MAX_CAN_ID: u32 = 0x7FF;
+pub(crate) const MAX_CAN_ID: u32 = 0x7FF;
 
 /// Where the response code sits in a negative response: `7F`, SID, code.
 const RC_BYTE_OFFSET: u32 = 2;

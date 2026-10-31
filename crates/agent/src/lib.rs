@@ -9,6 +9,7 @@
 //! - [`link`]: the communication link a job runs on, set up through the worker's D-PDU API
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
+//! - [`identification`]: the identification job's plan, its checks and the endpoints it derives (ADR-395)
 //! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
 //! - [`journal`]: the write-job journal a restart resumes from (ADR-244)
 //! - [`restart`]: how a job whose journal exists goes on (ADR-253, ADR-255)
@@ -28,6 +29,7 @@ pub mod comm_log;
 pub mod document;
 pub mod guards;
 pub mod host;
+pub mod identification;
 pub mod inputs;
 pub mod journal;
 mod journaling;

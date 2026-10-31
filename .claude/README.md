@@ -84,7 +84,11 @@ delegated (the final commit and push) or a single targeted read to check an agen
   Mechanical single-crate changes skip it.
   When the diff adds a path that builds what an existing path already builds (a second
   settlement, encoder or conversion producing the same entry or output), name the existing path
-  in the brief and ask for the agent's parity check.
+  in the brief and ask for the agent's parity check. A step the check (or a later review) finds
+  missing from the new path is fixed by having the new path call the existing path's code,
+  extracted into a function both call, not by copying the step or reproducing part of it; a copy
+  stays only when the existing code cannot be called from the new path, and the PR says why
+  (ADR-397). The fix brief asks for that extraction, without a smaller fallback.
 - **`design-advisor`** when a wrong decision is expensive to reverse: interpreting ISO 22900 /
   J2534 / UDS requirements, concurrency or state-machine design across crates, trust-boundary
   and signature design, a choice that needs an ADR, or a bug that survived a `code-scout` +

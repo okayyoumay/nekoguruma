@@ -386,6 +386,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-394](ADR-394-the-run-relaunches-a-worker-that-exited.md) | The Run Starts a Worker That Exited Again | Accepted (the settle step of item 3 also runs after a link fails to open and to close again, in both runners, by ADR-396) | `agent` source of the worker (`WorkerSource`, `launch::RelaunchingWorker`), host (`try_reopen`, `Relink`), runner (`run_job`'s end), `main.rs`; `worker-host` (`WorkerProcess::try_wait`, `kill`); communication log (`worker_exit`, `worker_restart`); design 8.2.5, 8.11; ADR-258; ADR-392; ADR-393 |
 | [ADR-395](ADR-395-the-identification-plan-format.md) | The Identification Plan Format, Its Checks and the Endpoint Key | Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396) | `diag-ir` `plan`, `agent` `identification`; design 8.8.2; ADR-318, ADR-319, ADR-324, ADR-326, ADR-327 |
 | [ADR-396](ADR-396-the-presence-requests-collecting-mode.md) | The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule | Accepted | `agent` link, policy, host, communication log, runner and `identification`; design 8.8.2, 8.11; ADR-235 item 8, ADR-327 item 2, ADR-392, ADR-393, ADR-394, ADR-395 |
+| [ADR-397](ADR-397-a-parity-gap-is-fixed-by-sharing-the-existing-code.md) | A Parity Gap Is Fixed by Sharing the Existing Code | Accepted | `.claude/README.md` (gates, the parity check), `.claude/agents/edge-case-hunter.md` |
 
 ## Status Legend
 
@@ -749,6 +750,7 @@ the predecessor repository these ADRs came from.
 - ADR-382
 - ADR-387
 - ADR-388
+- ADR-397
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

@@ -59,7 +59,9 @@ Working rules:
   two should differ. Also check the paths that later read or rebuild what
   the new path stores (a reclassification, a resume, a cache refresh): what
   the new path decided must survive them, unless the design says it need
-  not. Do this before the other categories, and do not stop at the first
+  not. For each missing step, propose calling the existing path's code (the
+  function to extract and its two callers), not a copy of the step; say so
+  when the existing code cannot be called from the new path. Do this before the other categories, and do not stop at the first
   gap.
 - Before calling a case unreachable or two paths equivalent, construct a
   concrete input that would exercise it and derive its outcome from the rule

@@ -69,7 +69,7 @@ margin theory — stop widening and instrument instead (see
 in the "Test-suite reliability: past flaky-test root causes" section of
 `crates/j2534-0404-service/docs/implementation-notes.md` for a worked example).
 
-- `ngr_agent_end_to_end::ngr_agent_identifies_the_vin_on_sim_vci` (`crates/j2534-0404-service/tests/ngr_agent_end_to_end.rs`): the report of `ngr-agent identify` came back with no `vin` key in several full local runs of the three agent end-to-end binaries, then passed; it failed the same way with the agent, sim and test sources of 203bce4 (the commit that added it), so it predates later work. Confirm in isolation: `cargo test -p j2534-0404-service --locked --test ngr_agent_end_to_end ngr_agent_identifies_the_vin_on_sim_vci` repeated, and beside `agent_identification_presence` and `agent_end_to_end`. Cause unknown; suspects are the VIN read's timing against `sim-vci` or a process-wide setting (`NGR_SIM_ECU_CONFIG`) the binaries share.
+No entries at present.
 
 Past root causes and their fixes: `crates/j2534-0404-service/docs/implementation-notes.md`, section
 "Test-suite reliability: past flaky-test root causes".

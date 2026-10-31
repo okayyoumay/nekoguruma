@@ -6,9 +6,11 @@
 //! for its ABI from a workers directory, launches it and runs the procedure of a variant's document on the simulated
 //! ECU the mock answers from (ADR-299).
 //!
-//! `ngr-agent` belongs to another package, so cargo builds it only when the `agent` package is
-//! tested in the same run (as `cargo test --workspace` and CI do). It is looked up next to the
-//! test's `deps` directory.
+//! `ngr-agent` belongs to another package, so cargo builds it only when the run builds the
+//! `agent` package's binaries (as `cargo test --workspace` and CI do). It is looked up next to
+//! the test's `deps` directory and checked against its sources
+//! (`crates/agent/tests/support/ngr_agent_binary.rs`): build it first with
+//! `cargo build -p agent --bin ngr-agent` to run this package's tests alone.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -20,20 +22,11 @@ const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
 /// The simulated ECU's built-in VIN (`crates/sim-vci/docs/simulated-vci.md`).
 const VIN: &[u8] = b"NGRSIMECU00000001";
 
+#[path = "../../agent/tests/support/ngr_agent_binary.rs"]
+mod ngr_agent_binary;
+
 fn ngr_agent_path() -> PathBuf {
-    let exe = std::env::current_exe().expect("test executable path");
-    let path = exe
-        .parent()
-        .and_then(Path::parent)
-        .expect("the test executable is in a deps directory")
-        .join(format!("ngr-agent{}", std::env::consts::EXE_SUFFIX));
-    assert!(
-        path.is_file(),
-        "{} should be built: test the agent package in the same run \
-         (cargo test --workspace, or -p agent -p iso22900-service)",
-        path.display()
-    );
-    path
+    ngr_agent_binary::ngr_agent_path("iso22900-service")
 }
 
 /// A variant's document whose procedure is `procedure`: its protocol is UDS over ISO 15765 at

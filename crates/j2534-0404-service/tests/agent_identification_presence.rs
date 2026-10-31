@@ -500,6 +500,20 @@ async fn flow(root: &Path, control_dir: &Path) {
             .map(Vec::len),
         Some(1)
     );
+    let pending_exchange = found.exchange("pending");
+    assert_timed(&pending_exchange["answers"][0]);
+    assert_eq!(
+        pending_exchange["answers"][0]["classification"], "undetermined",
+        "{pending_exchange}"
+    );
+    assert_eq!(
+        pending_exchange["classification"], "undetermined",
+        "{pending_exchange}"
+    );
+    assert_eq!(
+        pending_exchange["pending"].as_array().map(Vec::len),
+        Some(2)
+    );
 
     // The run's guards hold the VCI's lock until they are dropped.
     drop(found);

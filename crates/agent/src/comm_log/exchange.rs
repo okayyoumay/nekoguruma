@@ -393,6 +393,11 @@ pub(crate) struct VciTimes {
     /// it only when no other error is named. Not written.
     #[serde(skip)]
     pub rx_timeout: Option<VciTime>,
+    /// The item that finished a collecting primitive, which ends its window when answers came:
+    /// then no receive timeout does (ISO 22900-2:2022 8.2.6.2.2). `timing` judges the window's
+    /// end by it when it is on the clock the answers are. Not written.
+    #[serde(skip)]
+    pub finished: Option<VciTime>,
     /// When the host read the final response's item, on the entry's agent epoch: the log places
     /// its times in the order the host read them (ADR-361). Not written.
     #[serde(skip)]
@@ -824,6 +829,36 @@ pub(crate) struct Answer {
     /// Judged by the log from the end of the answer before it (ADR-400); the response time is
     /// from the transmit.
     pub timing: Timing,
+    /// The link's history for this answer as an exchange of its own, as the log took it in;
+    /// `None` is the entry's.
+    pub history: Option<LinkHistory>,
+}
+
+impl Answer {
+    /// Whether the answer is a response pending that no final answer on its identifier
+    /// followed.
+    pub(crate) fn is_pending(&self, expected: &Expected) -> bool {
+        matches!(&self.end, End::Negative(bytes) if expected.pending(bytes))
+    }
+
+    /// The end and the pendings the answer stands for as an exchange of its own: a lone pending
+    /// is a request that got a pending and no response, its own pending the last of its list.
+    /// The one conversion both the classification ([`Evidence::as_answer`]) and the log's
+    /// judgement of the answer's time read.
+    pub(crate) fn as_exchange(&self, expected: &Expected) -> (End, Vec<Pending>) {
+        let mut pending = self.pending.clone();
+        if !self.is_pending(expected) {
+            return (self.end.clone(), pending);
+        }
+        pending.push(Pending {
+            vci_us: self.vci_us,
+            clock: self.clock,
+            agent_us: self.agent_us,
+            epoch: self.epoch,
+            since_previous_ms: None,
+        });
+        (End::NoResponse, pending)
+    }
 }
 
 /// An [`Answer`] as the entry gives it, with its own outcome and classification.
@@ -1067,6 +1102,10 @@ pub(crate) struct Evidence {
     /// The pendings the agent saw, bound to the exchange's primitive. On a link whose VCI may
     /// absorb them (`pending_visibility` `absorbed_by_vci`) an empty list proves nothing.
     pub pending: Vec<Pending>,
+    /// The response identifier each of `pending` came on, by place, where the host knows it: a
+    /// pending is kept per identifier (ADR-400). Shorter than `pending`, or `None`, for one
+    /// whose identifier is not known; it then counts for every identifier. Not written.
+    pub pending_ids: Vec<Option<u32>>,
     pub timing: Timing,
     pub times: Times,
     /// A transmit confirmation the link gave. No link gives one yet.
@@ -1140,6 +1179,7 @@ impl Evidence {
             end,
             caused_by: None,
             pending: Vec::new(),
+            pending_ids: Vec::new(),
             timing: Timing::not_judged(),
             times: Times {
                 agent: AgentTimes {
@@ -1221,23 +1261,11 @@ impl Evidence {
     /// final answer is a request that got a pending and no response, so the pending rows apply
     /// to it.
     pub(crate) fn as_answer(&self, answer: &Answer) -> Evidence {
-        let mut pending = answer.pending.clone();
-        let end = match &answer.end {
-            End::Negative(bytes) if self.expected.pending(bytes) => {
-                pending.push(Pending {
-                    vci_us: answer.vci_us,
-                    clock: answer.clock,
-                    agent_us: answer.agent_us,
-                    epoch: answer.epoch,
-                    since_previous_ms: None,
-                });
-                End::NoResponse
-            }
-            end => end.clone(),
-        };
+        let (end, pending) = answer.as_exchange(&self.expected);
         let mut one = self.ended_as(end, answer.timing.clone());
         one.rx_id = answer.rx_id;
         one.pending = pending;
+        one.pending_ids.clear();
         one.collecting = false;
         one.answers.clear();
         one.rejected.clear();
@@ -3307,7 +3335,8 @@ fn outcome_phrase(evidence: &Evidence) -> String {
 /// response) takes the last row at the place where that row stands, so a row before it (a
 /// refusal, a lost VCI, a failure of the system, a link error) still decides.
 pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
-    let (mut classification, mut reason) = row(evidence, history);
+    let mut owed_handled = false;
+    let (mut classification, mut reason) = row(evidence, history, &mut owed_handled);
     for kind in &evidence.link_errors {
         let (fault, fault_reason) = kind.judge();
         classification = classification.max(fault);
@@ -3318,6 +3347,27 @@ pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
             fault_reason
         ));
     }
+    // The rows of the answers weigh the owed requests against their answers themselves.
+    if !owed_handled {
+        (classification, reason) = owed_tail(evidence, history, classification, reason);
+    }
+    Verdict {
+        classification,
+        reason,
+        text: text(evidence, history),
+    }
+}
+
+/// An answer that could belong to an owed request leaves the classification at least
+/// `undetermined`: the log never decides between the possible owners. The one place that says so;
+/// the rows of the answers (`collecting_row`, `several_answers_row`) weigh their answers against
+/// the owed requests and call it themselves.
+fn owed_tail(
+    evidence: &Evidence,
+    history: &LinkHistory,
+    mut classification: Classification,
+    mut reason: String,
+) -> (Classification, String) {
     if history.this_exchange && history.owed_matching > 0 {
         classification = classification.max(Classification::Undetermined);
         reason.push_str(&format!(
@@ -3328,11 +3378,7 @@ pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
             reason.push_str(" So it is not known whether this request reached the bus.");
         }
     }
-    Verdict {
-        classification,
-        reason,
-        text: text(evidence, history),
-    }
+    (classification, reason)
 }
 
 /// How a forwarded pending read after its exchange's entry stood against the limit in force
@@ -3689,14 +3735,24 @@ fn silence_open(evidence: &Evidence) -> Option<String> {
 }
 
 /// The classification and reason of each answer of `evidence`, judged as the exchange it alone
-/// would be ([`Evidence::as_answer`], ADR-400). The one place that classifies an answer: the
-/// entry's answer list and its collecting and several-answers rows both read it.
-fn answer_verdicts(evidence: &Evidence, history: &LinkHistory) -> Vec<(Classification, String)> {
+/// would be ([`Evidence::as_answer`], ADR-400), against its own history. The one place that
+/// classifies an answer: the entry's answer list and its collecting and several-answers rows all
+/// read it. `with_owed` leaves the owed requests an answer could belong to in its verdict; a
+/// request meant for one ECU weighs them against its extra answers instead.
+fn answer_verdicts(
+    evidence: &Evidence,
+    history: &LinkHistory,
+    with_owed: bool,
+) -> Vec<(Classification, String)> {
     evidence
         .answers
         .iter()
         .map(|answer| {
-            let verdict = classify(&evidence.as_answer(answer), history);
+            let mut own = answer.history.clone().unwrap_or_else(|| history.clone());
+            if !with_owed {
+                own.owed_matching = 0;
+            }
+            let verdict = classify(&evidence.as_answer(answer), &own);
             (verdict.classification, verdict.reason)
         })
         .collect()
@@ -3707,7 +3763,7 @@ fn answer_items(evidence: &Evidence, history: &LinkHistory) -> Vec<AnswerItem> {
     evidence
         .answers
         .iter()
-        .zip(answer_verdicts(evidence, history))
+        .zip(answer_verdicts(evidence, history, evidence.collecting))
         .map(|(answer, (classification, reason))| AnswerItem::of(answer, classification, reason))
         .collect()
 }
@@ -3752,8 +3808,11 @@ fn collecting_row(
     evidence: &Evidence,
     history: &LinkHistory,
     sent: Sent,
+    owed_handled: &mut bool,
 ) -> (Classification, String) {
-    let verdicts = answer_verdicts(evidence, history);
+    let verdicts = answer_verdicts(evidence, history, true);
+    // Each answer carries the owed requests it could belong to in its own verdict.
+    *owed_handled = !verdicts.is_empty();
     let mut open: Vec<String> = Vec::new();
     if let Some(reading) = silence_open(evidence) {
         open.push(reading);
@@ -3820,21 +3879,25 @@ fn collecting_row(
 /// it `undetermined`; otherwise a second responder is a fault of the vehicle, unless an answer
 /// is worse.
 fn several_answers_row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
-    let verdicts = answer_verdicts(evidence, history);
+    let verdicts = answer_verdicts(evidence, history, false);
     let extra = evidence.answers.len() - 1;
-    let owed = history.owed_matching as usize;
     let worst = verdicts
         .iter()
         .map(|(classification, _)| *classification)
         .max()
         .unwrap_or(Classification::None);
     let counted_answers = counted(evidence.answers.len(), "answer");
-    if extra <= owed {
-        return (
-            Classification::Undetermined.max(worst),
+    if extra <= history.owed_matching as usize {
+        let own = LinkHistory {
+            this_exchange: true,
+            ..history.clone()
+        };
+        return owed_tail(
+            evidence,
+            &own,
+            worst,
             format!(
-                "The request got {counted_answers}, and the {} beyond the first could belong to the {owed} earlier request(s) that never got a final response, so they do not show a second responder.{}",
-                counted(extra, "answer"),
+                "The request got {counted_answers}.{}",
                 answer_that_set_it(evidence, &verdicts)
             ),
         );
@@ -3860,8 +3923,12 @@ fn several_answers_row(evidence: &Evidence, history: &LinkHistory) -> (Classific
 /// a time not judged leaves open (ADR-376): a final response whose time is not judged may also
 /// have come after the limit in force with the VCI past its own limit, a `system` reading, so
 /// it is never `none` or `vehicle` on its own.
-fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
-    let (classification, mut reason) = rows(evidence, history);
+fn row(
+    evidence: &Evidence,
+    history: &LinkHistory,
+    owed_handled: &mut bool,
+) -> (Classification, String) {
+    let (classification, mut reason) = rows(evidence, history, owed_handled);
     let final_response = matches!(
         evidence.end,
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
@@ -3883,7 +3950,11 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
 }
 
 /// [`row`] before a time that is not judged is taken into account.
-fn rows(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
+fn rows(
+    evidence: &Evidence,
+    history: &LinkHistory,
+    owed_handled: &mut bool,
+) -> (Classification, String) {
     use Classification::{None as NoFault, System, Undetermined, Vehicle};
 
     let (sent, _) = sent_of(evidence, history);
@@ -4065,9 +4136,10 @@ fn rows(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) 
         // The rows of the answers (ADR-400): a request that collects every answer, with or
         // without one; and a request meant for one ECU that got more than one.
         _ if evidence.collecting && (answers_listed || matches!(evidence.end, End::NoResponse)) => {
-            collecting_row(evidence, history, sent)
+            collecting_row(evidence, history, sent, owed_handled)
         }
         _ if !evidence.collecting && evidence.answers.len() > 1 => {
+            *owed_handled = true;
             several_answers_row(evidence, history)
         }
         // A window `timeout_early` or `timeout_late` on a response has no other row.
@@ -7820,6 +7892,7 @@ mod tests {
                 }),
                 response_read_us: Some(8),
                 rx_timeout: None,
+                finished: None,
             }),
         })
         .unwrap();
@@ -7903,6 +7976,7 @@ mod tests {
             agent_us: 1,
             pending: Vec::new(),
             timing: Timing::not_judged(),
+            history: None,
         }
     }
 
@@ -8371,6 +8445,7 @@ mod tests {
             agent_us: 2_000,
             pending: Vec::new(),
             timing,
+            history: None,
         }
     }
 
@@ -8835,5 +8910,92 @@ mod tests {
         let (class, reason) = verdict_of(&answered);
         assert!(!reason.contains("No answer came"), "{reason}");
         assert_eq!(class, Classification::None, "{reason}");
+    }
+
+    /// A request meant for one ECU that got `count` answers, with one earlier request on the
+    /// link still owed, built with the history the link gives it.
+    fn owed_entry(count: usize) -> ExchangeEntry {
+        let mut state = LinkState::default();
+        log(&mut state, 1, read([0xF1, 0x86], End::NoResponse));
+        let reply = |extra| End::Positive(vec![0x62, 0xF1, 0x86, extra]);
+        let mut evidence = judged(forwarding(read([0xF1, 0x86], reply(1))));
+        evidence.answers = (0..count)
+            .map(|extra| answer(RX, reply(extra as u8 + 1), Window::WithinP2, 5.0))
+            .collect();
+        let history = state.history_for(&evidence);
+        assert_eq!(history.owed_matching, 1);
+        ExchangeEntry::build(2, evidence, history)
+    }
+
+    #[test]
+    fn extra_answers_are_weighed_against_the_owed_requests_the_link_gives() {
+        // One extra answer may be the owed request's late one; two cannot both be.
+        let one_extra = owed_entry(2);
+        assert_eq!(one_extra.classification, Classification::Undetermined);
+        let two_extra = owed_entry(3);
+        assert_eq!(
+            two_extra.classification,
+            Classification::Vehicle,
+            "{}",
+            two_extra.reason
+        );
+        assert!(
+            two_extra.reason.contains("second responder"),
+            "{}",
+            two_extra.reason
+        );
+        // The owed sentence is said once by the entry, and not by its answers.
+        let said = |entry: &ExchangeEntry| entry.reason.matches("could also belong").count();
+        assert_eq!(said(&one_extra), 1, "{}", one_extra.reason);
+        assert_eq!(said(&two_extra), 0);
+        for entry in [&one_extra, &two_extra] {
+            assert!(
+                entry
+                    .answers
+                    .iter()
+                    .all(|item| !item.reason.contains("could also belong")),
+                "{:?}",
+                entry.answers
+            );
+            assert!(
+                entry
+                    .answers
+                    .iter()
+                    .all(|item| item.classification == Classification::None)
+            );
+        }
+    }
+
+    #[test]
+    fn a_lone_pending_answer_that_came_late_is_system_as_a_single_exchange_is() {
+        let mut lone = answer(
+            RX,
+            End::Negative(vec![0x7F, 0x3E, 0x78]),
+            Window::Late,
+            90.0,
+        );
+        lone.timing.late_pending = Some(0);
+        lone.timing.window_by_ms = Some(3.0);
+        let (end, pending) = lone.as_exchange(&Expected::uds(&PRESENCE));
+        assert!(matches!(end, End::NoResponse));
+        assert_eq!(pending.len(), 1);
+        let entry = entry_of(collecting(vec![lone]));
+        assert_eq!(classes(&entry), [Classification::System]);
+        assert_eq!(entry.classification, Classification::System);
+    }
+
+    #[test]
+    fn each_answer_is_classified_against_its_own_history() {
+        let mut second = positive(0x7E9, Window::WithinP2);
+        let mut owed = LinkHistory::empty();
+        owed.this_exchange = true;
+        owed.owed_matching = 1;
+        second.history = Some(owed);
+        let entry = entry_of(collecting(vec![positive(RX, Window::WithinP2), second]));
+        assert_eq!(
+            classes(&entry),
+            [Classification::None, Classification::Undetermined]
+        );
+        assert_eq!(entry.classification, Classification::Undetermined);
     }
 }

@@ -31,7 +31,10 @@ step implements.
    (a definition the operator chose by hand, held as the plan's only candidate, which supplies
    its entries and VIN rules and narrows nothing) or `EveryEcu` (access to every ECU, with
    definitions and no candidate). The plan is refused when a chosen-definition plan does not hold
-   exactly one candidate or an every-ECU plan holds any, which is what item 8 describes. The
+   exactly one candidate or an every-ECU plan holds any. Item 8 says both manual plans hold
+   no candidates; this format carries a chosen definition's entries and VIN rules as the one
+   candidate instead, since candidates are where the plan keeps them, and that candidate narrows
+   nothing, so item 8's outcome holds (ADR-327 is annotated). The
    plan holds no ECU declarations: a definition lists its documents by SHA-256, and the
    documents come beside the plan.
 2. **Signature coverage.** The signature that the server-connected agent verifies later (the

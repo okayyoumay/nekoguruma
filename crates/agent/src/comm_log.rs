@@ -1424,8 +1424,76 @@ enum HostRead {
     Unbound(usize),
     Pending(usize),
     Rejected(usize),
+    /// An answer of a collecting request, or of a request meant for one ECU that got more than
+    /// one (ADR-400).
+    Answer(usize),
     /// The final response's item.
     End,
+}
+
+/// The window an answer closes (ADR-400): where it started, and the pendings that came in it,
+/// by their place in the evidence's list.
+struct AnswerWindow {
+    /// `None` is the transmit; `Some(None)` an earlier answer whose place is not known.
+    from: Option<timing::At>,
+    pendings: Vec<usize>,
+}
+
+/// The window of each answer of `evidence`, and the window a collecting entry's end closes.
+///
+/// A window starts at the transmit, and restarts at the end of each final answer: a pending
+/// does not end one, it extends the limit in force within it. `pending_order` and `answer_order`
+/// are the places of the pendings and answers in the order the host read them (`usize::MAX` for
+/// one not read at a known place), and `ends` where each answer ended. A pending the host also
+/// lists as an answer (the last of its identifier, with no final answer after it) is not in
+/// the window of that answer, which it closes, but in the next one's.
+fn answer_windows(
+    evidence: &exchange::Evidence,
+    pending_order: &[usize],
+    answer_order: &[usize],
+    ends: &[timing::At],
+) -> (Vec<AnswerWindow>, AnswerWindow) {
+    let is_pending = |answer: &exchange::Answer| matches!(&answer.end, exchange::End::Negative(bytes) if evidence.expected.pending(bytes));
+    let own = |index: usize, answer: &exchange::Answer| {
+        let pending = &evidence.pending[index];
+        is_pending(answer)
+            && pending.vci_us == answer.vci_us
+            && pending.agent_us == answer.agent_us
+            && pending.clock == answer.clock
+    };
+    // The final answer before `until`, the one that started the window.
+    let final_before = |until: usize| {
+        evidence.answers[..until]
+            .iter()
+            .rposition(|answer| !is_pending(answer))
+    };
+    let windows = (0..evidence.answers.len())
+        .map(|at| {
+            let previous = final_before(at);
+            let after = previous.map(|previous| answer_order[previous]);
+            AnswerWindow {
+                from: previous.map(|previous| ends[previous]),
+                pendings: (0..evidence.pending.len())
+                    .filter(|&index| {
+                        let order = pending_order[index];
+                        order != usize::MAX
+                            && after.is_none_or(|after| order > after)
+                            && order < answer_order[at]
+                            && !own(index, &evidence.answers[at])
+                    })
+                    .collect(),
+            }
+        })
+        .collect();
+    let last = final_before(evidence.answers.len());
+    let after = last.map(|last| answer_order[last]);
+    let entry = AnswerWindow {
+        from: last.map(|last| ends[last]),
+        pendings: (0..evidence.pending.len())
+            .filter(|&index| after.is_none_or(|after| pending_order[index] > after))
+            .collect(),
+    };
+    (windows, entry)
 }
 
 struct Inner {
@@ -1866,6 +1934,16 @@ impl CommLog {
                 ));
             }
         }
+        for (index, answer) in evidence.answers.iter().enumerate() {
+            if let Some(raw) = answer.vci_us {
+                reads.push((
+                    answer.agent_us,
+                    answer.clock,
+                    Some(raw),
+                    HostRead::Answer(index),
+                ));
+            }
+        }
         // The final response's item, when the host read it; without that time, as read when
         // the primitive ended, after everything else.
         let end_us = evidence.times.agent.end_us;
@@ -1920,8 +1998,21 @@ impl CommLog {
                 wall_unix_ms: 0,
             })
         };
-        for (read_us, _, read) in reads {
+        // Where each pending and each answer stands in the order the host read them, which
+        // tells the window an answer closes (ADR-400).
+        let mut pending_order = vec![usize::MAX; evidence.pending.len()];
+        let mut answer_order = vec![usize::MAX; evidence.answers.len()];
+        let mut answer_placed = vec![None; evidence.answers.len()];
+        for (order, (read_us, _, read)) in reads.into_iter().enumerate() {
             match read {
+                HostRead::Answer(index) => {
+                    let answer = &evidence.answers[index];
+                    let raw = answer.vci_us.unwrap_or_default();
+                    let placed = inner.place_read(answer.clock, raw, read_at(read_us))?;
+                    answer_placed[index] = placed;
+                    answer_order[index] = order;
+                    evidence.answers[index].epoch = placed.map(|placed| placed.epoch);
+                }
                 HostRead::Unbound(index) => {
                     let item = &unbound[index];
                     unbound_placed[index] =
@@ -1932,6 +2023,7 @@ impl CommLog {
                     let raw = pending.vci_us.unwrap_or_default();
                     let placed = inner.place_read(pending.clock, raw, read_at(read_us))?;
                     pending_placed[index] = placed;
+                    pending_order[index] = order;
                     evidence.pending[index].epoch = placed.map(|placed| placed.epoch);
                 }
                 HostRead::Rejected(index) => {
@@ -1952,7 +2044,33 @@ impl CommLog {
         // The reading at the agent's deadline was taken after everything else, as read when the
         // primitive ended; an error's time, and an item read at no known time, are placed
         // nearest their clock's latest time.
-        let anchor = vci.rx_end.and_then(|end| end.placed());
+        // A collecting request has no final response: the first answer that carries a transmit
+        // done gives it, and ends where that transmit done is placed from.
+        let carrier = evidence
+            .collecting
+            .then(|| {
+                evidence
+                    .answers
+                    .iter()
+                    .zip(&answer_placed)
+                    .find(|(answer, _)| answer.tx_done_us.is_some())
+            })
+            .flatten();
+        if let Some((answer, _)) = carrier {
+            vci.tx_done = vci
+                .tx_done
+                .into_iter()
+                .chain(
+                    answer
+                        .tx_done_us
+                        .map(|us| exchange::VciTime::new(us, answer.clock)),
+                )
+                .reduce(exchange::VciTime::prefer);
+        }
+        let anchor = vci.rx_end.and_then(|end| end.placed()).or_else(|| {
+            let (answer, placed) = carrier?;
+            answer.clock.zip(*placed)
+        });
         let end_read = read_at(end_us);
         for time in [&mut vci.tx_done, &mut vci.rx_start].into_iter().flatten() {
             let placed = match anchor {
@@ -2297,6 +2415,23 @@ impl CommLog {
         // The transmit done starts the first pending's interval.
         let transmit = vci.tx_done.and_then(|time| time.placed());
         exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
+        // The window each answer closes, and the one a collecting entry's end closes (ADR-400):
+        // the pendings that came in it, and where it started.
+        let answer_ends: Vec<timing::At> = evidence
+            .answers
+            .iter()
+            .zip(&answer_placed)
+            .map(|(answer, placed)| answer.clock.zip(*placed))
+            .collect();
+        let (answer_windows, entry_window) =
+            answer_windows(&evidence, &pending_order, &answer_order, &answer_ends);
+        for (answer, window) in evidence.answers.iter_mut().zip(&answer_windows) {
+            answer.pending = window
+                .pendings
+                .iter()
+                .map(|&index| evidence.pending[index].clone())
+                .collect();
+        }
         // The times judged against the limits of the link `link_opened` recorded (design 8.11
         // "Timing judged"); evidence on a link the log did not open keeps the timing it gives.
         let mut judged_from: Option<(Vec<timing::At>, timing::Limits)> = None;
@@ -2313,19 +2448,72 @@ impl CommLog {
                 || unbound
                     .iter()
                     .any(|item| item.is_start_indication_for(rx_id));
+            let in_window = |window: &AnswerWindow| -> Vec<timing::At> {
+                window
+                    .pendings
+                    .iter()
+                    .map(|&index| pendings[index])
+                    .collect()
+            };
+            // A collecting entry's own timing judges where the window ended, from where its last
+            // answer ended; it has no response time (ADR-400).
+            let collecting = evidence.collecting;
+            let entry_pendings = if collecting {
+                in_window(&entry_window)
+            } else {
+                pendings.clone()
+            };
             evidence.timing = timing::judge(
                 *limits,
                 evidence.absorbing(),
                 timing::Times {
                     transmit,
-                    pendings: &pendings,
-                    start: vci.rx_start.and_then(|time| time.placed()),
-                    end: vci.rx_end.and_then(|time| time.placed()),
+                    window_from: collecting.then_some(entry_window.from).flatten(),
+                    pendings: &entry_pendings,
+                    start: vci
+                        .rx_start
+                        .and_then(|time| time.placed())
+                        .filter(|_| !collecting),
+                    end: vci
+                        .rx_end
+                        .and_then(|time| time.placed())
+                        .filter(|_| !collecting),
                     end_len: evidence.end.response().map(<[u8]>::len),
                     timeout: vci.rx_timeout.and_then(|time| time.placed()),
                     response_may_have_begun,
                 },
             );
+            // Each answer from the end of the one before it, with the response time from the
+            // transmit.
+            let answer_timings: Vec<_> = evidence
+                .answers
+                .iter()
+                .zip(&answer_ends)
+                .zip(&answer_windows)
+                .map(|((answer, end), window)| {
+                    let start = answer
+                        .start_us
+                        .zip(*end)
+                        .map(|(us, (clock, placed))| (clock, clocks::before(placed, us)));
+                    timing::judge(
+                        *limits,
+                        evidence.absorbing(),
+                        timing::Times {
+                            transmit,
+                            window_from: window.from,
+                            pendings: &in_window(window),
+                            start,
+                            end: *end,
+                            end_len: answer.end.response().map(<[u8]>::len),
+                            timeout: None,
+                            response_may_have_begun,
+                        },
+                    )
+                })
+                .collect();
+            for (answer, timing) in evidence.answers.iter_mut().zip(answer_timings) {
+                answer.timing = timing;
+            }
             // The VCI's own limits past by the reading at the agent's deadline, on a link
             // whose start-of-message indications are on and showed no response under way: none
             // bound to the primitive, none unbound that names no identifier or this exchange's,
@@ -2865,6 +3053,7 @@ impl CommLog {
                 evidence.absorbing(),
                 timing::Times {
                     transmit,
+                    window_from: None,
                     pendings: &pendings,
                     start: vci.rx_start.and_then(|time| time.placed()),
                     end: vci.rx_end.and_then(|time| time.placed()),
@@ -3699,6 +3888,7 @@ impl Inner {
                 evidence.absorbing(),
                 timing::Times {
                     transmit,
+                    window_from: None,
                     pendings: &pendings,
                     start: vci.rx_start.and_then(|time| time.placed()),
                     end: vci.rx_end.and_then(|time| time.placed()),
@@ -7350,6 +7540,91 @@ mod tests {
                 .unwrap()
                 .contains("100.0 ms before the limit"),
             "{early}"
+        );
+    }
+
+    /// ADR-400: a collecting request's answers are placed on their clock, each judged from the end
+    /// of the answer before it with its response time from the transmit, and the entry's own
+    /// timing judges where the window ended.
+    #[test]
+    fn collecting_answers_are_placed_and_judged_each_from_the_one_before() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        // P2 1 s, P2* 5 s, completion 25 s; the profile's 2 ms margin.
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+            },
+            Some(true),
+        )
+        .unwrap();
+        let base = 1_000_000;
+        let answer = |after_us: u64| exchange::Answer {
+            rx_id: 0x7E8,
+            end: exchange::End::Positive(vec![0x7E, 0x00]),
+            vci_us: Some(base + after_us),
+            clock: Some(exchange::Clock::Device),
+            epoch: None,
+            start_us: None,
+            tx_done_us: None,
+            agent_us: base + after_us + 300,
+            pending: Vec::new(),
+            timing: exchange::Timing::not_judged(),
+        };
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let mut evidence = evidence(
+            endpoint(0x7DF),
+            &[0x3E, 0x00],
+            exchange::End::Positive(vec![0x7E, 0x00]),
+        );
+        evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+        evidence.collecting = true;
+        evidence.vci_ended = true;
+        // The first answer 20 ms after the transmit; the second 1 s after the first, which is
+        // more than P2 from the transmit and within it from the first; the third long after.
+        evidence.answers = vec![answer(20_000), answer(1_020_000), answer(3_000_000)];
+        evidence.times.agent.before_us = base - 100_000;
+        evidence.times.agent.end_us = base + 5_000_000;
+        evidence.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device(base)),
+            rx_timeout: Some(device(base + 4_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange(evidence).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .unwrap();
+        let answers = entry["answers"].as_array().unwrap();
+        assert_eq!(answers.len(), 3, "{entry}");
+        for item in answers {
+            assert_eq!(item["clock"], "device", "{entry}");
+            assert_eq!(item["epoch"], 0, "{entry}");
+        }
+        assert_eq!(answers[0]["response_ms"], 20.0, "{entry}");
+        assert_eq!(answers[1]["response_ms"], 1_020.0, "{entry}");
+        assert_eq!(answers[0]["classification"], "none", "{entry}");
+        assert_eq!(answers[1]["classification"], "none", "{entry}");
+        // The third is late for the window the second closed.
+        assert_eq!(answers[2]["classification"], "system", "{entry}");
+        // The entry judges the window's end, 1 s after the last answer, with no response time.
+        assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert!(entry["timing"]["response_ms"].is_null(), "{entry}");
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert!(
+            entry["reason"]
+                .as_str()
+                .unwrap()
+                .contains("3 answers on 1 identifier"),
+            "{entry}"
         );
     }
 

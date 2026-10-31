@@ -635,9 +635,7 @@ impl UnknownCause {
 /// How the exchange ended, as the producer saw it: the input of `outcome`. The response bytes
 /// are raw here; [`Outcome`] carries them through [`redact`].
 ///
-/// Not given yet, with the rows that need them: the classification of `answers` (the presence
-/// request lists them, ADR-396). No outcome rests on a worker's extra
-/// error information (ADR-351).
+/// No outcome rests on a worker's extra error information (ADR-351).
 #[derive(Debug, Clone)]
 #[expect(
     clippy::enum_variant_names,
@@ -803,14 +801,42 @@ pub(crate) struct EventsLost {
 }
 
 /// One answer of a request that collects every answer, or the further answers of one meant for
-/// one ECU (design 8.11, `answers`). The functional presence request gives them (ADR-396); the
-/// answers rows are not implemented, so an entry that has one is classified by the last row.
+/// one ECU, as the host read it (design 8.11, `answers`, ADR-400). The functional presence
+/// request gives them (ADR-396). The raw form: [`ExchangeEntry::build`] classifies each into an
+/// [`AnswerItem`].
+#[derive(Debug, Clone)]
+pub(crate) struct Answer {
+    pub rx_id: u32,
+    /// What the answer's bytes are: positive, negative (a pending the window did not follow
+    /// with a final answer included) or unusable.
+    pub end: End,
+    /// The item's time, with the clock it names, and the epoch of that time on it, which the
+    /// log gives it (ADR-361).
+    pub vci_us: Option<u64>,
+    pub clock: Option<Clock>,
+    pub epoch: Option<u32>,
+    /// The start and the transmit done the item carries, on its clock.
+    pub start_us: Option<u64>,
+    pub tx_done_us: Option<u64>,
+    pub agent_us: u64,
+    /// The pendings that came in this answer's window, before it.
+    pub pending: Vec<Pending>,
+    /// Judged by the log from the end of the answer before it (ADR-400); the response time is
+    /// from the transmit.
+    pub timing: Timing,
+}
+
+/// An [`Answer`] as the entry gives it, with its own outcome and classification.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AnswerItem {
     pub rx_id: u32,
     pub response: LoggedMessage,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub vci_us: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clock: Option<Clock>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub epoch: Option<u32>,
     pub agent_us: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub response_ms: Option<f64>,
@@ -820,26 +846,18 @@ pub(crate) struct AnswerItem {
 }
 
 impl AnswerItem {
-    /// An answer of a collecting request as it was read (ADR-396): `end` says what its bytes are
-    /// (positive, negative or unusable), `vci_us` is the item's time and `agent_us` the agent's
-    /// monotonic time when the host read it. The answer rows of design 8.11 do not classify it
-    /// yet, so it is `undetermined` and says so; its response time is not computed.
-    pub(crate) fn listed(rx_id: u32, end: &End, vci_us: Option<u64>, agent_us: u64) -> Self {
-        let bytes = match end {
-            End::Positive(bytes) | End::PositiveUnusable(bytes) | End::Negative(bytes) => bytes,
-            _ => &[][..],
-        };
+    fn of(answer: &Answer, classification: Classification, reason: String) -> Self {
         Self {
-            rx_id,
-            response: redact(Direction::Response, bytes),
-            vci_us,
-            agent_us,
-            response_ms: None,
-            outcome: Outcome::of(end),
-            classification: Classification::Undetermined,
-            reason: "The answer is listed as it was read; the rows that classify an answer of a \
-                     collecting request are not implemented yet."
-                .to_owned(),
+            rx_id: answer.rx_id,
+            response: redact(Direction::Response, answer.end.response().unwrap_or(&[])),
+            vci_us: answer.vci_us,
+            clock: answer.clock,
+            epoch: answer.epoch,
+            agent_us: answer.agent_us,
+            response_ms: answer.timing.response_ms,
+            outcome: Outcome::of(&answer.end),
+            classification,
+            reason,
         }
     }
 }
@@ -1077,7 +1095,14 @@ pub(crate) struct Evidence {
     pub link_errors_before_answer: bool,
     /// Link errors on other links of the same physical channel: evidence only (H3).
     pub channel_link_errors: Vec<LinkErrorKind>,
-    pub answers: Vec<AnswerItem>,
+    /// The request collects every answer within a window the VCI ends (ADR-396). Its `end` is
+    /// the first answer's, its `timing` judges the window's end, and each answer carries its own
+    /// timing (ADR-400). Readers tell such an entry by its target and origin; the log has no key
+    /// for it.
+    pub collecting: bool,
+    /// The answers of a collecting request, or all of a request meant for one ECU that got more
+    /// than one (the first included), in the order they were read.
+    pub answers: Vec<Answer>,
     /// The results bound to the primitive that it did not take as its answer.
     pub rejected: Vec<Rejected>,
     /// The worker's report of lost events, when it ended the exchange.
@@ -1136,6 +1161,7 @@ impl Evidence {
             link_errors: Vec::new(),
             link_errors_before_answer: false,
             channel_link_errors: Vec::new(),
+            collecting: false,
             answers: Vec::new(),
             rejected: Vec::new(),
             events_lost: None,
@@ -1176,6 +1202,50 @@ impl Evidence {
 
     fn pending_seen(&self) -> bool {
         !self.pending.is_empty()
+    }
+
+    /// This evidence with `end` as its end, judged by `timing`: what a settling entry and an
+    /// answer both classify (the shared part of [`Evidence::as_answer`] and
+    /// [`Kept::answered`]).
+    fn ended_as(&self, end: End, timing: Timing) -> Evidence {
+        let mut ended = self.clone();
+        ended.end = end;
+        ended.timing = timing;
+        ended.vci_limits_past_by_us = None;
+        ended
+    }
+
+    /// The exchange `answer` alone would be (ADR-400): its end and timing are the answer's, and
+    /// what belongs to the whole exchange (the answer list, the rejected results, the link
+    /// errors, the lost events) is left to the entry. A pending the window did not follow with a
+    /// final answer is a request that got a pending and no response, so the pending rows apply
+    /// to it.
+    pub(crate) fn as_answer(&self, answer: &Answer) -> Evidence {
+        let mut pending = answer.pending.clone();
+        let end = match &answer.end {
+            End::Negative(bytes) if self.expected.pending(bytes) => {
+                pending.push(Pending {
+                    vci_us: answer.vci_us,
+                    clock: answer.clock,
+                    agent_us: answer.agent_us,
+                    epoch: answer.epoch,
+                    since_previous_ms: None,
+                });
+                End::NoResponse
+            }
+            end => end.clone(),
+        };
+        let mut one = self.ended_as(end, answer.timing.clone());
+        one.rx_id = answer.rx_id;
+        one.pending = pending;
+        one.collecting = false;
+        one.answers.clear();
+        one.rejected.clear();
+        one.link_errors.clear();
+        one.channel_link_errors.clear();
+        one.events_lost = None;
+        one.end_rejected = false;
+        one
     }
 
     /// The exchange holds an answer the worker bound to it: a final response or a pending. The
@@ -3008,6 +3078,7 @@ impl ExchangeEntry {
     pub(crate) fn build(seq: u64, evidence: Evidence, history: LinkHistory) -> Self {
         let (sent, sent_evidence) = sent_of(&evidence, &history);
         let verdict = classify(&evidence, &history);
+        let answers = answer_items(&evidence, &history);
         let sid = evidence.sid();
         let effect = LinkEffect {
             key: MatchKey::of(&evidence),
@@ -3056,7 +3127,7 @@ impl ExchangeEntry {
                 }
                 end => Outcome::of(end),
             },
-            answers: evidence.answers,
+            answers,
             rejected: evidence
                 .rejected
                 .into_iter()
@@ -3174,7 +3245,7 @@ fn outcome_phrase(evidence: &Evidence) -> String {
     match &evidence.end {
         End::Positive(_) => {
             let timing = match evidence.timing.window {
-                Window::NotJudged => " (its time is not judged)".to_owned(),
+                Window::NotJudged if !evidence.collecting => " (its time is not judged)".to_owned(),
                 // A late pending's window names the pending, not the final response.
                 Window::Late if evidence.timing.late_pending.is_none() => {
                     format!(" {} ms after the limit in force", by_ms(&evidence.timing))
@@ -3231,8 +3302,8 @@ fn outcome_phrase(evidence: &Evidence) -> String {
 /// never decides between possible owners).
 ///
 /// The rows are in the table's order. A row that today's evidence cannot reach is named by a
-/// comment where it would stand; evidence that only such a row could classify (an answers
-/// list, a window `timeout_early` or `timeout_late` on a response, a window `late` on a missing
+/// comment where it would stand; evidence that only such a row could classify (a window
+/// `timeout_early` or `timeout_late` on a response, a window `late` on a missing
 /// response) takes the last row at the place where that row stands, so a row before it (a
 /// refusal, a lost VCI, a failure of the system, a link error) still decides.
 pub(crate) fn classify(evidence: &Evidence, history: &LinkHistory) -> Verdict {
@@ -3305,19 +3376,18 @@ impl Kept {
     /// The exchange's evidence with `response` as its end, judged by the rows that do not turn
     /// on timing: its window is taken as within the limit.
     pub(crate) fn answered(&self, response: &[u8]) -> Evidence {
-        let mut answered = self.evidence.clone();
         let negative = &self.evidence.expected.negative_pattern;
-        answered.end = if !negative.is_empty() && response.starts_with(negative) {
+        let end = if !negative.is_empty() && response.starts_with(negative) {
             End::Negative(response.to_vec())
         } else {
             End::Positive(response.to_vec())
         };
-        answered.timing.window = Window::WithinP2;
-        answered.timing.window_by_ms = None;
-        answered.timing.not_judged_reason = None;
-        answered.timing.late_pending = None;
-        answered.vci_limits_past_by_us = None;
-        answered
+        let mut timing = self.evidence.timing.clone();
+        timing.window = Window::WithinP2;
+        timing.window_by_ms = None;
+        timing.not_judged_reason = None;
+        timing.late_pending = None;
+        self.evidence.ended_as(end, timing)
     }
 }
 
@@ -3618,6 +3688,174 @@ fn silence_open(evidence: &Evidence) -> Option<String> {
     (!open.is_empty()).then(|| open.join("; and "))
 }
 
+/// The classification and reason of each answer of `evidence`, judged as the exchange it alone
+/// would be ([`Evidence::as_answer`], ADR-400). The one place that classifies an answer: the
+/// entry's answer list and its collecting and several-answers rows both read it.
+fn answer_verdicts(evidence: &Evidence, history: &LinkHistory) -> Vec<(Classification, String)> {
+    evidence
+        .answers
+        .iter()
+        .map(|answer| {
+            let verdict = classify(&evidence.as_answer(answer), history);
+            (verdict.classification, verdict.reason)
+        })
+        .collect()
+}
+
+/// The entry's `answers`: each answer with its own classification.
+fn answer_items(evidence: &Evidence, history: &LinkHistory) -> Vec<AnswerItem> {
+    evidence
+        .answers
+        .iter()
+        .zip(answer_verdicts(evidence, history))
+        .map(|(answer, (classification, reason))| AnswerItem::of(answer, classification, reason))
+        .collect()
+}
+
+/// "1 answer", "2 answers".
+fn counted(count: usize, noun: &str) -> String {
+    format!("{count} {noun}{}", if count == 1 { "" } else { "s" })
+}
+
+/// The worst of the answers' verdicts, the first of equals: its place from 0 and the verdict.
+fn worst_answer(
+    verdicts: &[(Classification, String)],
+) -> Option<(usize, &(Classification, String))> {
+    verdicts
+        .iter()
+        .enumerate()
+        .rev()
+        .max_by_key(|(_, (classification, _))| *classification)
+}
+
+/// The answer that set an entry's classification, as its reason names it.
+fn answer_that_set_it(evidence: &Evidence, verdicts: &[(Classification, String)]) -> String {
+    match worst_answer(verdicts) {
+        Some((at, (_, reason))) => format!(
+            " The answer that set it: #{} on {:#x}: {reason}",
+            at + 1,
+            evidence.answers[at].rx_id
+        ),
+        None => String::new(),
+    }
+}
+
+/// The row of a request that collects every answer within a window the VCI ends (design 8.11
+/// "Exchange entry" `answers`, ADR-400): the most severe of its answers' classifications, each
+/// answer judged from the end of the one before it, and `undetermined` as well when a reading
+/// stays open that the answers cannot exclude: a link error on another link of the channel, a
+/// pending the VCI absorbed, a window end not judged against its limit on one clock. A link
+/// error on the exchange's own link is the link-error rows' (`classify`). With no answer the
+/// silence is `none` only for a confirmed send, on a link that forwards pendings, with the end
+/// judged at its limit and no link error.
+fn collecting_row(
+    evidence: &Evidence,
+    history: &LinkHistory,
+    sent: Sent,
+) -> (Classification, String) {
+    let verdicts = answer_verdicts(evidence, history);
+    let mut open: Vec<String> = Vec::new();
+    if let Some(reading) = silence_open(evidence) {
+        open.push(reading);
+    }
+    if verdicts.is_empty() {
+        if sent != Sent::Confirmed {
+            open.push(READING_H1.to_owned());
+        }
+        if evidence.any_link_error() {
+            open.push(READING_H3.to_owned());
+        }
+        return if open.is_empty() {
+            (
+                Classification::None,
+                "No answer came before the window ended: the request was sent, the VCI ended the wait at the limit in force on one clock, the link forwards pendings, and no link error came.".to_owned(),
+            )
+        } else {
+            (
+                Classification::Undetermined,
+                format!(
+                    "No answer came before the window ended, but {}.",
+                    open.join("; ")
+                ),
+            )
+        };
+    }
+    if !evidence.channel_link_errors.is_empty() {
+        open.push(
+            "a link error on another link of the channel came during the window and may have lost an answer (H3)"
+                .to_owned(),
+        );
+    }
+    let worst = verdicts
+        .iter()
+        .map(|(classification, _)| *classification)
+        .max()
+        .unwrap_or(Classification::None);
+    let identifiers = {
+        let mut ids: Vec<u32> = evidence.answers.iter().map(|answer| answer.rx_id).collect();
+        ids.sort_unstable();
+        ids.dedup();
+        ids
+    };
+    let mut reason = format!(
+        "{} on {} ({}).{}",
+        counted(verdicts.len(), "answer"),
+        counted(identifiers.len(), "identifier"),
+        identifiers
+            .iter()
+            .map(|id| format!("{id:#x}"))
+            .collect::<Vec<_>>()
+            .join(", "),
+        answer_that_set_it(evidence, &verdicts)
+    );
+    if open.is_empty() {
+        return (worst, reason);
+    }
+    reason.push_str(&format!(" Also open: {}.", open.join("; ")));
+    (worst.max(Classification::Undetermined), reason)
+}
+
+/// The row of a request meant for one ECU that got more than one answer (design 8.11 "Exchange
+/// entry" `answers`, ADR-400): the extra answers may belong to requests still owed, which leaves
+/// it `undetermined`; otherwise a second responder is a fault of the vehicle, unless an answer
+/// is worse.
+fn several_answers_row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
+    let verdicts = answer_verdicts(evidence, history);
+    let extra = evidence.answers.len() - 1;
+    let owed = history.owed_matching as usize;
+    let worst = verdicts
+        .iter()
+        .map(|(classification, _)| *classification)
+        .max()
+        .unwrap_or(Classification::None);
+    let counted_answers = counted(evidence.answers.len(), "answer");
+    if extra <= owed {
+        return (
+            Classification::Undetermined.max(worst),
+            format!(
+                "The request got {counted_answers}, and the {} beyond the first could belong to the {owed} earlier request(s) that never got a final response, so they do not show a second responder.{}",
+                counted(extra, "answer"),
+                answer_that_set_it(evidence, &verdicts)
+            ),
+        );
+    }
+    if worst >= Classification::Undetermined {
+        return (
+            worst,
+            format!(
+                "The request got {counted_answers}.{}",
+                answer_that_set_it(evidence, &verdicts)
+            ),
+        );
+    }
+    (
+        Classification::Vehicle,
+        format!(
+            "The request was meant for one ECU and got {counted_answers}: a second responder answered it, which no earlier request explains."
+        ),
+    )
+}
+
 /// The rows of the table, in its order, for the exchange's own outcome, with no outcome that
 /// a time not judged leaves open (ADR-376): a final response whose time is not judged may also
 /// have come after the limit in force with the VCI past its own limit, a `system` reading, so
@@ -3628,7 +3866,10 @@ fn row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
         evidence.end,
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
     );
+    // A collecting entry's own timing judges the window's end, and its answers carry their own
+    // (ADR-400).
     if final_response
+        && !evidence.collecting
         && evidence.timing.window == Window::NotJudged
         && classification < Classification::Undetermined
     {
@@ -3807,10 +4048,30 @@ fn rows(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) 
                 )
             }
         }
-        // Not implemented: both `answers` rows, and a request meant for one ECU with more than
-        // one answer. Needs the answers of a request that collects every answer. Evidence of
-        // one, or a window `timeout_early` or `timeout_late` on any outcome, takes the last row.
-        _ if answers_listed || timed_out_unjudged => last_row(),
+        // The VCI ended a collecting window before or after the limit in force from the last
+        // answer: its own timer, as for a request with no answer.
+        _ if evidence.collecting && evidence.vci_ended && timed_out_unjudged => (
+            System,
+            format!(
+                "The VCI ended the window {} the limit in force by {} ms, counted from the last answer or the transmit: its own timer did not fire in time.",
+                if window == Window::TimeoutEarly {
+                    "before"
+                } else {
+                    "after"
+                },
+                by_ms(&evidence.timing)
+            ),
+        ),
+        // The rows of the answers (ADR-400): a request that collects every answer, with or
+        // without one; and a request meant for one ECU that got more than one.
+        _ if evidence.collecting && (answers_listed || matches!(evidence.end, End::NoResponse)) => {
+            collecting_row(evidence, history, sent)
+        }
+        _ if !evidence.collecting && evidence.answers.len() > 1 => {
+            several_answers_row(evidence, history)
+        }
+        // A window `timeout_early` or `timeout_late` on a response has no other row.
+        _ if timed_out_unjudged => last_row(),
         End::Positive(_) if suppressed && !pending_seen && !late => {
             if absorbing {
                 (
@@ -7421,18 +7682,7 @@ mod tests {
             millivolts: 12_100,
             age_ms: 40,
         });
-        full.answers = vec![AnswerItem {
-            rx_id: RX,
-            response: redact(Direction::Response, &[0x62, 0xF1, 0x86]),
-            vci_us: Some(5),
-            agent_us: 6,
-            response_ms: Some(1.5),
-            outcome: Outcome::Positive {
-                response: redact(Direction::Response, &[0x62, 0xF1, 0x86]),
-            },
-            classification: Classification::None,
-            reason: "x".to_owned(),
-        }];
+        full.answers = vec![an_answer()];
         full.pending = vec![pending()];
         full.caused_by = Some(3);
         let json = entry_json(full);
@@ -7639,17 +7889,20 @@ mod tests {
         assert_eq!(Expected::uds(&[]).positive_prefix, Vec::<u8>::new());
     }
 
-    /// An answers-list item, for the entries that hold one.
-    fn an_answer() -> AnswerItem {
-        AnswerItem {
+    /// An answer of the answers list, for the evidence that holds one: a positive response with
+    /// no time, so it is not judged.
+    fn an_answer() -> Answer {
+        Answer {
             rx_id: RX,
-            response: redact(Direction::Response, &[0x62, 0xF1, 0x86]),
+            end: End::Positive(vec![0x62, 0xF1, 0x86]),
             vci_us: None,
+            clock: None,
+            epoch: None,
+            start_us: None,
+            tx_done_us: None,
             agent_us: 1,
-            response_ms: None,
-            outcome: Outcome::NoResponse,
-            classification: Classification::None,
-            reason: "x".to_owned(),
+            pending: Vec::new(),
+            timing: Timing::not_judged(),
         }
     }
 
@@ -7823,24 +8076,12 @@ mod tests {
         let (class, reason) = verdict_of(&lost);
         assert_eq!(class, Classification::Undetermined);
         assert!(reason.contains("lost"), "{reason}");
-        // The rows after it still take the last row: an answers list on a final response, and
-        // a window `timeout_late` on one.
-        for case in [
-            {
-                let mut e = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
-                e.answers = vec![an_answer()];
-                e
-            },
-            {
-                let mut e = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
-                e.timing.window = Window::TimeoutLate;
-                e
-            },
-        ] {
-            let (class, reason) = verdict_of(&case);
-            assert_eq!(class, Classification::Undetermined);
-            assert!(reason.contains("could not decide"), "{reason}");
-        }
+        // The rows after it still take the last row: a window `timeout_late` on a response.
+        let mut late = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86]));
+        late.timing.window = Window::TimeoutLate;
+        let (class, reason) = verdict_of(&late);
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.contains("could not decide"), "{reason}");
     }
 
     #[test]
@@ -8105,5 +8346,494 @@ mod tests {
                 serde_json::to_value(self).unwrap()
             }
         }
+    }
+
+    // ----- The answers rows (design 8.11 "Exchange entry" `answers`, ADR-400)
+
+    const PRESENCE: [u8; 2] = [0x3E, 0x00];
+    const POSITIVE: [u8; 2] = [0x7E, 0x00];
+
+    /// An answer on `rx_id`, judged `window`, `ms` after the transmit.
+    fn answer(rx_id: u32, end: End, window: Window, ms: f64) -> Answer {
+        let mut timing = Timing::not_judged();
+        timing.window = window;
+        timing.response_ms = Some(ms);
+        timing.not_judged_reason =
+            (window == Window::NotJudged).then_some(NotJudgedReason::NoMargin);
+        Answer {
+            rx_id,
+            end,
+            vci_us: Some(1_000),
+            clock: Some(Clock::Device),
+            epoch: Some(0),
+            start_us: None,
+            tx_done_us: None,
+            agent_us: 2_000,
+            pending: Vec::new(),
+            timing,
+        }
+    }
+
+    fn positive(rx_id: u32, window: Window) -> Answer {
+        answer(rx_id, End::Positive(POSITIVE.to_vec()), window, 5.0)
+    }
+
+    /// A collecting presence exchange on a link that forwards pendings, whose window the VCI
+    /// ended at its limit, with a confirmed send.
+    fn collecting(answers: Vec<Answer>) -> Evidence {
+        let end = answers
+            .first()
+            .map_or(End::NoResponse, |first| first.end.clone());
+        let mut evidence = forwarding(evidence(&PRESENCE, end));
+        evidence.collecting = true;
+        evidence.vci_ended = true;
+        evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        evidence.timing.window = Window::TimeoutAtLimit;
+        evidence.timing.not_judged_reason = None;
+        evidence.answers = answers;
+        evidence
+    }
+
+    fn entry_of(evidence: Evidence) -> ExchangeEntry {
+        let history = LinkState::default().history_for(&evidence);
+        ExchangeEntry::build(1, evidence, history)
+    }
+
+    fn classes(entry: &ExchangeEntry) -> Vec<Classification> {
+        entry
+            .answers
+            .iter()
+            .map(|item| item.classification)
+            .collect()
+    }
+
+    #[test]
+    fn a_collecting_answer_within_p2_at_a_window_judged_at_its_limit_is_none() {
+        // Case 1.
+        let entry = entry_of(collecting(vec![positive(RX, Window::WithinP2)]));
+        assert_eq!(classes(&entry), [Classification::None]);
+        assert_eq!(
+            entry.classification,
+            Classification::None,
+            "{}",
+            entry.reason
+        );
+        assert_eq!(entry.answers[0].response_ms, Some(5.0));
+        assert!(
+            entry.reason.contains("1 answer on 1 identifier"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn a_collecting_window_not_judged_at_its_limit_leaves_the_entry_undetermined() {
+        // Case 2, as on the J2534 worker, which ends an answered window with no timeout item.
+        let mut evidence = collecting(vec![positive(RX, Window::WithinP2)]);
+        evidence.timing.window = Window::NotJudged;
+        evidence.timing.not_judged_reason = Some(NotJudgedReason::NoTimeToJudge);
+        let entry = entry_of(evidence);
+        assert_eq!(classes(&entry), [Classification::None]);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(
+            entry.reason.contains("not judged against the limit"),
+            "{}",
+            entry.reason
+        );
+        // Case 27: the not-judged upgrade of a final response is not applied to the entry.
+        assert!(
+            !entry.reason.contains("Its time is not judged"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn two_answers_on_one_identifier_are_each_judged_and_named() {
+        // Case 3.
+        let mut second = positive(RX, Window::WithinP2);
+        second.timing.response_ms = Some(1_020.0);
+        let entry = entry_of(collecting(vec![positive(RX, Window::WithinP2), second]));
+        assert_eq!(classes(&entry), [Classification::None; 2]);
+        assert_eq!(entry.classification, Classification::None);
+        assert!(
+            entry.reason.contains("2 answers on 1 identifier"),
+            "{}",
+            entry.reason
+        );
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(json["answers"][1]["response_ms"], 1_020.0);
+        assert_eq!(json["answers"][1]["clock"], "device");
+        assert_eq!(json["answers"][1]["epoch"], 0);
+    }
+
+    #[test]
+    fn a_late_second_answer_makes_the_entry_system() {
+        // Case 4.
+        let mut late = positive(RX, Window::Late);
+        late.timing.window_by_ms = Some(3.0);
+        let entry = entry_of(collecting(vec![positive(RX, Window::WithinP2), late]));
+        assert_eq!(
+            classes(&entry),
+            [Classification::None, Classification::System]
+        );
+        assert_eq!(entry.classification, Classification::System);
+        assert!(entry.reason.contains("#2 on 0x7e8"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn a_negative_answer_is_classified_as_a_single_exchange_would_be() {
+        // Case 5.
+        let negative = End::Negative(vec![0x7F, 0x3E, 0x22]);
+        let alone = judged(forwarding(evidence(&PRESENCE, negative.clone())));
+        let (class, _) = verdict_of(&alone);
+        let entry = entry_of(collecting(vec![answer(
+            RX,
+            negative,
+            Window::WithinP2,
+            5.0,
+        )]));
+        assert_eq!(classes(&entry), [class]);
+        assert_eq!(entry.classification, class);
+        assert_eq!(class, Classification::Vehicle);
+    }
+
+    #[test]
+    fn a_pending_before_its_final_answer_restarts_the_window_and_is_none() {
+        // Case 6.
+        let mut one = positive(RX, Window::WithinP2Star);
+        one.pending = vec![pending()];
+        let entry = entry_of(collecting(vec![one]));
+        assert_eq!(classes(&entry), [Classification::None]);
+        assert_eq!(entry.classification, Classification::None);
+    }
+
+    #[test]
+    fn a_lone_pending_answer_takes_the_pending_rows() {
+        // Case 7.
+        let lone = answer(
+            RX,
+            End::Negative(vec![0x7F, 0x3E, 0x78]),
+            Window::WithinP2,
+            5.0,
+        );
+        let as_exchange = collecting(vec![lone.clone()]).as_answer(&lone);
+        assert!(matches!(as_exchange.end, End::NoResponse));
+        assert_eq!(as_exchange.pending.len(), 1);
+        let entry = entry_of(collecting(vec![lone]));
+        assert_eq!(classes(&entry), [Classification::Undetermined]);
+        assert_eq!(entry.classification, Classification::Undetermined);
+    }
+
+    #[test]
+    fn a_silent_collecting_window_is_none_only_when_everything_is_shown() {
+        // Case 10.
+        let entry = entry_of(collecting(Vec::new()));
+        assert_eq!(
+            entry.classification,
+            Classification::None,
+            "{}",
+            entry.reason
+        );
+        assert!(entry.answers.is_empty());
+        // Case 11: no evidence the request reached the bus.
+        let mut unknown = collecting(Vec::new());
+        unknown.transmit_evidence = None;
+        let entry = entry_of(unknown);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(entry.reason.contains("(H1)"), "{}", entry.reason);
+        // Not judged at the limit, or a link that absorbs pendings: never `vehicle` or `none`.
+        let mut open = collecting(Vec::new());
+        open.timing.window = Window::NotJudged;
+        assert_eq!(entry_of(open).classification, Classification::Undetermined);
+        let mut absorbing = collecting(Vec::new());
+        absorbing.pending_visibility = PendingVisibility::AbsorbedByVci;
+        assert_eq!(
+            entry_of(absorbing).classification,
+            Classification::Undetermined
+        );
+        // A link error of the silent window.
+        let mut error = collecting(Vec::new());
+        error.channel_link_errors = vec![LinkErrorKind::Frame];
+        assert_eq!(entry_of(error).classification, Classification::Undetermined);
+    }
+
+    #[test]
+    fn an_own_link_error_names_itself_beside_the_answers() {
+        // Case 12.
+        let mut evidence = collecting(vec![positive(RX, Window::WithinP2)]);
+        evidence.link_errors = vec![LinkErrorKind::VciHardwareFault];
+        let entry = entry_of(evidence);
+        assert_eq!(classes(&entry), [Classification::None]);
+        assert_eq!(entry.classification, Classification::System);
+        assert!(
+            entry.reason.contains("1 answer on 1 identifier"),
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("A link error also came"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn another_links_error_leaves_the_entry_undetermined() {
+        // Case 13.
+        let mut evidence = collecting(vec![positive(RX, Window::WithinP2)]);
+        evidence.channel_link_errors = vec![LinkErrorKind::Frame];
+        let entry = entry_of(evidence);
+        assert_eq!(classes(&entry), [Classification::None]);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(entry.reason.contains("another link"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn a_window_a_receive_error_ended_is_decided_by_the_link_error_row_and_lists_its_answers() {
+        // Case 14.
+        let mut evidence = collecting(vec![positive(RX, Window::WithinP2)]);
+        evidence.end = End::LinkError(LinkErrorKind::VciHardwareFault);
+        let entry = entry_of(evidence);
+        assert_eq!(entry.classification, Classification::System);
+        assert_eq!(classes(&entry), [Classification::None]);
+    }
+
+    #[test]
+    fn an_absorbing_link_leaves_the_entry_undetermined_and_judges_the_answers_absorbing() {
+        // Case 15.
+        let mut evidence = collecting(vec![
+            positive(RX, Window::WithinP2),
+            positive(0x7E9, Window::PossiblePending),
+        ]);
+        evidence.pending_visibility = PendingVisibility::AbsorbedByVci;
+        let entry = entry_of(evidence);
+        assert_eq!(
+            classes(&entry),
+            [Classification::None, Classification::Undetermined]
+        );
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(
+            entry.reason.contains("2 answers on 2 identifiers"),
+            "{}",
+            entry.reason
+        );
+        assert!(entry.reason.contains("(H4)"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn the_rows_before_the_answers_decide_and_the_answers_are_still_listed() {
+        // Cases 16 and 17.
+        for (end, class) in [
+            (End::VciDidNotEnd, Classification::Undetermined),
+            (
+                End::Unknown(UnknownCause::EventsLost),
+                Classification::System,
+            ),
+            (
+                End::VciLost {
+                    refused_after_loss: false,
+                },
+                Classification::Undetermined,
+            ),
+        ] {
+            let mut evidence = collecting(vec![
+                positive(RX, Window::WithinP2),
+                positive(0x7E9, Window::WithinP2),
+            ]);
+            evidence.end = end;
+            let entry = entry_of(evidence);
+            assert_eq!(entry.classification, class, "{}", entry.reason);
+            assert_eq!(entry.answers.len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_collecting_window_the_vci_ended_early_or_late_is_system() {
+        // Case 18.
+        for window in [Window::TimeoutEarly, Window::TimeoutLate] {
+            let mut evidence = collecting(vec![positive(RX, Window::WithinP2)]);
+            evidence.timing.window = window;
+            evidence.timing.window_by_ms = Some(4.0);
+            let entry = entry_of(evidence);
+            assert_eq!(
+                entry.classification,
+                Classification::System,
+                "{}",
+                entry.reason
+            );
+            assert_eq!(classes(&entry), [Classification::None]);
+        }
+    }
+
+    #[test]
+    fn answers_whose_time_is_not_judged_are_undetermined() {
+        // Cases 19 and 20.
+        let entry = entry_of(collecting(vec![
+            positive(RX, Window::NotJudged),
+            positive(0x7E9, Window::NotJudged),
+        ]));
+        assert_eq!(classes(&entry), [Classification::Undetermined; 2]);
+        assert_eq!(entry.classification, Classification::Undetermined);
+    }
+
+    #[test]
+    fn a_second_responder_to_a_request_meant_for_one_ecu_is_the_vehicle() {
+        // Case 22: the entry's outcome stays the first answer's, and both answers are listed.
+        let mut evidence = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+        )));
+        evidence.answers = vec![
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+                Window::WithinP2,
+                5.0,
+            ),
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 2]),
+                Window::WithinP2,
+                9.0,
+            ),
+        ];
+        let entry = entry_of(evidence);
+        assert_eq!(
+            entry.classification,
+            Classification::Vehicle,
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("second responder"),
+            "{}",
+            entry.reason
+        );
+        assert_eq!(entry.answers.len(), 2);
+        assert!(matches!(entry.outcome, Outcome::Positive { .. }));
+    }
+
+    #[test]
+    fn extra_answers_no_more_than_the_owed_requests_are_undetermined() {
+        // Case 23.
+        let mut evidence = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+        )));
+        evidence.answers = vec![
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+                Window::WithinP2,
+                5.0,
+            ),
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 2]),
+                Window::WithinP2,
+                9.0,
+            ),
+        ];
+        let mut history = LinkHistory::empty();
+        history.owed_matching = 1;
+        let (class, reason) = several_answers_row(&evidence, &history);
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.contains("earlier request"), "{reason}");
+        // Two extras against one owed request show a second responder.
+        evidence.answers.push(evidence.answers[1].clone());
+        assert_eq!(
+            several_answers_row(&evidence, &history).0,
+            Classification::Vehicle
+        );
+    }
+
+    #[test]
+    fn the_worst_answer_of_a_request_meant_for_one_ecu_decides_when_it_is_worse() {
+        // Case 24.
+        let mut evidence = judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+        )));
+        evidence.answers = vec![
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+                Window::WithinP2,
+                5.0,
+            ),
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 2]),
+                Window::Late,
+                90.0,
+            ),
+        ];
+        let entry = entry_of(evidence);
+        assert_eq!(
+            entry.classification,
+            Classification::System,
+            "{}",
+            entry.reason
+        );
+        let mut open = judged(forwarding(evidence_with_two_unjudged()));
+        open.answers[1].timing.window = Window::NotJudged;
+        assert_eq!(entry_of(open).classification, Classification::Undetermined);
+    }
+
+    fn evidence_with_two_unjudged() -> Evidence {
+        let mut evidence = evidence(&READ_F186, End::Positive(vec![0x62, 0xF1, 0x86, 1]));
+        evidence.answers = vec![
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+                Window::WithinP2,
+                5.0,
+            ),
+            answer(
+                RX,
+                End::Positive(vec![0x62, 0xF1, 0x86, 2]),
+                Window::WithinP2,
+                9.0,
+            ),
+        ];
+        evidence
+    }
+
+    #[test]
+    fn a_single_answer_of_an_ordinary_request_is_unchanged() {
+        // Case 25.
+        let entry = entry_of(judged(forwarding(evidence(
+            &READ_F186,
+            End::Positive(vec![0x62, 0xF1, 0x86, 1]),
+        ))));
+        assert!(entry.answers.is_empty());
+        assert_eq!(entry.classification, Classification::None);
+    }
+
+    #[test]
+    fn as_answer_keeps_what_belongs_to_one_answer_only() {
+        let mut evidence = collecting(vec![positive(RX, Window::WithinP2)]);
+        evidence.link_errors = vec![LinkErrorKind::Frame];
+        evidence.channel_link_errors = vec![LinkErrorKind::Frame];
+        evidence.end_rejected = true;
+        let one = evidence.as_answer(&evidence.answers[0]);
+        assert!(!one.collecting);
+        assert!(one.answers.is_empty() && one.link_errors.is_empty());
+        assert!(one.channel_link_errors.is_empty() && !one.end_rejected);
+        assert_eq!(one.timing, evidence.answers[0].timing);
+        assert!(matches!(one.end, End::Positive(_)));
+    }
+
+    #[test]
+    fn a_late_response_settling_a_silent_collecting_exchange_takes_the_ordinary_rows() {
+        // Case 29: `Kept::answered` on a collecting exchange with no answers.
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, collecting(Vec::new()));
+        let answered = kept.answered(&POSITIVE);
+        assert!(answered.collecting && answered.answers.is_empty());
+        let (class, reason) = verdict_of(&answered);
+        assert!(!reason.contains("No answer came"), "{reason}");
+        assert_eq!(class, Classification::None, "{reason}");
     }
 }

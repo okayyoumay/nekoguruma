@@ -7,7 +7,8 @@
 //! whose receive table names the example ECU's pair 0x7E0 / 0x7E8, the J2534 worker collects
 //! every answer within the window, and the report says which response identifier answered.
 //! One scenario each: the simulated ECU answers, is silent (the answer is dropped), answers
-//! negatively, answers after a chain of pendings, and answers after the window has ended.
+//! negatively, answers after a chain of pendings, answers twice (ADR-400), and answers after
+//! the window has ended.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -237,6 +238,15 @@ async fn run_once(
     Found { run, log }
 }
 
+/// An answer item of a presence entry that is placed in time: on the device clock, with its
+/// epoch. It has no response time: the J2534 worker gives the functional presence primitive no
+/// transmit time to measure it from, so its window is not judged either (`no_transmit_time`).
+fn assert_timed(item: &serde_json::Value) {
+    assert!(item["response_ms"].is_null(), "{item}");
+    assert_eq!(item["clock"], "device", "{item}");
+    assert!(item["epoch"].is_number(), "{item}");
+}
+
 impl Found {
     /// The report, with the run's bookkeeping checked: one presence link, no refused table, no
     /// interruption, the link closed and the log complete.
@@ -396,6 +406,14 @@ async fn flow(root: &Path, control_dir: &Path) {
     );
     assert_eq!(exchange["answers"][0]["rx_id"], ECU_RESPONSE_ID);
     assert_eq!(exchange["outcome"]["result"], "positive");
+    // The link forwards pendings, so the rows may rely on that (ADR-376).
+    assert_eq!(exchange["pending_visibility"], "forwarded", "{exchange}");
+    // No transmit time reaches the log on this link, and an identification job is given no timing
+    // margin (ADR-377): nothing is judged against a limit, so the answer is placed on its clock
+    // and `undetermined`, and so is the entry (ADR-400).
+    assert_timed(&exchange["answers"][0]);
+    assert_eq!(exchange["answers"][0]["classification"], "undetermined");
+    assert_eq!(exchange["classification"], "undetermined", "{exchange}");
     let opened = found
         .log
         .iter()
@@ -429,6 +447,13 @@ async fn flow(root: &Path, control_dir: &Path) {
             .all(|endpoint| !report.answered(&endpoint.key))
     );
     assert_eq!(found.exchange("silent")["outcome"]["result"], "no_response");
+    // Never `vehicle`, whatever the link has answered before (ADR-400).
+    assert_eq!(
+        found.exchange("silent")["classification"],
+        "undetermined",
+        "{}",
+        found.exchange("silent")
+    );
 
     // The run's guards hold the VCI's lock until they are dropped.
     drop(found);
@@ -449,6 +474,10 @@ async fn flow(root: &Path, control_dir: &Path) {
         [(ECU_RESPONSE_ID, "7f3e22".to_owned())]
     );
     assert_eq!(found.exchange("negative")["outcome"]["result"], "negative");
+    let negative_answer = &found.exchange("negative")["answers"][0];
+    assert_timed(negative_answer);
+    assert_eq!(negative_answer["outcome"]["result"], "negative");
+    assert_eq!(negative_answer["classification"], "undetermined");
 
     // The run's guards hold the VCI's lock until they are dropped.
     drop(found);
@@ -470,6 +499,42 @@ async fn flow(root: &Path, control_dir: &Path) {
             .as_array()
             .map(Vec::len),
         Some(1)
+    );
+
+    // The run's guards hold the VCI's lock until they are dropped.
+    drop(found);
+
+    // The ECU answers twice on its identifier, 100 ms apart: two answers, each placed on its
+    // clock.
+    let repeat = r#"{"repeat_response": {"interval_ms": 100}}"#;
+    let found = run_once(
+        &client,
+        root,
+        control_dir,
+        "repeat",
+        Some(repeat),
+        checked_plan(),
+    )
+    .await;
+    let exchange = found.exchange("repeat");
+    let answers = exchange["answers"].as_array().expect("answers");
+    assert_eq!(answers.len(), 2, "{exchange}");
+    assert_eq!(answers[0]["rx_id"], answers[1]["rx_id"], "{exchange}");
+    for item in answers {
+        assert_timed(item);
+        assert_eq!(item["classification"], "undetermined", "{exchange}");
+    }
+    assert!(
+        answers[1]["vci_us"].as_u64() > answers[0]["vci_us"].as_u64(),
+        "{exchange}"
+    );
+    assert_eq!(exchange["classification"], "undetermined", "{exchange}");
+    assert!(
+        exchange["reason"]
+            .as_str()
+            .unwrap()
+            .contains("2 answers on 1 identifier"),
+        "{exchange}"
     );
 
     // The run's guards hold the VCI's lock until they are dropped.

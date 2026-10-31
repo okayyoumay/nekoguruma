@@ -738,13 +738,19 @@ impl Bus {
         let Some(channel) = self.channels.get_mut(&channel_id) else {
             return Ok(());
         };
-        // Response pending messages (NRC 78) first, then the response itself.
+        // Response pending messages (NRC 78) first, then the response itself, then the copies
+        // of it a `repeat_response` fault sends.
         let now = Instant::now();
         let final_response = exchange
             .response
             .to_bytes()
             .map(|bytes| (exchange.delay_ms, bytes));
-        for (delay_ms, bytes) in exchange.pending.into_iter().chain(final_response) {
+        let sends = exchange
+            .pending
+            .into_iter()
+            .chain(final_response)
+            .chain(exchange.after);
+        for (delay_ms, bytes) in sends {
             let mut data = ECU_RESPONSE_ID.to_be_bytes().to_vec();
             data.extend_from_slice(&bytes);
             let ready_at = now + Duration::from_millis(delay_ms.into());

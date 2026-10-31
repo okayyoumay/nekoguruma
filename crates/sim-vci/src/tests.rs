@@ -296,6 +296,26 @@ fn response_pending_messages_arrive_before_the_response() {
 }
 
 #[test]
+fn a_repeated_response_arrives_a_second_time_after_the_interval() {
+    let f = fixture();
+    with_ecu(|ecu| ecu.inject(Fault::RepeatResponse { interval_ms: 100 }));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    let start = Instant::now();
+    assert_eq!(
+        read(f.channel, 2, 1000),
+        (
+            STATUS_NOERROR,
+            vec![response(&[0x7E, 0x00]), response(&[0x7E, 0x00])]
+        )
+    );
+    assert!(
+        start.elapsed() >= Duration::from_millis(90),
+        "{:?}",
+        start.elapsed()
+    );
+}
+
+#[test]
 fn an_ecu_reset_keeps_its_own_response_pending_chain() {
     let f = fixture();
     with_ecu(|ecu| {

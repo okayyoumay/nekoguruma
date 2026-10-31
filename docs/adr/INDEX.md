@@ -385,10 +385,11 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-393](ADR-393-a-run-continues-after-its-vci-comes-back.md) | A Run Continues After Its VCI Comes Back | Accepted (item 2's "a worker that crashed is not restarted" superseded by ADR-394) | `agent` host (`resend_class`, `WorkerHost::reopen`), runner (`run_vm`, `JobLimits` reopen bounds), restart (`repeat_decision`), communication log (`settle_loss`, `vci_connected`, `link_opened`); design 8.2.5, 8.11; ADR-258; ADR-289; ADR-294; ADR-335; ADR-373; ADR-392 |
 | [ADR-394](ADR-394-the-run-relaunches-a-worker-that-exited.md) | The Run Starts a Worker That Exited Again | Accepted (the settle step of item 3 also runs after a link fails to open and to close again, in both runners, by ADR-396) | `agent` source of the worker (`WorkerSource`, `launch::RelaunchingWorker`), host (`try_reopen`, `Relink`), runner (`run_job`'s end), `main.rs`; `worker-host` (`WorkerProcess::try_wait`, `kill`); communication log (`worker_exit`, `worker_restart`); design 8.2.5, 8.11; ADR-258; ADR-392; ADR-393 |
 | [ADR-395](ADR-395-the-identification-plan-format.md) | The Identification Plan Format, Its Checks and the Endpoint Key | Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396) | `diag-ir` `plan`, `agent` `identification`; design 8.8.2; ADR-318, ADR-319, ADR-324, ADR-326, ADR-327 |
-| [ADR-396](ADR-396-the-presence-requests-collecting-mode.md) | The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule | Accepted (item 8 realized by ADR-398; item 7's per-VCI lock only and presence-only sends widened by ADR-399: the run then reads the VIN and may hold the vehicle's lock) | `agent` link, policy, host, communication log, runner and `identification`; design 8.8.2, 8.11; ADR-235 item 8, ADR-327 item 2, ADR-392, ADR-393, ADR-394, ADR-395 |
+| [ADR-396](ADR-396-the-presence-requests-collecting-mode.md) | The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule | Accepted (item 8 realized by ADR-398; item 7's per-VCI lock only and presence-only sends widened by ADR-399: the run then reads the VIN and may hold the vehicle's lock; item 4's placeholder `answers` items classified and timed by ADR-400) | `agent` link, policy, host, communication log, runner and `identification`; design 8.8.2, 8.11; ADR-235 item 8, ADR-327 item 2, ADR-392, ADR-393, ADR-394, ADR-395 |
 | [ADR-397](ADR-397-a-parity-gap-is-fixed-by-sharing-the-existing-code.md) | A Parity Gap Is Fixed by Sharing the Existing Code | Accepted | `.claude/README.md` (gates, the parity check), `.claude/agents/edge-case-hunter.md` |
 | [ADR-398](ADR-398-a-refused-connect-time-filter-fails-the-j2534-connect.md) | A Refused Connect-Time Filter Fails the J2534 Connect; the Log Header Names the Job Kind; `ngr-agent identify` | Accepted | `j2534-0404-service` rpc_link; `agent` comm_log, runner, identification, `main.rs`; design 8.8.2, 8.11; ADR-039, ADR-068, ADR-396, ADR-397 |
 | [ADR-399](ADR-399-the-identification-job-reads-the-vin.md) | The Identification Job Reads the VIN, Establishes It on Agreement and Takes the Vehicle's Lock | Accepted | `agent` `identification`, `inputs`, `runner` (`promote_to_vehicle`); design 8.8.2; ADR-261, ADR-262, ADR-327 item 5, ADR-345, ADR-392, ADR-393, ADR-395, ADR-396, ADR-397 |
+| [ADR-400](ADR-400-the-answers-of-an-exchange-are-judged-each-from-its-window.md) | The Answers of an Exchange Are Judged Each From Its Own Window | Accepted | `agent` host, communication log and timing, `sim-ecu` (`Fault::RepeatResponse`), `sim-vci`; design 8.11 `answers`, `timing`; ADR-327 item 2, ADR-361, ADR-376, ADR-396 item 4 |
 
 ## Status Legend
 
@@ -886,9 +887,10 @@ the predecessor repository these ADRs came from.
 - ADR-390
 - ADR-391
 - ADR-395 (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396)
-- ADR-396 (item 8 realized by ADR-398; item 7's per-VCI lock only and presence-only sends widened by ADR-399: the run then reads the VIN and may hold the vehicle's lock)
+- ADR-396 (item 8 realized by ADR-398; item 7's per-VCI lock only and presence-only sends widened by ADR-399: the run then reads the VIN and may hold the vehicle's lock; item 4's placeholder `answers` items classified and timed by ADR-400)
 - ADR-398
 - ADR-399
+- ADR-400
 
 ### Acquired Data & Monitoring
 - ADR-236

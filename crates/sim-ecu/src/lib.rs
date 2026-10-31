@@ -553,6 +553,9 @@ pub struct Exchange {
     /// Response pending messages (`7F SID 78`) sent before the response, each with its delay
     /// from the request in milliseconds, in order ([`Fault::ResponsePending`]).
     pub pending: Vec<(u32, Vec<u8>)>,
+    /// Messages sent after the response, each with its delay from the request in milliseconds,
+    /// in order ([`Fault::RepeatResponse`]).
+    pub after: Vec<(u32, Vec<u8>)>,
     /// Whether the request reached the ECU. It does not while the ECU is off, starting up after
     /// a reset, when a [`Fault::BusError`] loses it, or when `EcuConfig::drop_at_block` loses
     /// the block; the ECU then takes no part in the
@@ -566,6 +569,7 @@ impl Exchange {
             response: SimResponse::NoResponse,
             delay_ms: 0,
             pending: Vec::new(),
+            after: Vec::new(),
             reached: false,
         }
     }
@@ -917,10 +921,20 @@ impl SimEcu {
             };
             return (exchange, delay_ms);
         }
+        // The response goes out again `interval_ms` after the first time; the ECU's timers run
+        // from the first.
+        let mut after = Vec::new();
+        if let Some(Fault::RepeatResponse { interval_ms }) =
+            self.take_armed(|f| matches!(f, Fault::RepeatResponse { .. }))
+            && let Some(bytes) = response.to_bytes()
+        {
+            after.push((delay_ms.saturating_add(interval_ms), bytes));
+        }
         let exchange = Exchange {
             response,
             delay_ms,
             pending,
+            after,
             reached: true,
         };
         (exchange, delay_ms)
@@ -1093,4 +1107,9 @@ pub enum Fault {
     /// transport carries, so the response is cut to its service identifier instead. With
     /// [`Fault::DropResponse`] armed too, both fire on the response: it is cut, then lost.
     TruncateResponse { len: usize },
+    /// The next final response the ECU sends goes out twice, the second copy `interval_ms` after
+    /// the first, as a second ECU answering the same request on the same identifier would. A
+    /// request with no response leaves the fault armed; with [`Fault::DropResponse`] armed too,
+    /// both copies are lost and the fault stays armed.
+    RepeatResponse { interval_ms: u32 },
 }

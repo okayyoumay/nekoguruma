@@ -23,8 +23,10 @@ use std::time::Duration;
 use crate::artifact::{Artifact, SHA256_LEN, to_hex};
 use crate::client::{WorkerApi, WorkerSource};
 use crate::comm_log::{
-    CommLogIncomplete, CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciFacts, VciMargins,
+    CommLogIncomplete, CommLogSetup, CommLogStatus, JobKind, JobLog, RunFacts, RunKind, VciFacts,
+    VciMargins,
 };
+use crate::journal::JobKey;
 use diag_ir::declaration::EcuVariant;
 use diag_ir::{
     DiagHost, IdentityKind, Interruptible, Op, Program, StepError, StepOutcome, Vm, VmError,
@@ -1043,6 +1045,30 @@ fn same_log(a: &CommLogSetup, b: &CommLogSetup) -> bool {
             ))
 }
 
+/// The facts every run's log opens with, whatever the job (ADR-347, ADR-397): its ID and
+/// generation from the key of its log, its kind, and the VCI it runs on. A runner states what is
+/// its own on top of this: [`run_facts`] for a procedure, `identification::identification_facts`
+/// for an identification job.
+pub(crate) fn base_facts(
+    kind: JobKind,
+    key: Option<&JobKey>,
+    vci: Option<VciFacts>,
+    margins: VciMargins,
+) -> RunFacts {
+    RunFacts {
+        job_id: key.map(|key| key.job_id.0.clone()).unwrap_or_default(),
+        generation: key.map_or(0, |key| key.generation),
+        kind,
+        plan_sha256: None,
+        document_sha256: None,
+        variant_name: None,
+        target_vin: None,
+        writes: false,
+        vci,
+        margins,
+    }
+}
+
 /// What the communication log's header and `job_start` say of `job` (ADR-347).
 fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
     let setup = journal.map(|mode| {
@@ -1053,11 +1079,6 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
         .map(|setup| setup.key.clone())
         .or_else(|| job.comm_log.as_ref().map(|log| log.key.clone()));
     RunFacts {
-        job_id: key
-            .as_ref()
-            .map(|key| key.job_id.0.clone())
-            .unwrap_or_default(),
-        generation: key.as_ref().map_or(0, |key| key.generation),
         document_sha256: job.document.as_ref().map(JobDocument::sha256),
         variant_name: job
             .document
@@ -1065,8 +1086,7 @@ fn run_facts(job: &Job, journal: Option<&JournalMode>) -> RunFacts {
             .and_then(|document| document.variant().short_name().map(str::to_owned)),
         target_vin: setup.and_then(|setup| setup.vin.as_ref()).cloned(),
         writes: job.writes(),
-        vci: job.vci,
-        margins: job.vci_margins,
+        ..base_facts(JobKind::Procedure, key.as_ref(), job.vci, job.vci_margins)
     }
 }
 
@@ -20993,6 +21013,8 @@ def main():
                 &crate::comm_log::RunFacts {
                     job_id: "crash".to_owned(),
                     generation: 1,
+                    kind: crate::comm_log::JobKind::Procedure,
+                    plan_sha256: None,
                     document_sha256: None,
                     variant_name: None,
                     target_vin: None,

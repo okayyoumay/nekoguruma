@@ -1,9 +1,10 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has one command, which runs the
-procedure of a variant's document on a VCI for local end-to-end runs and tests; it does not
-connect to the server or take jobs from it. A job is always a document: a bare program has no
-declarations to decode with and no declared link, so the command takes none.
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has two commands, for local
+end-to-end runs and tests: `run` runs the procedure of a variant's document on a VCI, and
+`identify` runs an identification plan's functional presence requests (below). It does not connect
+to the server or take jobs from it. A procedure job is always a document: a bare program has no
+declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
 
@@ -135,6 +136,38 @@ commits 0 (ADR-252).
 | 2 | Invalid command line | The error and the usage on stderr |
 
 The worker's own log goes to stderr.
+
+## `ngr-agent identify`
+
+```sh
+ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]... [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--comm-log <dir>]
+```
+
+Runs the functional presence requests of an identification plan (`run_identification`, ADR-396;
+design 8.8.2) and prints the report. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
+`--comm-log` mean what they mean for `run`, and both commands run their job in one shell
+(`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
+source with the slot, the report of the log's path, and the worker's stop with the guards'
+release. The differences:
+
+| Option | Meaning |
+|---|---|
+| `--plan` | The identification plan (`diag_ir::plan::IdentificationPlan`, ADR-395). Required, given once. Unsigned plans are accepted until the plan's signature is verified |
+| `--document` | A document the plan names, by its hash. Any number, including none. The same file twice is one document. A document the plan does not name is ignored, with a warning on stderr. A document the plan names and that is not supplied refuses the plan |
+| `--artifact`, `--artifact-sha256` | Not accepted: the job reads no artifact (unknown options, exit status 2) |
+
+The plan and the documents are read and checked (`load_plan`, `check_plan`) before the log
+directory is made, a lock is taken or a worker starts. The job takes only the per-VCI lock
+(`JobGuards::take_vci_only`), since it sends nothing but the presence request, and keeps a
+communication log only when `--comm-log` is given. The log's header names the job as an
+identification job and carries the plan's SHA-256 (`job.plan_sha256`); `vci_connected` names the
+API and the width as a procedure's does.
+
+| Exit status | Meaning | Output |
+|---|---|---|
+| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout |
+| 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout); or the worker may still hold the VCI after a failed link close | The reason on stderr |
+| 2 | Invalid command line | The error and the usage on stderr |
 
 ## Operational log
 
@@ -329,7 +362,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   (`Job::with_comm_log_dir`), and without that directory it ends in `JobError::NoCommLogDir`
   before anything opens.
 - **Lines.** Every line has the next `seq` and an `event`. A new log starts with the `header`
-  (seq 0: the job's ID, generation, kind and document SHA-256, the target VIN when the job names
+  (seq 0: the job's ID, generation, kind (`procedure` or `identification`; whether the job writes
+  is in `job_start`), the document SHA-256 of a procedure or the plan SHA-256 of an
+  identification job (ADR-398), the target VIN when the job names
   one, the ECU variant, the agent and IR schema versions, and a reading of the agent's clocks).
   Each run writes `job_start` (the agent's version, `run`: `first`, `resume`, or `plain_start`
   for a resume that finds no journal, and whether the job writes) and, when it ends,
@@ -337,7 +372,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `agent_clock` first, a new reading that starts a new agent epoch. Right after the link opens,
   before anything is sent on it, the run writes `vci_connected`, then `link_opened`.
   `vci_connected` names the API (`dpdu` or `j2534_0404`) when the job was told it
-  (`Job::with_vci`, which `ngr-agent run` sets from the worker it launched), the `unsigned long`
+  (`Job::with_vci`, which `ngr-agent run` sets from the worker it launched, and the `vci` argument
+  of `run_identification`, which `ngr-agent identify` sets the same way), the `unsigned long`
   width of a J2534 worker, and the module's version data, which the link reads with
   `GetVersion` in every build (`null` when the worker gives none):
   - a D-PDU module's vendor, hardware name, serial number and version, firmware name and
@@ -1437,7 +1473,7 @@ restart's own checks read the same sources and still treat any non-integer readi
 
 The `identification` module (design 8.8.2, ADR-327, ADR-395) loads and checks the plan of an
 identification job, derives its endpoints and sends its functional presence requests
-(`run_identification`, ADR-396). No command or job kind runs it yet.
+(`run_identification`, ADR-396). `ngr-agent identify` runs it; the server does not yet.
 
 - `load_plan(plan_bytes, supplied)` decodes the plan (`diag_ir::plan::IdentificationPlan`, a
   postcard struct with its own schema version; a chosen-definition plan holds one candidate and
@@ -1456,7 +1492,7 @@ identification job, derives its endpoints and sends its functional presence requ
   endpoint (bus, request and response identifier) with the documents on it, the presence groups
   (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
   documents whose link is refused, and an empty presence section.
-- `run_identification(source, plan, limits, guards, comm_log, cancel)` sends one functional
+- `run_identification(source, plan, limits, guards, comm_log, vci, cancel)` sends one functional
   presence request (`3E 00`) per presence group, one link at a time, under the per-VCI lock
   (`JobGuards::take_vci_only`), and fills the report's presence section: the answers as bus,
   response identifier and bytes (an answer on a pair marks every endpoint with it,

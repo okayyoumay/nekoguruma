@@ -1,7 +1,7 @@
 # ADR-068: UniqueRespIdTable Gets a Working/Active Split, Mirroring ComParamSet (ADR-067)
 
 **Date:** 2026-07-07
-**Status:** Accepted
+**Status:** Accepted (the connect's filter install fails the connect on a refusal, by ADR-398)
 **Affects:** `j2534-0404-service/src/service.rs` (`LogicalLinkState`, `TxItem::UpdateParam`,
              `unique_resp_id_tables_equal`), `j2534-0404-service/src/service/rpc_link.rs`
              (`rpc_connect_com_logical_link`, `promote_unique_resp_id_table`,
@@ -237,3 +237,5 @@ table for no reason — the opposite of what the writeback is for.
 See ADR-039 (filter derivation), ADR-043 (lock check), ADR-044
 (`CoptUpdateparam` lock check), ADR-067 (the `ComParamSet` split this ADR
 mirrors, including the divergence this ADR carves out of §G).
+- A filter the adapter refuses while this CLL's own `ConnectComLogicalLink` installs the promoted
+  table fails the connect (ADR-398); the promotion at `CoptUpdateparam` still logs and skips it.

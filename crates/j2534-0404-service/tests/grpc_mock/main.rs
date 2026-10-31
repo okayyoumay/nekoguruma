@@ -159,6 +159,7 @@ mod can_mode;
 mod clear_msg_filters;
 mod comparam_tx;
 mod concat;
+mod connect_filter_refusal;
 mod connect_flags;
 mod cop_ctrl_cycles;
 mod cop_tag;

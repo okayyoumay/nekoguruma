@@ -19,7 +19,9 @@ use sha2::Digest;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
 use crate::client::{WorkerExit, WorkerSource, WorkerStatus};
-use crate::comm_log::{CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind};
+use crate::comm_log::{
+    CommLogSetup, CommLogStatus, JobKind, JobLog, RunFacts, RunKind, VciFacts, VciMargins,
+};
 use crate::document::{DocumentError, JobDocument};
 use crate::guards::JobGuards;
 use crate::host::{
@@ -29,8 +31,8 @@ use crate::host::{
 use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig, MAX_CAN_ID};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, WORKER_EXIT_GRACE, close_job_link,
-    on_job_thread, open_job_link, reopen_attempts,
+    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, WORKER_EXIT_GRACE, base_facts,
+    close_job_link, on_job_thread, open_job_link, reopen_attempts,
 };
 use crate::send_receive::declared_sid;
 
@@ -190,6 +192,7 @@ pub struct RefusedLink {
 #[derive(Debug)]
 pub struct LoadedPlan {
     plan: IdentificationPlan,
+    plan_sha256: Sha256,
     documents: Vec<(Sha256, JobDocument)>,
 }
 
@@ -221,7 +224,19 @@ pub fn load_plan(
             })?;
         documents.push((named, document));
     }
-    Ok(LoadedPlan { plan, documents })
+    Ok(LoadedPlan {
+        plan,
+        plan_sha256: sha2::Sha256::digest(plan_bytes).into(),
+        documents,
+    })
+}
+
+impl LoadedPlan {
+    /// The hashes of the documents the plan names, which [`load_plan`] found among those
+    /// supplied.
+    pub fn document_hashes(&self) -> Vec<Sha256> {
+        self.documents.iter().map(|(hash, _)| *hash).collect()
+    }
 }
 
 /// A declared link, with the functional identifier its protocol declares (0 when none).
@@ -235,6 +250,7 @@ struct DocumentLink {
 /// A plan that passed [`check_plan`].
 #[derive(Debug)]
 pub struct CheckedPlan {
+    plan_sha256: Sha256,
     selection: Selection,
     candidates: Vec<String>,
     links: Vec<DocumentLink>,
@@ -355,6 +371,7 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
         .map(|c| c.id.clone())
         .collect();
     Ok(CheckedPlan {
+        plan_sha256: loaded.plan_sha256,
         selection: loaded.plan.selection,
         candidates,
         links,
@@ -591,6 +608,25 @@ pub struct IdentificationRun {
     pub comm_log: CommLogStatus,
 }
 
+/// What the communication log's header and `job_start` say of an identification job: the facts
+/// every run's log opens with (`runner::base_facts`, ADR-397), the kind and the plan's hash. The
+/// job writes nothing and has no document of its own.
+fn identification_facts(
+    plan: &CheckedPlan,
+    comm_log: Option<&CommLogSetup>,
+    vci: Option<VciFacts>,
+) -> RunFacts {
+    RunFacts {
+        plan_sha256: Some(plan.plan_sha256),
+        ..base_facts(
+            JobKind::Identification,
+            comm_log.map(|setup| &setup.key),
+            vci,
+            VciMargins::default(),
+        )
+    }
+}
+
 /// Runs the plan's functional presence requests (ADR-327 item 2, ADR-396): per presence group, a
 /// receive table of every declared pair on the group's bus, one link and one request at a time,
 /// under the per-VCI lock `guards` hold. A table the VCI refuses (the worker's answer to the
@@ -600,13 +636,15 @@ pub struct IdentificationRun {
 /// and the request sent again within `limits.max_primitive_repeats` with the origin `repeat`
 /// (ADR-392); what was heard before the loss stays, and a run whose bounds run out reports
 /// `presence_interrupted`. A cancel (`cancel`, also set when the future is dropped) ends the run
-/// in [`JobError::Cancelled`]. `source` also gives the clients of the later links.
+/// in [`JobError::Cancelled`]. `source` also gives the clients of the later links. `vci` is what
+/// the agent knows of the VCI the worker was launched for, for the log's `vci_connected`.
 pub async fn run_identification<W: WorkerSource>(
     mut source: W,
     plan: CheckedPlan,
     limits: JobLimits,
     guards: JobGuards,
     comm_log: Option<CommLogSetup>,
+    vci: Option<VciFacts>,
     cancel: Arc<AtomicBool>,
 ) -> IdentificationRun {
     let handle = Handle::current();
@@ -629,7 +667,10 @@ pub async fn run_identification<W: WorkerSource>(
     if let Err(error) = source.client() {
         return refused(&slot, JobError::Link(error));
     }
-    let log = JobLog::new(comm_log, RunFacts::default());
+    let log = JobLog::new(
+        comm_log.clone(),
+        identification_facts(&plan, comm_log.as_ref(), vci),
+    );
     let cancelled = CancelOnDrop(Arc::clone(&cancel));
     let job_slot = Arc::clone(&slot);
     let (result, comm_log) = on_job_thread(

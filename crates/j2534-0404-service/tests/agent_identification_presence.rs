@@ -28,7 +28,8 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::identification::{
     CheckedPlan, IdentificationRun, check_plan, load_plan, run_identification,
 };
-use agent::{CommLogSetup, CommLogStatus, JobDocument, JobLimits};
+use agent::launch::Api;
+use agent::{CommLogSetup, CommLogStatus, JobDocument, JobLimits, VciFacts};
 use diag_ir::plan::{IdentificationPlan, PLAN_SCHEMA_VERSION, PlanDefinition, Selection};
 use worker_host::client::{ConnectOptions, WorkerClient};
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -104,6 +105,55 @@ fn checked_plan() -> CheckedPlan {
     check_plan(&loaded).expect("the plan passes its checks")
 }
 
+/// A variant's document that declares only its link: UDS over ISO 15765 at 500 kbit/s on
+/// `tx_id` / `rx_id`, with the example ECU's functional identifier.
+fn link_document(tx_id: u32, rx_id: u32) -> Vec<u8> {
+    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = tx_id;
+    protocol.rx_id = rx_id;
+    protocol.functional_id = 0x7DF;
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some(format!("ecu-{tx_id:x}-{rx_id:x}"));
+    variant.protocols = Some(vec![protocol]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = diag_ir::IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    encode_ecu_document(&document)
+}
+
+/// A plan that reads one ECU per pair of `pairs`, declared in that order, all on the one bus.
+fn plan_over(pairs: &[(u32, u32)]) -> CheckedPlan {
+    let documents: Vec<_> = pairs
+        .iter()
+        .map(|&(tx_id, rx_id)| {
+            let bytes = link_document(tx_id, rx_id);
+            let hash = JobDocument::new(bytes.clone())
+                .expect("the document loads")
+                .sha256();
+            (hash, bytes)
+        })
+        .collect();
+    let plan = IdentificationPlan {
+        schema_version: PLAN_SCHEMA_VERSION,
+        selection: Selection::EveryEcu,
+        candidates: Vec::new(),
+        definitions: vec![PlanDefinition {
+            id: "ecus".to_owned(),
+            documents: documents.iter().map(|(hash, _)| *hash).collect(),
+        }],
+    };
+    let loaded =
+        load_plan(&plan.encode().expect("the plan encodes"), documents).expect("the plan loads");
+    check_plan(&loaded).expect("the plan passes its checks")
+}
+
 async fn launch_worker() -> (WorkerProcess, WorkerClient) {
     let worker = WorkerProcess::launch(
         Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
@@ -149,6 +199,7 @@ async fn run_once(
     control_dir: &Path,
     name: &str,
     fault: Option<&str>,
+    plan: CheckedPlan,
 ) -> Found {
     if let Some(fault) = fault {
         send(
@@ -171,10 +222,14 @@ async fn run_once(
     .expect("guards should be taken");
     let run = run_identification(
         client.clone(),
-        checked_plan(),
+        plan,
         JobLimits::default(),
         guards,
         Some(setup.clone()),
+        Some(VciFacts {
+            api: Api::J2534,
+            long_size: long_size(),
+        }),
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -220,6 +275,56 @@ impl Found {
         assert_eq!(exchanges.len(), 1, "{what}\n{:#?}", self.log);
         exchanges[0]
     }
+}
+
+/// Checks a run whose table the adapter refused at connect: the refused table's size, the sizes
+/// of the parts that were linked in turn, and the one answer of the simulated ECU, which marks
+/// every endpoint with its response identifier.
+fn halved(found: &Found, what: &str, refused: &[usize], parts: &[usize], pairs: &[(u32, u32)]) {
+    let report = found
+        .run
+        .result
+        .as_ref()
+        .unwrap_or_else(|error| panic!("{what}: {error}\n{:#?}", found.log));
+    let sizes: Vec<usize> = report
+        .refused_tables()
+        .iter()
+        .map(|refused| refused.table.len())
+        .collect();
+    assert_eq!(sizes, refused, "{what}");
+    assert_eq!(report.refused_tables()[0].table, pairs, "{what}");
+    assert_eq!(
+        report.presence_links_opened() as usize,
+        parts.len(),
+        "{what}"
+    );
+    let tables: Vec<usize> = found
+        .log
+        .iter()
+        .filter(|line| line["event"] == "link_opened")
+        .map(|line| line["functional"]["table"].as_array().map_or(0, Vec::len))
+        .collect();
+    assert_eq!(tables, parts, "{what}\n{:#?}", found.log);
+    assert!(!report.presence_interrupted(), "{what}");
+    assert_eq!(
+        report
+            .presence()
+            .iter()
+            .map(|answer| (answer.rx_id, answer.bytes.clone()))
+            .collect::<Vec<_>>(),
+        [(ECU_RESPONSE_ID, vec![0x7E, 0x00])],
+        "{what}"
+    );
+    for endpoint in report.endpoints() {
+        assert_eq!(
+            report.answered(&endpoint.key),
+            endpoint.key.rx_id == ECU_RESPONSE_ID,
+            "{what}: {:?}",
+            endpoint.key
+        );
+    }
+    assert!(!found.run.guards.link_unconfirmed(), "{what}");
+    assert_eq!(found.run.comm_log, CommLogStatus::Complete, "{what}");
 }
 
 #[test]
@@ -272,7 +377,7 @@ async fn flow(root: &Path, control_dir: &Path) {
     let positive = || vec![(ECU_RESPONSE_ID, "7e00".to_owned())];
 
     // The ECU answers: one answer, on the example ECU's pair, on a functional link.
-    let found = run_once(&client, root, control_dir, "answer", None).await;
+    let found = run_once(&client, root, control_dir, "answer", None, checked_plan()).await;
     assert_eq!(found.heard("answer"), positive());
     let report = found.report("answer");
     assert!(
@@ -312,6 +417,7 @@ async fn flow(root: &Path, control_dir: &Path) {
         control_dir,
         "silent",
         Some(r#""drop_response""#),
+        checked_plan(),
     )
     .await;
     assert_eq!(found.heard("silent"), []);
@@ -329,7 +435,15 @@ async fn flow(root: &Path, control_dir: &Path) {
 
     // A negative answer is presence too, with its code.
     let negative = r#"{"negative_response": {"nrc": "conditions_not_correct"}}"#;
-    let found = run_once(&client, root, control_dir, "negative", Some(negative)).await;
+    let found = run_once(
+        &client,
+        root,
+        control_dir,
+        "negative",
+        Some(negative),
+        checked_plan(),
+    )
+    .await;
     assert_eq!(
         found.heard("negative"),
         [(ECU_RESPONSE_ID, "7f3e22".to_owned())]
@@ -341,7 +455,15 @@ async fn flow(root: &Path, control_dir: &Path) {
 
     // A chain of pendings, then the final answer: one answer.
     let pending = r#"{"response_pending": {"count": 2, "interval_ms": 300}}"#;
-    let found = run_once(&client, root, control_dir, "pending", Some(pending)).await;
+    let found = run_once(
+        &client,
+        root,
+        control_dir,
+        "pending",
+        Some(pending),
+        checked_plan(),
+    )
+    .await;
     assert_eq!(found.heard("pending"), positive());
     assert_eq!(
         found.exchange("pending")["answers"]
@@ -355,11 +477,51 @@ async fn flow(root: &Path, control_dir: &Path) {
 
     // An answer after the window has ended is not presence.
     let late = format!(r#"{{"delay_response": {{"ms": {LATE_MS}}}}}"#);
-    let found = run_once(&client, root, control_dir, "late", Some(&late)).await;
+    let found = run_once(
+        &client,
+        root,
+        control_dir,
+        "late",
+        Some(&late),
+        checked_plan(),
+    )
+    .await;
     assert_eq!(found.heard("late"), []);
     assert_eq!(found.exchange("late")["outcome"]["result"], "no_response");
 
     drop(found);
+
+    // Rows E1 and E2 (ADR-398): a receive table the adapter refuses at connect is halved.
+    // Two pairs that answer on one response identifier are refused as not unique: each half
+    // gets a link of its own, and the one answer marks both endpoints.
+    let shared = [(0x7E0, ECU_RESPONSE_ID), (0x7E1, ECU_RESPONSE_ID)];
+    let found = run_once(
+        &client,
+        root,
+        control_dir,
+        "not-unique",
+        None,
+        plan_over(&shared),
+    )
+    .await;
+    halved(&found, "not-unique", &[2], &[1, 1], &shared);
+    drop(found);
+
+    // Eleven distinct pairs are over the adapter's limit of ten filters: 6 and 5.
+    let mut many = vec![(0x7E0, ECU_RESPONSE_ID)];
+    many.extend((1..=10).map(|i| (0x710 + i, 0x790 + i)));
+    let found = run_once(
+        &client,
+        root,
+        control_dir,
+        "over-limit",
+        None,
+        plan_over(&many),
+    )
+    .await;
+    halved(&found, "over-limit", &[11], &[6, 5], &many);
+    drop(found);
+
     worker
         .stop(Duration::from_secs(5))
         .await

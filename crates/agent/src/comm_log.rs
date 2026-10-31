@@ -154,12 +154,24 @@ pub(crate) enum RunKind {
     PlainStart,
 }
 
+/// What kind of job a log's header names (design 8.11, ADR-398): a procedure, or an
+/// identification job. Whether the job writes is not a kind; `job_start` carries it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum JobKind {
+    Procedure,
+    Identification,
+}
+
 /// What the job knows of itself when its log starts: the header's content, and a run's facts
-/// for its `job_start`.
-#[derive(Debug, Clone, Default)]
+/// for its `job_start`. No default: the kind is stated by whoever builds the facts.
+#[derive(Debug, Clone)]
 pub(crate) struct RunFacts {
     pub job_id: String,
     pub generation: u64,
+    pub kind: JobKind,
+    /// SHA-256 of an identification job's plan, when the job has one.
+    pub plan_sha256: Option<[u8; 32]>,
     /// SHA-256 of the job's document, when it has one.
     pub document_sha256: Option<[u8; 32]>,
     /// The ECU variant's short name, when the document gives one.
@@ -1229,10 +1241,11 @@ struct Header<'a> {
 struct HeaderJob<'a> {
     id: &'a str,
     generation: u64,
-    /// The only kind the runner has.
-    kind: &'static str,
+    kind: JobKind,
     #[serde(skip_serializing_if = "Option::is_none")]
     document_sha256: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    plan_sha256: Option<String>,
 }
 
 #[derive(Serialize)]
@@ -1676,8 +1689,9 @@ impl CommLog {
                     job: HeaderJob {
                         id: &facts.job_id,
                         generation: facts.generation,
-                        kind: "procedure",
+                        kind: facts.kind,
                         document_sha256: facts.document_sha256.as_ref().map(|hash| to_hex(hash)),
+                        plan_sha256: facts.plan_sha256.as_ref().map(|hash| to_hex(hash)),
                     },
                     vehicle: facts.target_vin.as_ref().map(|target_vin| HeaderVehicle {
                         target_vin: target_vin.as_str(),
@@ -5345,6 +5359,8 @@ mod tests {
         RunFacts {
             job_id: "comm-log-test".to_owned(),
             generation: 3,
+            kind: JobKind::Procedure,
+            plan_sha256: None,
             document_sha256: Some([0xAB; 32]),
             variant_name: Some("Engine_V1".to_owned()),
             target_vin: Some(Vin::new("WVWZZZ1JZXW000001".to_owned())),

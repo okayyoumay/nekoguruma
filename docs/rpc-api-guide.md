@@ -1528,7 +1528,13 @@ Promotion (Working → Active) happens at exactly two points:
   point-to-point `FLOW_CONTROL_FILTER`s directly from it, since ISO15765
   `FLOW_CONTROL_FILTER`s are per-CLL (ADR-039), not a property of the shared
   physical channel. A table staged before connecting takes effect
-  immediately at Connect; an empty table installs nothing (ADR-048).
+  immediately at Connect; an empty table installs nothing (ADR-048). If the
+  adapter refuses one of the table's filters (a pattern or flow-control
+  identifier another filter uses, or its filter limit), the connect fails
+  with `Code::Internal` and the `PDUError` of the native status, after the
+  filters already installed for the table are stopped and the link is rolled
+  back (ADR-398); a refusal during `COPT_UPDATEPARAM`'s promotion does not
+  fail it.
 - **`StartComPrimitive(COPT_UPDATEPARAM)` execution.** Snapshots the Working
   table at the same call time as the Working ComParam set, and — only on
   hardware success — promotes it to Active, reconciling ISO15765

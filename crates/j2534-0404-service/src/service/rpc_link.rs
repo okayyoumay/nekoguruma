@@ -1314,6 +1314,15 @@ pub(super) fn effective_fd_tx_dl(params: &ComParamSet) -> usize {
 #[derive(Debug)]
 pub(super) struct NativeMixedTableCollision(CanAddress);
 
+/// ADR-398: the adapter refused one entry's point-to-point filter while the
+/// connect-time table was being installed. `installed` holds the ids that
+/// were accepted before the refusal, so the caller can stop them.
+#[derive(Debug)]
+pub(super) struct FilterInstallRefusal {
+    installed: Vec<MessageFilterId>,
+    error: j2534_0404::Error,
+}
+
 impl J2534Service {
     pub(super) async fn rpc_get_resource_status(
         &self,
@@ -3880,6 +3889,91 @@ impl J2534Service {
         )))
     }
 
+    /// ADR-398: undoes a connect whose point-to-point filter install was
+    /// refused by the adapter, after `finalize_connected_link` already
+    /// published the link. Stops the filters installed so far (a stop failure
+    /// is logged and never masks the refusal), unpublishes the link, then
+    /// runs the shared `rollback_channel_join` tail (ref count, occupancy
+    /// epoch, closing the channel when this link was its last user). Returns
+    /// the refusal as the connect's status.
+    ///
+    /// Lock order (ADR-080): `shared_channels`, then `logical_links`, then
+    /// `api` (innermost), as `DisconnectComLogicalLink` takes them. If a
+    /// concurrent disconnect or destroy already took the link's
+    /// `channel_key`, it also released this link's channel reference, so the
+    /// rollback is skipped to avoid releasing it twice.
+    async fn unwind_refused_connect(
+        &self,
+        handle: u32,
+        channel_id: ChannelId,
+        channel_key: ChannelKey,
+        join_epoch_rollback: Option<(u64, u64)>,
+        refusal: FilterInstallRefusal,
+    ) -> Status {
+        let FilterInstallRefusal { installed, error } = refusal;
+        let mut chans = self.shared_channels.lock().await;
+        let (still_ours, last_error, client_filters, wake_targets) = {
+            let mut links = self.logical_links.lock().await;
+            let mut still_ours = false;
+            let mut last_error = None;
+            let mut client_filters: Vec<MessageFilterId> = Vec::new();
+            if let Some(link) = links.get_mut(&handle) {
+                last_error = link.last_error.clone();
+                if link.channel_key == Some(channel_key) && link.channel_id == Some(channel_id) {
+                    still_ours = true;
+                    link.channel_key = None;
+                    link.channel_id = None;
+                    link.connected = false;
+                    link.held_lock_mask = 0;
+                    link.unique_resp_filter_ids = Vec::new();
+                    client_filters = link
+                        .client_filters
+                        .drain()
+                        .flat_map(|(_, ids)| ids)
+                        .collect();
+                }
+            }
+            let wake_targets: Vec<(u32, mpsc::UnboundedSender<TxItem>)> = if still_ours {
+                recompute_lock_tx_suspensions(&mut links)
+                    .into_iter()
+                    .filter_map(|h| {
+                        links
+                            .get(&h)
+                            .and_then(|l| l.channel_key)
+                            .and_then(|ck| chans.get(&ck).map(|sc| (h, sc.tx_queue.clone())))
+                    })
+                    .collect()
+            } else {
+                Vec::new()
+            };
+            (still_ours, last_error, client_filters, wake_targets)
+        };
+        for (h, tx_queue) in wake_targets {
+            let _ = tx_queue.send(TxItem::ResumeWake { cll_handle: h });
+        }
+        // The filters stay on hardware if a sibling joined the channel in
+        // the meantime, so stop them explicitly; a channel this link closes
+        // takes them down with it, which the stops make no harder.
+        let stop_ids: Vec<MessageFilterId> = installed.into_iter().chain(client_filters).collect();
+        self.remove_point_to_point_fc_filters(channel_id, &stop_ids)
+            .await;
+        if still_ours {
+            self.rollback_channel_join(&mut chans, channel_key, join_epoch_rollback)
+                .await;
+        }
+        drop(chans);
+        let last_error = if last_error.is_some() {
+            last_error
+        } else {
+            self.logical_links
+                .lock()
+                .await
+                .get(&handle)
+                .and_then(|l| l.last_error.clone())
+        };
+        map_native_error_for_link("PassThruStartMsgFilter", &error, last_error)
+    }
+
     /// Shared rollback tail for `finalize_connected_link`'s two reject paths
     /// (ADR-012/ADR-161's concurrent-destroy race, and ADR-162 Decision 2's
     /// native-mixed collision reject) and, since ADR-161's dedicated
@@ -4888,8 +4982,11 @@ impl J2534Service {
                     .map(|l| l.active_unique_resp_id_table.clone())
                     .unwrap_or_default()
             };
-            let filter_ids = self
-                .install_point_to_point_fc_filters(
+            // ADR-398: an adapter refusal of an entry's filter fails the
+            // connect (as a refused staged client filter does, ADR-129)
+            // instead of leaving the link up without that response path.
+            let filter_ids = match self
+                .install_point_to_point_fc_filters_strict(
                     channel_id,
                     &entries,
                     j2534_proto_id,
@@ -4897,7 +4994,21 @@ impl J2534Service {
                         || link_channel_index.is_some()
                         || resources::is_fd_protocol_id(j2534_proto_id),
                 )
-                .await;
+                .await
+            {
+                Ok(ids) => ids,
+                Err(refusal) => {
+                    return Err(self
+                        .unwind_refused_connect(
+                            handle,
+                            channel_id,
+                            channel_key,
+                            join_epoch_rollback,
+                            refusal,
+                        )
+                        .await);
+                }
+            };
             if let Some(link) = self.logical_links.lock().await.get_mut(&handle) {
                 link.unique_resp_filter_ids = filter_ids;
             }
@@ -5061,6 +5172,12 @@ impl J2534Service {
     /// only the earlier connect-time `SET_CONFIG` value differs by
     /// sub-mode. Mutually exclusive with `dual_channel` by construction (see
     /// `native_mixed`'s own doc comment below).
+    ///
+    /// Lenient form, used where a table is set after connect (the promote
+    /// path and the reinstall after `CLEAR_MSG_FILTERS`): an adapter refusal
+    /// of one entry's filter is logged and that entry is skipped (ADR-039,
+    /// ADR-068). The connect path uses
+    /// [`Self::install_point_to_point_fc_filters_strict`] instead (ADR-398).
     pub(super) async fn install_point_to_point_fc_filters(
         &self,
         channel_id: ChannelId,
@@ -5068,6 +5185,51 @@ impl J2534Service {
         protocol_id: u32,
         qualified: bool,
     ) -> Vec<MessageFilterId> {
+        match self
+            .install_point_to_point_fc_filters_core(
+                channel_id,
+                entries,
+                protocol_id,
+                qualified,
+                false,
+            )
+            .await
+        {
+            Ok(ids) => ids,
+            Err(refusal) => refusal.installed,
+        }
+    }
+
+    /// Strict form, used at `ConnectComLogicalLink`: the first adapter
+    /// refusal of an entry's `PassThruStartMsgFilter` stops the walk and is
+    /// returned together with the ids installed so far, so the caller can
+    /// stop them and fail the connect (ADR-398). Eligibility skips stay
+    /// skips.
+    pub(super) async fn install_point_to_point_fc_filters_strict(
+        &self,
+        channel_id: ChannelId,
+        entries: &[EcuUniqueRespEntry],
+        protocol_id: u32,
+        qualified: bool,
+    ) -> Result<Vec<MessageFilterId>, FilterInstallRefusal> {
+        self.install_point_to_point_fc_filters_core(
+            channel_id,
+            entries,
+            protocol_id,
+            qualified,
+            true,
+        )
+        .await
+    }
+
+    async fn install_point_to_point_fc_filters_core(
+        &self,
+        channel_id: ChannelId,
+        entries: &[EcuUniqueRespEntry],
+        protocol_id: u32,
+        qualified: bool,
+        strict: bool,
+    ) -> Result<Vec<MessageFilterId>, FilterInstallRefusal> {
         // Computed BEFORE `api` is locked below (Fix for an AB-BA deadlock
         // found on PR #110's holistic audit): `probe_can_channel_mode` holds
         // `resolved_can_channel_mode`'s lock while awaiting `api` (via
@@ -5180,10 +5342,18 @@ impl J2534Service {
                             protocol_id,
                         ) {
                             Ok(id) => ids.push(id),
-                            Err(err) => warn!(
-                                channel_id = channel_id.0, resp_id, req_id = req.id, %err,
-                                "failed to install point-to-point FLOW_CONTROL_FILTER (USDT)",
-                            ),
+                            Err(err) => {
+                                warn!(
+                                    channel_id = channel_id.0, resp_id, req_id = req.id, %err,
+                                    "failed to install point-to-point FLOW_CONTROL_FILTER (USDT)",
+                                );
+                                if strict {
+                                    return Err(FilterInstallRefusal {
+                                        installed: ids,
+                                        error: err,
+                                    });
+                                }
+                            }
                         }
                     } else {
                         // Preserves the pre-existing requirement that a
@@ -5278,15 +5448,23 @@ impl J2534Service {
                         filter_protocol_id,
                     ) {
                         Ok(id) => ids.push(id),
-                        Err(err) => warn!(
-                            channel_id = channel_id.0, resp_id, req_id = req.as_ref().map(|r| r.id), %err,
-                            "failed to install point-to-point {filter_kind}",
-                        ),
+                        Err(err) => {
+                            warn!(
+                                channel_id = channel_id.0, resp_id, req_id = req.as_ref().map(|r| r.id), %err,
+                                "failed to install point-to-point {filter_kind}",
+                            );
+                            if strict {
+                                return Err(FilterInstallRefusal {
+                                    installed: ids,
+                                    error: err,
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
-        ids
+        Ok(ids)
     }
 
     /// Removes previously-installed point-to-point filters. Failures are logged

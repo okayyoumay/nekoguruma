@@ -245,6 +245,120 @@ fn a_write_is_refused_before_resolving_the_vci_in_a_release_build() {
     assert_fails_with(output, "refused");
 }
 
+/// A release build refuses TesterPresent in a procedure, as it refuses every request outside the
+/// read-only set, before a worker starts. Only the identification job's presence request sends
+/// it (ADR-396); a debug build allows any request on the simulator (ADR-247), so it cannot
+/// refuse it up front.
+#[cfg(not(debug_assertions))]
+#[test]
+fn tester_present_is_refused_before_resolving_the_vci_in_a_release_build() {
+    let temp = TempDir::new("refused-tester-present");
+    let program = write_program(
+        &temp.0,
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x3E }],
+    );
+    let output = ngr_agent()
+        .args(["run", "--vci", "none", "--mode", "user", "--document"])
+        .arg(program)
+        .output()
+        .expect("ngr-agent should run");
+    assert_fails_with(output, "refused");
+}
+
+/// `ngr-agent identify`'s usage errors exit with 2 and print nothing on stdout (design 8.8.2).
+#[test]
+fn identify_usage_errors_exit_with_2() {
+    let base = [
+        "identify", "--vci", "x", "--mode", "user", "--plan", "p.bin",
+    ];
+    for args in [
+        // The plan, the VCI and the mode are required.
+        &["identify", "--vci", "x", "--mode", "user"][..],
+        &["identify", "--mode", "user", "--plan", "p.bin"],
+        &["identify", "--vci", "x", "--plan", "p.bin"],
+    ] {
+        let output = ngr_agent()
+            .args(args)
+            .output()
+            .expect("ngr-agent should run");
+        assert_eq!(output.status.code(), Some(2), "{args:?}");
+        assert!(output.stdout.is_empty());
+    }
+    for extra in [
+        // One plan; the artifact options are a run's; an unknown option.
+        &["--plan", "q.bin"][..],
+        &["--artifact", "a.bin"],
+        &["--artifact-sha256", "00"],
+        &["--bogus", "1"],
+    ] {
+        let output = ngr_agent()
+            .args(base)
+            .args(extra)
+            .output()
+            .expect("ngr-agent should run");
+        assert_eq!(output.status.code(), Some(2), "{extra:?}");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("usage: ngr-agent"), "{stderr}");
+        assert!(output.stdout.is_empty());
+    }
+}
+
+/// A plan or a document that cannot be read or is refused ends the run with 1 before the VCI:
+/// no log directory, no lock directory and no worker (design 8.8.2). The VCI is not resolvable
+/// here, so reaching it would fail with another message.
+#[test]
+fn identify_refuses_a_bad_plan_before_the_vci() {
+    use diag_ir::plan::{IdentificationPlan, PLAN_SCHEMA_VERSION, PlanDefinition, Selection};
+    let temp = TempDir::new("identify-refused");
+    let logs = temp.0.join("logs");
+    let locks = temp.0.join("locks");
+    let identify = |plan: &Path, documents: &[&Path]| {
+        let mut agent = ngr_agent();
+        agent
+            .args(["identify", "--vci", "none", "--mode", "user", "--plan"])
+            .arg(plan)
+            .arg("--comm-log")
+            .arg(&logs)
+            .arg("--locks")
+            .arg(&locks);
+        for document in documents {
+            agent.arg("--document").arg(document);
+        }
+        agent.output().expect("ngr-agent should run")
+    };
+
+    // A plan that is not there.
+    assert_fails_with(identify(&temp.0.join("missing.bin"), &[]), "cannot read");
+
+    // A file that is not a plan.
+    let garbage = temp.0.join("garbage.bin");
+    std::fs::write(&garbage, b"not a plan").expect("file should be writable");
+    assert_fails_with(identify(&garbage, &[]), "plan refused");
+
+    // A plan that names a document nobody supplied.
+    let plan = IdentificationPlan {
+        schema_version: PLAN_SCHEMA_VERSION,
+        selection: Selection::EveryEcu,
+        candidates: Vec::new(),
+        definitions: vec![PlanDefinition {
+            id: "ecu".to_owned(),
+            documents: vec![[7; 32]],
+        }],
+    };
+    let named = temp.0.join("plan.bin");
+    std::fs::write(&named, plan.encode().expect("the plan encodes")).expect("plan file");
+    assert_fails_with(identify(&named, &[]), "was not supplied");
+
+    // A document that is not there.
+    assert_fails_with(
+        identify(&named, &[&temp.0.join("missing.dir")]),
+        "cannot read",
+    );
+
+    assert!(!logs.exists(), "a refused plan creates no log directory");
+    assert!(!locks.exists(), "a refused plan takes no lock");
+}
+
 // The tests below point the agent at a test registration-definition directory through the
 // debug-only NGR_J2534_DEFINITION_DIR override (ADR-282), which replaces the Linux definition
 // directory and the Windows registry alike.

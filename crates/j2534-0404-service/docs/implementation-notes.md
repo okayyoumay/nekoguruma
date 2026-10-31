@@ -7707,8 +7707,9 @@ every area — no silent wrong-constant class of bug was found anywhere in this 
   filters per protocol on a minimally-conforming adapter. `SetUniqueRespIdTable` has no entry cap,
   and connect-time filter installation can install up to two filters per table entry (the ADR-041
   UUDT-workaround path, `rpc_link.rs:3623-3725`) — a large table can hit `PDU_ERR_EXCEEDED_LIMIT` at
-  connect time on such hardware. Surfaces loudly (not silent); worth a doc note next time this area
-  is touched, not a dedicated fix.
+  connect time on such hardware. Since ADR-398 the connect fails with that refusal (after the filters
+  installed so far are stopped and the link is rolled back) instead of logging and skipping the
+  entry; a table promoted later by `CoptUpdateparam` still skips a refused entry.
 
 ## SAE J2534-2 (DEC2020) already-implemented-phases conformance audit (2026-08-11)
 

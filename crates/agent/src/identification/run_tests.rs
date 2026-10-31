@@ -18,7 +18,7 @@ use worker_host::client::WorkerClient;
 
 use super::tests::{checked, document, named};
 use super::*;
-use crate::comm_log::CommLogSetup;
+use crate::comm_log::{CommLogSetup, VciFacts};
 use crate::guards::GuardSetup;
 
 /// One event a started primitive gives, in order.
@@ -528,6 +528,10 @@ async fn run_with(plan: CheckedPlan, fake: Fake, limits: JobLimits, cancel: bool
         limits,
         guards,
         Some(setup.clone()),
+        Some(VciFacts {
+            api: crate::launch::Api::J2534,
+            long_size: 8,
+        }),
         Arc::new(AtomicBool::new(cancel)),
     )
     .await;
@@ -628,6 +632,39 @@ async fn one_functional_request_collects_the_answers_of_the_whole_table() {
     assert_eq!(ids, [u64::from(A.1), u64::from(B.1)]);
     assert_eq!(ran.run.comm_log, CommLogStatus::Complete);
     assert!(!ran.run.guards.link_unconfirmed());
+}
+
+/// ADR-398 and ADR-397: the header names the job as an identification job, with the plan's hash
+/// and no document, and `vci_connected` carries the API and the width the caller passed, as a
+/// procedure's does.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_header_names_an_identification_job_with_its_plan_and_vci() {
+    let fake = Fake::default();
+    fake.state().scripts = VecDeque::from([vec![Item::Answer(A.1, POSITIVE), Item::Finish]]);
+    let plan = plan_of(&[A, B], Some(0x7DF));
+    let expected = hex(&plan.plan_sha256);
+    let ran = run(plan, fake).await;
+    let header = ran
+        .log
+        .iter()
+        .find(|line| line["event"] == "header")
+        .expect("a header");
+    assert_eq!(header["job"]["kind"], "identification", "{header}");
+    assert_eq!(header["job"]["plan_sha256"], expected.as_str(), "{header}");
+    assert!(header["job"].get("document_sha256").is_none(), "{header}");
+    let connected = ran
+        .log
+        .iter()
+        .find(|line| line["event"] == "vci_connected")
+        .expect("a vci_connected line");
+    assert_eq!(connected["api"], "j2534_0404", "{connected}");
+    assert_eq!(connected["unsigned_long_bytes"], 8, "{connected}");
+    let start = ran
+        .log
+        .iter()
+        .find(|line| line["event"] == "job_start")
+        .expect("a job_start");
+    assert_eq!(start["writes"], false, "{start}");
 }
 
 /// A window with no answer is the silent outcome: nothing is presence, nothing is dropped, and
@@ -1097,6 +1134,7 @@ async fn a_worker_that_exits_between_parts_is_logged() {
         limits(),
         guards,
         Some(setup.clone()),
+        None,
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -1169,6 +1207,7 @@ async fn run_with_worker_lost_in_setup(exits: u32) -> (IdentificationRun, Vec<St
         limits(),
         guards,
         Some(setup.clone()),
+        None,
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -1248,6 +1287,7 @@ async fn run_with_a_hung_worker(ends: bool) -> (IdentificationRun, Vec<String>) 
         limits(),
         guards,
         Some(setup.clone()),
+        None,
         Arc::new(AtomicBool::new(false)),
     )
     .await;

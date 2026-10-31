@@ -1,31 +1,45 @@
 //! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library.
-//! The binary's one command, `ngr-agent run`, runs the procedure of a variant's document on a
-//! VCI and prints the final VM state as JSON (`crates/agent/docs/ngr-agent.md`).
+//! The binary's commands: `ngr-agent run` runs the procedure of a variant's document on a VCI and
+//! prints the final VM state as JSON, and `ngr-agent identify` runs an identification plan's
+//! functional presence requests and prints the report as JSON (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
+use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
+use std::sync::Arc;
 use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use agent::artifact::{Artifact, SHA256_LEN, parse_sha256};
 use agent::guards::{GuardSetup, JobGuards};
+use agent::identification::{check_plan, load_plan, run_identification};
 use agent::journal::JobKey;
 use agent::launch::{Api, RelaunchingWorker, launch_worker};
 use agent::policy::build_ceiling;
 use agent::{
-    CommLogSetup, Job, JobDocument, JobLimits, JobRun, VciFacts, check_job, run_key, run_program,
+    CommLogSetup, CommLogStatus, Job, JobDocument, JobError, JobLimits, JobRun, VciFacts,
+    check_job, run_key, run_program,
 };
+use diag_ir::plan::Sha256;
 use diag_ir::{Value, VmState};
+use sha2::Digest;
 use tracing::Instrument;
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const USAGE: &str = "\
 usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [options]
+       ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]...
+                          [options]
 
-Runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API VCI and prints the
+run: runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API VCI and prints the
 final VM state as JSON on stdout. The job takes its link from the protocol the variant
 declares.
+
+identify: runs an identification plan's functional presence requests on the VCI and prints the
+report as JSON on stdout. The plan names the documents it reads by hash; give each as
+--document (a document the plan does not name is ignored with a warning). It sends only the
+presence request and takes only the VCI lock.
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -34,9 +48,11 @@ options:
   --mode <device|user> the device's operating mode, passed to the worker: device mode
                        refuses a library that fails the pre-load checks, user mode
                        reports the findings and loads it
-  --document <file>    a variant's document (.dir): runs its procedure, which decodes
+  --document <file>    run: a variant's document (.dir): runs its procedure, which decodes
                        response fields through the variant's declarations (required)
-  --artifact <file>    the flash artifact the procedure reads its blocks from, read once
+                       identify: a document the plan names; may be repeated
+  --plan <file>        identify only: the identification plan (required)
+  --artifact <file>    run only: the flash artifact the procedure reads its blocks from, read once
                        before any worker starts; needs --artifact-sha256
   --artifact-sha256 <hex>
                        the SHA-256 the job names for the artifact, 64 hexadecimal digits;
@@ -73,8 +89,38 @@ struct RunArgs {
     comm_log: Option<PathBuf>,
 }
 
+/// What `ngr-agent identify` takes.
+#[derive(Debug, PartialEq, Eq)]
+struct IdentifyArgs {
+    api: Api,
+    vci: String,
+    mode: OperatingMode,
+    /// The identification plan (design 8.8.2, ADR-395).
+    plan: PathBuf,
+    /// The documents the plan names, each by its hash; any number.
+    documents: Vec<PathBuf>,
+    workers: Option<PathBuf>,
+    locks: Option<PathBuf>,
+    comm_log: Option<PathBuf>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum Command {
+    Run(RunArgs),
+    Identify(IdentifyArgs),
+}
+
+impl Command {
+    fn mode(&self) -> OperatingMode {
+        match self {
+            Command::Run(args) => args.mode,
+            Command::Identify(args) => args.mode,
+        }
+    }
+}
+
 fn main() -> ExitCode {
-    let args = match parse_args(std::env::args_os().skip(1)) {
+    let command = match parse_args(std::env::args_os().skip(1)) {
         Ok(args) => args,
         Err(message) => {
             eprintln!("ngr-agent: {message}\n\n{USAGE}");
@@ -84,7 +130,7 @@ fn main() -> ExitCode {
     // The operational log (design 12.2), kept for the process's lifetime: stderr and the
     // rotated file, with the settings of the configuration file checked for the device's mode
     // (`crates/agent/docs/ngr-agent.md`).
-    let _logging = agent::logging::install(args.mode);
+    let _logging = agent::logging::install(command.mode());
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -97,7 +143,11 @@ fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
-    match runtime.block_on(run(args)) {
+    let outcome = match command {
+        Command::Run(args) => runtime.block_on(run(args)),
+        Command::Identify(args) => runtime.block_on(identify(args)),
+    };
+    match outcome {
         Ok(state) => {
             println!("{state}");
             ExitCode::SUCCESS
@@ -109,17 +159,19 @@ fn main() -> ExitCode {
     }
 }
 
-fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, String> {
+fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
-    match args.next() {
-        Some(command) if command == "run" => {}
+    let identify = match args.next() {
+        Some(command) if command == "run" => false,
+        Some(command) if command == "identify" => true,
         Some(command) => return Err(format!("unknown command {command:?}")),
         None => return Err("missing command".to_owned()),
-    }
+    };
     let mut api = Api::J2534;
     let mut vci = None;
     let mut mode = None;
-    let mut document = None;
+    let mut documents: Vec<PathBuf> = Vec::new();
+    let mut plan = None;
     let mut artifact = None;
     let mut artifact_sha256 = None;
     let mut workers = None;
@@ -154,10 +206,18 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
                     .parse()
                     .map_err(|error| format!("--api: {error}"))?
             }
-            "--document" if document.is_some() => {
+            // An identification plan names any number of documents; a run takes one.
+            "--document" if !identify && !documents.is_empty() => {
                 return Err("give --document once".to_owned());
             }
-            "--document" => document = Some(PathBuf::from(value)),
+            "--document" => documents.push(PathBuf::from(value)),
+            "--plan" if identify && plan.is_some() => {
+                return Err("give --plan once".to_owned());
+            }
+            "--plan" if identify => plan = Some(PathBuf::from(value)),
+            "--artifact" | "--artifact-sha256" if identify => {
+                return Err(format!("unknown option {flag:?}"));
+            }
             "--artifact" if artifact.is_some() => {
                 return Err("give --artifact once".to_owned());
             }
@@ -186,22 +246,36 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<RunArgs, Strin
             _ => return Err(format!("unknown option {flag:?}")),
         }
     }
+    let vci = vci.ok_or("--vci is required")?;
+    // The mode is fixed per device at installation (design 6.2); there is no default.
+    let mode = mode.ok_or("--mode is required")?;
+    if identify {
+        return Ok(Command::Identify(IdentifyArgs {
+            api,
+            vci,
+            mode,
+            plan: plan.ok_or("--plan is required")?,
+            documents,
+            workers,
+            locks,
+            comm_log,
+        }));
+    }
     let artifact = match (artifact, artifact_sha256) {
         (Some(path), Some(sha256)) => Some((path, sha256)),
         (None, None) => None,
         _ => return Err("--artifact and --artifact-sha256 must be given together".to_owned()),
     };
-    Ok(RunArgs {
+    Ok(Command::Run(RunArgs {
         api,
-        vci: vci.ok_or("--vci is required")?,
-        // The mode is fixed per device at installation (design 6.2); there is no default.
-        mode: mode.ok_or("--mode is required")?,
-        document: document.ok_or("--document is required")?,
+        vci,
+        mode,
+        document: documents.pop().ok_or("--document is required")?,
         artifact,
         workers,
         locks,
         comm_log,
-    })
+    }))
 }
 
 /// The `workers` directory next to the running executable.
@@ -278,78 +352,211 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
     // Only a job that passed its check gets a log, so a refused one creates no directory.
     // A procedure that logs messages keeps them in a log even without `--comm-log` (ADR-348
     // item 6): in `commlog/` beside the agent, as the locks are, and reported like any other.
-    let dir = match args.comm_log {
+    let log_dir = match args.comm_log {
         Some(dir) => Some(dir),
         None if job.logs_messages() => Some(default_comm_logs()?),
         None => None,
     };
+    let shell = VciShell {
+        api: args.api,
+        vci: args.vci,
+        mode: args.mode,
+        workers: args.workers,
+        locks: args.locks,
+    };
+    let writes = job.writes();
+    let state = run_on_vci(
+        shell,
+        key,
+        log_dir,
+        writes,
+        |source, setup, vci, guards| async move {
+            if let Some(setup) = setup {
+                job = job.with_comm_log(setup);
+            }
+            // The communication log's `vci_connected` names the API and the width (design 8.11).
+            let job = job.with_vci(vci);
+            let JobRun {
+                result,
+                guards,
+                comm_log,
+            } = run_program(source, &link, job, JobLimits::default(), guards).await;
+            (result, guards, comm_log)
+        },
+    )
+    .await?;
+    // serde_json would print such a value as `null`, which no longer reads back as the state.
+    if holds_non_finite_float(&state) {
+        return Err(
+            "the final state holds a non-finite float, which JSON cannot represent".to_owned(),
+        );
+    }
+    serde_json::to_string(&state).map_err(|error| format!("cannot print the result: {error}"))
+}
+
+/// Runs an identification plan on the VCI, in its span of the operational log, and returns the
+/// report as JSON.
+async fn identify(args: IdentifyArgs) -> Result<String, String> {
+    let key = run_key();
+    let span = agent::logging::job_span(&key, &args.vci);
+    identify_job(args, key).instrument(span).await
+}
+
+/// Reads a file the command line names.
+fn read_file(path: &Path) -> Result<Vec<u8>, String> {
+    std::fs::read(path).map_err(|error| format!("cannot read {}: {error}", path.display()))
+}
+
+async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String> {
+    // The plan and its documents are read and checked before anything else: a refused plan
+    // creates no log directory, takes no lock and starts no worker.
+    let plan_bytes = read_file(&args.plan)?;
+    let mut supplied: Vec<(Sha256, Vec<u8>)> = Vec::new();
+    let mut paths: Vec<(Sha256, &Path)> = Vec::new();
+    for path in &args.documents {
+        let bytes = read_file(path)?;
+        let hash: Sha256 = sha2::Sha256::digest(&bytes).into();
+        paths.push((hash, path));
+        // The same document given twice is one entry.
+        if !supplied.iter().any(|(known, _)| *known == hash) {
+            supplied.push((hash, bytes));
+        }
+    }
+    let loaded =
+        load_plan(&plan_bytes, supplied).map_err(|error| format!("plan refused: {error}"))?;
+    let named = loaded.document_hashes();
+    for (hash, path) in &paths {
+        if !named.contains(hash) {
+            eprintln!(
+                "ngr-agent: warning: {} is not named by the plan and is ignored",
+                path.display()
+            );
+        }
+    }
+    let plan = check_plan(&loaded).map_err(|error| format!("plan refused: {error}"))?;
+    let shell = VciShell {
+        api: args.api,
+        vci: args.vci,
+        mode: args.mode,
+        workers: args.workers,
+        locks: args.locks,
+    };
+    // The job sends only the presence request, so it needs the VCI lock alone, and it keeps a
+    // log only when asked.
+    let report = run_on_vci(
+        shell,
+        key,
+        args.comm_log,
+        false,
+        |source, setup, vci, guards| async move {
+            let run = run_identification(
+                source,
+                plan,
+                JobLimits::default(),
+                guards,
+                setup,
+                Some(vci),
+                Arc::new(AtomicBool::new(false)),
+            )
+            .await;
+            (run.result, run.guards, run.comm_log)
+        },
+    )
+    .await?;
+    serde_json::to_string(&report).map_err(|error| format!("cannot print the result: {error}"))
+}
+
+/// What a command needs to reach its VCI.
+struct VciShell {
+    api: Api,
+    vci: String,
+    mode: OperatingMode,
+    workers: Option<PathBuf>,
+    locks: Option<PathBuf>,
+}
+
+/// What a command's job gives back to the shell: its result, the guards it was given and how
+/// its communication log ended.
+type JobOutcome<T> = (Result<T, JobError>, JobGuards, CommLogStatus);
+
+/// The shell both commands run their job in (ADR-397): the communication log's setup, the
+/// per-VCI lock (and the reprogramming slot for a job that `writes`, design 8.8.1), the worker
+/// launch, the worker's source with its slot, the log path report, the worker's stop with the
+/// guards' release. `job` runs on what the shell sets up: the worker's source, the log's setup
+/// (when the command has a directory for one), the VCI's facts and the guards. Returns the job's
+/// result, or the message the command exits with.
+async fn run_on_vci<T, Fut>(
+    shell: VciShell,
+    key: JobKey,
+    log_dir: Option<PathBuf>,
+    writes: bool,
+    job: impl FnOnce(RelaunchingWorker, Option<CommLogSetup>, VciFacts, JobGuards) -> Fut,
+) -> Result<T, String>
+where
+    Fut: Future<Output = JobOutcome<T>>,
+{
     let mut log_path = None;
-    if let Some(dir) = dir {
-        let setup = comm_log_setup(dir, key)?;
-        log_path = setup.path().ok();
-        job = job.with_comm_log(setup);
+    let mut setup = None;
+    if let Some(dir) = log_dir {
+        let made = comm_log_setup(dir, key)?;
+        log_path = made.path().ok();
+        setup = Some(made);
     }
     // The per-VCI lock, and the reprogramming slot for a program that writes (design 8.8.1). The
     // wait polls a file lock, so it runs off the runtime's threads; nothing cancels it here.
-    let dir = match args.locks {
+    let dir = match shell.locks {
         Some(dir) => dir,
         None => default_locks()?,
     };
-    let setup = GuardSetup {
+    let guard_setup = GuardSetup {
         dir,
-        vci: args.vci.clone(),
+        vci: shell.vci.clone(),
     };
-    let writes = job.writes();
     let guards = tokio::task::spawn_blocking(move || {
         let never = AtomicBool::new(false);
         if writes {
-            JobGuards::take(&setup, GUARD_POLL, &never)
+            JobGuards::take(&guard_setup, GUARD_POLL, &never)
         } else {
-            JobGuards::take_vci_only(&setup, GUARD_POLL, &never)
+            JobGuards::take_vci_only(&guard_setup, GUARD_POLL, &never)
         }
     })
     .await
     .map_err(|error| format!("taking the job's guards failed: {error}"))?
     .map_err(|error| format!("cannot take the job's guards: {error}"))?;
     let workers = WorkerLayout {
-        root: match args.workers {
+        root: match shell.workers {
             Some(root) => root,
             None => default_workers()?,
         },
     };
     let worker = launch_worker(
-        args.api,
-        &args.vci,
-        args.mode,
+        shell.api,
+        &shell.vci,
+        shell.mode,
         &workers,
         &LaunchOptions::default(),
     )
     .await
     .map_err(|error| error.to_string())?;
-    // The communication log's `vci_connected` names the API and the width (design 8.11).
-    let job = job.with_vci(VciFacts {
-        api: args.api,
+    let vci = VciFacts {
+        api: shell.api,
         long_size: worker.long_size,
-    });
+    };
     // The run owns the worker's process through its source, which starts a new worker if the
     // current one exits (ADR-394); the process in the slot is the one to stop at the end.
     let source = RelaunchingWorker::new(worker.recipe, worker.process, worker.client);
     let slot = source.slot();
-    let JobRun {
-        result,
-        mut guards,
-        comm_log,
-    } = run_program(source, &link, job, JobLimits::default(), guards).await;
+    let (result, mut guards, comm_log) = job(source, setup, vci, guards).await;
     // The path is printed only once the log exists: a job that never ran, or a log that could
     // not be opened, names none.
     match (&comm_log, &log_path) {
-        (agent::CommLogStatus::None, _) => {}
-        (agent::CommLogStatus::Incomplete(agent::CommLogIncomplete::NotOpened(kind)), _) => {
+        (CommLogStatus::None, _) => {}
+        (CommLogStatus::Incomplete(agent::CommLogIncomplete::NotOpened(kind)), _) => {
             eprintln!("ngr-agent: communication log not opened: {kind:?}");
         }
         (status, Some(path)) => {
             eprintln!("ngr-agent: communication log: {}", path.display());
-            if let agent::CommLogStatus::Incomplete(incomplete) = status {
+            if let CommLogStatus::Incomplete(incomplete) = status {
                 eprintln!("ngr-agent: communication log incomplete: {incomplete:?}");
             }
         }
@@ -380,14 +587,7 @@ async fn run_job(args: RunArgs, key: JobKey) -> Result<String, String> {
     // Released only now: either the worker was reaped, or its stop failed after a confirmed
     // close, so its link is closed either way.
     drop(guards);
-    let state = result.map_err(|error| format!("job failed: {error}"))?;
-    // serde_json would print such a value as `null`, which no longer reads back as the state.
-    if holds_non_finite_float(&state) {
-        return Err(
-            "the final state holds a non-finite float, which JSON cannot represent".to_owned(),
-        );
-    }
-    serde_json::to_string(&state).map_err(|error| format!("cannot print the result: {error}"))
+    result.map_err(|error| format!("job failed: {error}"))
 }
 
 /// Whether any value in `state` is an infinite or NaN `F64`.
@@ -414,8 +614,22 @@ mod tests {
     /// A SHA-256 in lowercase hexadecimal.
     const HASH: &str = "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad";
 
-    fn parse(args: &[&str]) -> Result<RunArgs, String> {
+    fn parse_command(args: &[&str]) -> Result<Command, String> {
         parse_args(args.iter().map(OsString::from))
+    }
+
+    fn parse(args: &[&str]) -> Result<RunArgs, String> {
+        match parse_command(args)? {
+            Command::Run(args) => Ok(args),
+            Command::Identify(_) => Err("not a run".to_owned()),
+        }
+    }
+
+    fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
+        match parse_command(args)? {
+            Command::Identify(args) => Ok(args),
+            Command::Run(_) => Err("not an identify".to_owned()),
+        }
     }
 
     #[test]
@@ -588,6 +802,82 @@ mod tests {
             let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
             assert!(parse(&args).is_err(), "{args:?}");
         }
+    }
+
+    /// `identify` takes a plan, any number of documents and the options of `run` other than the
+    /// artifact's (design 8.8.2, ADR-398).
+    #[test]
+    fn parses_an_identify_with_a_plan_and_any_number_of_documents() {
+        let base = [
+            "identify", "--vci", "x", "--mode", "user", "--plan", "p.bin",
+        ];
+        let none = identify_args(&base).expect("valid arguments");
+        assert_eq!(none.plan, PathBuf::from("p.bin"));
+        assert!(none.documents.is_empty());
+        assert_eq!(none.api, Api::J2534);
+        let many = identify_args(
+            &[
+                &base[..],
+                &[
+                    "--document",
+                    "a.dir",
+                    "--document",
+                    "b.dir",
+                    "--api",
+                    "dpdu",
+                ],
+            ]
+            .concat(),
+        )
+        .expect("valid arguments");
+        assert_eq!(
+            many.documents,
+            [PathBuf::from("a.dir"), PathBuf::from("b.dir")]
+        );
+        assert_eq!(many.api, Api::Dpdu);
+        assert!(matches!(parse_command(&base), Ok(Command::Identify(_))));
+    }
+
+    #[test]
+    fn refuses_bad_identify_arguments() {
+        let valid = [
+            "identify", "--vci", "x", "--mode", "user", "--plan", "p.bin",
+        ];
+        for args in [
+            // The plan, the VCI and the mode are required.
+            &["identify", "--vci", "x", "--mode", "user"][..],
+            &["identify", "--mode", "user", "--plan", "p"],
+            &["identify", "--vci", "x", "--plan", "p"],
+        ] {
+            assert!(parse_command(args).is_err(), "{args:?}");
+        }
+        for extra in [
+            // One plan; the artifact is a run's.
+            &["--plan", "q.bin"][..],
+            &["--artifact", "a.bin"],
+            &["--artifact-sha256", HASH],
+            &["--program", "p.json"],
+            &["--bogus", "1"],
+            &["--locks", "locks"],
+        ] {
+            let args: Vec<&str> = valid.iter().chain(extra).copied().collect();
+            assert!(parse_command(&args).is_err(), "{args:?}");
+        }
+        // A run takes no plan.
+        assert!(
+            parse_command(&[
+                "run",
+                "--vci",
+                "x",
+                "--mode",
+                "user",
+                "--document",
+                "d",
+                "--plan",
+                "p"
+            ])
+            .is_err()
+        );
     }
 
     /// A job is always a document: the options that gave a bare program and its link are gone.

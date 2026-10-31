@@ -2,8 +2,8 @@
 
 `ngr-agent` is the binary of the `agent` crate (design 3.3). It has two commands, for local
 end-to-end runs and tests: `run` runs the procedure of a variant's document on a VCI, and
-`identify` runs an identification plan's functional presence requests (below). It does not connect
-to the server or take jobs from it. A procedure job is always a document: a bare program has no
+`identify` runs an identification plan's functional presence requests and VIN reads (below). It
+does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
@@ -143,8 +143,8 @@ The worker's own log goes to stderr.
 ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]... [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--comm-log <dir>]
 ```
 
-Runs the functional presence requests of an identification plan (`run_identification`, ADR-396;
-design 8.8.2) and prints the report. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
+Runs the functional presence requests of an identification plan and then reads the VIN its VIN
+rules name (`run_identification`, ADR-396, ADR-399; design 8.8.2) and prints the report. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
 `--comm-log` mean what they mean for `run`, and both commands run their job in one shell
 (`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
 source with the slot, the report of the log's path, and the worker's stop with the guards'
@@ -157,15 +157,16 @@ release. The differences:
 | `--artifact`, `--artifact-sha256` | Not accepted: the job reads no artifact (unknown options, exit status 2) |
 
 The plan and the documents are read and checked (`load_plan`, `check_plan`) before the log
-directory is made, a lock is taken or a worker starts. The job takes only the per-VCI lock
-(`JobGuards::take_vci_only`), since it sends nothing but the presence request, and keeps a
+directory is made, a lock is taken or a worker starts. The job takes the per-VCI lock
+(`JobGuards::take_vci_only`), since it sends only the presence request and read-only VIN
+requests, and the lock of the vehicle whose VIN it established (below, ADR-399); it keeps a
 communication log only when `--comm-log` is given. The log's header names the job as an
 identification job and carries the plan's SHA-256 (`job.plan_sha256`); `vci_connected` names the
 API and the width as a procedure's does.
 
 | Exit status | Meaning | Output |
 |---|---|---|
-| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout |
+| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established) |
 | 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
@@ -1356,7 +1357,8 @@ process dies, so a crashed run never blocks the next one, and the files are neve
   reads on other VCIs go on while a job reprograms. `JobGuards::holds_slot` tells the two
   apart.
 - `JobGuards::take_vehicle(vin, poll, cancelled)` takes the per-vehicle lock, on guards with or
-  without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The file is one of
+  without the slot, for a well-formed VIN only (`GuardError::InvalidVin`). The restart and an identification job that
+  established a VIN (ADR-399) take it so, through `runner::promote_to_vehicle`. The file is one of
   4096 buckets: `k` is the first two bytes of SHA-256 over the VIN, read big-endian, masked to
   their low 12 bits (a digest starting `84 b1` gives `vehicle-4b1.lock`). Before it opens its
   bucket, the call lists the lock directory and, when fewer than 4096 bucket files are present,
@@ -1482,7 +1484,10 @@ identification job, derives its endpoints and sends its functional presence requ
   something else and a document that does not load refuse the plan.
 - `check_plan` refuses a plan that names, in a variant pattern or a rule source, a service that
   is not declared or not in the read-only set of the variant's layer (a variant with no protocol
-  or layer judges nothing read-only), or a field the response lacks; one resource at two baud
+  or layer judges nothing read-only), or a field the response lacks; a VIN rule's source that is
+  not a 17-byte ASCII field ending a single-identifier read, as the ADR-345 table reads it
+  (`PlanRefused::VinSource`, through `inputs::vin_source_field`, which
+  `ServiceSources::from_document` uses for the VIN role too); one resource at two baud
   rates; a functional identifier wider than 11 bits or equal to a physical identifier of the bus;
   and declared links of one presence group (bus and functional identifier) that differ in a
   ComParam other than the listed timings (ADR-395 item 6), which are not compared. A declared link that ADR-324 refuses is reported, not
@@ -1491,13 +1496,16 @@ identification job, derives its endpoints and sends its functional presence requ
   hand, or every ECU; only the first narrows), the candidate ids, one entry per
   endpoint (bus, request and response identifier) with the documents on it, the presence groups
   (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
-  documents whose link is refused, and an empty presence section.
+  documents whose link is refused, an empty presence section, and the VIN reads with every source
+  `NotRead` (`LinkRefused` for a source whose document's link ADR-324 refuses) and every VIN rule
+  unevaluated.
 - `run_identification(source, plan, limits, guards, comm_log, vci, cancel)` sends one functional
   presence request (`3E 00`) per presence group, one link at a time, under the per-VCI lock
   (`JobGuards::take_vci_only`), and fills the report's presence section: the answers as bus,
   response identifier and bytes (an answer on a pair marks every endpoint with it,
   `IdentificationReport::answered`; presence drops nothing), the number of presence links opened,
-  the refused tables and `presence_interrupted`. The report serializes to JSON.
+  the refused tables and `presence_interrupted`. Then it reads the VIN (below). The report
+  serializes to JSON.
   - The link is functional (`LinkConfig::functional`): `CP_RequestAddrMode` 2, `CP_CanFuncReqId`,
     one unique-response entry per pair of a receive table of every declared pair on the bus, and
     a send-receive ceiling of one `CP_P2Max` window per pair. The host's `presence` collects
@@ -1517,6 +1525,40 @@ identification job, derives its endpoints and sends its functional presence requ
     link that did not close (ADR-258); a table refusal whose link did not close is not halved.
   - Only response identifiers of the link's receive table mark presence; the exchange entry
     lists every result.
+  - The VIN phase (ADR-399) runs after the last presence link is closed, unless the presence
+    phase was interrupted (then `vin_interrupted` is set when some read would have opened a link,
+    every source stays `NotRead` and a source whose link is refused stays `LinkRefused`),
+    and only when a candidate (a definition chosen by hand is the only one) declares a VIN rule.
+    The sources group into reads: one endpoint, equal ComParams other than the timings
+    (`raise_timings` gives the read's link the largest timings of its sources' links) and one
+    request, in the order the plan first names them. A read opens its link (`open_part`, the
+    open, settle and reopen step the presence parts use), sends the request once with the origin
+    `identification` and again within `max_primitive_repeats` with the origin `repeat`
+    (`repeat_within_bounds`, the loop the presence part uses; a receive error sends it again, and
+    the reopens count over the whole run), decodes the one response with every declaration of
+    the read (`inputs::field_bytes_of`, noted as the log's `identity` events) and closes the
+    link. Each source is `Decoded`, `NotWellFormed`, `Undecodable`, `Negative` (not sent again),
+    `NoUsableAnswer` (none, the link's error event for the request, a receive error or lost events,
+    after the repeats), `LinkRefused` (the document's declared link ADR-324 refuses, known before
+    any link opens), `WorkerRefused` (the worker refused the link when the read was made, a
+    refused connect or another failure to open that left nothing open; the other reads decide)
+    or `NotRead`.
+  - A read is accepted when every declaration gives one well-formed VIN. `vin` is set when a
+    read was accepted, every accepted read gave the same VIN (`vins_seen` lists each distinct
+    one) and the phase was not interrupted; bounds that run out in a read leave it and the later
+    reads `NotRead` and set `vin_interrupted`, with no VIN and no lock. `vin_reads` holds each
+    read (endpoint, request in hex, the sources' outcomes, the accepted VIN) and `vin_rules` each
+    candidate's VIN rule as `Matched`, `NotMatched` or `Unevaluated`; nothing is dropped.
+  - An established VIN takes the per-vehicle lock on the job's guards (`promote_to_vehicle`,
+    `JobGuards::take_vehicle`, which allows guards without the slot) once no link is open,
+    waiting for a job that holds the vehicle until it lets go or the cancel, which ends the run
+    in `JobError::Cancelled`; `vehicle_lock_held` says it is held, and the caller's guards
+    release it. Before the promotion the run settles the worker as every open does
+    (`settle_before_open`): a worker that exited during the last close is found and the guards'
+    mark cleared; guards still marked take no lock, and the report comes back with the VIN and
+    `vehicle_lock_held` false (ADR-258). The VIN is in the report and the communication log only, never in the
+    operational log. `IdentificationReport` holds the VINs as `journal::Vin`, whose `Debug`
+    hides them.
 
 The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two
 spellings of UDS on CAN that ADR-324 item 2 accepts are one bus.

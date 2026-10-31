@@ -376,10 +376,16 @@ impl ServiceSources {
                     field_id,
                     reason,
                 };
-                let field =
-                    declared_field(&variant, service_id, field_id).map_err(document_error)?;
+                // The VIN role has its own entry, which an identification plan's VIN sources go
+                // through as well (ADR-399).
+                let field = if roles.contains(&Role::Vin) {
+                    vin_source_field(&variant, service_id, field_id)
+                } else {
+                    declared_field(&variant, service_id, field_id)
+                }
+                .map_err(document_error)?;
                 // A source used in two roles must suit both.
-                for role in roles {
+                for role in roles.into_iter().filter(|role| *role != Role::Vin) {
                     role.accepts(&field).map_err(document_error)?;
                 }
                 Ok(field)
@@ -459,6 +465,20 @@ fn program_sources(program: &Program) -> Vec<(Source, Role)> {
         }
     }
     sources
+}
+
+/// The table entry for the VIN source field `field_id` of service `service_id` in `variant`: the
+/// declaration in the table's shape (`declared_field`) that is also 17 bytes of ASCII text
+/// ([`Role::Vin`]), or what keeps it from that. Both [`ServiceSources::from_document`] and an
+/// identification plan's check go through it (ADR-345 item 3, ADR-399).
+pub(crate) fn vin_source_field(
+    variant: &EcuVariant<'_>,
+    service_id: u32,
+    field_id: u32,
+) -> Result<ServiceField, String> {
+    let field = declared_field(variant, service_id, field_id)?;
+    Role::Vin.accepts(&field)?;
+    Ok(field)
 }
 
 /// The table entry for field `field_id` of service `service_id` in `variant`, or what keeps the
@@ -596,15 +616,17 @@ where
     H: DiagHost<Error = HostError>,
 {
     let read = read_field_bytes(source, table, host)?;
-    host.note_identity(
-        kind,
-        match &read {
-            FieldBytes::Field(bytes) => diag_ir::IdentityRead::Value(bytes),
-            FieldBytes::Negative(nrc) => diag_ir::IdentityRead::Negative(*nrc),
-            FieldBytes::Unreadable => diag_ir::IdentityRead::Unreadable,
-        },
-    );
+    host.note_identity(kind, identity_read_of(&read));
     Ok(read)
+}
+
+/// What the communication log's `identity` event says of a field read.
+pub(crate) fn identity_read_of(read: &FieldBytes) -> diag_ir::IdentityRead<'_> {
+    match read {
+        FieldBytes::Field(bytes) => diag_ir::IdentityRead::Value(bytes),
+        FieldBytes::Negative(nrc) => diag_ir::IdentityRead::Negative(*nrc),
+        FieldBytes::Unreadable => diag_ir::IdentityRead::Unreadable,
+    }
 }
 
 /// [`resolve_source`] for the identity `kind`, noting what was read with the host as
@@ -683,16 +705,25 @@ where
         return Ok(FieldBytes::Unreadable);
     };
     let response = host.service_request(u16::from(sid), payload)?;
+    Ok(field_bytes_of(field, sid, &response))
+}
+
+/// What `response` to the request with service `sid` gives for `field`: the field's raw bytes when
+/// the response is exactly the positive SID, the echo and a field that decodes, the response code
+/// of a negative response to the request, else unreadable. [`read_field_bytes`] sends the request
+/// and reads it so; a caller that sent the request itself reads each declaration of the one
+/// response so (ADR-399).
+pub(crate) fn field_bytes_of(field: &ServiceField, sid: u8, response: &[u8]) -> FieldBytes {
     if let [0x7F, echoed, nrc] = response[..]
         && echoed == sid
     {
-        return Ok(FieldBytes::Negative(nrc));
+        return FieldBytes::Negative(nrc);
     }
-    Ok(extract_field(field, sid, &response)
+    extract_field(field, sid, response)
         .filter(|bytes| decode_bytes(field, bytes).is_known())
         .map_or(FieldBytes::Unreadable, |bytes| {
             FieldBytes::Field(bytes.to_vec())
-        }))
+        })
 }
 
 /// The bytes of `field` in `response` to the request with service `sid`, if the response is
@@ -943,6 +974,33 @@ mod tests {
             },
         ])
         .unwrap()
+    }
+
+    /// ADR-399: `field_bytes_of` reads a response the caller sent as `read_field_bytes` reads
+    /// the one it sends, and `identity_read_of` tells the log what was read.
+    #[test]
+    fn a_response_read_without_sending_gives_the_same_bytes_as_a_read() {
+        let field = vin_field();
+        let mut response = vec![0x62, 0xF1, 0x90];
+        response.extend_from_slice(b"WVWZZZ1JZ3W386752");
+        let read = field_bytes_of(&field, 0x22, &response);
+        assert_eq!(read, FieldBytes::Field(b"WVWZZZ1JZ3W386752".to_vec()));
+        assert_eq!(
+            identity_read_of(&read),
+            diag_ir::IdentityRead::Value(b"WVWZZZ1JZ3W386752")
+        );
+        let negative = field_bytes_of(&field, 0x22, &[0x7F, 0x22, 0x31]);
+        assert_eq!(negative, FieldBytes::Negative(0x31));
+        assert_eq!(
+            identity_read_of(&negative),
+            diag_ir::IdentityRead::Negative(0x31)
+        );
+        // A short response, one for another service, and an empty one carry no field.
+        for response in [&response[..10], &[0x7F, 0x10, 0x31], &[][..]] {
+            let read = field_bytes_of(&field, 0x22, response);
+            assert_eq!(read, FieldBytes::Unreadable, "{response:02x?}");
+            assert_eq!(identity_read_of(&read), diag_ir::IdentityRead::Unreadable);
+        }
     }
 
     fn resolve(source: Source, host: &mut Fake) -> Reading {
@@ -1335,6 +1393,23 @@ mod tests {
 
         fn refused(services: Vec<ServiceT>) -> TableError {
             ServiceSources::from_document(&document(services), &named()).unwrap_err()
+        }
+
+        /// ADR-399: the VIN entry of the table code, which an identification plan's check shares
+        /// with `from_document`: the declaration of service 1 gives the table's entry, and a source
+        /// of another shape is refused with the reason `from_document` reports.
+        #[test]
+        fn the_vin_entry_is_the_one_from_document_builds() {
+            let document = document(services());
+            let variant = document.variant();
+            let field = vin_source_field(&variant, 1, 1).unwrap();
+            let table = ServiceSources::from_document(&document, &named()).unwrap();
+            assert_eq!(table.get(1, 1), Some(&field));
+            // The hardware part number (8 bytes) is a table entry but not a VIN source.
+            assert!(vin_source_field(&variant, 2, 1).is_err());
+            assert!(vin_source_field(&variant, 3, 1).is_err());
+            assert!(vin_source_field(&variant, 9, 1).is_err(), "no such service");
+            assert!(vin_source_field(&variant, 1, 9).is_err(), "no such field");
         }
 
         #[test]

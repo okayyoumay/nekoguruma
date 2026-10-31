@@ -2138,7 +2138,7 @@ fn count_procedure_resume<S: Store>(
 /// panic or an early return puts them back as well ([`SlotReturn`]), since the caller expects
 /// them in the slot at the end. A cancel is [`JobError::Cancelled`]; any other failure is
 /// [`JobError::VehicleLock`], and an empty slot [`JobError::GuardsMissing`].
-fn promote_to_vehicle(
+pub(crate) fn promote_to_vehicle(
     slot: &GuardSlot,
     vin: &crate::journal::Vin,
     poll: Duration,

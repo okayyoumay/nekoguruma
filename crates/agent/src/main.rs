@@ -1,7 +1,7 @@
 //! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library.
 //! The binary's commands: `ngr-agent run` runs the procedure of a variant's document on a VCI and
 //! prints the final VM state as JSON, and `ngr-agent identify` runs an identification plan's
-//! functional presence requests and prints the report as JSON (`crates/agent/docs/ngr-agent.md`).
+//! functional presence requests and VIN reads and prints the report as JSON (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -36,10 +36,11 @@ run: runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API V
 final VM state as JSON on stdout. The job takes its link from the protocol the variant
 declares.
 
-identify: runs an identification plan's functional presence requests on the VCI and prints the
-report as JSON on stdout. The plan names the documents it reads by hash; give each as
---document (a document the plan does not name is ignored with a warning). It sends only the
-presence request and takes only the VCI lock.
+identify: runs an identification plan's functional presence requests on the VCI, then reads the
+VIN its VIN rules name, and prints the report as JSON on stdout. The plan names the documents it
+reads by hash; give each as --document (a document the plan does not name is ignored with a
+warning). It sends only the presence request and the read-only VIN requests, and takes the VCI
+lock, then the lock of the vehicle whose VIN it established.
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -441,8 +442,8 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
         workers: args.workers,
         locks: args.locks,
     };
-    // The job sends only the presence request, so it needs the VCI lock alone, and it keeps a
-    // log only when asked.
+    // The job sends only the presence request and read-only VIN reads, so it needs the VCI lock
+    // (the vehicle's lock follows from the VIN it reads), and it keeps a log only when asked.
     let report = run_on_vci(
         shell,
         key,

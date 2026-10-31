@@ -1,7 +1,7 @@
 # ADR-396: The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule
 
 **Date:** 2026-10-31
-**Status:** Accepted (item 8 realized by ADR-398)
+**Status:** Accepted (item 8 realized by ADR-398; item 7's per-VCI lock only and presence-only sends widened by ADR-399: the run then reads the VIN and may hold the vehicle's lock)
 **Affects:** `agent` (`link`, `policy`, `host`, `comm_log`, `runner`, `identification`),
 `crates/agent/docs/ngr-agent.md`, design 8.8.2 and 8.11; ADR-235 item 8, ADR-327 item 2,
 ADR-392, ADR-393, ADR-394, ADR-395

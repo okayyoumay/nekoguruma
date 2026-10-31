@@ -5,7 +5,9 @@
 //! [`load_plan`] and [`check_plan`] send nothing and are the only gate before a link opens, and
 //! [`CheckedPlan::report`] is the only writer of the report's endpoint and presence-group lists.
 //! [`run_identification`] then sends the plan's functional presence requests and is the only
-//! writer of the report's presence section (ADR-396); it sends nothing else yet.
+//! writer of the report's presence section (ADR-396); it then reads the VIN the plan's VIN rules
+//! name, and is the only writer of the report's VIN section and of the per-vehicle lock the
+//! identified VIN takes (ADR-399). It sends nothing else yet.
 
 use std::cell::Cell;
 use std::collections::VecDeque;
@@ -13,26 +15,33 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use diag_ir::declaration::EcuVariant;
-use diag_ir::plan::{IdentificationPlan, PlanError, Selection, Sha256, hex};
+use diag_ir::plan::{
+    Component, IdentificationPlan, PlanError, Selection, Sha256, Source, VinRule, hex,
+};
+use diag_ir::{DiagHost, IdentityKind};
 use serde::{Serialize, Serializer};
 use sha2::Digest;
 use tokio::runtime::{Handle, RuntimeFlavor};
 
-use crate::client::{WorkerExit, WorkerSource, WorkerStatus};
+use crate::client::{WorkerApi, WorkerExit, WorkerSource, WorkerStatus};
 use crate::comm_log::{
     CommLogSetup, CommLogStatus, JobKind, JobLog, RunFacts, RunKind, VciFacts, VciMargins,
 };
 use crate::document::{DocumentError, JobDocument};
 use crate::guards::JobGuards;
 use crate::host::{
-    HostError, OwnRead, ProcedurePosition, ReopenAttempt, ResendClass, Timings, names_lost_vci,
-    settle_worker,
+    HostError, OwnRead, ProcedurePosition, ReopenAttempt, ResendClass, Timings, WorkerHost,
+    names_lost_vci, settle_worker,
 };
+use crate::inputs::{
+    FieldBytes, ServiceField, ServiceSources, field_bytes_of, identity_read_of, vin_source_field,
+};
+use crate::journal::Vin;
 use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig, MAX_CAN_ID};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
-    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, WORKER_EXIT_GRACE, base_facts,
-    close_job_link, on_job_thread, open_job_link, reopen_attempts,
+    CancelOnDrop, GuardSlot, JobError, JobLimits, JobLink, LinkRefused, WORKER_EXIT_GRACE,
+    base_facts, close_job_link, on_job_thread, open_job_link, promote_to_vehicle, reopen_attempts,
 };
 use crate::send_receive::declared_sid;
 
@@ -71,6 +80,16 @@ pub enum PlanRefused {
     /// One resource (the same protocol, bus type and pins) declared at two baud rates.
     #[error("documents {first} and {second} declare one resource at two baud rates")]
     BaudRatesDiffer { first: String, second: String },
+    /// A VIN rule's source that the identification job cannot read as a VIN: the document does
+    /// not declare it in the shape of the ADR-345 table, or it is not 17 bytes of ASCII text
+    /// (ADR-399 item 2).
+    #[error("document {document} cannot give a VIN from service {service} field {field}: {why}")]
+    VinSource {
+        document: String,
+        service: u32,
+        field: u32,
+        why: String,
+    },
     #[error("document {document} declares functional identifier {functional_id:#x}: {why}")]
     BadFunctionalId {
         document: String,
@@ -143,20 +162,58 @@ pub struct PresenceGroup {
 }
 
 impl PresenceGroup {
-    /// Raises each timing of the group to `link`'s when that is larger: a larger value only
-    /// makes the tester wait longer or send later (ADR-395 item 6).
+    /// Raises each timing of the group to `link`'s when that is larger (ADR-395 item 6), by
+    /// [`raise_timings`] on a copy of `link` that carries the group's timings.
     fn take_largest(&mut self, link: &LinkConfig) {
-        self.p2_max_ms = self.p2_max_ms.max(link.p2_max_ms);
-        self.p2_star_ms = self.p2_star_ms.max(link.p2_star_ms);
-        self.rc78_completion_ms = self.rc78_completion_ms.max(link.rc78_completion_ms);
-        for (name, value) in link.params.iter().filter(|(name, _)| is_timing(name)) {
-            let name = name.to_ascii_lowercase();
-            match self.timings.iter_mut().find(|(known, _)| *known == name) {
-                Some((_, largest)) => *largest = (*largest).max(*value),
-                None => self.timings.push((name, *value)),
+        let mut raised = link.clone();
+        self.write_timings(&mut raised);
+        raise_timings(&mut raised, link);
+        self.p2_max_ms = raised.p2_max_ms;
+        self.p2_star_ms = raised.p2_star_ms;
+        self.rc78_completion_ms = raised.rc78_completion_ms;
+        self.timings = raised
+            .params
+            .iter()
+            .filter(|(name, _)| is_timing(name))
+            .map(|(name, value)| (name.to_ascii_lowercase(), *value))
+            .collect();
+        self.timings.sort();
+    }
+
+    /// Sets the group's timings on `link`, replacing its own.
+    fn write_timings(&self, link: &mut LinkConfig) {
+        link.p2_max_ms = self.p2_max_ms;
+        link.p2_star_ms = self.p2_star_ms;
+        link.rc78_completion_ms = self.rc78_completion_ms;
+        for (name, value) in &self.timings {
+            match link
+                .params
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            {
+                Some((_, known)) => *known = *value,
+                None => link.params.push((name.clone(), *value)),
             }
         }
-        self.timings.sort();
+    }
+}
+
+/// Raises each timing of `target` to `link`'s when that is larger: a larger value only makes the
+/// tester wait longer or send later (ADR-395 item 6). A presence group takes the largest of its
+/// links so, and a VIN read does (ADR-399 item 1).
+fn raise_timings(target: &mut LinkConfig, link: &LinkConfig) {
+    target.p2_max_ms = target.p2_max_ms.max(link.p2_max_ms);
+    target.p2_star_ms = target.p2_star_ms.max(link.p2_star_ms);
+    target.rc78_completion_ms = target.rc78_completion_ms.max(link.rc78_completion_ms);
+    for (name, value) in link.params.iter().filter(|(name, _)| is_timing(name)) {
+        match target
+            .params
+            .iter_mut()
+            .find(|(known, _)| known.eq_ignore_ascii_case(name))
+        {
+            Some((_, largest)) => *largest = (*largest).max(*value),
+            None => target.params.push((name.clone(), *value)),
+        }
     }
 }
 
@@ -247,6 +304,24 @@ struct DocumentLink {
     functional_id: u32,
 }
 
+/// One read of the VIN: the sources that one request on one link answers (ADR-399 item 1).
+#[derive(Debug)]
+struct VinReadPlan {
+    /// The endpoint the read goes to; `None` for sources whose document's link ADR-324 refuses.
+    endpoint: Option<EndpointKey>,
+    /// The first declared link of the read with the largest timings of its sources' links;
+    /// `None` when the link is refused, and the read is never made.
+    link: Option<LinkConfig>,
+    /// The ComParams of the link other than the timings, which the sources of one read share.
+    non_timing: Vec<(String, u32)>,
+    /// The document of the sources whose link is refused.
+    refused: Option<Sha256>,
+    /// The whole request, SID first.
+    request: Vec<u8>,
+    /// The sources decoded from the one response, with how each is read.
+    declarations: Vec<(Source, ServiceField)>,
+}
+
 /// A plan that passed [`check_plan`].
 #[derive(Debug)]
 pub struct CheckedPlan {
@@ -255,11 +330,16 @@ pub struct CheckedPlan {
     candidates: Vec<String>,
     links: Vec<DocumentLink>,
     refused_links: Vec<RefusedLink>,
+    /// The VIN reads, in the order the plan's VIN rules first name their sources.
+    vin_reads: Vec<VinReadPlan>,
+    /// Every candidate's VIN rules, with the candidate's id, in plan order.
+    vin_rules: Vec<(String, VinRule)>,
 }
 
 /// The checks that run before any link opens: every service a pattern or a rule source names
-/// is read-only and declared, every document's link is derived (a link ADR-324 refuses is
-/// reported, not refused), and the links of one bus agree in their ComParams other than the
+/// is read-only and declared, every VIN rule's source is a 17-byte ASCII field in the shape of
+/// the ADR-345 table (ADR-399 item 2), every document's link is derived (a link ADR-324 refuses
+/// is reported, not refused), and the links of one bus agree in their ComParams other than the
 /// timings.
 pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
     let document = |hash: &Sha256| {
@@ -274,6 +354,8 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
             check_read_only(hash, &variant, pattern.service_id())?;
         }
     }
+    // The VIN rules' sources, each once, in plan order.
+    let mut vin_sources: Vec<(Source, ServiceField)> = Vec::new();
     for candidate in &loaded.plan.candidates {
         let sources = candidate
             .vin_rules
@@ -297,6 +379,25 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
                     field: source.field,
                 });
             }
+        }
+        for rule in &candidate.vin_rules {
+            if vin_sources.iter().any(|(known, _)| *known == rule.source) {
+                continue;
+            }
+            let variant = document(&rule.source.document).variant();
+            let vin_source = |why: String| PlanRefused::VinSource {
+                document: hex(&rule.source.document),
+                service: rule.source.service,
+                field: rule.source.field,
+                why,
+            };
+            let field = vin_source_field(&variant, rule.source.service, rule.source.field)
+                .map_err(vin_source)?;
+            // The shape the table accepts of one entry (a single-identifier read); the ids are
+            // local to a document, so entries of several documents are not tabled together.
+            ServiceSources::new(vec![field.clone()])
+                .map_err(|error| vin_source(error.to_string()))?;
+            vin_sources.push((rule.source, field));
         }
     }
     let mut links: Vec<DocumentLink> = Vec::new();
@@ -370,13 +471,67 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
         .iter()
         .map(|c| c.id.clone())
         .collect();
+    let vin_reads = group_vin_reads(vin_sources, &links);
+    let vin_rules = loaded
+        .plan
+        .candidates
+        .iter()
+        .flat_map(|c| c.vin_rules.iter().map(|rule| (c.id.clone(), rule.clone())))
+        .collect();
     Ok(CheckedPlan {
         plan_sha256: loaded.plan_sha256,
         selection: loaded.plan.selection,
         candidates,
         links,
         refused_links,
+        vin_reads,
+        vin_rules,
     })
+}
+
+/// Groups the VIN sources into reads: sources on one endpoint with equal ComParams other than the
+/// timings and the same request share one read, whose link has the largest timings of theirs
+/// (ADR-399 item 1). The reads are in the order their first source comes in the plan. Sources of
+/// a document whose link is refused are grouped by document and request and never read.
+fn group_vin_reads(
+    sources: Vec<(Source, ServiceField)>,
+    links: &[DocumentLink],
+) -> Vec<VinReadPlan> {
+    let mut reads: Vec<VinReadPlan> = Vec::new();
+    for (source, field) in sources {
+        let declared = links.iter().find(|l| l.document == source.document);
+        let endpoint = declared.map(|d| EndpointKey {
+            bus: BusKey::of(&d.link),
+            tx_id: d.link.tx_id,
+            rx_id: d.link.rx_id,
+        });
+        let non_timing = declared.map(|d| comparams(&d.link)).unwrap_or_default();
+        let refused = declared.is_none().then_some(source.document);
+        let known = reads.iter_mut().find(|read| {
+            read.endpoint == endpoint
+                && read.non_timing == non_timing
+                && read.refused == refused
+                && read.request == field.request
+        });
+        match (known, declared) {
+            (Some(read), Some(declared)) => {
+                if let Some(link) = &mut read.link {
+                    raise_timings(link, &declared.link);
+                }
+                read.declarations.push((source, field));
+            }
+            (Some(read), None) => read.declarations.push((source, field)),
+            (None, _) => reads.push(VinReadPlan {
+                endpoint,
+                link: declared.map(|d| d.link.clone()),
+                non_timing,
+                refused,
+                request: field.request.clone(),
+                declarations: vec![(source, field)],
+            }),
+        }
+    }
+    reads
 }
 
 /// Whether the request of declared service `service` is in its layer's read-only set
@@ -429,9 +584,77 @@ fn comparams(link: &LinkConfig) -> Vec<(String, u32)> {
     params
 }
 
+/// What one VIN source gave (ADR-399 item 4).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum VinOutcome {
+    /// A well-formed VIN, decoded from the response. `Debug` hides it (design 16.2).
+    Decoded(Vin),
+    /// The field decoded to text that is not a well-formed VIN.
+    NotWellFormed,
+    /// The response carried no field that decodes.
+    Undecodable,
+    /// A negative response, with its response code.
+    Negative(u8),
+    /// The request got no usable answer within the run's repeats: none at all, the link's
+    /// error event for it, a receive error or lost events (each a failure of the ECU or the
+    /// bus, ADR-392).
+    NoUsableAnswer,
+    /// The source's document declares a link ADR-324 refuses, so nothing was read: known
+    /// before any link opens.
+    LinkRefused,
+    /// The worker refused to open the source's link (a connect it refused, or another failure
+    /// to open that left nothing open) when the read was made.
+    WorkerRefused,
+    /// The read was not made: the run ended, or its bounds ran out, before it.
+    NotRead,
+}
+
+/// A VIN rule source of one read, with what it gave.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VinSourceRead {
+    #[serde(serialize_with = "as_hex")]
+    pub document: Sha256,
+    pub service: u32,
+    pub field: u32,
+    pub outcome: VinOutcome,
+}
+
+/// One read of the VIN: one request on one endpoint, and every source its response is decoded by
+/// (ADR-399 item 1).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VinRead {
+    /// The endpoint read; `None` when the sources' link is refused.
+    pub endpoint: Option<EndpointKey>,
+    #[serde(serialize_with = "as_hex")]
+    pub request: Vec<u8>,
+    pub sources: Vec<VinSourceRead>,
+    /// The VIN when every source gave the same well-formed one.
+    pub accepted: Option<Vin>,
+}
+
+/// Whether the established VIN satisfies a VIN rule. Nothing is dropped by it (ADR-399 item 6).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+pub enum VinRuleOutcome {
+    Matched,
+    NotMatched,
+    /// No VIN was established.
+    Unevaluated,
+}
+
+/// A candidate's VIN rule and how the established VIN stands to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct VinRuleResult {
+    pub candidate: String,
+    pub component: Component,
+    pub value: String,
+    pub start: u8,
+    pub end: u8,
+    pub outcome: VinRuleOutcome,
+}
+
 /// What the plan's checks and the derivation give (design 8.8.2), and, once
-/// [`run_identification`] has run, the presence section: which response identifiers answered
-/// the functional presence requests.
+/// [`run_identification`] has run, the presence section (which response identifiers answered
+/// the functional presence requests) and the VIN section (ADR-399).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IdentificationReport {
     selection: Selection,
@@ -447,6 +670,20 @@ pub struct IdentificationReport {
     /// A presence request could not be completed, because the path to the VCI was lost and the
     /// run's bounds ran out: the presence section holds what was heard before.
     presence_interrupted: bool,
+    /// The vehicle's VIN: every accepted VIN read gave this one, and the VIN phase was not
+    /// interrupted (ADR-399 item 3).
+    vin: Option<Vin>,
+    /// Each distinct VIN a read accepted, in the order they came.
+    vins_seen: Vec<Vin>,
+    /// The VIN reads in plan order, each source `NotRead` or `LinkRefused` until the run reads it.
+    vin_reads: Vec<VinRead>,
+    /// The VIN phase did not finish, because the presence phase was interrupted or the run's
+    /// bounds ran out while a VIN read was made.
+    vin_interrupted: bool,
+    /// The identified VIN's per-vehicle lock is held by the job's guards.
+    vehicle_lock_held: bool,
+    /// Each candidate's VIN rules against the established VIN.
+    vin_rules: Vec<VinRuleResult>,
 }
 
 impl IdentificationReport {
@@ -485,6 +722,26 @@ impl IdentificationReport {
     pub fn presence_interrupted(&self) -> bool {
         self.presence_interrupted
     }
+    /// The VIN the job established: `None` when no VIN rule names a source, no read gave a
+    /// well-formed VIN, reads disagreed, or the VIN phase was interrupted (ADR-399).
+    pub fn vin(&self) -> Option<&Vin> {
+        self.vin.as_ref()
+    }
+    pub fn vins_seen(&self) -> &[Vin] {
+        &self.vins_seen
+    }
+    pub fn vin_reads(&self) -> &[VinRead] {
+        &self.vin_reads
+    }
+    pub fn vin_interrupted(&self) -> bool {
+        self.vin_interrupted
+    }
+    pub fn vehicle_lock_held(&self) -> bool {
+        self.vehicle_lock_held
+    }
+    pub fn vin_rules(&self) -> &[VinRuleResult] {
+        &self.vin_rules
+    }
     /// Whether the endpoint's bus and response identifier answered a presence request: an answer
     /// on a pair marks every endpoint with it, since alternatives often share one. Presence
     /// drops no candidate (ADR-327 item 2).
@@ -492,6 +749,23 @@ impl IdentificationReport {
         self.presence
             .iter()
             .any(|answer| answer.bus == endpoint.bus && answer.rx_id == endpoint.rx_id)
+    }
+}
+
+impl IdentificationReport {
+    /// Sets each VIN rule's outcome from the established `vin`: matched when the compared
+    /// positions equal the rule's expected text. No candidate is dropped by it (ADR-399 item 6).
+    fn evaluate_vin_rules(&mut self, rules: &[(String, VinRule)], vin: &Vin) {
+        for (result, (_, rule)) in self.vin_rules.iter_mut().zip(rules) {
+            let compared = vin
+                .as_str()
+                .get(usize::from(rule.start - 1)..usize::from(rule.end));
+            result.outcome = if compared == Some(rule.expected.as_str()) {
+                VinRuleOutcome::Matched
+            } else {
+                VinRuleOutcome::NotMatched
+            };
+        }
     }
 }
 
@@ -557,6 +831,48 @@ impl CheckedPlan {
             presence_links_opened: 0,
             refused_tables: Vec::new(),
             presence_interrupted: false,
+            vin: None,
+            vins_seen: Vec::new(),
+            vin_reads: self
+                .vin_reads
+                .iter()
+                .map(|read| {
+                    let outcome = if read.link.is_some() {
+                        VinOutcome::NotRead
+                    } else {
+                        VinOutcome::LinkRefused
+                    };
+                    VinRead {
+                        endpoint: read.endpoint.clone(),
+                        request: read.request.clone(),
+                        sources: read
+                            .declarations
+                            .iter()
+                            .map(|(source, _)| VinSourceRead {
+                                document: source.document,
+                                service: source.service,
+                                field: source.field,
+                                outcome: outcome.clone(),
+                            })
+                            .collect(),
+                        accepted: None,
+                    }
+                })
+                .collect(),
+            vin_interrupted: false,
+            vehicle_lock_held: false,
+            vin_rules: self
+                .vin_rules
+                .iter()
+                .map(|(candidate, rule)| VinRuleResult {
+                    candidate: candidate.clone(),
+                    component: rule.component,
+                    value: rule.value.clone(),
+                    start: rule.start,
+                    end: rule.end,
+                    outcome: VinRuleOutcome::Unevaluated,
+                })
+                .collect(),
         }
     }
 
@@ -569,19 +885,7 @@ impl CheckedPlan {
             .find(|l| BusKey::of(&l.link) == group.bus && l.functional_id == group.functional_id)
             .expect("a presence group comes from a declared link");
         let mut link = first.link.clone();
-        link.p2_max_ms = group.p2_max_ms;
-        link.p2_star_ms = group.p2_star_ms;
-        link.rc78_completion_ms = group.rc78_completion_ms;
-        for (name, value) in &group.timings {
-            match link
-                .params
-                .iter_mut()
-                .find(|(k, _)| k.eq_ignore_ascii_case(name))
-            {
-                Some((_, known)) => *known = *value,
-                None => link.params.push((name.clone(), *value)),
-            }
-        }
+        group.write_timings(&mut link);
         link
     }
 
@@ -638,6 +942,13 @@ fn identification_facts(
 /// `presence_interrupted`. A cancel (`cancel`, also set when the future is dropped) ends the run
 /// in [`JobError::Cancelled`]. `source` also gives the clients of the later links. `vci` is what
 /// the agent knows of the VCI the worker was launched for, for the log's `vci_connected`.
+///
+/// Then, unless the presence phase was interrupted, it reads the VIN once per read of the plan's
+/// VIN rules (ADR-399): a link and a read-only request at a time, under the same bounds. The VIN
+/// is established when the reads that gave a well-formed VIN gave one VIN; the run then takes the
+/// per-vehicle lock of it on `guards`, with no link open, waiting for a job that holds it until
+/// the cancel, and reports how each VIN rule stands to it. The VIN is in the report and the
+/// communication log only.
 pub async fn run_identification<W: WorkerSource>(
     mut source: W,
     plan: CheckedPlan,
@@ -839,6 +1150,43 @@ fn identify<W: WorkerSource>(
             }
         }
     }
+    if report.presence_interrupted {
+        // The run's bounds ran out: no VIN link opens, and nothing is established (ADR-399).
+        report.vin_interrupted = plan.vin_reads.iter().any(|read| read.link.is_some());
+        return Ok(report);
+    }
+    vin_phase(
+        handle,
+        &source,
+        plan,
+        limits,
+        cancelled,
+        guards,
+        &comm_log,
+        &mut reopens,
+        &worker_ended,
+        &mut report,
+    )?;
+    if let Some(vin) = report.vin.clone() {
+        report.evaluate_vin_rules(&plan.vin_rules, &vin);
+        // Every VIN link is closed here, so the wait for a vehicle another job holds keeps no
+        // VCI link open (design 8.8.1, ADR-399 item 4). The promotion settles the worker as an
+        // open does: a worker that exited during the last close is found, and its mark cleared.
+        // Guards still marked take no lock (ADR-258); the report says so.
+        match settle_before_open(&source, &comm_log, cancelled, guards, &worker_ended) {
+            Ok(_) => {
+                promote_to_vehicle(
+                    guards,
+                    &vin,
+                    limits.wait_poll.max(std::time::Duration::from_millis(1)),
+                    cancelled,
+                )?;
+                report.vehicle_lock_held = true;
+            }
+            Err(JobError::LinkUnconfirmed) => {}
+            Err(error) => return Err(error),
+        }
+    }
     Ok(report)
 }
 
@@ -850,14 +1198,57 @@ fn halves(table: &[(u32, u32)]) -> Option<[Vec<(u32, u32)>; 2]> {
     })
 }
 
-/// Opens the link of `config`, sends the presence request on it until a window ends, and closes
-/// it. A link that fails to open on a lost path is opened again within the run's bounds; a
-/// table the worker refused is [`PartEnd::Refused`]; any other failure to open ends the job.
+/// What every open of a link, and the promotion to the vehicle's lock after the last one, does
+/// first: a cancel, a worker that exited and the guards' mark are judged, so a link the worker may
+/// still hold ends the job (ADR-258, ADR-394). Gives the source for the open, or
+/// [`JobError::Cancelled`], or [`JobError::LinkUnconfirmed`] when the guards are still marked.
+fn settle_before_open<W: WorkerSource>(
+    source: &Arc<Mutex<W>>,
+    comm_log: &Option<crate::comm_log::CommLog>,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    worker_ended: &Cell<bool>,
+) -> Result<SharedSource<W>, JobError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let mut shared = SharedSource(Arc::clone(source));
+    settle(
+        &mut shared,
+        CloseEvidence::default(),
+        comm_log,
+        guards,
+        worker_ended,
+    );
+    if link_unconfirmed(guards) {
+        return Err(JobError::LinkUnconfirmed);
+    }
+    Ok(shared)
+}
+
+/// How [`open_part`] ended without an open link.
+enum Opened<C: WorkerApi> {
+    /// The link is open.
+    Link(Box<JobLink<C>>),
+    /// The worker answered, refusing the table or the connect, with its error (ADR-396).
+    Refused(JobError),
+    /// The link failed to open for a reason that is neither a lost path nor the table, and
+    /// what was opened is closed again. The presence phase ends the job in it; a VIN read
+    /// reports its sources as refused by the worker (ADR-399 item 3).
+    Failed(JobError),
+    /// The path to the VCI was lost and the bounds ran out before the link opened.
+    Interrupted,
+}
+
+/// Opens the link of `config`: before each try a cancel, a worker that exited and the guards'
+/// mark are judged (ADR-258), and a link that fails to open on a lost path is opened again
+/// within the run's bounds (ADR-393). A table the worker refused is [`Opened::Refused`]; any
+/// other failure to open ends the job. The presence parts and the VIN reads open their links so.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run's whole context, split only by what the caller owns"
 )]
-fn presence_part<W: WorkerSource>(
+fn open_part<W: WorkerSource>(
     handle: &Handle,
     source: &Arc<Mutex<W>>,
     config: &LinkConfig,
@@ -867,7 +1258,7 @@ fn presence_part<W: WorkerSource>(
     guards: &GuardSlot,
     reopens: &mut u8,
     worker_ended: &Cell<bool>,
-) -> Result<PartEnd, JobError> {
+) -> Result<Opened<W::Client>, JobError> {
     let timings = Timings::for_link(config);
     let try_open = || {
         let stop = |error| LinkRefused {
@@ -876,22 +1267,8 @@ fn presence_part<W: WorkerSource>(
             table_refused: false,
             evidence: CloseEvidence::default(),
         };
-        // A cancel, a worker that exited and the guards' mark are judged before each open: a
-        // link the worker may still hold ends the job (ADR-258).
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(stop(JobError::Cancelled));
-        }
-        let mut shared = SharedSource(Arc::clone(source));
-        settle(
-            &mut shared,
-            CloseEvidence::default(),
-            &comm_log,
-            guards,
-            worker_ended,
-        );
-        if link_unconfirmed(guards) {
-            return Err(stop(JobError::LinkUnconfirmed));
-        }
+        let mut shared =
+            settle_before_open(source, &comm_log, cancelled, guards, worker_ended).map_err(stop)?;
         let client = shared
             .client()
             .map_err(|error| stop(JobError::Link(error)))?;
@@ -953,72 +1330,345 @@ fn presence_part<W: WorkerSource>(
             (Some(link), _) => Ok(link),
             (None, Some(refused)) => Err(refused),
             // The VCI did not come back within the bounds.
-            (None, None) => return Ok(PartEnd::Interrupted(Vec::new(), false)),
+            (None, None) => return Ok(Opened::Interrupted),
         };
     }
-    let link = match opened {
-        Ok(link) => link,
+    match opened {
+        Ok(link) => Ok(Opened::Link(Box::new(link))),
         // A refusal whose teardown failed left the guards marked: nothing more opens (ADR-258).
         Err(refused) if refused.table_refused && refused.cleaned_up => {
-            return Ok(PartEnd::Refused(refused.error));
+            Ok(Opened::Refused(refused.error))
         }
-        Err(refused) => return Err(refused.error),
-    };
-    let crate::runner::JobLink {
-        mut host,
-        open_link,
-        path_lost,
-        ..
-    } = link;
-    let mut heard = Vec::new();
+        // The worker answered or the call failed, and nothing is left open (a worker that cannot
+        // be started, a cancel and a mark on the guards are the job's end).
+        Err(refused)
+            if refused.cleaned_up
+                && matches!(&refused.error, JobError::Link(error)
+                    if !matches!(error, HostError::WorkerStart { .. })) =>
+        {
+            Ok(Opened::Failed(refused.error))
+        }
+        Err(refused) => Err(refused.error),
+    }
+}
+
+/// How [`repeat_within_bounds`] ended.
+enum Repeated {
+    /// An attempt succeeded.
+    Done,
+    /// The attempts could not complete within the run's bounds, or a failure ended them; the
+    /// last error.
+    Stopped(HostError),
+}
+
+/// Makes `attempt` on the open link of `host` until it succeeds, sending it again after a
+/// failure within the run's bounds (ADR-392, ADR-393): after an ECU-level or transient failure on
+/// the same link, after a lost path on a link opened again, each at most
+/// `limits.max_primitive_repeats` times, with the origin `repeat`; the reopens count over the
+/// run in `reopens` (ADR-396 item 6). `ends_run` tells an error that stops the attempts at once.
+/// A cancel is [`JobError::Cancelled`]; an error of no class that a resend fits ends the job. The
+/// presence request and the VIN read send so (ADR-399).
+fn repeat_within_bounds<C: WorkerApi>(
+    host: &mut WorkerHost<C>,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    reopens: &mut u8,
+    mut attempt: impl FnMut(&mut WorkerHost<C>) -> Result<(), HostError>,
+    ends_run: impl Fn(&HostError) -> bool,
+) -> Result<Repeated, JobError> {
     let mut attempts = 0u8;
-    let ended = loop {
+    loop {
         if cancelled.load(Ordering::Relaxed) {
-            break Err(JobError::Cancelled);
+            return Err(JobError::Cancelled);
         }
         // The origin is the identification's, and `repeat` for a request sent again (ADR-392).
         host.own_reads(Some(OwnRead::Identification));
         if attempts > 0 {
             host.step_resends();
         }
-        let presence = host.presence(&PRESENCE_REQUEST);
+        let end = attempt(host);
         host.step_ends();
         host.own_reads(None);
-        heard.extend(presence.answers);
-        let Err(error) = presence.end else {
-            break Ok(PartEnd::Done(heard));
+        let Err(error) = end else {
+            return Ok(Repeated::Done);
         };
         if error.resend_class() == ResendClass::PathLost {
             host.path_lost();
         }
         let again = attempts < limits.max_primitive_repeats;
-        // A receive error that ended the window is not a clean window, and sending the request
-        // again would not tell more: the part is interrupted with its answers (ADR-396).
-        if matches!(error, HostError::PrimitiveFailed(_)) {
-            break Ok(PartEnd::Interrupted(heard, true));
+        if ends_run(&error) {
+            return Ok(Repeated::Stopped(error));
         }
         match error.resend_class() {
-            // The ECU, the bus or the events failed the window, or the start was refused for a
+            // The ECU, the bus or the events failed the exchange, or the start was refused for a
             // reason that passes: the same link carries the request again.
             ResendClass::EcuLevel | ResendClass::Transient if again => {
                 std::thread::sleep(limits.wait_poll.max(std::time::Duration::from_millis(1)));
             }
             ResendClass::PathLost if again => {
-                match reopen_attempts(|| host.reopen_link(), limits, cancelled, reopens) {
-                    Ok(true) => {}
-                    Ok(false) => break Ok(PartEnd::Interrupted(heard, true)),
-                    Err(error) => break Err(error),
+                if !reopen_attempts(|| host.reopen_link(), limits, cancelled, reopens)? {
+                    return Ok(Repeated::Stopped(error));
                 }
             }
             ResendClass::EcuLevel | ResendClass::PathLost | ResendClass::Transient => {
-                break Ok(PartEnd::Interrupted(heard, true));
+                return Ok(Repeated::Stopped(error));
             }
-            ResendClass::Other => break Err(JobError::Link(error)),
+            ResendClass::Other => return Err(JobError::Link(error)),
         }
         attempts += 1;
+    }
+}
+
+/// Opens the link of `config`, sends the presence request on it until a window ends, and closes
+/// it. A link that fails to open on a lost path is opened again within the run's bounds; a
+/// table the worker refused is [`PartEnd::Refused`]; any other failure to open ends the job.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn presence_part<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    config: &LinkConfig,
+    comm_log: Option<crate::comm_log::CommLog>,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+) -> Result<PartEnd, JobError> {
+    let link = match open_part(
+        handle,
+        source,
+        config,
+        comm_log,
+        limits,
+        cancelled,
+        guards,
+        reopens,
+        worker_ended,
+    )? {
+        Opened::Link(link) => link,
+        Opened::Refused(error) => return Ok(PartEnd::Refused(error)),
+        Opened::Failed(error) => return Err(error),
+        Opened::Interrupted => return Ok(PartEnd::Interrupted(Vec::new(), false)),
     };
+    let JobLink {
+        mut host,
+        open_link,
+        path_lost,
+        ..
+    } = *link;
+    let mut heard = Vec::new();
+    let ended = repeat_within_bounds(
+        &mut host,
+        limits,
+        cancelled,
+        reopens,
+        |host| {
+            let presence = host.presence(&PRESENCE_REQUEST);
+            heard.extend(presence.answers);
+            presence.end
+        },
+        // A receive error that ended the window is not a clean window, and sending the request
+        // again would not tell more: the part is interrupted with its answers (ADR-396).
+        |error| matches!(error, HostError::PrimitiveFailed(_)),
+    );
     close_job_link(host, open_link, &path_lost);
-    ended
+    Ok(match ended? {
+        Repeated::Done => PartEnd::Done(heard),
+        Repeated::Stopped(_) => PartEnd::Interrupted(heard, true),
+    })
+}
+
+/// How one VIN read ended.
+enum VinReadEnd {
+    /// The read got an answer, or none within the repeats: what each source gave, and the VIN
+    /// when they all gave the same well-formed one.
+    Done(Vec<VinOutcome>, Option<Vin>),
+    /// The worker refused to open the link.
+    Refused,
+    /// The link could not open, or the request not be sent, within the run's bounds.
+    Interrupted,
+}
+
+/// Makes one VIN read: opens the link of `read` (a link ADR-324 accepts, not a table), sends the
+/// request once and again within the run's bounds, decodes the one response with every source
+/// of the read and closes the link (ADR-399 item 1). A read is idempotent, so a receive error
+/// sends it again too (ADR-392 item 2). The VIN goes to the communication log's `identity`
+/// event, and nowhere else.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn vin_read<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    read: &VinReadPlan,
+    link: &LinkConfig,
+    comm_log: Option<crate::comm_log::CommLog>,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+) -> Result<VinReadEnd, JobError> {
+    let opened = open_part(
+        handle,
+        source,
+        link,
+        comm_log,
+        limits,
+        cancelled,
+        guards,
+        reopens,
+        worker_ended,
+    )?;
+    let link = match opened {
+        Opened::Link(link) => link,
+        // The worker refused the link at run time: its sources are reported so and the other
+        // reads decide (ADR-399 item 3).
+        Opened::Refused(_) | Opened::Failed(_) => return Ok(VinReadEnd::Refused),
+        Opened::Interrupted => return Ok(VinReadEnd::Interrupted),
+    };
+    let JobLink {
+        mut host,
+        open_link,
+        path_lost,
+        ..
+    } = *link;
+    let (sid, payload) = read
+        .request
+        .split_first()
+        .expect("a VIN source's request has a service identifier");
+    let mut response = None;
+    let ended = repeat_within_bounds(
+        &mut host,
+        limits,
+        cancelled,
+        reopens,
+        |host| {
+            response = Some(host.service_request(u16::from(*sid), payload)?);
+            Ok(())
+        },
+        |_| false,
+    );
+    let end = ended.map(|ended| match (ended, response) {
+        (Repeated::Done, Some(response)) => {
+            let outcomes: Vec<VinOutcome> = read
+                .declarations
+                .iter()
+                .map(|(_, field)| {
+                    let bytes = field_bytes_of(field, *sid, &response);
+                    host.note_identity(IdentityKind::Vin, identity_read_of(&bytes));
+                    vin_outcome(bytes)
+                })
+                .collect();
+            let accepted = accepted_vin(&outcomes);
+            VinReadEnd::Done(outcomes, accepted)
+        }
+        (Repeated::Stopped(error), _) if error.resend_class() == ResendClass::EcuLevel => {
+            VinReadEnd::Done(
+                vec![VinOutcome::NoUsableAnswer; read.declarations.len()],
+                None,
+            )
+        }
+        _ => VinReadEnd::Interrupted,
+    });
+    close_job_link(host, open_link, &path_lost);
+    end
+}
+
+/// What a source gave, from the bytes its field was read as.
+fn vin_outcome(read: FieldBytes) -> VinOutcome {
+    match read {
+        FieldBytes::Field(bytes) => match String::from_utf8(bytes) {
+            Ok(text) if Vin::is_well_formed_text(&text) => VinOutcome::Decoded(Vin::new(text)),
+            _ => VinOutcome::NotWellFormed,
+        },
+        FieldBytes::Negative(nrc) => VinOutcome::Negative(nrc),
+        FieldBytes::Unreadable => VinOutcome::Undecodable,
+    }
+}
+
+/// The VIN of a read when every source gave the same well-formed one (ADR-399 item 1).
+fn accepted_vin(outcomes: &[VinOutcome]) -> Option<Vin> {
+    let mut accepted = None;
+    for outcome in outcomes {
+        let VinOutcome::Decoded(vin) = outcome else {
+            return None;
+        };
+        match &accepted {
+            Some(known) if known != vin => return None,
+            _ => accepted = Some(vin.clone()),
+        }
+    }
+    accepted
+}
+
+/// The VIN phase: reads the VIN once per read of the plan, in plan order, one link open at a time,
+/// and sets the report's VIN section (ADR-399). The VIN is established when at least one read
+/// accepted one and every accepted VIN is the same; reads that gave nothing do not block it. A
+/// run whose bounds run out in a read leaves the remaining reads `NotRead` and establishes
+/// nothing. Every link is closed when this returns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn vin_phase<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    plan: &CheckedPlan,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    comm_log: &Option<crate::comm_log::CommLog>,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+    report: &mut IdentificationReport,
+) -> Result<(), JobError> {
+    for (at, read) in plan.vin_reads.iter().enumerate() {
+        let Some(link) = &read.link else {
+            continue;
+        };
+        let end = vin_read(
+            handle,
+            source,
+            read,
+            link,
+            comm_log.clone(),
+            limits,
+            cancelled,
+            guards,
+            reopens,
+            worker_ended,
+        )?;
+        let (outcomes, accepted) = match end {
+            VinReadEnd::Done(outcomes, accepted) => (outcomes, accepted),
+            VinReadEnd::Refused => (
+                vec![VinOutcome::WorkerRefused; read.declarations.len()],
+                None,
+            ),
+            VinReadEnd::Interrupted => {
+                report.vin_interrupted = true;
+                break;
+            }
+        };
+        let reported = &mut report.vin_reads[at];
+        for (source, outcome) in reported.sources.iter_mut().zip(outcomes) {
+            source.outcome = outcome;
+        }
+        if let Some(vin) = &accepted
+            && !report.vins_seen.contains(vin)
+        {
+            report.vins_seen.push(vin.clone());
+        }
+        reported.accepted = accepted;
+    }
+    if !report.vin_interrupted && report.vins_seen.len() == 1 {
+        report.vin = report.vins_seen.first().cloned();
+    }
+    Ok(())
 }
 
 /// Whether a link that did not open failed on a lost path, with nothing left open: the open is
@@ -1049,12 +1699,12 @@ mod run_tests;
 mod tests {
     use diag_ir::IR_SCHEMA_VERSION;
     use diag_ir::declaration::{
-        ComParamT, DataKind, EcuDocumentT, EcuVariantT, ProtocolT, ServiceT, VariantPatternT,
-        encode_ecu_document,
+        ComParamT, DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement, ProtocolT, ServiceT,
+        VariantPatternT, encode_ecu_document,
     };
     use diag_ir::plan::{
-        Candidate, Component, Entry, PLAN_SCHEMA_VERSION, PlanDefinition, Selection as Chosen,
-        Source, VinRule,
+        Candidate, Component, Entry, FieldRule, PLAN_SCHEMA_VERSION, PlanDefinition,
+        Selection as Chosen, Source, VinRule,
     };
 
     use super::*;
@@ -1065,6 +1715,18 @@ mod tests {
     /// documents apart.
     pub(super) fn document(
         did: u8,
+        tx: u32,
+        rx: u32,
+        setup: impl FnOnce(&mut ProtocolT),
+    ) -> Vec<u8> {
+        document_reading(did, 4, tx, rx, setup)
+    }
+
+    /// [`document`] whose service 1 reads a field of `bytes` bytes; 17 makes the field a VIN
+    /// source.
+    pub(super) fn document_reading(
+        did: u8,
+        bytes: u32,
         tx: u32,
         rx: u32,
         setup: impl FnOnce(&mut ProtocolT),
@@ -1090,7 +1752,7 @@ mod tests {
             "read",
             [0xF1, did],
             DataKind::Ascii,
-            4,
+            bytes,
         )]);
         let mut document = EcuDocumentT::default();
         document.schema_version = IR_SCHEMA_VERSION;
@@ -1101,7 +1763,7 @@ mod tests {
     }
 
     /// `bytes` with its variant changed by `edit`.
-    fn edited(bytes: &[u8], edit: impl FnOnce(&mut EcuVariantT)) -> Vec<u8> {
+    pub(super) fn edited(bytes: &[u8], edit: impl FnOnce(&mut EcuVariantT)) -> Vec<u8> {
         let mut variant = diag_ir::declaration::load_ecu_document(bytes)
             .unwrap()
             .variant()
@@ -1145,15 +1807,13 @@ mod tests {
             candidates: vec![Candidate {
                 id: "c1".into(),
                 values: Vec::new(),
-                vin_rules: vec![VinRule {
-                    component: Component::ModelYear,
-                    value: "2020".into(),
-                    start: 10,
-                    end: 10,
-                    expected: "L".into(),
+                vin_rules: Vec::new(),
+                field_rules: vec![FieldRule {
+                    component: Component::Oem,
+                    value: "oem".into(),
                     source,
+                    expected: vec![1],
                 }],
-                field_rules: Vec::new(),
                 entries: vec![Entry {
                     role: "engine".into(),
                     optional: false,
@@ -1173,6 +1833,44 @@ mod tests {
         supplied: &[(Sha256, Vec<u8>)],
     ) -> Result<LoadedPlan, PlanRefused> {
         load_plan(&plan.encode().unwrap(), supplied.to_vec())
+    }
+
+    /// A plan over `documents` with one candidate whose VIN rules are `rules`: the index of the
+    /// document whose service 1 field 1 is the source, then the positions and the expected text.
+    pub(super) fn vin_plan(
+        documents: &[Sha256],
+        selection: Chosen,
+        rules: &[(usize, u8, u8, &str)],
+    ) -> IdentificationPlan {
+        let mut plan = plan(documents);
+        plan.selection = selection;
+        plan.candidates[0].field_rules.clear();
+        plan.candidates[0].vin_rules = rules
+            .iter()
+            .map(|&(at, start, end, expected)| VinRule {
+                component: Component::ModelYear,
+                value: "2020".into(),
+                start,
+                end,
+                expected: expected.into(),
+                source: Source {
+                    document: documents[at],
+                    service: 1,
+                    field: 1,
+                },
+            })
+            .collect();
+        plan
+    }
+
+    /// Loads and checks [`vin_plan`] over `documents`.
+    pub(super) fn checked_vin(
+        documents: &[(Sha256, Vec<u8>)],
+        selection: Chosen,
+        rules: &[(usize, u8, u8, &str)],
+    ) -> Result<CheckedPlan, PlanRefused> {
+        let hashes: Vec<Sha256> = documents.iter().map(|(hash, _)| *hash).collect();
+        check_plan(&load(&vin_plan(&hashes, selection, rules), documents)?)
     }
 
     /// Loads and checks a plan over `documents`.
@@ -1267,7 +1965,7 @@ mod tests {
     fn a_source_naming_a_field_the_response_lacks_is_refused() {
         let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
         let mut bad = plan(&[doc.0]);
-        bad.candidates[0].vin_rules[0].source.field = 9;
+        bad.candidates[0].field_rules[0].source.field = 9;
         assert!(matches!(
             check_plan(&load(&bad, &[doc]).unwrap()),
             Err(PlanRefused::UnknownField {
@@ -1568,5 +2266,257 @@ mod tests {
         assert_eq!(report.selection(), Chosen::EveryEcu);
         assert!(report.candidates().is_empty());
         assert_eq!(report.endpoints().len(), 1);
+    }
+
+    fn vin_doc(did: u8, tx: u32, rx: u32) -> (Sha256, Vec<u8>) {
+        named(document_reading(did, 17, tx, rx, |_| {}))
+    }
+
+    /// `doc` with its variant's name changed, so another document declares the same service.
+    fn renamed(doc: &(Sha256, Vec<u8>)) -> (Sha256, Vec<u8>) {
+        named(edited(&doc.1, |v| v.short_name = Some("other".into())))
+    }
+
+    const MODEL_YEAR: (usize, u8, u8, &str) = (0, 10, 10, "L");
+
+    /// ADR-399 item 2: a VIN rule's source that is not 17 bytes of ASCII text in the ADR-345
+    /// table's shape is refused before any link opens, with the document and the source.
+    #[test]
+    fn a_vin_source_that_is_not_17_ascii_bytes_is_refused() {
+        // Too short.
+        let short = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        assert!(matches!(
+            checked_vin(std::slice::from_ref(&short), Chosen::Candidates, &[MODEL_YEAR]),
+            Err(PlanRefused::VinSource { document, service: 1, field: 1, .. })
+                if document == hex(&short.0)
+        ));
+        // Not text.
+        let number = named(edited(&vin_doc(0x90, 0x7E0, 0x7E8).1, |v| {
+            let field = &mut v.services.as_mut().unwrap()[0]
+                .positive
+                .as_mut()
+                .unwrap()
+                .fields
+                .as_mut()
+                .unwrap()[0];
+            field.kind = DataKind::Uint;
+            field.bit_length = 56;
+        }));
+        assert!(matches!(
+            checked_vin(&[number], Chosen::Candidates, &[MODEL_YEAR]),
+            Err(PlanRefused::VinSource { .. })
+        ));
+        // The same field as a field rule's source is not a VIN source, and is accepted.
+        let mut as_field_rule = plan(&[short.0]);
+        as_field_rule.candidates[0].vin_rules.clear();
+        assert!(check_plan(&load(&as_field_rule, &[short]).unwrap()).is_ok());
+    }
+
+    /// The ADR-345 table reads a field that ends the response; a VIN field with another field
+    /// after it cannot be a VIN source (ADR-399 consequences).
+    #[test]
+    fn a_vin_field_another_field_follows_is_refused() {
+        let trailing = named(edited(&vin_doc(0x90, 0x7E0, 0x7E8).1, |v| {
+            let mut extra = FieldT::default();
+            extra.id = 2;
+            extra.short_name = Some("status".into());
+            extra.placement = Placement::AfterPrevious;
+            extra.bit_length = 8;
+            extra.kind = DataKind::Uint;
+            v.services.as_mut().unwrap()[0]
+                .positive
+                .as_mut()
+                .unwrap()
+                .fields
+                .as_mut()
+                .unwrap()
+                .push(extra);
+        }));
+        assert!(matches!(
+            checked_vin(&[trailing], Chosen::Candidates, &[MODEL_YEAR]),
+            Err(PlanRefused::VinSource { why, .. }) if why.contains("reaches past")
+        ));
+    }
+
+    /// The table reads a field that follows the echo at once (offset 2): a VIN field with another
+    /// field before it is refused too, though the declaration itself is well-formed.
+    #[test]
+    fn a_vin_field_another_field_precedes_is_refused() {
+        let leading = named(edited(&vin_doc(0x90, 0x7E0, 0x7E8).1, |v| {
+            let mut first = FieldT::default();
+            first.id = 2;
+            first.short_name = Some("status".into());
+            first.placement = Placement::AfterPrevious;
+            first.bit_length = 8;
+            first.kind = DataKind::Uint;
+            let fields = v.services.as_mut().unwrap()[0]
+                .positive
+                .as_mut()
+                .unwrap()
+                .fields
+                .as_mut()
+                .unwrap();
+            fields.insert(0, first);
+        }));
+        assert!(matches!(
+            checked_vin(&[leading], Chosen::Candidates, &[MODEL_YEAR]),
+            Err(PlanRefused::VinSource { why, .. }) if why.contains("offset 2")
+        ));
+    }
+
+    #[test]
+    fn a_plan_without_a_vin_rule_has_no_vin_read() {
+        let doc = vin_doc(0x90, 0x7E0, 0x7E8);
+        let plan = checked_vin(&[doc], Chosen::Candidates, &[]).unwrap();
+        assert!(plan.vin_reads.is_empty() && plan.vin_rules.is_empty());
+        let report = plan.report();
+        assert!(report.vin_reads().is_empty() && report.vin_rules().is_empty());
+        assert!(report.vin().is_none() && !report.vin_interrupted());
+    }
+
+    /// ADR-399 item 1: sources of one endpoint with one request are one read, whatever document
+    /// declares them, and its link takes the largest of their timings; a source named by two
+    /// rules is one source.
+    #[test]
+    fn sources_of_one_endpoint_and_request_are_one_read_with_the_largest_timings() {
+        let timed = |p2: i64, cr: i64| {
+            named(document_reading(0x90, 17, 0x7E0, 0x7E8, move |p| {
+                with_param("CP_P2Max", p2)(p);
+                with_param("CP_Cr", cr)(p);
+            }))
+        };
+        let (first, second) = (timed(50_000, 2_000_000), timed(60_000, 1_000_000));
+        let plan = checked_vin(
+            &[first, second],
+            Chosen::Candidates,
+            &[(0, 10, 10, "L"), (1, 11, 11, "M"), (0, 1, 3, "WVW")],
+        )
+        .unwrap();
+        assert_eq!(plan.vin_reads.len(), 1);
+        let read = &plan.vin_reads[0];
+        assert_eq!(read.declarations.len(), 2);
+        assert_eq!(read.request, [0x22, 0xF1, 0x90]);
+        let link = read.link.as_ref().unwrap();
+        assert_eq!(link.p2_max_ms, 60);
+        assert_eq!(
+            comparams(link),
+            read.non_timing,
+            "the timings are not among the ComParams compared"
+        );
+        let cr = link.params.iter().find(|(k, _)| k == "CP_Cr").unwrap();
+        assert_eq!(cr.1, 2_000_000);
+        let reported = plan.report();
+        assert_eq!(reported.vin_reads().len(), 1);
+        assert_eq!(reported.vin_rules().len(), 3);
+        assert!(
+            reported
+                .vin_reads()
+                .iter()
+                .flat_map(|r| &r.sources)
+                .all(|s| s.outcome == VinOutcome::NotRead)
+        );
+    }
+
+    /// ADR-399 item 1: another request, another endpoint or another non-timing ComParam makes
+    /// another read, and the reads come in the order their first source comes in the plan.
+    #[test]
+    fn reads_that_differ_in_request_endpoint_or_comparam_are_kept_apart_in_plan_order() {
+        let base = vin_doc(0x90, 0x7E0, 0x7E8);
+        let other_did = vin_doc(0x91, 0x7E0, 0x7E8);
+        let other_endpoint = vin_doc(0x90, 0x7E1, 0x7E9);
+        let other_param = named(document_reading(0x90, 17, 0x7E0, 0x7E8, |p| {
+            with_param("CP_BlockSize", 16)(p)
+        }));
+        let same = renamed(&base);
+        let plan = checked_vin(
+            &[base, other_did, other_endpoint, other_param, same],
+            Chosen::Candidates,
+            &[
+                (2, 1, 1, "W"),
+                (0, 1, 1, "W"),
+                (4, 2, 2, "V"),
+                (1, 1, 1, "W"),
+                (3, 1, 1, "W"),
+            ],
+        )
+        .unwrap();
+        let shape: Vec<_> = plan
+            .vin_reads
+            .iter()
+            .map(|r| {
+                (
+                    r.endpoint.as_ref().unwrap().tx_id,
+                    r.request[2],
+                    r.declarations.len(),
+                )
+            })
+            .collect();
+        // The other endpoint first; then the base with the renamed copy; then the other DID;
+        // the document with another ComParam last, on the base's endpoint and request.
+        assert_eq!(
+            shape,
+            [
+                (0x7E1, 0x90, 1),
+                (0x7E0, 0x90, 2),
+                (0x7E0, 0x91, 1),
+                (0x7E0, 0x90, 1)
+            ]
+        );
+    }
+
+    /// ADR-399 item 4: a source whose document's link ADR-324 refuses is a read that is never
+    /// made, reported as such; the plan stays valid and its other reads are kept.
+    #[test]
+    fn a_source_whose_link_is_refused_is_reported_as_such() {
+        let ok = vin_doc(0x90, 0x7E0, 0x7E8);
+        let refused = named(document_reading(0x90, 17, 0x7E1, 0x7E9, |p| {
+            p.extended_addressing = true
+        }));
+        let plan = checked_vin(
+            &[refused.clone(), ok],
+            Chosen::Candidates,
+            &[(0, 10, 10, "L"), (1, 10, 10, "L")],
+        )
+        .unwrap();
+        let report = plan.report();
+        let outcomes: Vec<_> = report
+            .vin_reads()
+            .iter()
+            .map(|r| (r.endpoint.is_some(), r.sources[0].outcome.clone()))
+            .collect();
+        assert_eq!(
+            outcomes,
+            [
+                (false, VinOutcome::LinkRefused),
+                (true, VinOutcome::NotRead)
+            ]
+        );
+        assert_eq!(report.vin_reads()[0].sources[0].document, refused.0);
+        assert!(plan.vin_reads[0].link.is_none());
+    }
+
+    /// The VIN section serializes to the report's JSON; a VIN is written only as the text of the
+    /// established one, and `Debug` hides it.
+    #[test]
+    fn the_vin_section_serializes_and_debug_hides_the_vin() {
+        let doc = vin_doc(0x90, 0x7E0, 0x7E8);
+        let mut report = checked_vin(&[doc], Chosen::Candidates, &[MODEL_YEAR])
+            .unwrap()
+            .report();
+        let vin = Vin::new("WVWZZZ1JZ3W386752".into());
+        report.vin_reads[0].sources[0].outcome = VinOutcome::Decoded(vin.clone());
+        report.vin_reads[0].accepted = Some(vin.clone());
+        report.vin = Some(vin.clone());
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["vin"], "WVWZZZ1JZ3W386752");
+        assert_eq!(json["vin_reads"][0]["request"], "22f190");
+        assert_eq!(
+            json["vin_reads"][0]["sources"][0]["outcome"]["Decoded"],
+            "WVWZZZ1JZ3W386752"
+        );
+        assert_eq!(json["vin_rules"][0]["outcome"], "Unevaluated");
+        assert_eq!(json["vin_interrupted"], false);
+        assert_eq!(json["vehicle_lock_held"], false);
+        assert!(!format!("{report:?}").contains("WVWZZZ"));
     }
 }

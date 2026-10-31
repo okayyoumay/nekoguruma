@@ -64,6 +64,13 @@ struct State {
     disconnect_script: VecDeque<tonic::Status>,
     /// The status `CreateComLogicalLink` fails with.
     create_status: Option<tonic::Status>,
+    /// The n-th (from 1) `CreateComLogicalLink`, `ConnectComLogicalLink` and `ModuleDisconnect`
+    /// call alone fails with the status, or (the last) hangs.
+    create_fail_at: Option<(usize, tonic::Status)>,
+    connect_fail_at: Option<(usize, tonic::Status)>,
+    hang_disconnect_at: Option<usize>,
+    /// A `ModuleDisconnect` hung (it is hanging now, or was).
+    disconnect_hung: bool,
     /// The statuses the first `ConnectComLogicalLink` calls fail with, one per call.
     link_connect_script: VecDeque<tonic::Status>,
     /// The events of the n-th started primitive; one that has no script finishes at once.
@@ -190,6 +197,11 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         _: tonic::Request<vci_service_interface::ModuleDisconnectRequest>,
     ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
         self.note("ModuleDisconnect");
+        let nth = self.count("ModuleDisconnect");
+        if self.state().hang_disconnect_at == Some(nth) {
+            self.state().disconnect_hung = true;
+            tokio::time::sleep(Duration::from_secs(60)).await;
+        }
         if hangs(&mut self.state().hang_disconnect) {
             tokio::time::sleep(Duration::from_secs(60)).await;
         }
@@ -243,7 +255,11 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         _: tonic::Request<vci_service_interface::CreateComLogicalLinkRequest>,
     ) -> Result<tonic::Response<vci_service_interface::ComLogicalLinkResponse>, tonic::Status> {
         self.note("CreateComLogicalLink");
+        let nth = self.count("CreateComLogicalLink");
         let mut state = self.state();
+        if let Some((_, status)) = state.create_fail_at.clone().filter(|(at, _)| *at == nth) {
+            return Err(status);
+        }
         if let Some(status) = state.create_status.clone() {
             return Err(status);
         }
@@ -277,6 +293,15 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         _: tonic::Request<vci_service_interface::ConnectComLogicalLinkRequest>,
     ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
         self.note("ConnectComLogicalLink");
+        let nth = self.count("ConnectComLogicalLink");
+        if let Some((_, status)) = self
+            .state()
+            .connect_fail_at
+            .clone()
+            .filter(|(at, _)| *at == nth)
+        {
+            return Err(status);
+        }
         match self.state().link_connect_script.pop_front() {
             Some(status) => Err(status),
             None => ok(),
@@ -1698,7 +1723,10 @@ fn a_read_is_accepted_when_all_its_sources_gave_one_vin() {
         accepted_vin(&[decoded(VIN_A), VinOutcome::NotWellFormed]),
         None
     );
-    assert_eq!(accepted_vin(&[VinOutcome::NoAnswer, decoded(VIN_A)]), None);
+    assert_eq!(
+        accepted_vin(&[VinOutcome::NoUsableAnswer, decoded(VIN_A)]),
+        None
+    );
 }
 
 /// ADR-399 item 4: a source whose document declares a link ADR-324 refuses is reported
@@ -1732,7 +1760,7 @@ async fn a_refused_link_is_reported_and_the_other_sources_decide() {
 }
 
 /// ADR-399 item 1 and ADR-392: a request nobody answers is sent again within
-/// `max_primitive_repeats` (origin `repeat`) and reported `NoAnswer`; a negative response is
+/// `max_primitive_repeats` (origin `repeat`) and reported `NoUsableAnswer`; a negative response is
 /// reported with its code; neither blocks the read that decodes.
 #[tokio::test(flavor = "multi_thread")]
 async fn no_answer_and_a_negative_response_do_not_block_the_read_that_decodes() {
@@ -1744,7 +1772,7 @@ async fn no_answer_and_a_negative_response_do_not_block_the_read_that_decodes() 
     assert_eq!(
         outcomes(report),
         [
-            vec![VinOutcome::NoAnswer],
+            vec![VinOutcome::NoUsableAnswer],
             vec![VinOutcome::Negative(0x31)],
             vec![VinOutcome::Decoded(vin(VIN_A))]
         ]
@@ -1948,13 +1976,20 @@ async fn waiting_for_the_vehicle() -> Waiting {
         Arc::clone(&cancel),
         dir,
     ));
-    // The read is made and its link closed, then the run waits.
+    // The read is made and its link closed (the presence link's disconnect and the read's), then
+    // the only step left is the wait for the holder.
+    let mut closed = false;
     for _ in 0..1000 {
-        if !fake.state().served.is_empty() && fake.state().open_links == 0 {
+        if !fake.state().served.is_empty()
+            && fake.state().open_links == 0
+            && fake.count("ModuleDisconnect") == 2
+        {
+            closed = true;
             break;
         }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
+    assert!(closed, "the read was made and its link closed in time");
     tokio::time::sleep(Duration::from_millis(100)).await;
     assert!(!task.is_finished(), "the run waits for the holder");
     assert_eq!(fake.state().open_links, 0, "no link is open while it waits");
@@ -1997,4 +2032,171 @@ async fn a_cancel_during_the_wait_for_the_vehicle_ends_the_run() {
     assert!(!ran.run.guards.holds_vehicle());
     assert!(!ran.run.guards.link_unconfirmed());
     drop(waiting.holder);
+}
+
+/// ADR-399 item 3: 17 printable characters that are not a well-formed VIN (here an `I`) are
+/// `NotWellFormed`: no VIN, no lock; the log still has what was read.
+#[tokio::test(flavor = "multi_thread")]
+async fn text_that_is_not_a_well_formed_vin_establishes_nothing() {
+    let fake = fake_with(&[(A.0, "WVWZZZ1JZ3W38675I")]);
+    let ran = run(reading_all(&[reader(0x90, A)]), fake).await;
+    let report = ran.report();
+    assert_eq!(outcomes(report), [vec![VinOutcome::NotWellFormed]]);
+    assert!(report.vin().is_none() && report.vins_seen().is_empty());
+    assert_eq!(report.vin_reads()[0].accepted, None);
+    assert!(!report.vehicle_lock_held() && !ran.run.guards.holds_vehicle());
+    assert!(!report.vin_interrupted());
+}
+
+/// ADR-399 item 5 and ADR-392: a receive error on a VIN read sends it again (a read is
+/// idempotent), with the origin `repeat`, and the answer then decodes.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_receive_error_on_a_vin_read_sends_it_again() {
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Finish],
+        vec![Item::RxError, Item::Finish],
+        vec![Item::Routed],
+    ]);
+    let ran = run(reading_all(&[reader(0x90, A)]), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(outcomes(report), [vec![VinOutcome::Decoded(vin(VIN_A))]]);
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert_eq!(
+        origins(&ran),
+        ["identification", "identification", "repeat"]
+    );
+    assert_eq!(
+        fake.count("ModuleConnect"),
+        2,
+        "the same link carried the resend"
+    );
+}
+
+/// ADR-399 item 3: a link the worker refuses when the read is made (the connect, or any other
+/// failure to open that leaves nothing open) is `WorkerRefused`, not `LinkRefused`, and the other
+/// reads decide.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_the_worker_refuses_is_reported_and_the_other_reads_decide() {
+    for connect in [true, false] {
+        let documents = [reader(0x90, A), reader(0x90, B)];
+        let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_A)]);
+        let refusal = tonic::Status::invalid_argument("refused");
+        // The presence link is the first of each; the first read's link is the second.
+        if connect {
+            fake.state().connect_fail_at = Some((2, refusal));
+        } else {
+            fake.state().create_fail_at = Some((2, refusal));
+        }
+        let ran = run(reading_all(&documents), fake.clone()).await;
+        let report = ran.report();
+        assert_eq!(
+            outcomes(report),
+            [
+                vec![VinOutcome::WorkerRefused],
+                vec![VinOutcome::Decoded(vin(VIN_A))]
+            ],
+            "connect {connect}"
+        );
+        assert_eq!(report.vin(), Some(&vin(VIN_A)));
+        assert!(!report.vin_interrupted() && report.vehicle_lock_held());
+        assert_eq!(fake.state().served.len(), 1);
+        assert_eq!(fake.state().open_links, 0);
+        assert!(!ran.run.guards.link_unconfirmed());
+    }
+}
+
+/// A source whose worker exits as the last read's link is closed: the status question after the
+/// close hanging says so once, as a launcher that owns the process does (ADR-394).
+struct ExitsWhenTheCloseHangs(WorkerClient, Fake, Arc<Mutex<bool>>);
+
+impl WorkerSource for ExitsWhenTheCloseHangs {
+    type Client = WorkerClient;
+    fn client(&mut self) -> Result<WorkerClient, HostError> {
+        Ok(self.0.clone())
+    }
+    fn status(&mut self) -> WorkerStatus {
+        let mut reported = self.2.lock().unwrap();
+        if self.1.state().disconnect_hung && !*reported {
+            *reported = true;
+            WorkerStatus::Exited(WorkerExit {
+                pid: Some(7),
+                how: crate::client::ExitHow::Code(1),
+            })
+        } else {
+            WorkerStatus::Alive
+        }
+    }
+    fn end(&mut self) -> Result<WorkerExit, HostError> {
+        Err(HostError::Setup("the worker cannot be ended"))
+    }
+    fn pid(&self) -> Option<u32> {
+        Some(8)
+    }
+}
+
+/// Runs a plan reading one VIN where the close of the read's link (the second disconnect) hangs,
+/// so the guards are marked, on a source `build` makes from the worker and the fake.
+async fn run_with_the_last_close_hanging<S: WorkerSource>(
+    build: impl FnOnce(WorkerClient, Fake) -> S,
+) -> IdentificationRun {
+    let fake = fake_with(&[(A.0, VIN_A)]);
+    fake.state().hang_disconnect_at = Some(2);
+    let dir = tempfile::tempdir().unwrap();
+    let guards = JobGuards::take_vci_only(
+        &GuardSetup {
+            dir: dir.path().join("locks"),
+            vci: "fake".to_owned(),
+        },
+        Duration::from_millis(1),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let source = build(serve(fake.clone()).await, fake);
+    run_identification(
+        source,
+        reading_all(&[reader(0x90, A)]),
+        limits(),
+        guards,
+        None,
+        None,
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await
+}
+
+/// ADR-399 item 4 and ADR-258: a worker that exited while the last VIN link was closed is found
+/// by the settle step before the promotion, which clears the mark, and the lock is taken.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_exited_in_the_last_close_does_not_keep_the_lock_from_the_vin() {
+    let run = run_with_the_last_close_hanging(|worker, fake| {
+        ExitsWhenTheCloseHangs(worker, fake, Arc::new(Mutex::new(false)))
+    })
+    .await;
+    let report = run
+        .result
+        .as_ref()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert!(report.vehicle_lock_held() && run.guards.holds_vehicle());
+    assert!(!run.guards.link_unconfirmed());
+}
+
+/// ADR-399 item 4 and ADR-258: a live worker whose close of the last VIN link failed leaves the
+/// guards marked; the VIN stays established and reported, no lock is taken and the report comes
+/// back with the mark kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn guards_still_marked_after_the_last_close_take_no_vehicle_lock() {
+    let run = run_with_the_last_close_hanging(|worker, _| {
+        ExitsOnce(worker, Arc::new(Mutex::new(0)), 0, false)
+    })
+    .await;
+    let report = run
+        .result
+        .as_ref()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert!(!report.vehicle_lock_held() && !run.guards.holds_vehicle());
+    assert!(run.guards.link_unconfirmed(), "the mark stays");
+    assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::Matched);
 }

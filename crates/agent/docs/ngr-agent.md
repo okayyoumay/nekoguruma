@@ -1526,7 +1526,8 @@ identification job, derives its endpoints and sends its functional presence requ
   - Only response identifiers of the link's receive table mark presence; the exchange entry
     lists every result.
   - The VIN phase (ADR-399) runs after the last presence link is closed, unless the presence
-    phase was interrupted (then `vin_interrupted` is set and every VIN source stays `NotRead`),
+    phase was interrupted (then `vin_interrupted` is set when some read would have opened a link,
+    every source stays `NotRead` and a source whose link is refused stays `LinkRefused`),
     and only when a candidate (a definition chosen by hand is the only one) declares a VIN rule.
     The sources group into reads: one endpoint, equal ComParams other than the timings
     (`raise_timings` gives the read's link the largest timings of its sources' links) and one
@@ -1537,7 +1538,11 @@ identification job, derives its endpoints and sends its functional presence requ
     the reopens count over the whole run), decodes the one response with every declaration of
     the read (`inputs::field_bytes_of`, noted as the log's `identity` events) and closes the
     link. Each source is `Decoded`, `NotWellFormed`, `Undecodable`, `Negative` (not sent again),
-    `NoAnswer`, `LinkRefused` or `NotRead`.
+    `NoUsableAnswer` (none, the link's error event for the request, a receive error or lost events,
+    after the repeats), `LinkRefused` (the document's declared link ADR-324 refuses, known before
+    any link opens), `WorkerRefused` (the worker refused the link when the read was made, a
+    refused connect or another failure to open that left nothing open; the other reads decide)
+    or `NotRead`.
   - A read is accepted when every declaration gives one well-formed VIN. `vin` is set when a
     read was accepted, every accepted read gave the same VIN (`vins_seen` lists each distinct
     one) and the phase was not interrupted; bounds that run out in a read leave it and the later
@@ -1548,7 +1553,10 @@ identification job, derives its endpoints and sends its functional presence requ
     `JobGuards::take_vehicle`, which allows guards without the slot) once no link is open,
     waiting for a job that holds the vehicle until it lets go or the cancel, which ends the run
     in `JobError::Cancelled`; `vehicle_lock_held` says it is held, and the caller's guards
-    release it. The VIN is in the report and the communication log only, never in the
+    release it. Before the promotion the run settles the worker as every open does
+    (`settle_before_open`): a worker that exited during the last close is found and the guards'
+    mark cleared; guards still marked take no lock, and the report comes back with the VIN and
+    `vehicle_lock_held` false (ADR-258). The VIN is in the report and the communication log only, never in the
     operational log. `IdentificationReport` holds the VINs as `journal::Vin`, whose `Debug`
     hides them.
 

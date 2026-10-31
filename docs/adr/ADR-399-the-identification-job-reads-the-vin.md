@@ -40,12 +40,23 @@ definitions are separate steps.
    read is accepted and every accepted read gives the same VIN, and the VIN phase was not
    interrupted (item 5); reads that gave nothing do not block it, and two that differ establish
    none and are both reported (ADR-327 item 5). What each source gave is `Decoded`,
-   `NotWellFormed`, `Undecodable`, `Negative` (with the response code), `NoAnswer`,
-   `LinkRefused` or `NotRead`. A source whose document's declared link ADR-324 refuses is
-   `LinkRefused`: nothing is opened for it and the other sources decide (ADR-395 item 3).
+   `NotWellFormed`, `Undecodable`, `Negative` (with the response code), `NoUsableAnswer`,
+   `LinkRefused`, `WorkerRefused` or `NotRead`. `NoUsableAnswer` covers every failure of the
+   ECU or the bus that outlasted the repeats (ADR-392): no answer, the link's error event for
+   the request, a receive error and lost events. A source whose document's declared link
+   ADR-324 refuses is `LinkRefused`: known before any link opens, nothing is opened for it and
+   the other sources decide (ADR-395 item 3). A link the worker refuses when the read is made
+   (a refused connect, or another failure to open that leaves nothing open) is `WorkerRefused`,
+   kept apart so a reader can tell a plan-time from a run-time refusal; the other reads decide
+   as well. A worker that cannot be started, a link that stays open (the guards are marked,
+   ADR-258) and a cancel still end the job.
 4. **The vehicle's lock.** After the last VIN link is closed, an established VIN takes the
    per-vehicle lock on the job's guards (`promote_to_vehicle`, the step the restart and the
    gates of a procedure promote by; `JobGuards::take_vehicle` allows guards without the slot).
+   The promotion first does what every open does (`settle_before_open`: the cancel, the worker
+   found exited with the guards' mark cleared, the mark judged, ADR-394), since the last close
+   may have failed with the worker. Guards still marked after it take no lock: the VIN stays
+   established and reported, `vehicle_lock_held` is false and the mark stays (ADR-258).
    When another job holds the vehicle the run waits until the holder lets go, or until the
    cancel (design 8.8.1), with no VCI link open. The report says whether the lock is held; the
    caller's guards release it when they are dropped.
@@ -54,7 +65,7 @@ definitions are separate steps.
    (ADR-393, ADR-394), the request sent again within `max_primitive_repeats` with the origin
    `repeat` (ADR-392), and the reopens counted over the whole run (ADR-396 item 6). A read is
    idempotent, so a receive error sends it again too (the presence request is not sent again on
-   one). A request nobody answers within the repeats is `NoAnswer` and blocks nothing; a
+   one). A request that gets no usable answer within the repeats is `NoUsableAnswer` and blocks nothing; a
    negative response is `Negative` and is not sent again. When the bounds run out in a read, the
    remaining reads are `NotRead` and `vin_interrupted` is set; no VIN is established and no lock
    is taken, though an earlier read's accepted VIN stays in `vins_seen`. A presence phase

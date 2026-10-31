@@ -595,10 +595,16 @@ pub enum VinOutcome {
     Undecodable,
     /// A negative response, with its response code.
     Negative(u8),
-    /// The request got no answer within the run's repeats.
-    NoAnswer,
-    /// The source's document declares a link ADR-324 refuses, so nothing was read.
+    /// The request got no usable answer within the run's repeats: none at all, the link's
+    /// error event for it, a receive error or lost events (each a failure of the ECU or the
+    /// bus, ADR-392).
+    NoUsableAnswer,
+    /// The source's document declares a link ADR-324 refuses, so nothing was read: known
+    /// before any link opens.
     LinkRefused,
+    /// The worker refused to open the source's link (a connect it refused, or another failure
+    /// to open that left nothing open) when the read was made.
+    WorkerRefused,
     /// The read was not made: the run ended, or its bounds ran out, before it.
     NotRead,
 }
@@ -1146,7 +1152,7 @@ fn identify<W: WorkerSource>(
     }
     if report.presence_interrupted {
         // The run's bounds ran out: no VIN link opens, and nothing is established (ADR-399).
-        report.vin_interrupted = !plan.vin_reads.is_empty();
+        report.vin_interrupted = plan.vin_reads.iter().any(|read| read.link.is_some());
         return Ok(report);
     }
     vin_phase(
@@ -1162,16 +1168,24 @@ fn identify<W: WorkerSource>(
         &mut report,
     )?;
     if let Some(vin) = report.vin.clone() {
-        // Every VIN link is closed here, so the wait for a vehicle another job holds keeps no
-        // VCI link open (design 8.8.1, ADR-399 item 3).
-        promote_to_vehicle(
-            guards,
-            &vin,
-            limits.wait_poll.max(std::time::Duration::from_millis(1)),
-            cancelled,
-        )?;
-        report.vehicle_lock_held = true;
         report.evaluate_vin_rules(&plan.vin_rules, &vin);
+        // Every VIN link is closed here, so the wait for a vehicle another job holds keeps no
+        // VCI link open (design 8.8.1, ADR-399 item 4). The promotion settles the worker as an
+        // open does: a worker that exited during the last close is found, and its mark cleared.
+        // Guards still marked take no lock (ADR-258); the report says so.
+        match settle_before_open(&source, &comm_log, cancelled, guards, &worker_ended) {
+            Ok(_) => {
+                promote_to_vehicle(
+                    guards,
+                    &vin,
+                    limits.wait_poll.max(std::time::Duration::from_millis(1)),
+                    cancelled,
+                )?;
+                report.vehicle_lock_held = true;
+            }
+            Err(JobError::LinkUnconfirmed) => {}
+            Err(error) => return Err(error),
+        }
     }
     Ok(report)
 }
@@ -1184,12 +1198,44 @@ fn halves(table: &[(u32, u32)]) -> Option<[Vec<(u32, u32)>; 2]> {
     })
 }
 
+/// What every open of a link, and the promotion to the vehicle's lock after the last one, does
+/// first: a cancel, a worker that exited and the guards' mark are judged, so a link the worker may
+/// still hold ends the job (ADR-258, ADR-394). Gives the source for the open, or
+/// [`JobError::Cancelled`], or [`JobError::LinkUnconfirmed`] when the guards are still marked.
+fn settle_before_open<W: WorkerSource>(
+    source: &Arc<Mutex<W>>,
+    comm_log: &Option<crate::comm_log::CommLog>,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    worker_ended: &Cell<bool>,
+) -> Result<SharedSource<W>, JobError> {
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let mut shared = SharedSource(Arc::clone(source));
+    settle(
+        &mut shared,
+        CloseEvidence::default(),
+        comm_log,
+        guards,
+        worker_ended,
+    );
+    if link_unconfirmed(guards) {
+        return Err(JobError::LinkUnconfirmed);
+    }
+    Ok(shared)
+}
+
 /// How [`open_part`] ended without an open link.
 enum Opened<C: WorkerApi> {
     /// The link is open.
     Link(Box<JobLink<C>>),
     /// The worker answered, refusing the table or the connect, with its error (ADR-396).
     Refused(JobError),
+    /// The link failed to open for a reason that is neither a lost path nor the table, and
+    /// what was opened is closed again. The presence phase ends the job in it; a VIN read
+    /// reports its sources as refused by the worker (ADR-399 item 3).
+    Failed(JobError),
     /// The path to the VCI was lost and the bounds ran out before the link opened.
     Interrupted,
 }
@@ -1221,22 +1267,8 @@ fn open_part<W: WorkerSource>(
             table_refused: false,
             evidence: CloseEvidence::default(),
         };
-        // A cancel, a worker that exited and the guards' mark are judged before each open: a
-        // link the worker may still hold ends the job (ADR-258).
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(stop(JobError::Cancelled));
-        }
-        let mut shared = SharedSource(Arc::clone(source));
-        settle(
-            &mut shared,
-            CloseEvidence::default(),
-            &comm_log,
-            guards,
-            worker_ended,
-        );
-        if link_unconfirmed(guards) {
-            return Err(stop(JobError::LinkUnconfirmed));
-        }
+        let mut shared =
+            settle_before_open(source, &comm_log, cancelled, guards, worker_ended).map_err(stop)?;
         let client = shared
             .client()
             .map_err(|error| stop(JobError::Link(error)))?;
@@ -1306,6 +1338,15 @@ fn open_part<W: WorkerSource>(
         // A refusal whose teardown failed left the guards marked: nothing more opens (ADR-258).
         Err(refused) if refused.table_refused && refused.cleaned_up => {
             Ok(Opened::Refused(refused.error))
+        }
+        // The worker answered or the call failed, and nothing is left open (a worker that cannot
+        // be started, a cancel and a mark on the guards are the job's end).
+        Err(refused)
+            if refused.cleaned_up
+                && matches!(&refused.error, JobError::Link(error)
+                    if !matches!(error, HostError::WorkerStart { .. })) =>
+        {
+            Ok(Opened::Failed(refused.error))
         }
         Err(refused) => Err(refused.error),
     }
@@ -1409,6 +1450,7 @@ fn presence_part<W: WorkerSource>(
     )? {
         Opened::Link(link) => link,
         Opened::Refused(error) => return Ok(PartEnd::Refused(error)),
+        Opened::Failed(error) => return Err(error),
         Opened::Interrupted => return Ok(PartEnd::Interrupted(Vec::new(), false)),
     };
     let JobLink {
@@ -1444,6 +1486,8 @@ enum VinReadEnd {
     /// The read got an answer, or none within the repeats: what each source gave, and the VIN
     /// when they all gave the same well-formed one.
     Done(Vec<VinOutcome>, Option<Vin>),
+    /// The worker refused to open the link.
+    Refused,
     /// The link could not open, or the request not be sent, within the run's bounds.
     Interrupted,
 }
@@ -1482,8 +1526,9 @@ fn vin_read<W: WorkerSource>(
     )?;
     let link = match opened {
         Opened::Link(link) => link,
-        // Not a table: the worker's refusal of the connect ends the job like any other.
-        Opened::Refused(error) => return Err(error),
+        // The worker refused the link at run time: its sources are reported so and the other
+        // reads decide (ADR-399 item 3).
+        Opened::Refused(_) | Opened::Failed(_) => return Ok(VinReadEnd::Refused),
         Opened::Interrupted => return Ok(VinReadEnd::Interrupted),
     };
     let JobLink {
@@ -1523,7 +1568,10 @@ fn vin_read<W: WorkerSource>(
             VinReadEnd::Done(outcomes, accepted)
         }
         (Repeated::Stopped(error), _) if error.resend_class() == ResendClass::EcuLevel => {
-            VinReadEnd::Done(vec![VinOutcome::NoAnswer; read.declarations.len()], None)
+            VinReadEnd::Done(
+                vec![VinOutcome::NoUsableAnswer; read.declarations.len()],
+                None,
+            )
         }
         _ => VinReadEnd::Interrupted,
     });
@@ -1595,9 +1643,16 @@ fn vin_phase<W: WorkerSource>(
             reopens,
             worker_ended,
         )?;
-        let VinReadEnd::Done(outcomes, accepted) = end else {
-            report.vin_interrupted = true;
-            break;
+        let (outcomes, accepted) = match end {
+            VinReadEnd::Done(outcomes, accepted) => (outcomes, accepted),
+            VinReadEnd::Refused => (
+                vec![VinOutcome::WorkerRefused; read.declarations.len()],
+                None,
+            ),
+            VinReadEnd::Interrupted => {
+                report.vin_interrupted = true;
+                break;
+            }
         };
         let reported = &mut report.vin_reads[at];
         for (source, outcome) in reported.sources.iter_mut().zip(outcomes) {

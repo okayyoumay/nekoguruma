@@ -156,7 +156,7 @@ pub(crate) enum RunKind {
 
 /// What the job knows of itself when its log starts: the header's content, and a run's facts
 /// for its `job_start`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub(crate) struct RunFacts {
     pub job_id: String,
     pub generation: u64,
@@ -1130,6 +1130,12 @@ struct LinkOpened<'a> {
     baud_rate: u32,
     request_id: u32,
     response_id: u32,
+    /// Present on a functionally addressed link only (the identification job's presence link,
+    /// ADR-396): the functional identifier the request goes to and the receive table, whose
+    /// pairs are the ECUs the link listens for. `request_id` is then the functional identifier
+    /// and `response_id` is 0.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    functional: Option<LinkFunctional>,
     /// Every ComParam by name: those the link sets, those the document declares, and the
     /// timing ones design 8.11 lists that neither sets, which keep the library's default.
     comparams: Vec<ComParamInForce<'a>>,
@@ -1143,6 +1149,18 @@ struct LinkOpened<'a> {
     /// answer to `CreateComLogicalLink` says (ADR-355); `null` when the worker does not say.
     forwards_pendings: Option<bool>,
     timing_margin: TimingMargin,
+}
+
+#[derive(Serialize)]
+struct LinkFunctional {
+    functional_id: u32,
+    table: Vec<ReceivePair>,
+}
+
+#[derive(Serialize)]
+struct ReceivePair {
+    request_id: u32,
+    response_id: u32,
 }
 
 #[derive(Serialize)]
@@ -1266,37 +1284,42 @@ struct JobEnd<'a> {
 pub(crate) fn outcome_name(result: &Result<VmState, JobError>) -> &'static str {
     match result {
         Ok(_) => "ok",
-        Err(error) => match error {
-            JobError::CurrentThreadRuntime => "CurrentThreadRuntime",
-            JobError::Link(_) => "Link",
-            JobError::Vm { .. } => "Vm",
-            JobError::Program(_) => "Program",
-            JobError::Host { .. } => "Host",
-            JobError::Unanswerable(_) => "Unanswerable",
-            JobError::StepLimit(_) => "StepLimit",
-            JobError::Refused { .. } => "Refused",
-            JobError::Cancelled => "Cancelled",
-            JobError::Journal(_) => "Journal",
-            JobError::IdentityUnreadable { .. } => "IdentityUnreadable",
-            JobError::IdentityRead { .. } => "IdentityRead",
-            JobError::IdentityMismatch { .. } => "IdentityMismatch",
-            JobError::OnSiteInterventionRequired(_) => "OnSiteInterventionRequired",
-            JobError::ProcedureFailed { .. } => "ProcedureFailed",
-            JobError::NoReprogrammingSlot => "NoReprogrammingSlot",
-            JobError::LinkUnconfirmed => "LinkUnconfirmed",
-            JobError::Panicked => "Panicked",
-            JobError::NoDeclarations => "NoDeclarations",
-            JobError::Sources(_) => "Sources",
-            JobError::NoArtifact => "NoArtifact",
-            JobError::ArtifactDiffersFromJournal => "ArtifactDiffersFromJournal",
-            JobError::ArtifactMismatch { .. } => "ArtifactMismatch",
-            JobError::SegmentOutsideArtifact { .. } => "SegmentOutsideArtifact",
-            JobError::Undeclared { .. } => "Undeclared",
-            JobError::VehicleLock(_) => "VehicleLock",
-            JobError::GuardsMissing => "GuardsMissing",
-            JobError::CommLogMismatch => "CommLogMismatch",
-            JobError::NoCommLogDir => "NoCommLogDir",
-        },
+        Err(error) => error_outcome_name(error),
+    }
+}
+
+/// The `outcome` a failed job writes to `job_end`: the name of the [`JobError`] variant.
+pub(crate) fn error_outcome_name(error: &JobError) -> &'static str {
+    match error {
+        JobError::CurrentThreadRuntime => "CurrentThreadRuntime",
+        JobError::Link(_) => "Link",
+        JobError::Vm { .. } => "Vm",
+        JobError::Program(_) => "Program",
+        JobError::Host { .. } => "Host",
+        JobError::Unanswerable(_) => "Unanswerable",
+        JobError::StepLimit(_) => "StepLimit",
+        JobError::Refused { .. } => "Refused",
+        JobError::Cancelled => "Cancelled",
+        JobError::Journal(_) => "Journal",
+        JobError::IdentityUnreadable { .. } => "IdentityUnreadable",
+        JobError::IdentityRead { .. } => "IdentityRead",
+        JobError::IdentityMismatch { .. } => "IdentityMismatch",
+        JobError::OnSiteInterventionRequired(_) => "OnSiteInterventionRequired",
+        JobError::ProcedureFailed { .. } => "ProcedureFailed",
+        JobError::NoReprogrammingSlot => "NoReprogrammingSlot",
+        JobError::LinkUnconfirmed => "LinkUnconfirmed",
+        JobError::Panicked => "Panicked",
+        JobError::NoDeclarations => "NoDeclarations",
+        JobError::Sources(_) => "Sources",
+        JobError::NoArtifact => "NoArtifact",
+        JobError::ArtifactDiffersFromJournal => "ArtifactDiffersFromJournal",
+        JobError::ArtifactMismatch { .. } => "ArtifactMismatch",
+        JobError::SegmentOutsideArtifact { .. } => "SegmentOutsideArtifact",
+        JobError::Undeclared { .. } => "Undeclared",
+        JobError::VehicleLock(_) => "VehicleLock",
+        JobError::GuardsMissing => "GuardsMissing",
+        JobError::CommLogMismatch => "CommLogMismatch",
+        JobError::NoCommLogDir => "NoCommLogDir",
     }
 }
 
@@ -3071,6 +3094,17 @@ impl CommLog {
             baud_rate: config.baud_rate,
             request_id: config.tx_id,
             response_id: config.rx_id,
+            functional: config.functional.as_ref().map(|functional| LinkFunctional {
+                functional_id: functional.functional_id,
+                table: functional
+                    .table
+                    .iter()
+                    .map(|&(request_id, response_id)| ReceivePair {
+                        request_id,
+                        response_id,
+                    })
+                    .collect(),
+            }),
             comparams,
             transmit_confirmation: if indications.transmit {
                 vec!["transmit_indication"]
@@ -5137,9 +5171,14 @@ impl JobLog {
 
     /// Ends the log with `result` and gives the job's status.
     pub(crate) fn finish(self, result: &Result<VmState, JobError>) -> CommLogStatus {
+        self.finish_as(outcome_name(result))
+    }
+
+    /// [`JobLog::finish`] with the job's `outcome` given: `ok` or a [`JobError`] variant's name.
+    pub(crate) fn finish_as(self, outcome: &str) -> CommLogStatus {
         match (self.log, self.not_opened) {
             (Some(log), _) => {
-                log.end(outcome_name(result));
+                log.end(outcome);
                 log.status()
             }
             (None, Some(incomplete)) => CommLogStatus::Incomplete(incomplete),
@@ -5629,6 +5668,56 @@ mod tests {
             assert_eq!(opened["transmit_confirmation"], expected, "{transmit}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// ADR-396: a functional link's `link_opened` records the functional identifier and the
+    /// receive table, and the ComParams that address functionally; a physical link's has no
+    /// `functional` group.
+    #[test]
+    fn link_opened_records_a_functional_links_addressing() {
+        let physical = crate::link::LinkConfig::iso15765(0x7E0, 0x7E8);
+        let functional = physical.functional(0x7DF, vec![(0x7E0, 0x7E8), (0x7E1, 0x7E9)]);
+        let opened = |config: &crate::link::LinkConfig| {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(1, config, &[], crate::link::Indications::default(), None)
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            lines
+                .into_iter()
+                .find(|line| line["event"] == "link_opened")
+                .unwrap()
+        };
+        let line = opened(&physical);
+        assert!(line.get("functional").is_none(), "{line}");
+        let line = opened(&functional);
+        assert_eq!(
+            line["functional"],
+            serde_json::json!({"functional_id": 0x7DF, "table": [
+                {"request_id": 0x7E0, "response_id": 0x7E8},
+                {"request_id": 0x7E1, "response_id": 0x7E9}]})
+        );
+        assert_eq!(line["request_id"], 0x7DF);
+        let named = |name: &str| {
+            line["comparams"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|param| param["name"] == name)
+                .map(|param| (param["value"].clone(), param["set_by"].clone()))
+        };
+        assert_eq!(
+            named("CP_RequestAddrMode"),
+            Some((serde_json::json!(2), serde_json::json!("link")))
+        );
+        assert_eq!(
+            named("CP_CanFuncReqId"),
+            Some((serde_json::json!(0x7DF), serde_json::json!("link")))
+        );
     }
 
     /// `forwards_pendings` is what the worker said when the link was created (ADR-355), and

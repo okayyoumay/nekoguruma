@@ -1436,8 +1436,8 @@ restart's own checks read the same sources and still treat any non-integer readi
 ## The identification plan
 
 The `identification` module (design 8.8.2, ADR-327, ADR-395) loads and checks the plan of an
-identification job and derives its endpoints. It sends nothing, and no command or job kind runs
-it yet.
+identification job, derives its endpoints and sends its functional presence requests
+(`run_identification`, ADR-396). No command or job kind runs it yet.
 
 - `load_plan(plan_bytes, supplied)` decodes the plan (`diag_ir::plan::IdentificationPlan`, a
   postcard struct with its own schema version; a chosen-definition plan holds one candidate and
@@ -1456,6 +1456,31 @@ it yet.
   endpoint (bus, request and response identifier) with the documents on it, the presence groups
   (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
   documents whose link is refused, and an empty presence section.
+- `run_identification(source, plan, limits, guards, comm_log, cancel)` sends one functional
+  presence request (`3E 00`) per presence group, one link at a time, under the per-VCI lock
+  (`JobGuards::take_vci_only`), and fills the report's presence section: the answers as bus,
+  response identifier and bytes (an answer on a pair marks every endpoint with it,
+  `IdentificationReport::answered`; presence drops nothing), the number of presence links opened,
+  the refused tables and `presence_interrupted`. The report serializes to JSON.
+  - The link is functional (`LinkConfig::functional`): `CP_RequestAddrMode` 2, `CP_CanFuncReqId`,
+    one unique-response entry per pair of a receive table of every declared pair on the bus, and
+    a send-receive ceiling of one `CP_P2Max` window per pair. The host's `presence` collects
+    every result within the window (`num_receive_cycles` -2) and is the only path that sends
+    TesterPresent (`policy::check_presence_request`, exactly `3E 00`).
+  - A table the worker answered with a refusal at `SetUniqueRespIdTable` or
+    `ConnectComLogicalLink` is halved in declaration order, each half with a link and a request
+    of its own; a single pair still refused fails the job. A timeout or a lost path is never a
+    refusal.
+  - A lost VCI (also while the link opens), a worker that exited or an event stream that failed
+    reopens the link within the run's bounds (`JobLimits::reopen_poll`, `vci_return_wait`,
+    `max_link_reopens`) and sends the request again within `max_primitive_repeats`, logged with
+    the origin `repeat`; lost events send it again on the same link. The answers heard before
+    count, and bounds that run out set `presence_interrupted`. A worker that exited between two
+    links is logged (`worker_exit`, `worker_restart`) and the next link opens on a new one
+    (ADR-394), as is one found exited after a link failed to open and to close again. Before each link opens the run checks for a cancel and for guards marked by a
+    link that did not close (ADR-258); a table refusal whose link did not close is not halved.
+  - Only response identifiers of the link's receive table mark presence; the exchange entry
+    lists every result.
 
 The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two
 spellings of UDS on CAN that ADR-324 item 2 accepts are one bus.

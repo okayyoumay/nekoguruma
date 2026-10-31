@@ -635,7 +635,8 @@ impl UnknownCause {
 /// How the exchange ended, as the producer saw it: the input of `outcome`. The response bytes
 /// are raw here; [`Outcome`] carries them through [`redact`].
 ///
-/// Not given yet, with the rows that need them: `answers`. No outcome rests on a worker's extra
+/// Not given yet, with the rows that need them: the classification of `answers` (the presence
+/// request lists them, ADR-396). No outcome rests on a worker's extra
 /// error information (ADR-351).
 #[derive(Debug, Clone)]
 #[expect(
@@ -802,8 +803,8 @@ pub(crate) struct EventsLost {
 }
 
 /// One answer of a request that collects every answer, or the further answers of one meant for
-/// one ECU (design 8.11, `answers`). No producer gives them yet; the answers rows are not
-/// implemented, so an entry that has one is classified by the last row.
+/// one ECU (design 8.11, `answers`). The functional presence request gives them (ADR-396); the
+/// answers rows are not implemented, so an entry that has one is classified by the last row.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AnswerItem {
     pub rx_id: u32,
@@ -816,6 +817,31 @@ pub(crate) struct AnswerItem {
     pub outcome: Outcome,
     pub classification: Classification,
     pub reason: String,
+}
+
+impl AnswerItem {
+    /// An answer of a collecting request as it was read (ADR-396): `end` says what its bytes are
+    /// (positive, negative or unusable), `vci_us` is the item's time and `agent_us` the agent's
+    /// monotonic time when the host read it. The answer rows of design 8.11 do not classify it
+    /// yet, so it is `undetermined` and says so; its response time is not computed.
+    pub(crate) fn listed(rx_id: u32, end: &End, vci_us: Option<u64>, agent_us: u64) -> Self {
+        let bytes = match end {
+            End::Positive(bytes) | End::PositiveUnusable(bytes) | End::Negative(bytes) => bytes,
+            _ => &[][..],
+        };
+        Self {
+            rx_id,
+            response: redact(Direction::Response, bytes),
+            vci_us,
+            agent_us,
+            response_ms: None,
+            outcome: Outcome::of(end),
+            classification: Classification::Undetermined,
+            reason: "The answer is listed as it was read; the rows that classify an answer of a \
+                     collecting request are not implemented yet."
+                .to_owned(),
+        }
+    }
 }
 
 /// Which side an exchange's fault lies on (design 8.11 "Classification"), ordered by severity:

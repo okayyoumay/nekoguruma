@@ -63,6 +63,22 @@ pub struct LinkConfig {
     /// Further ComParams by short name, set on the link as the document declares them, after
     /// the link's own (ADR-324 item 3).
     pub params: Vec<(String, u32)>,
+    /// Functional addressing, for the link of an identification job's presence request
+    /// (ADR-327 item 2, ADR-396): `None` on every other link, which addresses its one ECU by
+    /// `tx_id` and `rx_id`. On a functional link `tx_id` is the functional identifier and `rx_id`
+    /// is 0, since no one response identifier is the link's.
+    pub functional: Option<FunctionalAddressing>,
+}
+
+/// A link that sends its request to a functional identifier and receives from several ECUs
+/// (ADR-396).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionalAddressing {
+    /// The CAN identifier the request is sent to (`CP_CanFuncReqId`).
+    pub functional_id: u32,
+    /// The receive table: the physical request and response identifier of each ECU the link
+    /// listens for, in the order of its unique-response entries.
+    pub table: Vec<(u32, u32)>,
 }
 
 impl LinkConfig {
@@ -78,6 +94,22 @@ impl LinkConfig {
             p2_star_ms: 5_000,
             rc78_completion_ms: 25_000,
             params: Vec::new(),
+            functional: None,
+        }
+    }
+
+    /// This link's protocol, baud rate, timings and ComParams on a functional link to
+    /// `functional_id` that receives from `table` (ADR-396). The caller has set the timings it
+    /// wants on `self`.
+    pub fn functional(&self, functional_id: u32, table: Vec<(u32, u32)>) -> Self {
+        Self {
+            tx_id: functional_id,
+            rx_id: 0,
+            functional: Some(FunctionalAddressing {
+                functional_id,
+                table,
+            }),
+            ..self.clone()
         }
     }
 
@@ -235,6 +267,9 @@ impl LinkConfig {
         if self.baud_rate == 0 {
             return Err(HostError::Setup("the baud rate must not be zero"));
         }
+        if let Some(functional) = &self.functional {
+            functional.validate()?;
+        }
         // The link sets these itself, from the fields above or for its response pending
         // handling, and a further one would override it. The others would let a primitive run
         // past the host's deadline: the worker would go on sending after the host gave up.
@@ -265,13 +300,53 @@ impl LinkConfig {
 
     /// How long a send-receive may take before the host gives up: the first response window,
     /// the whole 0x78 chain, one more P2*, and a margin for the worker and the transmission of
-    /// the request (ADR-235 item 6).
+    /// the request (ADR-235 item 6). On a functional link the API restarts the window for each
+    /// answer, so the window is allowed once per receive-table entry (ADR-396).
     pub fn send_recv_ceiling(&self) -> Duration {
+        let windows = self
+            .functional
+            .as_ref()
+            .map_or(1, |functional| functional.table.len().max(1) as u64);
         Duration::from_millis(
-            u64::from(self.p2_max_ms)
+            u64::from(self.p2_max_ms) * windows
                 + u64::from(self.rc78_completion_ms)
                 + u64::from(self.p2_star_ms),
         ) + Duration::from_secs(2)
+    }
+}
+
+impl FunctionalAddressing {
+    /// The table must name at least one ECU, every identifier must fit 11 bits, and the
+    /// functional identifier must not be one of the table's (a request to it would be answered
+    /// by the tester's own filter), nor may a pair repeat.
+    fn validate(&self) -> Result<(), HostError> {
+        if self.table.is_empty() {
+            return Err(HostError::Setup("a functional link needs a receive table"));
+        }
+        let ids = self.table.iter().flat_map(|&(tx, rx)| [tx, rx]);
+        if ids
+            .clone()
+            .chain([self.functional_id])
+            .any(|id| id > MAX_CAN_ID)
+        {
+            return Err(HostError::Setup(
+                "only 11-bit CAN IDs are supported: the link does not set the ID format yet",
+            ));
+        }
+        if ids.clone().any(|id| id == self.functional_id) {
+            return Err(HostError::Setup(
+                "the functional identifier equals a physical identifier of the receive table",
+            ));
+        }
+        let repeats = self
+            .table
+            .iter()
+            .enumerate()
+            .any(|(at, pair)| self.table[..at].contains(pair));
+        if repeats {
+            return Err(HostError::Setup("the receive table repeats a pair"));
+        }
+        Ok(())
     }
 }
 
@@ -283,7 +358,7 @@ pub const PROTOCOL_UDS_ON_CAN: &str = "ISO_14229_3_on_ISO_15765_2";
 /// (Annex B.1, ADR-319).
 const UDS_ON_CAN_NAMES: [&str; 2] = ["ISO15765", PROTOCOL_UDS_ON_CAN];
 /// The ComParams the link sets itself ([`set_up_link`]).
-const SET_BY_LINK: [&str; 12] = [
+const SET_BY_LINK: [&str; 14] = [
     "CP_Baudrate",
     "CP_P2Max",
     "CP_P2Star",
@@ -296,7 +371,12 @@ const SET_BY_LINK: [&str; 12] = [
     "CP_StartMsgIndEnable",
     "CP_CanPhysReqId",
     "CP_CanRespUSDTId",
+    "CP_RequestAddrMode",
+    "CP_CanFuncReqId",
 ];
+/// `CP_RequestAddrMode`'s value for functional addressing (ISO 22900-2 (2022) Annex B ComParam
+/// table; the J2534 worker reads it the same way).
+const REQUEST_ADDR_MODE_FUNCTIONAL: u32 = 2;
 /// The indications the link turns on for the communication log (design 8.11 "Link settings
 /// for the log"): transmit indications and start-of-message indications, which the J2534 worker
 /// passes on only under them (ADR-151). A library that refuses one opens the link without it.
@@ -418,8 +498,8 @@ pub(crate) fn valued_by_document(variant: &EcuVariant<'_>) -> Vec<&'static str> 
 /// identifiers go into the response ID table instead, and the indications are set apart, since
 /// a library may refuse them ([`INDICATION_COMPARAMS`]). The communication log's `link_opened`
 /// names the same (design 8.11).
-pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 8] {
-    [
+pub(crate) fn own_comparams(config: &LinkConfig) -> Vec<(&'static str, u32)> {
+    let mut own = vec![
         ("CP_Baudrate", config.baud_rate),
         ("CP_P2Max", micros(config.p2_max_ms)),
         ("CP_P2Star", micros(config.p2_star_ms)),
@@ -435,7 +515,14 @@ pub(crate) fn own_comparams(config: &LinkConfig) -> [(&'static str, u32); 8] {
         // declares neither a pending code (ADR-309 item 5).
         ("CP_RC21Handling", 0),
         ("CP_RC23Handling", 0),
-    ]
+    ];
+    // The request goes to the functional identifier; the receive table still names the ECUs
+    // (ADR-396).
+    if let Some(functional) = &config.functional {
+        own.push(("CP_RequestAddrMode", REQUEST_ADDR_MODE_FUNCTIONAL));
+        own.push(("CP_CanFuncReqId", functional.functional_id));
+    }
+    own
 }
 
 fn micros(ms: u32) -> u32 {
@@ -483,6 +570,12 @@ pub(crate) struct OpenFailure {
     /// Whether what the open had already opened on the worker was closed again, or nothing was
     /// opened. When it is false the worker may still hold the module or the link (ADR-258).
     pub(crate) cleaned_up: bool,
+    /// The worker answered, refusing the receive table or the connect of the link: not a
+    /// timeout, not a lost path (ADR-396, the halving's trigger).
+    pub(crate) table_refused: bool,
+    /// What the failing step and the cleanup showed of the worker, for settling it when the
+    /// cleanup failed (ADR-394).
+    pub(crate) evidence: CloseEvidence,
 }
 
 impl OpenFailure {
@@ -491,8 +584,41 @@ impl OpenFailure {
         Self {
             error,
             cleaned_up: true,
+            table_refused: false,
+            evidence: CloseEvidence::default(),
         }
     }
+
+    /// A failure whose cleanup left `cleaned_up` and showed `evidence` of the worker.
+    fn unclean(error: HostError, cleaned_up: bool, mut evidence: CloseEvidence) -> Self {
+        evidence.note_error(&error);
+        Self {
+            error,
+            cleaned_up,
+            table_refused: false,
+            evidence,
+        }
+    }
+
+    /// [`OpenFailure::unclean`] after the module's disconnect, whose result is `closed`.
+    fn after_disconnect(error: HostError, closed: Result<(), HostError>) -> Self {
+        let mut evidence = CloseEvidence::default();
+        if let Err(cleanup) = &closed {
+            evidence.note_error(cleanup);
+        }
+        Self::unclean(error, closed.is_ok(), evidence)
+    }
+}
+
+/// Whether `error` is the worker's own answer refusing the unique-response table or the connect
+/// (rpc-api-guide "Reading a Worker's Answer"): a status the worker gave, which is not a loss of
+/// the path to the VCI. A deadline that passed and a connection that failed are not.
+fn refuses_receive_table(error: &HostError) -> bool {
+    matches!(
+        error,
+        HostError::Rpc { rpc: "SetUniqueRespIdTable" | "ConnectComLogicalLink", status }
+            if refused(status) && !crate::host::names_lost_vci(status)
+    )
 }
 
 /// [`open`], also telling whether a failed open left anything open on the worker.
@@ -520,14 +646,16 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
                 // failed create left nothing behind only when the worker refused it. A create that
                 // timed out or failed otherwise may have made a link nobody holds a handle for
                 // (ADR-258).
-                let cleaned_up = if client.held_module().is_some() {
-                    nothing_created(&error)
-                } else {
-                    disconnect_module(client, module_handle, deadline)
-                        .await
-                        .is_ok()
-                };
-                return Err(OpenFailure { error, cleaned_up });
+                if client.held_module().is_some() {
+                    let cleaned_up = nothing_created(&error);
+                    return Err(OpenFailure::unclean(
+                        error,
+                        cleaned_up,
+                        CloseEvidence::default(),
+                    ));
+                }
+                let closed = disconnect_module(client, module_handle, deadline).await;
+                return Err(OpenFailure::after_disconnect(error, closed));
             }
         };
     match set_up_link(client, config, deadline, cll_handle).await {
@@ -542,10 +670,12 @@ pub(crate) async fn open_tracked<C: WorkerApi>(
             forwards_pendings,
         }),
         Err(error) => {
-            let cleaned_up = teardown(client, module_handle, cll_handle, deadline, false)
-                .await
-                .is_ok();
-            Err(OpenFailure { error, cleaned_up })
+            let (closed, evidence) =
+                teardown_observed(client, module_handle, cll_handle, deadline, false).await;
+            Err(OpenFailure {
+                table_refused: refuses_receive_table(&error),
+                ..OpenFailure::unclean(error, closed.is_ok(), evidence)
+            })
         }
     }
 }
@@ -597,10 +727,8 @@ async fn open_module<C: WorkerApi>(
         // The connect may have completed on the worker after the deadline. Disconnecting a
         // module that is not connected changes nothing; when that disconnect fails too, the
         // module is not known to be disconnected.
-        let cleaned_up = disconnect_module(client, module_handle, deadline)
-            .await
-            .is_ok();
-        return Err(OpenFailure { error, cleaned_up });
+        let closed = disconnect_module(client, module_handle, deadline).await;
+        return Err(OpenFailure::after_disconnect(error, closed));
     }
     Ok(module_handle)
 }
@@ -750,6 +878,15 @@ fn forwards_pendings(pending_forwarding: i32) -> Option<bool> {
     }
 }
 
+/// The pairs of the link's receive table, one unique-response entry each, numbered from 1 in
+/// this order: the link's own pair, or a functional link's table.
+pub(crate) fn receive_table(config: &LinkConfig) -> Vec<(u32, u32)> {
+    match &config.functional {
+        Some(functional) => functional.table.clone(),
+        None => vec![(config.tx_id, config.rx_id)],
+    }
+}
+
 async fn set_up_link<C: WorkerApi>(
     client: &mut C,
     config: &LinkConfig,
@@ -814,13 +951,19 @@ async fn set_up_link<C: WorkerApi>(
         client.set_unique_resp_id_table(SetUniqueRespIdTableRequest {
             cll_handle: Some(cll_handle),
             unique_resp_id_table: Some(UniqueRespIdTableItem {
-                unique_data: vec![EcuUniqueRespData {
-                    unique_resp_identifier: 1,
-                    params: vec![
-                        param(phys_req, PduParamClass::PduPcUniqueId, config.tx_id),
-                        param(resp, PduParamClass::PduPcUniqueId, config.rx_id),
-                    ],
-                }],
+                unique_data: receive_table(config)
+                    .into_iter()
+                    .zip(1..)
+                    .map(
+                        |((tx_id, rx_id), unique_resp_identifier)| EcuUniqueRespData {
+                            unique_resp_identifier,
+                            params: vec![
+                                param(phys_req, PduParamClass::PduPcUniqueId, tx_id),
+                                param(resp, PduParamClass::PduPcUniqueId, rx_id),
+                            ],
+                        },
+                    )
+                    .collect(),
             }),
         }),
     )
@@ -965,11 +1108,21 @@ pub(crate) struct CloseEvidence {
 }
 
 impl CloseEvidence {
+    /// Whether some step showed the worker silent: a worker that answered every step is alive.
+    pub(crate) fn silent(&self) -> bool {
+        self.unanswered || self.hung
+    }
+
+    /// Takes in a step that failed with `error`.
+    pub(crate) fn note_error(&mut self, error: &HostError) {
+        self.unanswered |= !is_workers_answer(error);
+        self.hung |= matches!(error, HostError::WorkerUnresponsive(_));
+    }
+
     fn note(&mut self, outcome: &CloseOutcome) {
         for step in [&outcome.disconnect, &outcome.destroy, &outcome.module] {
             if let Err(error) = step {
-                self.unanswered |= !is_workers_answer(error);
-                self.hung |= matches!(error, HostError::WorkerUnresponsive(_));
+                self.note_error(error);
             }
         }
     }
@@ -1408,5 +1561,130 @@ mod tests {
                 "{protocols:?}: {error}"
             );
         }
+    }
+
+    fn table() -> Vec<(u32, u32)> {
+        vec![(0x7E0, 0x7E8), (0x7E1, 0x7E9)]
+    }
+
+    /// ADR-396: a functional link sends to the functional identifier, listens for every pair of
+    /// its table, and sets the two ComParams that make the worker address functionally; a
+    /// physical link sets neither and has its one pair as its table.
+    #[test]
+    fn a_functional_link_addresses_functionally_and_listens_for_its_table() {
+        let physical = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let config = physical.functional(0x7DF, table());
+        config.validate().expect("usable");
+        assert_eq!((config.tx_id, config.rx_id), (0x7DF, 0));
+        let own = own_comparams(&config);
+        assert_eq!(
+            own[own.len() - 2..],
+            [("CP_RequestAddrMode", 2), ("CP_CanFuncReqId", 0x7DF)]
+        );
+        assert_eq!(own.len(), own_comparams(&physical).len() + 2);
+        assert_eq!(receive_table(&config), table());
+        assert_eq!(receive_table(&physical), [(0x7E0, 0x7E8)]);
+        assert_eq!(physical.functional, None);
+    }
+
+    #[test]
+    fn a_functional_link_the_agent_cannot_open_is_refused() {
+        let base = LinkConfig::iso15765(0x7E0, 0x7E8);
+        for (config, why) in [
+            (base.functional(0x7DF, Vec::new()), "receive table"),
+            (base.functional(0x800, table()), "11-bit"),
+            (base.functional(0x7DF, vec![(0x7E0, 0x800)]), "11-bit"),
+            // The functional identifier is one of the table's.
+            (base.functional(0x7E8, table()), "equals a physical"),
+            (base.functional(0x7E0, table()), "equals a physical"),
+            (
+                base.functional(0x7DF, vec![(0x7E0, 0x7E8), (0x7E0, 0x7E8)]),
+                "repeats",
+            ),
+        ] {
+            let error = config.validate().expect_err(why);
+            assert!(
+                matches!(&error, HostError::Setup(text) if text.contains(why)),
+                "{error}"
+            );
+        }
+    }
+
+    /// ADR-396: the window restarts for each answer, so the ceiling allows one window per pair.
+    #[test]
+    fn a_functional_link_s_ceiling_allows_a_window_per_pair() {
+        let physical = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(
+            physical.send_recv_ceiling(),
+            Duration::from_millis(1_000 + 25_000 + 5_000 + 2_000)
+        );
+        let functional = physical.functional(0x7DF, vec![(1, 2), (3, 4), (5, 6)]);
+        assert_eq!(
+            functional.send_recv_ceiling(),
+            Duration::from_millis(3 * 1_000 + 25_000 + 5_000 + 2_000)
+        );
+    }
+
+    /// A document cannot set the two ComParams of functional addressing: the link does.
+    #[test]
+    fn a_document_cannot_set_the_functional_addressing_comparams() {
+        for name in ["CP_RequestAddrMode", "cp_canfuncreqid"] {
+            let error = declared(vec![protocol(&[(name, 2)])]).expect_err("refused");
+            assert!(
+                matches!(error, HostError::DeclaredLink(_)),
+                "{name}: {error}"
+            );
+        }
+    }
+
+    /// ADR-396: only a status the worker gave for the table or the connect is a refusal the
+    /// agent halves on; a deadline that passed, a connection that failed, a lost VCI and any
+    /// other step are not.
+    #[test]
+    fn only_the_workers_answer_at_the_table_or_the_connect_is_a_refusal() {
+        use vci_service_interface::{ErrorDetail, ErrorEventData, PduError, PduErrorEvent};
+        let rpc = |rpc, status| HostError::Rpc {
+            rpc,
+            status: Box::new(status),
+        };
+        let refusal = tonic::Status::invalid_argument("too many entries");
+        assert!(refuses_receive_table(&rpc(
+            "SetUniqueRespIdTable",
+            refusal.clone()
+        )));
+        assert!(refuses_receive_table(&rpc(
+            "ConnectComLogicalLink",
+            tonic::Status::failed_precondition("no device")
+        )));
+        assert!(!refuses_receive_table(&rpc("SetComParam", refusal)));
+        for status in [
+            tonic::Status::unavailable("gone"),
+            tonic::Status::cancelled("gone"),
+            tonic::Status::unknown("gone"),
+        ] {
+            assert!(!refuses_receive_table(&rpc("SetUniqueRespIdTable", status)));
+        }
+        assert!(!refuses_receive_table(&HostError::WorkerUnresponsive(
+            "SetUniqueRespIdTable"
+        )));
+        assert!(!refuses_receive_table(&HostError::WorkerUnresponsive(
+            "ConnectComLogicalLink"
+        )));
+        let lost = vci_service_interface::status_with_error_detail(
+            tonic::Code::FailedPrecondition,
+            "the VCI is lost",
+            ErrorDetail {
+                pdu_error: PduError::PduErrCllNotConnected as i32,
+                error_event_data: Some(ErrorEventData {
+                    error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+                    cop_handle: None,
+                    timestamp: 1,
+                    extra_error_info: 0,
+                }),
+                detail_text: None,
+                refusal: None,
+            },
+        );
+        assert!(!refuses_receive_table(&rpc("ConnectComLogicalLink", lost)));
     }
 }

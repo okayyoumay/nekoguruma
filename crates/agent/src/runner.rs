@@ -517,7 +517,7 @@ enum JournalMode {
 /// Where a job's guards stay during its run. The job thread keeps a handle, so the guards
 /// outlive the thread even when the caller's future is dropped first; the caller takes them
 /// back once the run ends.
-type GuardSlot = Arc<Mutex<Option<JobGuards>>>;
+pub(crate) type GuardSlot = Arc<Mutex<Option<JobGuards>>>;
 
 /// The checks [`run_program`] makes before it touches the worker: the program's schema version and
 /// size must suit this VM (`Vm::check_state`), its restart declaration must hold
@@ -1143,31 +1143,36 @@ async fn run_checked<C: WorkerApi>(
 
     let cancel = CancelOnDrop(Arc::new(AtomicBool::new(false)));
     let cancelled = Arc::clone(&cancel.0);
-    // The job's span, so what the VM's thread logs is in it (ADR-348 item 3).
+    let run = on_job_thread(
+        comm_log,
+        move |comm_log| {
+            run_job(
+                handle, client, source, &config, &program, document, artifact, limits, &cancelled,
+                journal, guards, comm_log,
+            )
+        },
+        |log, result| log.finish(result),
+    )
+    .await;
+    Ok(run)
+}
+
+/// Runs `job` on a blocking thread in the caller's span (ADR-348 item 3) and ends `comm_log`
+/// with `finish`, so a panic in either is the job's `Panicked` or an incomplete log, and the log
+/// never changes the result (ADR-347). A runtime that is shutting down cancels the job.
+pub(crate) async fn on_job_thread<T: Send + 'static>(
+    comm_log: JobLog,
+    job: impl FnOnce(&mut JobLog) -> Result<T, JobError> + Send + 'static,
+    finish: impl FnOnce(JobLog, &Result<T, JobError>) -> CommLogStatus + Send + 'static,
+) -> (Result<T, JobError>, CommLogStatus) {
     let span = tracing::Span::current();
-    let run = tokio::task::spawn_blocking(move || {
+    tokio::task::spawn_blocking(move || {
         let _span = span.entered();
         // Declared outside the unwind guard, so a panic still ends the log.
         let mut comm_log = comm_log;
-        let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
-            run_job(
-                handle,
-                client,
-                source,
-                &config,
-                &program,
-                document,
-                artifact,
-                limits,
-                &cancelled,
-                journal,
-                guards,
-                &mut comm_log,
-            )
-        }))
-        .unwrap_or(Err(JobError::Panicked));
-        // The log never changes the result, a panic while ending it included.
-        let status = std::panic::catch_unwind(AssertUnwindSafe(|| comm_log.finish(&result)))
+        let result = std::panic::catch_unwind(AssertUnwindSafe(|| job(&mut comm_log)))
+            .unwrap_or(Err(JobError::Panicked));
+        let status = std::panic::catch_unwind(AssertUnwindSafe(|| finish(comm_log, &result)))
             .unwrap_or(CommLogStatus::Incomplete(CommLogIncomplete::CloseFailed(
                 std::io::ErrorKind::Other,
             )));
@@ -1184,12 +1189,11 @@ async fn run_checked<C: WorkerApi>(
             }),
             CommLogStatus::None,
         )
-    });
-    Ok(run)
+    })
 }
 
 /// How long a close that got no answer waits for a killed worker's exit to show (ADR-394).
-const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
+pub(crate) const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
 
 /// The whole job, on the blocking thread: open, run, close.
 #[expect(
@@ -1198,7 +1202,7 @@ const WORKER_EXIT_GRACE: Duration = Duration::from_secs(1);
 )]
 fn run_job<C: WorkerApi>(
     handle: Handle,
-    mut client: C,
+    client: C,
     source: Box<dyn WorkerSource<Client = C>>,
     config: &LinkConfig,
     program: &Program,
@@ -1258,43 +1262,25 @@ fn run_job<C: WorkerApi>(
     };
     let comm_log = comm_log.open(run_kind);
     let timings = Timings::for_link(config);
-    // An open that fails partway closes what it opened; when even that fails, or the open
-    // panics, the worker may still hold the module or the link (ADR-258).
-    let opened = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        handle.block_on(link::open_tracked(&mut client, config, timings.unary))
-    }));
-    let link = match opened {
-        Ok(Ok(link)) => link,
-        Ok(Err(failure)) => {
-            if !failure.cleaned_up {
-                mark_link_unconfirmed(&guards);
-            }
-            return Err(JobError::Link(failure.error));
-        }
-        Err(_) => {
-            mark_link_unconfirmed(&guards);
-            return Err(JobError::Panicked);
-        }
-    };
-    let permission = link.permission;
-    // Declared before the host, which owns the link's event stream: on a panic the stream is
-    // dropped first, then the link is closed.
-    let open_handles: OpenHandles<C> = Arc::new(Mutex::new(Some(OpenOn {
-        client: client.clone(),
-        module_handle: link.module_handle,
-        cll_handle: link.cll_handle,
-    })));
-    // Whether the run's path to the VCI was lost (ADR-393): set by the host when it tries to open
-    // the link again, and below when the run ended on a lost path.
-    let path_lost = Arc::new(AtomicBool::new(false));
-    let open_link = OpenLink {
-        handle: handle.clone(),
-        handles: Arc::clone(&open_handles),
-        deadline: timings.unary,
-        guards: Arc::clone(&guards),
-        path_lost: Arc::clone(&path_lost),
-        closed: false,
-    };
+    // The artifact's hash is what the journal records (ADR-344).
+    let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
+    let JobLink {
+        mut host,
+        open_link,
+        path_lost,
+        permission,
+    } = open_job_link(
+        &handle,
+        client,
+        source,
+        config,
+        document.clone(),
+        artifact,
+        comm_log,
+        &guards,
+        timings,
+    )
+    .map_err(|refused| refused.error)?;
     // The VCI is known now. Nothing has been sent to the ECU yet, so a program that needs more
     // than this link allows is refused with no effect on it.
     let refused = refuse_beyond(
@@ -1302,44 +1288,6 @@ fn run_job<C: WorkerApi>(
         document.as_ref().map(JobDocument::variant).as_ref(),
         permission,
     );
-    // The VCI, then what the link has in force, before anything is sent on it (design 8.11).
-    if let Some(log) = &comm_log {
-        crate::host::log_connected(
-            &handle,
-            &mut client,
-            log,
-            config,
-            document.as_ref(),
-            &link,
-            timings.unary,
-        );
-    }
-    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
-    host.set_document(document);
-    // The journal records the hash of the artifact the job runs with (ADR-344).
-    let artifact_sha256 = artifact.as_ref().map(|artifact| *artifact.sha256());
-    host.set_artifact(artifact);
-    host.set_comm_log(comm_log);
-    host.set_link_ids(config.tx_id, config.rx_id);
-    host.set_job_end_wait(config.job_end_wait());
-    // What opens the link again after the path to the VCI was lost (ADR-393).
-    host.set_relink(Relink {
-        source,
-        config: config.clone(),
-        open: open_handles,
-        mark_unconfirmed: {
-            let guards = Arc::clone(&guards);
-            Box::new(move || mark_link_unconfirmed(&guards))
-        },
-        worker_gone: {
-            let guards = Arc::clone(&guards);
-            Box::new(move || clear_link_unconfirmed(&guards))
-        },
-        old_open: true,
-        path_lost: Arc::clone(&path_lost),
-        worker_ended: false,
-        exit_grace: WORKER_EXIT_GRACE,
-    });
     if let Err(error) = refused {
         drop(host);
         open_link.close();
@@ -1381,21 +1329,166 @@ fn run_job<C: WorkerApi>(
     if ended_on_lost_path(&result) {
         path_lost.store(true, Ordering::Relaxed);
     }
-    // On a lost path the worker may have exited: it is then reaped here, and the link it held is
-    // not closed through it, which would fail and mark the guards (ADR-394).
+    close_job_link(host, open_link, &path_lost);
+    result
+}
+
+/// A job's link, open: the host that sends on it, what closes it, and what the VCI allows.
+pub(crate) struct JobLink<C: WorkerApi> {
+    pub(crate) host: WorkerHost<C>,
+    pub(crate) open_link: OpenLink<C>,
+    /// Whether the run's path to the VCI was lost (ADR-393): set by the host when it tries to
+    /// open the link again, and by the caller when the run ended on a lost path.
+    pub(crate) path_lost: Arc<AtomicBool>,
+    permission: Permission,
+}
+
+/// A link that did not open: the job's error, and what the open showed of it.
+#[derive(Debug)]
+pub(crate) struct LinkRefused {
+    pub(crate) error: JobError,
+    /// What the open had opened on the worker was closed again, or nothing was opened; when it
+    /// is false the guards are marked (ADR-258).
+    pub(crate) cleaned_up: bool,
+    /// The worker answered, refusing the receive table or the connect (ADR-396).
+    pub(crate) table_refused: bool,
+    /// What the failed open showed of the worker (ADR-394).
+    pub(crate) evidence: link::CloseEvidence,
+}
+
+/// Opens the job's link on `client`, logs the VCI and the link, and builds the host that sends on
+/// it, with the means to open the link again after the path to the VCI was lost (ADR-393). An
+/// open that fails partway closes what it opened; when even that fails, or the open panics, the
+/// worker may still hold the module or the link and the guards are marked (ADR-258). The log
+/// is `None` for a job without one.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the job's whole input, split only by what the caller owns"
+)]
+pub(crate) fn open_job_link<C: WorkerApi>(
+    handle: &Handle,
+    mut client: C,
+    source: Box<dyn WorkerSource<Client = C>>,
+    config: &LinkConfig,
+    document: Option<JobDocument>,
+    artifact: Option<Artifact>,
+    comm_log: Option<crate::comm_log::CommLog>,
+    guards: &GuardSlot,
+    timings: Timings,
+) -> Result<JobLink<C>, LinkRefused> {
+    let opened = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        handle.block_on(link::open_tracked(&mut client, config, timings.unary))
+    }));
+    let link = match opened {
+        Ok(Ok(link)) => link,
+        Ok(Err(failure)) => {
+            if !failure.cleaned_up {
+                mark_link_unconfirmed(guards);
+            }
+            return Err(LinkRefused {
+                error: JobError::Link(failure.error),
+                cleaned_up: failure.cleaned_up,
+                table_refused: failure.table_refused,
+                evidence: failure.evidence,
+            });
+        }
+        Err(_) => {
+            mark_link_unconfirmed(guards);
+            return Err(LinkRefused {
+                error: JobError::Panicked,
+                cleaned_up: false,
+                table_refused: false,
+                evidence: link::CloseEvidence::default(),
+            });
+        }
+    };
+    let permission = link.permission;
+    // Declared before the host, which owns the link's event stream: on a panic the stream is
+    // dropped first, then the link is closed.
+    let open_handles: OpenHandles<C> = Arc::new(Mutex::new(Some(OpenOn {
+        client: client.clone(),
+        module_handle: link.module_handle,
+        cll_handle: link.cll_handle,
+    })));
+    let path_lost = Arc::new(AtomicBool::new(false));
+    let open_link = OpenLink {
+        handle: handle.clone(),
+        handles: Arc::clone(&open_handles),
+        deadline: timings.unary,
+        guards: Arc::clone(guards),
+        path_lost: Arc::clone(&path_lost),
+        closed: false,
+    };
+    // The VCI, then what the link has in force, before anything is sent on it (design 8.11).
+    if let Some(log) = &comm_log {
+        crate::host::log_connected(
+            handle,
+            &mut client,
+            log,
+            config,
+            document.as_ref(),
+            &link,
+            timings.unary,
+        );
+    }
+    let mut host = WorkerHost::new(handle.clone(), client, link, timings);
+    host.set_document(document);
+    host.set_artifact(artifact);
+    host.set_comm_log(comm_log);
+    host.set_link_ids(config.tx_id, config.rx_id);
+    host.set_receive_table(
+        config
+            .functional
+            .iter()
+            .flat_map(|f| f.table.clone())
+            .collect(),
+    );
+    host.set_job_end_wait(config.job_end_wait());
+    // What opens the link again after the path to the VCI was lost (ADR-393).
+    host.set_relink(Relink {
+        source,
+        config: config.clone(),
+        open: open_handles,
+        mark_unconfirmed: {
+            let guards = Arc::clone(guards);
+            Box::new(move || mark_link_unconfirmed(&guards))
+        },
+        worker_gone: {
+            let guards = Arc::clone(guards);
+            Box::new(move || clear_link_unconfirmed(&guards))
+        },
+        old_open: true,
+        path_lost: Arc::clone(&path_lost),
+        worker_ended: false,
+        exit_grace: WORKER_EXIT_GRACE,
+    });
+    Ok(JobLink {
+        host,
+        open_link,
+        path_lost,
+        permission,
+    })
+}
+
+/// Ends a job's link: on a lost path the worker may have exited, which is then reaped, and the
+/// link it held is not closed through it, which would fail and mark the guards (ADR-394); a
+/// primitive past its deadline is waited for, or cancelled, before the link closes; the event
+/// stream goes before the link is closed.
+pub(crate) fn close_job_link<C: WorkerApi>(
+    mut host: WorkerHost<C>,
+    open_link: OpenLink<C>,
+    path_lost: &AtomicBool,
+) {
     if path_lost.load(Ordering::Relaxed)
         && std::panic::catch_unwind(AssertUnwindSafe(|| host.reap_exited_worker())).is_err()
     {
         tracing::warn!("asking whether the worker had exited at job end panicked");
     }
-    // A primitive past its deadline is waited for, or cancelled, before the link closes.
     if std::panic::catch_unwind(AssertUnwindSafe(|| host.settle_at_end())).is_err() {
         tracing::warn!("settling a primitive past its deadline at job end panicked");
     }
-    // The event stream goes before the link is closed.
     drop(host);
     open_link.close();
-    result
 }
 
 /// Whether the run ended on an error that says the path to the VCI was lost
@@ -1416,7 +1509,7 @@ fn ended_on_lost_path(result: &Result<VmState, JobError>) -> bool {
 /// the job panics, by `Drop`. The job's result stands whether or not that works; a failure is
 /// logged and marks the job's guards (`JobGuards::mark_link_unconfirmed`, ADR-258), since the
 /// worker may then still hold the VCI.
-struct OpenLink<C: WorkerApi> {
+pub(crate) struct OpenLink<C: WorkerApi> {
     handle: Handle,
     /// The link open now and the client it was opened on, which the host replaces when it
     /// opens the link again (ADR-393) and empties once it has closed the lost one.
@@ -1431,7 +1524,7 @@ struct OpenLink<C: WorkerApi> {
 
 impl<C: WorkerApi> OpenLink<C> {
     /// Closes the link. The link's event stream must be dropped before.
-    fn close(mut self) {
+    pub(crate) fn close(mut self) {
         self.teardown();
     }
 
@@ -1498,7 +1591,7 @@ impl<C: WorkerApi> Drop for OpenLink<C> {
 }
 
 /// Sets the flag when the job's future is dropped.
-struct CancelOnDrop(Arc<AtomicBool>);
+pub(crate) struct CancelOnDrop(pub(crate) Arc<AtomicBool>);
 
 impl Drop for CancelOnDrop {
     fn drop(&mut self) {
@@ -2475,37 +2568,11 @@ where
         + ProcedurePosition,
     S: Store,
 {
-    if *reopens >= limits.max_link_reopens || !restart::continues_after_loss(program, state, unsent)
-    {
+    if !restart::continues_after_loss(program, state, unsent) {
         return Ok(false);
     }
-    *reopens += 1;
-    let poll = limits.reopen_poll.max(Duration::from_millis(1));
-    // `vci_return_wait` counts from the end of the first attempt, which closes the lost link
-    // first: a close that takes several deadlines does not use up the time the VCI has to come
-    // back.
-    let mut until = None;
-    loop {
-        if cancelled.load(Ordering::Relaxed) {
-            return Err(JobError::Cancelled);
-        }
-        // Every attempt after the first needs time left: the sleep may have used it up, and a
-        // VCI that returns after the wait does not resume the job.
-        if until.is_some_and(|until| std::time::Instant::now() >= until) {
-            return Ok(false);
-        }
-        match host.reopen_link() {
-            ReopenAttempt::Opened => break,
-            ReopenAttempt::Cannot => return Ok(false),
-            ReopenAttempt::NotYet => {}
-        }
-        let until =
-            *until.get_or_insert_with(|| std::time::Instant::now() + limits.vci_return_wait);
-        let remaining = until.saturating_duration_since(std::time::Instant::now());
-        if remaining.is_zero() {
-            return Ok(false);
-        }
-        std::thread::sleep(poll.min(remaining));
+    if !reopen_within(host, limits, cancelled, reopens)? {
+        return Ok(false);
     }
     let Some(journal) = journal else {
         return Ok(true);
@@ -2536,6 +2603,60 @@ where
         })?;
     }
     Ok(true)
+}
+
+/// Opens the link again after the path to the VCI was lost, within the run's bounds (design
+/// 8.2.5, ADR-393): `Ok(false)` when the run already opened its link `max_link_reopens` times,
+/// the host cannot open it, or the VCI did not come back within `vci_return_wait`; a cancel taken
+/// at a poll is [`JobError::Cancelled`]. The host opens the link every `reopen_poll`.
+fn reopen_within<H: ProcedurePosition>(
+    host: &mut H,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    reopens: &mut u8,
+) -> Result<bool, JobError> {
+    reopen_attempts(|| host.reopen_link(), limits, cancelled, reopens)
+}
+
+/// [`reopen_within`] over any attempt at opening the link, which an identification job also makes
+/// for a link that failed to open on a lost path (ADR-396).
+pub(crate) fn reopen_attempts(
+    mut attempt: impl FnMut() -> ReopenAttempt,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    reopens: &mut u8,
+) -> Result<bool, JobError> {
+    if *reopens >= limits.max_link_reopens {
+        return Ok(false);
+    }
+    *reopens += 1;
+    let poll = limits.reopen_poll.max(Duration::from_millis(1));
+    // `vci_return_wait` counts from the end of the first attempt, which closes the lost link
+    // first: a close that takes several deadlines does not use up the time the VCI has to come
+    // back.
+    let mut until = None;
+    loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(JobError::Cancelled);
+        }
+        // Every attempt after the first needs time left: the sleep may have used it up, and a
+        // VCI that returns after the wait does not resume the job.
+        if until.is_some_and(|until| std::time::Instant::now() >= until) {
+            return Ok(false);
+        }
+        match attempt() {
+            ReopenAttempt::Opened => return Ok(true),
+            ReopenAttempt::Cannot => return Ok(false),
+            ReopenAttempt::NotYet => {}
+        }
+        let until =
+            *until.get_or_insert_with(|| std::time::Instant::now() + limits.vci_return_wait);
+        let remaining = until.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            return Ok(false);
+        }
+        std::thread::sleep(poll.min(remaining));
+    }
 }
 
 /// Ends the run in `error` with the request marker at `unsent`, if there is one, withdrawn: the
@@ -15628,6 +15749,36 @@ def main():
         fake_worker_closing_all(disconnects, Vec::new(), modules).await
     }
 
+    /// A [`FakeWorker`] whose link set-up fails and whose module disconnect then gets no answer
+    /// (`Unavailable`), as a worker whose process is gone does.
+    async fn fake_worker_gone_in_setup() -> (WorkerClient, Arc<Mutex<Vec<&'static str>>>) {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let set = Arc::new(Mutex::new(Vec::new()));
+        let service = FakeWorker {
+            fail_disconnect: false,
+            fail_open: true,
+            calls: Arc::clone(&calls),
+            comparams: Mutex::new(Vec::new()),
+            set: Arc::clone(&set),
+            refuse_set: None,
+            starts: false,
+            started: Arc::default(),
+            cancelled: Arc::default(),
+            cancel: CancelAnswer::Done,
+            on_start: None,
+            start_script: Mutex::default(),
+            released: Arc::new(tokio::sync::Semaphore::new(0)),
+            events: Arc::default(),
+            device_clock: false,
+            disconnect_script: Mutex::default(),
+            module_script: Mutex::new([Some(unavailable())].into()),
+            destroy_script: Mutex::default(),
+            start_failures: Mutex::default(),
+        };
+        let (client, calls, _) = serve(service, calls, set).await;
+        (client, calls)
+    }
+
     /// [`fake_worker_closing`] whose first destroys of the link answer as `destroys` say too.
     async fn fake_worker_closing_all(
         disconnects: Vec<Option<tonic::Status>>,
@@ -20574,6 +20725,61 @@ def main():
             assert_eq!(of_event(&lines, "worker_restart")[0]["pid"], 101, "{tag}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// ADR-394: a worker that exited while the reopened link was set up leaves the open failed
+    /// and its cleanup failed too (the module's disconnect gets no answer). The process, found
+    /// exited, confirms nothing is held: its exit is logged, the guards stay unmarked, a worker is
+    /// started again and the read is sent again.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_exits_while_the_reopened_link_is_set_up_is_started_again() {
+        let tag = "exit-in-setup";
+        let dir = journal_dir(tag);
+        let (first, _) = fake_worker_losing(vec![unavailable()], Vec::new(), Vec::new()).await;
+        // The worker started for the reopen fails the link's connect and gives the module's
+        // disconnect no answer, as a process that is gone does.
+        let (second, _) = fake_worker_gone_in_setup().await;
+        let (third, third_calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let (source, asked_of) = scripted(
+            first,
+            vec![Ok(second), Ok(third)],
+            vec![exited(ExitHow::Signal(9)), exited(ExitHow::Signal(9))],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            Some(dir.as_path()),
+            after_loss_limits(),
+            tag,
+        )
+        .await;
+        run.result.unwrap_or_else(|error| panic!("{error}"));
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(asked(&asked_of, "launch"), 2);
+        assert_eq!(asked(&asked_of, "end"), 0);
+        assert_eq!(
+            closes(&third_calls),
+            [
+                "DisconnectComLogicalLink",
+                "DestroyComLogicalLink",
+                "ModuleDisconnect"
+            ]
+        );
+        assert_eq!(
+            worker_events(&dir),
+            [
+                "vci_connected",
+                "link_opened",
+                "worker_exit",
+                "worker_restart",
+                "worker_exit",
+                "worker_restart",
+                "vci_connected",
+                "link_opened"
+            ]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// ADR-394: when the run cannot go on after a worker exited (a request not safe to repeat

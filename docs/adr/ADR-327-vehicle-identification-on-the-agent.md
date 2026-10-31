@@ -1,7 +1,7 @@
 # ADR-327: Vehicle Identification Runs on the Agent
 
 **Date:** 2026-10-18
-**Status:** Accepted (the plan's format, its checks and the endpoint key given their form by ADR-395, which also decides the receive-table halving and carries item 8's definition chosen by hand as the plan's only candidate, one that narrows nothing)
+**Status:** Accepted (the plan's format, its checks and the endpoint key given their form by ADR-395, which also decides the receive-table halving and carries item 8's definition chosen by hand as the plan's only candidate, one that narrows nothing; item 2's presence request, its collecting mode and the halving's trigger given their form by ADR-396)
 **Affects:** `agent` (an identification job; the variant guard of jobs that change an ECU),
 `server` (identification plans, re-evaluation of the reported facts, guard lists),
 `diag-frontend` and `diag-ir` (operator-facing variant attributes, definitive negative

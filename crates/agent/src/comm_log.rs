@@ -1447,7 +1447,9 @@ struct AnswerWindow {
 /// that identifier's previous final answer, with the limit they put in force, and another ECU's
 /// final answer does not clear them. `pending_order` and `answer_order` are the places of the
 /// pendings and answers in the order the host read them (`usize::MAX` for one not read at a
-/// known place), and `ends` where each answer ended. A pending the host also lists as an answer
+/// known place), and `ends` where each answer ended. A chain of pendings is judged from the end
+/// of the latest final answer, of any identifier, read before its first pending; answers of
+/// other identifiers after that leave it whole. A pending the host also lists as an answer
 /// (the last of its identifier, with no final answer after it) is not in the window of that
 /// answer, which it closes, but in the later ones of its identifier. The entry's window is the
 /// pendings of the identifiers that never got a final answer, if any, else the last final
@@ -1482,6 +1484,22 @@ fn answer_windows(
             .rposition(|answer| !answer.is_pending(expected) && on(answer))
     };
     let order_of = |index: Option<usize>| index.map(|index| answer_order[index]);
+    // Where the collecting window the pendings of a chain came in started: the end of the latest
+    // final answer, of any identifier, read before the chain's first pending (ADR-400 decision
+    // 1). An answer not read at a known place counts as before it. `pendings` is the chain.
+    let chain_from = |pendings: &[usize], until: usize| {
+        let first = pendings
+            .iter()
+            .map(|&index| pending_order[index])
+            .min()
+            .unwrap_or(usize::MAX);
+        (0..until)
+            .rposition(|index| {
+                !evidence.answers[index].is_pending(expected)
+                    && (answer_order[index] == usize::MAX || answer_order[index] < first)
+            })
+            .map(|index| ends[index])
+    };
     let windows = (0..evidence.answers.len())
         .map(|at| {
             let id = evidence.answers[at].rx_id;
@@ -1503,8 +1521,11 @@ fn answer_windows(
                     pendings: own_pendings,
                 }
             } else {
+                // The chain started when the latest final answer before its first pending
+                // ended, whichever identifier it came on; later answers of other identifiers
+                // leave the chain whole.
                 AnswerWindow {
-                    from: previous_own.map(|previous| ends[previous]),
+                    from: chain_from(&own_pendings, at),
                     pendings: own_pendings,
                 }
             }
@@ -1535,7 +1556,7 @@ fn answer_windows(
         }
     } else {
         AnswerWindow {
-            from: None,
+            from: chain_from(&open_pendings, evidence.answers.len()),
             pendings: open_pendings,
         }
     };
@@ -2649,16 +2670,13 @@ impl CommLog {
             }
         }
         // Each answer's history as an exchange of its own: the owed requests it could belong to
-        // are its identifier's.
-        let answer_histories: Vec<_> = evidence
-            .answers
-            .iter()
-            .map(|answer| inner.links[at].1.history_for(&evidence.as_answer(answer)))
-            .collect();
-        for (answer, history) in evidence.answers.iter_mut().zip(answer_histories) {
-            answer.history = Some(history);
-        }
+        // are its identifier's. The one derivation the link also reads again at a settlement.
         let history = inner.links[at].1.history_for(&evidence);
+        let answer_histories =
+            inner.links[at]
+                .1
+                .answer_histories(&evidence, &history, inner.next_seq);
+        evidence.set_answer_histories(answer_histories);
         let clears = inner.links[at].1.clears();
         let rx_id = evidence.rx_id;
         let start_unattached = unbound
@@ -7837,6 +7855,58 @@ mod tests {
         // The pending was A's: B's answer is 1.98 s after A's, past P2.
         let entry = collecting_entry(build(false));
         assert_eq!(classes(&entry), ["none", "system"], "{entry}");
+    }
+
+    /// A pending chain starts when the latest final answer before its first pending ended,
+    /// whichever identifier it came on (ADR-400 decision 1): it is judged against the limit from
+    /// there, not from the transmit.
+    #[test]
+    fn a_pending_chain_starts_at_the_latest_final_answer_of_any_identifier() {
+        // A answers at 0.9 s, B pends at 1.5 s (0.6 s later, within P2) and answers at 2 s.
+        let entry = collecting_entry(|evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 900_000), positive_on(0x7E9, 2_000_000)];
+            evidence.pending = vec![pending_on(1_500_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+        });
+        assert_eq!(classes(&entry), ["none", "none"], "{entry}");
+        // B's pending 1.2 s after A's answer is late whoever answered before it.
+        let entry = collecting_entry(|evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 900_000), positive_on(0x7E9, 2_200_000)];
+            evidence.pending = vec![pending_on(2_100_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+        });
+        assert_eq!(classes(&entry), ["none", "system"], "{entry}");
+    }
+
+    #[test]
+    fn a_chain_is_anchored_at_the_final_answer_before_its_first_pending_not_after_it() {
+        let end_of = |window: &AnswerWindow| window.from.flatten().map(|(_, p)| p.unwrapped);
+        // A answers (end 1000), B pends twice, C answers between the pendings, B answers.
+        let (windows, entry) = windows_of(
+            vec![
+                positive_on(0x7E8, 10),
+                positive_on(0x7EA, 25),
+                positive_on(0x7E9, 40),
+            ],
+            vec![pending_on(20), pending_on(30)],
+            vec![Some(0x7E9), Some(0x7E9)],
+            &[1, 3],
+            &[0, 2, 4],
+        );
+        assert_eq!(windows[2].pendings, [0, 1]);
+        assert_eq!(end_of(&windows[2]), Some(1_000));
+        assert!(entry.pendings.is_empty());
+        // An identifier left open anchors the entry's window the same way.
+        let lone = answer_on(0x7E9, exchange::End::Negative(vec![0x7F, 0x3E, 0x78]), 20);
+        let (_, entry) = windows_of(
+            vec![positive_on(0x7E8, 10), lone],
+            vec![pending_on(20)],
+            vec![Some(0x7E9)],
+            &[1],
+            &[0, 2],
+        );
+        assert_eq!(entry.pendings, [0]);
+        assert_eq!(end_of(&entry), Some(1_000));
     }
 
     /// ISO 22900-2:2022 8.2.6.2.2: a window that got answers ends with the primitive's finished

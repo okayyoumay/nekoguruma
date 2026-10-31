@@ -26,7 +26,9 @@ response and its times on every answer, while the entry took the first answer's 
    10.2.1; ISO 22900-2:2022 8.2.6.2.2). A response pending extends the limit in force, and it is
    kept per response identifier (ISO 14229-2:2021 10.2.3): an identifier's final answer is
    judged from its own pendings since its previous final answer, with the limit they put in
-   force, and another ECU's final answer does not clear them. The host names the identifier of
+   force, and another ECU's final answer does not clear them. The chain of pendings starts at the
+   end of the latest final answer, of any identifier, read before its first pending (the window
+   that answer restarted); later answers of other identifiers leave the chain whole. The host names the identifier of
    each pending (`Evidence.pending_ids`; one it cannot name counts for every identifier).
    `timing::Times` gains `window_from`, the point the limit in force runs from (`None` is the
    transmit; a point whose place is unknown leaves the answer `not_judged` as `other_clock`).

@@ -1276,6 +1276,13 @@ impl Evidence {
         one
     }
 
+    /// Gives each answer the history [`LinkState::answer_histories`] derived for it.
+    pub(crate) fn set_answer_histories(&mut self, histories: Vec<LinkHistory>) {
+        for (answer, history) in self.answers.iter_mut().zip(histories) {
+            answer.history = Some(history);
+        }
+    }
+
     /// The exchange holds an answer the worker bound to it: a final response or a pending. The
     /// first frame of a response alone is not one (ADR-354): it confirms the send and counts as
     /// an answer, but the worker may still have discarded the full response.
@@ -1692,6 +1699,49 @@ impl LinkState {
         }
     }
 
+    /// The history of each answer of `evidence` as an exchange of its own (ADR-400): the one
+    /// place that derives it, read at every moment the entry's history is taken again (the
+    /// exchange's record, a settlement, a reset, a late link error), so that an answer's owners
+    /// follow the owed requests as they are then. `entry` is the entry's history at that moment,
+    /// whose counts the answers share; the owed requests are those logged before `before`. An
+    /// answer on another identifier than the exchange's keeps the matched count it was taken in
+    /// with, since the entry's does not count that identifier.
+    pub(crate) fn answer_histories(
+        &self,
+        evidence: &Evidence,
+        entry: &LinkHistory,
+        before: u64,
+    ) -> Vec<LinkHistory> {
+        evidence
+            .answers
+            .iter()
+            .map(|answer| {
+                let fresh = self.history_for(&evidence.as_answer(answer));
+                let owners: Vec<u64> = fresh
+                    .owners
+                    .into_iter()
+                    .filter(|owner| *owner < before)
+                    .collect();
+                let answered_same_match = if answer.rx_id == evidence.rx_id {
+                    entry.answered_same_match
+                } else {
+                    answer
+                        .history
+                        .as_ref()
+                        .map_or(fresh.answered_same_match, |own| own.answered_same_match)
+                };
+                LinkHistory {
+                    answered: entry.answered,
+                    answered_since_error: entry.answered_since_error,
+                    answered_same_match,
+                    owed_matching: owners.len() as u32,
+                    this_exchange: fresh.this_exchange,
+                    owners,
+                }
+            })
+            .collect()
+    }
+
     /// The link was opened again, the worker restarted or the VCI reconnected (design 8.11
     /// "Matched answer"): the matched answers start over, since the link may now be set up
     /// differently. The owed requests and the counts `answered` and `answered_since_error` stay
@@ -1878,6 +1928,7 @@ impl LinkState {
 
     /// The history of `evidence`, an exchange's evidence that a settling entry for exchange
     /// `seq` gives: the exchange is not an owed request its own answer could belong to.
+    /// (Answer histories: [`LinkState::answer_histories`].)
     pub(crate) fn history_settling(&self, evidence: &Evidence, seq: u64) -> LinkHistory {
         let mut history = self.history_for(evidence);
         history.owners.retain(|owner| *owner != seq);
@@ -2517,6 +2568,8 @@ impl LinkState {
         let mut evidence = self.kept.get(&seq)?.evidence.clone();
         add(&mut evidence);
         let history = self.history_settling(&evidence, seq);
+        let answer_histories = self.answer_histories(&evidence, &history, seq);
+        evidence.set_answer_histories(answer_histories);
         let mut entry = ExchangeEntry::build(seq, evidence.clone(), history);
         let kept = self.kept.get_mut(&seq)?;
         if let Some((floor, reason)) = &kept.floor
@@ -2815,14 +2868,24 @@ impl LinkState {
         history: LinkHistory,
     ) -> (Option<SettledAnswer>, Option<Reclassified>) {
         let logged = &self.window[at];
-        if history == logged.history {
+        // The answers' owners follow the owed requests as they are now.
+        let answer_histories = self.answer_histories(&logged.evidence, &history, logged.seq);
+        let unchanged = logged
+            .evidence
+            .answers
+            .iter()
+            .zip(&answer_histories)
+            .all(|(answer, fresh)| answer.history.as_ref() == Some(fresh));
+        if history == logged.history && unchanged {
             return (None, None);
         }
         // One a final response settled keeps its classification, but its answer is still freed
         // for the exchanges after it.
         let settled = logged.settled;
         let old = ExchangeEntry::build(logged.seq, logged.evidence.clone(), logged.history.clone());
-        let mut entry = ExchangeEntry::build(logged.seq, logged.evidence.clone(), history);
+        let mut evidence = logged.evidence.clone();
+        evidence.set_answer_histories(answer_histories.clone());
+        let mut entry = ExchangeEntry::build(logged.seq, evidence, history);
         let seq = logged.seq;
         // The floor first: `record` sees the classification the entry was written with.
         if let Some((floor, reason)) = &logged.floor
@@ -2884,6 +2947,7 @@ impl LinkState {
         });
         let logged = &mut self.window[at];
         logged.history = entry.link_history.clone();
+        logged.evidence.set_answer_histories(answer_histories);
         if settled
             || (entry.classification == logged.classification && entry.reason == logged.reason)
         {
@@ -9036,16 +9100,60 @@ mod tests {
             .iter()
             .map(|bytes| answer(RX, end(bytes), Window::WithinP2, 5.0))
             .collect();
-        let histories: Vec<_> = evidence
-            .answers
-            .iter()
-            .map(|answer| state.history_for(&evidence.as_answer(answer)))
-            .collect();
-        for (answer, history) in evidence.answers.iter_mut().zip(histories) {
-            answer.history = Some(history);
-        }
         let history = state.history_for(&evidence);
-        ExchangeEntry::build(owed.len() as u64 + 1, evidence, history)
+        let seq = owed.len() as u64 + 1;
+        evidence.set_answer_histories(state.answer_histories(&evidence, &history, seq));
+        ExchangeEntry::build(seq, evidence, history)
+    }
+
+    /// ADR-400 decision 4C: an answer's owners follow the owed requests as a settlement leaves
+    /// them. Read A is owed; read B got two compatible answers, which A could own; A's final
+    /// response then shows the second one is a second responder.
+    #[test]
+    fn an_owed_reads_final_response_leaves_the_later_reads_extra_answer_a_second_responder() {
+        let mut state = LinkState::default();
+        let confirmed = |did: [u8; 2], end| {
+            let mut evidence = judged(forwarding(read(did, end)));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let (_, kept) = log_kept(&mut state, 1, confirmed([0xF1, 0x91], End::NoResponse));
+        state.keep(1, kept.clone());
+        let mut second = confirmed([0xF1, 0x90], End::Positive(vec![0x62, 0xF1, 0x90, 1]));
+        second.answers = [vec![0x62, 0xF1, 0x90, 1], vec![0x7F, 0x22, 0x22]]
+            .into_iter()
+            .map(|bytes| {
+                let end = if bytes[0] == 0x7F {
+                    End::Negative(bytes)
+                } else {
+                    End::Positive(bytes)
+                };
+                answer(RX, end, Window::WithinP2, 5.0)
+            })
+            .collect();
+        let history = state.history_for(&second);
+        second.set_answer_histories(state.answer_histories(&second, &history, 2));
+        let (entry, _) = log_kept(&mut state, 2, second);
+        assert_eq!(
+            entry.classification,
+            Classification::Undetermined,
+            "{}",
+            entry.reason
+        );
+        let (_, changed, _) = settle_late(&mut state, 1, &kept, &[0x62, 0xF1, 0x91, 7]);
+        let later = changed.iter().find(|later| later.seq == 2);
+        assert_eq!(
+            later.map(|later| later.classification),
+            Some(Classification::Vehicle),
+            "{changed:?}"
+        );
+        let logged = state.window.iter().find(|logged| logged.seq == 2).unwrap();
+        assert!(logged.evidence.answers.iter().all(|answer| {
+            answer
+                .history
+                .as_ref()
+                .is_some_and(|own| own.owners.is_empty() && own.owed_matching == 0)
+        }));
     }
 
     #[test]

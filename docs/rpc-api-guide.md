@@ -1528,7 +1528,18 @@ Promotion (Working → Active) happens at exactly two points:
   point-to-point `FLOW_CONTROL_FILTER`s directly from it, since ISO15765
   `FLOW_CONTROL_FILTER`s are per-CLL (ADR-039), not a property of the shared
   physical channel. A table staged before connecting takes effect
-  immediately at Connect; an empty table installs nothing (ADR-048).
+  immediately at Connect; an empty table installs nothing (ADR-048). If the
+  adapter refuses one of the table's filters (a pattern or flow-control
+  identifier another filter uses, or its filter limit), the connect fails
+  with `Code::Internal` and the `PDUError` of the native status, after the
+  filters the table took are given back and the link is rolled back (ADR-398).
+  Two other failures of that install fail the connect with other statuses: a
+  lost device (`ERR_DEVICE_NOT_CONNECTED`) is `FAILED_PRECONDITION` with
+  `PDU_ERR_EVT_LOST_COMM_TO_VCI` (the lost VCI, below), and any other error is
+  `UNKNOWN` with `PDU_ERR_FCT_FAILED`. A filter a sibling CLL on the channel
+  already installed for the same pattern and flow-control pair is shared, not
+  installed again, and stopped when its last CLL leaves. A refusal during
+  `COPT_UPDATEPARAM`'s promotion does not fail it.
 - **`StartComPrimitive(COPT_UPDATEPARAM)` execution.** Snapshots the Working
   table at the same call time as the Working ComParam set, and — only on
   hardware success — promotes it to Active, reconciling ISO15765
@@ -1708,7 +1719,7 @@ worker. The rows are checked in order; the first that matches is the reading.
 | The answer | Reading | The agent's use |
 |---|---|---|
 | The client's own deadline for the call passed (no answer) | The worker does not answer: neither a refusal nor a success | `HostError::WorkerUnresponsive`; a `StartComPrimitive` so answered is `SendState::MayHaveReached` |
-| Code `UNAVAILABLE`, `CANCELLED` or `UNKNOWN` | The connection to the worker failed: the call may not have reached the library, so this is no answer of the library's | Never read as a refusal (`agent::link`'s `refused`; the guarded handle's `refuses_indication` in `ngr-hw-checks` keeps its own copy) |
+| Code `UNAVAILABLE`, `CANCELLED` or `UNKNOWN` | The connection to the worker failed: the call may not have reached the library, so this is no answer of the library's. `j2534-0404-service` also answers `UNKNOWN` (with `PDU_ERR_FCT_FAILED`) for a `ConnectComLogicalLink` whose receive-table filter failed with an error that is neither a refusal of the filter nor a lost device (ADR-398): the table is not shown to be at fault | Never read as a refusal (`agent::link`'s `refused`; the guarded handle's `refuses_indication` in `ngr-hw-checks` keeps its own copy) |
 | Code `FAILED_PRECONDITION` with `error_event_data.error_event` `PDU_ERR_EVT_LOST_COMM_TO_VCI` | The VCI is lost; the link is offline and the worker ended its primitives. A `StartComPrimitive` answered so was not sent (ADR-294) | `HostError::VciLost { refused_after_loss: true }`, `SendState::NotSent` |
 | `ErrorDetail.pdu_error` `PDU_ERR_INVALID_HANDLE`, whatever the code | The worker knows no object with the handle given (ISO 22900-2:2022 D.3). For a `CancelComPrimitive`, the primitive had already ended, which counts as cancelled | The host's stray-primitive cancel (`names_invalid_handle`); the guarded handle's `cancel_maybe_ended` |
 | A `StartComPrimitive` whose `ErrorDetail.refusal` is set | Refused before anything was sent, for the reason named (ADR-350) | The entry is `not_sent`; `SendState::NotSent` |

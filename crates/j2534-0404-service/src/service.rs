@@ -2977,6 +2977,18 @@ struct SharedChannel {
     /// covered it, while an entry that started at or after it is a genuine
     /// post-clear leak this clear never touched and must stay tracked.
     leaked_periodic_message_ids: Vec<(j2534_0404::PeriodicMessageId, u64)>,
+    /// ADR-398: the point-to-point filters (`FLOW_CONTROL_FILTER`s, and the
+    /// native-mixed UUDT `PASS_FILTER`) installed on this channel from the
+    /// links' `UniqueRespIdTable`s, one slot per distinct filter (pattern,
+    /// flow-control address, type and protocol id) with the number of links
+    /// using it. A link whose table repeats a filter another link already
+    /// installed shares it instead of installing it again (an adapter
+    /// refuses a repeated pattern or flow-control id), and the filter is
+    /// stopped when its last user leaves (`Disconnect`, `Destroy`, a failed
+    /// connect, a promoted or reinstalled table). Part of the entry, so it
+    /// goes with the channel when the last link closes it, and is cleared
+    /// when a hard error kills the channel. Guarded by `shared_channels`.
+    p2p_filters: HashMap<rpc_link::P2pFilterKey, rpc_link::P2pFilterSlot>,
     /// SAE J2534-2 clause 10 Analog Inputs (ADR-178): the CONFIG_SAMPLE_RATE
     /// value actually applied to this physical channel via SET_CONFIG at
     /// connect time, `Some(rate)` iff this channel was opened for one of the
@@ -3988,14 +4000,17 @@ struct LogicalLinkState {
     /// `working_unique_resp_id_table`; a temp COP's completion never touches
     /// either table.
     active_unique_resp_id_table: Vec<EcuUniqueRespEntry>,
-    /// Filter IDs of the point-to-point `FLOW_CONTROL_FILTER`s currently installed
-    /// on `channel_id` for this CLL's `active_unique_resp_id_table` entries (ISO15765
-    /// only). Empty when the table has no entry with a full `CP_CanRespUSDTId` +
+    /// The point-to-point filters this CLL uses on its channel for its
+    /// `active_unique_resp_id_table` entries (ISO15765 only), as keys into the
+    /// channel's `SharedChannel::p2p_filters` (ADR-398): a filter a sibling
+    /// installed first is listed here too and only counted, not installed
+    /// again. Formerly the filter ids installed for this CLL alone, hence the
+    /// name. Empty when the table has no entry with a full `CP_CanRespUSDTId` +
     /// `CP_CanPhysReqId` address pair — this CLL then has no `FLOW_CONTROL_FILTER`
     /// of its own on the shared channel at all (the zero-mask pass-all fallback
     /// that used to cover this case was spec-non-conformant and has been removed
     /// entirely, ADR-122).
-    unique_resp_filter_ids: Vec<MessageFilterId>,
+    unique_resp_filter_ids: Vec<rpc_link::P2pFilterKey>,
     /// cop_handles that have been cancelled but not yet dequeued by the poll task.
     /// The poll task checks this set before executing each TxItem and emits
     /// PduCopstCancelled then skips the item when the handle is present.

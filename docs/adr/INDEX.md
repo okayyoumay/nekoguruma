@@ -40,7 +40,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-036](ADR-036-registry-enumerate-libraries-config-merge.md) | `enumerate_libraries` — Merge Config-File Libraries into Registry Enumeration | Superseded by ADR-281 | `vci-service-config`, `iso22900-registry`, `j2534-0404-registry`, `vci-service-manager` |
 | [ADR-037](ADR-037-stmin-override-unit-conversion.md) | CP_StMinOverride ↔ J2534 STMIN_TX Unit Conversion | Accepted | `j2534-0404-service` comparam_id, rpc_link, events |
 | [ADR-038](ADR-038-msg-filter-type-protocol-restriction.md) | Message Filter Type Restricted by Protocol (ISO15765 vs. Others) | **Superseded by ADR-039** | `j2534-0404-service` rpc_link, rpc_misc |
-| [ADR-039](ADR-039-point-to-point-flow-control-filter.md) | Point-to-Point FLOW_CONTROL_FILTER from UniqueRespIdTable Addressing | Accepted (pass-all fallback amended by ADR-068; removed by ADR-122) | `j2534-0404-service` service, rpc_link, rpc_misc, `j2534-0404-mock` |
+| [ADR-039](ADR-039-point-to-point-flow-control-filter.md) | Point-to-Point FLOW_CONTROL_FILTER from UniqueRespIdTable Addressing | Accepted (pass-all fallback amended by ADR-068; removed by ADR-122; a refused filter at the connect fails the connect, by ADR-398) | `j2534-0404-service` service, rpc_link, rpc_misc, `j2534-0404-mock` |
 | [ADR-040](ADR-040-can-id-format-table-b13-flow-control-filter.md) | CP_Can*Format (Table B.13) Decoding for Point-to-Point FLOW_CONTROL_FILTER | **Superseded by ADR-041** | `j2534-0404-service` rpc_link, `j2534-0404-mock` |
 | [ADR-041](ADR-041-uudt-point-to-point-flow-control-filter.md) | UUDT Point-to-Point FLOW_CONTROL_FILTER from CP_CanRespUUDTId Addressing | Accepted | `j2534-0404-service` rpc_link, `j2534-0404-mock` |
 | [ADR-042](ADR-042-unique-id-class-comparams-rejected-by-get-set-comparam.md) | PDU_PC_UNIQUE_ID Class Boundary Enforced Symmetrically Between the Two ComParam RPC Pairs | Accepted | `j2534-0404-service` comparam_support, rpc_link, rpc_misc |
@@ -69,7 +69,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-065](ADR-065-passthruconnect-flag-derivation.md) | `PassThruConnect` `Flags` Are Derived From Working ComParams / UniqueRespIdTable | Accepted | `j2534-0404-service` rpc_link, `j2534-0404-mock`, `j2534-0404` |
 | [ADR-066](ADR-066-temp-param-update-for-copstartcomm-copstopcomm-live-resolution.md) | temp_param_update for CoptStartcomm/CoptStopcomm: Live Resolution Bounded to the Transient Init Transaction | **Superseded by ADR-067** | `j2534-0404-service` rpc_primitive, events, service |
 | [ADR-067](ADR-067-comparams-bind-at-startcomprimitive-call-time.md) | ComParams Bind to the ComPrimitive at StartComPrimitive Call Time (Snapshot), per ISO 22900-2 | Accepted | `j2534-0404-service` service, rpc_primitive, events, comparam_support |
-| [ADR-068](ADR-068-unique-resp-id-table-working-active-split.md) | UniqueRespIdTable Gets a Working/Active Split, Mirroring ComParamSet (ADR-067) | Accepted | `j2534-0404-service` service, rpc_link, rpc_misc, rpc_primitive, events |
+| [ADR-068](ADR-068-unique-resp-id-table-working-active-split.md) | UniqueRespIdTable Gets a Working/Active Split, Mirroring ComParamSet (ADR-067) | Accepted (the connect's filter install fails the connect on a refusal, by ADR-398) | `j2534-0404-service` service, rpc_link, rpc_misc, rpc_primitive, events |
 | [ADR-069](ADR-069-j2534-resource-id-table.md) | ISO 22900-2 Resource Table for GetResourceIds / CreateComLogicalLink | Accepted (amended for `GetObjectId(OBJT_PROTOCOL/OBJT_BUSTYPE)`; `GetConflictingResources` portions superseded by ADR-106; extended alongside by ADR-156's `_PS`/`_CHx` resolution path) | `j2534-0404-service` resources (new), protocol, names, rpc_link |
 | [ADR-070](ADR-070-j1850-vpw-pwm-autodetect.md) | SAE_J1850 VPW/PWM Auto-Detect at ConnectComLogicalLink | Accepted | `j2534-0404-service` rpc_link, resources, protocol, comparam_defaults, `j2534-0404-mock` |
 | [ADR-071](ADR-071-cp-uartconfig-decode.md) | CP_UartConfig Decodes to DATA_BITS + PARITY | Accepted | `j2534-0404-service` comparam_id, rpc_link, events |
@@ -385,8 +385,9 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-393](ADR-393-a-run-continues-after-its-vci-comes-back.md) | A Run Continues After Its VCI Comes Back | Accepted (item 2's "a worker that crashed is not restarted" superseded by ADR-394) | `agent` host (`resend_class`, `WorkerHost::reopen`), runner (`run_vm`, `JobLimits` reopen bounds), restart (`repeat_decision`), communication log (`settle_loss`, `vci_connected`, `link_opened`); design 8.2.5, 8.11; ADR-258; ADR-289; ADR-294; ADR-335; ADR-373; ADR-392 |
 | [ADR-394](ADR-394-the-run-relaunches-a-worker-that-exited.md) | The Run Starts a Worker That Exited Again | Accepted (the settle step of item 3 also runs after a link fails to open and to close again, in both runners, by ADR-396) | `agent` source of the worker (`WorkerSource`, `launch::RelaunchingWorker`), host (`try_reopen`, `Relink`), runner (`run_job`'s end), `main.rs`; `worker-host` (`WorkerProcess::try_wait`, `kill`); communication log (`worker_exit`, `worker_restart`); design 8.2.5, 8.11; ADR-258; ADR-392; ADR-393 |
 | [ADR-395](ADR-395-the-identification-plan-format.md) | The Identification Plan Format, Its Checks and the Endpoint Key | Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396) | `diag-ir` `plan`, `agent` `identification`; design 8.8.2; ADR-318, ADR-319, ADR-324, ADR-326, ADR-327 |
-| [ADR-396](ADR-396-the-presence-requests-collecting-mode.md) | The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule | Accepted | `agent` link, policy, host, communication log, runner and `identification`; design 8.8.2, 8.11; ADR-235 item 8, ADR-327 item 2, ADR-392, ADR-393, ADR-394, ADR-395 |
+| [ADR-396](ADR-396-the-presence-requests-collecting-mode.md) | The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule | Accepted (item 8 realized by ADR-398) | `agent` link, policy, host, communication log, runner and `identification`; design 8.8.2, 8.11; ADR-235 item 8, ADR-327 item 2, ADR-392, ADR-393, ADR-394, ADR-395 |
 | [ADR-397](ADR-397-a-parity-gap-is-fixed-by-sharing-the-existing-code.md) | A Parity Gap Is Fixed by Sharing the Existing Code | Accepted | `.claude/README.md` (gates, the parity check), `.claude/agents/edge-case-hunter.md` |
+| [ADR-398](ADR-398-a-refused-connect-time-filter-fails-the-j2534-connect.md) | A Refused Connect-Time Filter Fails the J2534 Connect; the Log Header Names the Job Kind; `ngr-agent identify` | Accepted | `j2534-0404-service` rpc_link; `agent` comm_log, runner, identification, `main.rs`; design 8.8.2, 8.11; ADR-039, ADR-068, ADR-396, ADR-397 |
 
 ## Status Legend
 
@@ -473,7 +474,7 @@ the predecessor repository these ADRs came from.
 - ADR-064 (superseded)
 - ADR-066 (superseded)
 - ADR-067 (amended by ADR-110)
-- ADR-068
+- ADR-068 (the connect's filter install fails the connect on a refusal, by ADR-398)
 - ADR-110
 
 ### Poll Task & TX Queue
@@ -589,7 +590,7 @@ the predecessor repository these ADRs came from.
 - ADR-005 (superseded)
 - ADR-008 (superseded)
 - ADR-038 (superseded)
-- ADR-039 (pass-all fallback removed by ADR-122)
+- ADR-039 (pass-all fallback removed by ADR-122; a refused filter at the connect fails the connect, by ADR-398)
 - ADR-040 (partially superseded)
 - ADR-041
 - ADR-048 (extended by ADR-122)
@@ -613,7 +614,7 @@ the predecessor repository these ADRs came from.
 ### RX Routing
 - ADR-007 (J1939 source-address matching added by ADR-184)
 - ADR-043
-- ADR-068
+- ADR-068 (the connect's filter install fails the connect on a refusal, by ADR-398)
 - ADR-162
 - ADR-180
 - ADR-184
@@ -884,7 +885,8 @@ the predecessor repository these ADRs came from.
 - ADR-390
 - ADR-391
 - ADR-395 (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396)
-- ADR-396
+- ADR-396 (item 8 realized by ADR-398)
+- ADR-398
 
 ### Acquired Data & Monitoring
 - ADR-236

@@ -1115,6 +1115,7 @@ mod tests {
                 occupancy_epoch: 0,
                 leaked_repeat_message_ids: Vec::new(),
                 leaked_periodic_message_ids: Vec::new(),
+                p2p_filters: Default::default(),
                 applied_analog_sample_rate: None,
                 applied_analog_samples_per_reading: None,
                 applied_analog_readings_per_msg: None,

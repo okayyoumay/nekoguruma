@@ -1,7 +1,7 @@
 # ADR-396: The Presence Request's Collecting Mode, Its Halving Trigger and Its Loss Rule
 
 **Date:** 2026-10-31
-**Status:** Accepted
+**Status:** Accepted (item 8 realized by ADR-398)
 **Affects:** `agent` (`link`, `policy`, `host`, `comm_log`, `runner`, `identification`),
 `crates/agent/docs/ngr-agent.md`, design 8.8.2 and 8.11; ADR-235 item 8, ADR-327 item 2,
 ADR-392, ADR-393, ADR-394, ADR-395
@@ -92,7 +92,7 @@ handling of a refused table entry are separate steps.
    JSON (hashes and bytes as lowercase hex). The runner's open, log, host, settle and close shell,
    and the loop that opens a link again within the bounds, are shared with `run_program`, which
    behaves as before.
-8. **Not decided here.** The J2534 worker today logs and skips a refused table entry instead of
+8. **Not decided here (done by ADR-398).** The J2534 worker today logs and skips a refused table entry instead of
    failing the connect, so a halving against `sim-vci` waits for that change in the worker, which
    is the next step; the halving is tested here against a scripted worker. The communication log's
    header still names the job kind a procedure, until the identification job kind exists.

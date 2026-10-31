@@ -1353,8 +1353,10 @@ async fn non_native_mixed_mode_accepts_a_colliding_uudt_usdt_table() {
     // Confirm this is still exercising a collision-shaped table (both a
     // FLOW_CONTROL_FILTER-eligible USDT id and a UUDT id at the same
     // numeric address), not an accidentally-empty one: the pre-existing
-    // ADR-041 workaround installs a FLOW_CONTROL_FILTER for each.
-    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 2);
+    // ADR-041 workaround wants a FLOW_CONTROL_FILTER for each, and both are
+    // the same pattern/flow-control pair, so the channel holds the one filter
+    // they share (ADR-398: an adapter refuses a repeated pair).
+    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 1);
 
     // The promote-time path must likewise accept a (different) colliding
     // table outside native-mixed mode.
@@ -1371,7 +1373,7 @@ async fn non_native_mixed_mode_accepts_a_colliding_uudt_usdt_table() {
         )],
     )
     .await;
-    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 2);
+    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 1);
 
     server.shutdown().await;
 }

@@ -11,8 +11,8 @@ use super::{
     PARAM_PHYS_REQ_TARGET_ADDR, comparam_defaults, comparam_support, discovery, events, *,
 };
 use crate::error::{
-    gm_uart_shared_channel_locked_status, map_native_error_as, map_native_error_for_link,
-    state_guard_status, unknown_handle_status,
+    gm_uart_shared_channel_locked_status, map_connect_filter_failure, map_native_error_as,
+    map_native_error_for_link, state_guard_status, unknown_handle_status,
 };
 
 /// SAE J1850 OBD-II functional-request frame used by the VPW/PWM auto-detect
@@ -1314,6 +1314,141 @@ pub(super) fn effective_fd_tx_dl(params: &ComParamSet) -> usize {
 #[derive(Debug)]
 pub(super) struct NativeMixedTableCollision(CanAddress);
 
+/// ADR-398: the adapter refused one entry's point-to-point filter while the
+/// connect-time table was being installed. `acquired` holds the filters the
+/// table had taken before the refusal (installed or shared with a sibling),
+/// so the caller can give them back.
+#[derive(Debug)]
+pub(super) struct FilterInstallRefusal {
+    acquired: Vec<P2pFilterKey>,
+    error: j2534_0404::Error,
+}
+
+/// ADR-398: one CAN address of a point-to-point filter, as the filter
+/// messages carry it (`can_filter_message`).
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct FilterAddrKey {
+    id: u32,
+    tx_flags: u32,
+    ext_addr: Option<u8>,
+}
+
+impl FilterAddrKey {
+    fn new(addr: &CanAddress, filter_type: u32) -> Self {
+        Self {
+            id: addr.id,
+            tx_flags: addr.format.tx_flags(filter_type),
+            ext_addr: addr.format.extended_addressing.then_some(addr.ext_addr),
+        }
+    }
+}
+
+/// ADR-398: what makes two point-to-point filters the same filter on a
+/// channel: the filter type, the protocol id of its messages, its pattern
+/// address and its flow-control address. The mask follows from the pattern.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub(super) struct P2pFilterKey {
+    filter_type: u32,
+    protocol_id: u32,
+    pattern: FilterAddrKey,
+    flow_control: Option<FilterAddrKey>,
+}
+
+impl P2pFilterKey {
+    fn new(
+        filter_type: u32,
+        resp: &CanAddress,
+        req: Option<&CanAddress>,
+        protocol_id: u32,
+    ) -> Self {
+        Self {
+            filter_type,
+            protocol_id,
+            pattern: FilterAddrKey::new(resp, filter_type),
+            flow_control: (filter_type == j2534_0404::FLOW_CONTROL_FILTER)
+                .then(|| req.map(|req| FilterAddrKey::new(req, filter_type)))
+                .flatten(),
+        }
+    }
+}
+
+/// ADR-398: a point-to-point filter installed on a channel and the number of
+/// links using it.
+#[derive(Debug)]
+pub(super) struct P2pFilterSlot {
+    filter_id: MessageFilterId,
+    users: u32,
+}
+
+/// ADR-398: takes a use of the filter `key` on `sc` for a link whose filters
+/// so far are `held`. A filter the link already holds (its table repeats the
+/// pair) or that a sibling installed is only counted; otherwise it is
+/// installed, and the adapter's refusal is returned.
+fn acquire_p2p_filter(
+    api: &J2534Api0404,
+    sc: &mut SharedChannel,
+    held: &mut Vec<P2pFilterKey>,
+    filter_type: u32,
+    resp: &CanAddress,
+    req: Option<&CanAddress>,
+    protocol_id: u32,
+) -> Result<(), j2534_0404::Error> {
+    let key = P2pFilterKey::new(filter_type, resp, req, protocol_id);
+    if held.contains(&key) {
+        return Ok(());
+    }
+    if let Some(slot) = sc.p2p_filters.get_mut(&key) {
+        slot.users += 1;
+    } else {
+        let filter_id = install_point_to_point_fc_filter(
+            api,
+            sc.channel_id,
+            filter_type,
+            resp,
+            req,
+            protocol_id,
+        )?;
+        sc.p2p_filters.insert(
+            key.clone(),
+            P2pFilterSlot {
+                filter_id,
+                users: 1,
+            },
+        );
+    }
+    held.push(key);
+    Ok(())
+}
+
+/// ADR-398: gives back a link's uses of the filters `keys` on `sc` and
+/// returns the filters nobody uses any more, which the caller stops.
+fn release_p2p_filters(sc: &mut SharedChannel, keys: &[P2pFilterKey]) -> Vec<MessageFilterId> {
+    let mut unused = Vec::new();
+    for key in keys {
+        let Some(slot) = sc.p2p_filters.get_mut(key) else {
+            continue;
+        };
+        slot.users = slot.users.saturating_sub(1);
+        if slot.users == 0
+            && let Some(slot) = sc.p2p_filters.remove(key)
+        {
+            unused.push(slot.filter_id);
+        }
+    }
+    unused
+}
+
+/// ADR-398: stops filters on `channel_id` that no link uses any more. A stop
+/// the adapter refuses is logged: the filter is gone from the bookkeeping
+/// either way, and a stale id is not actionable.
+fn stop_p2p_filters(api: &J2534Api0404, channel_id: ChannelId, ids: &[MessageFilterId]) {
+    for &id in ids {
+        if let Err(err) = api.stop_message_filter(channel_id, id) {
+            warn!(channel_id = channel_id.0, filter_id = id.0, %err, "failed to stop a point-to-point filter");
+        }
+    }
+}
+
 impl J2534Service {
     pub(super) async fn rpc_get_resource_status(
         &self,
@@ -2525,6 +2660,17 @@ impl J2534Service {
         let was_connected = link.connected;
         let channel_id_for_tp = link.channel_id;
 
+        // ADR-398: give back this CLL's uses of the channel's point-to-point
+        // filters; the ones no sibling uses are stopped below. Looked up by
+        // key alone (a hard error clears `channel_id` but keeps the key), and
+        // the stops go out only while the channel is still the one this link
+        // was connected on.
+        let unused_filters: Vec<MessageFilterId> = link
+            .channel_key
+            .and_then(|key| chans.get_mut(&key))
+            .map(|sc| release_p2p_filters(sc, &link.unique_resp_filter_ids))
+            .unwrap_or_default();
+
         // Stop this CLL's client-installed message filters before it goes away.
         // (ADR-010's pattern): done regardless of whether the physical channel
         // is shared or about to close -- harmless if the channel is about to
@@ -2564,6 +2710,13 @@ impl J2534Service {
                 if let Err(err) = api.stop_message_filter(channel_id, *filter_id) {
                     warn!(cll_handle = handle, %err, "DestroyComLogicalLink: stop_message_filter failed");
                 }
+            }
+            if link
+                .channel_key
+                .and_then(|key| chans.get(&key))
+                .is_some_and(|sc| sc.channel_id == channel_id)
+            {
+                stop_p2p_filters(&api, channel_id, &unused_filters);
             }
             // SAE J2534-2 clause 14 Repeat Messaging (ADR-165 Decision 4/6,
             // Codex review PR #42 round 2 Finding A): best-effort STOP for
@@ -3509,6 +3662,7 @@ impl J2534Service {
                 occupancy_epoch,
                 leaked_repeat_message_ids: Vec::new(),
                 leaked_periodic_message_ids: Vec::new(),
+                p2p_filters: Default::default(),
                 applied_analog_sample_rate,
                 applied_analog_samples_per_reading,
                 applied_analog_readings_per_msg,
@@ -3880,6 +4034,59 @@ impl J2534Service {
         )))
     }
 
+    /// ADR-398: undoes a connect whose point-to-point filter install failed,
+    /// after `finalize_connected_link` already published the link. The
+    /// filters the table took are handed to the link and the link is taken
+    /// offline the way `DisconnectComLogicalLink` does (`take_link_offline`,
+    /// ADR-397), with the occupancy epoch of this join restored; that
+    /// closes the channel when this link was its last user. A failure while
+    /// taking the link offline (a stop, the channel's disconnect) is logged
+    /// and never replaces the connect's own status, which is
+    /// [`map_connect_filter_failure`]'s.
+    ///
+    /// `chans` is the guard `finalize_connected_link` was given, held since:
+    /// no disconnect, destroy or hard error can have taken the link's
+    /// connection meanwhile. The teardown still acts only on a link that
+    /// holds `channel_key`, and stops filters only on the channel this
+    /// connect used.
+    async fn unwind_refused_connect(
+        &self,
+        handle: u32,
+        channel_key: ChannelKey,
+        join_epoch_rollback: Option<(u64, u64)>,
+        mut chans: tokio::sync::MutexGuard<'_, HashMap<ChannelKey, SharedChannel>>,
+        refusal: FilterInstallRefusal,
+    ) -> Status {
+        let FilterInstallRefusal { acquired, error } = refusal;
+        let handed_over = {
+            let mut links = self.logical_links.lock().await;
+            match links.get_mut(&handle) {
+                Some(link) => {
+                    link.unique_resp_filter_ids = acquired.clone();
+                    true
+                }
+                None => false,
+            }
+        };
+        if !handed_over && let Some(sc) = chans.get_mut(&channel_key) {
+            // Not reachable while `chans` is held, but never leave counts.
+            self.release_point_to_point_filters(sc, &acquired).await;
+        }
+        if let Err(status) = self
+            .take_link_offline(handle, chans, Some(channel_key), join_epoch_rollback)
+            .await
+        {
+            warn!(cll_handle = handle, %status, "rolling back a refused ConnectComLogicalLink: taking the link offline failed");
+        }
+        let last_error = self
+            .logical_links
+            .lock()
+            .await
+            .get(&handle)
+            .and_then(|l| l.last_error.clone());
+        map_connect_filter_failure(&error, last_error, events::module_timestamp_us())
+    }
+
     /// Shared rollback tail for `finalize_connected_link`'s two reject paths
     /// (ADR-012/ADR-161's concurrent-destroy race, and ADR-162 Decision 2's
     /// native-mixed collision reject) and, since ADR-161's dedicated
@@ -4219,7 +4426,10 @@ impl J2534Service {
         // note for `dual_channel`). `effective_can_mode` is read once and
         // reused for all three locals below, rather than calling
         // `effective_can_channel_mode()` again, since it is an async call
-        // that locks `resolved_can_channel_mode`.
+        // that locks `resolved_can_channel_mode`. This snapshot only drives
+        // the connect-time native-mixed channel setup, which an explicit
+        // mode fixes and `auto` never resolves to; the ISO15765 filter
+        // install re-reads the mode at install time (see below).
         //
         // - `native_mixed_applies`: `true` iff this link's primary channel
         //   is ISO15765-family, not FD-substituted (ADR-159's own fallback
@@ -4870,7 +5080,6 @@ impl J2534Service {
             analog_connect_sync,
         )
         .await?;
-        drop(chans);
 
         // Build ISO15765 point-to-point FLOW_CONTROL_FILTERs directly from this
         // CLL's UniqueRespIdTable as configured up to this point — no wide-open
@@ -4880,46 +5089,109 @@ impl J2534Service {
         // installs nothing, so the CLL receives only what other CLLs sharing the
         // channel already cause the adapter to forward, until its own
         // SetUniqueRespIdTable call installs filters of its own.
+        //
+        // `chans` stays held through the install (ADR-398): the channel's
+        // filter counts and this link's keys change together, and no
+        // disconnect or join can see the link half-installed.
         if base_proto_id == j2534_0404::ISO15765 {
-            let entries = {
+            // Auto mode (ADR-046 addendum, ADR-047): the strict install below
+            // must use the mode as resolved for this device NOW, never the
+            // snapshot taken before the channel was created or joined, which
+            // in `auto` is only the pre-probe fallback. The filters depend on
+            // it: under `DualChannel` a UUDT response id is served by the
+            // companion channel and gets no flow-control filter, while under
+            // `SingleChannel` it gets the flow-control workaround that an
+            // adapter enforcing unique flow-control ids refuses when the USDT
+            // filter shares the request id.
+            //
+            // So EVERY unqualified, non-FD ISO15765 connect (creator or
+            // joiner) runs `probe_can_channel_mode` and then re-reads the
+            // mode, after giving up `chans`. The probe is a no-op once the
+            // mode is resolved; while another connect's probe is still in
+            // flight, it waits on `resolved_can_channel_mode`'s lock, which
+            // the probe holds across its work, so this connect installs only
+            // after the result exists. If nothing has probed yet, this
+            // connect does. No lock is held across the probe except that
+            // cache's own (ADR-080). A non-`auto` mode is fixed, so its
+            // snapshot is already final and `chans` stays held.
+            // ADR-157 accepted residual, widened to `_CHx` by ADR-156
+            // Decision 3 addendum/Phase 2b: also skipped for a qualified
+            // (`_PS` or `_CHx`) link -- an `ISO15765_PS`/`ISO15765_CHx` link
+            // always uses hardware ISO-TP, so it must never be the one that
+            // decides (or is affected by) the module-wide probe.
+            //
+            // The probe takes `shared_channels` itself (through
+            // `ensure_uudt_companion_channel`), and needs the link already
+            // published as connected, so `chans` is given up around it and
+            // taken again (ADR-080 order: `shared_channels` before `api`).
+            // The link is checked again afterwards: a disconnect that ran in
+            // the gap has taken it offline, and nothing is installed for it.
+            let mut effective_can_mode = effective_can_mode;
+            let mut still_online = true;
+            if link_pin_select.is_none()
+                && link_channel_index.is_none()
+                && !resources::is_fd_protocol_id(j2534_proto_id)
+                && self.can_channel_mode == CanChannelMode::Auto
+            {
+                drop(chans);
+                self.probe_can_channel_mode(handle).await;
+                effective_can_mode = self.effective_can_channel_mode().await;
+                chans = self.shared_channels.lock().await;
+                still_online = self
+                    .logical_links
+                    .lock()
+                    .await
+                    .get(&handle)
+                    .is_some_and(|l| l.connected && l.channel_key == Some(channel_key));
+            }
+            let entries = if still_online {
                 let links = self.logical_links.lock().await;
                 links
                     .get(&handle)
                     .map(|l| l.active_unique_resp_id_table.clone())
                     .unwrap_or_default()
+            } else {
+                Vec::new()
             };
-            let filter_ids = self
-                .install_point_to_point_fc_filters(
-                    channel_id,
-                    &entries,
-                    j2534_proto_id,
-                    link_pin_select.is_some()
-                        || link_channel_index.is_some()
-                        || resources::is_fd_protocol_id(j2534_proto_id),
-                )
-                .await;
-            if let Some(link) = self.logical_links.lock().await.get_mut(&handle) {
-                link.unique_resp_filter_ids = filter_ids;
+            // ADR-398: an adapter refusal of an entry's filter fails the
+            // connect (as a refused staged client filter does, ADR-129)
+            // instead of leaving the link up without that response path.
+            let installed = match chans.get_mut(&channel_key) {
+                Some(sc) => Some(
+                    self.install_point_to_point_fc_filters_strict(
+                        sc,
+                        &entries,
+                        j2534_proto_id,
+                        link_pin_select.is_some()
+                            || link_channel_index.is_some()
+                            || resources::is_fd_protocol_id(j2534_proto_id),
+                        effective_can_mode,
+                    )
+                    .await,
+                ),
+                None => None,
+            };
+            match installed {
+                Some(Ok(keys)) => {
+                    if let Some(link) = self.logical_links.lock().await.get_mut(&handle) {
+                        link.unique_resp_filter_ids = keys;
+                    }
+                }
+                Some(Err(refusal)) => {
+                    return Err(self
+                        .unwind_refused_connect(
+                            handle,
+                            channel_key,
+                            join_epoch_rollback,
+                            chans,
+                            refusal,
+                        )
+                        .await);
+                }
+                None => {}
             }
         }
-
-        // Auto mode: the first ISO15765-family CLL to establish a *new*
-        // physical ISO15765 channel decides, once, whether this device is
-        // dual-channel-capable (ADR-046 addendum). A no-op for every other
-        // mode and for joining CLLs (whose channel's creator already probed).
-        // ADR-157 accepted residual, widened to `_CHx` by ADR-156 Decision 3
-        // addendum/Phase 2b: also skipped for a qualified (`_PS` or `_CHx`)
-        // link -- an `ISO15765_PS`/`ISO15765_CHx` link always uses hardware
-        // ISO-TP, so it must never be the one that decides (or is affected
-        // by) the module-wide dual-channel-mode probe.
-        if is_new_channel
-            && base_proto_id == j2534_0404::ISO15765
-            && link_pin_select.is_none()
-            && link_channel_index.is_none()
-            && !resources::is_fd_protocol_id(j2534_proto_id)
-        {
-            self.probe_can_channel_mode(handle).await;
-        }
+        drop(chans);
 
         // Dual-channel mode: when the UniqueRespIdTable already configures a
         // UUDT response ID (set before connect), open the companion raw-CAN
@@ -5061,14 +5333,76 @@ impl J2534Service {
     /// only the earlier connect-time `SET_CONFIG` value differs by
     /// sub-mode. Mutually exclusive with `dual_channel` by construction (see
     /// `native_mixed`'s own doc comment below).
+    ///
+    /// Lenient form, used where a table is set after connect (the promote
+    /// path and the reinstall after `CLEAR_MSG_FILTERS`): an adapter refusal
+    /// of one entry's filter is logged and that entry is skipped (ADR-039,
+    /// ADR-068). The connect path uses
+    /// [`Self::install_point_to_point_fc_filters_strict`] instead (ADR-398).
     pub(super) async fn install_point_to_point_fc_filters(
         &self,
-        channel_id: ChannelId,
+        sc: &mut SharedChannel,
         entries: &[EcuUniqueRespEntry],
         protocol_id: u32,
         qualified: bool,
-    ) -> Vec<MessageFilterId> {
-        // Computed BEFORE `api` is locked below (Fix for an AB-BA deadlock
+        effective_can_mode: CanChannelMode,
+    ) -> Vec<P2pFilterKey> {
+        match self
+            .install_point_to_point_fc_filters_core(
+                sc,
+                entries,
+                protocol_id,
+                qualified,
+                effective_can_mode,
+                false,
+            )
+            .await
+        {
+            Ok(keys) => keys,
+            Err(refusal) => refusal.acquired,
+        }
+    }
+
+    /// Strict form, used at `ConnectComLogicalLink`: the first adapter
+    /// refusal of an entry's `PassThruStartMsgFilter` stops the walk and is
+    /// returned together with the filters taken so far, so the caller can give
+    /// them back and fail the connect (ADR-398). Eligibility skips stay
+    /// skips.
+    pub(super) async fn install_point_to_point_fc_filters_strict(
+        &self,
+        sc: &mut SharedChannel,
+        entries: &[EcuUniqueRespEntry],
+        protocol_id: u32,
+        qualified: bool,
+        effective_can_mode: CanChannelMode,
+    ) -> Result<Vec<P2pFilterKey>, FilterInstallRefusal> {
+        self.install_point_to_point_fc_filters_core(
+            sc,
+            entries,
+            protocol_id,
+            qualified,
+            effective_can_mode,
+            true,
+        )
+        .await
+    }
+
+    /// `sc` is the channel the filters go on, held under the caller's
+    /// `shared_channels` guard (ADR-080: before `api`). `effective_can_mode`
+    /// is read by the caller before it took that guard, for the AB-BA reason
+    /// below. Returns the filters the table now uses, installed or shared
+    /// with a sibling (ADR-398).
+    async fn install_point_to_point_fc_filters_core(
+        &self,
+        sc: &mut SharedChannel,
+        entries: &[EcuUniqueRespEntry],
+        protocol_id: u32,
+        qualified: bool,
+        effective_can_mode: CanChannelMode,
+        strict: bool,
+    ) -> Result<Vec<P2pFilterKey>, FilterInstallRefusal> {
+        let channel_id = sc.channel_id;
+        // Read by the caller BEFORE `api` is locked below (Fix for an AB-BA deadlock
         // found on PR #110's holistic audit): `probe_can_channel_mode` holds
         // `resolved_can_channel_mode`'s lock while awaiting `api` (via
         // `ensure_uudt_companion_channel`), so calling
@@ -5082,7 +5416,6 @@ impl J2534Service {
         // its three native-mixed locals), rather than two separate awaited
         // locks of `resolved_can_channel_mode` for a value that cannot
         // change between them within this call.
-        let effective_can_mode = self.effective_can_channel_mode().await;
         let dual_channel = effective_can_mode == CanChannelMode::DualChannel && !qualified;
         // SAE J2534-2 clause 8 Mixed Format Frames on a CAN Network
         // (ADR-160/Phase 3c; widened to the family by ADR-217): mirrors
@@ -5101,7 +5434,7 @@ impl J2534Service {
         // "native PASS_FILTER" ever applies to a given UUDT id.
         let native_mixed = effective_can_mode.is_native_mixed_family() && !qualified;
         let api = self.api.lock().await;
-        let mut ids = Vec::new();
+        let mut held: Vec<P2pFilterKey> = Vec::new();
         for entry in entries {
             // Finding 2 (Codex review, PR #32): `req` is only REQUIRED (and
             // its absence only skips) the FLOW_CONTROL_FILTER-based branches
@@ -5171,19 +5504,28 @@ impl J2534Service {
                                 .copied()
                                 .unwrap_or(0) as u8,
                         };
-                        match install_point_to_point_fc_filter(
+                        match acquire_p2p_filter(
                             &api,
-                            channel_id,
+                            sc,
+                            &mut held,
                             j2534_0404::FLOW_CONTROL_FILTER,
                             &resp,
                             Some(req),
                             protocol_id,
                         ) {
-                            Ok(id) => ids.push(id),
-                            Err(err) => warn!(
-                                channel_id = channel_id.0, resp_id, req_id = req.id, %err,
-                                "failed to install point-to-point FLOW_CONTROL_FILTER (USDT)",
-                            ),
+                            Ok(()) => {}
+                            Err(err) => {
+                                warn!(
+                                    channel_id = channel_id.0, resp_id, req_id = req.id, %err,
+                                    "failed to install point-to-point FLOW_CONTROL_FILTER (USDT)",
+                                );
+                                if strict {
+                                    return Err(FilterInstallRefusal {
+                                        acquired: held,
+                                        error: err,
+                                    });
+                                }
+                            }
                         }
                     } else {
                         // Preserves the pre-existing requirement that a
@@ -5269,43 +5611,52 @@ impl J2534Service {
                         "skipping point-to-point FLOW_CONTROL_FILTER (UUDT): entry has no CP_CanPhysReqId",
                     );
                 } else {
-                    match install_point_to_point_fc_filter(
+                    match acquire_p2p_filter(
                         &api,
-                        channel_id,
+                        sc,
+                        &mut held,
                         filter_type,
                         &resp,
                         req.as_ref(),
                         filter_protocol_id,
                     ) {
-                        Ok(id) => ids.push(id),
-                        Err(err) => warn!(
-                            channel_id = channel_id.0, resp_id, req_id = req.as_ref().map(|r| r.id), %err,
-                            "failed to install point-to-point {filter_kind}",
-                        ),
+                        Ok(()) => {}
+                        Err(err) => {
+                            warn!(
+                                channel_id = channel_id.0, resp_id, req_id = req.as_ref().map(|r| r.id), %err,
+                                "failed to install point-to-point {filter_kind}",
+                            );
+                            if strict {
+                                return Err(FilterInstallRefusal {
+                                    acquired: held,
+                                    error: err,
+                                });
+                            }
+                        }
                     }
                 }
             }
         }
-        ids
+        Ok(held)
     }
 
-    /// Removes previously-installed point-to-point filters. Failures are logged
-    /// and otherwise ignored: a stale ID (e.g. one already wiped by a prior
-    /// `CLEAR_MSG_FILTERS`) is not actionable.
-    pub(super) async fn remove_point_to_point_fc_filters(
+    /// Gives back a link's uses of point-to-point filters on `sc` and stops
+    /// the filters no other link uses (ADR-398). Failures are logged and
+    /// otherwise ignored: a stale ID (e.g. one already wiped by a prior
+    /// `CLEAR_MSG_FILTERS`) is not actionable. For callers that do not hold
+    /// `api`; `Disconnect` and `Destroy` use [`release_p2p_filters`] and
+    /// [`stop_p2p_filters`] under their own guard.
+    pub(super) async fn release_point_to_point_filters(
         &self,
-        channel_id: ChannelId,
-        ids: &[MessageFilterId],
+        sc: &mut SharedChannel,
+        keys: &[P2pFilterKey],
     ) {
-        if ids.is_empty() {
+        let unused = release_p2p_filters(sc, keys);
+        if unused.is_empty() {
             return;
         }
         let api = self.api.lock().await;
-        for &id in ids {
-            if let Err(err) = api.stop_message_filter(channel_id, id) {
-                warn!(channel_id = channel_id.0, filter_id = id.0, %err, "failed to remove stale FLOW_CONTROL_FILTER");
-            }
-        }
+        stop_p2p_filters(&api, sc.channel_id, &unused);
     }
 
     /// Promotes `new_table` to `handle`'s Active UniqueRespIdTable and
@@ -5353,8 +5704,8 @@ impl J2534Service {
         handle: u32,
         new_table: Vec<EcuUniqueRespEntry>,
     ) -> Result<(), NativeMixedTableCollision> {
-        let native_mixed_mode =
-            self.effective_can_channel_mode().await == CanChannelMode::NativeMixed;
+        let effective_can_mode = self.effective_can_channel_mode().await;
+        let native_mixed_mode = effective_can_mode == CanChannelMode::NativeMixed;
 
         let (
             protocol,
@@ -5363,7 +5714,7 @@ impl J2534Service {
             link_pin_select,
             link_channel_index,
             channel_id,
-            old_filter_ids,
+            channel_key,
         ) = {
             let mut links = self.logical_links.lock().await;
             let Some(link) = links.get(&handle) else {
@@ -5381,6 +5732,7 @@ impl J2534Service {
             let link_pin_select = link.pin_select;
             let link_channel_index = link.channel_index;
             let channel_id = link.channel_id;
+            let channel_key = link.channel_key;
             let old_table = link.active_unique_resp_id_table.clone();
 
             if unique_resp_id_tables_equal(&old_table, &new_table) {
@@ -5423,12 +5775,9 @@ impl J2534Service {
                 }
             }
 
-            let old_filter_ids = if let Some(link) = links.get_mut(&handle) {
+            if let Some(link) = links.get_mut(&handle) {
                 link.active_unique_resp_id_table = new_table.clone();
-                link.unique_resp_filter_ids.clone()
-            } else {
-                Vec::new()
-            };
+            }
 
             (
                 protocol,
@@ -5437,7 +5786,7 @@ impl J2534Service {
                 link_pin_select,
                 link_channel_index,
                 channel_id,
-                old_filter_ids,
+                channel_key,
             )
         };
 
@@ -5445,22 +5794,43 @@ impl J2534Service {
 
         if base_hw_protocol_id == j2534_0404::ISO15765
             && let Some(channel_id) = channel_id
+            && let Some(channel_key) = channel_key
         {
-            self.remove_point_to_point_fc_filters(channel_id, &old_filter_ids)
-                .await;
-            let new_filter_ids = self
-                .install_point_to_point_fc_filters(
-                    channel_id,
-                    &new_table,
-                    hw_protocol_id,
-                    link_pin_select.is_some()
-                        || link_channel_index.is_some()
-                        || resources::is_fd_protocol_id(hw_protocol_id),
-                )
-                .await;
-            let mut links = self.logical_links.lock().await;
-            if let Some(link) = links.get_mut(&handle) {
-                link.unique_resp_filter_ids = new_filter_ids;
+            // ADR-080: `shared_channels`, then `logical_links`, then `api`.
+            // The channel's filter counts and this link's keys change
+            // together under the guard (ADR-398).
+            let mut chans = self.shared_channels.lock().await;
+            if let Some(sc) = chans
+                .get_mut(&channel_key)
+                .filter(|sc| sc.channel_id == channel_id)
+            {
+                let old_keys = self
+                    .logical_links
+                    .lock()
+                    .await
+                    .get_mut(&handle)
+                    .map(|l| std::mem::take(&mut l.unique_resp_filter_ids))
+                    .unwrap_or_default();
+                self.release_point_to_point_filters(sc, &old_keys).await;
+                let new_keys = self
+                    .install_point_to_point_fc_filters(
+                        sc,
+                        &new_table,
+                        hw_protocol_id,
+                        link_pin_select.is_some()
+                            || link_channel_index.is_some()
+                            || resources::is_fd_protocol_id(hw_protocol_id),
+                        effective_can_mode,
+                    )
+                    .await;
+                let mut links = self.logical_links.lock().await;
+                if let Some(link) = links.get_mut(&handle) {
+                    link.unique_resp_filter_ids = new_keys;
+                } else {
+                    // The link went away meanwhile: give its filters back.
+                    drop(links);
+                    self.release_point_to_point_filters(sc, &new_keys).await;
+                }
             }
         }
 
@@ -6694,6 +7064,18 @@ impl J2534Service {
         &self,
         channel_id: ChannelId,
     ) {
+        // Read before `shared_channels` is taken (see the AB-BA note in
+        // `install_point_to_point_fc_filters_core`).
+        let effective_can_mode = self.effective_can_channel_mode().await;
+        let mut chans = self.shared_channels.lock().await;
+        let Some(sc) = chans.values_mut().find(|sc| sc.channel_id == channel_id) else {
+            return;
+        };
+        // The clear wiped every point-to-point filter on the channel, so no
+        // link has one any more: count afresh from each link's table
+        // (ADR-398). A link whose filters are refused again keeps none of
+        // those.
+        sc.p2p_filters.clear();
         let cll_handles: Vec<u32> = {
             let links = self.logical_links.lock().await;
             links
@@ -6719,11 +7101,17 @@ impl J2534Service {
                     })
                     .unwrap_or_default()
             };
-            let ids = self
-                .install_point_to_point_fc_filters(channel_id, &entries, hw_protocol_id, qualified)
+            let keys = self
+                .install_point_to_point_fc_filters(
+                    sc,
+                    &entries,
+                    hw_protocol_id,
+                    qualified,
+                    effective_can_mode,
+                )
                 .await;
             if let Some(link) = self.logical_links.lock().await.get_mut(&handle) {
-                link.unique_resp_filter_ids = ids;
+                link.unique_resp_filter_ids = keys;
             }
         }
     }
@@ -6738,21 +7126,51 @@ impl J2534Service {
             .ok_or_else(|| Status::invalid_argument("cll_handle is required"))?
             .cll_handle;
 
-        // Hold shared_channels across the whole filter-teardown + ref_count
-        // sequence below (ADR-080: shared_channels is the outermost lock of
-        // the three) -- otherwise a concurrent ConnectComLogicalLink's (or
-        // ensure_uudt_companion_channel's) reciprocal client_filters check
-        // could see this CLL's filters already drained below and join the
-        // channel before the hardware filter is actually stopped, or before
-        // ref_count reflects this CLL's departure. `logical_links` and `api`
-        // are acquired and released underneath it, never before it (Codex-
-        // review fix).
-        let mut chans = self.shared_channels.lock().await;
+        // Everything that takes the link offline is shared with the rollback of
+        // a refused connect (ADR-398, ADR-397).
+        let chans = self.shared_channels.lock().await;
+        self.take_link_offline(handle, chans, None, None).await?;
 
+        info!(cll_handle = handle, "DisconnectComLogicalLink");
+        Ok(Self::empty_response())
+    }
+
+    /// Takes `handle`'s link offline: the teardown `DisconnectComLogicalLink`
+    /// does, which the rollback of a connect that fails after the link was
+    /// published runs too (ADR-398, ADR-397). Stops the link's filters,
+    /// repeat messages, periodic message and protocol sessions, cancels its
+    /// COPs, sends `PduCllstOffline`, releases the shared-channel reference
+    /// (closing the channel when the link was its last user) and the
+    /// dual-channel UUDT companion.
+    ///
+    /// Takes the `shared_channels` guard by value and holds it across the
+    /// whole filter-teardown + ref_count sequence (ADR-080: it is the
+    /// outermost lock of the three) -- otherwise a concurrent
+    /// ConnectComLogicalLink's (or ensure_uudt_companion_channel's)
+    /// reciprocal client_filters check could see this CLL's filters already
+    /// drained and join the channel before the hardware filter is actually
+    /// stopped, or before ref_count reflects this CLL's departure.
+    /// `logical_links` and `api` are acquired and released underneath it,
+    /// never before it (Codex-review fix). The guard is released before the
+    /// native `PassThruDisconnect` of a closing channel.
+    ///
+    /// `only_if_key`: `Some(key)` tears the link down only if it still holds
+    /// that connection (`Ok` and nothing done otherwise). `epoch_rollback` is
+    /// the occupancy epoch pair of a join being rolled back
+    /// (`rollback_channel_join`); `None` for an ordinary disconnect. A
+    /// failing `PassThruDisconnect` of the closed channel is the error.
+    async fn take_link_offline(
+        &self,
+        handle: u32,
+        mut chans: tokio::sync::MutexGuard<'_, HashMap<ChannelKey, SharedChannel>>,
+        only_if_key: Option<ChannelKey>,
+        epoch_rollback: Option<(u64, u64)>,
+    ) -> Result<(), Status> {
         let (
             channel_key,
             channel_id_for_tp,
             client_filters,
+            filter_keys,
             repeat_message_ids,
             hw_protocol_id,
             connect_generation,
@@ -6764,6 +7182,14 @@ impl J2534Service {
             let link = links
                 .get_mut(&handle)
                 .ok_or_else(|| unknown_handle_status(format!("unknown cll_handle {handle}")))?;
+            // A caller that took the link's connection only for a moment
+            // (the rollback of a refused connect) tears down only that
+            // connection: one the link no longer holds was released with the
+            // channel reference it carried. Matched on the key alone -- a
+            // hard channel error clears `channel_id` but keeps the key.
+            if only_if_key.is_some_and(|expected| link.channel_key != Some(expected)) {
+                return Ok(());
+            }
             let key = link.channel_key.take();
             let hw_protocol_id = link.hw_protocol_id;
             let connect_generation = link.connect_generation;
@@ -6848,6 +7274,9 @@ impl J2534Service {
             // all-periodic-messages requirement, extended by clause 14 to
             // repeat messages).
             let repeat_message_ids: Vec<u32> = std::mem::take(&mut link.repeat_message_ids);
+            // ADR-398: this CLL's uses of the channel's point-to-point
+            // filters (its UniqueRespIdTable's), given back below.
+            let filter_keys = std::mem::take(&mut link.unique_resp_filter_ids);
 
             // ADR-123: this CLL's held physical-resource locks were just
             // released above -- recompute every CLL's tx_suspended_by_lock
@@ -6869,6 +7298,7 @@ impl J2534Service {
                 key,
                 channel_id,
                 filters,
+                filter_keys,
                 repeat_message_ids,
                 hw_protocol_id,
                 connect_generation,
@@ -6881,6 +7311,16 @@ impl J2534Service {
         for (h, tx_queue) in wake_targets {
             let _ = tx_queue.send(TxItem::ResumeWake { cll_handle: h });
         }
+
+        // ADR-398: give back this CLL's uses of the channel's point-to-point
+        // filters; the ones no sibling uses are stopped below. The channel
+        // is looked up by key alone (a hard error clears `channel_id` but
+        // keeps the key), and the stops go out only while the channel is
+        // still the one this link was connected on.
+        let unused_filters: Vec<MessageFilterId> = channel_key
+            .and_then(|key| chans.get_mut(&key))
+            .map(|sc| release_p2p_filters(sc, &filter_keys))
+            .unwrap_or_default();
 
         // Stop this CLL's client-installed message filters before it goes offline
         // (ADR-010's pattern): harmless if the channel is about to close anyway (PassThruDisconnect tears
@@ -6898,6 +7338,12 @@ impl J2534Service {
                 if let Err(err) = api.stop_message_filter(channel_id, filter_id) {
                     warn!(cll_handle = handle, %err, "DisconnectComLogicalLink: stop_message_filter failed");
                 }
+            }
+            if channel_key
+                .and_then(|key| chans.get(&key))
+                .is_some_and(|sc| sc.channel_id == channel_id)
+            {
+                stop_p2p_filters(&api, channel_id, &unused_filters);
             }
             // SAE J2534-2 clause 14 Repeat Messaging (ADR-165 Decision 4/6,
             // Codex review PR #42 round 2 Finding A): best-effort STOP for
@@ -7112,6 +7558,7 @@ impl J2534Service {
 
         if let Some(key) = channel_key {
             let disconnected = if let Some(sc) = chans.get_mut(&key) {
+                Self::restore_occupancy_epoch_on_rollback(sc, epoch_rollback);
                 sc.ref_count -= 1;
                 if sc.ref_count == 0 {
                     chans.remove(&key).map(|sc| {
@@ -7208,9 +7655,7 @@ impl J2534Service {
 
         // Release the dual-channel-mode UUDT companion channel, if any (ADR-046).
         self.release_uudt_companion_channel(handle).await;
-
-        info!(cll_handle = handle, "DisconnectComLogicalLink");
-        Ok(Self::empty_response())
+        Ok(())
     }
 
     pub(super) async fn rpc_lock_resource(
@@ -9382,6 +9827,7 @@ mod tests {
             occupancy_epoch: 0,
             leaked_repeat_message_ids: Vec::new(),
             leaked_periodic_message_ids: Vec::new(),
+            p2p_filters: Default::default(),
             applied_analog_sample_rate: None,
             applied_analog_samples_per_reading: None,
             applied_analog_readings_per_msg: None,
@@ -9908,6 +10354,7 @@ mod tests {
                 occupancy_epoch: 0,
                 leaked_repeat_message_ids: Vec::new(),
                 leaked_periodic_message_ids: Vec::new(),
+                p2p_filters: Default::default(),
                 applied_analog_sample_rate: None,
                 applied_analog_samples_per_reading: None,
                 applied_analog_readings_per_msg: None,

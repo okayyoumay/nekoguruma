@@ -184,6 +184,7 @@ mod lifecycle;
 mod locks_and_param_classes;
 mod mixed_format_can;
 mod modules;
+mod p2p_filter_sharing;
 mod p3_gap;
 mod param_binding;
 mod pdu_ioctl;

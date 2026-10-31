@@ -413,6 +413,9 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
     // deliberately not removed here.
     if let Some(sc) = chans.values_mut().find(|sc| sc.channel_id == channel_id) {
         sc.dead = true;
+        // ADR-398: the filters died with the channel; the links drop their
+        // keys below, so a later disconnect gives nothing back to it.
+        sc.p2p_filters.clear();
     }
     let (cll_handles, wake_targets) = {
         let mut links = logical_links.lock().await;
@@ -445,6 +448,7 @@ async fn handle_channel_hard_error(channel_id: ChannelId, ctx: &ChannelPollCtx) 
                 l.stop_comm_pending = false;
                 if l.channel_id == Some(channel_id) {
                     l.channel_id = None;
+                    l.unique_resp_filter_ids.clear();
                 }
                 if l.uudt_channel_id == Some(channel_id) {
                     l.uudt_channel_id = None;

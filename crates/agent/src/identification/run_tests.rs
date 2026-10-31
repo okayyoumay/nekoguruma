@@ -58,6 +58,8 @@ struct State {
     disconnect_script: VecDeque<tonic::Status>,
     /// The status `CreateComLogicalLink` fails with.
     create_status: Option<tonic::Status>,
+    /// The statuses the first `ConnectComLogicalLink` calls fail with, one per call.
+    link_connect_script: VecDeque<tonic::Status>,
     /// The events of the n-th started primitive; one that has no script finishes at once.
     scripts: VecDeque<Vec<Item>>,
     calls: Vec<&'static str>,
@@ -227,7 +229,10 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         _: tonic::Request<vci_service_interface::ConnectComLogicalLinkRequest>,
     ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
         self.note("ConnectComLogicalLink");
-        ok()
+        match self.state().link_connect_script.pop_front() {
+            Some(status) => Err(status),
+            None => ok(),
+        }
     }
     async fn disconnect_com_logical_link(
         &self,
@@ -1051,6 +1056,69 @@ async fn a_vci_lost_while_the_link_opens_opens_it_again() {
     assert!(report.refused_tables().is_empty() && !report.presence_interrupted());
     assert_eq!(report.presence_links_opened(), 1);
     assert_eq!(ran.heard(), [(A.1, POSITIVE.to_vec())]);
+}
+
+/// ADR-398: the J2534 worker answers a device lost while the connect installs the receive
+/// table with the lost-VCI form (`FAILED_PRECONDITION` naming `PDU_ERR_EVT_LOST_COMM_TO_VCI`),
+/// so the link is opened again, with the same table, not halved as a refusal is.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vci_lost_while_the_connect_installs_the_table_is_not_halved() {
+    use vci_service_interface::{ErrorDetail, ErrorEventData, PduError};
+    let fake = Fake::default();
+    {
+        let mut state = fake.state();
+        state.link_connect_script =
+            VecDeque::from([vci_service_interface::status_with_error_detail(
+                tonic::Code::FailedPrecondition,
+                "PassThruStartMsgFilter failed: the device is not connected",
+                ErrorDetail {
+                    pdu_error: PduError::PduErrCommPcToVciFailed as i32,
+                    error_event_data: Some(ErrorEventData {
+                        error_event: PduErrorEvent::PduErrEvtLostCommToVci as i32,
+                        cop_handle: None,
+                        timestamp: 1,
+                        extra_error_info: 0,
+                    }),
+                    detail_text: None,
+                    refusal: None,
+                },
+            )]);
+        state.scripts = VecDeque::from([vec![Item::Answer(A.1, POSITIVE), Item::Finish]]);
+    }
+    let ran = run(plan_of(&[A, B], Some(0x7DF)), fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(fake.state().tables, [vec![A, B], vec![A, B]]);
+    assert!(report.refused_tables().is_empty() && !report.presence_interrupted());
+    assert_eq!(report.presence_links_opened(), 1);
+    assert_eq!(ran.heard(), [(A.1, POSITIVE.to_vec())]);
+}
+
+/// ADR-398: the J2534 worker answers a filter error that is neither a refusal of the filter nor
+/// a lost device as `UNKNOWN` with `PDU_ERR_FCT_FAILED`, which is not a refusal of the table:
+/// it is not halved.
+#[tokio::test(flavor = "multi_thread")]
+async fn another_error_while_the_connect_installs_the_table_is_not_halved() {
+    use vci_service_interface::{ErrorDetail, PduError};
+    let fake = Fake::default();
+    fake.state().link_connect_script =
+        VecDeque::from([vci_service_interface::status_with_error_detail(
+            tonic::Code::Unknown,
+            "PassThruStartMsgFilter failed: ERR_FAILED",
+            ErrorDetail {
+                pdu_error: PduError::PduErrFctFailed as i32,
+                error_event_data: None,
+                detail_text: None,
+                refusal: None,
+            },
+        )]);
+    let ran = run(plan_of(&[A, B, C, D], Some(0x7DF)), fake.clone()).await;
+    let report = ran.report();
+    assert!(report.refused_tables().is_empty());
+    let tables = fake.state().tables.clone();
+    assert!(
+        tables.iter().all(|table| *table == [A, B, C, D]),
+        "{tables:?}"
+    );
 }
 
 /// Only a response identifier of the receive table marks presence; the log lists every result.

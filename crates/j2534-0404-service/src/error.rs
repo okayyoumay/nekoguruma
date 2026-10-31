@@ -196,6 +196,66 @@ pub(crate) fn map_native_error_as(
     status_with_error_detail(code, format!("{context} failed: {error}"), detail)
 }
 
+/// Maps the native failure of a `PassThruStartMsgFilter` that installs one
+/// entry of a connect-time UniqueRespIdTable to the status of the failed
+/// `ConnectComLogicalLink` (ADR-398). Three kinds, told apart by what the agent
+/// does with each (rpc-api-guide "Reading a Worker's Answer"):
+///
+/// - The adapter refuses the filter itself (`ERR_NOT_UNIQUE`,
+///   `ERR_EXCEEDED_LIMIT`, `ERR_INVALID_MSG`, `ERR_MSG_PROTOCOL_ID`): a
+///   refusal of the receive table, `Internal` with the `PDUError` of the
+///   native status (`map_native_error_for_link`).
+/// - The device is gone (`ERR_DEVICE_NOT_CONNECTED`): the lost VCI of
+///   ADR-294, `FailedPrecondition` with the `PDU_ERR_EVT_LOST_COMM_TO_VCI`
+///   error event attached, which is how this service refuses a call on a
+///   link the VCI loss took offline (ADR-105).
+/// - Any other error: the connect fails, but nothing shows the table was
+///   at fault, so the status is not a refusal: `Unknown` (which a client
+///   never reads as the worker's answer about the table) with
+///   `PDU_ERR_FCT_FAILED`.
+///
+/// `timestamp` is the module clock's now, for the lost-VCI error event.
+pub(crate) fn map_connect_filter_failure(
+    error: &j2534_0404::Error,
+    last_error: Option<TrackedError>,
+    timestamp: u32,
+) -> Status {
+    const CONTEXT: &str = "PassThruStartMsgFilter";
+    let code = match error {
+        j2534_0404::Error::ApiStatus { code, .. } => Some(code.as_u32()),
+        _ => None,
+    };
+    match code {
+        Some(
+            j2534_0404::ERR_NOT_UNIQUE
+            | j2534_0404::ERR_EXCEEDED_LIMIT
+            | j2534_0404::ERR_INVALID_MSG
+            | j2534_0404::ERR_MSG_PROTOCOL_ID,
+        ) => map_native_error_for_link(CONTEXT, error, last_error),
+        Some(j2534_0404::ERR_DEVICE_NOT_CONNECTED) => state_guard_status(
+            Code::FailedPrecondition,
+            format!("{CONTEXT} failed: {error}"),
+            native_pdu_error(error),
+            Some(TrackedError {
+                event: PduErrorEvent::PduErrEvtLostCommToVci,
+                timestamp,
+                cop: None,
+                cop_tag: None,
+                name: None,
+            }),
+        ),
+        _ => {
+            let detail = ErrorDetail {
+                pdu_error: PduError::PduErrFctFailed as i32,
+                error_event_data: error_event_data_for(last_error),
+                detail_text: Some(format!("{CONTEXT}: {error}")),
+                refusal: None,
+            };
+            status_with_error_detail(Code::Unknown, format!("{CONTEXT} failed: {error}"), detail)
+        }
+    }
+}
+
 /// Builds a `NotFound` [`Status`] carrying a `PDU_ERR_INVALID_HANDLE`
 /// [`ErrorDetail`] for a reference to a Module/CLL/COP handle this service
 /// does not recognize. `message` is used verbatim as the client-visible
@@ -497,6 +557,82 @@ mod tests {
         assert_eq!(status.code(), Code::NotFound);
         let detail = error_detail_from_status(&status).unwrap();
         assert_eq!(detail.pdu_error, PduError::PduErrInvalidHandle as i32);
+    }
+
+    fn api_status(code: u32) -> j2534_0404::Error {
+        j2534_0404::Error::ApiStatus {
+            code: j2534_0404::StatusCode(code),
+            description: None,
+        }
+    }
+
+    /// ADR-398: the adapter's refusals of a filter are `Internal` with the native status'
+    /// `PDUError`, which the agent reads as a refusal of the receive table.
+    #[test]
+    fn connect_filter_failure_maps_the_four_refusals_to_internal() {
+        for (code, expected) in [
+            (
+                j2534_0404::ERR_NOT_UNIQUE,
+                PduError::PduErrInvalidParameters,
+            ),
+            (
+                j2534_0404::ERR_INVALID_MSG,
+                PduError::PduErrInvalidParameters,
+            ),
+            (
+                j2534_0404::ERR_MSG_PROTOCOL_ID,
+                PduError::PduErrInvalidParameters,
+            ),
+            (
+                j2534_0404::ERR_EXCEEDED_LIMIT,
+                PduError::PduErrResourceError,
+            ),
+        ] {
+            let status = map_connect_filter_failure(&api_status(code), None, 9);
+            assert_eq!(status.code(), Code::Internal, "{code:#x}");
+            let detail = error_detail_from_status(&status).unwrap();
+            assert_eq!(detail.pdu_error, expected as i32, "{code:#x}");
+            assert!(detail.error_event_data.is_none());
+        }
+    }
+
+    /// ADR-398: a lost device is the lost VCI of ADR-294, whatever the link's tracked error
+    /// is: `FailedPrecondition` with the lost-communication event attached.
+    #[test]
+    fn connect_filter_failure_maps_a_lost_device_to_the_lost_vci() {
+        let status =
+            map_connect_filter_failure(&api_status(j2534_0404::ERR_DEVICE_NOT_CONNECTED), None, 9);
+        assert_eq!(status.code(), Code::FailedPrecondition);
+        let detail = error_detail_from_status(&status).unwrap();
+        assert_eq!(detail.pdu_error, PduError::PduErrCommPcToVciFailed as i32);
+        let event = detail.error_event_data.expect("the lost-VCI event");
+        assert_eq!(
+            event.error_event,
+            PduErrorEvent::PduErrEvtLostCommToVci as i32
+        );
+        assert_eq!(event.timestamp, 9);
+    }
+
+    /// ADR-398: any other error is a failed connect that is no refusal of the table:
+    /// `Unknown` with `PDU_ERR_FCT_FAILED`, for a native status and for a failure that is not
+    /// one.
+    #[test]
+    fn connect_filter_failure_maps_any_other_error_to_unknown() {
+        for error in [
+            api_status(j2534_0404::ERR_FAILED),
+            api_status(j2534_0404::ERR_TIMEOUT),
+            api_status(0xDEAD_BEEF),
+            j2534_0404::Error::InvalidVersionString,
+        ] {
+            let status = map_connect_filter_failure(&error, None, 9);
+            assert_eq!(status.code(), Code::Unknown, "{error}");
+            let detail = error_detail_from_status(&status).unwrap();
+            assert_eq!(
+                detail.pdu_error,
+                PduError::PduErrFctFailed as i32,
+                "{error}"
+            );
+        }
     }
 
     #[test]

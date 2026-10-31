@@ -2401,6 +2401,23 @@ struct MockState {
     /// `CoptCancel` (Fix 2, PR #101) for a `MsgId` that is genuinely still
     /// alive and retransmitting.
     stop_periodic_message_error: Option<c_long>,
+    /// Raw J2534 error code `PassThruStartMsgFilter` returns instead of its
+    /// normal behavior, set via `__mock_set_start_filter_error`. `None` (the
+    /// default after `__mock_reset`) means no override. Checked after the
+    /// bad-`channel_id` check, before the filter is recorded -- a forced
+    /// failure never simulates a partial success. Lets `j2534-0404-service`
+    /// tests exercise a filter install that fails for a reason other than a
+    /// refusal of the filter, such as a lost device (ADR-398).
+    start_filter_error: Option<c_long>,
+    /// Opt-in checks for `FLOW_CONTROL_FILTER`s, set via
+    /// `__mock_set_flow_control_filter_checks`: `Some(max)` makes
+    /// `PassThruStartMsgFilter` refuse a `FLOW_CONTROL_FILTER` whose pattern
+    /// or flow-control CAN id already appears in another one on the channel
+    /// (`ERR_NOT_UNIQUE`) and a `max + 1`th one (`ERR_EXCEEDED_LIMIT`), as
+    /// `sim-vci` does. `None` (the default after `__mock_reset`) leaves
+    /// `FLOW_CONTROL_FILTER`s unchecked and uncapped, which existing tests
+    /// rely on.
+    flow_control_filter_checks: Option<usize>,
 }
 
 impl MockState {
@@ -3088,6 +3105,8 @@ exported_fn!(PassThruStartMsgFilter(
 
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.start_filter += 1;
+    let start_filter_error = guard.start_filter_error;
+    let flow_control_filter_checks = guard.flow_control_filter_checks;
 
     let Some(channel) = guard.channels.get_mut(&channel_id) else {
         return err_channel();
@@ -3124,6 +3143,39 @@ exported_fn!(PassThruStartMsgFilter(
     // `FLOW_CONTROL_FILTER` is left uncapped since the mock reports
     // NOT_SUPPORTED for `PROTOCOL_INFO_MAX_FLOW_CONTROL_FILTER` -- it makes
     // no numeric claim to keep consistent.
+    if let Some(code) = start_filter_error {
+        return code;
+    }
+    if filter_type == j2534_0404_sys::bindings::FLOW_CONTROL_FILTER
+        && let Some(max) = flow_control_filter_checks
+    {
+        // The CAN id of a filter message: its first four data bytes.
+        let can_id = |m: &StoredMessage| m.data.get(..4).map(<[u8]>::to_vec);
+        let (new_pattern, new_flow_control) =
+            (can_id(&pattern), flow_control.as_ref().and_then(can_id));
+        let mut existing = 0;
+        for (_, f) in channel
+            .filters
+            .iter()
+            .filter(|(_, f)| f.filter_type == filter_type)
+        {
+            existing += 1;
+            let used = [
+                can_id(&f.pattern),
+                f.flow_control.as_ref().and_then(can_id),
+            ];
+            if [&new_pattern, &new_flow_control]
+                .into_iter()
+                .flatten()
+                .any(|id| used.iter().flatten().any(|u| u == id))
+            {
+                return ERR_NOT_UNIQUE as c_long;
+            }
+        }
+        if existing >= max {
+            return ERR_EXCEEDED_LIMIT as c_long;
+        }
+    }
     if matches!(filter_type, PASS_FILTER | BLOCK_FILTER) {
         let existing_of_type = channel
             .filters
@@ -5282,6 +5334,42 @@ exported_fn!(
 });
 
 exported_fn!(
+    /// Forces `PassThruStartMsgFilter` to fail with the given raw J2534 error
+    /// code on every subsequent call, on every channel, instead of recording
+    /// the filter -- lets tests exercise a connect-time filter install that
+    /// fails for a reason other than a refusal of the filter, such as
+    /// `ERR_DEVICE_NOT_CONNECTED` (ADR-398). `code == STATUS_NOERROR` (`0`)
+    /// clears the override (the default after `__mock_reset`), mirroring
+    /// `__mock_set_stop_filter_error`'s convention. The checks that come
+    /// before it (an unknown channel, an unassigned pin, an unsupported
+    /// protocol) still take priority, and the call still counts toward
+    /// `__mock_get_start_filter_count`.
+    __mock_set_start_filter_error(code: c_long) -> c_long {
+    let mut guard = state().lock().expect("mock state poisoned");
+    guard.start_filter_error = if code == STATUS_NOERROR as c_long {
+        None
+    } else {
+        Some(code)
+    };
+    no_error()
+});
+
+exported_fn!(
+    /// Turns on `sim-vci`'s checks for `FLOW_CONTROL_FILTER`s: with
+    /// `max_filters > 0`, `PassThruStartMsgFilter` refuses one whose pattern
+    /// or flow-control CAN id is already used by another on the channel
+    /// (`ERR_NOT_UNIQUE`) and any beyond `max_filters` per channel
+    /// (`ERR_EXCEEDED_LIMIT`). `0` turns the checks off (the default after
+    /// `__mock_reset`: `FLOW_CONTROL_FILTER`s are neither checked nor
+    /// capped). Lets `j2534-0404-service` tests exercise the refusal of a
+    /// `FLOW_CONTROL_FILTER` (ADR-398), which the mock otherwise never gives.
+    __mock_set_flow_control_filter_checks(max_filters: usize) -> c_long {
+    let mut guard = state().lock().expect("mock state poisoned");
+    guard.flow_control_filter_checks = (max_filters > 0).then_some(max_filters);
+    no_error()
+});
+
+exported_fn!(
     /// Forces `PassThruWriteMsgs` to fail with the given raw J2534 error code
     /// on every subsequent call, on every channel, instead of its normal
     /// success behavior -- lets tests exercise `j2534-0404-service`'s RC21/
@@ -7348,6 +7436,80 @@ mod tests {
     // doesn't block the other), and that `FLOW_CONTROL_FILTER` -- for
     // which the mock reports `NOT_SUPPORTED` on
     // `PROTOCOL_INFO_MAX_FLOW_CONTROL_FILTER` -- is left uncapped.
+    // ADR-398: the opt-in `FLOW_CONTROL_FILTER` checks refuse a pattern or
+    // flow-control CAN id another filter of the channel uses (`ERR_NOT_UNIQUE`)
+    // and a filter over the cap (`ERR_EXCEEDED_LIMIT`), and the start-filter
+    // error override fails the call with the given code; both are off after a
+    // reset.
+    serial_test!(
+        fn start_msg_filter_flow_control_checks_and_error_override_are_opt_in() {
+            let mut channel_id: u32 = 0;
+            unsafe {
+                PassThruConnect(MOCK_DEVICE_ID, 6, 0, 500_000, &mut channel_id);
+            }
+            let message = |id: u32| -> PASSTHRU_MSG {
+                let mut m: PASSTHRU_MSG = unsafe { std::mem::zeroed() };
+                m.ProtocolID = 6;
+                m.DataSize = 4;
+                m.ExtraDataIndex = 4;
+                m.Data[..4].copy_from_slice(&id.to_be_bytes());
+                m
+            };
+            let start = |resp: u32, req: u32| -> c_long {
+                let (mut mask, mut pattern, mut flow_control) =
+                    (message(0xFFFF_FFFF), message(resp), message(req));
+                let mut filter_id: u32 = 0;
+                unsafe {
+                    PassThruStartMsgFilter(
+                        channel_id,
+                        j2534_0404_sys::bindings::FLOW_CONTROL_FILTER,
+                        &mut mask,
+                        &mut pattern,
+                        &mut flow_control,
+                        &mut filter_id,
+                    )
+                }
+            };
+
+            // Unchecked by default: the same pair twice is accepted.
+            assert_eq!(start(0x7E8, 0x7E0), STATUS_NOERROR as c_long);
+            assert_eq!(start(0x7E8, 0x7E0), STATUS_NOERROR as c_long);
+
+            unsafe { __mock_set_flow_control_filter_checks(3) };
+            assert_eq!(
+                start(0x7E8, 0x7E1),
+                ERR_NOT_UNIQUE as c_long,
+                "pattern in use"
+            );
+            assert_eq!(
+                start(0x7E9, 0x7E0),
+                ERR_NOT_UNIQUE as c_long,
+                "request in use"
+            );
+            assert_eq!(
+                start(0x7E0, 0x7F0),
+                ERR_NOT_UNIQUE as c_long,
+                "id used in the other role"
+            );
+            // The two unchecked filters already count toward the cap of three.
+            assert_eq!(start(0x7EA, 0x7E2), STATUS_NOERROR as c_long);
+            assert_eq!(start(0x7EB, 0x7E3), ERR_EXCEEDED_LIMIT as c_long);
+
+            unsafe {
+                __mock_set_start_filter_error(
+                    j2534_0404_sys::bindings::ERR_DEVICE_NOT_CONNECTED as c_long,
+                )
+            };
+            assert_eq!(
+                start(0x7EC, 0x7E4),
+                j2534_0404_sys::bindings::ERR_DEVICE_NOT_CONNECTED as c_long
+            );
+            unsafe { __mock_set_start_filter_error(0) };
+            unsafe { __mock_set_flow_control_filter_checks(0) };
+            assert_eq!(start(0x7EC, 0x7E4), STATUS_NOERROR as c_long);
+        }
+    );
+
     serial_test!(
         fn start_msg_filter_enforces_the_limit_discovery_advertises() {
             let mut channel_id: u32 = 0;

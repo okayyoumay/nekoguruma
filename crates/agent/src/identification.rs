@@ -2,17 +2,32 @@
 //! opens, and the endpoints and presence groups derived from the declared links (design 8.8.2,
 //! ADR-327, ADR-395).
 //!
-//! This module sends nothing. [`load_plan`] and [`check_plan`] are the only gate before a link
-//! opens, and [`CheckedPlan::report`] is the only writer of the report's endpoint and
-//! presence-group lists.
+//! [`load_plan`] and [`check_plan`] send nothing and are the only gate before a link opens, and
+//! [`CheckedPlan::report`] is the only writer of the report's endpoint and presence-group lists.
+//! [`run_identification`] then sends the plan's functional presence requests and is the only
+//! writer of the report's presence section (ADR-396); it sends nothing else yet.
+
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 
 use diag_ir::declaration::EcuVariant;
 use diag_ir::plan::{IdentificationPlan, PlanError, Selection, Sha256, hex};
+use serde::{Serialize, Serializer};
 use sha2::Digest;
+use tokio::runtime::{Handle, RuntimeFlavor};
 
+use crate::client::{WorkerExit, WorkerSource, WorkerStatus};
+use crate::comm_log::{CommLogSetup, CommLogStatus, JobLog, RunFacts, RunKind, VciMargins};
 use crate::document::{DocumentError, JobDocument};
+use crate::guards::JobGuards;
+use crate::host::{HostError, OwnRead, ProcedurePosition, ReopenAttempt, ResendClass, Timings};
 use crate::link::{BUS_TYPE_DWCAN, LinkConfig, MAX_CAN_ID};
-use crate::policy::ApplicationLayer;
+use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
+use crate::runner::{
+    CancelOnDrop, GuardSlot, JobError, JobLimits, LinkRefused, close_job_link, open_job_link,
+    reopen_attempts,
+};
 use crate::send_receive::declared_sid;
 
 /// Why a plan is refused before any link opens.
@@ -61,7 +76,7 @@ pub enum PlanRefused {
 /// The bus a link is on: the resource the agent resolves for it (protocol short name and bus
 /// type, ADR-319) with its baud rate, so two spellings of one stack that ADR-324 item 2
 /// accepts name the same bus. The DLC pins follow from the bus type.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct BusKey {
     pub protocol: String,
     pub bus_type: String,
@@ -79,7 +94,7 @@ impl BusKey {
 }
 
 /// An ECU's physical address: its bus and the request and response identifiers.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EndpointKey {
     pub bus: BusKey,
     pub tx_id: u32,
@@ -87,20 +102,34 @@ pub struct EndpointKey {
 }
 
 /// An endpoint and the documents whose declared link is on it.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct EndpointEntry {
     pub key: EndpointKey,
+    #[serde(serialize_with = "hashes_as_hex")]
     pub documents: Vec<Sha256>,
+}
+
+/// A hash as the lowercase hex a report shows it in.
+fn hash_as_hex<S: Serializer>(hash: &Sha256, serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex(hash))
+}
+
+fn hashes_as_hex<S: Serializer>(hashes: &[Sha256], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.collect_seq(hashes.iter().map(|hash| hex(hash)))
+}
+
+fn bytes_as_hex<S: Serializer>(bytes: &[u8], serializer: S) -> Result<S::Ok, S::Error> {
+    serializer.serialize_str(&hex(bytes))
 }
 
 /// The links that send one functional presence request together: a bus and a functional
 /// identifier.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PresenceGroup {
     pub bus: BusKey,
     pub functional_id: u32,
     /// `CP_P2Max` of the presence link, in milliseconds: the longest over the declared links of
-    /// the group (ADR-395 item 5). Not used for traffic yet.
+    /// the group (ADR-395 item 5).
     pub p2_max_ms: u32,
     /// `CP_P2Star` and `CP_RC78CompletionTimeout`, in milliseconds: the largest of the group.
     pub p2_star_ms: u32,
@@ -129,17 +158,30 @@ impl PresenceGroup {
     }
 }
 
-/// A presence answer: the bus and the response identifier that answered (ADR-327 item 2).
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// A presence answer: the bus and the response identifier that answered (ADR-327 item 2), with
+/// the bytes it carried.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct PresenceAnswer {
     pub bus: BusKey,
     pub rx_id: u32,
+    #[serde(serialize_with = "bytes_as_hex")]
+    pub bytes: Vec<u8>,
+}
+
+/// A receive table the VCI refused, which the agent then halved (ADR-396).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct RefusedTable {
+    pub bus: BusKey,
+    pub functional_id: u32,
+    /// The physical request and response identifier of each pair of the table.
+    pub table: Vec<(u32, u32)>,
 }
 
 /// A document whose declared link ADR-324 refuses: the job cannot read it, which leaves its
 /// definition inconclusive at read time (ADR-327 item 3), and the plan stays valid.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct RefusedLink {
+    #[serde(serialize_with = "hash_as_hex")]
     pub document: Sha256,
     pub reason: String,
 }
@@ -370,9 +412,10 @@ fn comparams(link: &LinkConfig) -> Vec<(String, u32)> {
     params
 }
 
-/// What the plan's checks and the derivation give (design 8.8.2). The presence section stays
-/// empty until the presence request is sent.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// What the plan's checks and the derivation give (design 8.8.2), and, once
+/// [`run_identification`] has run, the presence section: which response identifiers answered
+/// the functional presence requests.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct IdentificationReport {
     selection: Selection,
     candidates: Vec<String>,
@@ -381,6 +424,12 @@ pub struct IdentificationReport {
     buses_without_presence: Vec<BusKey>,
     refused_links: Vec<RefusedLink>,
     presence: Vec<PresenceAnswer>,
+    /// How many presence links the run opened (one per part of each group's halved table).
+    presence_links_opened: u32,
+    refused_tables: Vec<RefusedTable>,
+    /// A presence request could not be completed, because the path to the VCI was lost and the
+    /// run's bounds ran out: the presence section holds what was heard before.
+    presence_interrupted: bool,
 }
 
 impl IdentificationReport {
@@ -409,6 +458,23 @@ impl IdentificationReport {
     }
     pub fn presence(&self) -> &[PresenceAnswer] {
         &self.presence
+    }
+    pub fn presence_links_opened(&self) -> u32 {
+        self.presence_links_opened
+    }
+    pub fn refused_tables(&self) -> &[RefusedTable] {
+        &self.refused_tables
+    }
+    pub fn presence_interrupted(&self) -> bool {
+        self.presence_interrupted
+    }
+    /// Whether the endpoint's bus and response identifier answered a presence request: an answer
+    /// on a pair marks every endpoint with it, since alternatives often share one. Presence
+    /// drops no candidate (ADR-327 item 2).
+    pub fn answered(&self, endpoint: &EndpointKey) -> bool {
+        self.presence
+            .iter()
+            .any(|answer| answer.bus == endpoint.bus && answer.rx_id == endpoint.rx_id)
     }
 }
 
@@ -471,9 +537,427 @@ impl CheckedPlan {
             presence_groups: groups,
             refused_links: self.refused_links.clone(),
             presence: Vec::new(),
+            presence_links_opened: 0,
+            refused_tables: Vec::new(),
+            presence_interrupted: false,
         }
     }
+
+    /// The link of `group`'s presence requests, before its receive table: the first declared
+    /// link of the group with the group's largest timings (ADR-395 items 5 and 6).
+    fn presence_link(&self, group: &PresenceGroup) -> LinkConfig {
+        let first = self
+            .links
+            .iter()
+            .find(|l| BusKey::of(&l.link) == group.bus && l.functional_id == group.functional_id)
+            .expect("a presence group comes from a declared link");
+        let mut link = first.link.clone();
+        link.p2_max_ms = group.p2_max_ms;
+        link.p2_star_ms = group.p2_star_ms;
+        link.rc78_completion_ms = group.rc78_completion_ms;
+        for (name, value) in &group.timings {
+            match link
+                .params
+                .iter_mut()
+                .find(|(k, _)| k.eq_ignore_ascii_case(name))
+            {
+                Some((_, known)) => *known = *value,
+                None => link.params.push((name.clone(), *value)),
+            }
+        }
+        link
+    }
+
+    /// The physical request and response identifier of every endpoint on `bus`, in declaration
+    /// order: the receive table of a presence link (ADR-395 item 6).
+    fn bus_table(&self, bus: &BusKey) -> Vec<(u32, u32)> {
+        let mut table: Vec<(u32, u32)> = Vec::new();
+        for link in self.links.iter().filter(|l| BusKey::of(&l.link) == *bus) {
+            let pair = (link.link.tx_id, link.link.rx_id);
+            if !table.contains(&pair) {
+                table.push(pair);
+            }
+        }
+        table
+    }
 }
+
+/// What an identification run returns: the report or the job's error, the guards, and how the
+/// communication log ended. The result never depends on the log (ADR-347).
+#[derive(Debug)]
+pub struct IdentificationRun {
+    pub result: Result<IdentificationReport, JobError>,
+    pub guards: JobGuards,
+    pub comm_log: CommLogStatus,
+}
+
+/// Runs the plan's functional presence requests (ADR-327 item 2, ADR-396): per presence group, a
+/// receive table of every declared pair on the group's bus, one link and one request at a time,
+/// under the per-VCI lock `guards` hold. A table the VCI refuses (the worker's answer to the
+/// table or the connect, never a timeout or a lost path) is halved in declaration order, each
+/// part getting a link and a request of its own; a single pair still refused refuses the job.
+/// When the path to the VCI is lost, the link is opened again within `limits` (ADR-393, ADR-394)
+/// and the request sent again within `limits.max_primitive_repeats` with the origin `repeat`
+/// (ADR-392); what was heard before the loss stays, and a run whose bounds run out reports
+/// `presence_interrupted`. A cancel (`cancel`, also set when the future is dropped) ends the run
+/// in [`JobError::Cancelled`]. `source` also gives the clients of the later links.
+pub async fn run_identification<W: WorkerSource>(
+    mut source: W,
+    plan: CheckedPlan,
+    limits: JobLimits,
+    guards: JobGuards,
+    comm_log: Option<CommLogSetup>,
+    cancel: Arc<AtomicBool>,
+) -> IdentificationRun {
+    let handle = Handle::current();
+    let slot: GuardSlot = Arc::new(Mutex::new(Some(guards)));
+    let refused = |slot: &GuardSlot, error: JobError| {
+        let guards = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+        IdentificationRun {
+            result: Err(error),
+            guards: guards.expect("nothing else takes the guards out of the slot"),
+            comm_log: CommLogStatus::None,
+        }
+    };
+    if handle.runtime_flavor() == RuntimeFlavor::CurrentThread {
+        return refused(&slot, JobError::CurrentThreadRuntime);
+    }
+    let unconfirmed = slot
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(JobGuards::link_unconfirmed);
+    if unconfirmed {
+        return refused(&slot, JobError::LinkUnconfirmed);
+    }
+    // A worker that cannot give its first client ends the job before any link or log.
+    if let Err(error) = source.client() {
+        return refused(&slot, JobError::Link(error));
+    }
+    let facts = RunFacts {
+        job_id: String::new(),
+        generation: 0,
+        document_sha256: None,
+        variant_name: None,
+        target_vin: None,
+        writes: false,
+        vci: None,
+        margins: VciMargins::default(),
+    };
+    let log = JobLog::new(comm_log, facts);
+    let cancelled = CancelOnDrop(Arc::clone(&cancel));
+    let job_slot = Arc::clone(&slot);
+    let span = tracing::Span::current();
+    let run = tokio::task::spawn_blocking(move || {
+        let _span = span.entered();
+        let mut log = log;
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            identify(
+                &handle,
+                Arc::new(Mutex::new(source)),
+                &plan,
+                &limits,
+                &cancel,
+                &job_slot,
+                &mut log,
+            )
+        }))
+        .unwrap_or(Err(JobError::Panicked));
+        let outcome = match &result {
+            Ok(_) => "ok",
+            Err(error) => crate::comm_log::error_outcome_name(error),
+        };
+        let status =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.finish_as(outcome)))
+                .unwrap_or(CommLogStatus::None);
+        (result, status)
+    })
+    .await
+    .unwrap_or_else(|error| {
+        let error = if error.is_cancelled() {
+            JobError::Cancelled
+        } else {
+            JobError::Panicked
+        };
+        (Err(error), CommLogStatus::None)
+    });
+    drop(cancelled);
+    let (result, comm_log) = run;
+    let guards = slot.lock().unwrap_or_else(|e| e.into_inner()).take();
+    IdentificationRun {
+        result,
+        guards: guards.expect("nothing else takes the guards out of the slot"),
+        comm_log,
+    }
+}
+
+/// A worker source shared by the links of one run: each link gets its client from the one source,
+/// which also restarts a worker that exited (ADR-394).
+struct SharedSource<W: WorkerSource>(Arc<Mutex<W>>);
+
+impl<W: WorkerSource> SharedSource<W> {
+    fn with<T>(&self, call: impl FnOnce(&mut W) -> T) -> T {
+        call(&mut self.0.lock().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+impl<W: WorkerSource> WorkerSource for SharedSource<W> {
+    type Client = W::Client;
+    fn client(&mut self) -> Result<Self::Client, HostError> {
+        self.with(W::client)
+    }
+    fn status(&mut self) -> WorkerStatus {
+        self.with(W::status)
+    }
+    fn end(&mut self) -> Result<WorkerExit, HostError> {
+        self.with(W::end)
+    }
+    fn pid(&self) -> Option<u32> {
+        self.0.lock().unwrap_or_else(|e| e.into_inner()).pid()
+    }
+}
+
+/// How one part of a group's table ended.
+enum PartEnd {
+    /// The window ended; the answers heard.
+    Done(Vec<crate::host::HeardAnswer>),
+    /// The worker answered, refusing the table or the connect, with its error (ADR-396).
+    Refused(JobError),
+    /// The path to the VCI was lost and the bounds ran out; the answers heard before.
+    Interrupted(Vec<crate::host::HeardAnswer>),
+}
+
+/// The run on the job's blocking thread.
+fn identify<W: WorkerSource>(
+    handle: &Handle,
+    source: Arc<Mutex<W>>,
+    plan: &CheckedPlan,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    log: &mut JobLog,
+) -> Result<IdentificationReport, JobError> {
+    // The guards stay held until this function returns, after every link is closed.
+    let _guards = Arc::clone(guards);
+    if cancelled.load(Ordering::Relaxed) {
+        return Err(JobError::Cancelled);
+    }
+    let mut report = plan.report();
+    let comm_log = log.open(RunKind::First);
+    let mut reopens = 0u8;
+    'groups: for group in report.presence_groups.clone() {
+        let base = plan.presence_link(&group);
+        let mut queue = VecDeque::from([plan.bus_table(&group.bus)]);
+        while let Some(table) = queue.pop_front() {
+            let config = base.functional(group.functional_id, table.clone());
+            let part = presence_part(
+                handle,
+                &source,
+                &config,
+                comm_log.clone(),
+                limits,
+                cancelled,
+                guards,
+                &mut reopens,
+            )?;
+            let (heard, interrupted) = match part {
+                PartEnd::Done(heard) => (heard, false),
+                PartEnd::Interrupted(heard) => (heard, true),
+                PartEnd::Refused(error) => {
+                    // The halves go to the front, the first half first, so one link is open at a
+                    // time and the order stays the declaration order (ADR-395 item 6). A single
+                    // pair that is still refused refuses the job.
+                    let [first, second] = halves(&table).ok_or(error)?;
+                    report.refused_tables.push(RefusedTable {
+                        bus: group.bus.clone(),
+                        functional_id: group.functional_id,
+                        table,
+                    });
+                    queue.push_front(second);
+                    queue.push_front(first);
+                    continue;
+                }
+            };
+            report.presence_links_opened += 1;
+            for answer in heard {
+                let answer = PresenceAnswer {
+                    bus: group.bus.clone(),
+                    rx_id: answer.rx_id,
+                    bytes: answer.bytes,
+                };
+                if !report.presence.contains(&answer) {
+                    report.presence.push(answer);
+                }
+            }
+            if interrupted {
+                report.presence_interrupted = true;
+                break 'groups;
+            }
+        }
+    }
+    Ok(report)
+}
+
+/// A table cut in two, the first half the larger; `None` for a single pair.
+fn halves(table: &[(u32, u32)]) -> Option<[Vec<(u32, u32)>; 2]> {
+    (table.len() > 1).then(|| {
+        let (first, second) = table.split_at(table.len().div_ceil(2));
+        [first.to_vec(), second.to_vec()]
+    })
+}
+
+/// Opens the link of `config`, sends the presence request on it until a window ends, and closes
+/// it. A link that fails to open on a lost path is opened again within the run's bounds; a
+/// table the worker refused is [`PartEnd::Refused`]; any other failure to open ends the job.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn presence_part<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    config: &LinkConfig,
+    comm_log: Option<crate::comm_log::CommLog>,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    reopens: &mut u8,
+) -> Result<PartEnd, JobError> {
+    let timings = Timings::for_link(config);
+    let try_open = || {
+        let client = SharedSource(Arc::clone(source))
+            .client()
+            .map_err(|error| LinkRefused {
+                error: JobError::Link(error),
+                cleaned_up: true,
+                table_refused: false,
+            })?;
+        open_job_link(
+            handle,
+            client,
+            Box::new(SharedSource(Arc::clone(source))),
+            config,
+            None,
+            None,
+            comm_log.clone(),
+            guards,
+            timings,
+        )
+    };
+    let mut opened = try_open();
+    if opened.as_ref().is_err_and(is_path_loss) {
+        let mut last = None;
+        let mut link = None;
+        reopen_attempts(
+            || match try_open() {
+                Ok(open) => {
+                    link = Some(open);
+                    ReopenAttempt::Opened
+                }
+                Err(refused) if is_path_loss(&refused) => ReopenAttempt::NotYet,
+                Err(refused) => {
+                    last = Some(refused);
+                    ReopenAttempt::Cannot
+                }
+            },
+            limits,
+            cancelled,
+            reopens,
+        )?;
+        opened = match (link, last) {
+            (Some(link), _) => Ok(link),
+            (None, Some(refused)) => Err(refused),
+            // The VCI did not come back within the bounds.
+            (None, None) => return Ok(PartEnd::Interrupted(Vec::new())),
+        };
+    }
+    let link = match opened {
+        Ok(link) => link,
+        Err(refused) if refused.table_refused => return Ok(PartEnd::Refused(refused.error)),
+        Err(refused) => return Err(refused.error),
+    };
+    let crate::runner::JobLink {
+        mut host,
+        open_link,
+        path_lost,
+        ..
+    } = link;
+    host.set_receive_table(
+        config
+            .functional
+            .iter()
+            .flat_map(|f| f.table.clone())
+            .collect(),
+    );
+    host.set_link_ids(config.tx_id, config.rx_id);
+    let mut heard = Vec::new();
+    let mut attempts = 0u8;
+    let ended = loop {
+        if cancelled.load(Ordering::Relaxed) {
+            break Err(JobError::Cancelled);
+        }
+        // The origin is the identification's, and `repeat` for a request sent again (ADR-392).
+        host.own_reads(Some(OwnRead::Identification));
+        if attempts > 0 {
+            host.step_resends();
+        }
+        let presence = host.presence(&PRESENCE_REQUEST);
+        host.step_ends();
+        host.own_reads(None);
+        heard.extend(presence.answers);
+        let Err(error) = presence.end else {
+            break Ok(PartEnd::Done(heard));
+        };
+        if error.resend_class() == ResendClass::PathLost {
+            host.path_lost();
+        }
+        let again = attempts < limits.max_primitive_repeats;
+        match error.resend_class() {
+            // The ECU, the bus or the events failed the window, or the start was refused for a
+            // reason that passes: the same link carries the request again.
+            ResendClass::EcuLevel | ResendClass::Transient if again => {
+                std::thread::sleep(limits.wait_poll.max(std::time::Duration::from_millis(1)));
+            }
+            ResendClass::PathLost if again => {
+                match reopen_attempts(|| host.reopen_link(), limits, cancelled, reopens) {
+                    Ok(true) => {}
+                    Ok(false) => break Ok(PartEnd::Interrupted(heard)),
+                    Err(error) => break Err(error),
+                }
+            }
+            ResendClass::EcuLevel | ResendClass::PathLost | ResendClass::Transient => {
+                break Ok(PartEnd::Interrupted(heard));
+            }
+            ResendClass::Other => break Err(JobError::Link(error)),
+        }
+        attempts += 1;
+    };
+    close_job_link(host, open_link, &path_lost);
+    ended
+}
+
+/// Whether a link that did not open failed on a lost path, with nothing left open: the open is
+/// tried again within the run's bounds (ADR-393). A refusal the worker gave is not a loss.
+fn is_path_loss(refused: &LinkRefused) -> bool {
+    refused.cleaned_up
+        && match &refused.error {
+            JobError::Link(error) => {
+                !refused.table_refused
+                    && (error.resend_class() == ResendClass::PathLost
+                        || matches!(
+                            error,
+                            HostError::WorkerStart {
+                                spawn_failed: false,
+                                ..
+                            }
+                        ))
+            }
+            _ => false,
+        }
+}
+
+#[cfg(test)]
+mod run_tests;
 
 #[cfg(test)]
 mod tests {
@@ -493,7 +977,12 @@ mod tests {
     /// A document of one variant: service 1 reads a DID (request SID 0x22) with field 1, a
     /// pattern names it, and the protocol is UDS on CAN as `setup` leaves it. `did` tells
     /// documents apart.
-    fn document(did: u8, tx: u32, rx: u32, setup: impl FnOnce(&mut ProtocolT)) -> Vec<u8> {
+    pub(super) fn document(
+        did: u8,
+        tx: u32,
+        rx: u32,
+        setup: impl FnOnce(&mut ProtocolT),
+    ) -> Vec<u8> {
         let mut protocol = ProtocolT::default();
         protocol.short_name = Some("ISO15765".into());
         protocol.application_layer = Some("UDS".into());
@@ -547,7 +1036,7 @@ mod tests {
         service.request.as_mut().unwrap().sid = 0x2E;
     }
 
-    fn named(bytes: Vec<u8>) -> (Sha256, Vec<u8>) {
+    pub(super) fn named(bytes: Vec<u8>) -> (Sha256, Vec<u8>) {
         (sha2::Sha256::digest(&bytes).into(), bytes)
     }
 
@@ -601,7 +1090,7 @@ mod tests {
     }
 
     /// Loads and checks a plan over `documents`.
-    fn checked(documents: &[(Sha256, Vec<u8>)]) -> Result<CheckedPlan, PlanRefused> {
+    pub(super) fn checked(documents: &[(Sha256, Vec<u8>)]) -> Result<CheckedPlan, PlanRefused> {
         let hashes: Vec<Sha256> = documents.iter().map(|(hash, _)| *hash).collect();
         check_plan(&load(&plan(&hashes), documents)?)
     }
@@ -953,6 +1442,28 @@ mod tests {
         assert!(report.buses_without_presence().is_empty());
         assert!(report.refused_links().is_empty());
         assert!(report.presence().is_empty());
+    }
+
+    /// The report is the CLI's JSON: hashes and heard bytes as lowercase hex, the selection by
+    /// name, and the presence section with its bookkeeping.
+    #[test]
+    fn the_report_serializes_with_hashes_and_bytes_as_hex() {
+        let doc = named(document(0x90, 0x7E0, 0x7E8, |p| p.functional_id = 0x7DF));
+        let mut report = checked(std::slice::from_ref(&doc)).unwrap().report();
+        report.presence.push(PresenceAnswer {
+            bus: bus(500_000),
+            rx_id: 0x7E8,
+            bytes: vec![0x7E, 0x00],
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["selection"], "Candidates");
+        assert_eq!(json["endpoints"][0]["documents"][0], hex(&doc.0));
+        assert_eq!(json["endpoints"][0]["key"]["tx_id"], 0x7E0);
+        assert_eq!(json["presence"][0]["bytes"], "7e00");
+        assert_eq!(json["presence"][0]["bus"]["baud_rate"], 500_000);
+        assert_eq!(json["presence_links_opened"], 0);
+        assert_eq!(json["refused_tables"], serde_json::json!([]));
+        assert_eq!(json["presence_interrupted"], false);
     }
 
     #[test]

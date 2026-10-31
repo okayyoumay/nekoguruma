@@ -18,7 +18,7 @@ use vci_service_interface::{
 };
 
 use crate::comm_log::exchange::{
-    AgentTimes, At, Clock, ClockReading, Detail, End, EventsLost, Evidence, Expected,
+    AgentTimes, AnswerItem, At, Clock, ClockReading, Detail, End, EventsLost, Evidence, Expected,
     LinkErrorKind, Origin, Pending, PendingVisibility, RefusalCause, Rejected, RejectedReason,
     SectionAttrs, SourcePos, Target, TransmitEvidence, UnknownCause, VciTime, VciTimes,
 };
@@ -299,14 +299,7 @@ fn error_event_name(code: i32) -> String {
 /// primitives, so no pending primitive saw its event. Any other error is returned as it is.
 fn lost_vci_between_primitives(error: HostError) -> HostError {
     match &error {
-        HostError::Rpc { status, .. }
-            if status.code() == tonic::Code::FailedPrecondition
-                && vci_service_interface::error_detail_from_status(status)
-                    .and_then(|detail| detail.error_event_data)
-                    .is_some_and(|data| {
-                        data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32
-                    }) =>
-        {
+        HostError::Rpc { status, .. } if names_lost_vci(status) => {
             // The start was refused after the loss (ADR-294).
             HostError::VciLost {
                 refused_after_loss: true,
@@ -314,6 +307,16 @@ fn lost_vci_between_primitives(error: HostError) -> HostError {
         }
         _ => error,
     }
+}
+
+/// Whether the worker refused a call on a link it took offline after a lost VCI: it answers
+/// `FailedPrecondition` with the link's last error event, `PDU_ERR_EVT_LOST_COMM_TO_VCI`
+/// (ADR-105, ADR-294).
+pub(crate) fn names_lost_vci(status: &tonic::Status) -> bool {
+    status.code() == tonic::Code::FailedPrecondition
+        && vci_service_interface::error_detail_from_status(status)
+            .and_then(|detail| detail.error_event_data)
+            .is_some_and(|data| data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32)
 }
 
 /// Whether the worker refused a call because it knows no object with the handle given
@@ -560,6 +563,9 @@ pub struct WorkerHost<C: WorkerApi> {
     comm_log: Option<crate::comm_log::CommLog>,
     /// The link's request and response identifiers, which the entries name.
     link_ids: Option<(u32, u32)>,
+    /// A functional link's receive table, which names the ECU an answer without a header came
+    /// from by its unique-response number (ADR-396); empty on a physical link.
+    receive_table: Vec<(u32, u32)>,
     /// The VM position of the step running ([`ProcedurePosition`]): a request sent during a
     /// step gets an entry with `origin` `procedure` at this position.
     at: Option<At>,
@@ -644,6 +650,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             artifact: None,
             comm_log: None,
             link_ids: None,
+            receive_table: Vec::new(),
             at: None,
             resends: false,
             own: None,
@@ -1182,6 +1189,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         self.link_ids = Some((tx_id, rx_id));
     }
 
+    /// Gives the host a functional link's receive table ([`WorkerHost::presence`], ADR-396).
+    pub(crate) fn set_receive_table(&mut self, table: Vec<(u32, u32)>) {
+        self.receive_table = table;
+    }
+
     /// Gives the host the job's flash artifact, which `artifact_bytes` serves (ADR-336 item 12).
     pub fn set_artifact(&mut self, artifact: Option<crate::artifact::Artifact>) {
         self.artifact = artifact;
@@ -1254,6 +1266,13 @@ impl<C: WorkerApi> WorkerHost<C> {
         progress: Progress,
         before: Option<AgentNow>,
     ) -> Result<Vec<u8>, HostError> {
+        self.exchange(request, progress, before).result
+    }
+
+    /// [`send`](Self::send) that gives the whole of how the primitive ended; the only place that
+    /// sends a request and writes its exchange entry.
+    fn exchange(&mut self, request: Vec<u8>, progress: Progress, before: Option<AgentNow>) -> Sent {
+        let collecting = progress.collecting;
         let logged = before.map(|_| {
             let expected = Expected {
                 positive_prefix: progress.positive_prefix.clone(),
@@ -1269,7 +1288,30 @@ impl<C: WorkerApi> WorkerHost<C> {
         let handle = self.handle.clone();
         let sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
         if let Some((request, expected, negative, sid)) = logged {
-            let (end, mut detail) = sent_end(&request, &sent.result, &negative, sid);
+            let answers = if collecting {
+                answer_items(
+                    &sent.collected,
+                    &self.receive_table,
+                    &expected,
+                    &negative,
+                    sid,
+                )
+            } else {
+                Vec::new()
+            };
+            // A collecting request that ended on its own has the end of its first answer, or no
+            // response (ADR-396); any other end is judged as for any request.
+            let (end, mut detail) = match (&sent.result, answers.first()) {
+                (Ok(_) | Err(HostError::NoResponse), first)
+                    if collecting && !sent.agent_deadline =>
+                {
+                    (
+                        first.map_or(End::NoResponse, |(end, _)| end.clone()),
+                        Detail::default(),
+                    )
+                }
+                _ => sent_end(&request, &sent.result, &negative, sid),
+            };
             let end = deadline_end(end, sent.agent_deadline);
             let end = unanswered_end(end, &sent);
             let end_rejected = matches!(end, End::PositiveUnusable(_)) && sent.result.is_err();
@@ -1301,7 +1343,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             let vci_ended = sent.rx_timeout.is_some();
             let pending = pendings_of(&sent.pendings);
             let rx_id = self.link_ids.map_or(0, |(_, rx_id)| rx_id);
-            let rejected = rejected_of(&sent.rejected, rx_id);
+            // A collecting request lists its rejected results with its answers.
+            let rejected = if collecting {
+                Vec::new()
+            } else {
+                rejected_of(&sent.rejected, rx_id)
+            };
+            let answers: Vec<AnswerItem> = answers.into_iter().map(|(_, item)| item).collect();
             let events_lost = sent.events_lost.flatten().map(|read| EventsLost {
                 agent_us: read.monotonic_us,
                 notifications: 1,
@@ -1309,6 +1357,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             let agent_deadline = sent.agent_deadline;
             let seq = self.log(&request, before, end, detail, unbound, |evidence| {
                 evidence.pending = pending;
+                evidence.answers = answers;
                 evidence.rejected = rejected;
                 evidence.events_lost = events_lost;
                 evidence.end_rejected = end_rejected;
@@ -1330,7 +1379,46 @@ impl<C: WorkerApi> WorkerHost<C> {
                 stray.exchange = stray.exchange.or(seq);
             }
         }
-        sent.result
+        sent
+    }
+
+    /// Sends the functional presence request and collects every answer to it until the VCI ends
+    /// the window (ADR-327 item 2, ADR-396). The only path that sends TesterPresent: the policy
+    /// accepts exactly `3E 00` for it ([`crate::policy::check_presence_request`]) and refuses it
+    /// to every other path. The answers read before a failure are returned with it, so a part
+    /// that is sent again keeps them.
+    pub(crate) fn presence(&mut self, request: &[u8]) -> Presence {
+        let before = self.log_clock();
+        let checked = crate::policy::check_presence_request(request, self.link.application_layer)
+            .and_then(|()| Progress::collecting(request));
+        let progress = match checked {
+            Ok(progress) => progress,
+            Err(error) => {
+                self.log_refused(request, before, &error, None);
+                return Presence {
+                    answers: Vec::new(),
+                    end: Err(error),
+                };
+            }
+        };
+        let sent = self.exchange(request.to_vec(), progress, before);
+        // A window that ends with no answer is the silent outcome, not a failure; one the
+        // agent's deadline ended is, since the VCI did not end it.
+        let end = match sent.result {
+            Ok(_) => Ok(()),
+            Err(HostError::NoResponse) if !sent.agent_deadline => Ok(()),
+            Err(error) => Err(error),
+        };
+        let answers = collected_answers(&sent.collected, &self.receive_table)
+            .into_iter()
+            .filter_map(|(rx_id, read)| {
+                Some(HeardAnswer {
+                    rx_id: rx_id?,
+                    bytes: read.bytes.clone(),
+                })
+            })
+            .collect();
+        Presence { answers, end }
     }
 
     /// Sends `request` and waits for the primitive to end; `logged` when its entry is written,
@@ -1350,7 +1438,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             cop_ctrl_data: Some(ComPrimitiveCtrlData {
                 time: 0,
                 num_send_cycles: 1,
-                num_receive_cycles: 1,
+                num_receive_cycles: progress.receive_cycles,
                 temp_param_update: 0,
                 // Only an answer to this request ends the primitive, so an unsolicited frame
                 // or a late answer to an earlier request cannot.
@@ -1466,11 +1554,12 @@ impl<C: WorkerApi> WorkerHost<C> {
                         continue;
                     }
                 }
-                let (kept, kept_pendings, kept_rejected, kept_response) = (
+                let (kept, kept_pendings, kept_rejected, kept_response, kept_collected) = (
                     progress.unbound.len(),
                     progress.pendings.len(),
                     progress.rejected.len(),
                     progress.response_times.rx_end,
+                    progress.collected.len(),
                 );
                 let done = progress.on_notification(notification.event_data, cop);
                 let lost = matches!(done, Some(Err(HostError::EventsLost)));
@@ -1478,6 +1567,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 if progress.unbound.len() > kept
                     || progress.pendings.len() > kept_pendings
                     || progress.rejected.len() > kept_rejected
+                    || progress.collected.len() > kept_collected
                     || lost
                     || responded
                 {
@@ -1494,6 +1584,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                     }
                     for rejected in &mut progress.rejected[kept_rejected..] {
                         rejected.read = read;
+                    }
+                    for collected in &mut progress.collected[kept_collected..] {
+                        collected.read = read;
                     }
                     if lost {
                         progress.events_lost = Some(read);
@@ -1568,6 +1661,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             unbound: std::mem::take(&mut progress.unbound),
             pendings: std::mem::take(&mut progress.pendings),
             rejected: std::mem::take(&mut progress.rejected),
+            collected: std::mem::take(&mut progress.collected),
             last_rejected: progress.last_rejected,
             bound_start: progress.bound_start,
             bound_tx: progress.bound_tx,
@@ -1611,6 +1705,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         match (&self.at, self.own) {
             (Some(_), _) if self.resends => Some(Origin::Repeat),
             (Some(_), _) => Some(Origin::Procedure),
+            // The identification runner sends its presence request again (ADR-396).
+            (None, Some(_)) if self.resends => Some(Origin::Repeat),
             (None, Some(own)) => Some(own.origin()),
             (None, None) => None,
         }
@@ -2132,6 +2228,8 @@ struct Sent {
     pendings: Vec<PendingRead>,
     /// See `Progress::rejected`.
     rejected: Vec<RejectedRead>,
+    /// See `Progress::collected`.
+    collected: Vec<CollectedRead>,
     /// See `Progress::last_rejected`.
     last_rejected: bool,
     /// See `Progress::bound_start`.
@@ -2163,6 +2261,7 @@ impl Sent {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            collected: Vec::new(),
             last_rejected: false,
             bound_start: false,
             bound_tx: None,
@@ -2194,6 +2293,97 @@ struct RejectedRead {
     clock: Option<Clock>,
     reason: RejectedReason,
     read: Option<AgentNow>,
+}
+
+/// `num_receive_cycles` that makes the primitive collect every answer until its window ends
+/// (ISO 22900-2:2022 8.2.6.2.2, IS-MULTIPLE; the J2534 worker reads -2 the same way, ADR-396).
+const RECEIVE_UNTIL_WINDOW_ENDS: i32 = -2;
+
+/// A result a collecting primitive read (ADR-396): its response identifier as the worker gave it
+/// (the header's, else the unique-response number), its bytes and its time.
+#[derive(Debug)]
+struct CollectedRead {
+    identifier: Option<u32>,
+    unique: u32,
+    bytes: Vec<u8>,
+    vci_us: u64,
+    pending: bool,
+    read: Option<AgentNow>,
+}
+
+/// An answer of the presence request: the response identifier and the bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HeardAnswer {
+    pub(crate) rx_id: u32,
+    pub(crate) bytes: Vec<u8>,
+}
+
+/// How a presence request ended: the answers read, whatever the end, and the failure if the
+/// window did not end on its own (ADR-396).
+#[derive(Debug)]
+pub(crate) struct Presence {
+    pub(crate) answers: Vec<HeardAnswer>,
+    pub(crate) end: Result<(), HostError>,
+}
+
+/// The answers a collecting primitive read, in order, each with the response identifier it came
+/// on: every result that is not a pending, and a pending only when no result came on its
+/// identifier after it (a pending followed by its final answer is one answer). A result's
+/// identifier is the header's, else the table entry its unique-response number names, else the
+/// table's only pair; `None` when the worker gave none of these (ADR-396).
+fn collected_answers<'a>(
+    collected: &'a [CollectedRead],
+    table: &[(u32, u32)],
+) -> Vec<(Option<u32>, &'a CollectedRead)> {
+    let id_of = |read: &CollectedRead| {
+        read.identifier
+            .or_else(|| {
+                let at = usize::try_from(read.unique).ok()?.checked_sub(1)?;
+                table.get(at).map(|&(_, rx)| rx)
+            })
+            .or(match table {
+                [(_, only)] => Some(*only),
+                _ => None,
+            })
+    };
+    collected
+        .iter()
+        .enumerate()
+        .filter(|&(at, read)| {
+            !read.pending
+                || !collected[at + 1..]
+                    .iter()
+                    .any(|later| id_of(later) == id_of(read))
+        })
+        .map(|(_, read)| (id_of(read), read))
+        .collect()
+}
+
+/// The answers of a collecting primitive as its exchange entry lists them, each with the end its
+/// bytes have against the request's expected answer.
+fn answer_items(
+    collected: &[CollectedRead],
+    table: &[(u32, u32)],
+    expected: &Expected,
+    negative: &NegativeShape,
+    sid: u8,
+) -> Vec<(End, AnswerItem)> {
+    collected_answers(collected, table)
+        .into_iter()
+        .map(|(rx_id, read)| {
+            let bytes = read.bytes.clone();
+            let end = if negative.is_negative(sid, &bytes) {
+                End::Negative(bytes)
+            } else if bytes.starts_with(&expected.positive_prefix) {
+                End::Positive(bytes)
+            } else {
+                End::PositiveUnusable(bytes)
+            };
+            let agent_us = read.read.map_or(0, |read| read.monotonic_us);
+            let item = AnswerItem::listed(rx_id.unwrap_or(0), &end, Some(read.vci_us), agent_us);
+            (end, item)
+        })
+        .collect()
 }
 
 /// An item of the link read while a primitive ran that is not that primitive's: one of no
@@ -2739,6 +2929,14 @@ struct Progress {
     /// The results bound to the primitive that do not answer the request, in order (design 8.11
     /// `rejected`, ADR-359).
     rejected: Vec<RejectedRead>,
+    /// Collecting mode (ADR-396): every result bound to the primitive that is no indication, in
+    /// order, whether it answers the request or not. Empty unless `collecting`.
+    collected: Vec<CollectedRead>,
+    /// The primitive collects every answer within its window instead of ending at the first.
+    collecting: bool,
+    /// The primitive's `num_receive_cycles`: 1, or -2 (collect until the window ends) when
+    /// collecting.
+    receive_cycles: i32,
     /// The last result of the primitive was a rejected one: no pending or answer came after it.
     last_rejected: bool,
     /// A start-of-message indication bound to the primitive was read: a response may be under
@@ -2856,6 +3054,9 @@ impl Progress {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            collected: Vec::new(),
+            collecting: false,
+            receive_cycles: 1,
             last_rejected: false,
             bound_start: false,
             bound_tx: None,
@@ -2866,6 +3067,15 @@ impl Progress {
             new_items: Vec::new(),
             reads: Vec::new(),
             early_response: None,
+        })
+    }
+
+    /// Waits for every answer to `request` within the window: the primitive collects (ADR-396).
+    fn collecting(request: &[u8]) -> Result<Self, HostError> {
+        Ok(Self {
+            collecting: true,
+            receive_cycles: RECEIVE_UNTIL_WINDOW_ENDS,
+            ..Self::for_request(request)?
         })
     }
 
@@ -2884,6 +3094,9 @@ impl Progress {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            collected: Vec::new(),
+            collecting: false,
+            receive_cycles: 1,
             last_rejected: false,
             bound_start: false,
             bound_tx: None,
@@ -2991,6 +3204,16 @@ impl Progress {
             && !is_indication(result)
         {
             self.last_rejected = !self.answers(&result.data_bytes);
+            if self.collecting {
+                self.collected.push(CollectedRead {
+                    identifier: header_identifier(result),
+                    unique: result.unique_resp_identifier,
+                    bytes: result.data_bytes.clone(),
+                    vci_us: u64::from(item.timestamp),
+                    pending: self.negative.is_pending(self.sid, &result.data_bytes),
+                    read: None,
+                });
+            }
         }
         if let Some(event_item::Data::ResultData(result)) = &item.data
             && is_start_indication(result)
@@ -3592,6 +3815,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            collected: Vec::new(),
             last_rejected: false,
             bound_start: false,
             bound_tx: None,
@@ -3687,6 +3911,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            collected: Vec::new(),
             last_rejected: false,
             bound_start: false,
             bound_tx: None,
@@ -4704,6 +4929,7 @@ mod tests {
             unbound: Vec::new(),
             pendings: Vec::new(),
             rejected: Vec::new(),
+            collected: Vec::new(),
             last_rejected: false,
             bound_start: false,
             bound_tx: None,
@@ -4762,6 +4988,7 @@ mod tests {
                 unbound: Vec::new(),
                 pendings: Vec::new(),
                 rejected: Vec::new(),
+                collected: Vec::new(),
                 last_rejected: false,
                 bound_start: false,
                 bound_tx: None,
@@ -5541,5 +5768,168 @@ mod tests {
                 "{error:?}: {end:?}"
             );
         }
+    }
+
+    /// A result bound to the primitive with the CAN identifier in its header, as the J2534 worker
+    /// gives it, and the unique-response number.
+    fn answer_on(id: Option<u32>, unique: u32, bytes: &[u8]) -> EventItem {
+        event(
+            Some(COP),
+            event_item::Data::ResultData(vci_service_interface::ResultData {
+                unique_resp_identifier: unique,
+                extra_info: id.map(|id| vci_service_interface::ExtraInfo {
+                    header_bytes: id.to_be_bytes().to_vec(),
+                    footer_bytes: Vec::new(),
+                }),
+                data_bytes: bytes.to_vec(),
+                ..Default::default()
+            }),
+        )
+    }
+
+    const TABLE: [(u32, u32); 3] = [(0x7E0, 0x7E8), (0x7E1, 0x7E9), (0x7E2, 0x7EA)];
+
+    fn collect(events: Vec<EventItem>) -> (Progress, Option<Result<Vec<u8>, HostError>>) {
+        let mut progress = Progress::collecting(&[0x3E, 0x00]).unwrap();
+        let done = events
+            .into_iter()
+            .find_map(|item| progress.on_event(item, COP));
+        (progress, done)
+    }
+
+    fn judged(progress: &Progress, table: &[(u32, u32)]) -> Vec<(Option<u32>, Vec<u8>, String)> {
+        let expected = Expected {
+            positive_prefix: progress.positive_prefix.clone(),
+            negative_pattern: progress.negative.pattern(progress.sid),
+        };
+        let items = answer_items(
+            &progress.collected,
+            table,
+            &expected,
+            &progress.negative,
+            progress.sid,
+        );
+        collected_answers(&progress.collected, table)
+            .into_iter()
+            .zip(items)
+            .map(|((id, read), (end, _))| (id, read.bytes.clone(), format!("{end:?}")))
+            .collect()
+    }
+
+    /// ADR-396: the presence request collects until its window ends; every answer on a distinct
+    /// response identifier is kept, whatever its kind (positive, negative, a pending that was
+    /// followed by its final answer once, a result that does not answer), and an indication is
+    /// not an answer.
+    #[test]
+    fn several_answers_on_distinct_identifiers_are_each_collected() {
+        let indication = event(
+            Some(COP),
+            event_item::Data::ResultData(vci_service_interface::ResultData {
+                rx_flag: vec![0, 0, 0, 0x08],
+                data_bytes: vec![0x3E, 0x00],
+                ..Default::default()
+            }),
+        );
+        let (progress, done) = collect(vec![
+            indication,
+            answer_on(Some(0x7E8), 1, &[0x7E, 0x00]),
+            answer_on(Some(0x7E9), 2, &[0x7F, 0x3E, 0x22]),
+            answer_on(Some(0x7EA), 3, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7EA), 3, &[0x7E, 0x00]),
+            answer_on(Some(0x7EB), 0, &[0x62, 0xF1]),
+            event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished)),
+        ]);
+        assert_eq!(progress.receive_cycles, -2);
+        assert!(done.is_some_and(|result| result.is_ok()));
+        assert_eq!(
+            judged(&progress, &TABLE),
+            [
+                (
+                    Some(0x7E8),
+                    vec![0x7E, 0x00],
+                    "Positive([126, 0])".to_owned()
+                ),
+                (
+                    Some(0x7E9),
+                    vec![0x7F, 0x3E, 0x22],
+                    "Negative([127, 62, 34])".to_owned()
+                ),
+                (
+                    Some(0x7EA),
+                    vec![0x7E, 0x00],
+                    "Positive([126, 0])".to_owned()
+                ),
+                (
+                    Some(0x7EB),
+                    vec![0x62, 0xF1],
+                    "PositiveUnusable([98, 241])".to_owned()
+                ),
+            ]
+        );
+        // The ordinary primitive ends at one response and asks for one receive cycle.
+        assert_eq!(
+            Progress::for_request(&[0x22, 0xF1, 0x90])
+                .unwrap()
+                .receive_cycles,
+            1
+        );
+    }
+
+    /// A pending nobody finished is the ECU's answer too; one that its final answer followed is
+    /// not listed twice; the same identifier answering twice is two answers.
+    #[test]
+    fn a_pending_is_an_answer_only_when_no_final_answer_followed() {
+        let (progress, _) = collect(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7E9), 2, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+            answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+        ]);
+        let ids: Vec<_> = judged(&progress, &TABLE)
+            .into_iter()
+            .map(|(id, bytes, _)| (id, bytes))
+            .collect();
+        assert_eq!(
+            ids,
+            [
+                (Some(0x7E8), vec![0x7F, 0x3E, 0x78]),
+                (Some(0x7E9), vec![0x7E, 0x00]),
+                (Some(0x7E9), vec![0x7E, 0x00]),
+            ]
+        );
+    }
+
+    /// The response identifier is the header's, else the table entry the unique-response number
+    /// names, else the only pair of a one-pair table; with none of these the answer has no
+    /// identifier and is not presence.
+    #[test]
+    fn an_answer_s_identifier_comes_from_its_header_or_its_table_entry() {
+        let (progress, _) = collect(vec![
+            answer_on(Some(0x7EA), 1, &[0x7E, 0x00]),
+            answer_on(None, 2, &[0x7E, 0x00]),
+            answer_on(None, 9, &[0x7E, 0x00]),
+            answer_on(None, 0, &[0x7E, 0x00]),
+        ]);
+        let ids = |table: &[(u32, u32)]| -> Vec<Option<u32>> {
+            judged(&progress, table)
+                .into_iter()
+                .map(|(id, ..)| id)
+                .collect()
+        };
+        assert_eq!(ids(&TABLE), [Some(0x7EA), Some(0x7E9), None, None]);
+        assert_eq!(
+            ids(&TABLE[..1]),
+            [Some(0x7EA), Some(0x7E8), Some(0x7E8), Some(0x7E8)]
+        );
+        assert_eq!(ids(&[]), [Some(0x7EA), None, None, None]);
+    }
+
+    /// A rejected result of an ordinary primitive stays in `rejected`; the collecting one lists
+    /// every result in `collected` instead of treating the first as the end.
+    #[test]
+    fn an_ordinary_primitive_collects_nothing() {
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let _ = progress.on_event(answer_on(Some(0x7E8), 1, &[0x62, 0xF1, 0x90, 0x41]), COP);
+        assert!(progress.collected.is_empty());
     }
 }

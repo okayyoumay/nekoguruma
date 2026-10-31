@@ -1477,7 +1477,7 @@ identification job, derives its endpoints and sends its functional presence requ
     the origin `repeat`; lost events send it again on the same link. The answers heard before
     count, and bounds that run out set `presence_interrupted`. A worker that exited between two
     links is logged (`worker_exit`, `worker_restart`) and the next link opens on a new one
-    (ADR-394). Before each link opens the run checks for a cancel and for guards marked by a
+    (ADR-394), as is one found exited after a link failed to open and to close again. Before each link opens the run checks for a cancel and for guards marked by a
     link that did not close (ADR-258); a table refusal whose link did not close is not halved.
   - Only response identifiers of the link's receive table mark presence; the exchange entry
     lists every result.

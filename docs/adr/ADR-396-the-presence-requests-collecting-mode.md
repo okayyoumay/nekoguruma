@@ -72,7 +72,9 @@ handling of a refused table entry are separate steps.
    ADR-294) is a lost path too. Before each link opens the run checks for a cancel and for
    guards marked by a link that did not close (ADR-258): a refusal whose link did not close
    is not halved, and no further link opens. A worker that exited between two parts is logged
-   (`worker_exit`, `worker_restart`) as ADR-394 has it. TesterPresent with sub-function zero changes nothing on the ECU, so a
+   (`worker_exit`, `worker_restart`) as ADR-394 has it; so is one found exited after a link
+   failed to open on a lost path and could not close what it opened, since a reaped worker
+   holds no link: the mark is cleared and the open tried again. TesterPresent with sub-function zero changes nothing on the ECU, so a
    resend needs no idempotency check. Lost events, which end the primitive but not the link,
    and a start refused for a reason that passes, are resent on the same link within the same
    bound. The answers received before the failure count and are not discarded by the resend. A

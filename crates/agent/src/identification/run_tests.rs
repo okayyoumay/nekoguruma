@@ -50,6 +50,9 @@ struct State {
     table_script: VecDeque<tonic::Status>,
     /// What the first `DestroyComLogicalLink` calls answer (`None`: success), one per call.
     destroy_script: VecDeque<Option<tonic::Status>>,
+    /// The statuses the first `ModuleConnect` and `ModuleDisconnect` calls fail with.
+    connect_script: VecDeque<tonic::Status>,
+    disconnect_script: VecDeque<tonic::Status>,
     /// The status `CreateComLogicalLink` fails with.
     create_status: Option<tonic::Status>,
     /// The events of the n-th started primitive; one that has no script finishes at once.
@@ -115,14 +118,20 @@ impl vci_service_interface::vci_service_server::VciService for Fake {
         _: tonic::Request<vci_service_interface::ModuleConnectRequest>,
     ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
         self.note("ModuleConnect");
-        ok()
+        match self.state().connect_script.pop_front() {
+            Some(status) => Err(status),
+            None => ok(),
+        }
     }
     async fn module_disconnect(
         &self,
         _: tonic::Request<vci_service_interface::ModuleDisconnectRequest>,
     ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
         self.note("ModuleDisconnect");
-        ok()
+        match self.state().disconnect_script.pop_front() {
+            Some(status) => Err(status),
+            None => ok(),
+        }
     }
     async fn get_version(
         &self,
@@ -1011,10 +1020,10 @@ async fn an_answer_outside_the_table_is_listed_but_marks_nothing() {
     assert_eq!(ids, [0x6FF, u64::from(A.1)]);
 }
 
-/// A source that tells the second link's open that the worker has exited, as a launcher that
+/// A source that tells its n-th status question that the worker has exited, as a launcher that
 /// owns the process does (ADR-394).
 #[derive(Clone)]
-struct ExitsOnce(WorkerClient, Arc<Mutex<u32>>);
+struct ExitsOnce(WorkerClient, Arc<Mutex<u32>>, u32);
 
 impl WorkerSource for ExitsOnce {
     type Client = WorkerClient;
@@ -1024,7 +1033,7 @@ impl WorkerSource for ExitsOnce {
     fn status(&mut self) -> WorkerStatus {
         let mut calls = self.1.lock().unwrap();
         *calls += 1;
-        if *calls == 2 {
+        if *calls == self.2 {
             WorkerStatus::Exited(WorkerExit {
                 pid: Some(7),
                 how: crate::client::ExitHow::Code(1),
@@ -1055,7 +1064,7 @@ async fn a_worker_that_exits_between_parts_is_logged() {
         &AtomicBool::new(false),
     )
     .unwrap();
-    let source = ExitsOnce(serve(fake).await, Arc::new(Mutex::new(0)));
+    let source = ExitsOnce(serve(fake).await, Arc::new(Mutex::new(0)), 2);
     let run = run_identification(
         source,
         plan_of(&[A, B], Some(0x7DF)),
@@ -1103,4 +1112,83 @@ async fn a_receive_error_after_an_answer_interrupts_the_part_and_keeps_the_answe
         ran.exchanges()[0]["answers"].as_array().map(Vec::len),
         Some(1)
     );
+}
+
+/// What a run does when the worker's process ends during `ModuleConnect`, so that its cleanup
+/// fails too: `exits` is the status question that finds it exited (0: never).
+async fn run_with_worker_lost_in_setup(exits: u32) -> (IdentificationRun, Vec<String>) {
+    let fake = Fake::default();
+    {
+        let mut state = fake.state();
+        state.connect_script = VecDeque::from([tonic::Status::unavailable("the worker is gone")]);
+        state.disconnect_script =
+            VecDeque::from([tonic::Status::unavailable("the worker is gone")]);
+        state.scripts = VecDeque::from([vec![Item::Answer(A.1, POSITIVE), Item::Finish]]);
+    }
+    let dir = tempfile::tempdir().unwrap();
+    let setup = CommLogSetup::for_run(dir.path().join("log")).unwrap();
+    let guards = JobGuards::take_vci_only(
+        &GuardSetup {
+            dir: dir.path().join("locks"),
+            vci: "fake".to_owned(),
+        },
+        Duration::from_millis(1),
+        &AtomicBool::new(false),
+    )
+    .unwrap();
+    let source = ExitsOnce(serve(fake).await, Arc::new(Mutex::new(0)), exits);
+    let run = run_identification(
+        source,
+        plan_of(&[A, B], Some(0x7DF)),
+        limits(),
+        guards,
+        Some(setup.clone()),
+        Arc::new(AtomicBool::new(false)),
+    )
+    .await;
+    let events = std::fs::read_to_string(setup.path().unwrap())
+        .unwrap()
+        .lines()
+        .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+        .filter_map(|line| line["event"].as_str().map(str::to_owned))
+        .filter(|event| event.starts_with("worker_") || event == "link_opened")
+        .collect();
+    (run, events)
+}
+
+/// ADR-394: a worker that exited during the link's setup confirms the link closed, though the
+/// cleanup got no answer: the exit is logged, the guards' mark cleared, and the link opened again
+/// on a new worker.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_worker_that_exits_during_the_setup_is_replaced() {
+    // Question 1 is the probe before the open, question 2 the one after its failure.
+    let (run, events) = run_with_worker_lost_in_setup(2).await;
+    let report = run
+        .result
+        .as_ref()
+        .unwrap_or_else(|error| panic!("{error}"));
+    assert_eq!(report.presence_links_opened(), 1);
+    assert_eq!(report.presence()[0].rx_id, A.1);
+    assert!(!run.guards.link_unconfirmed());
+    assert_eq!(events, ["worker_exit", "worker_restart", "link_opened"]);
+}
+
+/// A worker that is alive or unknown leaves the unclean failure as it was: the guards stay marked
+/// and the run ends (ADR-258).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_setup_failure_that_leaves_the_worker_alive_ends_the_run() {
+    let (run, events) = run_with_worker_lost_in_setup(0).await;
+    assert!(
+        matches!(
+            run.result,
+            Err(JobError::Link(HostError::Rpc {
+                rpc: "ModuleConnect",
+                ..
+            }))
+        ),
+        "{:?}",
+        run.result
+    );
+    assert!(run.guards.link_unconfirmed());
+    assert!(events.is_empty(), "{events:?}");
 }

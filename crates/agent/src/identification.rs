@@ -661,6 +661,31 @@ pub async fn run_identification<W: WorkerSource>(
     }
 }
 
+/// Asks the source whether the worker has exited since it was last asked; if it has, logs its
+/// exit, clears the guards' mark (a reaped process holds no link, ADR-258 item 3) and notes that
+/// the next client is a restart (ADR-394). Returns whether the worker was found exited.
+fn probe_worker<W: WorkerSource>(
+    source: &mut SharedSource<W>,
+    comm_log: &Option<crate::comm_log::CommLog>,
+    guards: &GuardSlot,
+    worker_ended: &Cell<bool>,
+) -> bool {
+    if worker_ended.get() {
+        return false;
+    }
+    let WorkerStatus::Exited(exit) = source.status() else {
+        return false;
+    };
+    if let Some(log) = comm_log {
+        log.worker_exit(exit, &[]);
+    }
+    worker_ended.set(true);
+    if let Some(held) = guards.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        held.worker_gone();
+    }
+    true
+}
+
 /// Whether the guards in `slot` are marked: the worker may still hold a link (ADR-258).
 fn link_unconfirmed(slot: &GuardSlot) -> bool {
     let held = slot.lock().unwrap_or_else(|e| e.into_inner());
@@ -816,19 +841,7 @@ fn presence_part<W: WorkerSource>(
             return Err(stop(JobError::Cancelled));
         }
         let mut shared = SharedSource(Arc::clone(source));
-        if !worker_ended.get()
-            && let WorkerStatus::Exited(exit) = shared.status()
-        {
-            // The worker ended between links: its exit is logged and the mark cleared, as a
-            // host does when it opens the link again (ADR-394); `client` starts a new one.
-            if let Some(log) = &comm_log {
-                log.worker_exit(exit, &[]);
-            }
-            worker_ended.set(true);
-            if let Some(held) = guards.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-                held.worker_gone();
-            }
-        }
+        probe_worker(&mut shared, &comm_log, guards, worker_ended);
         if link_unconfirmed(guards) {
             return Err(stop(JobError::LinkUnconfirmed));
         }
@@ -840,7 +853,7 @@ fn presence_part<W: WorkerSource>(
         {
             log.worker_restart(shared.pid());
         }
-        open_job_link(
+        let opened = open_job_link(
             handle,
             client,
             Box::new(SharedSource(Arc::clone(source))),
@@ -850,7 +863,18 @@ fn presence_part<W: WorkerSource>(
             comm_log.clone(),
             guards,
             timings,
-        )
+        );
+        // An open that failed on a lost path and could not close what it opened may have been
+        // cut by the worker's exit, which confirms the link closed (ADR-394): a worker found
+        // exited is logged and the mark cleared, so the open is tried again.
+        opened.map_err(|mut refused| {
+            let lost = matches!(&refused.error, JobError::Link(error)
+                if error.resend_class() == ResendClass::PathLost);
+            if !refused.cleaned_up && lost {
+                refused.cleaned_up = probe_worker(&mut shared, &comm_log, guards, worker_ended);
+            }
+            refused
+        })
     };
     let mut opened = try_open();
     if opened.as_ref().is_err_and(is_path_loss) {

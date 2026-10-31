@@ -246,6 +246,77 @@ async fn refused_usdt_flow_control_filter_over_the_limit_fails_connect() {
     server.shutdown().await;
 }
 
+/// A table whose USDT and UUDT response identifiers share one physical request identifier.
+fn shared_request_id_table() -> Vec<EcuUniqueRespData> {
+    vec![ecu_entry(
+        1,
+        vec![
+            unum32_param(CP_CAN_RESP_USDT_ID, 0x7E8),
+            unum32_param(CP_CAN_RESP_UUDT_ID, 0x5E8),
+            unum32_param(CP_CAN_PHYS_REQ_ID, 0x7E0),
+        ],
+    )]
+}
+
+/// ADR-047 with ADR-398: in `auto` mode the capability probe runs before the connect-time
+/// filters are installed, so a device that holds a companion channel serves the UUDT id
+/// there and gets no second flow-control filter on the shared request id, which an adapter
+/// enforcing unique flow-control ids would refuse.
+#[tokio::test]
+#[serial]
+async fn auto_mode_probes_before_the_strict_install_and_connects_dual_channel() {
+    let server = TestServer::start_with_can_mode(Some("auto")).await;
+    server.backdoor.set_flow_control_filter_checks(10);
+    let mut client = server.client().await;
+
+    let cll = staged_link(&mut client, shared_request_id_table()).await;
+    connect(&mut client, cll)
+        .await
+        .expect("a dual-channel-capable adapter connects");
+
+    // Primary, the probe's channel (released again), and the UUDT companion.
+    assert_eq!(server.backdoor.connect_count(), 3);
+    assert_eq!(server.backdoor.disconnect_count(), 1, "the probe's channel");
+    assert_eq!(
+        server.backdoor.filter_count(MOCK_CHANNEL_ID),
+        1,
+        "only the USDT flow-control filter is on the primary channel"
+    );
+
+    server.shutdown().await;
+}
+
+/// ADR-047 with ADR-398: when the probe finds no second channel, `auto` is single-channel,
+/// the UUDT id gets the flow-control workaround as with an explicit `single-channel`, and
+/// an adapter that refuses the repeated request id fails the connect like any other
+/// refused table filter.
+#[tokio::test]
+#[serial]
+async fn auto_mode_single_channel_install_is_refused_like_explicit_single_channel() {
+    let server = TestServer::start_with_can_mode(Some("auto")).await;
+    server.backdoor.set_max_channels(1);
+    server.backdoor.set_flow_control_filter_checks(10);
+    let mut client = server.client().await;
+
+    let cll = staged_link(&mut client, shared_request_id_table()).await;
+    let status = connect(&mut client, cll)
+        .await
+        .expect_err("the second flow-control filter must be refused");
+    assert_eq!(status.code(), Code::Internal);
+    let detail = error_detail_from_status(&status).expect("an ErrorDetail");
+    assert_eq!(detail.pdu_error, PduError::PduErrInvalidParameters as i32);
+    assert_eq!(server.backdoor.connect_count(), 1, "no companion opened");
+    assert_eq!(
+        server.backdoor.stop_filter_count(),
+        1,
+        "the first was stopped"
+    );
+    assert_eq!(server.backdoor.filter_count(MOCK_CHANNEL_ID), 0);
+    assert_eq!(server.backdoor.disconnect_count(), 1);
+
+    server.shutdown().await;
+}
+
 /// A device that is gone while a table filter is installed is the lost VCI
 /// (`FAILED_PRECONDITION` with `PDU_ERR_EVT_LOST_COMM_TO_VCI`), which the agent reopens on,
 /// not a refusal of the table it would halve.

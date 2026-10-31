@@ -93,7 +93,10 @@ adapter refuses (ADR-129) and a native-mixed identifier collision (ADR-162).
    to halve. Any other error fails the connect as `Code::Unknown` with `PDU_ERR_FCT_FAILED`:
    the agent's `refused` never reads `UNKNOWN` as the worker's answer, so such an error is not
    a refusal and the table is not halved, with no change to the agent. The three are told apart
-   in `error::map_connect_filter_failure`.
+   in `error::map_connect_filter_failure`. In `auto` CAN channel mode the probe of ADR-047 runs
+   before this install, outside the `shared_channels` guard, so the filters installed are the
+   resolved mode's: an adapter with a companion channel is not refused the UUDT workaround's
+   second flow-control filter that a single-channel table would need.
 10. **One offline teardown (ADR-397).** `DisconnectComLogicalLink` and the rollback of a
     refused connect run one function, `take_link_offline`, under the `shared_channels` guard
     the caller holds: client filters, point-to-point filters (item 8), repeat messages, the
@@ -105,8 +108,10 @@ adapter refuses (ADR-129) and a native-mixed identifier collision (ADR-162).
     passes the connection it set up: the teardown acts only if the link still holds that
     channel key (matched on the key alone, since a channel hard error clears `channel_id` but
     keeps the key), and stops filters only on the channel whose id the link was connected on.
-    A link that never was online gets an Offline status, which ISO 22900-2's any-state-to-Offline
-    use case allows.
+    A link that never was online also gets an Offline status: `take_link_offline` is the one
+    teardown for both callers, so a refused connect leaves the link in the same Offline state
+    that a disconnect leaves, whatever state it had reached. This rests on the worker's own state handling, not on a clause of
+    ISO 22900-2.
 
 ## Consequences
 

@@ -5091,12 +5091,55 @@ impl J2534Service {
         // filter counts and this link's keys change together, and no
         // disconnect or join can see the link half-installed.
         if base_proto_id == j2534_0404::ISO15765 {
-            let entries = {
+            // Auto mode: the first ISO15765-family CLL to establish a *new*
+            // physical ISO15765 channel decides, once, whether this device is
+            // dual-channel-capable (ADR-046 addendum, ADR-047). The mode is
+            // resolved BEFORE the strict install below, because the filters
+            // depend on it: under `DualChannel` a UUDT response id is served
+            // by the companion channel and gets no flow-control filter, while
+            // under `SingleChannel` it gets the flow-control workaround that
+            // an adapter enforcing unique flow-control ids refuses when the
+            // USDT filter shares the request id. A no-op for every other mode
+            // and for joining CLLs (whose channel's creator already probed).
+            // ADR-157 accepted residual, widened to `_CHx` by ADR-156
+            // Decision 3 addendum/Phase 2b: also skipped for a qualified
+            // (`_PS` or `_CHx`) link -- an `ISO15765_PS`/`ISO15765_CHx` link
+            // always uses hardware ISO-TP, so it must never be the one that
+            // decides (or is affected by) the module-wide probe.
+            //
+            // The probe takes `shared_channels` itself (through
+            // `ensure_uudt_companion_channel`), and needs the link already
+            // published as connected, so `chans` is given up around it and
+            // taken again (ADR-080 order: `shared_channels` before `api`).
+            // The link is checked again afterwards: a disconnect that ran in
+            // the gap has taken it offline, and nothing is installed for it.
+            let mut effective_can_mode = effective_can_mode;
+            let mut still_online = true;
+            if is_new_channel
+                && link_pin_select.is_none()
+                && link_channel_index.is_none()
+                && !resources::is_fd_protocol_id(j2534_proto_id)
+                && self.can_channel_mode == CanChannelMode::Auto
+            {
+                drop(chans);
+                self.probe_can_channel_mode(handle).await;
+                effective_can_mode = self.effective_can_channel_mode().await;
+                chans = self.shared_channels.lock().await;
+                still_online = self
+                    .logical_links
+                    .lock()
+                    .await
+                    .get(&handle)
+                    .is_some_and(|l| l.connected && l.channel_key == Some(channel_key));
+            }
+            let entries = if still_online {
                 let links = self.logical_links.lock().await;
                 links
                     .get(&handle)
                     .map(|l| l.active_unique_resp_id_table.clone())
                     .unwrap_or_default()
+            } else {
+                Vec::new()
             };
             // ADR-398: an adapter refusal of an entry's filter fails the
             // connect (as a refused staged client filter does, ADR-129)
@@ -5137,24 +5180,6 @@ impl J2534Service {
             }
         }
         drop(chans);
-
-        // Auto mode: the first ISO15765-family CLL to establish a *new*
-        // physical ISO15765 channel decides, once, whether this device is
-        // dual-channel-capable (ADR-046 addendum). A no-op for every other
-        // mode and for joining CLLs (whose channel's creator already probed).
-        // ADR-157 accepted residual, widened to `_CHx` by ADR-156 Decision 3
-        // addendum/Phase 2b: also skipped for a qualified (`_PS` or `_CHx`)
-        // link -- an `ISO15765_PS`/`ISO15765_CHx` link always uses hardware
-        // ISO-TP, so it must never be the one that decides (or is affected
-        // by) the module-wide dual-channel-mode probe.
-        if is_new_channel
-            && base_proto_id == j2534_0404::ISO15765
-            && link_pin_select.is_none()
-            && link_channel_index.is_none()
-            && !resources::is_fd_protocol_id(j2534_proto_id)
-        {
-            self.probe_can_channel_mode(handle).await;
-        }
 
         // Dual-channel mode: when the UniqueRespIdTable already configures a
         // UUDT response ID (set before connect), open the companion raw-CAN

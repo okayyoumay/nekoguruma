@@ -1395,8 +1395,9 @@ mod tests {
                 .duration_since(UNIX_EPOCH)
                 .expect("clock after epoch")
                 .as_nanos();
+            let pid = std::process::id();
             let path = std::env::temp_dir().join(format!(
-                "ngr-journal-{nanos}-{}",
+                "ngr-journal-{pid}-{nanos}-{}",
                 COUNT.fetch_add(1, Ordering::Relaxed)
             ));
             fs::create_dir_all(&path).expect("temporary directory");

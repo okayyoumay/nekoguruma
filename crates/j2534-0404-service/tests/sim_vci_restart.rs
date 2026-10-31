@@ -230,7 +230,8 @@ fn sim_ecu_state_survives_a_restart_of_the_loading_process() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let dir = TempDir(std::env::temp_dir().join(format!("sim-vci-restart-{nanos}")));
+    let pid = std::process::id();
+    let dir = TempDir(std::env::temp_dir().join(format!("sim-vci-restart-{pid}-{nanos}")));
     std::fs::create_dir_all(dir.0.join("control")).expect("temporary directory should be created");
     std::fs::write(
         dir.0.join("ecu.json"),

@@ -1719,7 +1719,8 @@ mod library_path_tests {
         }
 
         let root = std::env::temp_dir().join(format!(
-            "iso22900-mock-search-test-{}",
+            "iso22900-mock-search-test-{}-{}",
+            std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()

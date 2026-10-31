@@ -242,14 +242,15 @@ fn a_run_goes_on_on_a_new_link_when_the_vci_returns_in_time() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let temp = std::env::temp_dir();
     let paths = TempPaths {
-        config: temp.join(format!("sim-vci-continue-{nanos}.toml")),
-        control_dir: temp.join(format!("sim-vci-continue-{nanos}")),
-        definitions: temp.join(format!("sim-vci-continue-definitions-{nanos}")),
-        ecu_state: temp.join(format!("sim-vci-continue-{nanos}.ecu")),
-        locks: temp.join(format!("sim-vci-continue-locks-{nanos}")),
-        comm_log: temp.join(format!("sim-vci-continue-commlog-{nanos}")),
+        config: temp.join(format!("sim-vci-continue-{pid}-{nanos}.toml")),
+        control_dir: temp.join(format!("sim-vci-continue-{pid}-{nanos}")),
+        definitions: temp.join(format!("sim-vci-continue-definitions-{pid}-{nanos}")),
+        ecu_state: temp.join(format!("sim-vci-continue-{pid}-{nanos}.ecu")),
+        locks: temp.join(format!("sim-vci-continue-locks-{pid}-{nanos}")),
+        comm_log: temp.join(format!("sim-vci-continue-commlog-{pid}-{nanos}")),
     };
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only

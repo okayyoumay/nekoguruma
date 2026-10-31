@@ -160,14 +160,15 @@ fn a_link_on_a_lost_device_is_confirmed_closed_and_the_loss_settles_in_the_next_
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let temp = std::env::temp_dir();
     let paths = TempPaths {
-        config: temp.join(format!("sim-vci-unconfirmed-{nanos}.toml")),
-        control_dir: temp.join(format!("sim-vci-unconfirmed-{nanos}")),
-        definitions: temp.join(format!("sim-vci-unconfirmed-definitions-{nanos}")),
-        ecu_state: temp.join(format!("sim-vci-unconfirmed-{nanos}.ecu")),
-        locks: temp.join(format!("sim-vci-unconfirmed-locks-{nanos}")),
-        comm_log: temp.join(format!("sim-vci-unconfirmed-commlog-{nanos}")),
+        config: temp.join(format!("sim-vci-unconfirmed-{pid}-{nanos}.toml")),
+        control_dir: temp.join(format!("sim-vci-unconfirmed-{pid}-{nanos}")),
+        definitions: temp.join(format!("sim-vci-unconfirmed-definitions-{pid}-{nanos}")),
+        ecu_state: temp.join(format!("sim-vci-unconfirmed-{pid}-{nanos}.ecu")),
+        locks: temp.join(format!("sim-vci-unconfirmed-locks-{pid}-{nanos}")),
+        comm_log: temp.join(format!("sim-vci-unconfirmed-commlog-{pid}-{nanos}")),
     };
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only

@@ -68,7 +68,8 @@ fn a_definition_runs_end_to_end_through_the_j2534_worker() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
-    let root = TempDir(std::env::temp_dir().join(format!("definition-e2e-{nanos}")));
+    let pid = std::process::id();
+    let root = TempDir(std::env::temp_dir().join(format!("definition-e2e-{pid}-{nanos}")));
     let definition_dir = root.0.join("definitions");
     std::fs::create_dir_all(&definition_dir).expect("definition directory");
     let config_path = root.0.join("sim-vci.toml");

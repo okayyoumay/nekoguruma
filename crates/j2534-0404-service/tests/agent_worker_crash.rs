@@ -258,13 +258,14 @@ fn a_run_starts_a_worker_that_crashed_again() {
         .duration_since(UNIX_EPOCH)
         .expect("system clock should be after unix epoch")
         .as_nanos();
+    let pid = std::process::id();
     let temp = std::env::temp_dir();
     let paths = TempPaths {
-        config: temp.join(format!("sim-vci-crash-{nanos}.toml")),
-        definitions: temp.join(format!("sim-vci-crash-definitions-{nanos}")),
-        ecu_state: temp.join(format!("sim-vci-crash-{nanos}.ecu")),
-        locks: temp.join(format!("sim-vci-crash-locks-{nanos}")),
-        comm_log: temp.join(format!("sim-vci-crash-commlog-{nanos}")),
+        config: temp.join(format!("sim-vci-crash-{pid}-{nanos}.toml")),
+        definitions: temp.join(format!("sim-vci-crash-definitions-{pid}-{nanos}")),
+        ecu_state: temp.join(format!("sim-vci-crash-{pid}-{nanos}.ecu")),
+        locks: temp.join(format!("sim-vci-crash-locks-{pid}-{nanos}")),
+        comm_log: temp.join(format!("sim-vci-crash-commlog-{pid}-{nanos}")),
     };
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only

@@ -59,13 +59,15 @@ response and its times on every answer, while the entry took the first answer's 
    Silence is `none` only for a confirmed send, a forwarding link, an end judged at its limit
    and no link error. The reason says how many answers came on how many identifiers, the answer
    that set the classification and each open reading. (C) A request meant for one ECU that got
-   more than one answer is `undetermined` when the extra answers are no more than the owed
-   requests it meets, else `vehicle` (a second responder) or the most severe of its answers if
-   that is `system` or `undetermined`; its entry's outcome stays the first answer's. Each
+   more than one answer is `undetermined` when each extra answer (every one but the first) can
+   be given its own owed request out of those its own link history says it could belong to (an
+   owed request takes one answer at most), else `vehicle` (a second responder) or the most
+   severe of its answers if that is `system` or `undetermined`; its entry's outcome stays the
+   first answer's. Each
    answer is classified against its own link history. A collecting entry's answers carry the
    owed requests they could belong to in their own verdicts, and a request meant for one ECU
-   weighs them against its extra answers once (`owed_tail`), so that more extra answers than
-   owed requests still show a second responder.
+   weighs them against its extra answers once (`owed_tail`), so that an extra answer no
+   remaining owed request can own still shows a second responder.
 5. **A request meant for one ECU lists its answers when it got several.** The host keeps every
    answering result, the first stays the primitive's response and its times, and the entry lists
    all of them from the second on. The J2534 worker binds one answer per receive cycle

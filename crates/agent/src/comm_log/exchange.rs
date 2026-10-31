@@ -3874,22 +3874,71 @@ fn collecting_row(
     (worst.max(Classification::Undetermined), reason)
 }
 
+/// Whether every answer can be given its own owner out of `candidates` (the owed requests each
+/// could belong to, by `seq`), an owner taking at most one answer: a bipartite matching that
+/// covers all answers.
+fn owners_absorb(candidates: &[&[u64]]) -> bool {
+    fn place(
+        at: usize,
+        candidates: &[&[u64]],
+        taken: &mut Vec<(u64, usize)>,
+        seen: &mut Vec<u64>,
+    ) -> bool {
+        for &owner in candidates[at] {
+            if seen.contains(&owner) {
+                continue;
+            }
+            seen.push(owner);
+            match taken.iter().position(|(held, _)| *held == owner) {
+                None => {
+                    taken.push((owner, at));
+                    return true;
+                }
+                Some(slot) => {
+                    let other = taken[slot].1;
+                    if place(other, candidates, taken, seen) {
+                        taken[slot].1 = at;
+                        return true;
+                    }
+                }
+            }
+        }
+        false
+    }
+    let mut taken = Vec::new();
+    (0..candidates.len()).all(|at| place(at, candidates, &mut taken, &mut Vec::new()))
+}
+
 /// The row of a request meant for one ECU that got more than one answer (design 8.11 "Exchange
-/// entry" `answers`, ADR-400): the extra answers may belong to requests still owed, which leaves
-/// it `undetermined`; otherwise a second responder is a fault of the vehicle, unless an answer
-/// is worse.
+/// entry" `answers`, ADR-400): the extra answers may belong to requests still owed, each
+/// weighed by its own history and an owed request taking one at most, which leaves it
+/// `undetermined`; otherwise a second responder is a fault of the vehicle, unless an answer is
+/// worse.
 fn several_answers_row(evidence: &Evidence, history: &LinkHistory) -> (Classification, String) {
     let verdicts = answer_verdicts(evidence, history, false);
-    let extra = evidence.answers.len() - 1;
     let worst = verdicts
         .iter()
         .map(|(classification, _)| *classification)
         .max()
         .unwrap_or(Classification::None);
     let counted_answers = counted(evidence.answers.len(), "answer");
-    if extra <= history.owed_matching as usize {
+    // Each extra answer (every one but the first, the request's own) could belong to the owed
+    // requests its own history gives; an owed request takes at most one of them (ADR-400
+    // decision 4C).
+    let candidates: Vec<&[u64]> = evidence
+        .answers
+        .iter()
+        .skip(1)
+        .map(|answer| answer.history.as_ref().unwrap_or(history).owners.as_slice())
+        .collect();
+    if owners_absorb(&candidates) {
+        let mut owners: Vec<u64> = candidates.concat();
+        owners.sort_unstable();
+        owners.dedup();
         let own = LinkHistory {
             this_exchange: true,
+            owed_matching: owners.len() as u32,
+            owners,
             ..history.clone()
         };
         return owed_tail(
@@ -8812,6 +8861,7 @@ mod tests {
         ];
         let mut history = LinkHistory::empty();
         history.owed_matching = 1;
+        history.owners = vec![1];
         let (class, reason) = several_answers_row(&evidence, &history);
         assert_eq!(class, Classification::Undetermined);
         assert!(reason.contains("earlier request"), "{reason}");
@@ -8964,6 +9014,131 @@ mod tests {
                     .all(|item| item.classification == Classification::None)
             );
         }
+    }
+
+    /// A read of 22 F1 90 answered by `replies` (the first its own), on a link where one request
+    /// per entry of `owed` (a data identifier) is still owed; every answer carries its own
+    /// history, as the log gives it.
+    fn entry_with_owed(owed: &[[u8; 2]], replies: &[Vec<u8>]) -> ExchangeEntry {
+        let mut state = LinkState::default();
+        for (seq, did) in owed.iter().enumerate() {
+            log(&mut state, seq as u64 + 1, read(*did, End::NoResponse));
+        }
+        let end = |bytes: &Vec<u8>| {
+            if bytes[0] == 0x7F {
+                End::Negative(bytes.clone())
+            } else {
+                End::Positive(bytes.clone())
+            }
+        };
+        let mut evidence = judged(forwarding(read([0xF1, 0x90], end(&replies[0]))));
+        evidence.answers = replies
+            .iter()
+            .map(|bytes| answer(RX, end(bytes), Window::WithinP2, 5.0))
+            .collect();
+        let histories: Vec<_> = evidence
+            .answers
+            .iter()
+            .map(|answer| state.history_for(&evidence.as_answer(answer)))
+            .collect();
+        for (answer, history) in evidence.answers.iter_mut().zip(histories) {
+            answer.history = Some(history);
+        }
+        let history = state.history_for(&evidence);
+        ExchangeEntry::build(owed.len() as u64 + 1, evidence, history)
+    }
+
+    #[test]
+    fn an_extra_answer_an_earlier_request_explains_is_not_a_second_responder() {
+        // The first answer matches no owed request; the extra negative one matches the owed read.
+        let entry = entry_with_owed(
+            &[[0xF1, 0x91]],
+            &[vec![0x62, 0xF1, 0x90, 1], vec![0x7F, 0x22, 0x22]],
+        );
+        assert_eq!(
+            entry.classification,
+            Classification::Undetermined,
+            "{}",
+            entry.reason
+        );
+        assert_eq!(
+            entry
+                .reason
+                .matches("could also belong to 1 earlier")
+                .count(),
+            1,
+            "{}",
+            entry.reason
+        );
+        assert!(
+            !entry.reason.contains("second responder"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn two_extras_with_one_compatible_owner_are_a_second_responder() {
+        let entry = entry_with_owed(
+            &[[0xF1, 0x91]],
+            &[
+                vec![0x62, 0xF1, 0x90, 1],
+                vec![0x7F, 0x22, 0x22],
+                vec![0x7F, 0x22, 0x22],
+            ],
+        );
+        assert_eq!(
+            entry.classification,
+            Classification::Vehicle,
+            "{}",
+            entry.reason
+        );
+        // An extra no owed request fits is one too.
+        let none = entry_with_owed(
+            &[[0xF1, 0x91]],
+            &[vec![0x62, 0xF1, 0x90, 1], vec![0x62, 0xF1, 0x90, 2]],
+        );
+        assert_eq!(
+            none.classification,
+            Classification::Vehicle,
+            "{}",
+            none.reason
+        );
+    }
+
+    #[test]
+    fn extras_each_explained_by_a_distinct_owner_are_undetermined() {
+        let entry = entry_with_owed(
+            &[[0xF1, 0x91], [0xF1, 0x92]],
+            &[
+                vec![0x62, 0xF1, 0x90, 1],
+                vec![0x7F, 0x22, 0x22],
+                vec![0x62, 0xF1, 0x92, 7],
+            ],
+        );
+        assert_eq!(
+            entry.classification,
+            Classification::Undetermined,
+            "{}",
+            entry.reason
+        );
+        assert_eq!(
+            entry
+                .reason
+                .matches("could also belong to 2 earlier")
+                .count(),
+            1,
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn owners_absorb_reassigns_a_shared_owner() {
+        assert!(owners_absorb(&[]));
+        assert!(owners_absorb(&[&[1, 2], &[1]]));
+        assert!(!owners_absorb(&[&[1], &[1]]));
+        assert!(!owners_absorb(&[&[1], &[]]));
     }
 
     #[test]

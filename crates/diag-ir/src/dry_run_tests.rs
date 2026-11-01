@@ -351,6 +351,66 @@ fn a_send_receive_must_start_with_its_services_sid() {
     }
 }
 
+#[test]
+fn a_request_with_a_suppressed_positive_response_is_answered_with_no_bytes_unless_scripted() {
+    // ECUReset with the suppress bit set (ISO 14229-1:2026 8.2.2); a plain request is built.
+    let buf = document(
+        vec![service(
+            7,
+            "reset",
+            0x11,
+            &[0x01],
+            vec![at(1, DataKind::Uint, 8, 8)],
+        )],
+        vec![],
+    );
+    let send = |request: Vec<u8>| {
+        program(
+            vec![Op::PushBytes(0), Op::SendReceive { service: 7 }, Op::Pop],
+            vec![request],
+        )
+    };
+    let report = run(&buf, &send(vec![0x11, 0x81]), &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert!(matches!(
+        &report.events[..],
+        [DryRunEvent::Request { answer, built: true, decoded: None, .. }] if answer.is_empty()
+    ));
+    // A scripted answer is still given: a test can script the negative response.
+    let script = Script::new().response("reset", [0x7F, 0x11, 0x12]);
+    let report = run(&buf, &send(vec![0x11, 0x81]), &script);
+    assert!(matches!(
+        &report.events[..],
+        [DryRunEvent::Request { answer, built: false, .. }] if answer == &[0x7F, 0x11, 0x12]
+    ));
+    // Without the bit the answer is built from the declaration.
+    let report = run(&buf, &send(vec![0x11, 0x01]), &Script::new());
+    assert!(matches!(
+        &report.events[..],
+        [DryRunEvent::Request { answer, built: true, decoded: Some(_), .. }] if answer.len() == 2
+    ));
+}
+
+#[test]
+fn the_suppress_bit_counts_on_a_service_with_a_sub_function() {
+    for suppressed in [
+        [0x3E, 0x80],
+        [0x10, 0x81],
+        [0x87, 0x83],
+        [0x29, 0x80],
+        [0x31, 0x81],
+        [0x19, 0x82],
+    ] {
+        assert!(
+            suppresses_positive_response(&suppressed),
+            "{suppressed:02X?}"
+        );
+    }
+    for not in [&[0x3E, 0x00][..], &[0x22, 0x80, 0x01], &[0x3E], &[]] {
+        assert!(!suppresses_positive_response(not), "{not:02X?}");
+    }
+}
+
 // ---------------------------------------------------------------- Other primitives
 
 #[test]

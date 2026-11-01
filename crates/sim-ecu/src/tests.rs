@@ -2474,9 +2474,9 @@ fn response_pending_fault_precedes_the_response_with_nrc_78() {
         count: 3,
         interval_ms: 100,
     });
-    // Suppressed: nothing goes out, and the fault waits for a request that is answered.
+    // A functional request the ECU does not answer leaves the fault armed.
     assert_eq!(
-        ecu.exchange(Addressing::Physical, &[0x3E, 0x80]),
+        ecu.exchange(Addressing::Functional, &[0x22, 0xF1, 0xFF]),
         Exchange {
             reached: true,
             ..Exchange::none()
@@ -2593,6 +2593,108 @@ fn a_dropped_response_still_follows_its_response_pending_messages() {
     let exchange = ecu.exchange(Addressing::Physical, &[0x3E, 0x00]);
     assert_eq!(exchange.response, SimResponse::NoResponse);
     assert_eq!(exchange.pending, [(0, vec![0x7F, 0x3E, 0x78])]);
+}
+
+#[test]
+fn a_suppressed_request_with_a_pending_fault_gets_its_final_response() {
+    // After a response pending message the final response is owed whatever the suppress bit says
+    // (clause 7.7.3.2); the positive response goes out last, with the bit cleared in its echo.
+    let mut ecu = SimEcu::new(EcuConfig {
+        response_delay_ms: 20,
+        ..config()
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x83]);
+    assert_eq!(
+        exchange.response,
+        pos(&[0x50, 0x03, 0x00, 0x32, 0x01, 0xF4])
+    );
+    assert_eq!(exchange.delay_ms, 220);
+    assert_eq!(
+        exchange.pending,
+        [(20, vec![0x7F, 0x10, 0x78]), (120, vec![0x7F, 0x10, 0x78])]
+    );
+    assert_eq!(ecu.session, Session::Extended);
+    assert!(ecu.armed_faults().is_empty());
+    // A negative response is sent whatever the bit says, after the pending as well.
+    ecu.inject(Fault::ResponsePending {
+        count: 1,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0xFF]);
+    assert_eq!(
+        exchange.response,
+        SimResponse::Negative {
+            sid: 0x10,
+            nrc: Nrc::SubFunctionNotSupported
+        }
+    );
+    assert_eq!(exchange.pending.len(), 1);
+    // Without the fault the bit suppresses as before, and a count of zero does not owe one.
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x10, 0x81]).response,
+        SimResponse::NoResponse
+    );
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    assert_eq!(
+        ecu.exchange(Addressing::Physical, &[0x10, 0x81]).response,
+        SimResponse::NoResponse
+    );
+    // The zero-count fault waits for a request that is answered, and uses itself up there.
+    assert!(
+        ecu.exchange(Addressing::Physical, &[0x22, 0xF1, 0x90])
+            .pending
+            .is_empty()
+    );
+    // A service without a sub-function reads bit 7 as data, not as the suppress bit.
+    ecu.inject(Fault::ResponsePending {
+        count: 1,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x22, 0xF1, 0x90]);
+    assert_eq!(exchange.pending.len(), 1);
+}
+
+#[test]
+fn a_suppressed_request_owes_its_final_response_only_for_the_pending_fault_that_fires() {
+    // The fault that fires is the first armed pending fault. A zero count first sends no
+    // pending, so the request is not owed an answer and the bit suppresses it; the second
+    // fault, which would owe one, does not fire on it.
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x81]);
+    assert_eq!(exchange.response, SimResponse::NoResponse);
+    assert!(
+        exchange.pending.is_empty(),
+        "no positive response without a pending, and no pending without one"
+    );
+    assert_eq!(ecu.armed_faults().len(), 2, "neither fault fired");
+    // The same request when the owing fault is first: pendings, then the positive response.
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x81]);
+    assert_eq!(exchange.pending.len(), 2);
+    assert!(matches!(exchange.response, SimResponse::Positive(_)));
 }
 
 #[test]

@@ -189,12 +189,17 @@ numbers contradict each other or exceed the flash window, which the ECU itself n
 | `NegativeResponse { nrc }` | The next request that reaches the ECU is refused with `nrc` and has no effect: it is not dispatched, so no state changes (an ECU reset does not happen, a session does not switch). Sent whatever the addressing and the suppress bit; tS3_Server restarts as for any request that reaches the ECU |
 | `TruncateResponse { len }` | The next positive response is cut to its first `len` bytes (at least its service identifier): the request is handled as usual, and the response no longer answers it (ADR-359). A request with no positive response leaves the fault armed; a `len` at or above the response's length uses the fault up without cutting; with `DropResponse` armed too, the cut response is lost |
 | `RepeatResponse { interval_ms }` | The next final response goes out twice, the second copy `interval_ms` after the first (ADR-400). A request with no response leaves the fault armed; with `DropResponse` armed too, both copies are lost and the fault stays armed |
-| `ResponsePending { count, interval_ms }` | The next request the ECU answers gets `count` response pending messages (`7F SID 78`, Annex A.1) before its response: the first when the response was due, the others `interval_ms` apart, and the response `interval_ms` after the last. `exchange()` lists them in `Exchange::pending` with their delays; tS3_Server restarts when the final response goes out. A request without a response leaves the fault armed; with `DropResponse` the messages still go out and only the final response is lost. `count` is capped at `MAX_RESPONSE_PENDING` (1000); zero uses the fault up without sending any |
+| `ResponsePending { count, interval_ms }` | The next request the ECU answers gets `count` response pending messages (`7F SID 78`, Annex A.1) before its response: the first when the response was due, the others `interval_ms` apart, and the response `interval_ms` after the last. `exchange()` lists them in `Exchange::pending` with their delays; tS3_Server restarts when the final response goes out. A request without a response leaves the fault armed (a request with the suppress bit is not one, see below); with `DropResponse` the messages still go out and only the final response is lost. `count` is capped at `MAX_RESPONSE_PENDING` (1000); zero uses the fault up without sending any |
 
 `ResponsePending` simplifies what a server does around NRC 78 (Annex A.1, clause 7.7.3):
 
-- A request with the suppress bit set gets no chain: a server that sends NRC 78 must then send a
-  final response even for such a request, a sequence the simulator cannot produce.
+- A request with the suppress bit set that a `ResponsePending` with a count above zero fires on is
+  handled as if the bit were clear: after a response pending message a final response is owed
+  whatever the bit says (clause 7.7.3.2), so the positive response follows the last message
+  (the bit is cleared in the sub-function it echoes). Only the services the simulator gives a
+  sub-function read the bit (DiagnosticSessionControl, ECUReset, SecurityAccess,
+  TesterPresent, ReadDTCInformation, RoutineControl). A request that has no response for another
+  reason leaves the fault armed.
 - The chain can precede any final response, also a negative one a server would have given at
   once (NRC 11, 12 or 13), although NRC 78 says the request was accepted.
 - During the chain the ECU answers other requests at once, and the request's own effect (an ECU

@@ -77,6 +77,21 @@ pub const fn is_standard_seed_level(level: u8) -> bool {
     matches!(level, 0x01..=0x41 | 0x5F) && level & 1 == 1
 }
 
+/// Whether `request` asks for its positive response to be suppressed: bit 7 of the
+/// sub-function of a service that has one (ISO 14229-1:2026 8.2.2: DiagnosticSessionControl,
+/// ECUReset, SecurityAccess, CommunicationControl, Authentication, ReadDTCInformation,
+/// TesterPresent, ControlDTCSetting, ResponseOnEvent, LinkControl,
+/// DynamicallyDefineDataIdentifier, RoutineControl), which the ECU leaves unanswered when the
+/// request succeeds. One function for the agent's host (the result and the log) and the dry run
+/// (ADR-408, ADR-397).
+pub fn suppresses_positive_response(request: &[u8]) -> bool {
+    matches!(
+        request,
+        [0x10 | 0x11 | 0x19 | 0x27 | 0x28 | 0x29 | 0x2C | 0x31 | 0x3E | 0x85 | 0x86 | 0x87, sub, ..]
+            if sub & 0x80 != 0
+    )
+}
+
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
 
@@ -504,10 +519,13 @@ pub enum Value {
 pub trait DiagHost {
     type Error: std::error::Error + Send + Sync + 'static;
 
+    /// An empty answer is the silence of a request whose positive response is suppressed
+    /// ([`suppresses_positive_response`], ADR-408).
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
     /// [`Op::SendReceive`]: sends `request` as it is and returns the answer to it, matched
     /// against the positive response of `service` (`Service.id`) and the negative-response
-    /// shape of the link's protocol (ADR-309 item 4, ADR-321).
+    /// shape of the link's protocol (ADR-309 item 4, ADR-321). An empty answer is as for
+    /// [`service_request`](Self::service_request).
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, Self::Error>;
     fn read_dtc(&mut self, mask: u8) -> Result<Vec<u8>, Self::Error>;
     fn routine_control(

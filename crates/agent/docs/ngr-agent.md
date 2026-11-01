@@ -132,7 +132,7 @@ commits 0 (ADR-252).
 
 | Exit status | Meaning | Output |
 |---|---|---|
-| 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure |
+| 0 | The program ran to its end | The final `diag_ir::VmState` as one line of JSON on stdout. A negative response is a value on the stack, not a failure, and neither is the silence of a request whose positive response is suppressed (an empty value, ADR-408; for a request longer than one classic CAN frame only with a confirmed send, and never with an error event bound to the primitive) |
 | 1 | Reading the document, launching the worker or the job failed (including a procedure that ended itself as failed, `JobError::ProcedureFailed`), the worker may still hold the VCI after a failed link close, or the final state holds a non-finite float (infinity or NaN), which JSON cannot represent | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 

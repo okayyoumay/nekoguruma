@@ -12,7 +12,10 @@
 //! does not know, and a DID whose response `sim-vci` drops, and the log holds an exchange entry
 //! for each, classified by what the host saw. A sixth sends a request longer than ISO 15765 can
 //! carry, which the worker refuses with its reason (ADR-350), and its log shows the request not
-//! sent, refused by the worker. Every job comes from a document and opens the link its variant
+//! sent, refused by the worker. A seventh set of jobs sends requests whose positive response is
+//! suppressed (ADR-408): the ECU's silence is the result, a negative response is returned, and a
+//! response pending obliges a final response. Every job comes from a document and opens the link
+//! its variant
 //! declares (ADR-324).
 //!
 //! This file holds a single test, so the process-wide `VCI_CONFIG_PATH` it sets for the
@@ -643,10 +646,274 @@ async fn run_the_job(control_dir: &std::path::Path, comm_log_dir: &std::path::Pa
     assert_eq!(entry["outcome"]["result"], "positive_unusable", "{entry}");
     assert_eq!(entry["classification"], "undetermined", "{entry}");
 
+    suppressed_requests(&worker, control_dir, comm_log_dir).await;
+
     worker
         .stop(Duration::from_secs(5))
         .await
         .expect("worker should stop");
+}
+
+/// Hands `command` to `sim-vci` through its control directory, as file `name`.
+fn control(control_dir: &std::path::Path, name: &str, command: &str) {
+    std::fs::write(control_dir.join(format!("{name}.tmp")), command)
+        .expect("the control file should be writable");
+    std::fs::rename(
+        control_dir.join(format!("{name}.tmp")),
+        control_dir.join(format!("{name}.json")),
+    )
+    .expect("the control file should be renamed");
+}
+
+/// Runs `procedure` as a writing job with a communication log under the job id `last` (the final
+/// group of a UUID of this file), and returns its result and its exchange entries.
+async fn logged_run(
+    worker: &WorkerProcess,
+    comm_log_dir: &std::path::Path,
+    last: &str,
+    procedure: &Program,
+) -> (
+    Result<diag_ir::VmState, agent::JobError>,
+    Vec<serde_json::Value>,
+) {
+    let setup = CommLogSetup {
+        dir: comm_log_dir.to_owned(),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId(format!("0190f5a8-7c2e-7d4b-9a6e-{last}")),
+            generation: 1,
+        },
+    };
+    let job = document_job(procedure).with_comm_log(setup.clone());
+    let JobRun {
+        result,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(true),
+    )
+    .await;
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let entries = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    (result, entries)
+}
+
+/// Requests whose positive response is suppressed (ADR-408), against the simulated ECU: its
+/// silence at the end of P2 is the request's result and the run goes on; a negative response is
+/// returned; a response pending obliges a final response, which is the result, and silence after
+/// one is a failure. Each entry keeps `outcome: no_response` and `request.suppressed` for the
+/// silence.
+async fn suppressed_requests(
+    worker: &WorkerProcess,
+    control_dir: &std::path::Path,
+    comm_log_dir: &std::path::Path,
+) {
+    let single = |constants: Vec<Vec<u8>>| Program {
+        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x10 }],
+        constants,
+        ..program()
+    };
+
+    // A read of the DTCs, the DTC read with the bit set, DiagnosticSessionControl with the bit
+    // set, and a VIN read: each silence succeeds with no bytes and the run goes on.
+    let send = |sid, constant| [Op::PushBytes(constant), Op::ServiceRequest { service: sid }];
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e80",
+        &Program {
+            code: [
+                &send(0x19, 0)[..],
+                &send(0x19, 1)[..],
+                &send(0x10, 2)[..],
+                &send(0x22, 3)[..],
+            ]
+            .concat(),
+            constants: vec![
+                vec![0x02, 0x08],
+                vec![0x82, 0x08],
+                vec![0x83],
+                vec![0xF1, 0x90],
+            ],
+            ..program()
+        },
+    )
+    .await;
+    let state = state.expect("a suppressed request's silence is not a failure");
+    let mut vin = vec![0x62, 0xF1, 0x90];
+    vin.extend_from_slice(VIN);
+    let [
+        Value::Bytes(dtcs),
+        Value::Bytes(dtc_silence),
+        Value::Bytes(session),
+        Value::Bytes(read),
+    ] = state.stack.as_slice()
+    else {
+        panic!("{state:?}");
+    };
+    assert!(dtcs.starts_with(&[0x59, 0x02]), "{state:?}");
+    assert!(session.is_empty() && dtc_silence.is_empty(), "{state:?}");
+    assert_eq!(read, &vin, "{state:?}");
+    for (entry, request) in [(&entries[1], "198208"), (&entries[2], "1083")] {
+        assert_eq!(entry["request"]["bytes"]["clear"], request, "{entry}");
+        assert_eq!(entry["request"]["suppressed"], true, "{entry}");
+        assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
+        assert!(entry["detail"].get("host_error").is_none(), "{entry}");
+        assert_eq!(entry["sent"], "confirmed", "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
+    }
+    // The DTC read follows an answer matched the same way; the worker times its receive timeout
+    // on its own clock, so nothing shows the wait ran its course: the suppressed request's row,
+    // not `none`.
+    let reason = entries[1]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("No response was expected and none came")
+            && reason.contains("no receive timeout is judged at P2 on one clock"),
+        "{reason}"
+    );
+    // The session change has no answer matched the same way before it (an accepted change of
+    // session does not count as one), so the silence leaves a wrong address or filter open.
+    let reason = entries[2]["reason"].as_str().expect("a reason");
+    assert!(
+        reason.contains("No response was expected, but") && reason.contains("(H2)"),
+        "{reason}"
+    );
+    assert_eq!(
+        entries[3]["outcome"]["result"], "positive",
+        "{}",
+        entries[3]
+    );
+
+    // A sub-function the ECU refuses, with the bit set: the negative response is sent anyway.
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e81",
+        &single(vec![vec![0xFF]]),
+    )
+    .await;
+    let state = state.expect("a negative response is a result");
+    assert_eq!(
+        state.stack,
+        [Value::Bytes(vec![0x7F, 0x10, 0x12])],
+        "{state:?}"
+    );
+    assert_eq!(entries[0]["request"]["suppressed"], true, "{}", entries[0]);
+    assert_eq!(
+        entries[0]["outcome"]["result"], "negative",
+        "{}",
+        entries[0]
+    );
+
+    // A response pending, then the final response: it is owed whatever the bit says, and it is
+    // the result.
+    control(
+        control_dir,
+        "010",
+        r#"{"command": "inject_fault", "request": [16, 131], "fault": {"response_pending": {"count": 2, "interval_ms": 30}}}"#,
+    );
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e82",
+        &single(vec![vec![0x83]]),
+    )
+    .await;
+    let state = state.expect("the final response after a pending is the result");
+    let [Value::Bytes(answer)] = state.stack.as_slice() else {
+        panic!("{state:?}");
+    };
+    assert!(answer.starts_with(&[0x50, 0x03]), "{state:?}");
+    assert_eq!(
+        entries[0]["outcome"]["result"], "positive",
+        "{}",
+        entries[0]
+    );
+    assert_eq!(
+        entries[0]["pending"].as_array().map(Vec::len),
+        Some(2),
+        "{}",
+        entries[0]
+    );
+    assert_eq!(
+        entries[0]["classification"], "undetermined",
+        "{}",
+        entries[0]
+    );
+
+    // A response pending, then the final negative response.
+    control(
+        control_dir,
+        "011",
+        r#"{"command": "inject_fault", "request": [16, 255], "fault": {"response_pending": {"count": 1, "interval_ms": 30}}}"#,
+    );
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e83",
+        &single(vec![vec![0xFF]]),
+    )
+    .await;
+    let state = state.expect("the final negative response after a pending is the result");
+    assert_eq!(
+        state.stack,
+        [Value::Bytes(vec![0x7F, 0x10, 0x12])],
+        "{state:?}"
+    );
+    assert_eq!(
+        entries[0]["outcome"]["result"], "negative",
+        "{}",
+        entries[0]
+    );
+
+    // A response pending, then silence: the final response is owed, so this is a failure, as for
+    // any request without a response.
+    control(
+        control_dir,
+        "012",
+        r#"{"command": "inject_fault", "request": [16, 131], "fault": {"response_pending": {"count": 2, "interval_ms": 30}}}"#,
+    );
+    control(
+        control_dir,
+        "013",
+        r#"{"command": "inject_fault", "request": [16, 131], "fault": "drop_response"}"#,
+    );
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e84",
+        &single(vec![vec![0x83]]),
+    )
+    .await;
+    // The session change may have reached the ECU, so the job's verdict is on-site intervention
+    // for the unconfirmed request, not a primitive error.
+    assert!(
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
+        "silence after a pending fails: {state:?}"
+    );
+    let owed = &entries[0];
+    assert_eq!(owed["request"]["suppressed"], true, "{owed}");
+    assert_eq!(owed["outcome"]["result"], "no_response", "{owed}");
+    assert_eq!(owed["detail"]["host_error"], "NoResponse", "{owed}");
+    assert_eq!(owed["pending"].as_array().map(Vec::len), Some(2), "{owed}");
 }
 
 /// The fifth job's exchange entries (design 8.11 "Exchange entry"): one per request, at the

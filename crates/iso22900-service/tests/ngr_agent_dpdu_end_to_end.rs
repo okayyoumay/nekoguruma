@@ -108,7 +108,7 @@ impl Setup {
             &ecu_config,
             r#"{"vin":"NGRSIMECU00000001","part_number":"NGR-SIM-ECU","sw_version":"1.0.0",
                 "response_delay_ms":0,"drop_at_block":null,"require_security_access":false,
-                "require_gateway_auth":false,"fail_checksum":false}"#,
+                "require_gateway_auth":false,"fail_checksum":false,"startup_ms":60000}"#,
         )
         .expect("ECU configuration should be writable");
         Self {
@@ -201,13 +201,20 @@ fn ngr_agent_runs_a_document_on_a_d_pdu_api_vci() {
     );
 }
 
-/// TesterPresent with its suppress bit set, which the simulated ECU leaves unanswered, so the
-/// mock ends the primitive with its receive timeout and its own extra error code.
+/// An ECU reset, then a VIN read: the reset is answered, and the ECU then starts up for the
+/// configured `startup_ms`, during which it loses the read. The read has no suppressed response,
+/// so it is unanswered and the mock ends the primitive with its receive timeout and its own extra
+/// error code.
 fn unanswered_program() -> Program {
     Program {
         schema_version: IR_SCHEMA_VERSION,
-        code: vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x3E }],
-        constants: vec![vec![0x80]],
+        code: vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x11 },
+            Op::PushBytes(1),
+            Op::ServiceRequest { service: 0x22 },
+        ],
+        constants: vec![vec![0x01], vec![0xF1, 0x90]],
         sections: Vec::new(),
         source_map: Vec::new(),
         identity: Default::default(),
@@ -216,7 +223,8 @@ fn unanswered_program() -> Program {
     }
 }
 
-/// The `detail` of the one exchange entry in the communication log under `dir`.
+/// The `detail` of the last of the two exchange entries in the communication log under `dir`,
+/// after the answered reset.
 fn exchange_detail(dir: &Path) -> serde_json::Value {
     let mut entries: Vec<serde_json::Value> = std::fs::read_dir(dir)
         .expect("the communication log directory")
@@ -231,8 +239,9 @@ fn exchange_detail(dir: &Path) -> serde_json::Value {
         })
         .filter(|line| line["event"] == "exchange")
         .collect();
-    assert_eq!(entries.len(), 1, "{entries:?}");
-    entries.remove(0)["detail"].clone()
+    assert_eq!(entries.len(), 2, "{entries:?}");
+    assert_eq!(entries[0]["outcome"]["result"], "positive", "{entries:?}");
+    entries.remove(1)["detail"].clone()
 }
 
 #[test]

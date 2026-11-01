@@ -79,6 +79,29 @@ fn an_index_out_of_range_is_refused_at_its_line() {
 }
 
 #[test]
+fn a_field_read_of_a_suppressed_requests_response_is_refused() {
+    // ECUReset with the suppress bit set (reset type 0x81): the ECU sends no positive response,
+    // so the dry run answers with no bytes, `ok` holds, and a field read has nothing to read
+    // (ADR-408).
+    let checked = "def main():\n\
+        \x20   r = diag.request(0x11, {\"reset\": 0x81})\n\
+        \x20   if not r[\"ok\"]:\n\
+        \x20       diag.fail(\"RESET\", \"refused\")\n";
+    assert_eq!(rejection(checked), None);
+    let read = "def main():\n\
+        \x20   r = diag.request(0x11, {\"reset\": 0x81})\n\
+        \x20   diag.log(1, \"sent\")\n\
+        \x20   if r[\"fields\"][\"reset\"] == 1:\n\
+        \x20       diag.log(1, \"a\")\n";
+    let error = stopped(read);
+    assert_eq!(error.code, star::StarCode::DryRunStopped);
+    assert_eq!((error.file.as_str(), error.line), ("p.star", 4));
+    // The same read of the response to the request without the bit is accepted.
+    let plain = read.replace("0x81", "0x01");
+    assert_eq!(rejection(&plain), None);
+}
+
+#[test]
 fn a_flash_image_larger_than_the_report_budget_is_accepted() {
     use diag_ir::dry_run::{DryRunEvent, Script, dry_run};
     // 0x05000000 bytes (80 MiB, over the report's 64 MiB) in blocks of 0x1000: 20480 blocks of

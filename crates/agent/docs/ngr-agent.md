@@ -27,16 +27,17 @@ The job opens the link its variant declares (`agent::Job::declared_link`, ADR-32
 
 - The variant must declare exactly one protocol. It must carry `UDS`, under the short name
   `ISO15765` or `ISO_14229_3_on_ISO_15765_2`, without extended addressing.
-- The baud rate and the two identifiers are the protocol's.
+- The baud rate and the identifiers are the protocol's, within 11 bits.
 - `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout`, in microseconds, give the timings,
   rounded up to whole milliseconds. Without them the timings are the link's defaults
   (`LinkConfig::iso15765`): P2 1 s, P2* 5 s and a 25 s bound on a response-pending chain.
 - The protocol's other ComParams are set on the link as declared, after the link's own, with
   the class the worker takes from the ComParam. Names compare ignoring case.
-- Refused: a ComParam the link sets itself, one that lets a primitive outlast the host's
-  deadline (`CP_RC21*`, `CP_RC23*`, `CP_RepeatReqCount*`, `CP_ModifyTiming`), a name not
-  starting `CP_`, a ComParam declared twice or with a unit, and a value outside an unsigned
-  32-bit integer (ADR-324 item 3).
+- Refused, naming the ComParam: a ComParam the link sets itself, one that lets a primitive
+  outlast the host's deadline, a name not starting `CP_`, a ComParam declared twice or with a
+  unit, a timing of 0 or above 4294967000 us (a value under 1 ms is rounded up to 1 ms), and a value outside an unsigned 32-bit integer
+  (ADR-324 item 3). The rules are `diag_ir::link`'s, which the CSV conversion applies too, so
+  the lists are in `crates/diag-frontend/docs/csv-tables.md` 4.3 (ADR-406).
 - A document whose link cannot be used fails before any worker starts. A ComParam the worker
   does not know, or resolves to one the link already set, fails when the link is set up,
   naming the ComParam.

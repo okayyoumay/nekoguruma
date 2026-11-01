@@ -197,16 +197,20 @@ Each row compares `expected` with the value the field decodes to, not with the b
 
 ### 4.3 `protocols.csv` (scoped) and `comparams.csv` (scoped)
 
-`protocols.csv`, one `Protocol` per row. Every variant needs at least one.
+`protocols.csv`, one `Protocol` per row. Every variant needs exactly one: a second protocol in
+a variant's document is rejected (`CSV_UNSUPPORTED`, on the later row's `name`), since no job
+can yet choose among several links (ADR-324). The same name twice in a variant is a duplicate
+(`CSV_DUPLICATE`, section 3) instead. An ECU reachable over two protocols or application layers
+is declared as two variants.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|
-| `name` | text | yes | `Protocol.short_name`, such as `ISO15765` |
+| `name` | text | yes | `Protocol.short_name`: `ISO15765` or `ISO_14229_3_on_ISO_15765_2`, the two names the agent's link accepts for UDS on CAN; any other is rejected (`CSV_UNSUPPORTED`) |
 | `baud_rate` | integer, 1 to 2^32 - 1 | yes | |
 | `tx_id` | integer, 0x000 to 0x7FF | yes | Physical request identifier |
 | `rx_id` | integer, 0x000 to 0x7FF | yes | Physical response identifier |
 | `functional_id` | integer, 0x000 to 0x7FF | no | Default 0 (none) |
-| `extended_addressing` | boolean | no | Default `no` |
+| `extended_addressing` | boolean | no | Default `no`; `yes` is rejected (`CSV_UNSUPPORTED`), since the link does not set extended addressing |
 | `application_layer` | text | no | `Protocol.application_layer`, the application layer the protocol carries, default `UDS`; its profile's negative-response shape and pending codes go into `Protocol.negative_shape` |
 
 The identifiers are 11-bit CAN identifiers. A 29-bit identifier also needs the ComParams that
@@ -216,25 +220,35 @@ rejected (`CSV_BAD_VALUE`); the agent's link accepts only 11-bit identifiers for
 
 `application_layer` selects the application-layer profile the variant's procedures are lowered
 through (ADR-309 item 3, ADR-314). It must name a profile that ships with the frontend, `UDS`
-being the only one, or it is rejected (`CSV_UNKNOWN_REFERENCE`). Every protocol of one variant
-must name the same application layer, since a variant's procedures are one program per variant
-whose requests belong to one layer; a protocol whose layer differs from that of the variant's
-first protocol is rejected (`CSV_DUPLICATE`). An ECU reachable over two application layers is
-declared as two variants.
+being the only one, or it is rejected (`CSV_UNKNOWN_REFERENCE`).
+
+The conversion refuses every declared link the agent would refuse when a job starts, by the one
+rule set in `diag_ir::link` that both call (ADR-406, design 8.2.4): this section's rows for
+`protocols.csv` and `comparams.csv`, and the refusals listed below. Only what needs the worker
+(a ComParam name it does not know, two names it resolves to one id, a value it refuses) or
+several documents (ADR-395) is left to the agent.
 
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
-The agent sets them on the job's link as written (ADR-324). It reads `CP_P2Max`, `CP_P2Star`
-and `CP_RC78CompletionTimeout` as the link's timings, in microseconds as ISO 22900-2 defines
-them. It refuses a ComParam with a `unit`, since it cannot convert units (give the value in
-the ComParam's own unit), and a ComParam the link sets from the protocol row itself (such as
-`CP_Baudrate` or the CAN identifiers); `crates/agent/docs/ngr-agent.md` lists the rest.
+The agent sets them on the job's link as written (ADR-324), in the ComParam's own unit
+(microseconds for a time); there is no `unit` column. It reads `CP_P2Max`, `CP_P2Star` and
+`CP_RC78CompletionTimeout` as the link's timings, in microseconds as ISO 22900-2 defines them,
+and a timing of 0 or above 4294967000 is rejected (`CSV_BAD_VALUE`); a value under 1 ms (under 1000) is rounded up to 1 ms. Names compare ignoring ASCII
+case. Rejected on `name`:
+
+- a ComParam the link sets itself, such as `CP_Baudrate`, the CAN identifiers, the response
+  pending and indication ComParams and the addressing mode (`CSV_UNSUPPORTED`);
+- one that lets a primitive outlast the host's deadline: `CP_RC21*`, `CP_RC23*`,
+  `CP_RepeatReqCount*` and `CP_ModifyTiming` (`CSV_UNSUPPORTED`);
+- one declared twice for a variant's protocol, on the later row (`CSV_DUPLICATE`);
+- a name that does not start with `CP_` (`CSV_BAD_VALUE`).
+
+`crates/agent/docs/ngr-agent.md` describes what the agent does with the rest.
 
 | Column | Type | Required | Meaning |
 |---|---|---|---|
 | `protocol` | text | yes | A protocol in the same variant's document |
-| `name` | text | yes | The COMPARAM short name, held standard-neutral (design 8.5); unique per protocol and variant |
-| `value` | signed integer, 64 bits | yes | |
-| `unit` | key | no | A `units.csv` key |
+| `name` | text | yes | The COMPARAM short name, held standard-neutral (design 8.5); unique per protocol and variant, ignoring ASCII case |
+| `value` | integer, 0 to 2^32 - 1 | yes | |
 
 ### 4.4 `texts.csv` and `units.csv`
 
@@ -808,7 +822,8 @@ checked, whether or not anything refers to it; an error is reported once, at the
 it, and not again where another row refers to that row. The checks run in stages: first each file
 on its own (the file set, the record format, the header, each cell, and names defined twice in
 one table); then the rules that compare rows with each other or with other tables (references,
-variant scoping, a key defined twice in one variant's document); then the rules of fields (5.2
+variant scoping, a key defined twice in one variant's document, and the declared-link rules of
+4.3 that the agent applies when a job starts, ADR-406); then the rules of fields (5.2
 to 5.5, the conversion and type pairs of 4.5, the services of 4.6, the status layouts of 4.11
 and the layout rules of section 6), which follow the references the stage before resolved, and
 last the fields that identity and precondition sources name (4.13, 4.14), which are judged once

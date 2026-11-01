@@ -5,6 +5,8 @@
 //! - [`dry_run`]: a procedure run with vehicle access mocked (12.1, ADR-328).
 //! - [`identify`]: the identification runs of candidate variants and the variant they select
 //!   (8.9.1).
+//! - [`link`]: the rules a declared link must meet, applied by both the agent and the CSV
+//!   conversion (8.2.4, ADR-406).
 //! - [`plan`]: the identification plan an identification job carries (8.8.2, ADR-395).
 //! - Procedure part: custom bytecode VM. The entire execution state must be serializable (8.2.3).
 
@@ -17,6 +19,7 @@ pub mod dry_run;
 pub mod encode;
 pub mod hmi;
 pub mod identify;
+pub mod link;
 pub mod plan;
 mod recovery;
 

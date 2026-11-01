@@ -216,8 +216,8 @@ impl<'a> Resolver<'a> {
         let service_map = self.services(&services, &dids, &routines);
 
         self.protocols_per_variant(&protocols);
-        self.application_layers(&protocols);
-        self.comparams(&comparams, &protocols, &units);
+        self.application_layers();
+        self.comparams(&comparams, &protocols);
         self.variant_patterns(&service_map, &conversions);
         self.nrcs(&nrcs, &service_map, &texts);
         self.conversions(&texts);
@@ -229,7 +229,6 @@ impl<'a> Resolver<'a> {
         self.nested(&layouts);
         self.per_variant_duplicates(
             &protocols,
-            &comparams,
             &dids,
             &routines,
             &nrcs,
@@ -238,6 +237,9 @@ impl<'a> Resolver<'a> {
             &identity,
             &preconditions,
         );
+        // Last: the rules of the declared link judge rows whose references the stages above
+        // have resolved (ADR-406).
+        self.declared_links(&protocols, &comparams);
 
         let members = |sets: &[Variants], v: usize| -> Vec<usize> {
             sets.iter()
@@ -355,9 +357,9 @@ impl<'a> Resolver<'a> {
         }
     }
 
-    /// A protocol names an application layer a profile ships for, and the protocols of one
-    /// variant all name the same one (4.3, ADR-309 item 3).
-    fn application_layers(&mut self, protocols: &[Variants]) {
+    /// A protocol names an application layer a profile ships for (4.3, ADR-309 item 3). A
+    /// variant declares one protocol ([`Resolver::declared_links`]), so it has one layer.
+    fn application_layers(&mut self) {
         for row in &self.t.protocols {
             if crate::profile::get(&row.application_layer).is_none() {
                 let known: Vec<&str> = crate::profile::ALL.iter().map(|p| p.layer).collect();
@@ -374,58 +376,10 @@ impl<'a> Resolver<'a> {
                 );
             }
         }
-        // A row is reported once, however many of its variants it mixes, against the first
-        // protocol of the first of them.
-        let mut mixed = Vec::new();
-        for (row, scope) in self.t.protocols.iter().zip(protocols) {
-            let clash = self
-                .t
-                .variants
-                .iter()
-                .enumerate()
-                .filter(|(i, _)| scope.contains(i))
-                .find_map(|(i, variant)| {
-                    let (first, _) = self
-                        .t
-                        .protocols
-                        .iter()
-                        .zip(protocols)
-                        .find(|(_, s)| s.contains(&i))?;
-                    (first.application_layer != row.application_layer).then_some((variant, first))
-                });
-            if let Some((variant, first)) = clash {
-                mixed.push((
-                    row.line,
-                    format!(
-                        "variant {} has protocols over application layers {:?} (protocol {}) \
-                         and {:?} (protocol {}); declare a variant per application layer",
-                        variant.name,
-                        first.application_layer,
-                        first.name,
-                        row.application_layer,
-                        row.name,
-                    ),
-                ));
-            }
-        }
-        for (line, message) in mixed {
-            self.error(
-                ErrorCode::Duplicate,
-                "protocols.csv",
-                line,
-                "application_layer",
-                message,
-            );
-        }
     }
 
     /// A ComParam names a protocol in each of its variants' documents (4.3).
-    fn comparams(
-        &mut self,
-        comparams: &[Variants],
-        protocols: &[Variants],
-        units: &HashSet<String>,
-    ) {
+    fn comparams(&mut self, comparams: &[Variants], protocols: &[Variants]) {
         let t = self.t;
         for (row, variants) in t.comparams.iter().zip(comparams) {
             let missing: Vec<&str> = variants
@@ -461,15 +415,167 @@ impl<'a> Resolver<'a> {
                     ),
                 );
             }
-            if let Some(unit) = &row.unit
-                && !units.contains(unit)
-            {
-                self.unknown(
-                    "comparams.csv",
-                    row.line,
-                    "unit",
-                    format!("no unit {unit} in units.csv"),
-                );
+        }
+    }
+
+    /// A variant declares one protocol, and the link it declares is one the agent can open: the
+    /// rules of `diag_ir::link` the agent applies when a job starts are applied here to each
+    /// variant's protocol rows and their ComParams, each refusal at the row and column that
+    /// caused it (4.3, ADR-406). A row shared by several variants is reported once per refusal.
+    /// A row whose `variants` list names an unknown variant still takes part in the variants it
+    /// does name: what is found there holds whichever variant the author meant. A protocol whose
+    /// layer no profile ships for is not also judged as not UDS, since `application_layers`
+    /// reports it.
+    fn declared_links(&mut self, protocols: &[Variants], comparams: &[Variants]) {
+        use diag_ir::link::{
+            ComParamRefusal, Identifier, LinkRefusal, UDS_LAYER, check_protocol, only_protocol,
+        };
+        let t = self.t;
+        // The refusal's kind keeps two refusals of one cell apart.
+        let mut reported: HashSet<(&'static str, Line, &'static str, ErrorCode, &'static str)> =
+            HashSet::new();
+        let mut found: Vec<(
+            ErrorCode,
+            &'static str,
+            Line,
+            &'static str,
+            &'static str,
+            String,
+        )> = Vec::new();
+        for (v, variant) in t.variants.iter().enumerate() {
+            let rows: Vec<&ProtocolRow> = t
+                .protocols
+                .iter()
+                .zip(protocols)
+                .filter(|(_, scope)| scope.contains(&v))
+                .map(|(row, _)| row)
+                .collect();
+            if let Err(LinkRefusal::SeveralProtocols) = only_protocol(&rows) {
+                for (at, row) in rows.iter().enumerate().skip(1) {
+                    // The same name twice is the duplicate `per_variant_duplicates` reports.
+                    if rows[..at].iter().any(|earlier| earlier.name == row.name) {
+                        continue;
+                    }
+                    found.push((
+                        ErrorCode::Unsupported,
+                        "protocols.csv",
+                        row.line,
+                        "name",
+                        "several",
+                        format!(
+                            "variant {} already declares protocol {} on line {}; a variant \
+                             declares one protocol (ADR-324)",
+                            variant.name, rows[0].name, rows[0].line
+                        ),
+                    ));
+                }
+            }
+            let variant_comparams: Vec<&ComParamRow> = t
+                .comparams
+                .iter()
+                .zip(comparams)
+                .filter(|(_, scope)| scope.contains(&v))
+                .map(|(row, _)| row)
+                .collect();
+            for row in rows {
+                let (declared, params) = declared_protocol(row, variant_comparams.iter().copied());
+                let Err(refusals) = check_protocol(&declared) else {
+                    continue;
+                };
+                let has_profile = crate::profile::get(&row.application_layer).is_some();
+                for refusal in refusals {
+                    let hint = refusal.to_string();
+                    let (code, file, line, column, kind, hint) = match refusal {
+                        LinkRefusal::NoProtocol | LinkRefusal::SeveralProtocols => continue,
+                        LinkRefusal::NotUdsOnCan { .. } if !has_profile => continue,
+                        LinkRefusal::NotUdsOnCan { .. } => {
+                            let column = if row.application_layer == UDS_LAYER {
+                                "name"
+                            } else {
+                                "application_layer"
+                            };
+                            (
+                                ErrorCode::Unsupported,
+                                "protocols.csv",
+                                row.line,
+                                column,
+                                "not-uds-on-can",
+                                hint,
+                            )
+                        }
+                        LinkRefusal::ExtendedAddressing => (
+                            ErrorCode::Unsupported,
+                            "protocols.csv",
+                            row.line,
+                            "extended_addressing",
+                            "extended",
+                            hint,
+                        ),
+                        LinkRefusal::WideIdentifier { which, .. } => {
+                            let column = match which {
+                                Identifier::Tx => "tx_id",
+                                Identifier::Rx => "rx_id",
+                                Identifier::Functional => "functional_id",
+                            };
+                            (
+                                ErrorCode::BadValue,
+                                "protocols.csv",
+                                row.line,
+                                column,
+                                "wide",
+                                hint,
+                            )
+                        }
+                        LinkRefusal::ZeroBaudRate => (
+                            ErrorCode::BadValue,
+                            "protocols.csv",
+                            row.line,
+                            "baud_rate",
+                            "baud",
+                            hint,
+                        ),
+                        LinkRefusal::ComParam { at, name, why } => {
+                            let line = params[at].line;
+                            let (code, column, kind, hint) = match why {
+                                ComParamRefusal::DeclaredTwice { earlier } => (
+                                    ErrorCode::Duplicate,
+                                    "name",
+                                    "twice",
+                                    format!(
+                                        "ComParam {name} of {} is already defined for {} on \
+                                         line {} (names compare ignoring case)",
+                                        row.name, variant.name, params[earlier].line
+                                    ),
+                                ),
+                                ComParamRefusal::HasUnit => {
+                                    (ErrorCode::Unsupported, "name", "unit", hint)
+                                }
+                                ComParamRefusal::SetByLink => {
+                                    (ErrorCode::Unsupported, "name", "set-by-link", hint)
+                                }
+                                ComParamRefusal::OutlastsHost => {
+                                    (ErrorCode::Unsupported, "name", "outlasts", hint)
+                                }
+                                ComParamRefusal::NotStandardName => {
+                                    (ErrorCode::BadValue, "name", "not-standard", hint)
+                                }
+                                ComParamRefusal::NotUnsigned32(_) => {
+                                    (ErrorCode::BadValue, "value", "not-u32", hint)
+                                }
+                                ComParamRefusal::TimingOutOfRange(_) => {
+                                    (ErrorCode::BadValue, "value", "timing", hint)
+                                }
+                            };
+                            (code, "comparams.csv", line, column, kind, hint)
+                        }
+                    };
+                    found.push((code, file, line, column, kind, hint));
+                }
+            }
+        }
+        for (code, file, line, column, kind, hint) in found {
+            if reported.insert((file, line, column, code, kind)) {
+                self.error(code, file, line, column, hint);
             }
         }
     }
@@ -1309,12 +1415,12 @@ impl<'a> Resolver<'a> {
     }
 
     /// Two rows that would put two definitions of one thing into one variant's document (3,
-    /// 4.3, 4.9): the later row is reported once.
+    /// 4.3, 4.9): the later row is reported once. A ComParam declared twice is judged with the
+    /// rest of the declared link ([`Resolver::declared_links`]).
     #[expect(clippy::too_many_arguments, reason = "one scope list per scoped table")]
     fn per_variant_duplicates(
         &mut self,
         protocols: &[Variants],
-        comparams: &[Variants],
         dids: &[Variants],
         routines: &[Variants],
         nrcs: &[Variants],
@@ -1331,18 +1437,6 @@ impl<'a> Resolver<'a> {
                 .iter()
                 .zip(protocols)
                 .map(|(r, v)| (r.line, v, r.name.clone(), format!("protocol {}", r.name))),
-        );
-        self.unique_per_variant(
-            "comparams.csv",
-            "name",
-            t.comparams.iter().zip(comparams).map(|(r, v)| {
-                (
-                    r.line,
-                    v,
-                    (r.protocol.clone(), r.name.clone()),
-                    format!("ComParam {} of {}", r.name, r.protocol),
-                )
-            }),
         );
         self.unique_per_variant(
             "dids.csv",

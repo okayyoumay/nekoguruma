@@ -188,56 +188,88 @@ fn the_catalogs_are_sorted_by_id() {
 }
 
 #[test]
-fn each_variant_gets_its_own_protocols_and_comparams() {
+fn each_variant_gets_its_own_protocol_and_comparams() {
+    // A variant declares one protocol (ADR-406), each variant its own.
     let files = with(
         example(),
         "protocols.csv",
-        "name,baud_rate,tx_id,rx_id,functional_id,extended_addressing,variants\n\
-         ISO15765,500000,0x7E0,0x7E8,0x7DF,,\n\
-         ISO15765_ext,250000,0x7E1,0x7E9,,yes,exampleEcuV2\n",
+        "name,baud_rate,tx_id,rx_id,functional_id,variants\n\
+         ISO15765,500000,0x7E0,0x7E8,0x7DF,exampleEcuV1\n\
+         ISO_14229_3_on_ISO_15765_2,250000,0x7E1,0x7E9,,exampleEcuV2\n",
     );
     let files = with(
         files,
         "comparams.csv",
-        "protocol,name,value,unit,variants\n\
-         ISO15765_ext,CP_BlockSize,8,,exampleEcuV2\n\
-         ISO15765,CP_P2Max,50,millisecond,\n\
-         ISO15765,CP_StMin,-1,,exampleEcuV1\n",
+        "protocol,name,value,variants\n\
+         ISO_14229_3_on_ISO_15765_2,CP_BlockSize,8,exampleEcuV2\n\
+         ISO15765,CP_P2Max,50000,exampleEcuV1\n\
+         ISO15765,CP_StMin,4294967295,exampleEcuV1\n",
     );
     let documents = documents(&convert(files));
-    let base = |params: Vec<(String, i64, u32)>| {
-        (
+    assert_eq!(
+        protocols(&documents[0]),
+        [(
             "ISO15765".to_owned(),
             500_000,
             0x7E0,
             0x7E8,
             0x7DF,
             false,
-            params,
-        )
-    };
-    assert_eq!(
-        protocols(&documents[0]),
-        [base(vec![
-            ("CP_P2Max".to_owned(), 50, 2),
-            ("CP_StMin".to_owned(), -1, 0),
-        ])]
+            vec![
+                ("CP_P2Max".to_owned(), 50_000, 0),
+                ("CP_StMin".to_owned(), 4_294_967_295, 0),
+            ],
+        )]
     );
     assert_eq!(
         protocols(&documents[1]),
-        [
-            base(vec![("CP_P2Max".to_owned(), 50, 2)]),
-            (
-                "ISO15765_ext".to_owned(),
-                250_000,
-                0x7E1,
-                0x7E9,
-                0,
-                true,
-                vec![("CP_BlockSize".to_owned(), 8, 0)],
-            ),
-        ]
+        [(
+            "ISO_14229_3_on_ISO_15765_2".to_owned(),
+            250_000,
+            0x7E1,
+            0x7E9,
+            0,
+            false,
+            vec![("CP_BlockSize".to_owned(), 8, 0)],
+        )]
     );
+}
+
+/// ADR-397: the conversion writes the values the resolve stage judged, so the link rules the
+/// agent applies accept the converted protocol of every variant of an accepted definition.
+#[test]
+fn a_converted_protocol_passes_the_rules_the_agent_applies() {
+    use diag_ir::link::{DeclaredProtocol, check_protocol};
+    let files = with(
+        example(),
+        "comparams.csv",
+        "protocol,name,value\n\
+         ISO15765,CP_P2Max,50000\n\
+         ISO15765,cp_p2star,2000001\n\
+         ISO15765,CP_BlockSize,8\n\
+         ISO15765,CP_StMin,0\n",
+    );
+    let converted = convert(files);
+    for document in &converted.documents {
+        let loaded = load_ecu_document(&document.bytes).expect("the document loads");
+        let protocols: Vec<_> = loaded
+            .variant()
+            .expect("a variant")
+            .protocols()
+            .into_iter()
+            .flatten()
+            .collect();
+        let [protocol] = protocols[..] else {
+            panic!("one protocol per variant");
+        };
+        let link = check_protocol(&DeclaredProtocol::from(protocol)).expect("accepted");
+        assert_eq!(link.p2_max_us, Some(50_000));
+        assert_eq!(link.p2_star_us, Some(2_000_001));
+        assert_eq!(
+            link.params,
+            [("CP_BlockSize".to_owned(), 8), ("CP_StMin".to_owned(), 0)]
+        );
+    }
 }
 
 #[test]

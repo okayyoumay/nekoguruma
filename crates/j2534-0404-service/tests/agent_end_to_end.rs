@@ -846,7 +846,11 @@ async fn suppressed_requests(
         "{}",
         entries[0]
     );
-    assert_ne!(entries[0]["classification"], "vehicle", "{}", entries[0]);
+    assert_eq!(
+        entries[0]["classification"], "undetermined",
+        "{}",
+        entries[0]
+    );
 
     // A response pending, then the final negative response.
     control(
@@ -892,7 +896,19 @@ async fn suppressed_requests(
         &single(vec![vec![0x83]]),
     )
     .await;
-    assert!(state.is_err(), "silence after a pending fails: {state:?}");
+    // The session change may have reached the ECU, so the job's verdict is on-site intervention
+    // for the unconfirmed request, not a primitive error.
+    assert!(
+        matches!(
+            state,
+            Err(agent::JobError::OnSiteInterventionRequired(
+                agent::restart::OnSiteReason::UnconfirmedRequest {
+                    at: agent::journal::StepRef { pc: 1, steps: 1 }
+                }
+            ))
+        ),
+        "silence after a pending fails: {state:?}"
+    );
     let owed = &entries[0];
     assert_eq!(owed["request"]["suppressed"], true, "{owed}");
     assert_eq!(owed["outcome"]["result"], "no_response", "{owed}");

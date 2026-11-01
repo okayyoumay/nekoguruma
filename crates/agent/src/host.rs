@@ -23,7 +23,7 @@ use crate::comm_log::exchange::{
     SectionAttrs, SourcePos, Target, Timing, TransmitEvidence, UnknownCause, VciTime, VciTimes,
 };
 use crate::comm_log::{AgentNow, EndError, EndItem, EndRead, UnattachedData, UnattachedItem};
-use crate::link::{CloseEvidence, Link, LinkConfig};
+use crate::link::{CAN_SINGLE_FRAME_BYTES, CloseEvidence, Link, LinkConfig};
 use crate::send_receive::{Expectation, NegativeShape};
 
 /// The `link` of the host's exchange entries and of the log's `link_opened`: a job has one
@@ -1310,9 +1310,13 @@ impl<C: WorkerApi> WorkerHost<C> {
             )
         });
         let silent = suppresses_positive_response(&request);
+        // The host does not know the link's addressing format; the only protocol a link may use
+        // is UDS on CAN (`LinkConfig::validate`), so the length a classic CAN frame surely
+        // carries as a single frame, whatever the addressing (`LinkConfig::single_frame`).
+        let one_frame = request.len() <= CAN_SINGLE_FRAME_BYTES;
         let handle = self.handle.clone();
         let mut sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
-        sent.silence_is_result(silent);
+        sent.silence_is_result(silent, one_frame);
         if let Some((request, expected, negative, sid)) = logged {
             // A request that collects every answer lists them; any other lists them when it got
             // more than one (the first included), which only a worker that passes more than one
@@ -2305,12 +2309,18 @@ impl Sent {
 
     /// A request whose positive response is suppressed (`suppressed`) is answered by silence
     /// when it succeeds: a primitive the VCI ended by its receive timeout, with no pending seen
-    /// (a final response would be owed after one) and no final response, has the empty answer
-    /// as its result (ADR-408). Every other end keeps its error.
-    fn silence_is_result(&mut self, suppressed: bool) {
+    /// (a final response would be owed after one), no error event bound to it and no final
+    /// response, has the empty answer as its result (ADR-408). A request longer than one frame
+    /// (`one_frame` false) needs a confirmed send as well, a transmit indication or a
+    /// transmit-done time: an expired flow control is reported as a receive timeout too (ISO
+    /// 22900-2:2022 D.4.2), and then nothing was delivered. Every other end keeps its error.
+    fn silence_is_result(&mut self, suppressed: bool, one_frame: bool) {
+        let sent = one_frame || self.bound_tx.is_some() || self.response_times.tx_done.is_some();
         if suppressed
+            && sent
             && self.vci_ended(false)
             && self.pendings.is_empty()
+            && self.error_events.is_empty()
             && matches!(self.result, Err(HostError::NoResponse))
         {
             self.result = Ok(Vec::new());
@@ -4675,7 +4685,7 @@ mod tests {
             ..Sent::not_started(Err(HostError::NoResponse))
         };
         let silent = |mut sent: Sent, suppressed| {
-            sent.silence_is_result(suppressed);
+            sent.silence_is_result(suppressed, true);
             sent.result
         };
         // Case 1: a receive timeout at P2, nothing else.
@@ -4749,6 +4759,113 @@ mod tests {
             0x10,
         );
         assert!(detail.host_error.is_some());
+    }
+
+    /// ADR-408: a suppressed request longer than one frame needs a confirmed send for its silence
+    /// to count, since an expired flow control is reported as a receive timeout too (ISO
+    /// 22900-2:2022 D.4.2); a request of one frame needs none. An error event bound to the
+    /// primitive keeps the error.
+    #[test]
+    fn a_suppressed_request_over_one_frame_needs_a_confirmed_send_and_no_error_event() {
+        let timed_out = || Sent {
+            rx_timeout: Some(seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        let silent = |mut sent: Sent, one_frame| {
+            sent.silence_is_result(true, one_frame);
+            sent.result
+        };
+        // A short request: the silence is the result with no confirmed send.
+        assert_eq!(silent(timed_out(), true).unwrap(), Vec::<u8>::new());
+        // A longer one with no confirmed send stays no response.
+        assert!(timed_out().bound_tx.is_none());
+        assert!(matches!(
+            silent(timed_out(), false),
+            Err(HostError::NoResponse)
+        ));
+        // A transmit indication bound to the primitive, or a transmit-done time, confirms it.
+        let indicated = Sent {
+            bound_tx: Some(VciTime::new(10, Some(Clock::Device))),
+            ..timed_out()
+        };
+        assert_eq!(silent(indicated, false).unwrap(), Vec::<u8>::new());
+        let done = Sent {
+            response_times: VciTimes {
+                tx_done: Some(VciTime::new(10, Some(Clock::Device))),
+                ..VciTimes::default()
+            },
+            ..timed_out()
+        };
+        assert_eq!(silent(done, false).unwrap(), Vec::<u8>::new());
+        // An error read, then the receive timeout, then the agent's deadline: not silence.
+        let errored = Sent {
+            error_events: vec![seen(PduErrorEvent::PduErrEvtFrameStruct as i32)],
+            ..timed_out()
+        };
+        assert!(matches!(silent(errored, true), Err(HostError::NoResponse)));
+    }
+
+    /// ADR-408, ADR-321: the silence of a send-receive whose request carries the suppress bit,
+    /// read through the progress that waits for its declared answer, is its result.
+    #[test]
+    fn a_suppressed_send_receive_s_silence_is_its_result() {
+        let document = crate::send_receive::tests::document_with(
+            vec![Some(crate::send_receive::tests::uds_shape())],
+            None,
+        );
+        let expected = crate::send_receive::expectation(
+            &document.variant(),
+            crate::send_receive::tests::READ_DTC,
+        )
+        .unwrap();
+        let request = [0x19, 0x82, 0x08];
+        assert!(suppresses_positive_response(&request));
+        let run = |events: Vec<EventItem>| {
+            let mut progress = Progress::expecting(expected.clone());
+            let ended = events
+                .into_iter()
+                .find_map(|item| progress.on_event(item, COP));
+            let mut sent = Sent {
+                error_events: std::mem::take(&mut progress.errors),
+                rx_timeout: progress.rx_timeout.take(),
+                pendings: std::mem::take(&mut progress.pendings),
+                bound_tx: progress.bound_tx,
+                ..Sent::not_started(ended.expect("the primitive ended"))
+            };
+            sent.silence_is_result(true, true);
+            sent.result
+        };
+        let timeout = || {
+            event(
+                Some(COP),
+                event_item::Data::ErrorData(ErrorData {
+                    error_event: PduErrorEvent::PduErrEvtRxTimeout as i32,
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                }),
+            )
+        };
+        let finished = || event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        // Silence to the receive timeout: the empty answer.
+        assert_eq!(run(vec![timeout(), finished()]).unwrap(), Vec::<u8>::new());
+        // A pending first: a final response is owed.
+        assert!(matches!(
+            run(vec![
+                event(Some(COP), result(&[0x7F, 0x19, 0x78])),
+                timeout(),
+                finished()
+            ]),
+            Err(HostError::NoResponse)
+        ));
+        // A negative response is the result, as for any request.
+        assert_eq!(
+            run(vec![
+                event(Some(COP), result(&[0x7F, 0x19, 0x12])),
+                finished()
+            ])
+            .unwrap(),
+            [0x7F, 0x19, 0x12]
+        );
     }
 
     /// ADR-359: a result of the primitive that does not answer the request is rejected, with its

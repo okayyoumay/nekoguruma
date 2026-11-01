@@ -2662,6 +2662,42 @@ fn a_suppressed_request_with_a_pending_fault_gets_its_final_response() {
 }
 
 #[test]
+fn a_suppressed_request_owes_its_final_response_only_for_the_pending_fault_that_fires() {
+    // The fault that fires is the first armed pending fault. A zero count first sends no
+    // pending, so the request is not owed an answer and the bit suppresses it; the second
+    // fault, which would owe one, does not fire on it.
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x81]);
+    assert_eq!(exchange.response, SimResponse::NoResponse);
+    assert!(
+        exchange.pending.is_empty(),
+        "no positive response without a pending, and no pending without one"
+    );
+    assert_eq!(ecu.armed_faults().len(), 2, "neither fault fired");
+    // The same request when the owing fault is first: pendings, then the positive response.
+    let mut ecu = SimEcu::new(config());
+    ecu.inject(Fault::ResponsePending {
+        count: 2,
+        interval_ms: 100,
+    });
+    ecu.inject(Fault::ResponsePending {
+        count: 0,
+        interval_ms: 100,
+    });
+    let exchange = ecu.exchange(Addressing::Physical, &[0x10, 0x81]);
+    assert_eq!(exchange.pending.len(), 2);
+    assert!(matches!(exchange.response, SimResponse::Positive(_)));
+}
+
+#[test]
 fn response_pending_counts_are_capped_and_zero_sends_none() {
     let mut ecu = SimEcu::new(config());
     ecu.inject(Fault::ResponsePending {

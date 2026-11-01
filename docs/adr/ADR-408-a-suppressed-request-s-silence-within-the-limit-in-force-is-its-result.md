@@ -36,6 +36,14 @@ log already names a suppressed request (`request.suppressed`) and classifies its
    The wait is the link's limit in force as the VCI or worker runs it; the agent's own budget
    (ADR-235 item 6) is unchanged, and its passing stays `NoResponse`, as does a short
    positive-form frame the worker took as the end, an error event, lost events and a lost VCI.
+2a. **Two further conditions.** No error event may be bound to the primitive: an error read, then
+   the receive timeout, then the agent's deadline passing is not silence. A request longer than
+   one frame (more than `CAN_SINGLE_FRAME_BYTES`, the 6 bytes a classic CAN frame surely carries
+   whatever the addressing; the host does not know the format) needs a confirmed send as well, a
+   transmit indication bound to the primitive or a transmit-done time in `Sent`. An expired
+   flow control is reported as a receive timeout too (ISO 22900-2:2022 D.4.2; the J2534 worker
+   does the same), so without that confirmation nothing was delivered and the result stays
+   `NoResponse`.
 3. **A negative response is returned as for any request. A pending seen means a final response
    is owed**, so silence after it stays `NoResponse`. On a link whose VCI absorbs pendings the
    host cannot see one, so silence after an absorbed pending counts as success; the log's reading

@@ -883,7 +883,8 @@ impl SimEcu {
             && self
                 .armed
                 .iter()
-                .any(|f| matches!(f, Fault::ResponsePending { count, .. } if *count > 0));
+                .find(|f| matches!(f, Fault::ResponsePending { .. }))
+                .is_some_and(|f| matches!(f, Fault::ResponsePending { count, .. } if *count > 0));
         let response = match refused {
             Some(response) => response,
             None if owed => {

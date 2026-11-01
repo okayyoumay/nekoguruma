@@ -393,6 +393,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-401](ADR-401-the-identification-job-reads-the-ecu-definitions.md) | The Identification Job Reads the ECU Definitions and Reports the Entry States | Accepted (item 1's plan order, item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim: ADR-402 orders the reads by ADR-327 item 4, skips definitions no remaining candidate names and drops contradicted candidates in a plan of candidates; item 4's conclusiveness judged over the pattern declarations, and item 8's pattern-less definition read when a field rule names it, by ADR-403) | `agent` `identification` and `inputs`, `diag-ir` `identify`; design 8.8.2; ADR-315 item 3, ADR-324, ADR-326 item 3, ADR-327, ADR-395, ADR-396, ADR-397, ADR-399 |
 | [ADR-402](ADR-402-the-identification-job-narrows-its-candidates.md) | The Identification Job Narrows Its Candidates and Chooses the Next ECU | Accepted (item 5's rule-field alternatives and its open mixed outcome settled by ADR-403: a rule field plugs in per key and a mixed outcome does not count) | `agent` `identification`; design 8.8.2; ADR-326 items 2 and 3, ADR-327 items 3, 4, 5, 6 and 8, ADR-397, ADR-399 item 6, ADR-401 |
 | [ADR-403](ADR-403-the-identification-job-evaluates-the-matching-rules-fields.md) | The Identification Job Evaluates the Matching Rules' Fields | Accepted | `agent` `identification`, `diag-ir` `decode` / `identify` / `plan`; design 8.8.2; ADR-306, ADR-326 item 2, ADR-327 items 3, 4 and 6, ADR-395 item 3, ADR-397, ADR-399, ADR-401, ADR-402 |
+| [ADR-404](ADR-404-a-hung-test-fails-the-ci-job-instead-of-holding-it.md) | A Hung Test Fails the CI Job Instead of Holding It | Accepted | `.config/nextest.toml` CI profiles, `.github/workflows/ci.yml` (`core-linux`, `core-windows`) |
 
 ## Status Legend
 
@@ -757,6 +758,7 @@ the predecessor repository these ADRs came from.
 - ADR-387
 - ADR-388
 - ADR-397
+- ADR-404
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

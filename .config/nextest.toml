@@ -14,6 +14,10 @@ test-threads = 16
 fail-fast = false
 # Never retry: a test that passes only on retry is a flaky test to fix, not to hide.
 retries = 0
+# A hung test fails instead of holding the job (ADR-404): nextest marks a test slow after each
+# 60 s and ends it after five such periods. The slowest test on the Windows runner takes about
+# 55 s on main, so five minutes leaves more than five times its time.
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # Windows CI, for everything but the agent's tests. The runner has four cores, so four tests run
 # at once. Six modules of `j2534-0404-service`'s `grpc_mock` tests fail on the Windows runner when
@@ -26,6 +30,8 @@ retries = 0
 test-threads = 4
 fail-fast = false
 retries = 0
+# As in `ci` (ADR-404).
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 [[profile.ci-windows.overrides]]
 filter = """
@@ -69,6 +75,8 @@ windows-restart-scenarios = { max-threads = 2 }
 test-threads = 4
 fail-fast = false
 retries = 0
+# As in `ci` (ADR-404).
+slow-timeout = { period = "60s", terminate-after = 5 }
 
 # The real-hardware checks (design 13.5, ADR-275), run by hand with
 # `cargo nextest run --profile hardware --run-ignored=only` and never in CI. The `hw_` tests are

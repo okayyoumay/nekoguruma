@@ -1,7 +1,7 @@
 # ADR-401: The Identification Job Reads the ECU Definitions and Reports the Entry States
 
 **Date:** 2026-11-01
-**Status:** Accepted (item 1's plan order, item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim: ADR-402 orders the reads by ADR-327 item 4, skips definitions no remaining candidate names and drops contradicted candidates in a plan of candidates)
+**Status:** Accepted (item 1's plan order, item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim: ADR-402 orders the reads by ADR-327 item 4, skips definitions no remaining candidate names and drops contradicted candidates in a plan of candidates; item 4's conclusiveness judged over the pattern declarations, and item 8's pattern-less definition read when a field rule names it, by ADR-403)
 **Affects:** `agent` (`identification`: `check_plan`, `PlanRefused::IdentificationRequest`,
 `ecu_phase`, `evaluate_entries`, the report; `inputs`: `negative_code`), `diag-ir` (`identify`:
 `identification_requests`, `decode_identification_answer`), `crates/agent/docs/ngr-agent.md`,
@@ -86,9 +86,10 @@ the choice of the next ECU and the rule fields are later steps.
    ADR-399 item 4, whose report came back with no lock, to the case where no ECU read remains.
 8. **A variant without patterns** has no request: it sends nothing, can never match and
    contributes nothing to conclusiveness or to the entry gate of item 6, whether its link is
-   refused or not; a definition of
-   such variants only opens no link, and its read is reported with no requests, not answered, not
-   conclusive and with no match.
+   refused or not. A definition of such variants only opens no link unless a field rule names it
+   (ADR-403 item 8): then its link opens for the rule's request alone, and the read is still never
+   conclusive and has no match. Conclusiveness and the refused-variant test count the declarations
+   a variant pattern names only (ADR-403 item 7).
 9. **Plan validation.** `diag_ir::plan` refuses an entry that lists the same alternative twice,
    as its other duplicate checks refuse a repeated id. This adds to the list of ADR-395 item 3.
 10. **No `note_identity`.** The ECU reads do not note identities for the communication log:

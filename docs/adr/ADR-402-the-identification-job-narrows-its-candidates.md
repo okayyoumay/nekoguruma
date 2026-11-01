@@ -1,7 +1,7 @@
 # ADR-402: The Identification Job Narrows Its Candidates and Chooses the Next ECU
 
 **Date:** 2026-11-01
-**Status:** Accepted
+**Status:** Accepted (item 5's rule-field alternatives and its open mixed outcome settled by ADR-403: a rule field plugs in per key and a mixed outcome does not count)
 **Affects:** `agent` (`identification`: `ecu_phase`, `read_definition_at`, `narrow`,
 `contradictions`, `outcome_sets`, `next_definition`, `mark_unread`, the report),
 `crates/agent/docs/ngr-agent.md`, design 8.8.2, `docs/glossary.md`; ADR-326 items 2 and 3,
@@ -26,8 +26,8 @@ candidate was ruled out) or does not (and was dropped already). A definition wit
 endpoints has mixed outcomes that drop nothing either. So the worst case of such a definition is
 the number of remaining candidates, and the tie-breaks decide the order among them. A definition
 with a refused variant can never be conclusive and has only the identified outcome, which can drop
-a candidate, so it can score lower and be read earlier. The count gets teeth when the
-rule fields land: a decoded rule value contradicts in every conclusive outcome.
+a candidate, so it can score lower and be read earlier. The count gets teeth from the
+rule fields (ADR-403): a decoded rule value contradicts in every conclusive outcome.
 
 ## Decision
 
@@ -68,9 +68,9 @@ rule fields land: a decoded rule value contradicts in every conclusive outcome.
    With variant outcomes only the worst case is the remaining count for every definition for
    which both verdicts are possible at every endpoint (the finding in the Context); a definition
    with a refused variant can score lower. It is computed and reported, and the rule fields plug in
-   as further per-endpoint alternatives of `outcome_sets`. The mixed outcome "identified at one
-   endpoint, inconclusive at another" is not enumerated; with variant outcomes it cannot change
-   the worst case, and the rule-field work decides whether it counts.
+   as further alternatives of `outcome_sets`, one list per rule field (ADR-403 item 5). The mixed
+   outcome "identified at one endpoint, inconclusive at another" is not enumerated, and ADR-403
+   decides it does not count: unevaluated and inconclusive are not outcomes at any endpoint.
 6. **The end.** The ECU phase ends when no definition in play is left untried, which is ADR-327
    item 5's "every definition still in play read or out of reach" and, in a plan of candidates
    with none remaining, "no candidate remains". A definition is tried after its own physical
@@ -99,11 +99,11 @@ rule fields land: a decoded rule value contradicts in every conclusive outcome.
 - A plan of candidates sends fewer requests when a read or the VIN contradicts a candidate; the
   order is deterministic and no longer the plan's for any selection (ADR-401 item 1's plan order,
   item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim).
-- The worst case is reported but is the remaining count, for a definition that can be conclusive
-  at every endpoint, until the rule fields are read, so the tie-breaks decide among those; a
-  definition with a refused variant is inconclusive everywhere (ADR-401 item 4), has only the
-  identified outcome and can score lower, so it can be read earlier. The count only counts
-  variant outcomes until the rule fields land.
+- The worst case is the remaining count for a definition without a rule field that can be
+  conclusive at every endpoint, so the tie-breaks decide among those; a definition with a rule
+  field that separates the candidates scores lower (ADR-403), and so does one with a refused
+  variant, which is inconclusive everywhere (ADR-401 item 4), has only the identified outcome and
+  can be read earlier.
 - A definition with a refused variant is listed at every endpoint a candidate's entries use and
   is never ruled out, so it keeps the candidate (`has_refused_variant`, shared by the read's
   judgment, the outcomes and the contradiction).

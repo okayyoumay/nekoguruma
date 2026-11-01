@@ -321,6 +321,26 @@ impl IdentificationPlan {
                     });
                 }
             }
+            // A field rule reads the read of a definition an entry lists (ADR-403): a rule
+            // whose source belongs to no listed definition could never be judged in play.
+            for rule in &candidate.field_rules {
+                let listed = candidate
+                    .entries
+                    .iter()
+                    .flat_map(|entry| &entry.alternatives)
+                    .any(|alternative| {
+                        self.definitions.iter().any(|definition| {
+                            definition.id == *alternative
+                                && definition.documents.contains(&rule.source.document)
+                        })
+                    });
+                if !listed {
+                    return Err(invalid(
+                        at("field rule"),
+                        "its source is a document of a definition no entry of the candidate lists",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -512,6 +532,36 @@ mod tests {
                 document: "cc".repeat(32)
             })
         );
+    }
+
+    #[test]
+    fn a_field_rule_on_a_definition_no_entry_lists_is_refused() {
+        let why = "its source is a document of a definition no entry of the candidate lists";
+        // The rule's document is DOC_B, listed by a definition the candidate's entries lack.
+        let mut other = plan();
+        other.definitions[0].documents = vec![DOC_A];
+        other.definitions.push(PlanDefinition {
+            id: "other".to_owned(),
+            documents: vec![DOC_B],
+        });
+        other.candidates[0].field_rules[0].source.document = DOC_B;
+        assert_eq!(
+            other.validate(),
+            invalid("candidate \"c1\" field rule", why)
+        );
+        // Listing that definition in an entry makes the rule valid; a VIN rule is not judged so.
+        other.candidates[0].entries[0]
+            .alternatives
+            .push("other".to_owned());
+        assert_eq!(other.validate(), Ok(()));
+        let mut vin_only = plan();
+        vin_only.definitions[0].documents = vec![DOC_A];
+        vin_only.definitions.push(PlanDefinition {
+            id: "other".to_owned(),
+            documents: vec![DOC_B],
+        });
+        vin_only.candidates[0].vin_rules[0].source.document = DOC_B;
+        assert_eq!(vin_only.validate(), Ok(()));
     }
 
     #[test]

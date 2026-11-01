@@ -144,8 +144,9 @@ ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <
 ```
 
 Runs the functional presence requests of an identification plan, then reads the VIN its VIN
-rules name, then reads each ECU definition it names (`run_identification`, ADR-396, ADR-399,
-ADR-401; design 8.8.2) and prints the report. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
+rules name, then reads the ECU definitions it names in the order ADR-327 item 4 gives, narrowing
+the candidates on what the reads and the VIN rules show (`run_identification`, ADR-396, ADR-399,
+ADR-401, ADR-402; design 8.8.2), and prints the report, which lists the remaining candidates. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
 `--comm-log` mean what they mean for `run`, and both commands run their job in one shell
 (`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
 source with the slot, the report of the log's path, and the worker's stop with the guards'
@@ -1507,7 +1508,8 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
   A declared link that ADR-324 refuses is reported, not
   refused. `load_plan` also refuses the structural errors listed in ADR-395 item 3.
 - `CheckedPlan::report` derives the `IdentificationReport`: the plan's selection (candidates, a definition chosen by
-  hand, or every ECU; only the first narrows), the candidate ids, one entry per
+  hand, or every ECU; only the first narrows), the candidate ids, the remaining candidates (all of
+  them, no drop and an empty read order until the ECU phase has run), one entry per
   endpoint (bus, request and response identifier) with the documents on it, the presence groups
   (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
   documents whose link is refused, an empty presence section, and the VIN reads with every source
@@ -1563,7 +1565,8 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     one) and the phase was not interrupted; bounds that run out in a read leave it and the later
     reads `NotRead` and set `vin_interrupted`, with no VIN and no lock. `vin_reads` holds each
     read (endpoint, request in hex, the sources' outcomes, the accepted VIN) and `vin_rules` each
-    candidate's VIN rule as `Matched`, `NotMatched` or `Unevaluated`; nothing is dropped.
+    candidate's VIN rule as `Matched`, `NotMatched` or `Unevaluated`; the ECU phase's first
+    `narrow` drops a candidate of a plan that narrows per component (ADR-402).
   - An established VIN takes the per-vehicle lock on the job's guards (`promote_to_vehicle`,
     `JobGuards::take_vehicle`, which allows guards without the slot) once no link is open,
     waiting for a job that holds the vehicle until it lets go or the cancel, which ends the run
@@ -1579,7 +1582,7 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     was established, unless the presence or VIN phase was interrupted (then
     `ecu_reads_interrupted` is set when some read would have opened a link and every declaration
     stays `NotRead`). `check_plan` derives the reads before any link opens: one `EcuReadPlan` per
-    definition and endpoint, in plan order, whose variants are grouped by the ComParams other
+    definition and endpoint, in plan order (the order they stay in the report, `ecu_reads`), whose variants are grouped by the ComParams other
     than the timings into `LinkGroup`s (`raise_timings` gives the group's link the largest
     timings), each holding its distinct identification requests
     (`diag_ir::identify::identification_requests`) with the (document, service) declarations that
@@ -1590,7 +1593,8 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     declaration (`inputs::negative_code`, then `diag_ir::identify::decode_identification_answer`),
     closes the link, and each variant is judged with `diag_ir::decode::variant_matches`, so every
     match is reported. A declaration is `Decoded` (the fields), `Undecodable`, `Negative` (not
-    sent again), `NoUsableAnswer`, `LinkRefused`, `WorkerRefused` or `NotRead`; bounds that run
+    sent again), `NoUsableAnswer`, `LinkRefused`, `WorkerRefused`, `NotRead` or `NotInPlay` (no
+    remaining candidate named the definition when the phase ended, so it was not read); bounds that run
     out leave the read and the rest `NotRead` and set `ecu_reads_interrupted`. A read is
     `conclusive` when it has a declaration, all `Decoded`, and its definition has no refused
     variant (no negative response is definitive yet), and `answered` when a declaration got a
@@ -1604,7 +1608,27 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     `AnsweredNotIdentified` (an answered endpoint with an inconclusive read), `NotAnswering` or
     `NotFitted` (requests sent, nothing answered) or `NotRead` (none sent). The JSON uses serde's
     default names; field values are the agent's `FieldValue`, with bytes and hashes as lowercase
-    hex. Nothing is narrowed and no definition skipped.
+    hex.
+  - The loop of the ECU phase (ADR-402; `ecu_phase`) is: `narrow` recomputes the remaining
+    candidates from the facts (`facts_of`: a read with a match identifies its definition at its
+    endpoint, a conclusive one without a match rules it out) and the VIN rules, with the one
+    function `contradictions`; `next_definition` picks among the definitions in play and not yet
+    tried (`in_play`: every definition of a plan that does not narrow, else one a remaining
+    candidate lists) the one with the smallest worst case over its conclusive outcomes
+    (`outcome_sets`), then the most candidates naming it, then the most endpoints that answered
+    presence, then the lowest identifier; `read_definition_at` reads the definition's planned
+    reads (the former loop body, the only caller of `ecu_read_group`); the loop ends when nothing
+    in play is untried. `mark_unread` then sets `NotInPlay` on the declarations of the definitions
+    no remaining candidate names. Only a plan of candidates drops; the report's `remaining`,
+    `dropped` (each with its `Contradiction`, `UnlistedDefinition` with the identified definition,
+    the endpoint and the definitions ruled out there, or `VinRules` with the component, and
+    `after`, the definition whose read completed it, null for the VIN) and `read_order` (each
+    definition with its `worst_case`) are the result. Until the rule fields are read the worst
+    case is the remaining count for every definition that can be conclusive at every endpoint
+    (one with a refused variant can score lower). An interruption narrows once more, from the
+    matches of the part read, before it ends the phase. An interrupted phase keeps `remaining` and
+    `dropped` and leaves every entry `NotRead`; the entries of dropped candidates are judged from
+    the same reads.
 
 The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two
 spellings of UDS on CAN that ADR-324 item 2 accepts are one bus.

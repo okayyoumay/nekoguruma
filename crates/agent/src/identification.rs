@@ -7,12 +7,14 @@
 //! [`run_identification`] then sends the plan's functional presence requests and is the only
 //! writer of the report's presence section (ADR-396); it then reads the VIN the plan's VIN rules
 //! name, and is the only writer of the report's VIN section and of the per-vehicle lock the
-//! identified VIN takes (ADR-399). It then reads every ECU definition the plan names, once, in
-//! plan order, and is the only writer of the report's ECU reads and entry states (ADR-401); it
-//! narrows no candidate yet.
+//! identified VIN takes (ADR-399). It then reads the ECU definitions the plan names, once each, in
+//! the order ADR-327 item 4 gives, and is the only writer of the report's ECU reads and entry
+//! states (ADR-401); a plan whose selection narrows drops the candidates the reads and the VIN
+//! rules contradict, and reads no definition that no remaining candidate names (ADR-402).
 
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
+use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -400,12 +402,17 @@ pub struct CheckedPlan {
     entries: Vec<(String, PlanEntry)>,
 }
 
+impl EcuReadPlan {
+    /// Whether the run opens a link for some group of the read.
+    fn opens(&self) -> bool {
+        self.groups.iter().any(LinkGroup::opens)
+    }
+}
+
 impl CheckedPlan {
     /// Whether some ECU read opens a link.
     fn ecu_reads_to_do(&self) -> bool {
-        self.ecu_reads
-            .iter()
-            .any(|read| read.groups.iter().any(LinkGroup::opens))
+        self.ecu_reads.iter().any(EcuReadPlan::opens)
     }
 }
 
@@ -818,7 +825,8 @@ pub struct VinRead {
     pub accepted: Option<Vin>,
 }
 
-/// Whether the established VIN satisfies a VIN rule. Nothing is dropped by it (ADR-399 item 6).
+/// Whether the established VIN satisfies a VIN rule. Only a plan whose selection narrows drops a
+/// candidate on it, per component (ADR-402, ADR-399 item 6).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 pub enum VinRuleOutcome {
     Matched,
@@ -937,6 +945,9 @@ pub enum RequestOutcome {
     WorkerRefused,
     /// The read was not made: the run ended, or its bounds ran out, before it.
     NotRead,
+    /// The read was not made: no remaining candidate named the definition when the reads ended
+    /// (ADR-402).
+    NotInPlay,
 }
 
 /// A (document, service) declaration of an identification request and what it gave.
@@ -1012,6 +1023,39 @@ pub struct EntryResult {
     pub state: EntryState,
 }
 
+/// Why a candidate was dropped (ADR-327 item 3, ADR-402).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub enum Contradiction {
+    /// A definition the candidate lists in no entry was identified at an endpoint one of its
+    /// entries uses, and every definition the candidate lists there was read there conclusively
+    /// without a match.
+    UnlistedDefinition {
+        definition: String,
+        endpoint: EndpointKey,
+        ruled_out: Vec<String>,
+    },
+    /// The VIN is established and none of the candidate's VIN rules for the component matched.
+    VinRules { component: Component },
+}
+
+/// A candidate a plan whose selection narrows dropped, and why.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct DroppedCandidate {
+    pub candidate: String,
+    /// The definition whose read completed the contradiction; `None` when the VIN did.
+    pub after: Option<String>,
+    pub contradictions: Vec<Contradiction>,
+}
+
+/// One step of the ECU phase: the definition read, with the worst case that chose it
+/// (ADR-327 item 4, ADR-402).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ReadStep {
+    pub definition: String,
+    /// The most candidates any conclusive outcome of reading the definition leaves.
+    pub worst_case: usize,
+}
+
 /// What the plan's checks and the derivation give (design 8.8.2), and, once
 /// [`run_identification`] has run, the presence section (which response identifiers answered
 /// the functional presence requests) and the VIN section (ADR-399).
@@ -1019,6 +1063,9 @@ pub struct EntryResult {
 pub struct IdentificationReport {
     selection: Selection,
     candidates: Vec<String>,
+    /// The candidates no contradiction dropped: all of them for a plan whose selection does not
+    /// narrow (ADR-402).
+    remaining: Vec<String>,
     endpoints: Vec<EndpointEntry>,
     presence_groups: Vec<PresenceGroup>,
     buses_without_presence: Vec<BusKey>,
@@ -1044,6 +1091,10 @@ pub struct IdentificationReport {
     vehicle_lock_held: bool,
     /// Each candidate's VIN rules against the established VIN.
     vin_rules: Vec<VinRuleResult>,
+    /// The candidates dropped, in the order they were (ADR-402).
+    dropped: Vec<DroppedCandidate>,
+    /// The definitions read, in the order read, each with the worst case that chose it.
+    read_order: Vec<ReadStep>,
     /// The ECU reads in plan order, each declaration `NotRead` or `LinkRefused` until the run
     /// reads it (ADR-401).
     ecu_reads: Vec<EcuRead>,
@@ -1062,6 +1113,19 @@ impl IdentificationReport {
     /// The ids of the plan's candidates.
     pub fn candidates(&self) -> &[String] {
         &self.candidates
+    }
+    /// The candidates left after the reads and the VIN rules; all of them for a plan whose
+    /// selection does not narrow (ADR-402).
+    pub fn remaining(&self) -> &[String] {
+        &self.remaining
+    }
+    /// The candidates dropped, in order, each with its contradictions.
+    pub fn dropped(&self) -> &[DroppedCandidate] {
+        &self.dropped
+    }
+    /// The definitions in the order the ECU phase read them (ecu_reads stays in plan order).
+    pub fn read_order(&self) -> &[ReadStep] {
+        &self.read_order
     }
     /// Each endpoint once, with the documents whose link is on it, in plan order.
     pub fn endpoints(&self) -> &[EndpointEntry] {
@@ -1131,7 +1195,8 @@ impl IdentificationReport {
 
 impl IdentificationReport {
     /// Sets each VIN rule's outcome from the established `vin`: matched when the compared
-    /// positions equal the rule's expected text. No candidate is dropped by it (ADR-399 item 6).
+    /// positions equal the rule's expected text. It drops nobody itself; `contradictions` reads
+    /// the outcomes (ADR-402).
     fn evaluate_vin_rules(&mut self, rules: &[(String, VinRule)], vin: &Vin) {
         for (result, (_, rule)) in self.vin_rules.iter_mut().zip(rules) {
             let compared = vin
@@ -1197,6 +1262,7 @@ impl CheckedPlan {
         IdentificationReport {
             selection: self.selection,
             candidates: self.candidates.clone(),
+            remaining: self.candidates.clone(),
             endpoints,
             buses_without_presence: buses
                 .into_iter()
@@ -1250,6 +1316,8 @@ impl CheckedPlan {
                     outcome: VinRuleOutcome::Unevaluated,
                 })
                 .collect(),
+            dropped: Vec::new(),
+            read_order: Vec::new(),
             ecu_reads: self
                 .ecu_reads
                 .iter()
@@ -2330,9 +2398,354 @@ fn ecu_read_group<W: WorkerSource>(
     failure.map_or(Ok(Some(read)), Err)
 }
 
-/// The ECU phase: reads each ECU definition once per endpoint, in plan order, one link open at a
-/// time, and sets the report's ECU reads (ADR-401). A run whose bounds run out in a read leaves
-/// the rest `NotRead`. Every link is closed when this returns.
+/// What one reading of a definition's endpoint established (ADR-327 item 3).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Verdict {
+    /// A variant of the definition matched there.
+    Identified,
+    /// The read was conclusive and no variant matched.
+    RuledOut,
+}
+
+/// A definition's verdict at one endpoint.
+#[derive(Clone, PartialEq, Eq, Debug)]
+struct Fact {
+    definition: String,
+    endpoint: EndpointKey,
+    verdict: Verdict,
+}
+
+/// What the reads established (ADR-327 item 3): a read with a match identifies its definition at
+/// its endpoint; a conclusive read without a match rules it out there. A read without an endpoint
+/// (a refused link) gives no fact, nor does one that was not made or stayed inconclusive.
+/// Callers: `narrow`, `next_definition`.
+fn facts_of(reads: &[EcuRead]) -> Vec<Fact> {
+    reads
+        .iter()
+        .filter_map(|read| {
+            let verdict = if !read.matching.is_empty() {
+                Verdict::Identified
+            } else if read.conclusive {
+                Verdict::RuledOut
+            } else {
+                return None;
+            };
+            Some(Fact {
+                definition: read.definition.clone(),
+                endpoint: read.endpoint.clone()?,
+                verdict,
+            })
+        })
+        .collect()
+}
+
+/// Whether some group of the planned read has a request to send.
+fn has_request(read: &EcuReadPlan) -> bool {
+    read.groups.iter().any(|group| !group.requests.is_empty())
+}
+
+/// Whether a variant of the definition has a link ADR-324 refuses (a read without an endpoint
+/// that has a request): the definition is inconclusive at every endpoint, so no read rules it
+/// out (ADR-401 item 4). Callers: `read_definition_at`, `outcome_sets`, `contradictions`.
+fn has_refused_variant(plan: &CheckedPlan, definition: &str) -> bool {
+    plan.ecu_reads
+        .iter()
+        .any(|read| read.definition == definition && read.endpoint.is_none() && has_request(read))
+}
+
+/// Every contradiction the facts and the VIN rules hold against each candidate, in plan order,
+/// only for the candidates that have one (ADR-327 item 3, ADR-402). A candidate is contradicted by
+/// an identified definition it lists in no entry, at an endpoint one of its entries uses, once
+/// every definition it lists there is ruled out there (so one whose read stayed inconclusive,
+/// failed or got no answer keeps it); a fact of a definition that has left play still counts. And
+/// per component, by its VIN rules when the VIN is established and none of them matched; an
+/// unevaluated rule contradicts nothing. The one function the run (`narrow`) and the hypothetical
+/// outcomes (`outcome_sets`) both judge by, so the choice and the drop cannot drift apart.
+fn contradictions(
+    plan: &CheckedPlan,
+    facts: &[Fact],
+    vin_rules: &[VinRuleResult],
+) -> Vec<(String, Vec<Contradiction>)> {
+    let mut found = Vec::new();
+    for candidate in &plan.candidates {
+        let mut contradictions = Vec::new();
+        let rules = || vin_rules.iter().filter(|rule| rule.candidate == *candidate);
+        let mut components: Vec<Component> = Vec::new();
+        for rule in rules() {
+            if !components.contains(&rule.component) {
+                components.push(rule.component);
+            }
+        }
+        for component in components {
+            if rules()
+                .filter(|rule| rule.component == component)
+                .all(|rule| rule.outcome == VinRuleOutcome::NotMatched)
+            {
+                contradictions.push(Contradiction::VinRules { component });
+            }
+        }
+        let listed: Vec<&String> = plan
+            .entries
+            .iter()
+            .filter(|(owner, _)| owner == candidate)
+            .flat_map(|(_, entry)| &entry.alternatives)
+            .collect();
+        for fact in facts.iter().filter(|fact| {
+            fact.verdict == Verdict::Identified && !listed.contains(&&fact.definition)
+        }) {
+            let mut at: Vec<String> = Vec::new();
+            for read in &plan.ecu_reads {
+                if read.endpoint.as_ref() == Some(&fact.endpoint)
+                    && has_request(read)
+                    && listed.contains(&&read.definition)
+                    && !at.contains(&read.definition)
+                {
+                    at.push(read.definition.clone());
+                }
+            }
+            // A listed definition with a refused variant is listed at every endpoint the
+            // candidate uses and is never ruled out, so it keeps the candidate (ADR-401 item 4).
+            if !at.is_empty() {
+                for definition in &listed {
+                    if has_refused_variant(plan, definition) && !at.contains(definition) {
+                        at.push((*definition).clone());
+                    }
+                }
+            }
+            let ruled_out = |definition: &String| {
+                facts.iter().any(|other| {
+                    other.verdict == Verdict::RuledOut
+                        && other.definition == *definition
+                        && other.endpoint == fact.endpoint
+                })
+            };
+            if !at.is_empty() && at.iter().all(ruled_out) {
+                contradictions.push(Contradiction::UnlistedDefinition {
+                    definition: fact.definition.clone(),
+                    endpoint: fact.endpoint.clone(),
+                    ruled_out: at,
+                });
+            }
+        }
+        if !contradictions.is_empty() {
+            found.push((candidate.clone(), contradictions));
+        }
+    }
+    found
+}
+
+/// Recomputes the remaining candidates from the facts and the VIN rules, records each newly
+/// contradicted candidate in `report.dropped` with `after`, and writes `report.remaining`. A plan
+/// whose selection does not narrow keeps every candidate and records nothing (ADR-327 item 8).
+/// Callers: `ecu_phase`, before the first read and after each definition.
+fn narrow(
+    plan: &CheckedPlan,
+    report: &mut IdentificationReport,
+    after: Option<&str>,
+) -> Vec<String> {
+    if !plan.selection.narrows() {
+        return report.remaining.clone();
+    }
+    let facts = facts_of(&report.ecu_reads);
+    let contradicted = contradictions(plan, &facts, &report.vin_rules);
+    for (candidate, contradictions) in &contradicted {
+        if !report.dropped.iter().any(|d| d.candidate == *candidate) {
+            report.dropped.push(DroppedCandidate {
+                candidate: candidate.clone(),
+                after: after.map(str::to_owned),
+                contradictions: contradictions.clone(),
+            });
+        }
+    }
+    report.remaining = plan
+        .candidates
+        .iter()
+        .filter(|candidate| {
+            !contradicted
+                .iter()
+                .any(|(dropped, _)| dropped == *candidate)
+        })
+        .cloned()
+        .collect();
+    report.remaining.clone()
+}
+
+/// Whether a definition is still in play (ADR-327 item 4): every definition in a plan whose
+/// selection does not narrow; in one that does, a definition an entry of a remaining candidate
+/// lists. Callers: `next_definition`, `mark_unread`.
+fn in_play(plan: &CheckedPlan, remaining: &[String], definition: &str) -> bool {
+    !plan.selection.narrows() || named_by(plan, remaining, definition) > 0
+}
+
+/// How many of the `remaining` candidates list `definition` in an entry.
+fn named_by(plan: &CheckedPlan, remaining: &[String], definition: &str) -> usize {
+    remaining
+        .iter()
+        .filter(|candidate| {
+            plan.entries.iter().any(|(owner, entry)| {
+                owner == *candidate && entry.alternatives.iter().any(|a| a == definition)
+            })
+        })
+        .count()
+}
+
+/// The distinct candidate sets the conclusive outcomes of reading `definition` would leave over
+/// `remaining` (ADR-327 item 4). Per endpoint of the definition (its planned reads with an
+/// endpoint and a request) the alternatives are identified there, and ruled out there where the
+/// read can be conclusive (no planned read of the definition without an endpoint but with a
+/// request, the rule of ADR-401); the outcomes are the product over its endpoints, each judged by
+/// `contradictions` over the facts so far and the outcome. No answer and an inconclusive read are
+/// not outcomes. A decoded rule field will be a further alternative per endpoint. Empty for a
+/// definition with no endpoint to read. A plan whose selection does not narrow leaves every
+/// candidate in every outcome. Caller: `next_definition`.
+fn outcome_sets(
+    plan: &CheckedPlan,
+    facts: &[Fact],
+    vin_rules: &[VinRuleResult],
+    remaining: &[String],
+    definition: &str,
+) -> Vec<Vec<String>> {
+    let planned: Vec<&EcuReadPlan> = plan
+        .ecu_reads
+        .iter()
+        .filter(|read| read.definition == definition && has_request(read))
+        .collect();
+    let mut endpoints: Vec<&EndpointKey> = Vec::new();
+    for endpoint in planned.iter().filter_map(|read| read.endpoint.as_ref()) {
+        if !endpoints.contains(&endpoint) {
+            endpoints.push(endpoint);
+        }
+    }
+    let conclusive = !has_refused_variant(plan, definition);
+    let mut verdicts = vec![Verdict::Identified];
+    if conclusive {
+        verdicts.push(Verdict::RuledOut);
+    }
+    let mut outcomes: Vec<Vec<Fact>> = if endpoints.is_empty() {
+        Vec::new()
+    } else {
+        vec![Vec::new()]
+    };
+    for endpoint in endpoints {
+        outcomes = outcomes
+            .iter()
+            .flat_map(|outcome| {
+                verdicts.iter().map(|&verdict| {
+                    let mut next = outcome.clone();
+                    next.push(Fact {
+                        definition: definition.to_owned(),
+                        endpoint: endpoint.clone(),
+                        verdict,
+                    });
+                    next
+                })
+            })
+            .collect();
+    }
+    let mut sets: Vec<Vec<String>> = Vec::new();
+    for outcome in outcomes {
+        let set: Vec<String> = if plan.selection.narrows() {
+            let all: Vec<Fact> = facts.iter().cloned().chain(outcome).collect();
+            let contradicted = contradictions(plan, &all, vin_rules);
+            remaining
+                .iter()
+                .filter(|candidate| {
+                    !contradicted
+                        .iter()
+                        .any(|(dropped, _)| dropped == *candidate)
+                })
+                .cloned()
+                .collect()
+        } else {
+            remaining.to_vec()
+        };
+        if !sets.contains(&set) {
+            sets.push(set);
+        }
+    }
+    sets
+}
+
+/// The definition to read next, with its worst case (ADR-327 item 4): among those in play, not
+/// yet tried and with a group that opens a link, the one with the smallest worst case (the
+/// largest outcome set; every remaining candidate for a definition with no outcome), then named
+/// by the most remaining candidates, then with the most endpoints that answered presence, then
+/// the lowest identifier (byte order). `None` when no definition is left. Caller: `ecu_phase`.
+fn next_definition(
+    plan: &CheckedPlan,
+    report: &IdentificationReport,
+    remaining: &[String],
+    tried: &HashSet<String>,
+) -> Option<(String, usize)> {
+    let facts = facts_of(&report.ecu_reads);
+    let mut seen: Vec<&str> = Vec::new();
+    let mut best: Option<(usize, Reverse<usize>, Reverse<usize>, &str)> = None;
+    for read in &plan.ecu_reads {
+        let definition = read.definition.as_str();
+        if seen.contains(&definition) {
+            continue;
+        }
+        seen.push(definition);
+        let opens = plan
+            .ecu_reads
+            .iter()
+            .any(|r| r.definition == definition && r.opens());
+        if tried.contains(definition) || !opens || !in_play(plan, remaining, definition) {
+            continue;
+        }
+        let worst = outcome_sets(plan, &facts, &report.vin_rules, remaining, definition)
+            .iter()
+            .map(Vec::len)
+            .max()
+            .unwrap_or(remaining.len());
+        let mut heard: Vec<&EndpointKey> = Vec::new();
+        for endpoint in plan
+            .ecu_reads
+            .iter()
+            .filter(|r| r.definition == definition && r.opens())
+            .filter_map(|r| r.endpoint.as_ref())
+        {
+            if report.answered(endpoint) && !heard.contains(&endpoint) {
+                heard.push(endpoint);
+            }
+        }
+        let key = (
+            worst,
+            Reverse(named_by(plan, remaining, definition)),
+            Reverse(heard.len()),
+            definition,
+        );
+        if best.as_ref().is_none_or(|known| key < *known) {
+            best = Some(key);
+        }
+    }
+    best.map(|(worst, .., definition)| (definition.to_owned(), worst))
+}
+
+/// Marks the declarations of the definitions that were not read as `NotInPlay` when no remaining
+/// candidate names the definition; those still in play stay `NotRead` (the run's bounds ran out).
+/// Callers: both ends of `ecu_phase`.
+fn mark_unread(plan: &CheckedPlan, report: &mut IdentificationReport, remaining: &[String]) {
+    for read in &mut report.ecu_reads {
+        if in_play(plan, remaining, &read.definition) {
+            continue;
+        }
+        for request in &mut read.requests {
+            for declaration in &mut request.declarations {
+                if declaration.outcome == RequestOutcome::NotRead {
+                    declaration.outcome = RequestOutcome::NotInPlay;
+                }
+            }
+        }
+    }
+}
+
+/// The ECU phase: reads the definitions in the order of `next_definition`, each once per endpoint
+/// and one link open at a time, narrowing the candidates of a plan whose selection narrows
+/// before each choice, and sets the report's ECU reads (ADR-401, ADR-402). It ends when no
+/// definition in play is left untried (which includes the end of every candidate in such a plan).
+/// A run whose bounds run out in a read leaves the rest `NotRead` and keeps the drops made. Every
+/// link is closed when this returns.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run's whole context, split only by what the caller owns"
@@ -2349,101 +2762,148 @@ fn ecu_phase<W: WorkerSource>(
     worker_ended: &Cell<bool>,
     report: &mut IdentificationReport,
 ) -> Result<(), JobError> {
-    for (at, planned) in plan.ecu_reads.iter().enumerate() {
-        let mut decoded: HashMap<(Sha256, u32), Vec<DecodedField>> = HashMap::new();
-        let mut first = 0;
-        let mut interrupted = false;
-        for group in &planned.groups {
-            let count = group.requests.len();
-            let Some(link) = group.link.as_ref().filter(|_| count > 0) else {
-                first += count;
+    let mut remaining = narrow(plan, report, None);
+    let mut tried: HashSet<String> = HashSet::new();
+    while let Some((definition, worst_case)) = next_definition(plan, report, &remaining, &tried) {
+        report.read_order.push(ReadStep {
+            definition: definition.clone(),
+            worst_case,
+        });
+        for at in 0..plan.ecu_reads.len() {
+            if plan.ecu_reads[at].definition != definition {
                 continue;
-            };
-            let end = ecu_read_group(
+            }
+            let interrupted = read_definition_at(
                 handle,
                 source,
-                group,
-                link,
-                &plan.documents,
-                comm_log.clone(),
+                plan,
+                at,
                 limits,
                 cancelled,
                 guards,
+                comm_log,
                 reopens,
                 worker_ended,
+                report,
             )?;
-            let reported = &mut report.ecu_reads[at].requests[first..first + count];
-            match end {
-                None => {
-                    for request in reported {
-                        for declaration in &mut request.declarations {
-                            declaration.outcome = RequestOutcome::WorkerRefused;
-                        }
-                    }
-                }
-                Some(read) => {
-                    for (request, outcomes) in reported.iter_mut().zip(read.outcomes) {
-                        for (declaration, outcome) in request.declarations.iter_mut().zip(outcomes)
-                        {
-                            declaration.outcome = outcome;
-                        }
-                    }
-                    decoded.extend(read.decoded);
-                    interrupted = read.interrupted;
-                }
-            }
-            first += count;
             if interrupted {
-                break;
+                report.ecu_reads_interrupted = true;
+                // A match from the part read counts as a fact; no interrupted read is conclusive.
+                remaining = narrow(plan, report, Some(&definition));
+                mark_unread(plan, report, &remaining);
+                return Ok(());
             }
         }
-        let reported = &mut report.ecu_reads[at];
-        // Every match is reported, not the first by name (ADR-327 item 7).
-        for (hash, document) in &plan.documents {
-            if reported.documents.contains(hash)
-                && variant_matches(&document.variant(), |service| {
-                    decoded.get(&(*hash, service)).map(Vec::as_slice)
-                })
-                && !reported.matching.contains(hash)
-            {
-                reported.matching.push(*hash);
-            }
-        }
-        let outcomes = || {
-            reported
-                .requests
-                .iter()
-                .flat_map(|request| &request.declarations)
-                .map(|declaration| &declaration.outcome)
+        remaining = narrow(plan, report, Some(&definition));
+        tried.insert(definition);
+    }
+    mark_unread(plan, report, &remaining);
+    Ok(())
+}
+
+/// Reads the planned read `plan.ecu_reads[at]`: each of its link groups that opens, then judges
+/// the read (matches, answered, conclusive) and sets it in the report (ADR-401). The only caller
+/// of `ecu_read_group`. Whether the run's bounds ran out in it.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn read_definition_at<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    plan: &CheckedPlan,
+    at: usize,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    comm_log: &Option<crate::comm_log::CommLog>,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+    report: &mut IdentificationReport,
+) -> Result<bool, JobError> {
+    let planned = &plan.ecu_reads[at];
+    let mut decoded: HashMap<(Sha256, u32), Vec<DecodedField>> = HashMap::new();
+    let mut first = 0;
+    let mut interrupted = false;
+    for group in &planned.groups {
+        let count = group.requests.len();
+        let Some(link) = group.link.as_ref().filter(|_| count > 0) else {
+            first += count;
+            continue;
         };
-        let answered = outcomes().any(|o| {
-            matches!(
-                o,
-                RequestOutcome::Decoded(_)
-                    | RequestOutcome::Undecodable
-                    | RequestOutcome::Negative(_)
-            )
-        });
-        // The one place that judges a read conclusive: no negative response is definitive until
-        // the IR declares which are, and a positive response that does not decode rules nothing
-        // out (ADR-327 item 3, ADR-401). A variant whose link is refused leaves the definition
-        // inconclusive at every endpoint.
-        let refused_variant = plan.ecu_reads.iter().any(|r| {
-            r.definition == planned.definition
-                && r.endpoint.is_none()
-                && r.groups.iter().any(|group| !group.requests.is_empty())
-        });
-        let conclusive = outcomes().next().is_some()
-            && outcomes().all(|o| matches!(o, RequestOutcome::Decoded(_)))
-            && !refused_variant;
-        reported.answered = answered;
-        reported.conclusive = conclusive;
+        let end = ecu_read_group(
+            handle,
+            source,
+            group,
+            link,
+            &plan.documents,
+            comm_log.clone(),
+            limits,
+            cancelled,
+            guards,
+            reopens,
+            worker_ended,
+        )?;
+        let reported = &mut report.ecu_reads[at].requests[first..first + count];
+        match end {
+            None => {
+                for request in reported {
+                    for declaration in &mut request.declarations {
+                        declaration.outcome = RequestOutcome::WorkerRefused;
+                    }
+                }
+            }
+            Some(read) => {
+                for (request, outcomes) in reported.iter_mut().zip(read.outcomes) {
+                    for (declaration, outcome) in request.declarations.iter_mut().zip(outcomes) {
+                        declaration.outcome = outcome;
+                    }
+                }
+                decoded.extend(read.decoded);
+                interrupted = read.interrupted;
+            }
+        }
+        first += count;
         if interrupted {
-            report.ecu_reads_interrupted = true;
             break;
         }
     }
-    Ok(())
+    let reported = &mut report.ecu_reads[at];
+    // Every match is reported, not the first by name (ADR-327 item 7).
+    for (hash, document) in &plan.documents {
+        if reported.documents.contains(hash)
+            && variant_matches(&document.variant(), |service| {
+                decoded.get(&(*hash, service)).map(Vec::as_slice)
+            })
+            && !reported.matching.contains(hash)
+        {
+            reported.matching.push(*hash);
+        }
+    }
+    let outcomes = || {
+        reported
+            .requests
+            .iter()
+            .flat_map(|request| &request.declarations)
+            .map(|declaration| &declaration.outcome)
+    };
+    let answered = outcomes().any(|o| {
+        matches!(
+            o,
+            RequestOutcome::Decoded(_) | RequestOutcome::Undecodable | RequestOutcome::Negative(_)
+        )
+    });
+    // The one place that judges a read conclusive: no negative response is definitive until
+    // the IR declares which are, and a positive response that does not decode rules nothing
+    // out (ADR-327 item 3, ADR-401). A variant whose link is refused leaves the definition
+    // inconclusive at every endpoint.
+    let refused_variant = has_refused_variant(plan, &planned.definition);
+    let conclusive = outcomes().next().is_some()
+        && outcomes().all(|o| matches!(o, RequestOutcome::Decoded(_)))
+        && !refused_variant;
+    reported.answered = answered;
+    reported.conclusive = conclusive;
+    Ok(interrupted)
 }
 
 /// Sets each entry's state from the reads of its alternatives (ADR-326 item 3, ADR-327 item 3,
@@ -2479,9 +2939,14 @@ fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
             .filter(|outcomes| !outcomes.is_empty())
             .collect();
         let physically_read = |outcomes: &Vec<&RequestOutcome>| {
-            outcomes
-                .iter()
-                .any(|o| !matches!(o, RequestOutcome::NotRead | RequestOutcome::WorkerRefused))
+            outcomes.iter().any(|o| {
+                !matches!(
+                    o,
+                    RequestOutcome::NotRead
+                        | RequestOutcome::NotInPlay
+                        | RequestOutcome::WorkerRefused
+                )
+            })
         };
         if judged.is_empty() || !judged.iter().all(physically_read) {
             entry.state = EntryState::NotRead;
@@ -2544,6 +3009,7 @@ fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
                             RequestOutcome::LinkRefused
                                 | RequestOutcome::WorkerRefused
                                 | RequestOutcome::NotRead
+                                | RequestOutcome::NotInPlay
                         )
                     });
                 if !answered.is_empty() && answered.iter().all(settled) {
@@ -3457,6 +3923,21 @@ mod tests {
         definitions: &[(&str, &[usize])],
         candidates: &[CandidateEntries<'_>],
     ) -> CheckedPlan {
+        ecu_plan_ruled(selection, documents, definitions, candidates, &[])
+    }
+
+    /// A VIN rule of a model-year component: the candidate's id, the index of the document whose
+    /// service 1 field 1 is the source, the positions compared and the expected text.
+    pub(super) type CandidateVinRule<'a> = (&'a str, usize, u8, u8, &'a str);
+
+    /// [`ecu_plan_of`] with VIN rules for the candidates.
+    pub(super) fn ecu_plan_ruled(
+        selection: Chosen,
+        documents: &[(Sha256, Vec<u8>)],
+        definitions: &[(&str, &[usize])],
+        candidates: &[CandidateEntries<'_>],
+        vin_rules: &[CandidateVinRule<'_>],
+    ) -> CheckedPlan {
         let plan = IdentificationPlan {
             schema_version: PLAN_SCHEMA_VERSION,
             selection,
@@ -3465,7 +3946,22 @@ mod tests {
                 .map(|&(id, entries)| Candidate {
                     id: id.into(),
                     values: Vec::new(),
-                    vin_rules: Vec::new(),
+                    vin_rules: vin_rules
+                        .iter()
+                        .filter(|rule| rule.0 == id)
+                        .map(|&(_, at, start, end, expected)| VinRule {
+                            component: Component::ModelYear,
+                            value: "2020".into(),
+                            start,
+                            end,
+                            expected: expected.into(),
+                            source: Source {
+                                document: documents[at].0,
+                                service: 1,
+                                field: 1,
+                            },
+                        })
+                        .collect(),
                     field_rules: Vec::new(),
                     entries: entries
                         .iter()
@@ -3646,7 +4142,12 @@ mod tests {
         assert!(!report.ecu_reads_interrupted());
         assert_eq!(report.entries().len(), 1);
         assert_eq!(report.entries()[0].state, EntryState::NotRead);
+        assert_eq!(report.remaining(), report.candidates());
+        assert!(report.dropped().is_empty() && report.read_order().is_empty());
         let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["remaining"], serde_json::json!(["c1"]));
+        assert_eq!(json["dropped"], serde_json::json!([]));
+        assert_eq!(json["read_order"], serde_json::json!([]));
         assert_eq!(json["ecu_reads"][0]["requests"][0]["request"], "22f187");
         assert_eq!(
             json["ecu_reads"][0]["requests"][0]["declarations"][0]["outcome"],
@@ -3680,6 +4181,7 @@ mod tests {
             RequestOutcome::Undecodable,
             RequestOutcome::NoUsableAnswer,
             RequestOutcome::WorkerRefused,
+            RequestOutcome::NotInPlay,
         ]
         .into_iter()
         .map(|outcome| DeclarationOutcome {
@@ -3711,6 +4213,40 @@ mod tests {
         assert_eq!(declarations[2]["outcome"], "Undecodable");
         assert_eq!(declarations[3]["outcome"], "NoUsableAnswer");
         assert_eq!(declarations[4]["outcome"], "WorkerRefused");
+        assert_eq!(declarations[5]["outcome"], "NotInPlay");
+        report.dropped.push(DroppedCandidate {
+            candidate: "c1".into(),
+            after: Some("D2".into()),
+            contradictions: vec![
+                Contradiction::UnlistedDefinition {
+                    definition: "D2".into(),
+                    endpoint: endpoint(0x7E0),
+                    ruled_out: vec!["D1".into()],
+                },
+                Contradiction::VinRules {
+                    component: Component::ModelYear,
+                },
+            ],
+        });
+        report.read_order.push(ReadStep {
+            definition: "D1".into(),
+            worst_case: 2,
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["read_order"][0]["worst_case"], 2);
+        assert_eq!(json["dropped"][0]["after"], "D2");
+        assert_eq!(
+            json["dropped"][0]["contradictions"][0]["UnlistedDefinition"]["ruled_out"],
+            serde_json::json!(["D1"])
+        );
+        assert_eq!(
+            json["dropped"][0]["contradictions"][0]["UnlistedDefinition"]["endpoint"]["tx_id"],
+            0x7E0
+        );
+        assert_eq!(
+            json["dropped"][0]["contradictions"][1],
+            serde_json::json!({"VinRules": {"component": "ModelYear"}})
+        );
         assert_eq!(json["ecu_reads"][0]["matching"][0], hex(&doc.0));
         assert_eq!(json["ecu_reads"][0]["answered"], true);
         assert_eq!(
@@ -4009,5 +4545,319 @@ mod tests {
         assert!(debug.contains("Text(<17 bytes>)"));
         let json = serde_json::to_string(&report).unwrap();
         assert!(json.contains(vin));
+    }
+
+    // ------------------------------------------------------ Narrowing and the next ECU (ADR-402)
+
+    fn fact(definition: &str, tx: u32, verdict: Verdict) -> Fact {
+        Fact {
+            definition: definition.into(),
+            endpoint: endpoint(tx),
+            verdict,
+        }
+    }
+
+    fn ids(set: &[&str]) -> Vec<String> {
+        set.iter().map(|id| (*id).to_owned()).collect()
+    }
+
+    fn vin_rule(candidate: &str, component: Component, outcome: VinRuleOutcome) -> VinRuleResult {
+        VinRuleResult {
+            candidate: candidate.into(),
+            component,
+            value: "2020".into(),
+            start: 10,
+            end: 10,
+            outcome,
+        }
+    }
+
+    /// Two candidates whose engines are definitions at one endpoint, and a second ECU only the
+    /// second candidate has.
+    fn two_engines() -> CheckedPlan {
+        let (a, b) = ((0x7E0, 0x7E8), (0x7E1, 0x7E9));
+        let documents = [
+            identified_by(0x87, 11, b"P", "v1", a, |_| {}),
+            identified_by(0x87, 11, b"Q", "v2", a, |_| {}),
+            identified_by(0x87, 11, b"P", "v3", b, |_| {}),
+        ];
+        ecu_plan(
+            &documents,
+            &[("D1", &[0]), ("D2", &[1]), ("D3", &[2])],
+            &[
+                ("c1", &[("engine", false, &["D1"])]),
+                (
+                    "c2",
+                    &[("engine", false, &["D2"]), ("body", false, &["D3"])],
+                ),
+            ],
+        )
+    }
+
+    /// ADR-327 item 3 and ADR-402: an identified definition a candidate lists in no entry
+    /// contradicts it only at an endpoint one of its entries uses and only once every definition
+    /// it lists there is ruled out; a listed definition that matched, an unused endpoint and a
+    /// definition whose read stayed inconclusive contradict nothing; the VIN rules contradict per
+    /// component and only when all of the component's rules are known not to match.
+    #[test]
+    fn a_candidate_is_contradicted_only_by_an_unlisted_identified_definition_at_a_settled_endpoint()
+    {
+        use Verdict::{Identified, RuledOut};
+        let plan = two_engines();
+        let dropped = |facts: &[Fact]| -> Vec<(String, Vec<Contradiction>)> {
+            contradictions(&plan, facts, &[])
+        };
+        // The other candidate's definition identified, own one not read yet: nothing.
+        assert!(dropped(&[fact("D2", 0x7E0, Identified)]).is_empty());
+        // Own definition ruled out there: c1 is contradicted, c2 (which lists D2) is not.
+        assert_eq!(
+            dropped(&[fact("D1", 0x7E0, RuledOut), fact("D2", 0x7E0, Identified)]),
+            [(
+                "c1".to_owned(),
+                vec![Contradiction::UnlistedDefinition {
+                    definition: "D2".into(),
+                    endpoint: endpoint(0x7E0),
+                    ruled_out: ids(&["D1"]),
+                }]
+            )]
+        );
+        // The same, the other way: D1 identified, D2 ruled out contradicts c2.
+        let facts = [fact("D1", 0x7E0, Identified), fact("D2", 0x7E0, RuledOut)];
+        let found = dropped(&facts);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "c2");
+        // Both matched: neither is contradicted.
+        assert!(
+            dropped(&[fact("D1", 0x7E0, Identified), fact("D2", 0x7E0, Identified)]).is_empty()
+        );
+        // An endpoint c1 does not use.
+        assert!(dropped(&[fact("D1", 0x7E0, RuledOut), fact("D3", 0x7E1, Identified)]).is_empty());
+        // A listed definition ruled out at an endpoint nobody identified anything else at.
+        assert!(dropped(&[fact("D3", 0x7E1, RuledOut)]).is_empty());
+        // Ruled out facts alone contradict nothing.
+        assert!(dropped(&[fact("D1", 0x7E0, RuledOut), fact("D2", 0x7E0, RuledOut)]).is_empty());
+
+        // The VIN rules: per component, all not matched.
+        use Component::{ModelYear, Oem};
+        use VinRuleOutcome::{Matched, NotMatched, Unevaluated};
+        let by_vin = |rules: &[VinRuleResult]| contradictions(&plan, &[], rules);
+        assert_eq!(
+            by_vin(&[vin_rule("c1", ModelYear, NotMatched)]),
+            [(
+                "c1".to_owned(),
+                vec![Contradiction::VinRules {
+                    component: ModelYear
+                }]
+            )]
+        );
+        assert!(
+            by_vin(&[
+                vin_rule("c1", ModelYear, NotMatched),
+                vin_rule("c1", ModelYear, Matched)
+            ])
+            .is_empty()
+        );
+        assert!(by_vin(&[vin_rule("c1", ModelYear, Unevaluated)]).is_empty());
+        let found = by_vin(&[
+            vin_rule("c2", ModelYear, Matched),
+            vin_rule("c2", Oem, NotMatched),
+        ]);
+        assert_eq!(
+            found,
+            [(
+                "c2".to_owned(),
+                vec![Contradiction::VinRules { component: Oem }]
+            )]
+        );
+        // A VIN contradiction is listed before the facts'.
+        let both = contradictions(
+            &plan,
+            &[fact("D1", 0x7E0, RuledOut), fact("D2", 0x7E0, Identified)],
+            &[vin_rule("c1", ModelYear, NotMatched)],
+        );
+        assert_eq!(both[0].1.len(), 2);
+        assert!(matches!(both[0].1[0], Contradiction::VinRules { .. }));
+    }
+
+    /// ADR-327 item 4 and ADR-402: the outcomes of a read are the conclusive results per endpoint,
+    /// each judged by the same `contradictions` as the run; a definition with a refused variant
+    /// cannot be ruled out, one with no request has none, and the next definition follows the
+    /// tie-breaks.
+    #[test]
+    fn outcomes_are_the_conclusive_results_per_endpoint() {
+        use Verdict::RuledOut;
+        let plan = two_engines();
+        let all = ids(&["c1", "c2"]);
+        let ruled = [fact("D1", 0x7E0, RuledOut)];
+        assert_eq!(
+            outcome_sets(&plan, &ruled, &[], &all, "D2"),
+            [ids(&["c2"]), ids(&["c1", "c2"])]
+        );
+        // Without that fact no outcome of D2 drops c1.
+        assert_eq!(
+            outcome_sets(&plan, &[], &[], &all, "D2"),
+            [ids(&["c1", "c2"])]
+        );
+        // D3 has one endpoint nobody else uses: nothing drops whatever it shows.
+        assert_eq!(
+            outcome_sets(&plan, &ruled, &[], &all, "D3"),
+            [ids(&["c1", "c2"])]
+        );
+        // A refused variant: only the identified outcome.
+        let (a, b) = ((0x7E0, 0x7E8), (0x7E1, 0x7E9));
+        let documents = [
+            identified_by(0x87, 11, b"P", "v1", a, |_| {}),
+            identified_by(0x87, 11, b"P", "v2", a, |_| {}),
+            identified_by(0x87, 11, b"P", "v3", b, |p| p.extended_addressing = true),
+        ];
+        let refused = ecu_plan(
+            &documents,
+            &[("D1", &[0]), ("D2", &[1, 2])],
+            &[
+                ("c1", &[("engine", false, &["D1"])]),
+                ("c2", &[("engine", false, &["D2"])]),
+            ],
+        );
+        assert_eq!(
+            outcome_sets(&refused, &ruled, &[], &all, "D2"),
+            [ids(&["c2"])]
+        );
+        // No pattern: no request, so no outcome, and the definition is never picked.
+        let bare = named(edited(&documents[0].1, |v| v.patterns = None));
+        let barren = ecu_plan(
+            &[bare, documents[1].clone()],
+            &[("D1", &[0]), ("D2", &[1])],
+            &[
+                ("c1", &[("engine", false, &["D1"])]),
+                ("c2", &[("engine", false, &["D2"])]),
+            ],
+        );
+        assert!(outcome_sets(&barren, &[], &[], &all, "D1").is_empty());
+        let report = barren.report();
+        let picked = next_definition(&barren, &report, &all, &HashSet::new());
+        assert_eq!(picked, Some(("D2".to_owned(), 2)));
+    }
+
+    /// ADR-327 item 4 and ADR-402: among definitions with the same worst case, the one named by
+    /// the most remaining candidates, then the one with the most endpoints that answered presence,
+    /// then the lowest identifier; tried definitions and definitions no remaining candidate names
+    /// are not offered.
+    #[test]
+    fn the_next_definition_follows_the_tie_breaks() {
+        let (a, b) = ((0x7E0, 0x7E8), (0x7E1, 0x7E9));
+        let documents = [
+            identified_by(0x87, 11, b"P", "v1", a, |_| {}),
+            identified_by(0x87, 11, b"P", "v2", b, |_| {}),
+            identified_by(0x87, 11, b"P", "v3", a, |_| {}),
+        ];
+        // Plan order Da, Dc, Db; Db is named by two candidates, Dc and Da by one.
+        let plan = ecu_plan(
+            &documents,
+            &[("Da", &[0]), ("Dc", &[1]), ("Db", &[2])],
+            &[
+                ("c1", &[("x", false, &["Db"]), ("y", false, &["Dc"])]),
+                ("c2", &[("x", false, &["Db"])]),
+                ("c3", &[("x", false, &["Da"])]),
+            ],
+        );
+        let all = ids(&["c1", "c2", "c3"]);
+        let mut report = plan.report();
+        let mut tried = HashSet::new();
+        assert_eq!(
+            next_definition(&plan, &report, &all, &tried),
+            Some(("Db".to_owned(), 3)),
+            "named by two beats the lower identifier and the plan order"
+        );
+        tried.insert("Db".to_owned());
+        assert_eq!(
+            next_definition(&plan, &report, &all, &tried).map(|d| d.0),
+            Some("Da".to_owned()),
+            "the lowest identifier when nothing else separates"
+        );
+        report.presence.push(PresenceAnswer {
+            bus: bus(500_000),
+            rx_id: b.1,
+            bytes: vec![0x7E, 0],
+        });
+        assert_eq!(
+            next_definition(&plan, &report, &all, &tried).map(|d| d.0),
+            Some("Dc".to_owned()),
+            "an endpoint that answered presence beats the lower identifier"
+        );
+        tried.insert("Dc".to_owned());
+        // c3 gone: Da is named by no remaining candidate and is not offered.
+        let left = ids(&["c1", "c2"]);
+        assert_eq!(next_definition(&plan, &report, &left, &tried), None);
+        tried.insert("Da".to_owned());
+        assert_eq!(next_definition(&plan, &report, &all, &tried), None);
+    }
+
+    /// ADR-327 item 3, ADR-402: every definition the candidate lists at the endpoint must be ruled
+    /// out: one ruled out and another inconclusive keep the candidate.
+    #[test]
+    fn a_candidate_is_kept_while_any_definition_it_lists_at_the_endpoint_is_not_ruled_out() {
+        use Verdict::{Identified, RuledOut};
+        let a = (0x7E0, 0x7E8);
+        let documents = [
+            identified_by(0x87, 11, b"Q", "v1", a, |_| {}),
+            identified_by(0x87, 11, b"Q", "v5", a, |_| {}),
+            identified_by(0x87, 11, b"P", "v2", a, |_| {}),
+        ];
+        let plan = ecu_plan(
+            &documents,
+            &[("D1", &[0]), ("D5", &[1]), ("D2", &[2])],
+            &[
+                ("c1", &[("x", false, &["D1", "D5"])]),
+                ("c2", &[("y", false, &["D2"])]),
+            ],
+        );
+        // D5 gave no fact (inconclusive).
+        let facts = [fact("D1", 0x7E0, RuledOut), fact("D2", 0x7E0, Identified)];
+        assert!(contradictions(&plan, &facts, &[]).is_empty());
+        let facts = [
+            fact("D1", 0x7E0, RuledOut),
+            fact("D5", 0x7E0, RuledOut),
+            fact("D2", 0x7E0, Identified),
+        ];
+        let found = contradictions(&plan, &facts, &[]);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].0, "c1");
+    }
+
+    /// `narrow` records a drop once, with the read that completed it, and keeps every candidate of
+    /// a plan whose selection does not narrow.
+    #[test]
+    fn narrow_records_each_drop_once_and_a_manual_plan_drops_nothing() {
+        let plan = two_engines();
+        let mut report = plan.report();
+        assert_eq!(report.remaining(), ["c1", "c2"]);
+        assert!(report.dropped().is_empty() && report.read_order().is_empty());
+        // D1 ruled out, D2 identified at the same endpoint.
+        report.ecu_reads[0].conclusive = true;
+        report.ecu_reads[1].matching = vec![[1; 32]];
+        assert_eq!(narrow(&plan, &mut report, Some("D2")), ["c2"]);
+        assert_eq!(narrow(&plan, &mut report, Some("D3")), ["c2"]);
+        assert_eq!(report.remaining(), ["c2"]);
+        assert_eq!(
+            report.dropped(),
+            [DroppedCandidate {
+                candidate: "c1".into(),
+                after: Some("D2".into()),
+                contradictions: vec![Contradiction::UnlistedDefinition {
+                    definition: "D2".into(),
+                    endpoint: endpoint(0x7E0),
+                    ruled_out: ids(&["D1"]),
+                }],
+            }]
+        );
+        let mut manual = two_engines();
+        manual.selection = Chosen::ChosenDefinition;
+        let mut report = manual.report();
+        report.ecu_reads[0].conclusive = true;
+        report.ecu_reads[1].matching = vec![[1; 32]];
+        assert_eq!(narrow(&manual, &mut report, None), ["c1", "c2"]);
+        assert!(report.dropped().is_empty());
+        assert!(in_play(&manual, &[], "D1"));
+        assert!(!in_play(&plan, &ids(&["c1"]), "D2"));
     }
 }

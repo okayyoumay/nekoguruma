@@ -17,8 +17,8 @@ use vci_service_interface::{
 use worker_host::client::WorkerClient;
 
 use super::tests::{
-    checked, checked_vin, checked_vin_reading, document, document_reading, ecu_plan, ecu_plan_of,
-    edited, identified_by, named,
+    CandidateEntries, checked, checked_vin, checked_vin_reading, document, document_reading,
+    ecu_plan, ecu_plan_of, ecu_plan_ruled, edited, identified_by, named,
 };
 use super::*;
 use crate::comm_log::{CommLogSetup, VciFacts};
@@ -2528,10 +2528,11 @@ async fn a_manual_plan_reads_every_definition() {
     ));
 }
 
-/// ADR-327 item 8 and ADR-401: a plan for every ECU has no entries and identifies each definition
-/// on its own, in the plan's order.
+/// ADR-327 items 4 and 8: a plan for every ECU has no entries and identifies each definition on
+/// its own, in the order of item 4 (here the lowest identifier first, since nothing else
+/// separates them), while `ecu_reads` stays in plan order (ADR-402).
 #[tokio::test(flavor = "multi_thread")]
-async fn a_plan_for_every_ecu_identifies_each_definition_in_plan_order() {
+async fn a_plan_for_every_ecu_reads_each_definition_in_the_item_4_order() {
     let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
     let plan = ecu_plan(&documents, &[("D2", &[1]), ("D1", &[0])], &[]);
     let fake = fake_ecus(&[
@@ -2544,7 +2545,7 @@ async fn a_plan_for_every_ecu_identifies_each_definition_in_plan_order() {
     assert!(report.entries().is_empty());
     assert_eq!(
         served(&fake).iter().map(|(tx, _)| *tx).collect::<Vec<_>>(),
-        [B.0, A.0]
+        [A.0, B.0]
     );
     let definitions: Vec<_> = report
         .ecu_reads()
@@ -2552,6 +2553,7 @@ async fn a_plan_for_every_ecu_identifies_each_definition_in_plan_order() {
         .map(|r| r.definition.as_str())
         .collect();
     assert_eq!(definitions, ["D2", "D1"]);
+    assert_eq!(read_order(report), [("D1", 0), ("D2", 0)]);
     assert!(
         report
             .ecu_reads()
@@ -2949,4 +2951,641 @@ async fn guards_marked_by_the_last_presence_close_end_the_run_before_an_ecu_read
     let fake = fake_ref.lock().unwrap().take().unwrap();
     assert_eq!(fake.count("ModuleConnect"), 1, "the presence link only");
     assert!(fake.state().served.is_empty());
+}
+
+// ------------------------------------------- Narrowing and the next ECU (ADR-402, ADR-327)
+
+/// The candidates dropped, each with the definition whose read completed it.
+fn dropped(report: &IdentificationReport) -> Vec<(&str, Option<&str>)> {
+    report
+        .dropped()
+        .iter()
+        .map(|d| (d.candidate.as_str(), d.after.as_deref()))
+        .collect()
+}
+
+/// The definitions in the order read, with the worst case that chose each.
+fn read_order(report: &IdentificationReport) -> Vec<(&str, usize)> {
+    report
+        .read_order()
+        .iter()
+        .map(|step| (step.definition.as_str(), step.worst_case))
+        .collect()
+}
+
+const F187: &[u8] = &[0x22, 0xF1, 0x87];
+const F189: &[u8] = &[0x22, 0xF1, 0x89];
+
+/// A document on `endpoint` whose variant `name` reads the software version (F189) and expects
+/// one starting with `expected`.
+fn sw_reader(name: &str, expected: &[u8], endpoint: (u32, u32)) -> (Sha256, Vec<u8>) {
+    identified_by(0x89, 5, expected, name, endpoint, |_| {})
+}
+
+/// Two candidates whose engines are the definitions D1 and D2 at one endpoint, which reads the
+/// part number for D1 and the software version for D2.
+fn two_engines_at_a(d1: (Sha256, Vec<u8>)) -> CheckedPlan {
+    let documents = [d1, sw_reader("v2", b"SW", A)];
+    ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[
+            ("c1", &[("engine", false, &["D1"])]),
+            ("c2", &[("engine", false, &["D2"])]),
+        ],
+    )
+}
+
+fn a_key(report: &IdentificationReport) -> EndpointKey {
+    report.endpoints()[0].key.clone()
+}
+
+/// ADR-327 items 3 and 5, ADR-402: a read that identifies a definition no candidate lists at an
+/// endpoint drops the candidate whose own definition there was read conclusively without a match;
+/// the reads go in the tie-break order and the report says why and after which read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identified_unlisted_definition_drops_the_candidate_whose_own_definition_was_ruled_out()
+{
+    let plan = two_engines_at_a(part_reader("v1", b"Q", A));
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake), [(A.0, F187.to_vec()), (A.0, F189.to_vec())]);
+    assert_eq!(read_order(report), [("D1", 2), ("D2", 2)]);
+    assert_eq!(report.candidates(), ["c1", "c2"]);
+    assert_eq!(report.remaining(), ["c2"]);
+    assert_eq!(dropped(report), [("c1", Some("D2"))]);
+    assert_eq!(
+        report.dropped()[0].contradictions,
+        [Contradiction::UnlistedDefinition {
+            definition: "D2".into(),
+            endpoint: a_key(report),
+            ruled_out: vec!["D1".into()],
+        }]
+    );
+    assert_eq!(
+        report.entries()[0].state,
+        EntryState::UnrecognizedVariant {
+            endpoints: vec![a_key(report)]
+        },
+        "a dropped candidate's entry is judged from the same reads"
+    );
+    assert!(matches!(
+        &report.entries()[1].state,
+        EntryState::Identified { definition, .. } if definition == "D2"
+    ));
+}
+
+/// ADR-327 item 3, ADR-402: a candidate whose own definition at the endpoint stayed inconclusive
+/// (the ECU refused the request) is kept.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_candidate_whose_own_definition_is_inconclusive_at_the_endpoint_is_kept() {
+    // The simulated ECU has no data identifier F1A0 and answers a request-out-of-range code.
+    let plan = two_engines_at_a(identified_by(0xA0, 4, b"P", "v1", A, |_| {}));
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&RequestOutcome::Negative(0x31)]);
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+    assert_eq!(report.entries()[0].state, EntryState::AnsweredNotIdentified);
+    assert!(matches!(
+        &report.entries()[1].state,
+        EntryState::Identified { .. }
+    ));
+}
+
+/// ADR-327 item 3, ADR-402: two candidates whose definitions both match are both kept, whether
+/// they list one definition each or one lists both.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_candidates_whose_definitions_both_match_are_both_kept() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"PA", A)];
+    let definitions: &[(&str, &[usize])] = &[("D1", &[0]), ("D2", &[1])];
+    let plan = ecu_plan(
+        &documents,
+        definitions,
+        &[
+            ("c1", &[("engine", false, &["D1"])]),
+            ("c2", &[("engine", false, &["D2"])]),
+        ],
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+    assert!(
+        report
+            .entries()
+            .iter()
+            .all(|e| matches!(e.state, EntryState::Identified { .. }))
+    );
+    // The same with one candidate listing both: ambiguous for it, identified for the other.
+    let plan = ecu_plan(
+        &documents,
+        definitions,
+        &[
+            ("c1", &[("engine", false, &["D1", "D2"])]),
+            ("c2", &[("engine", false, &["D2"])]),
+        ],
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+    assert!(matches!(
+        &report.entries()[0].state,
+        EntryState::Ambiguous { definitions } if definitions == &["D1", "D2"]
+    ));
+    assert!(matches!(
+        &report.entries()[1].state,
+        EntryState::Identified { .. }
+    ));
+}
+
+/// ADR-327 item 3, ADR-402: an ECU identified at an address no entry of a candidate uses drops
+/// nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unlisted_definition_at_an_address_no_entry_uses_drops_nothing() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v3", b"P", B)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D3", &[1])],
+        &[
+            ("c1", &[("engine", false, &["D1"])]),
+            (
+                "c2",
+                &[("engine", false, &["D1"]), ("body", false, &["D3"])],
+            ),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake).len(), 2);
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+    assert_eq!(read_order(report), [("D1", 2), ("D3", 2)]);
+}
+
+/// ADR-327 item 4, ADR-402: the order is named by the most remaining candidates, then the most
+/// endpoints that answered presence, then the lowest identifier; the plan's order does not count.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_read_order_follows_the_tie_breaks_not_the_plan() {
+    let documents = [
+        part_reader("va", b"Q", A),
+        part_reader("vc", b"P", B),
+        part_reader("vb", b"P", A),
+    ];
+    // Plan order Da, Dc, Db. Db is named by two candidates, Dc and Da by one each.
+    let plan = ecu_plan(
+        &documents,
+        &[("Da", &[0]), ("Dc", &[1]), ("Db", &[2])],
+        &[
+            ("c1", &[("x", false, &["Db"]), ("y", false, &["Dc"])]),
+            ("c2", &[("x", false, &["Db"])]),
+            ("c3", &[("x", false, &["Da"])]),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    // The presence request: only the ECU at B answers it.
+    fake.state().scripts = VecDeque::from([vec![Item::Answer(B.1, POSITIVE), Item::Finish]]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(read_order(report), [("Db", 3), ("Dc", 3), ("Da", 3)]);
+    assert_eq!(
+        served(&fake).iter().map(|(tx, _)| *tx).collect::<Vec<_>>(),
+        [A.0, B.0, A.0]
+    );
+    // Da, read last, is ruled out where Db was identified: c3, which lists only Da, is dropped.
+    assert_eq!(dropped(report), [("c3", Some("Da"))]);
+    let planned: Vec<_> = report
+        .ecu_reads()
+        .iter()
+        .map(|r| r.definition.as_str())
+        .collect();
+    assert_eq!(planned, ["Da", "Dc", "Db"], "ecu_reads stays in plan order");
+}
+
+/// ADR-327 item 8, ADR-402: a plan for a definition chosen by hand whose definition a read
+/// contradicts still reads every definition and drops nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_plan_whose_definition_a_read_contradicts_reads_every_definition() {
+    let documents = [part_reader("v1", b"Q", A), sw_reader("v2", b"SW", A)];
+    let plan = ecu_plan_of(
+        Selection::ChosenDefinition,
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", false, &["D1"])])],
+    );
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake).len(), 2);
+    assert_eq!(report.remaining(), ["c1"]);
+    assert!(report.dropped().is_empty());
+    assert_eq!(read_order(report), [("D1", 1), ("D2", 1)]);
+    assert!(report.ecu_reads()[1].matching.len() == 1);
+    assert!(matches!(
+        &report.entries()[0].state,
+        EntryState::UnrecognizedVariant { .. }
+    ));
+}
+
+/// ADR-327 item 4, ADR-402: a definition no remaining candidate names is not read: its
+/// declarations are not in play, no link opens for it, and an entry that lists it is not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_no_remaining_candidate_names_is_not_read() {
+    let documents = [
+        part_reader("v1", b"Q", A),
+        part_reader("v2", b"P", A),
+        part_reader("v3", b"P", B),
+        part_reader("v4", b"P", C),
+    ];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1]), ("D3", &[2]), ("D4", &[3])],
+        &[
+            ("c1", &[("x", false, &["D1"]), ("y", false, &["D4"])]),
+            ("c2", &[("x", false, &["D2"]), ("y", false, &["D3"])]),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(dropped(report), [("c1", Some("D2"))]);
+    assert_eq!(read_order(report), [("D1", 2), ("D2", 2), ("D3", 1)]);
+    assert_eq!(declarations(report, 3), [&RequestOutcome::NotInPlay]);
+    assert_eq!(
+        fake.count("ModuleConnect"),
+        4,
+        "the presence link and the three reads; none to C"
+    );
+    assert!(matches!(&report.entries()[1].state, EntryState::NotRead));
+    assert!(matches!(
+        &report.entries()[0].state,
+        EntryState::UnrecognizedVariant { .. }
+    ));
+    assert!(matches!(
+        &report.entries()[3].state,
+        EntryState::Identified { .. }
+    ));
+}
+
+/// ADR-327 items 3 and 5, ADR-402: a fact of a definition that has left play still counts, and the
+/// loop ends when no candidate remains.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_fact_of_a_definition_that_left_play_still_counts_and_the_loop_ends_with_no_candidate() {
+    // A is a model of Da, B of Db: a vehicle that mixes two candidates.
+    let documents = [
+        part_reader("va", b"P", A),
+        part_reader("vb", b"P", B),
+        part_reader("vc", b"Q", A),
+        part_reader("vd", b"Q", B),
+    ];
+    let plan = ecu_plan(
+        &documents,
+        &[("Da", &[0]), ("Db", &[1]), ("Dc", &[2]), ("Dd", &[3])],
+        &[
+            ("c1", &[("x", false, &["Dc"]), ("y", false, &["Db"])]),
+            ("c2", &[("x", false, &["Da"]), ("y", false, &["Dd"])]),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(
+        read_order(report),
+        [("Da", 2), ("Db", 2), ("Dc", 2), ("Dd", 1)]
+    );
+    assert_eq!(dropped(report), [("c1", Some("Dc")), ("c2", Some("Dd"))]);
+    assert_eq!(
+        report.dropped()[1].contradictions,
+        [Contradiction::UnlistedDefinition {
+            definition: "Db".into(),
+            endpoint: EndpointKey {
+                tx_id: B.0,
+                rx_id: B.1,
+                ..a_key(report)
+            },
+            ruled_out: vec!["Dd".into()],
+        }]
+    );
+    assert!(report.remaining().is_empty());
+}
+
+/// ADR-327 item 5, ADR-392, ADR-402: an endpoint nothing answers does not skip the other
+/// definition that uses it: each is tried after its own read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_endpoint_does_not_skip_the_other_definition_using_it() {
+    let documents = [part_reader("v1", b"P", C), part_reader("v2", b"P", C)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[
+            ("c1", &[("engine", false, &["D1"])]),
+            ("c2", &[("engine", false, &["D2"])]),
+        ],
+    );
+    let ran = run(plan, Fake::default()).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&RequestOutcome::NoUsableAnswer]);
+    assert_eq!(declarations(report, 1), [&RequestOutcome::NoUsableAnswer]);
+    assert_eq!(read_order(report), [("D1", 2), ("D2", 2)]);
+    assert!(report.dropped().is_empty());
+    assert!(
+        report
+            .entries()
+            .iter()
+            .all(|e| e.state == EntryState::NotAnswering)
+    );
+}
+
+/// ADR-401 item 6, ADR-402: an interruption after a drop keeps the drop and what remained, leaves
+/// the definition it ended in and the ones still in play not read, the definitions no remaining
+/// candidate names not in play, and every entry not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interruption_keeps_the_candidates_dropped_so_far() {
+    let documents = [
+        part_reader("v1", b"Q", A),
+        part_reader("v2", b"P", A),
+        part_reader("v3", b"P", B),
+        part_reader("v4", b"P", B),
+    ];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1]), ("D3", &[2]), ("D4", &[3])],
+        &[
+            (
+                "c1",
+                &[("engine", false, &["D1"]), ("extra", false, &["D4"])],
+            ),
+            (
+                "c2",
+                &[("engine", false, &["D2"]), ("body", false, &["D3"])],
+            ),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    // The presence request and the first two reads, then the VCI is lost in the third read.
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Finish],
+        vec![Item::Routed],
+        vec![Item::Routed],
+        vec![Item::VciLost],
+    ]);
+    let limits = JobLimits {
+        max_link_reopens: 0,
+        ..limits()
+    };
+    let ran = run_with(plan, fake, limits, false).await;
+    let report = ran.report();
+    assert!(report.ecu_reads_interrupted());
+    assert_eq!(dropped(report), [("c1", Some("D2"))]);
+    assert_eq!(report.remaining(), ["c2"]);
+    assert_eq!(read_order(report).len(), 3);
+    assert_eq!(declarations(report, 2), [&RequestOutcome::NotRead]);
+    assert_eq!(declarations(report, 3), [&RequestOutcome::NotInPlay]);
+    assert!(
+        report
+            .entries()
+            .iter()
+            .all(|e| e.state == EntryState::NotRead)
+    );
+}
+
+/// ADR-327 item 3, ADR-399 item 6, ADR-402: a candidate none of whose VIN rules for a component
+/// matched the established VIN is dropped before any ECU read, and the definitions only it names
+/// are not in play; a rule that matched, an unevaluated rule and a manual plan keep the
+/// candidate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vin_rule_that_does_not_match_drops_the_candidate_before_the_ecu_reads() {
+    // The definitions read F190, the data identifier the simulated ECUs give their VIN in, and
+    // expect a VIN starting with "W"; the first document is also the VIN rules' source. The VIN's
+    // tenth character is "3".
+    let documents = [
+        identified_by(0x90, 17, b"W", "v1", A, |_| {}),
+        identified_by(0x90, 17, b"W", "v2", B, |_| {}),
+    ];
+    let definitions: &[(&str, &[usize])] = &[("D1", &[0]), ("D2", &[1])];
+    let engines: &[CandidateEntries<'_>] = &[
+        ("c1", &[("engine", false, &["D1"])]),
+        ("c2", &[("engine", false, &["D2"])]),
+    ];
+    let f190 = vec![0x22, 0xF1, 0x90];
+    let ecus = |ecus: &[u32]| {
+        let fake = Fake::default();
+        for &tx in ecus {
+            fake.state().ecus.insert(
+                tx,
+                sim_ecu::SimEcu::new(sim_ecu::EcuConfig {
+                    vin: VIN_A.to_owned(),
+                    ..Default::default()
+                }),
+            );
+        }
+        fake
+    };
+    let plan = ecu_plan_ruled(
+        Selection::Candidates,
+        &documents,
+        definitions,
+        engines,
+        &[("c1", 0, 10, 10, "L"), ("c2", 0, 10, 10, "3")],
+    );
+    let fake = ecus(&[A.0, B.0]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.vin(), Some(&vin(VIN_A)));
+    assert_eq!(dropped(report), [("c1", None)]);
+    assert_eq!(
+        report.dropped()[0].contradictions,
+        [Contradiction::VinRules {
+            component: Component::ModelYear
+        }]
+    );
+    assert_eq!(report.remaining(), ["c2"]);
+    assert_eq!(read_order(report), [("D2", 1)]);
+    assert_eq!(declarations(report, 0), [&RequestOutcome::NotInPlay]);
+    assert_eq!(
+        served(&fake),
+        [(A.0, f190.clone()), (B.0, f190.clone())],
+        "the VIN read, then D2's; D1 was not read"
+    );
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+    assert!(matches!(
+        &report.entries()[1].state,
+        EntryState::Identified { .. }
+    ));
+
+    // A manual plan keeps its candidate and reads the definition.
+    let manual = ecu_plan_ruled(
+        Selection::ChosenDefinition,
+        &documents,
+        definitions,
+        &engines[..1],
+        &[("c1", 0, 10, 10, "L")],
+    );
+    let ran = run(manual, ecus(&[A.0, B.0])).await;
+    let report = ran.report();
+    assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::NotMatched);
+    assert_eq!(report.remaining(), ["c1"]);
+    assert!(report.dropped().is_empty());
+    assert!(matches!(
+        &report.entries()[0].state,
+        EntryState::Identified { .. }
+    ));
+
+    // Per component, not per rule: one rule of the component matched.
+    let one_matched = ecu_plan_ruled(
+        Selection::Candidates,
+        &documents,
+        definitions,
+        engines,
+        &[("c1", 0, 10, 10, "L"), ("c1", 0, 10, 10, "3")],
+    );
+    let ran = run(one_matched, ecus(&[A.0, B.0])).await;
+    let report = ran.report();
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+
+    // No VIN established (nothing answers the VIN read): the rule stays unevaluated and keeps its
+    // candidate.
+    let unevaluated = ecu_plan_ruled(
+        Selection::Candidates,
+        &documents,
+        definitions,
+        engines,
+        &[("c1", 0, 10, 10, "L")],
+    );
+    let ran = run(unevaluated, ecus(&[B.0])).await;
+    let report = ran.report();
+    assert_eq!(report.vin(), None);
+    assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::Unevaluated);
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+}
+
+/// ADR-401 item 4, ADR-327 item 3, ADR-402: a definition of the candidate whose only variant has
+/// a refused link is listed at every endpoint the candidate uses and is never ruled out, so an
+/// identified unlisted definition does not drop the candidate.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_link_definition_keeps_its_candidate() {
+    let refused = identified_by(0x87, 11, b"P", "v9", B, |p| p.extended_addressing = true);
+    let documents = [
+        part_reader("v1", b"Q", A),
+        sw_reader("v2", b"SW", A),
+        refused,
+    ];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1]), ("D9", &[2])],
+        &[
+            ("c1", &[("engine", false, &["D1", "D9"])]),
+            ("c2", &[("engine", false, &["D2"])]),
+        ],
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(
+        read_order(report).iter().map(|s| s.0).collect::<Vec<_>>(),
+        ["D1", "D2"]
+    );
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty());
+    assert_eq!(report.entries()[0].state, EntryState::AnsweredNotIdentified);
+}
+
+/// ADR-327 item 4, ADR-402: a definition that can never be conclusive has only the identified
+/// outcome, which can drop a candidate, so its worst case is lower and it is read before a
+/// definition that cannot drop anything.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_worst_case_can_decide_the_read_order() {
+    let refused = identified_by(0x87, 11, b"P", "vz2", C, |p| p.extended_addressing = true);
+    let documents = [
+        part_reader("v1", b"Q", A),
+        part_reader("vz", b"P", A),
+        refused,
+        part_reader("vb", b"P", B),
+    ];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("Dz", &[1, 2]), ("Db", &[3])],
+        &[
+            ("c1", &[("engine", false, &["D1"])]),
+            (
+                "c2",
+                &[("engine", false, &["Dz"]), ("body", false, &["Db"])],
+            ),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake).await;
+    let report = ran.report();
+    assert_eq!(read_order(report), [("D1", 2), ("Dz", 1), ("Db", 1)]);
+    assert_eq!(dropped(report), [("c1", Some("Dz"))]);
+}
+
+/// ADR-402: a match from a partly read definition counts as a fact when the bounds run out, so the
+/// drop it completes is kept and the definitions only the dropped candidate names are not in play.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interruption_narrows_on_the_part_read() {
+    let documents = [
+        part_reader("v1", b"Q", A),
+        part_reader("v2a", b"P", A),
+        part_reader("v2b", b"P", B),
+        part_reader("v9", b"P", C),
+    ];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1, 2]), ("D9", &[3])],
+        &[
+            ("c1", &[("x", false, &["D1"]), ("w", false, &["D9"])]),
+            ("c2", &[("x", false, &["D2"])]),
+        ],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    // The presence request, D1, D2 at A, then the VCI is lost in D2 at B.
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Finish],
+        vec![Item::Routed],
+        vec![Item::Routed],
+        vec![Item::VciLost],
+    ]);
+    let limits = JobLimits {
+        max_link_reopens: 0,
+        ..limits()
+    };
+    let ran = run_with(plan, fake, limits, false).await;
+    let report = ran.report();
+    assert!(report.ecu_reads_interrupted());
+    assert_eq!(dropped(report), [("c1", Some("D2"))]);
+    assert_eq!(report.remaining(), ["c2"]);
+    assert_eq!(declarations(report, 2), [&RequestOutcome::NotRead]);
+    assert_eq!(declarations(report, 3), [&RequestOutcome::NotInPlay]);
+    assert!(
+        report
+            .entries()
+            .iter()
+            .all(|e| e.state == EntryState::NotRead)
+    );
 }

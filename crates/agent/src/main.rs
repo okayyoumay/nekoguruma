@@ -37,7 +37,8 @@ final VM state as JSON on stdout. The job takes its link from the protocol the v
 declares.
 
 identify: runs an identification plan's functional presence requests on the VCI, then reads the
-VIN its VIN rules name, then reads each ECU definition the plan names, and prints the report as
+VIN its VIN rules name, then reads the ECU definitions the plan names that a remaining candidate
+lists, and prints the report, with the remaining candidates and why the others were dropped, as
 JSON on stdout. The plan names the documents it reads by hash; give each as --document (a
 document the plan does not name is ignored with a warning). It sends only the presence request
 and read-only requests, and takes the VCI lock, then the lock of the vehicle whose VIN it

@@ -1,6 +1,6 @@
 use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document};
 use diag_ir::hmi::{self, HmiForm, HmiValue, decode_form};
-use diag_ir::{DiagHost, RuntimeInput, StepError, StepOutcome, Vm, VmError, WaitingOn};
+use diag_ir::{DiagHost, RuntimeInput, StepError, StepOutcome, Value, Vm, VmError, WaitingOn};
 
 use super::*;
 use crate::profile::{Intent, Profile};
@@ -2206,14 +2206,201 @@ fn security_access_sends_the_seed_request_the_key_step_and_the_key() {
             "log 1 key response"
         ]
     );
-    // The highest level, and a seed response with no seed bytes after the level, or none at all:
-    // the host is handed what there is.
-    let mut host = security_access_host(&[&[0x67, 0x7D], &[0x67, 0x7E]], &[&[0x01]]);
+    // The highest level: its key is sent with 0x7E.
+    let mut host = security_access_host(&[&[0x67, 0x7D, 0x01], &[0x67, 0x7E]], &[&[0x01]]);
     run_on("def main():\n    diag.security_access(0x7D)\n", &mut host);
-    assert_eq!(host.calls, ["request 27 7D", "key 7D ", "request 27 7E01"]);
-    let mut host = security_access_host(&[&[0x67], &[0x67, 0x02]], &[&[0x01]]);
-    run_on("def main():\n    diag.security_access(1)\n", &mut host);
-    assert_eq!(host.calls, ["request 27 01", "key 01 ", "request 27 0201"]);
+    assert_eq!(
+        host.calls,
+        ["request 27 7D", "key 7D 01", "request 27 7E01"]
+    );
+}
+
+/// Runs `source` against `host` until the procedure fails itself, and returns the failure.
+fn run_on_until_failed(source: &str, host: &mut ScriptedHost) -> (String, String) {
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    let mut vm = Vm::new(&program);
+    for _ in 0..10_000 {
+        match vm.step(&program, host) {
+            Ok(StepOutcome::Continue) => {}
+            Ok(StepOutcome::Failed(failure)) => {
+                let detail = String::from_utf8_lossy(&failure.detail).into_owned();
+                return (failure.code, detail);
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+    panic!("the procedure did not end")
+}
+
+/// A seed response with no seed bytes after the level, or shorter than that, is not a zero seed
+/// and not a seed: the procedure ends, naming the empty seed, and no key is asked for or sent
+/// (ADR-405 item 3).
+#[test]
+fn an_empty_seed_ends_the_run_naming_the_empty_seed() {
+    for response in [&[0x67_u8, 0x01][..], &[0x67], &[]] {
+        let mut host = security_access_host(&[response], &[]);
+        let (code, detail) = run_on_until_failed(SECURITY_ACCESS, &mut host);
+        assert_eq!(code, "SEED_EMPTY", "{response:02X?}");
+        assert!(detail.contains("no seed bytes"), "{detail}");
+        assert_eq!(host.calls, ["request 27 01"], "{response:02X?}");
+    }
+}
+
+/// A seed of zero is the server's answer for a level that is already unlocked (ISO 14229-1
+/// (2026) 9.4.1): the call ends there, with the seed response as its value.
+#[test]
+fn a_zero_seed_ends_security_access_as_unlocked_without_a_key() {
+    let source = "\
+def main():
+    res = diag.security_access(0x01)
+    if res[\"ok\"]:
+        diag.log(1, \"ok\")
+    if res[\"nrc\"] == 0:
+        diag.log(1, \"no nrc\")
+    if res[\"raw\"][1] == 0x01:
+        diag.log(1, \"was unlocked\")
+    if res[\"raw\"] == b\"\\x67\\x02\":
+        diag.log(1, \"key response\")
+";
+    // No key is scripted: asking for one would panic.
+    for seed in [&[0x67_u8, 0x01, 0, 0, 0, 0][..], &[0x67, 0x01, 0]] {
+        let mut host = security_access_host(&[seed], &[]);
+        run_on(source, &mut host);
+        assert_eq!(
+            host.calls,
+            [
+                "request 27 01",
+                "log 1 ok",
+                "log 1 no nrc",
+                "log 1 was unlocked"
+            ],
+            "{seed:02X?}"
+        );
+    }
+    // The result is a positive one, so a procedure that tests `ok` takes its unlocked branch.
+    let mut host = security_access_host(&[&[0x67, 0x01, 0, 0]], &[]);
+    run_on(SECURITY_ACCESS, &mut host);
+    assert_eq!(host.calls, ["request 27 01", "log 1 unlocked"]);
+    // The last standard seed level just below the supplier-specific range (9.4.2.2).
+    let mut host = security_access_host(&[&[0x67, 0x5F, 0]], &[]);
+    run_on("def main():\n    diag.security_access(0x5F)\n", &mut host);
+    assert_eq!(host.calls, ["request 27 5F"]);
+}
+
+/// On the supplier-specific levels (0x61 to 0x7D) the standard defines no seed and key pairing,
+/// so the key step runs whatever the seed, a zero or an empty one included (ADR-405).
+#[test]
+fn the_supplier_specific_levels_send_the_key_whatever_the_seed() {
+    for (level, seed, shown) in [
+        (0x61_u8, &[0_u8, 0][..], "0000"),
+        (0x7D, &[0, 0], "0000"),
+        (0x7D, &[], ""),
+    ] {
+        let mut response = vec![0x67, level];
+        response.extend_from_slice(seed);
+        let next = [0x67, level + 1];
+        let mut host = security_access_host(&[&response, &next], &[&[0x01]]);
+        run_on(
+            &format!("def main():\n    diag.security_access({level})\n"),
+            &mut host,
+        );
+        assert_eq!(
+            host.calls,
+            [
+                format!("request 27 {level:02X}"),
+                format!("key {level:02X} {shown}"),
+                format!("request 27 {:02X}01", level + 1)
+            ],
+            "{level:02X} {seed:02X?}"
+        );
+    }
+}
+
+/// The call's slots hold no seed bytes once it has ended, on the zero path and on the key path
+/// (ADR-347, design 8.11): the VM state and its journaled checkpoints would otherwise carry them.
+#[test]
+fn security_access_leaves_no_seed_or_response_bytes_in_the_vm_state() {
+    let source = "def main():\n    diag.security_access(0x01)\n";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    for (responses, keys) in [
+        (vec![vec![0x67, 0x01, 0, 0]], vec![]),
+        (
+            vec![vec![0x67, 0x01, 0xAA, 0xBB], vec![0x67, 0x02]],
+            vec![vec![0x12]],
+        ),
+    ] {
+        let mut host = ScriptedHost {
+            responses: responses.into(),
+            keys: keys.into(),
+            ..ScriptedHost::default()
+        };
+        let mut vm = Vm::new(&program);
+        loop {
+            match vm.step(&program, &mut host) {
+                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Finished) => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        let held: Vec<_> = vm
+            .state
+            .locals
+            .iter()
+            .flatten()
+            .filter(|value| matches!(value, Value::Bytes(_)))
+            .collect();
+        assert!(held.is_empty(), "{held:?}");
+    }
+}
+
+/// Only an all-zero seed is read as unlocked: a non-zero byte anywhere sends the key.
+#[test]
+fn a_seed_with_any_non_zero_byte_still_sends_the_key() {
+    for (seed, shown) in [
+        (&[0x67_u8, 0x01, 0, 0, 1][..], "000001"),
+        (&[0x67, 0x01, 1, 0], "0100"),
+        (&[0x67, 0x01, 0, 1, 0], "000100"),
+        (&[0x67, 0x01, 0xFF], "FF"),
+    ] {
+        let mut host = security_access_host(&[seed, &[0x67, 0x02]], &[&[0x9A]]);
+        run_on("def main():\n    diag.security_access(1)\n", &mut host);
+        assert_eq!(
+            host.calls,
+            [
+                "request 27 01".to_owned(),
+                format!("key 01 {shown}"),
+                "request 27 029A".to_owned()
+            ],
+            "{seed:02X?}"
+        );
+    }
+}
+
+/// A call that finds the level unlocked starts the next pass from a clean state.
+#[test]
+fn a_repeated_security_access_after_an_unlock_ends_at_the_zero_seed() {
+    let mut host = security_access_host(
+        &[&[0x67, 0x01, 0x11], &[0x67, 0x02], &[0x67, 0x01, 0, 0]],
+        &[&[0xA1]],
+    );
+    let source = "\
+def main():
+    for i in range(2):
+        res = diag.security_access(0x01)
+        diag.log(1, \"done\")
+";
+    run_on(source, &mut host);
+    assert_eq!(
+        host.calls,
+        [
+            "request 27 01",
+            "key 01 11",
+            "request 27 02A1",
+            "log 1 done",
+            "request 27 01",
+            "log 1 done"
+        ]
+    );
 }
 
 #[test]

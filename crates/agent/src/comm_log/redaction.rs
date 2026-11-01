@@ -144,9 +144,8 @@ enum SecurityLevel {
 impl SecurityLevel {
     fn of(level: u8) -> Self {
         match level {
-            0x01..=0x41 if level & 1 == 1 => Self::Seed,
+            _ if diag_ir::is_standard_seed_level(level) => Self::Seed,
             0x02..=0x42 if level & 1 == 0 => Self::Key,
-            0x5F => Self::Seed,
             0x60 => Self::Key,
             _ => Self::Other,
         }

@@ -524,7 +524,9 @@ fn a_declared_security_access_service_still_answers_the_profiles_requests() {
         &Script::new().key(vec![0xAA]),
     );
     assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
-    for index in [0, 2] {
+    // The seed request's built answer carries a seed that is not zero (ADR-405); the send-key
+    // request's is the declaration's own.
+    for (index, expected) in [(0, &[0x67, 1, 1, 2, 3, 4][..]), (2, &[0x67][..])] {
         let DryRunEvent::Request {
             service,
             built,
@@ -536,7 +538,7 @@ fn a_declared_security_access_service_still_answers_the_profiles_requests() {
             panic!("{report:?}");
         };
         assert_eq!((service.as_str(), *built), ("sec", true));
-        assert_eq!(answer, &[0x67]);
+        assert_eq!(answer, expected);
         assert!(decoded.is_some());
     }
 }
@@ -1184,4 +1186,15 @@ fn a_run_on_the_built_defaults_reads_every_input() {
     assert_eq!(report.steps, steps);
     // The run ended on the instruction after the last (the pc of the finish).
     assert_eq!(u64::from(report.pc), steps);
+}
+
+#[test]
+fn a_built_seed_is_never_zero_and_has_the_declared_length() {
+    assert_eq!(built_seed_response(0x67, 0x01, None), [0x67, 1, 1, 2, 3, 4]);
+    assert_eq!(built_seed_response(0x67, 0x01, Some(2)), [0x67, 1, 1, 2]);
+    // Longer than the built seed: it repeats.
+    assert_eq!(
+        built_seed_response(0x67, 0x03, Some(6)),
+        [0x67, 3, 1, 2, 3, 4, 1, 2]
+    );
 }

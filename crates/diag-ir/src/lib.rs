@@ -65,6 +65,15 @@ pub const IR_SCHEMA_VERSION: u32 = 20;
 /// steps on a vehicle that answers the same way.
 pub const DEFAULT_MAX_STEPS: u64 = 1_000_000;
 
+/// Whether `level` (a SecurityAccess sub-function without the suppress bit) is a seed level of
+/// the standard's requestSeed and sendKey pairing: odd from 0x01 to 0x41, or 0x5F (ISO 14229-1
+/// (2026) 9.4.2.2). The supplier-specific range 0x61 to 0x7E and the reserved values define no
+/// pairing, so nothing reads their data as a seed. The lowering's zero-seed rule (ADR-405) and
+/// the agent's communication-log redaction (ADR-347) both decide by this.
+pub const fn is_standard_seed_level(level: u8) -> bool {
+    matches!(level, 0x01..=0x41 | 0x5F) && level & 1 == 1
+}
+
 /// The longest code, in bytes, that `Program::validate` accepts for a `Fail` (ADR-280).
 pub const MAX_FAILURE_CODE_LEN: usize = 128;
 

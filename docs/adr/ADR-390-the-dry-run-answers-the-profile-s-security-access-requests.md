@@ -1,7 +1,7 @@
 # ADR-390: The Dry Run Answers the Profile's Security Access Requests
 
 **Date:** 2026-10-30
-**Status:** Accepted
+**Status:** Accepted (item 3 amended by ADR-405: the answer to the seed request is never an all-zero seed)
 **Affects:** `diag-ir` dry run (`dry_run.rs` `dry_run`, `ScriptedHost::service_request`,
 `Script::seed`, `PROFILE_SEED_REQUEST`, `PROFILE_KEY_REQUEST`);
 `crates/diag-frontend/docs/starlark-subset.md` (3.2, 6); design 12.1; ADR-328 items 2 to 5

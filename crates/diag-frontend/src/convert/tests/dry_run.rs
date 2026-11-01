@@ -171,6 +171,54 @@ fn security_access_a_form_a_record_and_preconditions_run_on_the_built_defaults()
         \x20   if record[\"ok\"]:\n\
         \x20       diag.log(1, \"recorded\")\n";
     assert_eq!(rejection(source), None);
+    // The run itself reaches the end: the built seed is not zero, so the key path runs, and the
+    // form and the record template are both answered (ADR-405).
+    let converted = convert(with(example(), "p.star", source));
+    let document = load_ecu_document(&converted.documents[0].bytes).expect("the document loads");
+    let program: Program =
+        postcard::from_bytes(document.procedure().expect("a program").bytes()).expect("a program");
+    let variant = document.variant().expect("a variant");
+    let report = dry_run(
+        &program,
+        &variant,
+        &Script::built_defaults(),
+        DEFAULT_MAX_STEPS,
+    );
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    let events = &report.events;
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DryRunEvent::SecurityAccess { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DryRunEvent::Hmi { .. })),
+        "{events:?}"
+    );
+    assert!(
+        events
+            .iter()
+            .any(|event| matches!(event, DryRunEvent::RecordInput { .. })),
+        "{events:?}"
+    );
+}
+
+/// A built answer to the seed request carries a seed that is not zero, so the call before it does
+/// not hide the rest of the procedure from the dry run: the read after it is still refused for
+/// its index (ADR-405).
+#[test]
+fn a_security_access_before_a_refused_read_does_not_hide_it() {
+    let source = "def main():\n\
+        \x20   unlock = diag.security_access(0x01)\n\
+        \x20   dtcs = diag.read_dtc(0x09)\n\
+        \x20   records = dtcs[\"fields\"][\"dtcs\"]\n\
+        \x20   records[0]\n";
+    let error = stopped(source);
+    assert_eq!(error.code, star::StarCode::DryRunStopped);
+    assert!(error.hint.contains("index out of range"), "{}", error.hint);
 }
 
 #[test]

@@ -1,7 +1,7 @@
 # ADR-314: Application-Layer Profiles as Typed Frontend Data
 
 **Date:** 2026-10-16
-**Status:** Accepted
+**Status:** Accepted (items 4 and 5 extended by ADR-405)
 **Affects:** `diag-frontend` (`src/profile.rs`), `crates/diag-frontend/docs/starlark-subset.md`
 3.2 and 3.4, `crates/diag-frontend/docs/csv-tables.md` 5.3; interprets ADR-309 items 2 and 5
 

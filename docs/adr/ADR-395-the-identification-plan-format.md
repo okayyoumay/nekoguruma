@@ -1,7 +1,7 @@
 # ADR-395: The Identification Plan Format, Its Checks and the Endpoint Key
 
 **Date:** 2026-10-30
-**Status:** Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396)
+**Status:** Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396; item 3's checks gain an entry that lists an alternative twice, by ADR-401)
 **Affects:** `diag-ir` (`plan`), `agent` (`identification`), `crates/agent/docs/ngr-agent.md`,
 `docs/glossary.md`, design 8.8.2; ADR-318, ADR-319, ADR-324, ADR-326, ADR-327
 
@@ -48,7 +48,7 @@ step implements.
    - a selection's candidate count is not the one item 1 gives it, or a `Candidates` plan holds
      none;
    - a candidate, definition or role id is empty or used twice (a role within its candidate), an
-     entry has no alternative, a definition lists no document, or a gateway is its own entry or
+     entry has no alternative or lists one twice (ADR-401), a definition lists no document, or a gateway is its own entry or
      names no role of the candidate. Two values of one component are allowed (design 8.8.2);
    - an entry names a definition the plan lacks, or a rule source names a document no
      definition lists, or a document is listed under two definitions (listed twice under one is

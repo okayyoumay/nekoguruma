@@ -268,7 +268,14 @@ impl IdentificationPlan {
                         "it has no alternative",
                     ));
                 }
+                let mut listed = HashSet::new();
                 for definition in &entry.alternatives {
+                    if !listed.insert(definition.as_str()) {
+                        return Err(invalid(
+                            at(&format!("role {:?}", entry.role)),
+                            "it lists an alternative twice",
+                        ));
+                    }
                     if !definitions.contains(definition.as_str()) {
                         return Err(PlanError::UnknownDefinition {
                             candidate: candidate.id.clone(),
@@ -597,6 +604,16 @@ mod tests {
         assert_eq!(
             empty.validate(),
             invalid("candidate \"c1\" role \"engine\"", "it has no alternative")
+        );
+        let mut twice = plan();
+        let first = twice.candidates[0].entries[0].alternatives[0].clone();
+        twice.candidates[0].entries[0].alternatives.push(first);
+        assert_eq!(
+            twice.validate(),
+            invalid(
+                "candidate \"c1\" role \"engine\"",
+                "it lists an alternative twice"
+            )
         );
     }
 

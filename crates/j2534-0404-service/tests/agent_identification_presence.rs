@@ -27,7 +27,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
 use agent::identification::{
-    CheckedPlan, IdentificationRun, check_plan, load_plan, run_identification,
+    CheckedPlan, FieldValue, IdentificationRun, RequestOutcome, check_plan, load_plan,
+    run_identification,
 };
 use agent::launch::Api;
 use agent::{CommLogSetup, CommLogStatus, JobDocument, JobLimits, VciFacts};
@@ -275,12 +276,14 @@ impl Found {
             .collect()
     }
 
-    /// The presence exchange's entry: the only exchange of the run.
+    /// The presence exchange's entry: the only exchange of the run whose request is TesterPresent.
+    /// The ECU phase then reads the example ECU's software version (ADR-401), which is another
+    /// exchange.
     fn exchange(&self, what: &str) -> &serde_json::Value {
         let exchanges: Vec<_> = self
             .log
             .iter()
-            .filter(|line| line["event"] == "exchange")
+            .filter(|line| line["event"] == "exchange" && line["request"]["sid"] == "0x3e")
             .collect();
         assert_eq!(exchanges.len(), 1, "{what}\n{:#?}", self.log);
         exchanges[0]
@@ -396,6 +399,26 @@ async fn flow(root: &Path, control_dir: &Path) {
             .iter()
             .all(|endpoint| report.answered(&endpoint.key))
     );
+    // After the presence request the job reads the example ECU's definition (ADR-401): the
+    // software version, which the first variant's pattern names, and which the simulated ECU
+    // answers with the version that pattern expects.
+    let read = &report.ecu_reads()[0];
+    assert_eq!(read.definition, "example-ecu");
+    assert_eq!(read.requests[0].request, [0x22, 0xF1, 0x89]);
+    let RequestOutcome::Decoded(fields) = &read.requests[0].declarations[0].outcome else {
+        panic!("{:#?}", read.requests);
+    };
+    assert_eq!(fields.len(), 1, "{fields:?}");
+    assert_eq!(fields[0].value, FieldValue::Text("1.0.0".to_owned()));
+    assert_eq!(read.matching.len(), 1);
+    assert!(read.answered && read.conclusive && !report.ecu_reads_interrupted());
+    let reads: Vec<_> = found
+        .log
+        .iter()
+        .filter(|line| line["event"] == "exchange" && line["request"]["sid"] == "0x22")
+        .collect();
+    assert_eq!(reads.len(), 1, "{:#?}", found.log);
+    assert_eq!(reads[0]["origin"], "identification");
     let exchange = found.exchange("answer");
     assert_eq!(exchange["origin"], "identification");
     assert_eq!(exchange["target"]["tx_id"], 0x7DF);

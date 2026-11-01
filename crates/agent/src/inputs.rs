@@ -708,15 +708,23 @@ where
     Ok(field_bytes_of(field, sid, &response))
 }
 
+/// The response code of `response` when it is a negative response to the request with service
+/// `sid`: the negative-response SID, the echoed service and the code. The VIN read and the ECU
+/// reads of the identification job judge a response so (ADR-399, ADR-401).
+pub(crate) fn negative_code(sid: u8, response: &[u8]) -> Option<u8> {
+    match response[..] {
+        [0x7F, echoed, nrc] if echoed == sid => Some(nrc),
+        _ => None,
+    }
+}
+
 /// What `response` to the request with service `sid` gives for `field`: the field's raw bytes when
 /// the response is exactly the positive SID, the echo and a field that decodes, the response code
 /// of a negative response to the request, else unreadable. [`read_field_bytes`] sends the request
 /// and reads it so; a caller that sent the request itself reads each declaration of the one
 /// response so (ADR-399).
 pub(crate) fn field_bytes_of(field: &ServiceField, sid: u8, response: &[u8]) -> FieldBytes {
-    if let [0x7F, echoed, nrc] = response[..]
-        && echoed == sid
-    {
+    if let Some(nrc) = negative_code(sid, response) {
         return FieldBytes::Negative(nrc);
     }
     extract_field(field, sid, response)

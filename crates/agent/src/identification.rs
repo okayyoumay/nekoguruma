@@ -7,16 +7,21 @@
 //! [`run_identification`] then sends the plan's functional presence requests and is the only
 //! writer of the report's presence section (ADR-396); it then reads the VIN the plan's VIN rules
 //! name, and is the only writer of the report's VIN section and of the per-vehicle lock the
-//! identified VIN takes (ADR-399). It sends nothing else yet.
+//! identified VIN takes (ADR-399). It then reads every ECU definition the plan names, once, in
+//! plan order, and is the only writer of the report's ECU reads and entry states (ADR-401); it
+//! narrows no candidate yet.
 
 use std::cell::Cell;
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use diag_ir::declaration::EcuVariant;
+use diag_ir::decode::{DecodedField, PhysicalValue, variant_matches};
+use diag_ir::identify::{IdentifyError, decode_identification_answer, identification_requests};
 use diag_ir::plan::{
-    Component, IdentificationPlan, PlanError, Selection, Sha256, Source, VinRule, hex,
+    Component, Entry as PlanEntry, IdentificationPlan, PlanError, Selection, Sha256, Source,
+    VinRule, hex,
 };
 use diag_ir::{DiagHost, IdentityKind};
 use serde::{Serialize, Serializer};
@@ -34,7 +39,8 @@ use crate::host::{
     names_lost_vci, settle_worker,
 };
 use crate::inputs::{
-    FieldBytes, ServiceField, ServiceSources, field_bytes_of, identity_read_of, vin_source_field,
+    FieldBytes, ServiceField, ServiceSources, field_bytes_of, identity_read_of, negative_code,
+    vin_source_field,
 };
 use crate::journal::Vin;
 use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig, MAX_CAN_ID};
@@ -88,6 +94,16 @@ pub enum PlanRefused {
         document: String,
         service: u32,
         field: u32,
+        why: String,
+    },
+    /// A service a variant pattern names whose identification request cannot be built without
+    /// values (ADR-401): known before any link opens.
+    #[error(
+        "document {document} cannot build the identification request of service {service}: {why}"
+    )]
+    IdentificationRequest {
+        document: String,
+        service: u32,
         why: String,
     },
     #[error("document {document} declares functional identifier {functional_id:#x}: {why}")]
@@ -322,6 +338,48 @@ struct VinReadPlan {
     declarations: Vec<(Source, ServiceField)>,
 }
 
+/// A document's identification requests: each pattern service with its whole request.
+type DocumentRequests = (Sha256, Vec<(u32, Vec<u8>)>);
+
+/// One identification request of a link group and the declarations that share its bytes.
+#[derive(Debug)]
+struct RequestPlan {
+    /// The whole request, SID first.
+    request: Vec<u8>,
+    /// The (document, service) declarations whose identification request these bytes are.
+    declarations: Vec<(Sha256, u32)>,
+}
+
+/// The variants of one definition at one endpoint that share a link: equal ComParams other than
+/// the timings (ADR-401).
+#[derive(Debug)]
+struct LinkGroup {
+    /// The first document's declared link with the largest timings of the group; `None` when the
+    /// documents' link is refused and nothing opens.
+    link: Option<LinkConfig>,
+    /// The ComParams of the link other than the timings.
+    non_timing: Vec<(String, u32)>,
+    documents: Vec<Sha256>,
+    requests: Vec<RequestPlan>,
+}
+
+impl LinkGroup {
+    /// Whether the run opens a link for the group: it has a link and a request to send.
+    fn opens(&self) -> bool {
+        self.link.is_some() && !self.requests.is_empty()
+    }
+}
+
+/// The read of one ECU definition at one endpoint: its variants grouped by declared link
+/// (ADR-401).
+#[derive(Debug)]
+struct EcuReadPlan {
+    definition: String,
+    /// `None` for the documents whose link ADR-324 refuses.
+    endpoint: Option<EndpointKey>,
+    groups: Vec<LinkGroup>,
+}
+
 /// A plan that passed [`check_plan`].
 #[derive(Debug)]
 pub struct CheckedPlan {
@@ -334,6 +392,21 @@ pub struct CheckedPlan {
     vin_reads: Vec<VinReadPlan>,
     /// Every candidate's VIN rules, with the candidate's id, in plan order.
     vin_rules: Vec<(String, VinRule)>,
+    /// The documents the plan names, which the ECU reads decode with.
+    documents: Vec<(Sha256, JobDocument)>,
+    /// The ECU reads, definition by definition in plan order (ADR-401).
+    ecu_reads: Vec<EcuReadPlan>,
+    /// Every candidate's entries with the candidate's id, in plan order.
+    entries: Vec<(String, PlanEntry)>,
+}
+
+impl CheckedPlan {
+    /// Whether some ECU read opens a link.
+    fn ecu_reads_to_do(&self) -> bool {
+        self.ecu_reads
+            .iter()
+            .any(|read| read.groups.iter().any(LinkGroup::opens))
+    }
 }
 
 /// The checks that run before any link opens: every service a pattern or a rule source names
@@ -348,11 +421,25 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
             .expect("validate: every source names a listed document")
             .1
     };
+    // Every document's identification requests, built before any link opens (ADR-401).
+    let mut requests: Vec<DocumentRequests> = Vec::new();
     for (hash, document) in &loaded.documents {
         let variant = document.variant();
         for pattern in variant.patterns().into_iter().flatten() {
             check_read_only(hash, &variant, pattern.service_id())?;
         }
+        let built = identification_requests(&variant).map_err(|error| {
+            PlanRefused::IdentificationRequest {
+                document: hex(hash),
+                service: match &error {
+                    IdentifyError::Incomplete(service, _)
+                    | IdentifyError::Encode { service, .. } => *service,
+                    _ => 0,
+                },
+                why: error.to_string(),
+            }
+        })?;
+        requests.push((*hash, built));
     }
     // The VIN rules' sources, each once, in plan order.
     let mut vin_sources: Vec<(Source, ServiceField)> = Vec::new();
@@ -478,6 +565,13 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
         .iter()
         .flat_map(|c| c.vin_rules.iter().map(|rule| (c.id.clone(), rule.clone())))
         .collect();
+    let ecu_reads = group_ecu_reads(&loaded.plan, &requests, &links, &refused_links);
+    let entries = loaded
+        .plan
+        .candidates
+        .iter()
+        .flat_map(|c| c.entries.iter().map(|entry| (c.id.clone(), entry.clone())))
+        .collect();
     Ok(CheckedPlan {
         plan_sha256: loaded.plan_sha256,
         selection: loaded.plan.selection,
@@ -486,7 +580,99 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
         refused_links,
         vin_reads,
         vin_rules,
+        documents: loaded.documents.clone(),
+        ecu_reads,
+        entries,
     })
+}
+
+/// The endpoint a declared link goes to.
+fn endpoint_of(link: &LinkConfig) -> EndpointKey {
+    EndpointKey {
+        bus: BusKey::of(link),
+        tx_id: link.tx_id,
+        rx_id: link.rx_id,
+    }
+}
+
+/// Groups the plan's definitions into ECU reads: per definition, in plan order, its documents in
+/// their listed order by endpoint, and within an endpoint by ComParams other than the timings;
+/// each group's link has the largest timings of its documents' links, and a request of equal
+/// bytes is one request of the group for every declaration that builds it (ADR-401). The
+/// documents whose link is refused form a read without an endpoint, a group each.
+fn group_ecu_reads(
+    plan: &IdentificationPlan,
+    requests: &[DocumentRequests],
+    links: &[DocumentLink],
+    refused_links: &[RefusedLink],
+) -> Vec<EcuReadPlan> {
+    let mut reads: Vec<EcuReadPlan> = Vec::new();
+    for definition in &plan.definitions {
+        for (at, hash) in definition.documents.iter().enumerate() {
+            // A document listed twice under one definition is read once.
+            if definition.documents[..at].contains(hash) {
+                continue;
+            }
+            let built = requests
+                .iter()
+                .find(|(known, _)| known == hash)
+                .map_or(&[][..], |(_, built)| built.as_slice());
+            let declared = links.iter().find(|l| l.document == *hash);
+            let refused = refused_links.iter().any(|r| r.document == *hash);
+            let endpoint = match (declared, refused) {
+                (Some(declared), _) => Some(endpoint_of(&declared.link)),
+                (None, true) => None,
+                // `check_plan` puts every document in one of the two.
+                (None, false) => continue,
+            };
+            let at = reads
+                .iter()
+                .position(|r| r.definition == definition.id && r.endpoint == endpoint)
+                .unwrap_or_else(|| {
+                    reads.push(EcuReadPlan {
+                        definition: definition.id.clone(),
+                        endpoint: endpoint.clone(),
+                        groups: Vec::new(),
+                    });
+                    reads.len() - 1
+                });
+            let groups = &mut reads[at].groups;
+            let non_timing = declared.map(|d| comparams(&d.link)).unwrap_or_default();
+            let known =
+                declared.and_then(|_| groups.iter().position(|g| g.non_timing == non_timing));
+            let group = match (known, declared) {
+                (Some(known), Some(declared)) => {
+                    let group = &mut groups[known];
+                    if let Some(link) = &mut group.link {
+                        raise_timings(link, &declared.link);
+                    }
+                    group
+                }
+                _ => {
+                    groups.push(LinkGroup {
+                        link: declared.map(|d| d.link.clone()),
+                        non_timing,
+                        documents: Vec::new(),
+                        requests: Vec::new(),
+                    });
+                    groups.last_mut().expect("just pushed")
+                }
+            };
+            if !group.documents.contains(hash) {
+                group.documents.push(*hash);
+            }
+            for (service, request) in built {
+                match group.requests.iter_mut().find(|r| r.request == *request) {
+                    Some(known) => known.declarations.push((*hash, *service)),
+                    None => group.requests.push(RequestPlan {
+                        request: request.clone(),
+                        declarations: vec![(*hash, *service)],
+                    }),
+                }
+            }
+        }
+    }
+    reads
 }
 
 /// Groups the VIN sources into reads: sources on one endpoint with equal ComParams other than the
@@ -652,10 +838,184 @@ pub struct VinRuleResult {
     pub outcome: VinRuleOutcome,
 }
 
+/// A decoded value of an identification field. It is built from the decoder's physical value, so
+/// bytes show as the lowercase hex the report shows them in (ADR-396 item 7, ADR-401) and the IR
+/// crate commits to no JSON shape. `Debug` shows the kind and the length only: a field can hold
+/// the VIN, which design 16.2 keeps out of debug output.
+#[derive(Clone, PartialEq, Serialize)]
+pub enum FieldValue {
+    Unsigned(u64),
+    Signed(i64),
+    Float(f64),
+    Text(String),
+    Bytes(#[serde(serialize_with = "as_hex")] Vec<u8>),
+    Group(Vec<IdentificationField>),
+    Repeat(Vec<Vec<IdentificationField>>),
+    Select {
+        case: Option<usize>,
+        fields: Vec<IdentificationField>,
+    },
+}
+
+impl std::fmt::Debug for FieldValue {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Unsigned(_) => f.write_str("Unsigned(<redacted>)"),
+            Self::Signed(_) => f.write_str("Signed(<redacted>)"),
+            Self::Float(_) => f.write_str("Float(<redacted>)"),
+            Self::Text(text) => write!(f, "Text(<{} bytes>)", text.len()),
+            Self::Bytes(bytes) => write!(f, "Bytes(<{} bytes>)", bytes.len()),
+            Self::Group(fields) => f.debug_tuple("Group").field(fields).finish(),
+            Self::Repeat(items) => f.debug_tuple("Repeat").field(items).finish(),
+            Self::Select { case, fields } => f
+                .debug_struct("Select")
+                .field("case", case)
+                .field("fields", fields)
+                .finish(),
+        }
+    }
+}
+
+/// A field of a response to an identification request, decoded through a variant's positive
+/// response.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IdentificationField {
+    pub id: u32,
+    pub short_name: String,
+    pub value: FieldValue,
+}
+
+impl From<&DecodedField> for IdentificationField {
+    fn from(field: &DecodedField) -> Self {
+        Self {
+            id: field.id,
+            short_name: field.short_name.clone(),
+            value: FieldValue::from(&field.value),
+        }
+    }
+}
+
+fn fields_of(fields: &[DecodedField]) -> Vec<IdentificationField> {
+    fields.iter().map(IdentificationField::from).collect()
+}
+
+impl From<&PhysicalValue> for FieldValue {
+    fn from(value: &PhysicalValue) -> Self {
+        match value {
+            PhysicalValue::Unsigned(n) => Self::Unsigned(*n),
+            PhysicalValue::Signed(n) => Self::Signed(*n),
+            PhysicalValue::Float(n) => Self::Float(*n),
+            PhysicalValue::Text(text) => Self::Text(text.clone()),
+            PhysicalValue::Bytes(bytes) => Self::Bytes(bytes.clone()),
+            PhysicalValue::Group(fields) => Self::Group(fields_of(fields)),
+            PhysicalValue::Repeat(items) => {
+                Self::Repeat(items.iter().map(|i| fields_of(i)).collect())
+            }
+            PhysicalValue::Select { case, fields } => Self::Select {
+                case: *case,
+                fields: fields_of(fields),
+            },
+        }
+    }
+}
+
+/// What one declaration gave: the response to the identification request it shares, decoded
+/// through its service (ADR-401).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum RequestOutcome {
+    /// A positive response that decodes through the declaration's service.
+    Decoded(Vec<IdentificationField>),
+    /// A response that is not negative and does not decode through the service.
+    Undecodable,
+    /// A negative response, with its response code.
+    Negative(u8),
+    /// The request got no usable answer within the run's repeats (ADR-392).
+    NoUsableAnswer,
+    /// The declaration's document declares a link ADR-324 refuses, so nothing was read.
+    LinkRefused,
+    /// The worker refused to open the link when the read was made.
+    WorkerRefused,
+    /// The read was not made: the run ended, or its bounds ran out, before it.
+    NotRead,
+}
+
+/// A (document, service) declaration of an identification request and what it gave.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DeclarationOutcome {
+    #[serde(serialize_with = "as_hex")]
+    pub document: Sha256,
+    pub service: u32,
+    pub outcome: RequestOutcome,
+}
+
+/// One identification request, sent once, and every declaration its one response is decoded by.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct IdentificationRequest {
+    #[serde(serialize_with = "as_hex")]
+    pub request: Vec<u8>,
+    pub declarations: Vec<DeclarationOutcome>,
+}
+
+/// The read of one ECU definition at one endpoint (ADR-401).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EcuRead {
+    pub definition: String,
+    /// The endpoint read; `None` for the documents whose link ADR-324 refuses.
+    pub endpoint: Option<EndpointKey>,
+    #[serde(serialize_with = "hashes_as_hex")]
+    pub documents: Vec<Sha256>,
+    /// Every distinct request of every link group, in group order.
+    pub requests: Vec<IdentificationRequest>,
+    /// Every document whose variant matched (ADR-327 item 7).
+    #[serde(serialize_with = "hashes_as_hex")]
+    pub matching: Vec<Sha256>,
+    /// Every declaration decoded a positive response and no variant of the definition has a link
+    /// ADR-324 refuses: a read that rules out the definition's other variants (ADR-327 item 3).
+    /// No negative response is definitive yet, so any one leaves the read inconclusive.
+    pub conclusive: bool,
+    /// Some declaration got a response of the ECU.
+    pub answered: bool,
+}
+
+/// How an entry of a candidate stands after the reads (ADR-326 item 3, ADR-327, ADR-401).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum EntryState {
+    /// Exactly one alternative has a matching variant.
+    Identified {
+        definition: String,
+        #[serde(serialize_with = "hashes_as_hex")]
+        variants: Vec<Sha256>,
+    },
+    /// Two or more alternatives have a matching variant.
+    Ambiguous { definitions: Vec<String> },
+    /// An endpoint answered, and every alternative read there was read conclusively without a
+    /// match.
+    UnrecognizedVariant { endpoints: Vec<EndpointKey> },
+    /// An endpoint answered, but an alternative read there, or a variant of it, stayed
+    /// inconclusive.
+    AnsweredNotIdentified,
+    /// A request was sent and nothing answered, for a mandatory entry.
+    NotAnswering,
+    /// A request was sent and nothing answered, for an optional entry.
+    NotFitted,
+    /// No request was sent for the entry: the reads never ran, were refused or were interrupted.
+    NotRead,
+}
+
+/// A candidate's entry and its state.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct EntryResult {
+    pub candidate: String,
+    pub role: String,
+    pub optional: bool,
+    pub alternatives: Vec<String>,
+    pub state: EntryState,
+}
+
 /// What the plan's checks and the derivation give (design 8.8.2), and, once
 /// [`run_identification`] has run, the presence section (which response identifiers answered
 /// the functional presence requests) and the VIN section (ADR-399).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct IdentificationReport {
     selection: Selection,
     candidates: Vec<String>,
@@ -684,6 +1044,14 @@ pub struct IdentificationReport {
     vehicle_lock_held: bool,
     /// Each candidate's VIN rules against the established VIN.
     vin_rules: Vec<VinRuleResult>,
+    /// The ECU reads in plan order, each declaration `NotRead` or `LinkRefused` until the run
+    /// reads it (ADR-401).
+    ecu_reads: Vec<EcuRead>,
+    /// The ECU phase did not finish, because an earlier phase was interrupted or the run's
+    /// bounds ran out while an ECU read was made.
+    ecu_reads_interrupted: bool,
+    /// Every candidate's entries in plan order, `NotRead` until the ECU phase has run.
+    entries: Vec<EntryResult>,
 }
 
 impl IdentificationReport {
@@ -741,6 +1109,15 @@ impl IdentificationReport {
     }
     pub fn vin_rules(&self) -> &[VinRuleResult] {
         &self.vin_rules
+    }
+    pub fn ecu_reads(&self) -> &[EcuRead] {
+        &self.ecu_reads
+    }
+    pub fn ecu_reads_interrupted(&self) -> bool {
+        self.ecu_reads_interrupted
+    }
+    pub fn entries(&self) -> &[EntryResult] {
+        &self.entries
     }
     /// Whether the endpoint's bus and response identifier answered a presence request: an answer
     /// on a pair marks every endpoint with it, since alternatives often share one. Presence
@@ -873,6 +1250,60 @@ impl CheckedPlan {
                     outcome: VinRuleOutcome::Unevaluated,
                 })
                 .collect(),
+            ecu_reads: self
+                .ecu_reads
+                .iter()
+                .map(|read| EcuRead {
+                    definition: read.definition.clone(),
+                    endpoint: read.endpoint.clone(),
+                    documents: read
+                        .groups
+                        .iter()
+                        .flat_map(|group| group.documents.iter().copied())
+                        .collect(),
+                    requests: read
+                        .groups
+                        .iter()
+                        .flat_map(|group| {
+                            let outcome = if group.link.is_some() {
+                                RequestOutcome::NotRead
+                            } else {
+                                RequestOutcome::LinkRefused
+                            };
+                            group
+                                .requests
+                                .iter()
+                                .map(move |request| IdentificationRequest {
+                                    request: request.request.clone(),
+                                    declarations: request
+                                        .declarations
+                                        .iter()
+                                        .map(|&(document, service)| DeclarationOutcome {
+                                            document,
+                                            service,
+                                            outcome: outcome.clone(),
+                                        })
+                                        .collect(),
+                                })
+                        })
+                        .collect(),
+                    matching: Vec::new(),
+                    conclusive: false,
+                    answered: false,
+                })
+                .collect(),
+            ecu_reads_interrupted: false,
+            entries: self
+                .entries
+                .iter()
+                .map(|(candidate, entry)| EntryResult {
+                    candidate: candidate.clone(),
+                    role: entry.role.clone(),
+                    optional: entry.optional,
+                    alternatives: entry.alternatives.clone(),
+                    state: EntryState::NotRead,
+                })
+                .collect(),
         }
     }
 
@@ -948,7 +1379,9 @@ fn identification_facts(
 /// is established when the reads that gave a well-formed VIN gave one VIN; the run then takes the
 /// per-vehicle lock of it on `guards`, with no link open, waiting for a job that holds it until
 /// the cancel, and reports how each VIN rule stands to it. The VIN is in the report and the
-/// communication log only.
+/// communication log only. Last, unless the VIN phase was interrupted, it reads each ECU
+/// definition of the plan (ADR-401) the same way, with the lock held, and reports the entry
+/// states; guards still marked end the run in [`JobError::LinkUnconfirmed`] when a read remains.
 pub async fn run_identification<W: WorkerSource>(
     mut source: W,
     plan: CheckedPlan,
@@ -1153,6 +1586,7 @@ fn identify<W: WorkerSource>(
     if report.presence_interrupted {
         // The run's bounds ran out: no VIN link opens, and nothing is established (ADR-399).
         report.vin_interrupted = plan.vin_reads.iter().any(|read| read.link.is_some());
+        report.ecu_reads_interrupted = plan.ecu_reads_to_do();
         return Ok(report);
     }
     vin_phase(
@@ -1167,12 +1601,19 @@ fn identify<W: WorkerSource>(
         &worker_ended,
         &mut report,
     )?;
+    if report.vin_interrupted {
+        // The bounds ran out in a VIN read: nothing is established, and every later link would
+        // fail the same way (ADR-401).
+        report.ecu_reads_interrupted = plan.ecu_reads_to_do();
+        return Ok(report);
+    }
     if let Some(vin) = report.vin.clone() {
         report.evaluate_vin_rules(&plan.vin_rules, &vin);
         // Every VIN link is closed here, so the wait for a vehicle another job holds keeps no
         // VCI link open (design 8.8.1, ADR-399 item 4). The promotion settles the worker as an
         // open does: a worker that exited during the last close is found, and its mark cleared.
-        // Guards still marked take no lock (ADR-258); the report says so.
+        // Guards still marked take no lock (ADR-258); an ECU read that remains then ends the run
+        // in `LinkUnconfirmed` as its link opens (ADR-401), and a run with none reports so.
         match settle_before_open(&source, &comm_log, cancelled, guards, &worker_ended) {
             Ok(_) => {
                 promote_to_vehicle(
@@ -1186,6 +1627,23 @@ fn identify<W: WorkerSource>(
             Err(JobError::LinkUnconfirmed) => {}
             Err(error) => return Err(error),
         }
+    }
+    ecu_phase(
+        handle,
+        &source,
+        plan,
+        limits,
+        cancelled,
+        guards,
+        &comm_log,
+        &mut reopens,
+        &worker_ended,
+        &mut report,
+    )?;
+    // An interrupted phase leaves every entry not read, as an interrupted VIN phase establishes
+    // nothing (ADR-401).
+    if !report.ecu_reads_interrupted {
+        evaluate_entries(&mut report.entries, &report.ecu_reads);
     }
     Ok(report)
 }
@@ -1234,7 +1692,8 @@ enum Opened<C: WorkerApi> {
     Refused(JobError),
     /// The link failed to open for a reason that is neither a lost path nor the table, and
     /// what was opened is closed again. The presence phase ends the job in it; a VIN read
-    /// reports its sources as refused by the worker (ADR-399 item 3).
+    /// reports its sources, and an ECU read its declarations, as refused by the worker (ADR-399
+    /// item 3, ADR-401).
     Failed(JobError),
     /// The path to the VCI was lost and the bounds ran out before the link opened.
     Interrupted,
@@ -1243,7 +1702,8 @@ enum Opened<C: WorkerApi> {
 /// Opens the link of `config`: before each try a cancel, a worker that exited and the guards'
 /// mark are judged (ADR-258), and a link that fails to open on a lost path is opened again
 /// within the run's bounds (ADR-393). A table the worker refused is [`Opened::Refused`]; any
-/// other failure to open ends the job. The presence parts and the VIN reads open their links so.
+/// other failure to open ends the job. The presence parts, the VIN reads and the ECU reads open
+/// their links so.
 #[expect(
     clippy::too_many_arguments,
     reason = "the run's whole context, split only by what the caller owns"
@@ -1367,7 +1827,7 @@ enum Repeated {
 /// `limits.max_primitive_repeats` times, with the origin `repeat`; the reopens count over the
 /// run in `reopens` (ADR-396 item 6). `ends_run` tells an error that stops the attempts at once.
 /// A cancel is [`JobError::Cancelled`]; an error of no class that a resend fits ends the job. The
-/// presence request and the VIN read send so (ADR-399).
+/// presence request, the VIN read and the ECU read send so (ADR-399, ADR-401).
 fn repeat_within_bounds<C: WorkerApi>(
     host: &mut WorkerHost<C>,
     limits: &JobLimits,
@@ -1481,6 +1941,100 @@ fn presence_part<W: WorkerSource>(
     })
 }
 
+/// How [`open_read_link`] ended without an open link.
+enum ReadLink<C: WorkerApi> {
+    /// The link is open.
+    Link(Box<JobLink<C>>),
+    /// The worker refused to open the link (a connect it refused, or another failure to open that
+    /// left nothing open) when the read was made.
+    Refused,
+    /// The path to the VCI was lost and the bounds ran out before the link opened.
+    Interrupted,
+}
+
+/// Opens the link of a read (a link ADR-324 accepts, not a table) by [`open_part`] and maps its
+/// end: a refusal or another failure that left nothing open is [`ReadLink::Refused`]. The VIN
+/// reads and the ECU reads open their links so (ADR-399 item 3, ADR-401).
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn open_read_link<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    link: &LinkConfig,
+    comm_log: Option<crate::comm_log::CommLog>,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+) -> Result<ReadLink<W::Client>, JobError> {
+    Ok(
+        match open_part(
+            handle,
+            source,
+            link,
+            comm_log,
+            limits,
+            cancelled,
+            guards,
+            reopens,
+            worker_ended,
+        )? {
+            Opened::Link(link) => ReadLink::Link(link),
+            Opened::Refused(_) | Opened::Failed(_) => ReadLink::Refused,
+            Opened::Interrupted => ReadLink::Interrupted,
+        },
+    )
+}
+
+/// How [`identification_request`] ended.
+enum RequestEnd {
+    /// The ECU's response, positive or negative.
+    Response(Vec<u8>),
+    /// No usable answer within the repeats: none at all, the link's error event for the request,
+    /// a receive error or lost events (each a failure of the ECU or the bus, ADR-392).
+    NoUsableAnswer,
+    /// The path to the VCI was lost and the bounds ran out, or a failure of another class
+    /// stopped the attempts.
+    Interrupted,
+}
+
+/// Sends the read-only `request` (SID first) on the open link of `host` and again within the run's
+/// bounds, as [`repeat_within_bounds`] has it (a read is idempotent, so a receive error sends it
+/// again too, ADR-392 item 2). The VIN reads and the ECU reads send so (ADR-399, ADR-401).
+fn identification_request<C: WorkerApi>(
+    host: &mut WorkerHost<C>,
+    request: &[u8],
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    reopens: &mut u8,
+) -> Result<RequestEnd, JobError> {
+    let (sid, payload) = request
+        .split_first()
+        .expect("an identification request has a service identifier");
+    let mut response = None;
+    let ended = repeat_within_bounds(
+        host,
+        limits,
+        cancelled,
+        reopens,
+        |host| {
+            response = Some(host.service_request(u16::from(*sid), payload)?);
+            Ok(())
+        },
+        |_| false,
+    )?;
+    Ok(match (ended, response) {
+        (Repeated::Done, Some(response)) => RequestEnd::Response(response),
+        (Repeated::Stopped(error), _) if error.resend_class() == ResendClass::EcuLevel => {
+            RequestEnd::NoUsableAnswer
+        }
+        _ => RequestEnd::Interrupted,
+    })
+}
+
 /// How one VIN read ended.
 enum VinReadEnd {
     /// The read got an answer, or none within the repeats: what each source gave, and the VIN
@@ -1513,7 +2067,7 @@ fn vin_read<W: WorkerSource>(
     reopens: &mut u8,
     worker_ended: &Cell<bool>,
 ) -> Result<VinReadEnd, JobError> {
-    let opened = open_part(
+    let link = match open_read_link(
         handle,
         source,
         link,
@@ -1523,13 +2077,12 @@ fn vin_read<W: WorkerSource>(
         guards,
         reopens,
         worker_ended,
-    )?;
-    let link = match opened {
-        Opened::Link(link) => link,
+    )? {
+        ReadLink::Link(link) => link,
         // The worker refused the link at run time: its sources are reported so and the other
         // reads decide (ADR-399 item 3).
-        Opened::Refused(_) | Opened::Failed(_) => return Ok(VinReadEnd::Refused),
-        Opened::Interrupted => return Ok(VinReadEnd::Interrupted),
+        ReadLink::Refused => return Ok(VinReadEnd::Refused),
+        ReadLink::Interrupted => return Ok(VinReadEnd::Interrupted),
     };
     let JobLink {
         mut host,
@@ -1537,24 +2090,13 @@ fn vin_read<W: WorkerSource>(
         path_lost,
         ..
     } = *link;
-    let (sid, payload) = read
+    let (sid, _) = read
         .request
         .split_first()
         .expect("a VIN source's request has a service identifier");
-    let mut response = None;
-    let ended = repeat_within_bounds(
-        &mut host,
-        limits,
-        cancelled,
-        reopens,
-        |host| {
-            response = Some(host.service_request(u16::from(*sid), payload)?);
-            Ok(())
-        },
-        |_| false,
-    );
-    let end = ended.map(|ended| match (ended, response) {
-        (Repeated::Done, Some(response)) => {
+    let ended = identification_request(&mut host, &read.request, limits, cancelled, reopens);
+    let end = ended.map(|ended| match ended {
+        RequestEnd::Response(response) => {
             let outcomes: Vec<VinOutcome> = read
                 .declarations
                 .iter()
@@ -1567,13 +2109,11 @@ fn vin_read<W: WorkerSource>(
             let accepted = accepted_vin(&outcomes);
             VinReadEnd::Done(outcomes, accepted)
         }
-        (Repeated::Stopped(error), _) if error.resend_class() == ResendClass::EcuLevel => {
-            VinReadEnd::Done(
-                vec![VinOutcome::NoUsableAnswer; read.declarations.len()],
-                None,
-            )
-        }
-        _ => VinReadEnd::Interrupted,
+        RequestEnd::NoUsableAnswer => VinReadEnd::Done(
+            vec![VinOutcome::NoUsableAnswer; read.declarations.len()],
+            None,
+        ),
+        RequestEnd::Interrupted => VinReadEnd::Interrupted,
     });
     close_job_link(host, open_link, &path_lost);
     end
@@ -1669,6 +2209,355 @@ fn vin_phase<W: WorkerSource>(
         report.vin = report.vins_seen.first().cloned();
     }
     Ok(())
+}
+
+/// What the requests of one link group gave.
+#[derive(Default)]
+struct GroupRead {
+    /// Per request in group order, the outcome of each declaration; fewer than the group's
+    /// requests when the bounds ran out.
+    outcomes: Vec<Vec<RequestOutcome>>,
+    /// The fields each declaration that decoded gave, for the variants' patterns.
+    decoded: HashMap<(Sha256, u32), Vec<DecodedField>>,
+    /// The path to the VCI was lost and the bounds ran out before the group was read.
+    interrupted: bool,
+}
+
+/// What each declaration of a request gave from its one `response` (ADR-401): a negative
+/// response to the request, else the response decoded through the declaration's service.
+fn declaration_outcomes(
+    request: &RequestPlan,
+    sid: u8,
+    response: &[u8],
+    documents: &[(Sha256, JobDocument)],
+    read: &mut GroupRead,
+) -> Vec<RequestOutcome> {
+    request
+        .declarations
+        .iter()
+        .map(|&(hash, service)| {
+            if let Some(nrc) = negative_code(sid, response) {
+                return RequestOutcome::Negative(nrc);
+            }
+            let Some((_, document)) = documents.iter().find(|(known, _)| *known == hash) else {
+                return RequestOutcome::Undecodable;
+            };
+            match decode_identification_answer(&document.variant(), service, response) {
+                Ok(Some(fields)) => {
+                    let outcome = RequestOutcome::Decoded(fields_of(&fields));
+                    read.decoded.insert((hash, service), fields);
+                    outcome
+                }
+                Ok(None) | Err(_) => RequestOutcome::Undecodable,
+            }
+        })
+        .collect()
+}
+
+/// Reads one link group: opens its link, sends each request once and again within the run's
+/// bounds, decodes the one response of each with every declaration that shares it, and closes the
+/// link (ADR-401). A read is idempotent, so a receive error sends it again too (ADR-392 item 2).
+/// `None` when the worker refused to open the link.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn ecu_read_group<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    group: &LinkGroup,
+    link: &LinkConfig,
+    documents: &[(Sha256, JobDocument)],
+    comm_log: Option<crate::comm_log::CommLog>,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+) -> Result<Option<GroupRead>, JobError> {
+    let link = match open_read_link(
+        handle,
+        source,
+        link,
+        comm_log,
+        limits,
+        cancelled,
+        guards,
+        reopens,
+        worker_ended,
+    )? {
+        ReadLink::Link(link) => link,
+        // The worker refused the link at run time: its declarations are reported so and the
+        // other groups decide (ADR-399 item 3).
+        ReadLink::Refused => return Ok(None),
+        ReadLink::Interrupted => {
+            return Ok(Some(GroupRead {
+                interrupted: true,
+                ..GroupRead::default()
+            }));
+        }
+    };
+    let JobLink {
+        mut host,
+        open_link,
+        path_lost,
+        ..
+    } = *link;
+    let mut read = GroupRead::default();
+    let mut failure = None;
+    for request in &group.requests {
+        let outcomes =
+            match identification_request(&mut host, &request.request, limits, cancelled, reopens) {
+                Ok(RequestEnd::Response(response)) => {
+                    let sid = request.request[0];
+                    declaration_outcomes(request, sid, &response, documents, &mut read)
+                }
+                Ok(RequestEnd::NoUsableAnswer) => {
+                    vec![RequestOutcome::NoUsableAnswer; request.declarations.len()]
+                }
+                Ok(RequestEnd::Interrupted) => {
+                    read.interrupted = true;
+                    break;
+                }
+                Err(error) => {
+                    failure = Some(error);
+                    break;
+                }
+            };
+        read.outcomes.push(outcomes);
+    }
+    close_job_link(host, open_link, &path_lost);
+    failure.map_or(Ok(Some(read)), Err)
+}
+
+/// The ECU phase: reads each ECU definition once per endpoint, in plan order, one link open at a
+/// time, and sets the report's ECU reads (ADR-401). A run whose bounds run out in a read leaves
+/// the rest `NotRead`. Every link is closed when this returns.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, split only by what the caller owns"
+)]
+fn ecu_phase<W: WorkerSource>(
+    handle: &Handle,
+    source: &Arc<Mutex<W>>,
+    plan: &CheckedPlan,
+    limits: &JobLimits,
+    cancelled: &AtomicBool,
+    guards: &GuardSlot,
+    comm_log: &Option<crate::comm_log::CommLog>,
+    reopens: &mut u8,
+    worker_ended: &Cell<bool>,
+    report: &mut IdentificationReport,
+) -> Result<(), JobError> {
+    for (at, planned) in plan.ecu_reads.iter().enumerate() {
+        let mut decoded: HashMap<(Sha256, u32), Vec<DecodedField>> = HashMap::new();
+        let mut first = 0;
+        let mut interrupted = false;
+        for group in &planned.groups {
+            let count = group.requests.len();
+            let Some(link) = group.link.as_ref().filter(|_| count > 0) else {
+                first += count;
+                continue;
+            };
+            let end = ecu_read_group(
+                handle,
+                source,
+                group,
+                link,
+                &plan.documents,
+                comm_log.clone(),
+                limits,
+                cancelled,
+                guards,
+                reopens,
+                worker_ended,
+            )?;
+            let reported = &mut report.ecu_reads[at].requests[first..first + count];
+            match end {
+                None => {
+                    for request in reported {
+                        for declaration in &mut request.declarations {
+                            declaration.outcome = RequestOutcome::WorkerRefused;
+                        }
+                    }
+                }
+                Some(read) => {
+                    for (request, outcomes) in reported.iter_mut().zip(read.outcomes) {
+                        for (declaration, outcome) in request.declarations.iter_mut().zip(outcomes)
+                        {
+                            declaration.outcome = outcome;
+                        }
+                    }
+                    decoded.extend(read.decoded);
+                    interrupted = read.interrupted;
+                }
+            }
+            first += count;
+            if interrupted {
+                break;
+            }
+        }
+        let reported = &mut report.ecu_reads[at];
+        // Every match is reported, not the first by name (ADR-327 item 7).
+        for (hash, document) in &plan.documents {
+            if reported.documents.contains(hash)
+                && variant_matches(&document.variant(), |service| {
+                    decoded.get(&(*hash, service)).map(Vec::as_slice)
+                })
+                && !reported.matching.contains(hash)
+            {
+                reported.matching.push(*hash);
+            }
+        }
+        let outcomes = || {
+            reported
+                .requests
+                .iter()
+                .flat_map(|request| &request.declarations)
+                .map(|declaration| &declaration.outcome)
+        };
+        let answered = outcomes().any(|o| {
+            matches!(
+                o,
+                RequestOutcome::Decoded(_)
+                    | RequestOutcome::Undecodable
+                    | RequestOutcome::Negative(_)
+            )
+        });
+        // The one place that judges a read conclusive: no negative response is definitive until
+        // the IR declares which are, and a positive response that does not decode rules nothing
+        // out (ADR-327 item 3, ADR-401). A variant whose link is refused leaves the definition
+        // inconclusive at every endpoint.
+        let refused_variant = plan.ecu_reads.iter().any(|r| {
+            r.definition == planned.definition
+                && r.endpoint.is_none()
+                && r.groups.iter().any(|group| !group.requests.is_empty())
+        });
+        let conclusive = outcomes().next().is_some()
+            && outcomes().all(|o| matches!(o, RequestOutcome::Decoded(_)))
+            && !refused_variant;
+        reported.answered = answered;
+        reported.conclusive = conclusive;
+        if interrupted {
+            report.ecu_reads_interrupted = true;
+            break;
+        }
+    }
+    Ok(())
+}
+
+/// Sets each entry's state from the reads of its alternatives (ADR-326 item 3, ADR-327 item 3,
+/// ADR-401): the only writer of the entry states, and called only for a phase that ran to its end
+/// (an interrupted one leaves every entry not read). An entry with an alternative that had no
+/// physical read (every declaration not read or refused by the worker) is not read, whatever the
+/// others show; an alternative with no declaration at all (no pattern) is left out, and an entry
+/// with none left is not read. Else one alternative with a matching variant identifies the
+/// entry, two make it ambiguous; else an endpoint that answered is unrecognized when every read
+/// there was conclusive and no alternative has a variant whose link is refused, and the entry is
+/// answered but not identified otherwise; else the entry is not answering (not fitted when
+/// optional) if a request was sent, and not read if none was.
+fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
+    for entry in entries {
+        let relevant: Vec<&EcuRead> = reads
+            .iter()
+            .filter(|read| entry.alternatives.contains(&read.definition))
+            .collect();
+        let outcomes = |definition: &String| {
+            relevant
+                .iter()
+                .filter(|read| read.definition == *definition)
+                .flat_map(|read| &read.requests)
+                .flat_map(|request| &request.declarations)
+                .map(|d| &d.outcome)
+                .collect::<Vec<_>>()
+        };
+        // An alternative with no declaration (no variant has a pattern) contributes nothing.
+        let judged: Vec<Vec<&RequestOutcome>> = entry
+            .alternatives
+            .iter()
+            .map(outcomes)
+            .filter(|outcomes| !outcomes.is_empty())
+            .collect();
+        let physically_read = |outcomes: &Vec<&RequestOutcome>| {
+            outcomes
+                .iter()
+                .any(|o| !matches!(o, RequestOutcome::NotRead | RequestOutcome::WorkerRefused))
+        };
+        if judged.is_empty() || !judged.iter().all(physically_read) {
+            entry.state = EntryState::NotRead;
+            continue;
+        }
+        // A variant whose link ADR-324 refuses leaves its definition, and so the entry,
+        // inconclusive (a pattern-less one sends nothing and counts for nothing).
+        let refused_variant = relevant
+            .iter()
+            .any(|read| read.endpoint.is_none() && !read.requests.is_empty());
+        let matched: Vec<&String> = entry
+            .alternatives
+            .iter()
+            .filter(|definition| {
+                relevant
+                    .iter()
+                    .any(|read| read.definition == **definition && !read.matching.is_empty())
+            })
+            .collect();
+        entry.state = match matched[..] {
+            [definition] => EntryState::Identified {
+                definition: definition.clone(),
+                variants: relevant
+                    .iter()
+                    .filter(|read| read.definition == *definition)
+                    .flat_map(|read| read.matching.iter().copied())
+                    .collect(),
+            },
+            [_, ..] => EntryState::Ambiguous {
+                definitions: matched.into_iter().cloned().collect(),
+            },
+            [] => {
+                let mut answered: Vec<&EndpointKey> = Vec::new();
+                for read in &relevant {
+                    if let Some(endpoint) = &read.endpoint
+                        && read.answered
+                        && !answered.contains(&endpoint)
+                    {
+                        answered.push(endpoint);
+                    }
+                }
+                let settled = |endpoint: &&EndpointKey| {
+                    relevant
+                        .iter()
+                        .filter(|read| read.endpoint.as_ref() == Some(*endpoint))
+                        .all(|read| read.conclusive)
+                        && !refused_variant
+                };
+                let sent = relevant
+                    .iter()
+                    .flat_map(|read| &read.requests)
+                    .flat_map(|request| &request.declarations)
+                    .any(|d| {
+                        !matches!(
+                            d.outcome,
+                            RequestOutcome::LinkRefused
+                                | RequestOutcome::WorkerRefused
+                                | RequestOutcome::NotRead
+                        )
+                    });
+                if !answered.is_empty() && answered.iter().all(settled) {
+                    EntryState::UnrecognizedVariant {
+                        endpoints: answered.into_iter().cloned().collect(),
+                    }
+                } else if !answered.is_empty() {
+                    EntryState::AnsweredNotIdentified
+                } else if sent && entry.optional {
+                    EntryState::NotFitted
+                } else if sent {
+                    EntryState::NotAnswering
+                } else {
+                    EntryState::NotRead
+                }
+            }
+        };
+    }
 }
 
 /// Whether a link that did not open failed on a lost path, with nothing left open: the open is
@@ -1863,8 +2752,21 @@ mod tests {
         plan
     }
 
-    /// Loads and checks [`vin_plan`] over `documents`.
+    /// Loads and checks [`vin_plan`] over `documents`, without the ECU reads: the presence and
+    /// VIN tests isolate their phases from the ECU phase (the fixtures' documents carry
+    /// identification patterns), which [`checked_vin_reading`] keeps.
     pub(super) fn checked_vin(
+        documents: &[(Sha256, Vec<u8>)],
+        selection: Chosen,
+        rules: &[(usize, u8, u8, &str)],
+    ) -> Result<CheckedPlan, PlanRefused> {
+        let mut checked = checked_vin_reading(documents, selection, rules)?;
+        checked.ecu_reads.clear();
+        Ok(checked)
+    }
+
+    /// [`checked_vin`] with the ECU reads the plan derives.
+    pub(super) fn checked_vin_reading(
         documents: &[(Sha256, Vec<u8>)],
         selection: Chosen,
         rules: &[(usize, u8, u8, &str)],
@@ -1873,8 +2775,17 @@ mod tests {
         check_plan(&load(&vin_plan(&hashes, selection, rules), documents)?)
     }
 
-    /// Loads and checks a plan over `documents`.
+    /// Loads and checks a plan over `documents`, without the ECU reads (see [`checked_vin`]).
     pub(super) fn checked(documents: &[(Sha256, Vec<u8>)]) -> Result<CheckedPlan, PlanRefused> {
+        let mut checked = checked_reading(documents)?;
+        checked.ecu_reads.clear();
+        Ok(checked)
+    }
+
+    /// [`checked`] with the ECU reads the plan derives.
+    pub(super) fn checked_reading(
+        documents: &[(Sha256, Vec<u8>)],
+    ) -> Result<CheckedPlan, PlanRefused> {
         let hashes: Vec<Sha256> = documents.iter().map(|(hash, _)| *hash).collect();
         check_plan(&load(&plan(&hashes), documents)?)
     }
@@ -2495,6 +3406,85 @@ mod tests {
         assert!(plan.vin_reads[0].link.is_none());
     }
 
+    /// A candidate's id with its entries (role, optional, alternatives).
+    pub(super) type CandidateEntries<'a> = (&'a str, &'a [(&'a str, bool, &'a [&'a str])]);
+
+    /// A document on `endpoint` (with a functional identifier) whose variant `short_name` reads
+    /// data identifier F1`did` as `bytes` bytes of text, and whose pattern expects the text to
+    /// start with `expected`.
+    pub(super) fn identified_by(
+        did: u8,
+        bytes: u32,
+        expected: &[u8],
+        short_name: &str,
+        endpoint: (u32, u32),
+        setup: impl FnOnce(&mut ProtocolT),
+    ) -> (Sha256, Vec<u8>) {
+        let base = document_reading(did, bytes, endpoint.0, endpoint.1, |protocol| {
+            protocol.functional_id = 0x7DF;
+            setup(protocol)
+        });
+        named(edited(&base, |variant| {
+            variant.short_name = Some(short_name.into());
+            variant.patterns.as_mut().unwrap()[0].expected = Some(expected.to_vec());
+        }))
+    }
+
+    /// A plan over `documents` and its checked form: `definitions` names each definition with the
+    /// indexes of its documents, `candidates` each candidate with its entries (role, optional,
+    /// alternatives). A candidate-less plan is for every ECU.
+    pub(super) fn ecu_plan(
+        documents: &[(Sha256, Vec<u8>)],
+        definitions: &[(&str, &[usize])],
+        candidates: &[CandidateEntries<'_>],
+    ) -> CheckedPlan {
+        let selection = match candidates.len() {
+            0 => Chosen::EveryEcu,
+            1 => Chosen::ChosenDefinition,
+            _ => Chosen::Candidates,
+        };
+        ecu_plan_of(selection, documents, definitions, candidates)
+    }
+
+    /// [`ecu_plan`] with the selection given.
+    pub(super) fn ecu_plan_of(
+        selection: Chosen,
+        documents: &[(Sha256, Vec<u8>)],
+        definitions: &[(&str, &[usize])],
+        candidates: &[CandidateEntries<'_>],
+    ) -> CheckedPlan {
+        let plan = IdentificationPlan {
+            schema_version: PLAN_SCHEMA_VERSION,
+            selection,
+            candidates: candidates
+                .iter()
+                .map(|&(id, entries)| Candidate {
+                    id: id.into(),
+                    values: Vec::new(),
+                    vin_rules: Vec::new(),
+                    field_rules: Vec::new(),
+                    entries: entries
+                        .iter()
+                        .map(|&(role, optional, alternatives)| Entry {
+                            role: role.into(),
+                            optional,
+                            gateway: None,
+                            alternatives: alternatives.iter().map(|a| (*a).into()).collect(),
+                        })
+                        .collect(),
+                })
+                .collect(),
+            definitions: definitions
+                .iter()
+                .map(|&(id, at)| PlanDefinition {
+                    id: id.into(),
+                    documents: at.iter().map(|&i| documents[i].0).collect(),
+                })
+                .collect(),
+        };
+        check_plan(&load(&plan, documents).expect("a valid plan")).expect("a checked plan")
+    }
+
     /// The VIN section serializes to the report's JSON; a VIN is written only as the text of the
     /// established one, and `Debug` hides it.
     #[test]
@@ -2518,5 +3508,488 @@ mod tests {
         assert_eq!(json["vin_interrupted"], false);
         assert_eq!(json["vehicle_lock_held"], false);
         assert!(!format!("{report:?}").contains("WVWZZZ"));
+    }
+
+    // ------------------------------------------------------------ The ECU reads (ADR-401)
+
+    /// A pattern service whose request needs a value cannot be built without one, which the
+    /// check refuses before any link opens.
+    #[test]
+    fn an_identification_request_with_parameters_is_refused() {
+        let base = document(0x90, 0x7E0, 0x7E8, |_| {});
+        let scalar = named(edited(&base, |v| {
+            let request = v.services.as_mut().unwrap()[0].request.as_mut().unwrap();
+            let mut argument = FieldT::default();
+            argument.id = 9;
+            argument.short_name = Some("argument".into());
+            argument.placement = Placement::AfterPrevious;
+            argument.bit_length = 8;
+            argument.kind = DataKind::Uint;
+            request.params = Some(vec![argument]);
+        }));
+        assert!(matches!(
+            checked_reading(std::slice::from_ref(&scalar)),
+            Err(PlanRefused::IdentificationRequest { document, service: 1, .. })
+                if document == hex(&scalar.0)
+        ));
+    }
+
+    /// Variants of one definition are grouped by endpoint, and within an endpoint by the ComParams
+    /// other than the timings, which a group raises to the largest; a request of equal bytes is one
+    /// request of its group; reads come in plan order (definition, then first document).
+    #[test]
+    fn ecu_reads_group_variants_by_endpoint_and_comparams_in_plan_order() {
+        let block = |size: i64, cr: i64| {
+            move |p: &mut ProtocolT| {
+                p.functional_id = 0;
+                with_param("CP_BlockSize", size)(p);
+                with_param("CP_Cr", cr)(p);
+            }
+        };
+        let (a, b) = ((0x7E0, 0x7E8), (0x7E1, 0x7E9));
+        let documents = [
+            identified_by(0x87, 11, b"P", "v1", a, block(8, 1)),
+            identified_by(0x87, 11, b"Q", "v2", a, block(16, 1)),
+            identified_by(0x89, 5, b"R", "v3", a, block(8, 3)),
+            identified_by(0x87, 11, b"S", "v4", b, block(8, 1)),
+            identified_by(0x87, 11, b"T", "v5", a, block(8, 1)),
+        ];
+        let plan = ecu_plan(
+            &documents,
+            &[("D", &[0, 1, 2, 3]), ("E", &[4])],
+            &[("c1", &[("engine", false, &["D", "E"])])],
+        );
+        let shape: Vec<_> = plan
+            .ecu_reads
+            .iter()
+            .map(|read| {
+                (
+                    read.definition.as_str(),
+                    read.endpoint.as_ref().map(|e| e.tx_id),
+                    read.groups
+                        .iter()
+                        .map(|g| (g.documents.len(), g.requests.len()))
+                        .collect::<Vec<_>>(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shape,
+            [
+                ("D", Some(0x7E0), vec![(2, 2), (1, 1)]),
+                ("D", Some(0x7E1), vec![(1, 1)]),
+                ("E", Some(0x7E0), vec![(1, 1)]),
+            ]
+        );
+        let raised = plan.ecu_reads[0].groups[0].link.as_ref().unwrap();
+        assert_eq!(
+            raised.params.iter().find(|(k, _)| k == "CP_Cr").unwrap().1,
+            3
+        );
+        // Equal request bytes are one request, whatever documents declare them.
+        let twins = [
+            identified_by(0x87, 11, b"P", "v1", a, block(8, 1)),
+            identified_by(0x87, 11, b"Q", "v2", a, block(8, 1)),
+        ];
+        let plan = ecu_plan(
+            &twins,
+            &[("D", &[0, 1])],
+            &[("c1", &[("e", false, &["D"])])],
+        );
+        let group = &plan.ecu_reads[0].groups[0];
+        assert_eq!(group.requests.len(), 1);
+        assert_eq!(group.requests[0].request, [0x22, 0xF1, 0x87]);
+        assert_eq!(group.requests[0].declarations.len(), 2);
+    }
+
+    /// The report starts with every declaration not read (link refused for a refused document)
+    /// and every entry not read; its ECU section reads back from the JSON.
+    #[test]
+    fn the_report_starts_with_every_declaration_not_read_and_every_entry_not_read() {
+        let a = (0x7E0, 0x7E8);
+        let refused = identified_by(0x87, 11, b"P", "v2", (0x7E1, 0x7E9), |p| {
+            p.extended_addressing = true
+        });
+        let documents = [
+            identified_by(0x87, 11, b"P", "v1", a, |_| {}),
+            refused.clone(),
+        ];
+        let plan = ecu_plan(
+            &documents,
+            &[("D", &[0, 1])],
+            &[("c1", &[("engine", false, &["D"])])],
+        );
+        let report = plan.report();
+        let declared: Vec<_> = report
+            .ecu_reads()
+            .iter()
+            .map(|read| {
+                (
+                    read.endpoint.is_some(),
+                    read.requests[0].declarations[0].outcome.clone(),
+                    read.matching.is_empty() && !read.conclusive && !read.answered,
+                )
+            })
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                (true, RequestOutcome::NotRead, true),
+                (false, RequestOutcome::LinkRefused, true)
+            ]
+        );
+        assert_eq!(report.ecu_reads()[1].documents, [refused.0]);
+        assert!(!report.ecu_reads_interrupted());
+        assert_eq!(report.entries().len(), 1);
+        assert_eq!(report.entries()[0].state, EntryState::NotRead);
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["ecu_reads"][0]["requests"][0]["request"], "22f187");
+        assert_eq!(
+            json["ecu_reads"][0]["requests"][0]["declarations"][0]["outcome"],
+            "NotRead"
+        );
+        assert!(json["ecu_reads"][1]["endpoint"].is_null());
+        assert_eq!(json["entries"][0]["state"], "NotRead");
+        assert_eq!(json["ecu_reads_interrupted"], false);
+    }
+
+    /// Every outcome and state shows in JSON by serde's default naming, with bytes and hashes as
+    /// lowercase hex.
+    #[test]
+    fn the_ecu_section_serializes_with_bytes_as_hex() {
+        let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        let mut report = checked_reading(std::slice::from_ref(&doc))
+            .unwrap()
+            .report();
+        let field = |value| IdentificationField {
+            id: 1,
+            short_name: "value".into(),
+            value,
+        };
+        let read = &mut report.ecu_reads[0];
+        read.requests[0].declarations = [
+            RequestOutcome::Decoded(vec![
+                field(FieldValue::Text("PA".into())),
+                field(FieldValue::Bytes(vec![0xAB, 0x01])),
+            ]),
+            RequestOutcome::Negative(0x31),
+            RequestOutcome::Undecodable,
+            RequestOutcome::NoUsableAnswer,
+            RequestOutcome::WorkerRefused,
+        ]
+        .into_iter()
+        .map(|outcome| DeclarationOutcome {
+            document: doc.0,
+            service: 1,
+            outcome,
+        })
+        .collect();
+        read.matching = vec![doc.0];
+        read.answered = true;
+        report.entries[0].state = EntryState::Identified {
+            definition: "ecu".into(),
+            variants: vec![doc.0],
+        };
+        let json = serde_json::to_value(&report).unwrap();
+        let declarations = &json["ecu_reads"][0]["requests"][0]["declarations"];
+        assert_eq!(declarations[0]["document"], hex(&doc.0));
+        assert_eq!(
+            declarations[0]["outcome"],
+            serde_json::json!({"Decoded": [
+                {"id": 1, "short_name": "value", "value": {"Text": "PA"}},
+                {"id": 1, "short_name": "value", "value": {"Bytes": "ab01"}}
+            ]})
+        );
+        assert_eq!(
+            declarations[1]["outcome"],
+            serde_json::json!({"Negative": 49})
+        );
+        assert_eq!(declarations[2]["outcome"], "Undecodable");
+        assert_eq!(declarations[3]["outcome"], "NoUsableAnswer");
+        assert_eq!(declarations[4]["outcome"], "WorkerRefused");
+        assert_eq!(json["ecu_reads"][0]["matching"][0], hex(&doc.0));
+        assert_eq!(json["ecu_reads"][0]["answered"], true);
+        assert_eq!(
+            json["entries"][0]["state"],
+            serde_json::json!({"Identified": {"definition": "ecu", "variants": [hex(&doc.0)]}})
+        );
+        for state in [
+            EntryState::Ambiguous {
+                definitions: vec!["a".into(), "b".into()],
+            },
+            EntryState::UnrecognizedVariant {
+                endpoints: vec![EndpointKey {
+                    bus: bus(500_000),
+                    tx_id: 1,
+                    rx_id: 2,
+                }],
+            },
+            EntryState::AnsweredNotIdentified,
+            EntryState::NotAnswering,
+            EntryState::NotFitted,
+        ] {
+            let json = serde_json::to_value(&state).unwrap();
+            assert!(json.is_string() || json.is_object(), "{json}");
+        }
+        assert_eq!(
+            serde_json::to_value(EntryState::Ambiguous {
+                definitions: vec!["a".into()]
+            })
+            .unwrap(),
+            serde_json::json!({"Ambiguous": {"definitions": ["a"]}})
+        );
+    }
+
+    fn endpoint(tx: u32) -> EndpointKey {
+        EndpointKey {
+            bus: bus(500_000),
+            tx_id: tx,
+            rx_id: tx + 8,
+        }
+    }
+
+    /// A read of `definition` at the endpoint of `tx` (none for a refused link) with one
+    /// declaration that gave `outcome`.
+    fn read_of(
+        definition: &str,
+        tx: Option<u32>,
+        outcome: RequestOutcome,
+        matching: bool,
+        conclusive: bool,
+    ) -> EcuRead {
+        let answered = matches!(
+            outcome,
+            RequestOutcome::Decoded(_) | RequestOutcome::Undecodable | RequestOutcome::Negative(_)
+        );
+        EcuRead {
+            definition: definition.into(),
+            endpoint: tx.map(endpoint),
+            documents: vec![[1; 32]],
+            requests: vec![IdentificationRequest {
+                request: vec![0x22, 0xF1, 0x87],
+                declarations: vec![DeclarationOutcome {
+                    document: [1; 32],
+                    service: 1,
+                    outcome,
+                }],
+            }],
+            matching: if matching { vec![[1; 32]] } else { Vec::new() },
+            conclusive,
+            answered,
+        }
+    }
+
+    fn entry_of(optional: bool, alternatives: &[&str]) -> EntryResult {
+        EntryResult {
+            candidate: "c1".into(),
+            role: "engine".into(),
+            optional,
+            alternatives: alternatives.iter().map(|a| (*a).into()).collect(),
+            state: EntryState::NotRead,
+        }
+    }
+
+    fn state_of(optional: bool, alternatives: &[&str], reads: &[EcuRead]) -> EntryState {
+        let mut entries = [entry_of(optional, alternatives)];
+        evaluate_entries(&mut entries, reads);
+        let [entry] = entries;
+        entry.state
+    }
+
+    /// ADR-326 item 3 and ADR-327 item 3 as ADR-401 reads them, over hand-built reads.
+    #[test]
+    fn entry_states_follow_the_reads_of_the_alternatives() {
+        let decoded = || RequestOutcome::Decoded(Vec::new());
+        let both = ["D1", "D2"];
+        // One alternative with a matching variant identifies the entry; an inconclusive
+        // alternative beside it does not matter.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), true, true),
+            read_of(
+                "D2",
+                Some(0x7E0),
+                RequestOutcome::Negative(0x31),
+                false,
+                false,
+            ),
+        ];
+        assert_eq!(
+            state_of(false, &both, &reads),
+            EntryState::Identified {
+                definition: "D1".into(),
+                variants: vec![[1; 32]]
+            }
+        );
+        // Two matching alternatives make it ambiguous.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), true, true),
+            read_of("D2", Some(0x7E0), decoded(), true, true),
+        ];
+        assert_eq!(
+            state_of(false, &both, &reads),
+            EntryState::Ambiguous {
+                definitions: vec!["D1".into(), "D2".into()]
+            }
+        );
+        // Answered, every read there conclusive, no match.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, true),
+            read_of("D2", Some(0x7E0), decoded(), false, true),
+        ];
+        assert_eq!(
+            state_of(false, &both, &reads),
+            EntryState::UnrecognizedVariant {
+                endpoints: vec![endpoint(0x7E0)]
+            }
+        );
+        // One alternative inconclusive: answered but not identified.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, true),
+            read_of(
+                "D2",
+                Some(0x7E0),
+                RequestOutcome::Negative(0x31),
+                false,
+                false,
+            ),
+        ];
+        assert_eq!(
+            state_of(false, &both, &reads),
+            EntryState::AnsweredNotIdentified
+        );
+        // Two endpoints, one answered and settled and one answered and not: not identified.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, true),
+            read_of("D1", Some(0x7E1), RequestOutcome::Undecodable, false, false),
+        ];
+        assert_eq!(
+            state_of(false, &["D1"], &reads),
+            EntryState::AnsweredNotIdentified
+        );
+        // An endpoint that did not answer does not unsettle the one that did.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, true),
+            read_of(
+                "D1",
+                Some(0x7E1),
+                RequestOutcome::NoUsableAnswer,
+                false,
+                false,
+            ),
+        ];
+        assert_eq!(
+            state_of(false, &["D1"], &reads),
+            EntryState::UnrecognizedVariant {
+                endpoints: vec![endpoint(0x7E0)]
+            }
+        );
+        // A variant whose link is refused leaves the definition inconclusive at its endpoints.
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, false),
+            read_of("D1", None, RequestOutcome::LinkRefused, false, false),
+        ];
+        assert_eq!(
+            state_of(false, &["D1"], &reads),
+            EntryState::AnsweredNotIdentified
+        );
+        // Sent, nothing answered: not answering, or not fitted when optional.
+        let silent = [read_of(
+            "D1",
+            Some(0x7E0),
+            RequestOutcome::NoUsableAnswer,
+            false,
+            false,
+        )];
+        assert_eq!(state_of(false, &["D1"], &silent), EntryState::NotAnswering);
+        assert_eq!(state_of(true, &["D1"], &silent), EntryState::NotFitted);
+        // Nothing sent: not read, whether never run, refused by the link or by the worker.
+        for outcome in [
+            RequestOutcome::NotRead,
+            RequestOutcome::LinkRefused,
+            RequestOutcome::WorkerRefused,
+        ] {
+            let reads = [read_of("D1", Some(0x7E0), outcome, false, false)];
+            assert_eq!(state_of(false, &["D1"], &reads), EntryState::NotRead);
+        }
+        // Reads of definitions the entry does not list do not count.
+        let reads = [read_of("Z", Some(0x7E0), decoded(), true, true)];
+        assert_eq!(state_of(false, &["D1"], &reads), EntryState::NotRead);
+    }
+
+    /// An alternative with no physical read makes the entry not read, whatever the others show;
+    /// a refused-link alternative beside a conclusive read without a match is inconclusive
+    /// (ADR-401).
+    #[test]
+    fn an_unread_or_refused_alternative_decides_the_entry() {
+        let decoded = || RequestOutcome::Decoded(Vec::new());
+        let both = ["D1", "D2"];
+        for unread in [RequestOutcome::NotRead, RequestOutcome::WorkerRefused] {
+            let reads = [
+                read_of("D1", Some(0x7E0), decoded(), true, true),
+                read_of("D2", Some(0x7E1), unread, false, false),
+            ];
+            assert_eq!(state_of(false, &both, &reads), EntryState::NotRead);
+        }
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, true),
+            read_of("D2", None, RequestOutcome::LinkRefused, false, false),
+        ];
+        assert_eq!(
+            state_of(false, &both, &reads),
+            EntryState::AnsweredNotIdentified
+        );
+        // A refused variant with no request (no pattern) counts for nothing.
+        let mut bare = read_of("D2", None, RequestOutcome::LinkRefused, false, false);
+        bare.requests.clear();
+        let reads = [read_of("D1", Some(0x7E0), decoded(), false, true), bare];
+        assert_eq!(
+            state_of(false, &["D1", "D2"], &reads),
+            EntryState::UnrecognizedVariant {
+                endpoints: vec![endpoint(0x7E0)]
+            }
+        );
+        // A pattern-less alternative is skipped, so another one's match decides.
+        let mut bare = read_of("D2", Some(0x7E1), decoded(), false, false);
+        bare.requests.clear();
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), true, true),
+            bare.clone(),
+        ];
+        assert!(matches!(
+            state_of(false, &both, &reads),
+            EntryState::Identified { .. }
+        ));
+        // All alternatives pattern-less: nothing was read.
+        assert_eq!(state_of(false, &["D2"], &[bare]), EntryState::NotRead);
+    }
+
+    /// A decoded field can hold the VIN: `Debug` of the report shows no value, the JSON does.
+    #[test]
+    fn debug_hides_a_decoded_field_value() {
+        let doc = named(document(0x90, 0x7E0, 0x7E8, |_| {}));
+        let mut report = checked_reading(std::slice::from_ref(&doc))
+            .unwrap()
+            .report();
+        let vin = "WVWZZZ1JZ3W386752";
+        let field = |value| IdentificationField {
+            id: 1,
+            short_name: "value".into(),
+            value,
+        };
+        report.ecu_reads[0].requests[0].declarations[0].outcome = RequestOutcome::Decoded(vec![
+            field(FieldValue::Text(vin.into())),
+            field(FieldValue::Bytes(vin.as_bytes().to_vec())),
+            field(FieldValue::Group(vec![field(FieldValue::Unsigned(
+                0x5757_575A,
+            ))])),
+        ]);
+        let debug = format!("{report:?}");
+        assert!(
+            !debug.contains("WVWZZZ") && !debug.contains("5757"),
+            "{debug}"
+        );
+        assert!(debug.contains("Text(<17 bytes>)"));
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains(vin));
     }
 }

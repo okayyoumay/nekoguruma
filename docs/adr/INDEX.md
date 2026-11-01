@@ -396,6 +396,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-404](ADR-404-a-hung-test-fails-the-ci-job-instead-of-holding-it.md) | A Hung Test Fails the CI Job Instead of Holding It | Accepted | `.config/nextest.toml` CI profiles, `.github/workflows/ci.yml` (`core-linux`, `core-windows`) |
 | [ADR-405](ADR-405-a-zero-seed-ends-security-access-as-unlocked.md) | A Zero Seed Ends `diag.security_access` as Unlocked | Accepted | `diag-frontend` profile and lowering, Starlark subset 3.2, 3.4 and 6; design 8.10; ADR-314 items 4 and 5, ADR-390, ADR-397 |
 | [ADR-406](ADR-406-the-declared-link-rules-live-in-diag-ir-and-the-conversion-applies-them.md) | The Declared-Link Rules Live in `diag-ir` and the Conversion Applies Them | Accepted | `diag-ir` `link`, `agent` link (`LinkConfig::declared`, `validate`), `diag-frontend` resolve and `comparams.csv`; design 8.2.4; ADR-295, ADR-324 consequence 3, ADR-397 |
+| [ADR-407](ADR-407-a-blocked-item-stays-p1-only-while-the-milestone-can-unblock-it.md) | A Blocked Item Stays P1 Only While the Milestone Can Unblock It | Accepted | `work/README.md` (priorities), `.claude/skills/milestone-exit`, `.claude/skills/backlog`, `.claude/skills/backlog-triage`; ADR-388 |
 | [ADR-408](ADR-408-a-suppressed-request-s-silence-within-the-limit-in-force-is-its-result.md) | A Suppressed Request's Silence Within the Limit in Force Is Its Result | Accepted | `diag-ir` (`suppresses_positive_response`, `dry_run`), `agent` host (`exchange`, `Sent`), `sim-ecu` `Fault::ResponsePending`; design 8.2.4 and 8.11; ADR-235 item 3, ADR-328 item 2, ADR-392, ADR-397 |
 
 ## Status Legend
@@ -762,6 +763,7 @@ the predecessor repository these ADRs came from.
 - ADR-388
 - ADR-397
 - ADR-404
+- ADR-407
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

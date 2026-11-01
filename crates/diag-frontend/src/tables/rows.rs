@@ -22,6 +22,13 @@ fn as_u8(min: u8, max: u8) -> impl Fn(&str) -> Parsed<u8> {
     move |cell| values::integer(cell, false, min.into(), max.into()).map(|v| v as u8)
 }
 
+/// The largest CAN identifier a protocol row takes: the agent's link sets 11-bit ones only
+/// (`diag_ir::link`, ADR-406).
+const MAX_CAN_ID: u16 = {
+    assert!(diag_ir::link::MAX_CAN_ID <= u16::MAX as u32);
+    diag_ir::link::MAX_CAN_ID as u16
+};
+
 fn as_u16(max: u16) -> impl Fn(&str) -> Parsed<u16> {
     move |cell| values::integer(cell, false, 0, max.into()).map(|v| v as u16)
 }
@@ -162,9 +169,9 @@ pub(crate) fn protocols(sheet: &Sheet, errors: &mut Errors) -> Vec<ProtocolRow> 
         let variants = scope(row, e);
         let name = row.required(e, "name", values::text);
         let baud_rate = row.required(e, "baud_rate", as_u32(1));
-        let tx_id = row.required(e, "tx_id", as_u16(0x7FF));
-        let rx_id = row.required(e, "rx_id", as_u16(0x7FF));
-        let functional_id = row.or(e, "functional_id", 0, as_u16(0x7FF));
+        let tx_id = row.required(e, "tx_id", as_u16(MAX_CAN_ID));
+        let rx_id = row.required(e, "rx_id", as_u16(MAX_CAN_ID));
+        let functional_id = row.or(e, "functional_id", 0, as_u16(MAX_CAN_ID));
         let extended_addressing = row.or(e, "extended_addressing", false, values::boolean);
         let application_layer = row.or(
             e,
@@ -194,18 +201,45 @@ pub struct ComParamRow {
     pub protocol: String,
     pub name: String,
     pub value: i64,
-    pub unit: Option<String>,
+}
+
+/// `row` as `diag_ir::link` judges it, with the ComParam rows among `variant_comparams` (a
+/// variant's, in row order) that name it, in the order they are appended to its `params`. The
+/// one place a protocol is assembled for the declared-link rules: the resolve stage judges what
+/// it returns and the conversion writes the same values into the IR (ADR-406, ADR-397).
+pub(crate) fn declared_protocol<'a>(
+    row: &'a ProtocolRow,
+    variant_comparams: impl IntoIterator<Item = &'a ComParamRow>,
+) -> (diag_ir::link::DeclaredProtocol<'a>, Vec<&'a ComParamRow>) {
+    let params: Vec<&ComParamRow> = variant_comparams
+        .into_iter()
+        .filter(|param| param.protocol == row.name)
+        .collect();
+    let declared = diag_ir::link::DeclaredProtocol {
+        short_name: Some(&row.name),
+        application_layer: Some(&row.application_layer),
+        baud_rate: row.baud_rate,
+        tx_id: row.tx_id.into(),
+        rx_id: row.rx_id.into(),
+        functional_id: row.functional_id.into(),
+        extended_addressing: row.extended_addressing,
+        // No unit: a ComParam is given in its own unit (ADR-324, ADR-406).
+        params: params
+            .iter()
+            .map(|param| diag_ir::link::DeclaredComParam {
+                short_name: Some(&param.name),
+                value: param.value,
+                unit_id: 0,
+            })
+            .collect(),
+    };
+    (declared, params)
 }
 
 pub(crate) const COMPARAMS: Spec = Spec {
     file: "comparams.csv",
     scoped: true,
-    columns: &[
-        ("protocol", true),
-        ("name", true),
-        ("value", true),
-        ("unit", false),
-    ],
+    columns: &[("protocol", true), ("name", true), ("value", true)],
 };
 
 pub(crate) fn comparams(sheet: &Sheet, errors: &mut Errors) -> Vec<ComParamRow> {
@@ -214,16 +248,14 @@ pub(crate) fn comparams(sheet: &Sheet, errors: &mut Errors) -> Vec<ComParamRow> 
         let protocol = row.required(e, "protocol", values::text);
         let name = row.required(e, "name", values::text);
         let value = row.required(e, "value", |c| {
-            values::integer(c, true, i64::MIN.into(), i64::MAX.into()).map(|v| v as i64)
+            values::integer(c, false, 0, u32::MAX.into()).map(|v| v as i64)
         });
-        let unit = row.optional(e, "unit", values::key);
         Some(ComParamRow {
             line: row.line,
             variants: variants?,
             protocol: protocol?,
             name: name?,
             value: value?,
-            unit: unit.ok()?,
         })
     })
 }

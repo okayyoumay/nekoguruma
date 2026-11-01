@@ -1,7 +1,7 @@
 # ADR-395: The Identification Plan Format, Its Checks and the Endpoint Key
 
 **Date:** 2026-10-30
-**Status:** Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396; item 3's checks gain an entry that lists an alternative twice, by ADR-401; item 3's checks gain the field-rule source checks and the entry-listed source of ADR-403)
+**Status:** Accepted (item 6's halving trigger made concrete, and the presence request given its form, by ADR-396; item 3's checks gain an entry that lists an alternative twice, by ADR-401; item 3's checks gain the field-rule source checks and the entry-listed source of ADR-403; the too-wide functional identifier stays a whole-plan refusal before any link is judged, ADR-406)
 **Affects:** `diag-ir` (`plan`), `agent` (`identification`), `crates/agent/docs/ngr-agent.md`,
 `docs/glossary.md`, design 8.8.2; ADR-318, ADR-319, ADR-324, ADR-326, ADR-327
 

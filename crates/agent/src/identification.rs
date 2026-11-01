@@ -52,7 +52,7 @@ use crate::inputs::{
     vin_source_field,
 };
 use crate::journal::Vin;
-use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig, MAX_CAN_ID};
+use crate::link::{BUS_TYPE_DWCAN, CloseEvidence, LinkConfig};
 use crate::policy::{ApplicationLayer, PRESENCE_REQUEST};
 use crate::runner::{
     CancelOnDrop, GuardSlot, JobError, JobLimits, JobLink, LinkRefused, WORKER_EXIT_GRACE,
@@ -577,20 +577,23 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
     let mut refused_links = Vec::new();
     for (hash, document) in &loaded.documents {
         let variant = document.variant();
+        // A functional identifier too wide refuses the whole plan before any link is judged,
+        // whatever else the document's link has wrong (ADR-395, ADR-406). A document with no
+        // protocol or several has none to judge; `declared` refuses it below.
+        let protocols: Vec<_> = variant.protocols().into_iter().flatten().collect();
+        let functional_id =
+            diag_ir::link::only_protocol(&protocols).map_or(0, |only| only.functional_id());
+        if diag_ir::link::wide_identifier(diag_ir::link::Identifier::Functional, functional_id)
+            .is_some()
+        {
+            return Err(PlanRefused::BadFunctionalId {
+                document: hex(hash),
+                functional_id,
+                why: "only 11-bit identifiers are supported, as for the physical ones",
+            });
+        }
         match LinkConfig::declared(&variant) {
             Ok(link) => {
-                // `declared` accepted exactly one protocol.
-                let functional_id = variant
-                    .protocols()
-                    .and_then(|protocols| protocols.iter().next())
-                    .map_or(0, |protocol| protocol.functional_id());
-                if functional_id > MAX_CAN_ID {
-                    return Err(PlanRefused::BadFunctionalId {
-                        document: hex(hash),
-                        functional_id,
-                        why: "only 11-bit identifiers are supported, as for the physical ones",
-                    });
-                }
                 let new_bus = BusKey::of(&link);
                 for other in &links {
                     let bus = BusKey::of(&other.link);
@@ -4208,6 +4211,23 @@ mod tests {
             checked(&[own]),
             Err(PlanRefused::BadFunctionalId {
                 functional_id: 0x7E0,
+                ..
+            })
+        ));
+    }
+
+    /// ADR-395: the refusal comes before any link is judged, so another refusal of the same
+    /// document's link does not hide it.
+    #[test]
+    fn a_wide_functional_id_refuses_the_plan_beside_another_link_refusal() {
+        let both = named(document(0x90, 0x7E0, 0x7E8, |p| {
+            p.functional_id = 0x800;
+            p.extended_addressing = true;
+        }));
+        assert!(matches!(
+            checked(&[both]),
+            Err(PlanRefused::BadFunctionalId {
+                functional_id: 0x800,
                 ..
             })
         ));

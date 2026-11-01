@@ -305,6 +305,15 @@ fn ranges_follow_each_column() {
         protocol("CAN,500000,0x7E0,0x7E8,0X7DF"),
         vec![cell(BadValue, 2, "functional_id")]
     );
+    assert_eq!(
+        protocol("CAN,500000,0x7E0,0x800,"),
+        vec![cell(BadValue, 2, "rx_id")]
+    );
+    assert_eq!(
+        protocol("CAN,500000,0x7E0,0x7E8,0x800"),
+        vec![cell(BadValue, 2, "functional_id")]
+    );
+    assert!(protocol("CAN,500000,0x7FF,0x7FF,0x7FF").is_empty());
     let service = |sid: &str| table_errors("services.csv", "name,sid", &[&format!("s,{sid}")]);
     assert_eq!(service("0x3F"), vec![cell(BadValue, 2, "sid")]);
     assert_eq!(service("0xC0"), vec![cell(BadValue, 2, "sid")]);
@@ -316,11 +325,18 @@ fn ranges_follow_each_column() {
             &[&format!("ISO15765,CP,{value}")],
         )
     };
-    assert!(comparam("-9223372036854775808").is_empty());
-    assert_eq!(
-        comparam("0x8000000000000000"),
-        vec![cell(BadValue, 2, "value")]
-    );
+    // A ComParam value is a 32-bit unsigned one: the link sets nothing wider (ADR-406).
+    assert!(comparam("0").is_empty());
+    assert!(comparam("4294967295").is_empty());
+    for value in [
+        "-1",
+        "-9223372036854775808",
+        "4294967296",
+        "0x100000000",
+        "0x8000000000000000",
+    ] {
+        assert_eq!(comparam(value), vec![cell(BadValue, 2, "value")], "{value}");
+    }
 }
 
 #[test]
@@ -856,13 +872,18 @@ fn every_variant_needs_a_protocol_and_comparams_follow_their_protocol() {
             at(MissingColumn, "variants.csv", Some(3), Some("name")),
         ]
     );
+}
+
+/// The column is gone (ADR-406): a ComParam is given in its own unit.
+#[test]
+fn a_comparam_has_no_unit_column() {
     assert_eq!(
-        resolved_with(
+        table_errors(
             "comparams.csv",
             "protocol,name,value,unit",
-            &["ISO15765,CP_StMin,0,millisecond", "ISO15765,CP_Bs,0,parsec"],
+            &["ISO15765,CP_StMin,0,millisecond"],
         ),
-        vec![at(UnknownReference, "comparams.csv", Some(3), Some("unit"))]
+        vec![cell(UnknownColumn, 1, "unit")]
     );
 }
 
@@ -1263,7 +1284,7 @@ fn example_text(file: &str) -> String {
 }
 
 #[test]
-fn a_variant_s_protocols_name_one_application_layer_a_profile_ships_for() {
+fn a_protocol_names_an_application_layer_a_profile_ships_for() {
     // Without the column, or with it, a protocol carries UDS.
     let definition = resolve(read_files(example()).expect("reads")).expect("resolves");
     assert!(
@@ -1296,15 +1317,90 @@ fn a_variant_s_protocols_name_one_application_layer_a_profile_ships_for() {
             Some("application_layer")
         )]
     );
-    // Two layers in one variant, reported on the protocol whose layer differs from the first.
-    // Only exampleEcuV2 has both.
-    let mut found = resolved_with(
-        "protocols.csv",
-        header,
-        &[
-            ",ISO15765,500000,0x7E0,0x7E8,UDS",
-            "exampleEcuV2,KLINE,10400,0x7E1,0x7E9,KWP2000",
-        ],
+}
+
+// ---------------------------------------------------------------- The declared link (ADR-406)
+
+/// The errors of resolving the example with `protocols.csv` and `comparams.csv` replaced; the
+/// protocol rows have the columns `variants,name,baud_rate,tx_id,rx_id,functional_id,
+/// extended_addressing,application_layer`.
+fn linked(
+    protocols: &[&str],
+    comparams: &[&str],
+) -> Vec<(ErrorCode, String, Option<u32>, Option<String>)> {
+    let table = |header: &str, rows: &[&str]| {
+        let mut contents = format!("{header}\n");
+        for row in rows {
+            contents.push_str(row);
+            contents.push('\n');
+        }
+        contents.into_bytes()
+    };
+    let mut files = without("protocols.csv");
+    files.retain(|(n, _)| n != "comparams.csv");
+    files.push((
+        "protocols.csv".into(),
+        table(
+            "variants,name,baud_rate,tx_id,rx_id,functional_id,extended_addressing,\
+             application_layer",
+            protocols,
+        ),
+    ));
+    files.push((
+        "comparams.csv".into(),
+        table("variants,protocol,name,value", comparams),
+    ));
+    resolved(files)
+}
+
+const UDS_ROW: &str = ",ISO15765,500000,0x7E0,0x7E8,,,";
+
+/// The errors of a ComParam row `,ISO15765,{name},{value}` beside the example's protocol.
+fn comparam_errors(
+    name: &str,
+    value: &str,
+) -> Vec<(ErrorCode, String, Option<u32>, Option<String>)> {
+    linked(&[UDS_ROW], &[&format!(",ISO15765,{name},{value}")])
+}
+
+fn comparam_error(
+    code: ErrorCode,
+    column: &str,
+) -> Vec<(ErrorCode, String, Option<u32>, Option<String>)> {
+    vec![at(code, "comparams.csv", Some(2), Some(column))]
+}
+
+#[test]
+fn a_variant_declares_one_protocol() {
+    // Two protocols over all variants: the second is refused, once.
+    assert_eq!(
+        linked(
+            &[UDS_ROW, ",ISO_14229_3_on_ISO_15765_2,250000,0x7E1,0x7E9,,,"],
+            &[",ISO15765,CP_StMin,0"],
+        ),
+        vec![at(Unsupported, "protocols.csv", Some(3), Some("name"))]
+    );
+    // The same name twice is the duplicate of section 3, not also an unsupported protocol.
+    assert_eq!(
+        linked(&[UDS_ROW, UDS_ROW], &[",ISO15765,CP_StMin,0"]),
+        vec![at(Duplicate, "protocols.csv", Some(3), Some("name"))]
+    );
+    // A second protocol scoped to one variant is refused for it; the other variant is fine.
+    assert_eq!(
+        linked(
+            &[
+                UDS_ROW,
+                "exampleEcuV2,ISO_14229_3_on_ISO_15765_2,250000,0x7E1,0x7E9,,,"
+            ],
+            &[",ISO15765,CP_StMin,0"],
+        ),
+        vec![at(Unsupported, "protocols.csv", Some(3), Some("name"))]
+    );
+    // Two application layers in one variant are two protocols: the layer without a profile is
+    // reported where it is written, and the second protocol is refused.
+    let mut found = linked(
+        &[UDS_ROW, "exampleEcuV2,KLINE,10400,0x7E1,0x7E9,,,KWP2000"],
+        &[",ISO15765,CP_StMin,0"],
     );
     found.sort();
     assert_eq!(
@@ -1316,22 +1412,169 @@ fn a_variant_s_protocols_name_one_application_layer_a_profile_ships_for() {
                 Some(3),
                 Some("application_layer")
             ),
-            at(
-                Duplicate,
-                "protocols.csv",
-                Some(3),
-                Some("application_layer")
-            ),
+            at(Unsupported, "protocols.csv", Some(3), Some("name")),
         ]
     );
-    // A row that mixes both variants is reported once.
-    let mut found = resolved_with(
-        "protocols.csv",
-        header,
+}
+
+#[test]
+fn a_protocol_is_uds_on_can_by_one_of_its_two_names() {
+    for name in ["CAN", "ISO_15765_3_on_ISO_15765_2", "iso15765"] {
+        assert_eq!(
+            linked(
+                &[&format!(",{name},500000,0x7E0,0x7E8,,,")],
+                &[&format!(",{name},CP_StMin,0")]
+            ),
+            vec![at(Unsupported, "protocols.csv", Some(2), Some("name"))],
+            "{name}"
+        );
+    }
+    let accepted = "ISO_14229_3_on_ISO_15765_2";
+    assert_eq!(
+        linked(
+            &[&format!(",{accepted},500000,0x7E0,0x7E8,,,")],
+            &[&format!(",{accepted},CP_StMin,0")]
+        ),
+        vec![]
+    );
+}
+
+#[test]
+fn extended_addressing_is_unsupported_and_reported_once_for_a_shared_row() {
+    assert_eq!(
+        linked(
+            &[",ISO15765,500000,0x7E0,0x7E8,,yes,"],
+            &[",ISO15765,CP_StMin,0"]
+        ),
+        vec![at(
+            Unsupported,
+            "protocols.csv",
+            Some(2),
+            Some("extended_addressing")
+        )]
+    );
+}
+
+#[test]
+fn a_comparam_declared_twice_is_a_duplicate_ignoring_case() {
+    assert_eq!(
+        linked(
+            &[UDS_ROW],
+            &[",ISO15765,CP_StMin,0", ",ISO15765,cp_stmin,1"]
+        ),
+        vec![at(Duplicate, "comparams.csv", Some(3), Some("name"))]
+    );
+    // Only in the variant whose document holds both rows: once, and the other variant is fine.
+    assert_eq!(
+        linked(
+            &[UDS_ROW],
+            &[
+                "exampleEcuV1,ISO15765,CP_StMin,0",
+                "exampleEcuV1,ISO15765,cp_stmin,1"
+            ]
+        ),
+        vec![at(Duplicate, "comparams.csv", Some(3), Some("name"))]
+    );
+}
+
+#[test]
+fn a_timing_comparam_is_one_millisecond_to_the_widest_the_worker_holds() {
+    for name in ["CP_P2Max", "cp_p2star", "CP_RC78CompletionTimeout"] {
+        assert_eq!(
+            comparam_errors(name, "0"),
+            comparam_error(BadValue, "value")
+        );
+        assert_eq!(
+            comparam_errors(name, "4294967001"),
+            comparam_error(BadValue, "value")
+        );
+        assert_eq!(
+            comparam_errors(name, "4294967295"),
+            comparam_error(BadValue, "value")
+        );
+        assert_eq!(comparam_errors(name, "1"), vec![]);
+        assert_eq!(comparam_errors(name, "4294967000"), vec![]);
+    }
+}
+
+#[test]
+fn a_comparam_the_link_sets_or_that_outlasts_the_host_is_unsupported() {
+    use diag_ir::link::{OUTLAST_THE_HOST, SET_BY_LINK, timing_of};
+    for name in SET_BY_LINK.into_iter().chain(OUTLAST_THE_HOST) {
+        // A timing is a timing although the link also sets it.
+        if timing_of(name).is_some() {
+            continue;
+        }
+        for spelled in [
+            name.to_owned(),
+            name.to_ascii_lowercase(),
+            name.to_ascii_uppercase(),
+        ] {
+            assert_eq!(
+                comparam_errors(&spelled, "1"),
+                comparam_error(Unsupported, "name"),
+                "{spelled}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_comparam_name_is_the_standards_prefix_in_any_case() {
+    for name in ["DATA_RATE", "cp", "XCP_Y", "CP"] {
+        assert_eq!(
+            comparam_errors(name, "1"),
+            comparam_error(BadValue, "name"),
+            "{name}"
+        );
+    }
+    for name in ["cp_blocksize", "CP_Cr", "Cp_Bs"] {
+        assert_eq!(comparam_errors(name, "1"), vec![], "{name}");
+    }
+}
+
+#[test]
+fn a_row_naming_an_unknown_variant_still_has_its_link_judged_for_the_variants_it_names() {
+    // Line 2 is refused whichever variant line 3 was meant for; line 3 is reported too.
+    let mut found = linked(
+        &[UDS_ROW],
         &[
-            ",ISO15765,500000,0x7E0,0x7E8,UDS",
-            ",KLINE,10400,0x7E1,0x7E9,KWP2000",
+            ",ISO15765,CP_Baudrate,0",
+            "exampleEcuV3,ISO15765,CP_StMin,0",
         ],
+    );
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            at(UnknownReference, "comparams.csv", Some(3), Some("variants")),
+            at(Unsupported, "comparams.csv", Some(2), Some("name")),
+        ]
+    );
+}
+
+#[test]
+fn a_duplicate_comparam_is_reported_beside_an_unknown_variant_or_a_layer_without_profile() {
+    let mut found = linked(
+        &[UDS_ROW],
+        &[
+            ",ISO15765,CP_StMin,0",
+            ",ISO15765,CP_StMin,1",
+            "exampleEcuV3,ISO15765,CP_Bs,0",
+        ],
+    );
+    found.sort();
+    assert_eq!(
+        found,
+        vec![
+            at(UnknownReference, "comparams.csv", Some(4), Some("variants")),
+            at(Duplicate, "comparams.csv", Some(3), Some("name")),
+        ]
+    );
+    // A layer no profile ships for is reported where it is written, not also as not UDS.
+    let mut found = linked(
+        &[",ISO15765,500000,0x7E0,0x7E8,,,KWP2000"],
+        &[",ISO15765,CP_StMin,0", ",ISO15765,CP_StMin,1"],
     );
     found.sort();
     assert_eq!(
@@ -1340,45 +1583,44 @@ fn a_variant_s_protocols_name_one_application_layer_a_profile_ships_for() {
             at(
                 UnknownReference,
                 "protocols.csv",
-                Some(3),
+                Some(2),
                 Some("application_layer")
             ),
-            at(
-                Duplicate,
-                "protocols.csv",
-                Some(3),
-                Some("application_layer")
-            ),
+            at(Duplicate, "comparams.csv", Some(3), Some("name")),
         ]
     );
-    // A scope that also names an unknown variant still mixes the variants it does name.
-    let mut found = resolved_with(
-        "protocols.csv",
-        header,
-        &[
-            ",ISO15765,500000,0x7E0,0x7E8,UDS",
-            "exampleEcuV2;typo,KLINE,10400,0x7E1,0x7E9,KWP2000",
-        ],
+}
+
+#[test]
+fn two_refusals_of_one_cell_are_both_reported_once_for_a_shared_row() {
+    // A second protocol named CAN: already declared a protocol, and not UDS on CAN. The row is
+    // in both variants and each refusal appears once.
+    let tables = {
+        let mut files = without("protocols.csv");
+        files.push((
+            "protocols.csv".into(),
+            b"name,baud_rate,tx_id,rx_id\nISO15765,500000,0x7E0,0x7E8\nCAN,500000,0x7E1,0x7E9\n"
+                .to_vec(),
+        ));
+        resolve(read_files(files).expect("reads"))
+    };
+    let rejected = tables.expect_err("rejected");
+    let hints: Vec<&str> = rejected
+        .errors
+        .iter()
+        .filter(|e| {
+            e.file == "protocols.csv" && e.line == Some(3) && e.column.as_deref() == Some("name")
+        })
+        .map(|e| e.hint.as_str())
+        .collect();
+    assert_eq!(hints.len(), 2, "{hints:?}");
+    assert!(
+        hints
+            .iter()
+            .any(|h| h.contains("already declares protocol ISO15765"))
     );
-    found.sort();
-    assert_eq!(
-        found,
-        vec![
-            at(
-                UnknownReference,
-                "protocols.csv",
-                Some(3),
-                Some("application_layer")
-            ),
-            at(UnknownReference, "protocols.csv", Some(3), Some("variants")),
-            at(
-                Duplicate,
-                "protocols.csv",
-                Some(3),
-                Some("application_layer")
-            ),
-        ]
-    );
+    assert!(hints.iter().any(|h| h.contains("is not UDS on CAN")));
+    assert_eq!(rejected.errors.len(), 2, "{:?}", rejected.errors);
 }
 
 #[test]

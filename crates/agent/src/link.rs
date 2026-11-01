@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::client::WorkerApi;
 use diag_ir::declaration::{EcuVariant, Protocol};
+use diag_ir::link as link_rules;
 use tonic::Streaming;
 use vci_service_interface::{
     ComLogicalLinkHandle, ConnectComLogicalLinkRequest, CreateComLogicalLinkRequest,
@@ -117,74 +118,30 @@ impl LinkConfig {
     /// its identifiers and baud rate. P2, P2* and the 0x78 completion timeout come from its
     /// ComParams `CP_P2Max`, `CP_P2Star` and `CP_RC78CompletionTimeout` in microseconds, rounded
     /// up to whole milliseconds, or from [`LinkConfig::iso15765`] when it declares none; its
-    /// other ComParams are set on the link as they are. ComParam names are compared ignoring
-    /// case, as the workers resolve them, and a ComParam with a unit is refused, since the agent
-    /// cannot convert units. The result is validated.
+    /// other ComParams are set on the link as they are. The rules are `diag_ir::link`'s, which
+    /// the CSV conversion applies too (ADR-406); the result is validated.
     pub fn declared(variant: &EcuVariant<'_>) -> Result<Self, HostError> {
         let refuse = |why: String| HostError::DeclaredLink(why);
         let protocols: Vec<Protocol<'_>> = variant.protocols().into_iter().flatten().collect();
-        let protocol = match protocols.as_slice() {
-            [only] => *only,
-            [] => return Err(refuse("the variant declares no protocol".to_owned())),
-            _ => {
-                return Err(refuse(
-                    "the variant declares several protocols; choosing one is not supported yet"
-                        .to_owned(),
-                ));
-            }
+        let protocol = link_rules::only_protocol(&protocols).map_err(|r| refuse(r.to_string()))?;
+        let declared = link_rules::check_protocol(&(*protocol).into()).map_err(|refusals| {
+            refuse(
+                refusals
+                    .first()
+                    .map(ToString::to_string)
+                    .unwrap_or_default(),
+            )
+        })?;
+        let defaults = Self::iso15765(declared.tx_id, declared.rx_id);
+        let ms = |us: Option<u32>, default: u32| us.map_or(default, |us| us.div_ceil(1_000));
+        let config = Self {
+            baud_rate: declared.baud_rate,
+            p2_max_ms: ms(declared.p2_max_us, defaults.p2_max_ms),
+            p2_star_ms: ms(declared.p2_star_us, defaults.p2_star_ms),
+            rc78_completion_ms: ms(declared.rc78_completion_us, defaults.rc78_completion_ms),
+            params: declared.params,
+            ..defaults
         };
-        let name = protocol.short_name().unwrap_or_default();
-        if !UDS_ON_CAN_NAMES.contains(&name) || protocol.application_layer() != Some("UDS") {
-            return Err(refuse(format!(
-                "protocol {name:?} carrying {:?} is not UDS on CAN",
-                protocol.application_layer().unwrap_or_default()
-            )));
-        }
-        if protocol.extended_addressing() {
-            return Err(refuse(
-                "extended addressing is not supported: the link does not set it".to_owned(),
-            ));
-        }
-        let mut config = Self {
-            baud_rate: protocol.baud_rate(),
-            params: Vec::new(),
-            ..Self::iso15765(protocol.tx_id(), protocol.rx_id())
-        };
-        let mut seen: Vec<&str> = Vec::new();
-        for param in protocol.params().into_iter().flatten() {
-            let name = param.short_name().unwrap_or_default();
-            if seen.iter().any(|seen| seen.eq_ignore_ascii_case(name)) {
-                return Err(refuse(format!("ComParam {name} is declared twice")));
-            }
-            seen.push(name);
-            // A unit is an id of the server's unit table, which the agent does not have: a
-            // value is taken in the ComParam's own unit (microseconds for a time).
-            if param.unit_id() != 0 {
-                return Err(refuse(format!(
-                    "ComParam {name} has a unit; give it in the ComParam's own unit, without one"
-                )));
-            }
-            let value = u32::try_from(param.value()).map_err(|_| {
-                refuse(format!(
-                    "ComParam {name} is {}, not a 32-bit unsigned value",
-                    param.value()
-                ))
-            })?;
-            let is = |standard: &str| name.eq_ignore_ascii_case(standard);
-            let timing = if is("CP_P2Max") {
-                Some(&mut config.p2_max_ms)
-            } else if is("CP_P2Star") {
-                Some(&mut config.p2_star_ms)
-            } else if is("CP_RC78CompletionTimeout") {
-                Some(&mut config.rc78_completion_ms)
-            } else {
-                None
-            };
-            match timing {
-                Some(ms) => *ms = value.div_ceil(1_000),
-                None => config.params.push((name.to_owned(), value)),
-            }
-        }
         config
             .validate()
             .map_err(|error| refuse(error.to_string()))?;
@@ -270,30 +227,26 @@ impl LinkConfig {
         if let Some(functional) = &self.functional {
             functional.validate()?;
         }
-        // The link sets these itself, from the fields above or for its response pending
-        // handling, and a further one would override it. The others would let a primitive run
-        // past the host's deadline: the worker would go on sending after the host gave up.
-        let named = |list: &[&str], name: &str| list.iter().any(|n| n.eq_ignore_ascii_case(name));
-        if self
-            .params
-            .iter()
-            .any(|(name, _)| named(&SET_BY_LINK, name) || named(&OUTLAST_THE_HOST, name))
-        {
-            return Err(HostError::Setup(
-                "a further ComParam is one the link sets itself, or one that lets a primitive \
-                 outlast the host's deadline (ADR-324 item 3)",
-            ));
-        }
-        // Only the standard's ComParams: the J2534 worker also resolves names of its own, which
-        // could name what the link sets under another name.
-        if self
-            .params
-            .iter()
-            .any(|(name, _)| !name.get(..3).is_some_and(|p| p.eq_ignore_ascii_case("CP_")))
-        {
-            return Err(HostError::Setup(
-                "a further ComParam must have a standard name, starting with CP_",
-            ));
+        // The link sets some itself, from the fields above or for its response pending
+        // handling, and a further one would override it; others would let a primitive run past
+        // the host's deadline: the worker would go on sending after the host gave up. Only the
+        // standard's ComParams: the J2534 worker also resolves names of its own, which could
+        // name what the link sets under another name.
+        for (name, _) in &self.params {
+            match link_rules::further_comparam(name) {
+                Ok(()) => {}
+                Err(link_rules::ComParamRefusal::NotStandardName) => {
+                    return Err(HostError::Setup(
+                        "a further ComParam must have a standard name, starting with CP_",
+                    ));
+                }
+                Err(_) => {
+                    return Err(HostError::Setup(
+                        "a further ComParam is one the link sets itself, or one that lets a \
+                         primitive outlast the host's deadline (ADR-324 item 3)",
+                    ));
+                }
+            }
         }
         Ok(())
     }
@@ -350,30 +303,7 @@ impl FunctionalAddressing {
     }
 }
 
-/// The one protocol the runner supports: UDS on CAN, by its ISO 22900-2 (2022) short name
-/// (Annex B.1). Both worker kinds resolve the link's resource from the standard names (ADR-319).
-pub const PROTOCOL_UDS_ON_CAN: &str = "ISO_14229_3_on_ISO_15765_2";
-/// The protocol names a document may declare UDS on CAN by (ADR-324 item 2): the transport's
-/// name the CSV tables use, or the ISO 22900-2 (2022) short name the link names its resource by
-/// (Annex B.1, ADR-319).
-const UDS_ON_CAN_NAMES: [&str; 2] = ["ISO15765", PROTOCOL_UDS_ON_CAN];
-/// The ComParams the link sets itself ([`set_up_link`]).
-const SET_BY_LINK: [&str; 14] = [
-    "CP_Baudrate",
-    "CP_P2Max",
-    "CP_P2Star",
-    "CP_RC78Handling",
-    "CP_RCByteOffset",
-    "CP_RC78CompletionTimeout",
-    "CP_RC21Handling",
-    "CP_RC23Handling",
-    "CP_TransmitIndEnable",
-    "CP_StartMsgIndEnable",
-    "CP_CanPhysReqId",
-    "CP_CanRespUSDTId",
-    "CP_RequestAddrMode",
-    "CP_CanFuncReqId",
-];
+pub use diag_ir::link::{MAX_CAN_ID, MAX_TIMING_MS, PROTOCOL_UDS_ON_CAN};
 /// `CP_RequestAddrMode`'s value for functional addressing (ISO 22900-2 (2022) Annex B ComParam
 /// table; the J2534 worker reads it the same way).
 const REQUEST_ADDR_MODE_FUNCTIONAL: u32 = 2;
@@ -381,19 +311,6 @@ const REQUEST_ADDR_MODE_FUNCTIONAL: u32 = 2;
 /// for the log"): transmit indications and start-of-message indications, which the J2534 worker
 /// passes on only under them (ADR-151). A library that refuses one opens the link without it.
 pub(crate) const INDICATION_COMPARAMS: [&str; 2] = ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"];
-/// ComParams that let a primitive run longer than [`LinkConfig::send_recv_ceiling`] allows:
-/// the limits and request times of repeating the request on a busy (0x21) or not-yet-complete
-/// (0x23) answer, which the link turns off (`CP_RC21Handling`, `CP_RC23Handling`), repeating it
-/// at the application or transport layer, and taking P2 and P2* from the ECU's session response.
-const OUTLAST_THE_HOST: [&str; 7] = [
-    "CP_RC21CompletionTimeout",
-    "CP_RC21RequestTime",
-    "CP_RC23CompletionTimeout",
-    "CP_RC23RequestTime",
-    "CP_RepeatReqCountApp",
-    "CP_RepeatReqCountTrans",
-    "CP_ModifyTiming",
-];
 /// The ID GetObjectId gives a name the implementation does not know (`PDU_ID_UNDEF`, ISO
 /// 22900-2 (2022) 8.4.23).
 const PDU_ID_UNDEF: u32 = 0xFFFF_FFFE;
@@ -402,12 +319,6 @@ pub const BUS_TYPE_DWCAN: &str = "ISO_11898_2_DWCAN";
 /// The DLC pins of dual-wire CAN and their pin types (ISO 22900-2 (2022) Annex B.2): CAN high
 /// on pin 6, CAN low on pin 14.
 pub const DWCAN_PINS: [(u32, &str); 2] = [(6, "HI"), (14, "LOW")];
-
-/// Longest timing the worker's microsecond ComParams can hold.
-pub const MAX_TIMING_MS: u32 = u32::MAX / 1_000;
-/// 11-bit IDs only: a 29-bit ID needs `CP_CanPhysReqFormat` / `CP_CanRespUSDTFormat`, which
-/// `open` does not set yet.
-pub(crate) const MAX_CAN_ID: u32 = 0x7FF;
 
 /// Where the response code sits in a negative response: `7F`, SID, code.
 const RC_BYTE_OFFSET: u32 = 2;
@@ -485,10 +396,8 @@ pub(crate) fn valued_by_document(variant: &EcuVariant<'_>) -> Vec<&'static str> 
     let mut named = vec!["CP_Baudrate"];
     for param in protocol.params().into_iter().flatten() {
         let name = param.short_name().unwrap_or_default();
-        for timing in ["CP_P2Max", "CP_P2Star", "CP_RC78CompletionTimeout"] {
-            if name.eq_ignore_ascii_case(timing) {
-                named.push(timing);
-            }
+        if let Some(timing) = link_rules::timing_of(name) {
+            named.push(timing.comparam());
         }
     }
     named
@@ -1528,6 +1437,8 @@ mod tests {
             vec![with(|p| p.extended_addressing = true)],
             // What `validate` refuses.
             vec![with(|p| p.tx_id = 0x800)],
+            vec![with(|p| p.functional_id = 0x800)],
+            vec![protocol(&[("CP_P2Max", 4_294_967_001)])],
             vec![with(|p| p.baud_rate = 0)],
             vec![protocol(&[("CP_P2Max", 0)])],
             vec![protocol(&[("CP_P2Star", 4_294_967_296)])],
@@ -1560,6 +1471,34 @@ mod tests {
                 matches!(error, HostError::DeclaredLink(_)),
                 "{protocols:?}: {error}"
             );
+        }
+    }
+
+    /// The names `diag_ir::link::SET_BY_LINK` refuses a document are the ones the link writes
+    /// itself: its own ComParams (physical and functional), the indications, and the two
+    /// identifiers the receive table carries. A name added on one side only fails here.
+    #[test]
+    fn the_names_set_by_link_are_the_ones_the_link_writes() {
+        let physical = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let mut written: Vec<&str> = own_comparams(&physical.functional(0x7DF, table()))
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        written.extend(own_comparams(&physical).into_iter().map(|(name, _)| name));
+        written.extend(INDICATION_COMPARAMS);
+        written.extend(["CP_CanPhysReqId", "CP_CanRespUSDTId"]);
+        written.sort_unstable();
+        written.dedup();
+        let mut listed = diag_ir::link::SET_BY_LINK.to_vec();
+        listed.sort_unstable();
+        assert_eq!(listed, written);
+        // The timings the document may value are among the link's own.
+        let own: Vec<&str> = own_comparams(&physical)
+            .into_iter()
+            .map(|(n, _)| n)
+            .collect();
+        for name in diag_ir::link::TIMING_COMPARAMS {
+            assert!(own.contains(&name), "{name}");
         }
     }
 

@@ -30,7 +30,7 @@ use sha2::{Digest, Sha256};
 
 use crate::star::{self, RequestIndex, StarError};
 use crate::tables::Definition;
-use crate::tables::rows::CatalogRow;
+use crate::tables::rows::{CatalogRow, declared_protocol};
 
 /// The `source_format` of a document converted from CSV tables and Starlark (ADR-254).
 pub const SOURCE_FORMAT: &str = "csv-starlark";
@@ -302,33 +302,45 @@ fn merge(per_variant: Vec<(&str, Vec<StarError>)>, variants: usize) -> Vec<StarE
 /// and its digest to each.
 fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
     let tables = &definition.tables;
-    let unit_ids: HashMap<&str, u32> = tables
-        .units
-        .iter()
-        .map(|row| (row.key.as_str(), row.id))
-        .collect();
     let index = services::Index::new(definition);
     let dtcs_and_flash = dtcs_and_flash::DtcsAndFlash::new(definition, &index);
     let mut documents = Vec::new();
     for (at, (variant, rows)) in tables.variants.iter().zip(&definition.variants).enumerate() {
-        let mut protocols: Vec<ProtocolT> = rows
+        let protocols: Vec<ProtocolT> = rows
             .protocols
             .iter()
             .map(|&i| {
                 let row = &tables.protocols[i];
+                // The values the agent's link rules judged at resolving (ADR-406). A variant's
+                // protocol names are unique (section 3), and every ComParam names one of them
+                // (4.3), so each ComParam goes to exactly one protocol, in row order.
+                let (declared, _) =
+                    declared_protocol(row, rows.comparams.iter().map(|&c| &tables.comparams[c]));
                 let mut protocol = ProtocolT::default();
-                protocol.short_name = Some(row.name.clone());
-                protocol.baud_rate = row.baud_rate;
-                protocol.tx_id = row.tx_id.into();
-                protocol.rx_id = row.rx_id.into();
-                protocol.functional_id = row.functional_id.into();
-                protocol.extended_addressing = row.extended_addressing;
-                protocol.params = Some(Vec::new());
+                protocol.short_name = declared.short_name.map(str::to_owned);
+                protocol.baud_rate = declared.baud_rate;
+                protocol.tx_id = declared.tx_id;
+                protocol.rx_id = declared.rx_id;
+                protocol.functional_id = declared.functional_id;
+                protocol.extended_addressing = declared.extended_addressing;
+                protocol.params = Some(
+                    declared
+                        .params
+                        .iter()
+                        .map(|declared| {
+                            let mut param = ComParamT::default();
+                            param.short_name = declared.short_name.map(str::to_owned);
+                            param.value = declared.value;
+                            param.unit_id = declared.unit_id;
+                            param
+                        })
+                        .collect(),
+                );
                 // The layer names a shipped profile (4.3), whose shape and pending codes the
                 // agent reads answers with (ADR-309 item 4).
                 let profile = crate::profile::get(&row.application_layer)
                     .expect("resolving checks that a profile ships for every protocol's layer");
-                protocol.application_layer = Some(row.application_layer.clone());
+                protocol.application_layer = declared.application_layer.map(str::to_owned);
                 let mut shape = NegativeShapeT::default();
                 shape.marker = profile.negative.marker;
                 shape.echoes_sid = profile.negative.echoes_sid;
@@ -338,25 +350,6 @@ fn declarations(definition: &Definition) -> Vec<EcuDocumentT> {
                 protocol
             })
             .collect();
-        // A variant's protocol names are unique (section 3), and every ComParam names one of
-        // them (4.3), so each is appended to exactly one protocol, in row order.
-        let by_name: HashMap<&str, usize> = rows
-            .protocols
-            .iter()
-            .enumerate()
-            .map(|(at, &i)| (tables.protocols[i].name.as_str(), at))
-            .collect();
-        for &i in &rows.comparams {
-            let row = &tables.comparams[i];
-            let mut param = ComParamT::default();
-            param.short_name = Some(row.name.clone());
-            param.value = row.value;
-            param.unit_id = row.unit.as_deref().map_or(0, |key| unit_ids[key]);
-            protocols[by_name[row.protocol.as_str()]]
-                .params
-                .get_or_insert_with(Vec::new)
-                .push(param);
-        }
         let mut ecu = EcuVariantT::default();
         ecu.id = variant.id;
         ecu.short_name = Some(variant.name.clone());

@@ -2589,15 +2589,46 @@ fn named_by(plan: &CheckedPlan, remaining: &[String], definition: &str) -> usize
         .count()
 }
 
+/// The distinct candidate sets left by combining, per endpoint, one of its alternatives: each
+/// alternative is the set of candidates it drops. Starts from `remaining` and, for each endpoint,
+/// replaces every set by itself minus each alternative's drops, deduplicated after each endpoint,
+/// so the collection never exceeds the distinct subsets reachable (not the product of the
+/// alternatives). Empty when there is no endpoint. Caller: `outcome_sets`.
+fn fold_outcomes(remaining: &[String], endpoints: &[Vec<Vec<String>>]) -> Vec<Vec<String>> {
+    if endpoints.is_empty() {
+        return Vec::new();
+    }
+    let mut sets: Vec<Vec<String>> = vec![remaining.to_vec()];
+    for alternatives in endpoints {
+        let mut next: Vec<Vec<String>> = Vec::new();
+        for set in &sets {
+            for dropped in alternatives {
+                let left: Vec<String> = set
+                    .iter()
+                    .filter(|candidate| !dropped.contains(candidate))
+                    .cloned()
+                    .collect();
+                if !next.contains(&left) {
+                    next.push(left);
+                }
+            }
+        }
+        sets = next;
+    }
+    sets
+}
+
 /// The distinct candidate sets the conclusive outcomes of reading `definition` would leave over
 /// `remaining` (ADR-327 item 4). Per endpoint of the definition (its planned reads with an
 /// endpoint and a request) the alternatives are identified there, and ruled out there where the
-/// read can be conclusive (no planned read of the definition without an endpoint but with a
-/// request, the rule of ADR-401); the outcomes are the product over its endpoints, each judged by
-/// `contradictions` over the facts so far and the outcome. No answer and an inconclusive read are
-/// not outcomes. A decoded rule field will be a further alternative per endpoint. Empty for a
-/// definition with no endpoint to read. A plan whose selection does not narrow leaves every
-/// candidate in every outcome. Caller: `next_definition`.
+/// read can be conclusive (no variant of the definition has a refused link, ADR-401); each
+/// alternative's drops are judged by `contradictions` over the facts so far and that one verdict
+/// (a contradiction at an endpoint depends only on the facts at it, and the VIN rules do not
+/// depend on the read), and `fold_outcomes` combines the endpoints without building their
+/// product. No answer and an inconclusive read are not outcomes. A decoded rule field plugs in as
+/// a further alternative of an endpoint (or of an endpoint and component) with its own drops.
+/// Empty for a definition with no endpoint to read. A plan whose selection does not narrow leaves
+/// every candidate in every outcome. Caller: `next_definition`.
 fn outcome_sets(
     plan: &CheckedPlan,
     facts: &[Fact],
@@ -2605,65 +2636,46 @@ fn outcome_sets(
     remaining: &[String],
     definition: &str,
 ) -> Vec<Vec<String>> {
-    let planned: Vec<&EcuReadPlan> = plan
+    let mut endpoints: Vec<&EndpointKey> = Vec::new();
+    for read in plan
         .ecu_reads
         .iter()
         .filter(|read| read.definition == definition && has_request(read))
-        .collect();
-    let mut endpoints: Vec<&EndpointKey> = Vec::new();
-    for endpoint in planned.iter().filter_map(|read| read.endpoint.as_ref()) {
-        if !endpoints.contains(&endpoint) {
+    {
+        if let Some(endpoint) = &read.endpoint
+            && !endpoints.contains(&endpoint)
+        {
             endpoints.push(endpoint);
         }
     }
-    let conclusive = !has_refused_variant(plan, definition);
     let mut verdicts = vec![Verdict::Identified];
-    if conclusive {
+    if !has_refused_variant(plan, definition) {
         verdicts.push(Verdict::RuledOut);
     }
-    let mut outcomes: Vec<Vec<Fact>> = if endpoints.is_empty() {
-        Vec::new()
-    } else {
-        vec![Vec::new()]
-    };
-    for endpoint in endpoints {
-        outcomes = outcomes
-            .iter()
-            .flat_map(|outcome| {
-                verdicts.iter().map(|&verdict| {
-                    let mut next = outcome.clone();
-                    next.push(Fact {
+    let alternatives: Vec<Vec<Vec<String>>> = endpoints
+        .into_iter()
+        .map(|endpoint| {
+            verdicts
+                .iter()
+                .map(|&verdict| {
+                    if !plan.selection.narrows() {
+                        return Vec::new();
+                    }
+                    let mut all = facts.to_vec();
+                    all.push(Fact {
                         definition: definition.to_owned(),
                         endpoint: endpoint.clone(),
                         verdict,
                     });
-                    next
+                    contradictions(plan, &all, vin_rules)
+                        .into_iter()
+                        .map(|(dropped, _)| dropped)
+                        .collect()
                 })
-            })
-            .collect();
-    }
-    let mut sets: Vec<Vec<String>> = Vec::new();
-    for outcome in outcomes {
-        let set: Vec<String> = if plan.selection.narrows() {
-            let all: Vec<Fact> = facts.iter().cloned().chain(outcome).collect();
-            let contradicted = contradictions(plan, &all, vin_rules);
-            remaining
-                .iter()
-                .filter(|candidate| {
-                    !contradicted
-                        .iter()
-                        .any(|(dropped, _)| dropped == *candidate)
-                })
-                .cloned()
                 .collect()
-        } else {
-            remaining.to_vec()
-        };
-        if !sets.contains(&set) {
-            sets.push(set);
-        }
-    }
-    sets
+        })
+        .collect();
+    fold_outcomes(remaining, &alternatives)
 }
 
 /// The definition to read next, with its worst case (ADR-327 item 4): among those in play, not
@@ -4790,6 +4802,67 @@ mod tests {
         assert_eq!(next_definition(&plan, &report, &left, &tried), None);
         tried.insert("Da".to_owned());
         assert_eq!(next_definition(&plan, &report, &all, &tried), None);
+    }
+
+    /// ADR-402: the fold over the endpoints gives the sets of the brute-force product of the
+    /// alternatives (three endpoints, three candidates, differing drops), and a definition at many
+    /// endpoints is folded at once.
+    #[test]
+    fn the_per_endpoint_fold_equals_the_product() {
+        let all = ids(&["a", "b", "c"]);
+        let endpoints = vec![
+            vec![ids(&["a"]), ids(&[])],
+            vec![ids(&["b"]), ids(&["a", "c"])],
+            vec![ids(&[]), ids(&["b"]), ids(&["c"])],
+        ];
+        let mut brute: Vec<Vec<String>> = Vec::new();
+        for x in &endpoints[0] {
+            for y in &endpoints[1] {
+                for z in &endpoints[2] {
+                    let left: Vec<String> = all
+                        .iter()
+                        .filter(|c| !x.contains(c) && !y.contains(c) && !z.contains(c))
+                        .cloned()
+                        .collect();
+                    if !brute.contains(&left) {
+                        brute.push(left);
+                    }
+                }
+            }
+        }
+        let mut folded = fold_outcomes(&all, &endpoints);
+        folded.sort();
+        brute.sort();
+        assert_eq!(folded, brute);
+        assert!(folded.len() > 1);
+        // 24 endpoints with two alternatives each: 2^24 combinations, a few distinct sets.
+        let many = vec![vec![ids(&["a"]), ids(&[])]; 24];
+        let sets = fold_outcomes(&all, &many);
+        assert_eq!(sets.iter().map(Vec::len).max(), Some(3));
+        assert_eq!(sets.len(), 2);
+        // Nothing to drop: one set, whatever the endpoints.
+        assert_eq!(fold_outcomes(&[], &many), [Vec::<String>::new()]);
+        assert!(fold_outcomes(&all, &[]).is_empty());
+    }
+
+    /// ADR-402: a definition read at 24 endpoints has its worst case computed at once.
+    #[test]
+    fn a_definition_at_many_endpoints_has_its_worst_case_computed_at_once() {
+        let documents: Vec<_> = (0..24u32)
+            .map(|n| identified_by(0x87, 11, b"P", "v", (0x600 + n, 0x700 + n), |_| {}))
+            .collect();
+        let indexes: Vec<usize> = (0..24).collect();
+        let plan = ecu_plan(
+            &documents,
+            &[("D1", &indexes)],
+            &[
+                ("c1", &[("engine", false, &["D1"])]),
+                ("c2", &[("engine", false, &["D1"])]),
+            ],
+        );
+        let all = ids(&["c1", "c2"]);
+        let sets = outcome_sets(&plan, &[], &[], &all, "D1");
+        assert_eq!(sets, [all]);
     }
 
     /// ADR-327 item 3, ADR-402: every definition the candidate lists at the endpoint must be ruled

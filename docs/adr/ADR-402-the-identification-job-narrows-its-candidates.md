@@ -56,8 +56,12 @@ rule fields land: a decoded rule value contradicts in every conclusive outcome.
    opens a link, the one with the smallest worst case over its conclusive outcomes. The outcomes
    of a read are, per endpoint of the definition, identified there, or ruled out there where the
    read can be conclusive (no variant of the definition has a refused link); the outcomes of the
-   definition are the product over its endpoints, and each is judged by the same `contradictions`
-   function the run uses, so the choice and the drop cannot drift apart. No answer and an
+   definition are the combinations over its endpoints, and each verdict's drops are judged by the
+   same `contradictions` function the run uses, so the choice and the drop cannot drift apart.
+   Since a contradiction at an endpoint depends only on the facts there, the combinations are
+   not built: the distinct remaining sets are folded endpoint by endpoint (`fold_outcomes`),
+   deduplicated after each, which gives the same worst case without growing with the number of
+   endpoints. No answer and an
    inconclusive read are not outcomes. A definition with no outcome counts every remaining
    candidate. Ties go to the definition named by the most remaining candidates, then the one
    with the most endpoints that answered presence, then the lowest identifier in byte order.

@@ -1,7 +1,7 @@
 # ADR-399: The Identification Job Reads the VIN, Establishes It on Agreement and Takes the Vehicle's Lock
 
 **Date:** 2026-10-31
-**Status:** Accepted (item 4's report with no lock now ends the run in `LinkUnconfirmed` when an ECU read remains, by ADR-401)
+**Status:** Accepted (item 4's report with no lock now ends the run in `LinkUnconfirmed` when an ECU read remains, by ADR-401; item 6's "nothing is dropped" superseded for a plan of candidates by ADR-402: a candidate none of whose VIN rules for a component matched is dropped)
 **Affects:** `agent` (`identification`: `check_plan`, `PlanRefused::VinSource`, the VIN phase of
 `run_identification`, the report; `inputs`: `vin_source_field`, `field_bytes_of`; `runner`:
 `promote_to_vehicle`), `crates/agent/docs/ngr-agent.md`, design 8.8.2, `docs/glossary.md`;

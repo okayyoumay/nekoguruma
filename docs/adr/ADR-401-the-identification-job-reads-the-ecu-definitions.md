@@ -1,7 +1,7 @@
 # ADR-401: The Identification Job Reads the ECU Definitions and Reports the Entry States
 
 **Date:** 2026-11-01
-**Status:** Accepted
+**Status:** Accepted (item 1's plan order, item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim: ADR-402 orders the reads by ADR-327 item 4, skips definitions no remaining candidate names and drops contradicted candidates in a plan of candidates)
 **Affects:** `agent` (`identification`: `check_plan`, `PlanRefused::IdentificationRequest`,
 `ecu_phase`, `evaluate_entries`, the report; `inputs`: `negative_code`), `diag-ir` (`identify`:
 `identification_requests`, `decode_identification_answer`), `crates/agent/docs/ngr-agent.md`,

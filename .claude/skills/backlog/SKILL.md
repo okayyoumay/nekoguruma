@@ -52,7 +52,10 @@ Re-prioritize, sharpen the "Done when", or add new evidence in place. An
 item another item is blocked on keeps at least that item's priority
 (`work/README.md`): raising a blocked item raises its blocker, and a
 blocker is judged on its own again only when nothing it blocks needs the
-higher level. Move
+higher level. When you remove an item's `Blocked on:` clause because its
+blocker is resolved, judge its priority again against the current milestone
+(`work/README.md`, ADR-407): an item that was moved out of a milestone
+because it was blocked comes back to P1 once it is on that milestone's path. Move
 the item if its priority changes so the section stays sorted. Do not append
 a dated history of changes; the item states the current understanding.
 

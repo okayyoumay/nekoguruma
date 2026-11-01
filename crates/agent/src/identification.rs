@@ -2523,10 +2523,14 @@ fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
                         answered.push(endpoint);
                     }
                 }
+                // A read with no request (a pattern-less definition) is never conclusive and
+                // counts for nothing here either.
                 let settled = |endpoint: &&EndpointKey| {
                     relevant
                         .iter()
-                        .filter(|read| read.endpoint.as_ref() == Some(*endpoint))
+                        .filter(|read| {
+                            read.endpoint.as_ref() == Some(*endpoint) && !read.requests.is_empty()
+                        })
                         .all(|read| read.conclusive)
                         && !refused_variant
                 };
@@ -3959,6 +3963,20 @@ mod tests {
             state_of(false, &both, &reads),
             EntryState::Identified { .. }
         ));
+        // A pattern-less alternative at the same endpoint does not keep a conclusive
+        // no-match from settling it.
+        let mut bare = read_of("D2", Some(0x7E0), decoded(), false, false);
+        bare.requests.clear();
+        let reads = [
+            read_of("D1", Some(0x7E0), decoded(), false, true),
+            bare.clone(),
+        ];
+        assert_eq!(
+            state_of(false, &both, &reads),
+            EntryState::UnrecognizedVariant {
+                endpoints: vec![endpoint(0x7E0)]
+            }
+        );
         // All alternatives pattern-less: nothing was read.
         assert_eq!(state_of(false, &["D2"], &[bare]), EntryState::NotRead);
     }

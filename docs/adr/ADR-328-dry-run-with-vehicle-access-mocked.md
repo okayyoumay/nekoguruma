@@ -1,7 +1,7 @@
 # ADR-328: Dry Run with Vehicle Access Mocked
 
 **Date:** 2026-10-18
-**Status:** Accepted (`FlashBlock` served as zero bytes of the requested length by ADR-336; item 2's and the Consequences' `ReadDtc` bytes no longer built by the agent's host, only by the dry run, by ADR-342; items 2 to 5 extended by ADR-390: the profile's security access requests are answered; the Consequences' pass criterion decided, and item 7's transfer data held as a length and a digest, by ADR-391)
+**Status:** Accepted (`FlashBlock` served as zero bytes of the requested length by ADR-336; item 2's and the Consequences' `ReadDtc` bytes no longer built by the agent's host, only by the dry run, by ADR-342; items 2 to 5 extended by ADR-390: the profile's security access requests are answered; the Consequences' pass criterion decided, and item 7's transfer data held as a length and a digest, by ADR-391; item 2's dry run answers a request whose positive response is suppressed with no bytes unless scripted, by ADR-407)
 **Affects:** `diag-ir` (`dry_run`: `Script`, `dry_run`, `DryRunReport`), `diag-frontend` tests
 (`tests/dry_run.rs`), design 12.1, `crates/diag-frontend/docs/starlark-subset.md` 6; ADR-233,
 ADR-280, ADR-297, ADR-321

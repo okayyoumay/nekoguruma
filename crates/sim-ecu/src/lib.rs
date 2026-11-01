@@ -875,8 +875,22 @@ impl SimEcu {
                 }),
             None => None,
         };
+        // After a response pending message the ECU owes its final response, whatever the
+        // suppress bit says (clause 7.7.3.2): a request with the bit that a pending fault fires
+        // on is handled as if the client had not set it, so its positive response is sent last.
+        let owed = services::has_sub_function(message)
+            && message[1] & SUPPRESS_POS_RSP != 0
+            && self
+                .armed
+                .iter()
+                .any(|f| matches!(f, Fault::ResponsePending { count, .. } if *count > 0));
         let response = match refused {
             Some(response) => response,
+            None if owed => {
+                let mut owing = message.to_vec();
+                owing[1] &= !SUPPRESS_POS_RSP;
+                self.respond(addressing, &owing)
+            }
             None => self.respond(addressing, message),
         };
         let response = match response {
@@ -1092,8 +1106,10 @@ pub enum Fault {
     CorruptBlock { block: u32 },
     /// The next request the ECU answers gets `count` response pending messages (NRC 78) before
     /// its response: the first when the response was due, the others `interval_ms` apart, and
-    /// the response `interval_ms` after the last. A request without a response (suppressed, or
-    /// not for this ECU to answer) leaves the fault armed. `count` is capped at
+    /// the response `interval_ms` after the last. A request with the suppress bit gets its
+    /// positive response after the last message, since a final response is owed after one
+    /// (clause 7.7.3.2); a request without a response (not for this ECU to answer) leaves the
+    /// fault armed. `count` is capped at
     /// [`MAX_RESPONSE_PENDING`]; zero uses the fault up without sending any.
     ResponsePending { count: u32, interval_ms: u32 },
     /// The next request that reaches the ECU is refused with this NRC and has no effect: the

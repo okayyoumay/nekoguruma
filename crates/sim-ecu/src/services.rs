@@ -58,6 +58,24 @@ fn sub_function(message: &[u8], supported: impl Fn(u8) -> bool) -> Result<SubFun
     })
 }
 
+/// Whether `message` is a request of a service whose SubFunction byte carries the
+/// suppressPosRspMsgIndicationBit in this simulator.
+pub(crate) fn has_sub_function(message: &[u8]) -> bool {
+    matches!(
+        message,
+        [
+            SID_DIAGNOSTIC_SESSION_CONTROL
+                | SID_ECU_RESET
+                | SID_SECURITY_ACCESS
+                | SID_TESTER_PRESENT
+                | SID_READ_DTC_INFORMATION
+                | SID_ROUTINE_CONTROL,
+            _,
+            ..
+        ]
+    )
+}
+
 /// A positive response, or none when the client set the suppressPosRspMsgIndicationBit.
 fn reply(sf: &SubFunction, response: Vec<u8>) -> ServiceResult {
     Ok((!sf.suppress).then_some(response))

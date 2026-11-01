@@ -9,7 +9,7 @@ use std::future::Future;
 use std::time::{Duration, Instant};
 
 use crate::client::{WorkerApi, WorkerStatus};
-use diag_ir::DiagHost;
+use diag_ir::{DiagHost, suppresses_positive_response};
 use tokio::runtime::Handle;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle,
@@ -45,6 +45,9 @@ pub enum HostError {
     LinkHeld,
     #[error("the worker's event stream ended")]
     EventStreamEnded,
+    /// The ECU did not answer. Not the silence of a request whose positive response is
+    /// suppressed, which the VCI ended by its receive timeout with no pending seen: that is an
+    /// empty response (ADR-407).
     #[error("no response from the ECU")]
     NoResponse,
     /// The worker dropped events of the link, so the primitive's outcome is unknown: the
@@ -1238,7 +1241,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     }
 
     /// Sends `request` on the link and returns the whole final response (positive, or a
-    /// negative `7F` response), or [`HostError::NoResponse`] if the ECU did not answer.
+    /// negative `7F` response), or [`HostError::NoResponse`] if the ECU did not answer. The
+    /// silence of a request whose positive response is suppressed, which the VCI ended by its
+    /// receive timeout with no pending seen, is the empty response (ADR-407).
     ///
     /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
@@ -1304,8 +1309,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                 progress.sid,
             )
         });
+        let silent = suppresses_positive_response(&request);
         let handle = self.handle.clone();
-        let sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
+        let mut sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
+        sent.silence_is_result(silent);
         if let Some((request, expected, negative, sid)) = logged {
             // A request that collects every answer lists them; any other lists them when it got
             // more than one (the first included), which only a worker that passes more than one
@@ -1364,8 +1371,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             let before_answer = errors_before_answer(&sent);
             // A collecting window that got answers ends with the primitive's finished status, not
             // with a receive timeout (ISO 22900-2:2022 8.2.6.2.2).
-            let vci_ended =
-                sent.rx_timeout.is_some() || (collecting && response_times.finished.is_some());
+            let vci_ended = sent.vci_ended(collecting);
             let pending = pendings_of(&sent.pendings);
             let pending_ids = pending_ids_of(&sent.pendings, &self.receive_table);
             let rx_id = self.link_ids.map_or(0, |(_, rx_id)| rx_id);
@@ -2288,6 +2294,29 @@ struct Sent {
 }
 
 impl Sent {
+    /// Whether the VCI ended the exchange: by its receive timeout, or for a collecting window
+    /// that got answers by the primitive's finished status (ISO 22900-2:2022 8.2.6.2.2). Not the
+    /// agent's own deadline.
+    fn vci_ended(&self, collecting: bool) -> bool {
+        // A response's times count only for an exchange that ended with that response.
+        self.rx_timeout.is_some()
+            || (collecting && self.result.is_ok() && self.response_times.finished.is_some())
+    }
+
+    /// A request whose positive response is suppressed (`suppressed`) is answered by silence
+    /// when it succeeds: a primitive the VCI ended by its receive timeout, with no pending seen
+    /// (a final response would be owed after one) and no final response, has the empty answer
+    /// as its result (ADR-407). Every other end keeps its error.
+    fn silence_is_result(&mut self, suppressed: bool) {
+        if suppressed
+            && self.vci_ended(false)
+            && self.pendings.is_empty()
+            && matches!(self.result, Err(HostError::NoResponse))
+        {
+            self.result = Ok(Vec::new());
+        }
+    }
+
     /// A request whose primitive did not start, ending as `result`.
     fn not_started(result: Result<Vec<u8>, HostError>) -> Self {
         Self {
@@ -2520,20 +2549,6 @@ fn named_events(
     (kinds, named.and_then(|seen| seen.at))
 }
 
-/// Whether `request` asks for its positive response to be suppressed: bit 7 of the
-/// sub-function of a service that has one (ISO 14229-1:2026 8.2.2: DiagnosticSessionControl,
-/// ECUReset, SecurityAccess, CommunicationControl, Authentication, ReadDTCInformation,
-/// TesterPresent,
-/// ControlDTCSetting, ResponseOnEvent, LinkControl, DynamicallyDefineDataIdentifier,
-/// RoutineControl), which the ECU leaves unanswered when the request succeeds.
-fn suppresses_positive_response(request: &[u8]) -> bool {
-    matches!(
-        request,
-        [0x10 | 0x11 | 0x19 | 0x27 | 0x28 | 0x29 | 0x2C | 0x31 | 0x3E | 0x85 | 0x86 | 0x87, sub, ..]
-            if sub & 0x80 != 0
-    )
-}
-
 /// How a sent request ended, as its exchange entry gives it (design 8.11, `outcome`), and the
 /// internal names behind it. Whether the request was sent comes from [`HostError::send_state`].
 ///
@@ -2550,6 +2565,9 @@ fn sent_end(
         Ok(response) if negative.is_negative(sid, response) => {
             return (End::Negative(response.clone()), Detail::default());
         }
+        // The silence of a request whose positive response is suppressed (ADR-407): the entry
+        // is `no_response`, and the primitive did not fail, so there is no `host_error`.
+        Ok(response) if response.is_empty() => return (End::NoResponse, Detail::default()),
         Ok(response) => {
             let unusable = match (request, response.as_slice()) {
                 ([0x36, counter, ..], [0x76, echoed, ..]) => echoed != counter,
@@ -4074,26 +4092,6 @@ mod tests {
     }
 
     #[test]
-    fn the_suppress_bit_counts_on_a_service_with_a_sub_function() {
-        for suppressed in [
-            [0x3E, 0x80],
-            [0x10, 0x81],
-            [0x87, 0x83],
-            [0x29, 0x80],
-            [0x31, 0x81],
-            [0x19, 0x82],
-        ] {
-            assert!(
-                suppresses_positive_response(&suppressed),
-                "{suppressed:02X?}"
-            );
-        }
-        for not in [&[0x3E, 0x00][..], &[0x22, 0x80, 0x01], &[0x3E], &[]] {
-            assert!(!suppresses_positive_response(not), "{not:02X?}");
-        }
-    }
-
-    #[test]
     fn a_step_s_position_names_its_source_and_sections() {
         let span = |pc, line| diag_ir::SourceSpan {
             pc,
@@ -4665,6 +4663,92 @@ mod tests {
             unanswered_end(End::NoResponse, &none),
             End::NoResponse
         ));
+    }
+
+    /// ADR-407: the silence of a request whose positive response is suppressed is its result
+    /// only when the VCI ended the primitive by its receive timeout with no pending seen and no
+    /// final response; every other end keeps its error.
+    #[test]
+    fn a_suppressed_request_s_silence_within_the_limit_is_its_result() {
+        let timed_out = || Sent {
+            rx_timeout: Some(seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        let silent = |mut sent: Sent, suppressed| {
+            sent.silence_is_result(suppressed);
+            sent.result
+        };
+        // Case 1: a receive timeout at P2, nothing else.
+        assert_eq!(silent(timed_out(), true).unwrap(), Vec::<u8>::new());
+        // Case 13: the request does not suppress its positive response.
+        assert!(matches!(
+            silent(timed_out(), false),
+            Err(HostError::NoResponse)
+        ));
+        // Case 4: a pending was seen, so a final response is owed.
+        let pending = PendingRead {
+            identifier: None,
+            unique: 1,
+            vci_us: 0,
+            clock: None,
+            read: None,
+        };
+        let pended = Sent {
+            pendings: vec![pending],
+            ..timed_out()
+        };
+        assert!(matches!(silent(pended, true), Err(HostError::NoResponse)));
+        // Case 8: the agent's deadline ended the wait, not the VCI.
+        let deadline = Sent {
+            agent_deadline: true,
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        assert!(matches!(silent(deadline, true), Err(HostError::NoResponse)));
+        // Case 11: the worker took a short positive-form frame as the end, with no timeout.
+        let short = Sent {
+            rejected: vec![RejectedRead {
+                identifier: None,
+                bytes: vec![0x50],
+                vci_us: 0,
+                clock: None,
+                reason: RejectedReason::WrongEcho,
+                read: None,
+            }],
+            last_rejected: true,
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        assert!(matches!(silent(short, true), Err(HostError::NoResponse)));
+        // Cases 9 and 10: other errors, even with a timeout seen, are not silence.
+        for error in [
+            HostError::EventsLost,
+            HostError::PrimitiveFailed(PduErrorEvent::PduErrEvtTxError as i32),
+        ] {
+            let failed = Sent {
+                result: Err(error),
+                ..timed_out()
+            };
+            assert!(matches!(silent(failed, true), Err(e) if !matches!(e, HostError::NoResponse)));
+        }
+        // Cases 2 and 3: an answer is returned as it is.
+        for answer in [vec![0x7F, 0x10, 0x12], vec![0x50, 0x83]] {
+            let answered = Sent {
+                result: Ok(answer.clone()),
+                ..timed_out()
+            };
+            assert_eq!(silent(answered, true).unwrap(), answer);
+        }
+        // The entry of the empty result is `no_response` with no host error.
+        let request = [0x10, 0x83];
+        let (end, detail) = sent_end(&request, &Ok(Vec::new()), &NegativeShape::uds(), 0x10);
+        assert!(matches!(end, End::NoResponse));
+        assert_eq!(detail.host_error, None);
+        let (_, detail) = sent_end(
+            &request,
+            &Err(HostError::NoResponse),
+            &NegativeShape::uds(),
+            0x10,
+        );
+        assert!(detail.host_error.is_some());
     }
 
     /// ADR-359: a result of the primitive that does not answer the request is rejected, with its

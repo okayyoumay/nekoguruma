@@ -7415,8 +7415,9 @@ mod tests {
         reset.suppressed = true;
         let history = state.history_for(&reset);
         let mut entry = ExchangeEntry::build(2, reset, history);
-        // The none row for a suppressed no-response is not implemented yet; a later part's
-        // classification is stood in for here.
+        // The `none` row needs a confirmed send, an earlier answer matched this way and a
+        // timeout judged at P2; the classification is set directly to test what `none` does to
+        // the link's history.
         entry.classification = Classification::None;
         state.record(&entry);
         assert_eq!(state.last_reset(), Some(2));

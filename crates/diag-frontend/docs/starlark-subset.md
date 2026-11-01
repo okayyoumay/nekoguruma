@@ -400,7 +400,11 @@ lowered where it is read: `raw` is those bytes, `ok` is false only when the firs
 marker of the negative-response shape the variant's protocols declare (`7F` on UDS), and `nrc`
 is the byte at that shape's code position (the third on UDS) of a negative response and 0
 otherwise (ADR-309 item 4). A negative response too short to hold its code stops the run when
-`nrc` is read. Another string key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than
+`nrc` is read. The response to a request whose positive response is suppressed (bit 7 of the
+sub-function of a UDS service that has one) is empty when the ECU accepts it, because the ECU
+sends nothing then (ADR-407): `ok` is true, `nrc` is 0, `raw` is `b""`, and reading a key of
+`fields` stops the run as for a negative response. A negative response to such a request is
+returned as for any request. Another string key is `STAR_UNSUPPORTED_SYNTAX`. A response used other than
 through its keys (its truth value, an operator such as `==`, a built-in) is
 `STAR_NOT_LOWERABLE`.
 
@@ -1062,7 +1066,7 @@ The conversion reports this code after lowering (6, ADR-391):
   lacks) is checked by the lowering
 - Constant folding is done during bytecode generation
 - After generation, verify with a dry run on the `diag-ir` VM (vehicle access mocked) (12.1): `diag_ir::dry_run` with a script of answers, or with answers built from the declaration part (ADR-328). The dry run also answers the profile's seed and send-key requests of `diag.security_access`, which no declared service answers: it finds them by their place around the `SecurityAccess` step and answers a seed request with a scripted or a built seed and the send-key request with a built positive response, so a variant that declares no SecurityAccess service still runs (ADR-390); a scripted seed of zero bytes takes the unlocked path, with no `SecurityAccess` event and no send-key request, while a seed the dry run builds is never zero, from the declared field's fixed length when the variant declares the service (ADR-405)
-- The conversion runs this dry run on every lowered procedure for each variant (ADR-391), with `Script::built_defaults()` (a key of four zero bytes, the empty positive answer to every form and record template, and 0 for every runtime input, so a procedure that uses `diag.security_access`, `diag.hmi`, `diag.record` or a precondition runs) and `diag_ir::DEFAULT_MAX_STEPS` instructions, the agent's default step budget. One function decides the end: `Finished`, any `Failed` and an `Undecodable` response of a built answer are accepted, and everything else (another VM error, a host error, the step limit, a wait, an invalid program) is `STAR_DRY_RUN_STOPPED` at `DryRunReport::pc`, merged across variants as in ADR-311. Built answers are zeros, so a procedure must also guard a value that is out of range when the vehicle's data is zero (an index into a list that is empty, a negative offset)
+- The conversion runs this dry run on every lowered procedure for each variant (ADR-391), with `Script::built_defaults()` (a key of four zero bytes, the empty positive answer to every form and record template, and 0 for every runtime input, so a procedure that uses `diag.security_access`, `diag.hmi`, `diag.record` or a precondition runs) and `diag_ir::DEFAULT_MAX_STEPS` instructions, the agent's default step budget. One function decides the end: `Finished`, any `Failed` and an `Undecodable` response of a built answer are accepted, and everything else (another VM error, a host error, the step limit, a wait, an invalid program) is `STAR_DRY_RUN_STOPPED` at `DryRunReport::pc`, merged across variants as in ADR-311. A request whose positive response is suppressed is answered with no bytes unless the script gives an answer, so a procedure that reads a field of its response is refused (ADR-407). Built answers are zeros, so a procedure must also guard a value that is out of range when the vehicle's data is zero (an index into a list that is empty, a negative offset)
 
 ## 7. Verification
 

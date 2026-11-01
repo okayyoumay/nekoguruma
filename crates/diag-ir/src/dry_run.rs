@@ -26,7 +26,7 @@ use crate::decode::{DecodeError, DecodedField, Layouts, PhysicalValue, decode_po
 use crate::hmi::{self, HmiForm};
 use crate::{
     DiagHost, Failure, Op, Program, ProgramError, RuntimeInput, StepError, StepOutcome, Vm,
-    VmError, WaitingOn,
+    VmError, WaitingOn, suppresses_positive_response,
 };
 
 /// The most bytes of requests, answers, forms and messages one report holds,
@@ -532,8 +532,12 @@ impl ScriptedHost<'_, '_> {
         let name = service.short_name().unwrap_or_default().to_owned();
         let script = self.script;
         let scripted = script.responses.get(&name).map_or(&[][..], Vec::as_slice);
+        // A request whose positive response is suppressed is answered with no bytes unless the
+        // script gives an answer, as the host returns the ECU's silence (ADR-407).
+        let silent = suppresses_positive_response(request);
         let (answer, built) = match self.next(Answers::Response(name.clone()), scripted) {
             Some(answer) => (answer, false),
+            None if silent => (Vec::new(), true),
             None => {
                 let positive =
                     service
@@ -555,6 +559,7 @@ impl ScriptedHost<'_, '_> {
         };
         let decoded = service
             .positive()
+            .filter(|_| !(silent && answer.is_empty()))
             .map(|positive| decode_positive_response(&positive, self.variant.layouts(), &answer));
         let decoded_bytes = match &decoded {
             // Twice the count: the decoder's vectors and strings grow as they fill, so their

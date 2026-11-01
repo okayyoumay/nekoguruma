@@ -296,9 +296,17 @@ async fn auto_mode_probes_before_the_strict_install_and_connects_dual_channel() 
 /// channel, and must not finish before the probe does. The native connect blocks its thread
 /// while held, hence the multi-thread runtime.
 ///
-/// The mock cannot hold B between its first read of the mode and its install: B waits for
-/// A's device guard before that read, and once A's probe runs, the read itself waits on the
-/// probe. A joiner holding the pre-probe mode is therefore a race window of a few awaits,
+/// The held connect blocks a runtime worker, and that worker may be the one that last drove
+/// the runtime's timers and I/O: tokio hands the driver to another worker only when one is
+/// woken, and the other workers may all be parked with nothing to wake them. A runtime timer
+/// in the test body could then never fire, and the hold would never be released. So the
+/// test body, which runs on the test's own thread and not on a worker, waits with
+/// `std::thread::sleep` until it has released the hold: blocking that thread stalls nothing
+/// else. Spawning B wakes a parked worker, which then drives the timers and I/O for B's
+/// connect.
+///
+/// The mock cannot hold B between its first read of the mode and its install: B's first read
+/// of the mode waits on the lock A's probe holds (`resolved_can_channel_mode`). A joiner holding the pre-probe mode is therefore a race window of a few awaits,
 /// which the install-time re-read closes by construction (no snapshot is used for the
 /// install), not a state this test can pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -338,18 +346,17 @@ async fn auto_mode_joiner_waits_for_the_creators_probe_before_installing() {
         if server.backdoor.connect_hold_engaged() {
             break;
         }
-        tokio::time::sleep(tokio::time::Duration::from_millis(10)).await;
+        std::thread::sleep(std::time::Duration::from_millis(10));
     }
     assert!(
         server.backdoor.connect_hold_engaged(),
         "A's probe was never reached"
     );
 
-    let mut connect_b = tokio::spawn(async move { connect(&mut client_b, cll_b).await });
+    let connect_b = tokio::spawn(async move { connect(&mut client_b, cll_b).await });
+    std::thread::sleep(std::time::Duration::from_millis(500));
     assert!(
-        tokio::time::timeout(tokio::time::Duration::from_millis(500), &mut connect_b)
-            .await
-            .is_err(),
+        !connect_b.is_finished(),
         "B finished while A's probe was held"
     );
 

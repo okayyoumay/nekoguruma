@@ -47,7 +47,7 @@ use starlark_syntax::syntax::ast::{
 };
 use starlark_syntax::syntax::uniplate::Visit;
 
-use crate::profile::{Intent, Part, ResultMap, Source, StepKind, UDS};
+use crate::profile::{Intent, Part, ResultMap, Source, StepKind, UDS, ZeroSeed};
 
 use super::{
     Annotation, BUILTINS, Checked, FlashFacts, Pending, RequestConstant, RequestIndex,
@@ -110,6 +110,9 @@ const UINT_OUT_OF_RANGE: &str = "UINT_OUT_OF_RANGE";
 /// The `Fail` code of a request param known only at run time whose value does not fit its
 /// field (3.2).
 const PARAM_OUT_OF_RANGE: &str = "PARAM_OUT_OF_RANGE";
+
+/// The `Fail` code of a seed response with no seed bytes (3.2, ADR-405).
+const SEED_EMPTY: &str = "SEED_EMPTY";
 
 /// A `params` value of `diag.request` or `diag.routine` known only at run time: its key, the
 /// value, and where it is written.
@@ -4596,7 +4599,6 @@ impl<'a> Lowerer<'a> {
         let operand = self.pool(&operand);
         let exit = self.pool(&[]);
         let i = self.temp(id, span);
-        let (head, end) = (self.label(), self.label());
         let mut code: Code = Vec::new();
         code.push((Ins::Op(Op::PushBytes(operand)), span));
         if !erases {
@@ -4608,26 +4610,24 @@ impl<'a> Lowerer<'a> {
                 Ins::Op(Op::ServiceRequest { service: 0x34 }),
                 // Its response is dropped (ADR-336 item 10).
                 Ins::Op(Op::Pop),
-                Ins::Op(Op::PushI64(0)),
-                Ins::Op(Op::StoreLocal(i)),
-                Ins::Mark(head),
-                Ins::Op(Op::LoadLocal(i)),
-                Ins::Op(Op::PushI64(blocks as i64)),
-                Ins::Op(Op::CmpLt),
-                Ins::JumpIfFalse(end),
-                Ins::Op(Op::LoadLocal(i)),
-                Ins::Op(Op::FlashBlock {
-                    session,
-                    segment: 0,
-                }),
-                // The host numbers the blocks itself, so the operand is the same for each.
-                Ins::Op(Op::FlashTransfer { block: 0 }),
-                Ins::Op(Op::LoadLocal(i)),
-                Ins::Op(Op::PushI64(1)),
-                Ins::Op(Op::Add),
-                Ins::Op(Op::StoreLocal(i)),
-                Ins::Jump(head),
-                Ins::Mark(end),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        let bound = vec![(Ins::Op(Op::PushI64(blocks as i64)), span)];
+        let body = [
+            Ins::Op(Op::LoadLocal(i)),
+            Ins::Op(Op::FlashBlock {
+                session,
+                segment: 0,
+            }),
+            // The host numbers the blocks itself, so the operand is the same for each.
+            Ins::Op(Op::FlashTransfer { block: 0 }),
+        ]
+        .map(|ins| (ins, span))
+        .to_vec();
+        code.extend(self.counted_loop(i, bound, body, span));
+        code.extend(
+            [
                 Ins::Op(Op::PushBytes(exit)),
                 Ins::Boundary(Boundary::TransferExit),
                 Ins::Op(Op::ServiceRequest { service: 0x37 }),
@@ -5978,12 +5978,45 @@ impl<'a> Lowerer<'a> {
         }
     }
 
+    /// A loop that runs `body` for `i` = 0, 1, ... while `i` is below `bound`, which is code that
+    /// pushes one `I64`. `body` leaves the stack as it found it, or jumps out of the loop with
+    /// it balanced for its target; `i` is a temporary the caller allocated.
+    fn counted_loop(&mut self, i: u16, bound: Code, body: Code, span: Span) -> Code {
+        let (head, end) = (self.label(), self.label());
+        let mut code: Code = [
+            Ins::Op(Op::PushI64(0)),
+            Ins::Op(Op::StoreLocal(i)),
+            Ins::Mark(head),
+            Ins::Op(Op::LoadLocal(i)),
+        ]
+        .map(|ins| (ins, span))
+        .to_vec();
+        code.extend(bound);
+        code.extend([Ins::Op(Op::CmpLt), Ins::JumpIfFalse(end)].map(|ins| (ins, span)));
+        code.extend(body);
+        code.extend(
+            [
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::PushI64(1)),
+                Ins::Op(Op::Add),
+                Ins::Op(Op::StoreLocal(i)),
+                Ins::Jump(head),
+                Ins::Mark(end),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        code
+    }
+
     /// `diag.security_access(level)` through the variant's profile (ADR-309 items 2 and 4,
     /// ADR-314): the seed request, the `SecurityAccess` step that turns the seed into a key
     /// through the host, then the send-key request carrying that key. The profile's requests are
     /// not decoded through declared services, so each is a `ServiceRequest` of the template's SID
     /// whose payload the template gives. A negative seed response ends the call before the key
-    /// step, as a failed `diag.request` does, and is its value; otherwise the value is the
+    /// step, as a failed `diag.request` does, and is its value. Where the profile says a zero seed
+    /// means the level is unlocked (ISO 14229-1 (2026) 9.4.1, ADR-405), a seed whose bytes are all
+    /// zero ends the call there too, with the seed response as its value; a response with no seed
+    /// bytes ends the procedure with `Fail` code `SEED_EMPTY`. Otherwise the value is the
     /// send-key response, positive or negative. The result has no `fields` (ADR-314 item 4).
     fn diag_security_access(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
         let key_result = Tys {
@@ -6032,7 +6065,7 @@ impl<'a> Lowerer<'a> {
             );
             return failed;
         };
-        let ResultMap::Seed { after_bytes } = seed_step.result else {
+        let ResultMap::Seed { after_bytes, zero } = seed_step.result else {
             unreachable!("a validated profile reads the seed from the step before the key step")
         };
         if seed_step.declared || send_step.declared || key_step.kind != StepKind::SecurityKey {
@@ -6063,6 +6096,7 @@ impl<'a> Lowerer<'a> {
         };
         let seed_payload = self.pool(&seed_payload);
         let response = self.temp(id, span);
+        let seed = self.temp(id, span);
         let end = self.label();
         let mut code: Code = [
             Ins::Op(Op::PushBytes(seed_payload)),
@@ -6076,16 +6110,64 @@ impl<'a> Lowerer<'a> {
         .to_vec();
         code.extend(self.response_ok(span));
         code.push((Ins::JumpIfFalse(end), span));
-        if !key_prefix.is_empty() {
-            let key_prefix = self.pool(&key_prefix);
-            code.push((Ins::Op(Op::PushBytes(key_prefix)), span));
-        }
         code.extend(
             [
                 Ins::Op(Op::LoadLocal(response)),
                 Ins::Op(Op::PushI64(i64::from(after_bytes))),
                 Ins::Op(Op::PushI64(i64::MAX)),
                 Ins::Op(Op::Slice),
+                Ins::Op(Op::StoreLocal(seed)),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        // The key step starts here; a zero seed skips past it to `end`.
+        let (key, empty) = (self.label(), self.label());
+        if zero == ZeroSeed::Unlocked {
+            let i = self.temp(id, span);
+            // The seed's length; `Length` leaves the seed below it, which `Swap` and `Pop` drop.
+            let length = || -> Code {
+                [
+                    Ins::Op(Op::LoadLocal(seed)),
+                    Ins::Op(Op::Length),
+                    Ins::Op(Op::Swap),
+                    Ins::Op(Op::Pop),
+                ]
+                .map(|ins| (ins, span))
+                .to_vec()
+            };
+            code.extend(length());
+            code.extend(
+                [
+                    Ins::Op(Op::PushI64(0)),
+                    Ins::Op(Op::CmpGt),
+                    Ins::JumpIfFalse(empty),
+                ]
+                .map(|ins| (ins, span)),
+            );
+            // A byte that is not zero means the level is locked: on to the key step.
+            let body = [
+                Ins::Op(Op::LoadLocal(seed)),
+                Ins::Op(Op::LoadLocal(i)),
+                Ins::Op(Op::IndexGet),
+                Ins::Op(Op::Swap),
+                Ins::Op(Op::Pop),
+                Ins::Op(Op::PushI64(0)),
+                Ins::Op(Op::CmpEq),
+                Ins::JumpIfFalse(key),
+            ]
+            .map(|ins| (ins, span))
+            .to_vec();
+            code.extend(self.counted_loop(i, length(), body, span));
+            code.push((Ins::Jump(end), span));
+        }
+        code.push((Ins::Mark(key), span));
+        if !key_prefix.is_empty() {
+            let key_prefix = self.pool(&key_prefix);
+            code.push((Ins::Op(Op::PushBytes(key_prefix)), span));
+        }
+        code.extend(
+            [
+                Ins::Op(Op::LoadLocal(seed)),
                 Ins::Op(Op::SecurityAccess { level }),
             ]
             .map(|ins| (ins, span)),
@@ -6099,12 +6181,40 @@ impl<'a> Lowerer<'a> {
                     service: u16::from(send_step.request.sid),
                 }),
                 Ins::Op(Op::StoreLocal(response)),
+            ]
+            .map(|ins| (ins, span)),
+        );
+        if zero == ZeroSeed::Unlocked {
+            // Out of line, after the send-key request: a `Fail` between the seed request and the
+            // `SecurityAccess` would end the dry run's scan for the profile's requests (ADR-390).
+            let failure = self.pool(SEED_EMPTY.as_bytes());
+            let detail = self.pool(
+                format!(
+                    "the seed response of `diag.security_access` on line {} has no seed bytes",
+                    self.line_of(span)
+                )
+                .as_bytes(),
+            );
+            code.extend(
+                [
+                    Ins::Jump(end),
+                    Ins::Mark(empty),
+                    Ins::Op(Op::PushBytes(detail)),
+                    Ins::Op(Op::Fail { code: failure }),
+                ]
+                .map(|ins| (ins, span)),
+            );
+        }
+        code.extend(
+            [
                 Ins::Mark(end),
                 Ins::Op(Op::LoadLocal(response)),
-                // The slot would otherwise keep a copy of the response in the VM state, and its
-                // journaled checkpoints, until the function returns.
+                // The slots would otherwise keep a copy of the response and of the seed in the VM
+                // state, and its journaled checkpoints, until the function returns.
                 Ins::Op(Op::PushI64(0)),
                 Ins::Op(Op::StoreLocal(response)),
+                Ins::Op(Op::PushI64(0)),
+                Ins::Op(Op::StoreLocal(seed)),
             ]
             .map(|ins| (ins, span)),
         );

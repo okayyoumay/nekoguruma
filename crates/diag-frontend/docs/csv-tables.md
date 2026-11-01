@@ -662,7 +662,7 @@ the constants only as prefix bytes, so the conversion hands the lowering an inde
 variant's services with their request constants by name and value; a call that selects no
 service, or more than one, is rejected (`STAR_UNKNOWN_SERVICE`, ADR-313).
 `diag.security_access` needs no declared service: its seed and key requests come from the
-application-layer profile, which also reads the seed from the seed response, and are sent as
+application-layer profile, which also reads the seed from the seed response and ends the call at a seed of zero (ADR-405), and are sent as
 `ServiceRequest`s of the profile's SID (subset spec 3.2, ADR-309, ADR-314).
 `diag.read_dtc(mask)` is lowered through the profile (ADR-314): its request template selects the
 variant's one service whose SID and request prefix are the template's constants at their widths

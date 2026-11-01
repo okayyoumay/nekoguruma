@@ -450,6 +450,37 @@ fn security_access_runs_against_a_variant_that_declares_no_security_access_servi
     )));
 }
 
+/// A scripted zero seed takes the unlocked path: the byte loop reaches no host, so the seed
+/// request stays the call's one marked request and no key is asked for (ADR-390, ADR-405).
+#[test]
+fn a_zero_seed_ends_the_call_before_its_key_step_in_a_dry_run() {
+    let source =
+        "def main():\n    unlock = diag.security_access(0x01)\n    diag.log(1, \"done\")\n";
+    let document = document_of(
+        "unlock.star",
+        source,
+        "exampleEcuV1",
+        Some("securityAccess,"),
+    );
+    let report = run(
+        &document,
+        None,
+        &Script::new().seed(vec![0x67, 0x01, 0, 0, 0, 0]),
+    );
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(
+        requests(&report),
+        [(diag_ir::dry_run::PROFILE_SEED_REQUEST, false)]
+    );
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|event| matches!(event, DryRunEvent::SecurityAccess { .. })),
+        "{report:?}"
+    );
+}
+
 const UNLOCK_NO_SERVICE: &str = "def main():\n    a = diag.security_access(0x01)\n    b = diag.security_access(0x03)\n    c = diag.security_access(0x05)\n";
 
 #[test]

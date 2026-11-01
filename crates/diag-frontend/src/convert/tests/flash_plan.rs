@@ -509,8 +509,8 @@ impl diag_ir::DiagHost for PlanHost {
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, NotSent> {
         self.log
             .push(format!("request {service:02x} {}", hex(payload)));
-        // Positive: the SID plus 0x40, which the seed step reads past two bytes of.
-        Ok(vec![service as u8 + 0x40, 0x01])
+        // Positive: the SID plus 0x40, and a non-zero seed past the two bytes the seed step skips.
+        Ok(vec![service as u8 + 0x40, 0x01, 0x01])
     }
     fn send_receive(&mut self, _: u32, _: &[u8]) -> Result<Vec<u8>, NotSent> {
         Err(NotSent)

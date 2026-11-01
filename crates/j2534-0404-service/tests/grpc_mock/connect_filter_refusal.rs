@@ -306,9 +306,10 @@ async fn auto_mode_probes_before_the_strict_install_and_connects_dual_channel() 
 /// connect.
 ///
 /// The mock cannot hold B between its first read of the mode and its install: B's first read
-/// of the mode waits on the lock A's probe holds (`resolved_can_channel_mode`). A joiner holding the pre-probe mode is therefore a race window of a few awaits,
-/// which the install-time re-read closes by construction (no snapshot is used for the
-/// install), not a state this test can pin.
+/// of the mode waits on the lock A's probe holds (`resolved_can_channel_mode`). A joiner
+/// holding the pre-probe mode is therefore a race window of a few awaits, which the
+/// install-time re-read closes by construction (no snapshot is used for the install), not a
+/// state this test can pin.
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 #[serial]
 async fn auto_mode_joiner_waits_for_the_creators_probe_before_installing() {

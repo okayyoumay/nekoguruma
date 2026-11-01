@@ -1,6 +1,6 @@
 use diag_ir::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document, load_ecu_document};
 use diag_ir::hmi::{self, HmiForm, HmiValue, decode_form};
-use diag_ir::{DiagHost, RuntimeInput, StepError, StepOutcome, Vm, VmError, WaitingOn};
+use diag_ir::{DiagHost, RuntimeInput, StepError, StepOutcome, Value, Vm, VmError, WaitingOn};
 
 use super::*;
 use crate::profile::{Intent, Profile};
@@ -2281,10 +2281,76 @@ def main():
     let mut host = security_access_host(&[&[0x67, 0x01, 0, 0]], &[]);
     run_on(SECURITY_ACCESS, &mut host);
     assert_eq!(host.calls, ["request 27 01", "log 1 unlocked"]);
-    // The highest level.
-    let mut host = security_access_host(&[&[0x67, 0x7D, 0]], &[]);
-    run_on("def main():\n    diag.security_access(0x7D)\n", &mut host);
-    assert_eq!(host.calls, ["request 27 7D"]);
+    // The last standard seed level just below the supplier-specific range (9.4.2.2).
+    let mut host = security_access_host(&[&[0x67, 0x5F, 0]], &[]);
+    run_on("def main():\n    diag.security_access(0x5F)\n", &mut host);
+    assert_eq!(host.calls, ["request 27 5F"]);
+}
+
+/// On the supplier-specific levels (0x61 to 0x7D) the standard defines no seed and key pairing,
+/// so the key step runs whatever the seed, a zero or an empty one included (ADR-405).
+#[test]
+fn the_supplier_specific_levels_send_the_key_whatever_the_seed() {
+    for (level, seed, shown) in [
+        (0x61_u8, &[0_u8, 0][..], "0000"),
+        (0x7D, &[0, 0], "0000"),
+        (0x7D, &[], ""),
+    ] {
+        let mut response = vec![0x67, level];
+        response.extend_from_slice(seed);
+        let next = [0x67, level + 1];
+        let mut host = security_access_host(&[&response, &next], &[&[0x01]]);
+        run_on(
+            &format!("def main():\n    diag.security_access({level})\n"),
+            &mut host,
+        );
+        assert_eq!(
+            host.calls,
+            [
+                format!("request 27 {level:02X}"),
+                format!("key {level:02X} {shown}"),
+                format!("request 27 {:02X}01", level + 1)
+            ],
+            "{level:02X} {seed:02X?}"
+        );
+    }
+}
+
+/// The call's slots hold no seed bytes once it has ended, on the zero path and on the key path
+/// (ADR-347, design 8.11): the VM state and its journaled checkpoints would otherwise carry them.
+#[test]
+fn security_access_leaves_no_seed_or_response_bytes_in_the_vm_state() {
+    let source = "def main():\n    diag.security_access(0x01)\n";
+    let program = lowered(source).unwrap_or_else(|errors| panic!("{errors:#?}"));
+    for (responses, keys) in [
+        (vec![vec![0x67, 0x01, 0, 0]], vec![]),
+        (
+            vec![vec![0x67, 0x01, 0xAA, 0xBB], vec![0x67, 0x02]],
+            vec![vec![0x12]],
+        ),
+    ] {
+        let mut host = ScriptedHost {
+            responses: responses.into(),
+            keys: keys.into(),
+            ..ScriptedHost::default()
+        };
+        let mut vm = Vm::new(&program);
+        loop {
+            match vm.step(&program, &mut host) {
+                Ok(StepOutcome::Continue) => {}
+                Ok(StepOutcome::Finished) => break,
+                other => panic!("{other:?}"),
+            }
+        }
+        let held: Vec<_> = vm
+            .state
+            .locals
+            .iter()
+            .flatten()
+            .filter(|value| matches!(value, Value::Bytes(_)))
+            .collect();
+        assert!(held.is_empty(), "{held:?}");
+    }
 }
 
 /// Only an all-zero seed is read as unlocked: a non-zero byte anywhere sends the key.

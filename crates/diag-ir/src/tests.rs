@@ -4706,3 +4706,14 @@ fn a_resumed_hmi_wait_sends_the_same_form_under_the_same_inquiry() {
     );
     assert_eq!(resumed.state.stack, [Value::Bytes(b"\x01done".to_vec())]);
 }
+
+#[test]
+fn only_odd_levels_up_to_0x41_and_0x5f_are_standard_seed_levels() {
+    let found: Vec<u8> = (0..=0xFF).filter(|&l| is_standard_seed_level(l)).collect();
+    let expected: Vec<u8> = (0x01..=0x41).step_by(2).chain([0x5F]).collect();
+    assert_eq!(found, expected);
+    // Just below the supplier-specific range, and its first odd level.
+    assert!(is_standard_seed_level(0x5F));
+    assert!(!is_standard_seed_level(0x61));
+    assert!(!is_standard_seed_level(0x7D));
+}

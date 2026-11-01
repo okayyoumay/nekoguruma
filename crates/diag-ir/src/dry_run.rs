@@ -58,6 +58,20 @@ pub fn block_digest(bytes: &[u8]) -> u64 {
 /// the ECU is already unlocked.
 const BUILT_SEED: [u8; 4] = [1, 2, 3, 4];
 
+/// A built positive answer to a seed request (ADR-390 item 3, ADR-405): the positive SID, the
+/// level, then [`BUILT_SEED`] cut or repeated to `seed_len` bytes when the declaration fixes the
+/// seed's length. It is never all zero for a seed of one byte or more, so the procedure takes
+/// the key path.
+fn built_seed_response(positive_sid: u8, level: u8, seed_len: Option<usize>) -> Vec<u8> {
+    let seed = BUILT_SEED.iter().copied().cycle();
+    let mut bytes = vec![positive_sid, level];
+    match seed_len {
+        Some(len) => bytes.extend(seed.take(len)),
+        None => bytes.extend_from_slice(&BUILT_SEED),
+    }
+    bytes
+}
+
 /// Every [`RuntimeInput`]; [`Script::built_defaults`] gives each a value. Its `match` fails to
 /// compile when a new input is added without a value, and a test that decodes every variant tag
 /// fails when the input is missing from this list.
@@ -507,7 +521,14 @@ impl ScriptedHost<'_, '_> {
     }
 
     /// Answers `request` as `service`, records it, and returns the answer.
-    fn answer(&mut self, request: &[u8], service: Service<'_>) -> Result<Vec<u8>, DryRunError> {
+    /// `seed` is set for the request marked as the profile's seed request: a built answer then
+    /// carries a seed that is not zero (ADR-405).
+    fn answer(
+        &mut self,
+        request: &[u8],
+        service: Service<'_>,
+        seed: bool,
+    ) -> Result<Vec<u8>, DryRunError> {
         let name = service.short_name().unwrap_or_default().to_owned();
         let script = self.script;
         let scripted = script.responses.get(&name).map_or(&[][..], Vec::as_slice);
@@ -520,7 +541,16 @@ impl ScriptedHost<'_, '_> {
                         .ok_or_else(|| DryRunError::NoPositiveResponse {
                             service: error_name(&service),
                         })?;
-                (built_response(&positive, self.variant.layouts()), true)
+                let built = built_response(&positive, self.variant.layouts());
+                let answer = match (seed, request.get(1)) {
+                    // The declaration's own fields after the SID and the level are the seed.
+                    (true, Some(&level)) => {
+                        let fixed = built.len().checked_sub(2).filter(|&len| len > 0);
+                        built_seed_response(positive.sid(), level, fixed)
+                    }
+                    _ => built,
+                };
+                (answer, true)
             }
         };
         let decoded = service
@@ -564,11 +594,12 @@ impl ScriptedHost<'_, '_> {
                 request: error_request(request),
             });
         };
-        let mut built_answer = vec![sid.wrapping_add(0x40), sub];
+        let positive_sid = sid.wrapping_add(0x40);
+        let mut built_answer = vec![positive_sid, sub];
         let script = self.script;
         let (name, scripted) = match kind {
             ProfileRequest::Seed => {
-                built_answer.extend_from_slice(&BUILT_SEED);
+                built_answer = built_seed_response(positive_sid, sub, None);
                 (
                     PROFILE_SEED_REQUEST,
                     self.next(Answers::Seed, &script.seeds),
@@ -597,7 +628,7 @@ impl ScriptedHost<'_, '_> {
 
     fn send(&mut self, request: Vec<u8>) -> Result<Vec<u8>, DryRunError> {
         let service = resolve(*self.variant, &request)?;
-        self.answer(&request, service)
+        self.answer(&request, service, false)
     }
 }
 
@@ -853,7 +884,8 @@ impl DiagHost for ScriptedHost<'_, '_> {
         if let (Err(DryRunError::Undeclared { .. }), Some(kind)) = (&resolved, kind) {
             return self.answer_profile(&request, kind);
         }
-        self.answer(&request, resolved?)
+        let seed = kind == Some(ProfileRequest::Seed);
+        self.answer(&request, resolved?, seed)
     }
 
     fn send_receive(&mut self, service: u32, request: &[u8]) -> Result<Vec<u8>, DryRunError> {
@@ -875,7 +907,7 @@ impl DiagHost for ScriptedHost<'_, '_> {
                 request: error_request(request),
             });
         }
-        self.answer(request, declared)
+        self.answer(request, declared, false)
     }
 
     // The bytes the agent sends for these primitives (`agent::host`): ReadDTCInformation with

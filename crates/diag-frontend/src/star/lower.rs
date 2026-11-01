@@ -6015,9 +6015,10 @@ impl<'a> Lowerer<'a> {
     /// whose payload the template gives. A negative seed response ends the call before the key
     /// step, as a failed `diag.request` does, and is its value. Where the profile says a zero seed
     /// means the level is unlocked (ISO 14229-1 (2026) 9.4.1, ADR-405), a seed whose bytes are all
-    /// zero ends the call there too, with the seed response as its value; a response with no seed
-    /// bytes ends the procedure with `Fail` code `SEED_EMPTY`. Otherwise the value is the
-    /// send-key response, positive or negative. The result has no `fields` (ADR-314 item 4).
+    /// zero ends the call there too, with the seed response as its value; a response with no
+    /// seed bytes ends the procedure with `Fail` code `SEED_EMPTY`. Both rules apply on the
+    /// standard seed levels only (9.4.2.2). Otherwise the value is the send-key response,
+    /// positive or negative. The result has no `fields` (ADR-314 item 4).
     fn diag_security_access(&mut self, id: Option<usize>, args: &[&AstExpr], span: Span) -> Val {
         let key_result = Tys {
             bits: Ty::Response.bit(),
@@ -6121,8 +6122,11 @@ impl<'a> Lowerer<'a> {
             .map(|ins| (ins, span)),
         );
         // The key step starts here; a zero seed skips past it to `end`.
+        // Only a standard seed level pairs a seed with a key (ISO 14229-1 (2026) 9.4.2.2); on
+        // the supplier-specific levels the key step runs whatever the seed (ADR-405).
+        let reads_zero = zero == ZeroSeed::Unlocked && diag_ir::is_standard_seed_level(level);
         let (key, empty) = (self.label(), self.label());
-        if zero == ZeroSeed::Unlocked {
+        if reads_zero {
             let i = self.temp(id, span);
             // The seed's length; `Length` leaves the seed below it, which `Swap` and `Pop` drop.
             let length = || -> Code {
@@ -6184,7 +6188,7 @@ impl<'a> Lowerer<'a> {
             ]
             .map(|ins| (ins, span)),
         );
-        if zero == ZeroSeed::Unlocked {
+        if reads_zero {
             // Out of line, after the send-key request: a `Fail` between the seed request and the
             // `SecurityAccess` would end the dry run's scan for the profile's requests (ADR-390).
             let failure = self.pool(SEED_EMPTY.as_bytes());

@@ -13,7 +13,7 @@
 //! for each, classified by what the host saw. A sixth sends a request longer than ISO 15765 can
 //! carry, which the worker refuses with its reason (ADR-350), and its log shows the request not
 //! sent, refused by the worker. A seventh set of jobs sends requests whose positive response is
-//! suppressed (ADR-407): the ECU's silence is the result, a negative response is returned, and a
+//! suppressed (ADR-408): the ECU's silence is the result, a negative response is returned, and a
 //! response pending obliges a final response. Every job comes from a document and opens the link
 //! its variant
 //! declares (ADR-324).
@@ -709,7 +709,7 @@ async fn logged_run(
     (result, entries)
 }
 
-/// Requests whose positive response is suppressed (ADR-407), against the simulated ECU: its
+/// Requests whose positive response is suppressed (ADR-408), against the simulated ECU: its
 /// silence at the end of P2 is the request's result and the run goes on; a negative response is
 /// returned; a response pending obliges a final response, which is the result, and silence after
 /// one is a failure. Each entry keeps `outcome: no_response` and `request.suppressed` for the

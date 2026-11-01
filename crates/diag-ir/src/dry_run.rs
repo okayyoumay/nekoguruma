@@ -533,7 +533,7 @@ impl ScriptedHost<'_, '_> {
         let script = self.script;
         let scripted = script.responses.get(&name).map_or(&[][..], Vec::as_slice);
         // A request whose positive response is suppressed is answered with no bytes unless the
-        // script gives an answer, as the host returns the ECU's silence (ADR-407).
+        // script gives an answer, as the host returns the ECU's silence (ADR-408).
         let silent = suppresses_positive_response(request);
         let (answer, built) = match self.next(Answers::Response(name.clone()), scripted) {
             Some(answer) => (answer, false),

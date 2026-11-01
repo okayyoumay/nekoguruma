@@ -47,7 +47,7 @@ pub enum HostError {
     EventStreamEnded,
     /// The ECU did not answer. Not the silence of a request whose positive response is
     /// suppressed, which the VCI ended by its receive timeout with no pending seen: that is an
-    /// empty response (ADR-407).
+    /// empty response (ADR-408).
     #[error("no response from the ECU")]
     NoResponse,
     /// The worker dropped events of the link, so the primitive's outcome is unknown: the
@@ -1243,7 +1243,7 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// Sends `request` on the link and returns the whole final response (positive, or a
     /// negative `7F` response), or [`HostError::NoResponse`] if the ECU did not answer. The
     /// silence of a request whose positive response is suppressed, which the VCI ended by its
-    /// receive timeout with no pending seen, is the empty response (ADR-407).
+    /// receive timeout with no pending seen, is the empty response (ADR-408).
     ///
     /// Every request leaves through here, so the policy is checked here (ADR-235 item 8).
     fn send_recv(&mut self, request: Vec<u8>) -> Result<Vec<u8>, HostError> {
@@ -2306,7 +2306,7 @@ impl Sent {
     /// A request whose positive response is suppressed (`suppressed`) is answered by silence
     /// when it succeeds: a primitive the VCI ended by its receive timeout, with no pending seen
     /// (a final response would be owed after one) and no final response, has the empty answer
-    /// as its result (ADR-407). Every other end keeps its error.
+    /// as its result (ADR-408). Every other end keeps its error.
     fn silence_is_result(&mut self, suppressed: bool) {
         if suppressed
             && self.vci_ended(false)
@@ -2565,7 +2565,7 @@ fn sent_end(
         Ok(response) if negative.is_negative(sid, response) => {
             return (End::Negative(response.clone()), Detail::default());
         }
-        // The silence of a request whose positive response is suppressed (ADR-407): the entry
+        // The silence of a request whose positive response is suppressed (ADR-408): the entry
         // is `no_response`, and the primitive did not fail, so there is no `host_error`.
         Ok(response) if response.is_empty() => return (End::NoResponse, Detail::default()),
         Ok(response) => {
@@ -4665,7 +4665,7 @@ mod tests {
         ));
     }
 
-    /// ADR-407: the silence of a request whose positive response is suppressed is its result
+    /// ADR-408: the silence of a request whose positive response is suppressed is its result
     /// only when the VCI ended the primitive by its receive timeout with no pending seen and no
     /// final response; every other end keeps its error.
     #[test]

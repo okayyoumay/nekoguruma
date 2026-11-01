@@ -82,7 +82,7 @@ fn an_index_out_of_range_is_refused_at_its_line() {
 fn a_field_read_of_a_suppressed_requests_response_is_refused() {
     // ECUReset with the suppress bit set (reset type 0x81): the ECU sends no positive response,
     // so the dry run answers with no bytes, `ok` holds, and a field read has nothing to read
-    // (ADR-407).
+    // (ADR-408).
     let checked = "def main():\n\
         \x20   r = diag.request(0x11, {\"reset\": 0x81})\n\
         \x20   if not r[\"ok\"]:\n\

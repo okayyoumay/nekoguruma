@@ -83,7 +83,7 @@ pub const fn is_standard_seed_level(level: u8) -> bool {
 /// TesterPresent, ControlDTCSetting, ResponseOnEvent, LinkControl,
 /// DynamicallyDefineDataIdentifier, RoutineControl), which the ECU leaves unanswered when the
 /// request succeeds. One function for the agent's host (the result and the log) and the dry run
-/// (ADR-407, ADR-397).
+/// (ADR-408, ADR-397).
 pub fn suppresses_positive_response(request: &[u8]) -> bool {
     matches!(
         request,
@@ -520,7 +520,7 @@ pub trait DiagHost {
     type Error: std::error::Error + Send + Sync + 'static;
 
     /// An empty answer is the silence of a request whose positive response is suppressed
-    /// ([`suppresses_positive_response`], ADR-407).
+    /// ([`suppresses_positive_response`], ADR-408).
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, Self::Error>;
     /// [`Op::SendReceive`]: sends `request` as it is and returns the answer to it, matched
     /// against the positive response of `service` (`Service.id`) and the negative-response

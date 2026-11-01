@@ -1,4 +1,4 @@
-# ADR-407: A Suppressed Request's Silence Within the Limit in Force Is Its Result
+# ADR-408: A Suppressed Request's Silence Within the Limit in Force Is Its Result
 
 **Date:** 2026-11-01
 **Status:** Accepted

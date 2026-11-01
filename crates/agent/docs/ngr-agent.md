@@ -144,9 +144,11 @@ ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <
 ```
 
 Runs the functional presence requests of an identification plan, then reads the VIN its VIN
-rules name, then reads the ECU definitions it names in the order ADR-327 item 4 gives, narrowing
-the candidates on what the reads and the VIN rules show (`run_identification`, ADR-396, ADR-399,
-ADR-401, ADR-402; design 8.8.2), and prints the report, which lists the remaining candidates. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
+rules name, then reads the ECU definitions it names in the order ADR-327 item 4 gives, with the
+fields the candidates' matching rules read, narrowing the candidates on what the reads, the VIN
+rules and those fields show (`run_identification`, ADR-396, ADR-399, ADR-401, ADR-402, ADR-403;
+design 8.8.2), and prints the report, which lists the remaining candidates, the rule fields and
+the component values the rules gave. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
 `--comm-log` mean what they mean for `run`, and both commands run their job in one shell
 (`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
 source with the slot, the report of the log's path, and the worker's stop with the guards'
@@ -168,7 +170,7 @@ API and the width as a procedure's does.
 
 | Exit status | Meaning | Output |
 |---|---|---|
-| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, and the ECU reads and entry states, ADR-401) |
+| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, the ECU reads and entry states, ADR-401, and the rule fields and component values, ADR-403) |
 | 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
@@ -1504,7 +1506,15 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
   and declared links of one presence group (bus and functional identifier) that differ in a
   ComParam other than the listed timings (ADR-395 item 6), which are not compared; and a pattern
   service whose identification request cannot be built without values
-  (`PlanRefused::IdentificationRequest`, through `diag_ir::identify::identification_requests`).
+  (`PlanRefused::IdentificationRequest`, through `diag_ir::identify::identification_requests`); and
+  a field rule's source the job cannot judge (`PlanRefused::FieldSource`, ADR-403): its request
+  needs values (`identification_request_of`), its field is one a variant pattern could not
+  compare (`ExpectedKind::of_field`, ADR-306 item 5), its `expected` could never match
+  (`ExpectedKind::never_matches`: empty, over eight bytes for an integer, a number outside what
+  the field's fixed width holds, longer than a fixed-length bytes or text field can be, text that
+  is not UTF-8), or the sources of one component on one request cannot decode to one value
+  (different kinds, a text and bytes, or one data kind at two fixed lengths). `diag_ir::plan::validate` (so `load_plan`) also refuses a field rule whose source is a
+  document of a definition no entry of its candidate lists.
   A declared link that ADR-324 refuses is reported, not
   refused. `load_plan` also refuses the structural errors listed in ADR-395 item 3.
 - `CheckedPlan::report` derives the `IdentificationReport`: the plan's selection (candidates, a definition chosen by
@@ -1515,7 +1525,9 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
   documents whose link is refused, an empty presence section, and the VIN reads with every source
   `NotRead` (`LinkRefused` for a source whose document's link ADR-324 refuses) and every VIN rule
   unevaluated, the ECU reads with every declaration `NotRead` (`LinkRefused` for a refused
-  document) and every entry `NotRead`.
+  document) and every entry `NotRead`; the rule fields with every source `NotRead` (`LinkRefused`
+  for a refused document), no value established and every rule `Unevaluated`, and no component
+  value.
 - `run_identification(source, plan, limits, guards, comm_log, vci, cancel)` sends one functional
   presence request (`3E 00`) per presence group, one link at a time, under the per-VCI lock
   (`JobGuards::take_vci_only`), and fills the report's presence section: the answers as bus,
@@ -1586,7 +1598,9 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     than the timings into `LinkGroup`s (`raise_timings` gives the group's link the largest
     timings), each holding its distinct identification requests
     (`diag_ir::identify::identification_requests`) with the (document, service) declarations that
-    share the bytes. The documents whose link ADR-324 refuses form a read with `endpoint` null and
+    share the bytes (each flagged `pattern` when a variant pattern names it; `group_rule_fields` adds
+    a field rule's source as a declaration with `pattern` false when no pattern names its
+    service, so its request is sent with the group's and opens nothing of its own). The documents whose link ADR-324 refuses form a read with `endpoint` null and
     a group with no link, and make their definition inconclusive at every endpoint. A group
     opens its link (`open_part`), sends each request once with the origin `identification`
     (`repeat_within_bounds`, as the VIN read does), decodes the one response with every
@@ -1596,12 +1610,13 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     sent again), `NoUsableAnswer`, `LinkRefused`, `WorkerRefused`, `NotRead` or `NotInPlay` (no
     remaining candidate named the definition when the phase ended, so it was not read); bounds that run
     out leave the read and the rest `NotRead` and set `ecu_reads_interrupted`. A read is
-    `conclusive` when it has a declaration, all `Decoded`, and its definition has no refused
-    variant (no negative response is definitive yet), and `answered` when a declaration got a
-    response. `evaluate_entries` then sets each entry's state from the reads of its alternatives
+    `conclusive` when it has a pattern declaration, all pattern declarations `Decoded`, and its
+    definition has no refused variant (no negative response is definitive yet; a rule-only
+    declaration counts for nothing, a definition with no pattern a field rule names is read and
+    never conclusive), and `answered` when any declaration got a response. `evaluate_entries` then sets each entry's state from the reads of its alternatives
     (every entry stays `NotRead` when the phase was interrupted, and an entry with an
     alternative that had no physical read, all `NotRead` or `WorkerRefused`, is `NotRead`, an
-    alternative with no declaration (no pattern) is left out, and an entry with none left is `NotRead`; a
+    alternative with no pattern declaration is left out, and an entry with none left is `NotRead`; a
     refused-link alternative is an inconclusive read):
     `Identified` (one alternative with a matching variant), `Ambiguous` (two or more),
     `UnrecognizedVariant` (the answered endpoints, every read there conclusive),
@@ -1609,6 +1624,38 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     `NotFitted` (requests sent, nothing answered) or `NotRead` (none sent). The JSON uses serde's
     default names; field values are the agent's `FieldValue`, with bytes and hashes as lowercase
     hex.
+  - The rule fields (ADR-403). `group_rule_fields` gives each field rule's source a place in the
+    read of its document's definition: one `RuleFieldPlan` per definition, endpoint, link group,
+    request and component, holding the deduplicated sources. After the groups of a read are
+    judged, `evaluate_rule_fields` gives each source an outcome from its declaration
+    (`RuleSourceOutcome`: `Decoded` with the field's value, `Undecodable`, `Negative`,
+    `NoUsableAnswer`, `LinkRefused`, `WorkerRefused`, `NotRead`, `NotInPlay`), establishes the
+    component's value when every source decoded and all gave one value, and sets each rule on
+    the field `Matched` or `NotMatched` by `diag_ir::decode::expected_matches` (ADR-306), else
+    `Unevaluated`. `contradictions` drops a candidate with rules on an established field none of
+    which matched (`Contradiction::FieldRules`, naming the field); `outcome_sets` adds, per rule
+    field of the definition at an endpoint, one list of alternatives from `rule_classes` (a class
+    per distinct value the remaining candidates' rules expect, built by `expected_value`, and the
+    value no rule matches), so an unevaluated field is not an outcome at any endpoint.
+    `mark_unread` sets `NotInPlay` on the sources of definitions not in play. The report's
+    `rule_fields` is in plan order; `component_values` lists the distinct values the matched VIN
+    rules and field rules give, VIN rules first:
+
+    ```json
+    "rule_fields": [{ "definition": "D2", "endpoint": { "bus": {}, "tx_id": 2017, "rx_id": 2025 },
+      "group": 0, "request": "22f189", "component": "ModelYear",
+      "sources": [{ "document": "<hex>", "service": 2, "field": 1,
+                    "outcome": { "Decoded": { "Text": "SW123" } } }],
+      "established": { "Text": "SW123" },
+      "rules": [{ "candidate": "c1", "value": "2021", "document": "<hex>", "service": 2,
+                  "field": 1, "expected": "535731", "outcome": "Matched" }] }],
+    "component_values": [{ "component": "ModelYear", "value": "2021" }]
+    ```
+
+    `group` is the link group's index within the read (two groups can read one request), and the
+    `FieldRules` contradiction carries it too. `component_values` holds the values of the rules of
+    the candidates that remain. `endpoint` is null for a refused link, `established` null when a source failed or the values
+    differ, and each declaration in `ecu_reads` carries `pattern`.
   - The loop of the ECU phase (ADR-402; `ecu_phase`) is: `narrow` recomputes the remaining
     candidates from the facts (`facts_of`: a read with a match identifies its definition at its
     endpoint, a conclusive one without a match rules it out) and the VIN rules, with the one
@@ -1623,9 +1670,9 @@ and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401).
     `dropped` (each with its `Contradiction`, `UnlistedDefinition` with the identified definition,
     the endpoint and the definitions ruled out there, or `VinRules` with the component, and
     `after`, the definition whose read completed it, null for the VIN) and `read_order` (each
-    definition with its `worst_case`) are the result. Until the rule fields are read the worst
-    case is the remaining count for every definition that can be conclusive at every endpoint
-    (one with a refused variant can score lower). An interruption narrows once more, from the
+    definition with its `worst_case`) are the result. The worst case is the remaining count for
+    every definition without a rule field that can be conclusive at every endpoint (one with a
+    refused variant can score lower). An interruption narrows once more, from the
     matches of the part read, before it ends the phase. An interrupted phase keeps `remaining` and
     `dropped` and leaves every entry `NotRead`; the entries of dropped candidates are judged from
     the same reads.

@@ -54,22 +54,31 @@ pub fn identification_requests(
     services.dedup();
     services
         .into_iter()
-        .map(|id| {
-            let request = variant
-                .services()
-                .into_iter()
-                .flatten()
-                .find(|service| service.id() == id)
-                .and_then(|service| service.request())
-                .ok_or(IdentifyError::Incomplete(id, "request"))?;
-            let mut message = vec![request.sid()];
-            message.extend(
-                encode_request(&request, &HashMap::new())
-                    .map_err(|error| IdentifyError::Encode { service: id, error })?,
-            );
-            Ok((id, message))
-        })
+        .map(|id| Ok((id, identification_request_of(variant, id)?)))
         .collect()
+}
+
+/// The whole constant request (the SID, then the encoded request) of service `id` of `variant`,
+/// built without values: the request of a service a variant pattern names, or of a service a field
+/// rule reads (8.8.2). A service with no request in the variant's declarations, or a request that
+/// needs values, is an error. [`identification_requests`] builds each of its requests so.
+pub fn identification_request_of(
+    variant: &EcuVariant<'_>,
+    id: u32,
+) -> Result<Vec<u8>, IdentifyError> {
+    let request = variant
+        .services()
+        .into_iter()
+        .flatten()
+        .find(|service| service.id() == id)
+        .and_then(|service| service.request())
+        .ok_or(IdentifyError::Incomplete(id, "request"))?;
+    let mut message = vec![request.sid()];
+    message.extend(
+        encode_request(&request, &HashMap::new())
+            .map_err(|error| IdentifyError::Encode { service: id, error })?,
+    );
+    Ok(message)
 }
 
 /// The identification run of a variant's `document`: the document with its procedure replaced
@@ -250,6 +259,47 @@ mod tests {
         // The server's program names the same services in the same order.
         let (_, services) = identification_document(&bytes).unwrap();
         assert_eq!(services, vec![1, 2]);
+    }
+
+    #[test]
+    fn the_request_of_one_service_is_the_entry_identification_requests_builds() {
+        let bytes = document(
+            vec![
+                read_service(2, [0xF1, 0x89], 2),
+                read_service(1, [0xF1, 0x87], 2),
+                read_service(3, [0xF1, 0x90], 2),
+            ],
+            &[2, 1],
+        );
+        let loaded = load_ecu_document(&bytes).unwrap();
+        let variant = loaded.variant().unwrap();
+        for (id, request) in identification_requests(&variant).unwrap() {
+            assert_eq!(identification_request_of(&variant, id), Ok(request));
+        }
+        // A service no pattern names (a field rule's) builds its request too.
+        assert_eq!(
+            identification_request_of(&variant, 3),
+            Ok(vec![0x22, 0xF1, 0x90])
+        );
+        assert_eq!(
+            identification_request_of(&variant, 9),
+            Err(IdentifyError::Incomplete(9, "request"))
+        );
+        let mut scalar = read_service(1, [0xF1, 0x87], 2);
+        scalar.request.as_mut().unwrap().params = Some(vec![FieldT {
+            id: 9,
+            short_name: Some("arg".into()),
+            placement: Placement::AfterPrevious,
+            bit_length: 8,
+            kind: DataKind::Uint,
+            ..Default::default()
+        }]);
+        let bytes = document(vec![scalar], &[1]);
+        let loaded = load_ecu_document(&bytes).unwrap();
+        assert!(matches!(
+            identification_request_of(&loaded.variant().unwrap(), 1),
+            Err(IdentifyError::Encode { service: 1, .. })
+        ));
     }
 
     #[test]

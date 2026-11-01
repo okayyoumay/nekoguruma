@@ -10,7 +10,10 @@
 //! identified VIN takes (ADR-399). It then reads the ECU definitions the plan names, once each, in
 //! the order ADR-327 item 4 gives, and is the only writer of the report's ECU reads and entry
 //! states (ADR-401); a plan whose selection narrows drops the candidates the reads and the VIN
-//! rules contradict, and reads no definition that no remaining candidate names (ADR-402).
+//! rules contradict, and reads no definition that no remaining candidate names (ADR-402). The
+//! fields the candidates' matching rules read are requests of the definitions' reads: their
+//! values are established per component when their sources agree, and a candidate whose rules on
+//! an established field none matched is dropped (ADR-403).
 
 use std::cell::Cell;
 use std::cmp::Reverse;
@@ -18,12 +21,16 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
-use diag_ir::declaration::EcuVariant;
-use diag_ir::decode::{DecodedField, PhysicalValue, variant_matches};
-use diag_ir::identify::{IdentifyError, decode_identification_answer, identification_requests};
+use diag_ir::declaration::{DataKind, EcuVariant, LengthKind};
+use diag_ir::decode::{
+    DecodedField, ExpectedKind, PhysicalValue, expected_matches, expected_value, variant_matches,
+};
+use diag_ir::identify::{
+    IdentifyError, decode_identification_answer, identification_request_of, identification_requests,
+};
 use diag_ir::plan::{
-    Component, Entry as PlanEntry, IdentificationPlan, PlanError, Selection, Sha256, Source,
-    VinRule, hex,
+    Component, Entry as PlanEntry, FieldRule, IdentificationPlan, PlanError, Selection, Sha256,
+    Source, VinRule, hex,
 };
 use diag_ir::{DiagHost, IdentityKind};
 use serde::{Serialize, Serializer};
@@ -106,6 +113,19 @@ pub enum PlanRefused {
     IdentificationRequest {
         document: String,
         service: u32,
+        why: String,
+    },
+    /// A field rule's source that the identification job cannot judge: its request needs values,
+    /// its field is one a variant pattern could not compare (ADR-306 item 5), its expected value
+    /// could never match, or the sources of one component on one request decode to different
+    /// kinds (ADR-403).
+    #[error(
+        "document {document} cannot give a field rule value from service {service} field {field}: {why}"
+    )]
+    FieldSource {
+        document: String,
+        service: u32,
+        field: u32,
         why: String,
     },
     #[error("document {document} declares functional identifier {functional_id:#x}: {why}")]
@@ -343,13 +363,23 @@ struct VinReadPlan {
 /// A document's identification requests: each pattern service with its whole request.
 type DocumentRequests = (Sha256, Vec<(u32, Vec<u8>)>);
 
+/// A (document, service) declaration of a request: `pattern` when a variant pattern names it,
+/// which counts for conclusiveness (ADR-327 item 3); a rule-only declaration is read for a field
+/// rule's source (ADR-403).
+#[derive(Debug, Clone, Copy)]
+struct Declaration {
+    document: Sha256,
+    service: u32,
+    pattern: bool,
+}
+
 /// One identification request of a link group and the declarations that share its bytes.
 #[derive(Debug)]
 struct RequestPlan {
     /// The whole request, SID first.
     request: Vec<u8>,
-    /// The (document, service) declarations whose identification request these bytes are.
-    declarations: Vec<(Sha256, u32)>,
+    /// The declarations whose identification request these bytes are.
+    declarations: Vec<Declaration>,
 }
 
 /// The variants of one definition at one endpoint that share a link: equal ComParams other than
@@ -382,6 +412,45 @@ struct EcuReadPlan {
     groups: Vec<LinkGroup>,
 }
 
+/// What a field rule's source decodes to, as far as its declaration tells (ADR-403): text or not,
+/// and the data kind with the bit length of a fixed-length field.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SourceType {
+    text: bool,
+    fixed: Option<(DataKind, u32)>,
+}
+
+impl SourceType {
+    /// Whether a response could decode to one value through both: a text and bytes never equal,
+    /// and fields of one data kind at different fixed lengths never agree.
+    fn can_agree(self, other: Self) -> bool {
+        self.text == other.text
+            && match (self.fixed, other.fixed) {
+                (Some((a, bits)), Some((b, other_bits))) if a == b => bits == other_bits,
+                _ => true,
+            }
+    }
+}
+
+/// The field rules' sources of one component on one request of one link group of one read: the
+/// sources decode the one response, and the component's value is established when they agree
+/// (ADR-327 item 4, ADR-403).
+#[derive(Debug)]
+struct RuleFieldPlan {
+    /// Index into `CheckedPlan::ecu_reads` (a definition at an endpoint).
+    read: usize,
+    /// Indexes of the link group and of its request.
+    group: usize,
+    request: usize,
+    component: Component,
+    /// How the sources' values read a rule's expected value; equal for every source.
+    kind: ExpectedKind,
+    /// What each source decodes to, which the plan check requires to be able to agree.
+    types: Vec<SourceType>,
+    /// Deduplicated, in plan order (candidate order, then rule order).
+    sources: Vec<Source>,
+}
+
 /// A plan that passed [`check_plan`].
 #[derive(Debug)]
 pub struct CheckedPlan {
@@ -400,6 +469,10 @@ pub struct CheckedPlan {
     ecu_reads: Vec<EcuReadPlan>,
     /// Every candidate's entries with the candidate's id, in plan order.
     entries: Vec<(String, PlanEntry)>,
+    /// Every candidate's field rules, with the candidate's id, in plan order.
+    field_rules: Vec<(String, FieldRule)>,
+    /// The rule fields of the ECU reads, in plan order (ADR-403).
+    rule_fields: Vec<RuleFieldPlan>,
 }
 
 impl EcuReadPlan {
@@ -450,6 +523,8 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
     }
     // The VIN rules' sources, each once, in plan order.
     let mut vin_sources: Vec<(Source, ServiceField)> = Vec::new();
+    // Every field rule's whole request and expected kind, in plan order (ADR-403).
+    let mut field_checks: Vec<(Vec<u8>, ExpectedKind, SourceType)> = Vec::new();
     for candidate in &loaded.plan.candidates {
         let sources = candidate
             .vin_rules
@@ -473,6 +548,10 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
                     field: source.field,
                 });
             }
+        }
+        for rule in &candidate.field_rules {
+            let variant = document(&rule.source.document).variant();
+            field_checks.push(check_field_rule(&variant, rule)?);
         }
         for rule in &candidate.vin_rules {
             if vin_sources.iter().any(|(known, _)| *known == rule.source) {
@@ -572,7 +651,18 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
         .iter()
         .flat_map(|c| c.vin_rules.iter().map(|rule| (c.id.clone(), rule.clone())))
         .collect();
-    let ecu_reads = group_ecu_reads(&loaded.plan, &requests, &links, &refused_links);
+    let mut ecu_reads = group_ecu_reads(&loaded.plan, &requests, &links, &refused_links);
+    let field_rules: Vec<(String, FieldRule)> = loaded
+        .plan
+        .candidates
+        .iter()
+        .flat_map(|c| {
+            c.field_rules
+                .iter()
+                .map(|rule| (c.id.clone(), rule.clone()))
+        })
+        .collect();
+    let rule_fields = group_rule_fields(&field_rules, &field_checks, &mut ecu_reads)?;
     let entries = loaded
         .plan
         .candidates
@@ -590,7 +680,149 @@ pub fn check_plan(loaded: &LoadedPlan) -> Result<CheckedPlan, PlanRefused> {
         documents: loaded.documents.clone(),
         ecu_reads,
         entries,
+        field_rules,
+        rule_fields,
     })
+}
+
+/// What the plan check requires of one field rule's source: its request builds without values,
+/// its field is one a variant pattern could compare (ADR-306 item 5), and its expected value could
+/// match some value of the field (`ExpectedKind::never_matches`: not empty, within what the
+/// field's width holds, no longer than a fixed-length field, UTF-8 for text). The source's whole
+/// request, the kind its field's value reads `expected` by and what it decodes to.
+fn check_field_rule(
+    variant: &EcuVariant<'_>,
+    rule: &FieldRule,
+) -> Result<(Vec<u8>, ExpectedKind, SourceType), PlanRefused> {
+    let source = &rule.source;
+    let refused = |why: String| PlanRefused::FieldSource {
+        document: hex(&source.document),
+        service: source.service,
+        field: source.field,
+        why,
+    };
+    let request = identification_request_of(variant, source.service)
+        .map_err(|error| refused(error.to_string()))?;
+    let field = variant
+        .services()
+        .into_iter()
+        .flatten()
+        .find(|service| service.id() == source.service)
+        .and_then(|service| service.positive()?.fields())
+        .and_then(|fields| fields.iter().find(|field| field.id() == source.field))
+        .ok_or_else(|| PlanRefused::UnknownField {
+            document: hex(&source.document),
+            service: source.service,
+            field: source.field,
+        })?;
+    let kind = ExpectedKind::of_field(&field).map_err(|reason| {
+        refused(format!(
+            "a field a variant pattern could not compare: {reason}"
+        ))
+    })?;
+    if let Some(why) = kind.never_matches(&field, &rule.expected) {
+        return Err(refused(why.to_owned()));
+    }
+    let fixed = (field.length_kind() == LengthKind::Fixed && field.bit_length() >= 1)
+        .then(|| (field.kind(), field.bit_length()));
+    let text = matches!(
+        field.kind(),
+        DataKind::Ascii | DataKind::Utf8 | DataKind::Unicode2
+    );
+    Ok((request, kind, SourceType { text, fixed }))
+}
+
+/// Joins each field rule's source to the read of its document's definition (ADR-403): the source
+/// is a declaration of the request its service builds, in the link group that holds its document,
+/// flagged as no pattern's when none names it; one rule field per (read, group, request,
+/// component) holds the sources of its rules. `checks` gives each rule's request and kind, in the
+/// order of `rules`. Refused when the sources of one rule field read their value by different
+/// kinds.
+fn group_rule_fields(
+    rules: &[(String, FieldRule)],
+    checks: &[(Vec<u8>, ExpectedKind, SourceType)],
+    reads: &mut [EcuReadPlan],
+) -> Result<Vec<RuleFieldPlan>, PlanRefused> {
+    let mut fields: Vec<RuleFieldPlan> = Vec::new();
+    for ((_, rule), (request, kind, source_type)) in rules.iter().zip(checks) {
+        let source = rule.source;
+        // The document is in exactly one group of one read (`validate`, `group_ecu_reads`).
+        let Some((read, group)) = reads.iter().enumerate().find_map(|(read, planned)| {
+            let group = planned
+                .groups
+                .iter()
+                .position(|group| group.documents.contains(&source.document))?;
+            Some((read, group))
+        }) else {
+            continue;
+        };
+        let requests = &mut reads[read].groups[group].requests;
+        let at = requests
+            .iter()
+            .position(|known| known.request == *request)
+            .unwrap_or_else(|| {
+                requests.push(RequestPlan {
+                    request: request.clone(),
+                    declarations: Vec::new(),
+                });
+                requests.len() - 1
+            });
+        let declarations = &mut requests[at].declarations;
+        if !declarations
+            .iter()
+            .any(|d| d.document == source.document && d.service == source.service)
+        {
+            declarations.push(Declaration {
+                document: source.document,
+                service: source.service,
+                pattern: false,
+            });
+        }
+        let known = fields.iter().position(|f| {
+            f.read == read && f.group == group && f.request == at && f.component == rule.component
+        });
+        let field = match known {
+            Some(known) => &mut fields[known],
+            None => {
+                fields.push(RuleFieldPlan {
+                    read,
+                    group,
+                    request: at,
+                    component: rule.component,
+                    kind: *kind,
+                    types: Vec::new(),
+                    sources: Vec::new(),
+                });
+                fields.last_mut().expect("just pushed")
+            }
+        };
+        if field.kind != *kind {
+            return Err(PlanRefused::FieldSource {
+                document: hex(&source.document),
+                service: source.service,
+                field: source.field,
+                why: "sources of one component on one request decode to different kinds".to_owned(),
+            });
+        }
+        if !field
+            .types
+            .iter()
+            .all(|known| known.can_agree(*source_type))
+        {
+            return Err(PlanRefused::FieldSource {
+                document: hex(&source.document),
+                service: source.service,
+                field: source.field,
+                why: "sources of one component on one request cannot decode to one value (a text and bytes, or one data kind at two fixed lengths)"
+                    .to_owned(),
+            });
+        }
+        if !field.sources.contains(&source) {
+            field.sources.push(source);
+            field.types.push(*source_type);
+        }
+    }
+    Ok(fields)
 }
 
 /// The endpoint a declared link goes to.
@@ -670,10 +902,18 @@ fn group_ecu_reads(
             }
             for (service, request) in built {
                 match group.requests.iter_mut().find(|r| r.request == *request) {
-                    Some(known) => known.declarations.push((*hash, *service)),
+                    Some(known) => known.declarations.push(Declaration {
+                        document: *hash,
+                        service: *service,
+                        pattern: true,
+                    }),
                     None => group.requests.push(RequestPlan {
                         request: request.clone(),
-                        declarations: vec![(*hash, *service)],
+                        declarations: vec![Declaration {
+                            document: *hash,
+                            service: *service,
+                            pattern: true,
+                        }],
                     }),
                 }
             }
@@ -825,13 +1065,14 @@ pub struct VinRead {
     pub accepted: Option<Vin>,
 }
 
-/// Whether the established VIN satisfies a VIN rule. Only a plan whose selection narrows drops a
-/// candidate on it, per component (ADR-402, ADR-399 item 6).
+/// Whether the established VIN satisfies a VIN rule, or the established value of a rule field a
+/// field rule. Only a plan whose selection narrows drops a candidate on it, per component (and
+/// rule field, for a field rule) (ADR-402, ADR-399 item 6, ADR-403).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
-pub enum VinRuleOutcome {
+pub enum RuleOutcome {
     Matched,
     NotMatched,
-    /// No VIN was established.
+    /// No VIN was established, or the rule field's value was not.
     Unevaluated,
 }
 
@@ -843,7 +1084,7 @@ pub struct VinRuleResult {
     pub value: String,
     pub start: u8,
     pub end: u8,
-    pub outcome: VinRuleOutcome,
+    pub outcome: RuleOutcome,
 }
 
 /// A decoded value of an identification field. It is built from the decoder's physical value, so
@@ -956,7 +1197,82 @@ pub struct DeclarationOutcome {
     #[serde(serialize_with = "as_hex")]
     pub document: Sha256,
     pub service: u32,
+    /// A variant pattern names the service; else it is read only for a field rule's source and
+    /// counts for nothing in conclusiveness (ADR-403).
+    pub pattern: bool,
     pub outcome: RequestOutcome,
+}
+
+/// What one field rule source gave (ADR-403): the field's value, or why there is none.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub enum RuleSourceOutcome {
+    /// The response decoded and held the field.
+    Decoded(FieldValue),
+    /// A response that is not negative and does not decode through the source's service.
+    Undecodable,
+    /// A negative response, with its response code.
+    Negative(u8),
+    /// The request got no usable answer within the run's repeats (ADR-392).
+    NoUsableAnswer,
+    /// The source's document declares a link ADR-324 refuses, so nothing was read.
+    LinkRefused,
+    /// The worker refused to open the link when the read was made.
+    WorkerRefused,
+    /// The read was not made: the run ended, or its bounds ran out, before it.
+    NotRead,
+    /// The read was not made: no remaining candidate named the definition (ADR-402).
+    NotInPlay,
+}
+
+/// A field rule source of a rule field, with what it gave.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuleFieldSource {
+    #[serde(serialize_with = "as_hex")]
+    pub document: Sha256,
+    pub service: u32,
+    pub field: u32,
+    pub outcome: RuleSourceOutcome,
+}
+
+/// A candidate's field rule and how the rule field's established value stands to it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct FieldRuleResult {
+    pub candidate: String,
+    pub value: String,
+    #[serde(serialize_with = "as_hex")]
+    pub document: Sha256,
+    pub service: u32,
+    pub field: u32,
+    #[serde(serialize_with = "as_hex")]
+    pub expected: Vec<u8>,
+    pub outcome: RuleOutcome,
+}
+
+/// One component's field rules on one request of one definition's read at one endpoint: the
+/// sources that decode its response, the value established when they agree, and every candidate's
+/// rules on it (ADR-327 items 4 and 6, ADR-403).
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RuleFieldRead {
+    pub definition: String,
+    /// The endpoint read; `None` when the sources' link is refused.
+    pub endpoint: Option<EndpointKey>,
+    /// The index of the link group within the definition's read at the endpoint, in the order
+    /// the groups are planned: two groups can read one request.
+    pub group: usize,
+    #[serde(serialize_with = "as_hex")]
+    pub request: Vec<u8>,
+    pub component: Component,
+    pub sources: Vec<RuleFieldSource>,
+    /// The value every source decoded to, when they all decoded and agree.
+    pub established: Option<FieldValue>,
+    pub rules: Vec<FieldRuleResult>,
+}
+
+/// A value of a component that a matched rule gives (ADR-403).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct ComponentValue {
+    pub component: Component,
+    pub value: String,
 }
 
 /// One identification request, sent once, and every declaration its one response is decoded by.
@@ -980,11 +1296,12 @@ pub struct EcuRead {
     /// Every document whose variant matched (ADR-327 item 7).
     #[serde(serialize_with = "hashes_as_hex")]
     pub matching: Vec<Sha256>,
-    /// Every declaration decoded a positive response and no variant of the definition has a link
-    /// ADR-324 refuses: a read that rules out the definition's other variants (ADR-327 item 3).
-    /// No negative response is definitive yet, so any one leaves the read inconclusive.
+    /// Every pattern declaration decoded a positive response and no variant of the definition has
+    /// a link ADR-324 refuses: a read that rules out the definition's other variants (ADR-327
+    /// item 3). No negative response is definitive yet, so any one leaves the read inconclusive;
+    /// a request read only for a field rule's source counts for nothing here (ADR-403).
     pub conclusive: bool,
-    /// Some declaration got a response of the ECU.
+    /// Some declaration got a response of the ECU, a rule-only one included.
     pub answered: bool,
 }
 
@@ -1036,6 +1353,17 @@ pub enum Contradiction {
     },
     /// The VIN is established and none of the candidate's VIN rules for the component matched.
     VinRules { component: Component },
+    /// A rule field of the component is established and none of the candidate's rules on it
+    /// matched (ADR-403).
+    FieldRules {
+        component: Component,
+        definition: String,
+        endpoint: EndpointKey,
+        /// The link group of the rule field within the read (see `RuleFieldRead::group`).
+        group: usize,
+        #[serde(serialize_with = "as_hex")]
+        request: Vec<u8>,
+    },
 }
 
 /// A candidate a plan whose selection narrows dropped, and why.
@@ -1091,6 +1419,11 @@ pub struct IdentificationReport {
     vehicle_lock_held: bool,
     /// Each candidate's VIN rules against the established VIN.
     vin_rules: Vec<VinRuleResult>,
+    /// The rule fields of the ECU reads in plan order, each source `NotRead` or `LinkRefused`
+    /// and each rule unevaluated until the run reads them (ADR-403).
+    rule_fields: Vec<RuleFieldRead>,
+    /// The distinct component values the matched VIN and field rules give, VIN rules first.
+    component_values: Vec<ComponentValue>,
     /// The candidates dropped, in the order they were (ADR-402).
     dropped: Vec<DroppedCandidate>,
     /// The definitions read, in the order read, each with the worst case that chose it.
@@ -1177,6 +1510,12 @@ impl IdentificationReport {
     pub fn ecu_reads(&self) -> &[EcuRead] {
         &self.ecu_reads
     }
+    pub fn rule_fields(&self) -> &[RuleFieldRead] {
+        &self.rule_fields
+    }
+    pub fn component_values(&self) -> &[ComponentValue] {
+        &self.component_values
+    }
     pub fn ecu_reads_interrupted(&self) -> bool {
         self.ecu_reads_interrupted
     }
@@ -1203,9 +1542,9 @@ impl IdentificationReport {
                 .as_str()
                 .get(usize::from(rule.start - 1)..usize::from(rule.end));
             result.outcome = if compared == Some(rule.expected.as_str()) {
-                VinRuleOutcome::Matched
+                RuleOutcome::Matched
             } else {
-                VinRuleOutcome::NotMatched
+                RuleOutcome::NotMatched
             };
         }
     }
@@ -1313,9 +1652,11 @@ impl CheckedPlan {
                     value: rule.value.clone(),
                     start: rule.start,
                     end: rule.end,
-                    outcome: VinRuleOutcome::Unevaluated,
+                    outcome: RuleOutcome::Unevaluated,
                 })
                 .collect(),
+            rule_fields: self.rule_fields_initial(),
+            component_values: Vec::new(),
             dropped: Vec::new(),
             read_order: Vec::new(),
             ecu_reads: self
@@ -1346,9 +1687,10 @@ impl CheckedPlan {
                                     declarations: request
                                         .declarations
                                         .iter()
-                                        .map(|&(document, service)| DeclarationOutcome {
-                                            document,
-                                            service,
+                                        .map(|declaration| DeclarationOutcome {
+                                            document: declaration.document,
+                                            service: declaration.service,
+                                            pattern: declaration.pattern,
                                             outcome: outcome.clone(),
                                         })
                                         .collect(),
@@ -1373,6 +1715,58 @@ impl CheckedPlan {
                 })
                 .collect(),
         }
+    }
+
+    /// The rule fields as the report starts with them: every source not read (or its link
+    /// refused), no value established, every rule unevaluated (ADR-403).
+    fn rule_fields_initial(&self) -> Vec<RuleFieldRead> {
+        self.rule_fields
+            .iter()
+            .map(|field| {
+                let read = &self.ecu_reads[field.read];
+                let group = &read.groups[field.group];
+                let outcome = if group.link.is_some() {
+                    RuleSourceOutcome::NotRead
+                } else {
+                    RuleSourceOutcome::LinkRefused
+                };
+                RuleFieldRead {
+                    definition: read.definition.clone(),
+                    endpoint: read.endpoint.clone(),
+                    group: field.group,
+                    request: group.requests[field.request].request.clone(),
+                    component: field.component,
+                    sources: field
+                        .sources
+                        .iter()
+                        .map(|source| RuleFieldSource {
+                            document: source.document,
+                            service: source.service,
+                            field: source.field,
+                            outcome: outcome.clone(),
+                        })
+                        .collect(),
+                    established: None,
+                    rules: self
+                        .field_rules
+                        .iter()
+                        .filter(|(_, rule)| {
+                            rule.component == field.component
+                                && field.sources.contains(&rule.source)
+                        })
+                        .map(|(candidate, rule)| FieldRuleResult {
+                            candidate: candidate.clone(),
+                            value: rule.value.clone(),
+                            document: rule.source.document,
+                            service: rule.source.service,
+                            field: rule.source.field,
+                            expected: rule.expected.clone(),
+                            outcome: RuleOutcome::Unevaluated,
+                        })
+                        .collect(),
+                }
+            })
+            .collect()
     }
 
     /// The link of `group`'s presence requests, before its receive table: the first declared
@@ -1713,6 +2107,8 @@ fn identify<W: WorkerSource>(
     if !report.ecu_reads_interrupted {
         evaluate_entries(&mut report.entries, &report.ecu_reads);
     }
+    // A matched rule is a fact, whether or not the phase ran to its end.
+    report.component_values = component_values(&report);
     Ok(report)
 }
 
@@ -2201,17 +2597,25 @@ fn vin_outcome(read: FieldBytes) -> VinOutcome {
 
 /// The VIN of a read when every source gave the same well-formed one (ADR-399 item 1).
 fn accepted_vin(outcomes: &[VinOutcome]) -> Option<Vin> {
-    let mut accepted = None;
-    for outcome in outcomes {
-        let VinOutcome::Decoded(vin) = outcome else {
-            return None;
-        };
-        match &accepted {
-            Some(known) if known != vin => return None,
-            _ => accepted = Some(vin.clone()),
+    agreed(outcomes.iter().map(|outcome| match outcome {
+        VinOutcome::Decoded(vin) => Some(vin.clone()),
+        _ => None,
+    }))
+}
+
+/// The one value every item gave: `None` when there is no item, an item gave none or two differ.
+/// What "every source gave the same" means for a VIN read and for a rule field (ADR-399 item 1,
+/// ADR-403).
+fn agreed<T: PartialEq>(items: impl IntoIterator<Item = Option<T>>) -> Option<T> {
+    let mut agreed = None;
+    for item in items {
+        let item = item?;
+        match &agreed {
+            Some(known) if *known != item => return None,
+            _ => agreed = Some(item),
         }
     }
-    accepted
+    agreed
 }
 
 /// The VIN phase: reads the VIN once per read of the plan, in plan order, one link open at a time,
@@ -2303,22 +2707,28 @@ fn declaration_outcomes(
     request
         .declarations
         .iter()
-        .map(|&(hash, service)| {
-            if let Some(nrc) = negative_code(sid, response) {
-                return RequestOutcome::Negative(nrc);
-            }
-            let Some((_, document)) = documents.iter().find(|(known, _)| *known == hash) else {
-                return RequestOutcome::Undecodable;
-            };
-            match decode_identification_answer(&document.variant(), service, response) {
-                Ok(Some(fields)) => {
-                    let outcome = RequestOutcome::Decoded(fields_of(&fields));
-                    read.decoded.insert((hash, service), fields);
-                    outcome
+        .map(
+            |&Declaration {
+                 document: hash,
+                 service,
+                 ..
+             }| {
+                if let Some(nrc) = negative_code(sid, response) {
+                    return RequestOutcome::Negative(nrc);
                 }
-                Ok(None) | Err(_) => RequestOutcome::Undecodable,
-            }
-        })
+                let Some((_, document)) = documents.iter().find(|(known, _)| *known == hash) else {
+                    return RequestOutcome::Undecodable;
+                };
+                match decode_identification_answer(&document.variant(), service, response) {
+                    Ok(Some(fields)) => {
+                        let outcome = RequestOutcome::Decoded(fields_of(&fields));
+                        read.decoded.insert((hash, service), fields);
+                        outcome
+                    }
+                    Ok(None) | Err(_) => RequestOutcome::Undecodable,
+                }
+            },
+        )
         .collect()
 }
 
@@ -2439,9 +2849,15 @@ fn facts_of(reads: &[EcuRead]) -> Vec<Fact> {
         .collect()
 }
 
-/// Whether some group of the planned read has a request to send.
+/// Whether some group of the planned read has a request a variant pattern names: a read for a
+/// field rule's source alone is no identification request (ADR-327 item 3, ADR-403).
 fn has_request(read: &EcuReadPlan) -> bool {
-    read.groups.iter().any(|group| !group.requests.is_empty())
+    read.groups.iter().any(|group| {
+        group
+            .requests
+            .iter()
+            .any(|request| request.declarations.iter().any(|d| d.pattern))
+    })
 }
 
 /// Whether a variant of the definition has a link ADR-324 refuses (a read without an endpoint
@@ -2459,12 +2875,14 @@ fn has_refused_variant(plan: &CheckedPlan, definition: &str) -> bool {
 /// every definition it lists there is ruled out there (so one whose read stayed inconclusive,
 /// failed or got no answer keeps it); a fact of a definition that has left play still counts. And
 /// per component, by its VIN rules when the VIN is established and none of them matched; an
-/// unevaluated rule contradicts nothing. The one function the run (`narrow`) and the hypothetical
+/// unevaluated rule contradicts nothing; and per component and rule field, by its field rules when
+/// the field is established and none of them matched (ADR-403). The one function the run (`narrow`) and the hypothetical
 /// outcomes (`outcome_sets`) both judge by, so the choice and the drop cannot drift apart.
 fn contradictions(
     plan: &CheckedPlan,
     facts: &[Fact],
     vin_rules: &[VinRuleResult],
+    rule_fields: &[RuleFieldRead],
 ) -> Vec<(String, Vec<Contradiction>)> {
     let mut found = Vec::new();
     for candidate in &plan.candidates {
@@ -2479,9 +2897,32 @@ fn contradictions(
         for component in components {
             if rules()
                 .filter(|rule| rule.component == component)
-                .all(|rule| rule.outcome == VinRuleOutcome::NotMatched)
+                .all(|rule| rule.outcome == RuleOutcome::NotMatched)
             {
                 contradictions.push(Contradiction::VinRules { component });
+            }
+        }
+        // Per component and rule field: an established field none of whose rules of the
+        // candidate matched; another field of the same component neither saves nor drops it, and
+        // an unestablished field drops nothing (ADR-403).
+        for field in rule_fields {
+            let (Some(_), Some(endpoint)) = (&field.established, &field.endpoint) else {
+                continue;
+            };
+            let own = || {
+                field
+                    .rules
+                    .iter()
+                    .filter(|rule| rule.candidate == *candidate)
+            };
+            if own().next().is_some() && own().all(|rule| rule.outcome != RuleOutcome::Matched) {
+                contradictions.push(Contradiction::FieldRules {
+                    component: field.component,
+                    definition: field.definition.clone(),
+                    endpoint: endpoint.clone(),
+                    group: field.group,
+                    request: field.request.clone(),
+                });
             }
         }
         let listed: Vec<&String> = plan
@@ -2547,7 +2988,7 @@ fn narrow(
         return report.remaining.clone();
     }
     let facts = facts_of(&report.ecu_reads);
-    let contradicted = contradictions(plan, &facts, &report.vin_rules);
+    let contradicted = contradictions(plan, &facts, &report.vin_rules, &report.rule_fields);
     for (candidate, contradictions) in &contradicted {
         if !report.dropped.iter().any(|d| d.candidate == *candidate) {
             report.dropped.push(DroppedCandidate {
@@ -2633,6 +3074,7 @@ fn outcome_sets(
     plan: &CheckedPlan,
     facts: &[Fact],
     vin_rules: &[VinRuleResult],
+    rule_fields: &[RuleFieldRead],
     remaining: &[String],
     definition: &str,
 ) -> Vec<Vec<String>> {
@@ -2652,7 +3094,7 @@ fn outcome_sets(
     if !has_refused_variant(plan, definition) {
         verdicts.push(Verdict::RuledOut);
     }
-    let alternatives: Vec<Vec<Vec<String>>> = endpoints
+    let mut alternatives: Vec<Vec<Vec<String>>> = endpoints
         .into_iter()
         .map(|endpoint| {
             verdicts
@@ -2667,7 +3109,7 @@ fn outcome_sets(
                         endpoint: endpoint.clone(),
                         verdict,
                     });
-                    contradictions(plan, &all, vin_rules)
+                    contradictions(plan, &all, vin_rules, rule_fields)
                         .into_iter()
                         .map(|(dropped, _)| dropped)
                         .collect()
@@ -2675,7 +3117,69 @@ fn outcome_sets(
                 .collect()
         })
         .collect();
+    // A rule field is a further list of alternatives: unevaluated is not an outcome, as an
+    // inconclusive read is not (ADR-403).
+    for (k, field) in plan.rule_fields.iter().enumerate() {
+        let read = &plan.ecu_reads[field.read];
+        if read.definition == definition && read.endpoint.is_some() {
+            alternatives.push(rule_classes(
+                plan,
+                facts,
+                vin_rules,
+                rule_fields,
+                k,
+                remaining,
+            ));
+        }
+    }
     fold_outcomes(remaining, &alternatives)
+}
+
+/// The alternatives of rule field `k` for the outcomes of reading its definition (ADR-327 item 4,
+/// ADR-403): per distinct value the `remaining` candidates' rules on it expect (built from
+/// `expected` by the field's kind, so one expected value that is a prefix of another lands in one
+/// class with it) the candidates dropped when the field is established to it, every rule on the
+/// field judged by `expected_matches`; and the value no rule matches. Each class is judged by
+/// `contradictions`, as the run is. A plan whose selection does not narrow drops nothing. Caller:
+/// `outcome_sets`.
+fn rule_classes(
+    plan: &CheckedPlan,
+    facts: &[Fact],
+    vin_rules: &[VinRuleResult],
+    rule_fields: &[RuleFieldRead],
+    k: usize,
+    remaining: &[String],
+) -> Vec<Vec<String>> {
+    if !plan.selection.narrows() {
+        return vec![Vec::new()];
+    }
+    let kind = plan.rule_fields[k].kind;
+    let mut values: Vec<PhysicalValue> = Vec::new();
+    for rule in &rule_fields[k].rules {
+        if let Some(value) = expected_value(kind, &rule.expected)
+            && remaining.contains(&rule.candidate)
+            && !values.contains(&value)
+        {
+            values.push(value);
+        }
+    }
+    // The value no rule matches: a float, which no rule compares equal (ADR-306 item 5).
+    let none = PhysicalValue::Float(0.0);
+    let dropped_when = |value: &PhysicalValue| {
+        let mut hypothetical = rule_fields.to_vec();
+        let field = &mut hypothetical[k];
+        field.established = Some(FieldValue::from(value));
+        judge_rules(field, value);
+        contradictions(plan, facts, vin_rules, &hypothetical)
+            .into_iter()
+            .map(|(dropped, _)| dropped)
+            .collect::<Vec<String>>()
+    };
+    values
+        .iter()
+        .map(dropped_when)
+        .chain([dropped_when(&none)])
+        .collect()
 }
 
 /// The definition to read next, with its worst case (ADR-327 item 4): among those in play, not
@@ -2705,11 +3209,18 @@ fn next_definition(
         if tried.contains(definition) || !opens || !in_play(plan, remaining, definition) {
             continue;
         }
-        let worst = outcome_sets(plan, &facts, &report.vin_rules, remaining, definition)
-            .iter()
-            .map(Vec::len)
-            .max()
-            .unwrap_or(remaining.len());
+        let worst = outcome_sets(
+            plan,
+            &facts,
+            &report.vin_rules,
+            &report.rule_fields,
+            remaining,
+            definition,
+        )
+        .iter()
+        .map(Vec::len)
+        .max()
+        .unwrap_or(remaining.len());
         let mut heard: Vec<&EndpointKey> = Vec::new();
         for endpoint in plan
             .ecu_reads
@@ -2747,6 +3258,16 @@ fn mark_unread(plan: &CheckedPlan, report: &mut IdentificationReport, remaining:
                 if declaration.outcome == RequestOutcome::NotRead {
                     declaration.outcome = RequestOutcome::NotInPlay;
                 }
+            }
+        }
+    }
+    for (field, planned) in report.rule_fields.iter_mut().zip(&plan.rule_fields) {
+        if in_play(plan, remaining, &plan.ecu_reads[planned.read].definition) {
+            continue;
+        }
+        for source in &mut field.sources {
+            if source.outcome == RuleSourceOutcome::NotRead {
+                source.outcome = RuleSourceOutcome::NotInPlay;
             }
         }
     }
@@ -2892,11 +3413,21 @@ fn read_definition_at<W: WorkerSource>(
             reported.matching.push(*hash);
         }
     }
+    // The answered judgement counts every declaration: an ECU that answered a rule's request is
+    // there. Conclusiveness counts the pattern declarations only (ADR-327 item 3, ADR-403).
     let outcomes = || {
         reported
             .requests
             .iter()
             .flat_map(|request| &request.declarations)
+            .map(|declaration| &declaration.outcome)
+    };
+    let pattern_outcomes = || {
+        reported
+            .requests
+            .iter()
+            .flat_map(|request| &request.declarations)
+            .filter(|declaration| declaration.pattern)
             .map(|declaration| &declaration.outcome)
     };
     let answered = outcomes().any(|o| {
@@ -2910,12 +3441,134 @@ fn read_definition_at<W: WorkerSource>(
     // out (ADR-327 item 3, ADR-401). A variant whose link is refused leaves the definition
     // inconclusive at every endpoint.
     let refused_variant = has_refused_variant(plan, &planned.definition);
-    let conclusive = outcomes().next().is_some()
-        && outcomes().all(|o| matches!(o, RequestOutcome::Decoded(_)))
+    let conclusive = pattern_outcomes().next().is_some()
+        && pattern_outcomes().all(|o| matches!(o, RequestOutcome::Decoded(_)))
         && !refused_variant;
     reported.answered = answered;
     reported.conclusive = conclusive;
+    evaluate_rule_fields(plan, at, &decoded, report);
     Ok(interrupted)
+}
+
+/// Judges the rule fields of the planned read `plan.ecu_reads[at]` from what its declarations
+/// gave and the fields of the groups just read (`decoded`): each source's outcome, the value the
+/// component is established to when every source decoded and all agree (a text and bytes of equal
+/// content differ: another layout decoding to another value), and each rule on the field,
+/// matched or not by `expected_matches` as a pattern is (ADR-327 item 4, ADR-306, ADR-403). A rule
+/// of a field that is not established stays unevaluated. Caller: `read_definition_at`.
+fn evaluate_rule_fields(
+    plan: &CheckedPlan,
+    at: usize,
+    decoded: &HashMap<(Sha256, u32), Vec<DecodedField>>,
+    report: &mut IdentificationReport,
+) {
+    let declared = |document: Sha256, service: u32| {
+        report.ecu_reads[at]
+            .requests
+            .iter()
+            .flat_map(|request| &request.declarations)
+            .find(|d| d.document == document && d.service == service)
+            .map(|d| d.outcome.clone())
+    };
+    let mut judged = Vec::new();
+    for (k, planned) in plan
+        .rule_fields
+        .iter()
+        .enumerate()
+        .filter(|(_, f)| f.read == at)
+    {
+        let mut values: Vec<Option<PhysicalValue>> = Vec::new();
+        let mut sources = Vec::new();
+        for source in &planned.sources {
+            let value = decoded
+                .get(&(source.document, source.service))
+                .and_then(|fields| fields.iter().find(|f| f.id == source.field))
+                .map(|f| f.value.clone());
+            let outcome = match declared(source.document, source.service) {
+                Some(RequestOutcome::Decoded(_)) => match &value {
+                    Some(value) => RuleSourceOutcome::Decoded(FieldValue::from(value)),
+                    None => RuleSourceOutcome::Undecodable,
+                },
+                Some(RequestOutcome::Undecodable) | None => RuleSourceOutcome::Undecodable,
+                Some(RequestOutcome::Negative(nrc)) => RuleSourceOutcome::Negative(nrc),
+                Some(RequestOutcome::NoUsableAnswer) => RuleSourceOutcome::NoUsableAnswer,
+                Some(RequestOutcome::LinkRefused) => RuleSourceOutcome::LinkRefused,
+                Some(RequestOutcome::WorkerRefused) => RuleSourceOutcome::WorkerRefused,
+                Some(RequestOutcome::NotRead) => RuleSourceOutcome::NotRead,
+                Some(RequestOutcome::NotInPlay) => RuleSourceOutcome::NotInPlay,
+            };
+            values.push(match outcome {
+                RuleSourceOutcome::Decoded(_) => value,
+                _ => None,
+            });
+            sources.push(RuleFieldSource {
+                document: source.document,
+                service: source.service,
+                field: source.field,
+                outcome,
+            });
+        }
+        let established = agreed(values);
+        judged.push((k, sources, established));
+    }
+    for (k, sources, established) in judged {
+        let field = &mut report.rule_fields[k];
+        field.sources = sources;
+        field.established = established.as_ref().map(FieldValue::from);
+        match &established {
+            Some(value) => judge_rules(field, value),
+            None => {
+                for rule in &mut field.rules {
+                    rule.outcome = RuleOutcome::Unevaluated;
+                }
+            }
+        }
+    }
+}
+
+/// Sets each rule on `field` matched or not by `expected_matches` for the established `value`
+/// (ADR-306, ADR-403). Callers: `evaluate_rule_fields`, `rule_classes`.
+fn judge_rules(field: &mut RuleFieldRead, value: &PhysicalValue) {
+    for rule in &mut field.rules {
+        rule.outcome = if expected_matches(&rule.expected, value) {
+            RuleOutcome::Matched
+        } else {
+            RuleOutcome::NotMatched
+        };
+    }
+}
+
+/// The distinct component values the matched rules of the remaining candidates give: the VIN
+/// rules' first, then the field rules' (ADR-403). A dropped candidate's matched rule gives none,
+/// though its sources still counted in establishing the field. Caller: `identify`, last.
+fn component_values(report: &IdentificationReport) -> Vec<ComponentValue> {
+    let mut values: Vec<ComponentValue> = Vec::new();
+    let kept = |candidate: &String| report.remaining.contains(candidate);
+    let matched = report
+        .vin_rules
+        .iter()
+        .filter(|rule| rule.outcome == RuleOutcome::Matched && kept(&rule.candidate))
+        .map(|rule| (rule.component, &rule.value))
+        .chain(
+            report
+                .rule_fields
+                .iter()
+                .flat_map(|field| field.rules.iter().map(|rule| (field.component, rule)))
+                .filter(|(_, rule)| rule.outcome == RuleOutcome::Matched && kept(&rule.candidate))
+                .map(|(component, rule)| (component, &rule.value)),
+        );
+    for (component, value) in matched {
+        if !values
+            .iter()
+            .any(|known| known.component == component && known.value == *value)
+        {
+            values.push(ComponentValue {
+                component,
+                value: value.clone(),
+            });
+        }
+    }
+    values
 }
 
 /// Sets each entry's state from the reads of its alternatives (ADR-326 item 3, ADR-327 item 3,
@@ -2930,9 +3583,16 @@ fn read_definition_at<W: WorkerSource>(
 /// optional) if a request was sent, and not read if none was.
 fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
     for entry in entries {
+        // A read with no pattern declaration (a definition read only for a field rule) is judged
+        // as if the definition had no declaration (ADR-401 item 8, ADR-403).
         let relevant: Vec<&EcuRead> = reads
             .iter()
             .filter(|read| entry.alternatives.contains(&read.definition))
+            .filter(|read| {
+                read.requests
+                    .iter()
+                    .any(|request| request.declarations.iter().any(|d| d.pattern))
+            })
             .collect();
         let outcomes = |definition: &String| {
             relevant
@@ -2940,6 +3600,7 @@ fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
                 .filter(|read| read.definition == *definition)
                 .flat_map(|read| &read.requests)
                 .flat_map(|request| &request.declarations)
+                .filter(|d| d.pattern)
                 .map(|d| &d.outcome)
                 .collect::<Vec<_>>()
         };
@@ -3015,6 +3676,7 @@ fn evaluate_entries(entries: &mut [EntryResult], reads: &[EcuRead]) {
                     .iter()
                     .flat_map(|read| &read.requests)
                     .flat_map(|request| &request.declarations)
+                    .filter(|d| d.pattern)
                     .any(|d| {
                         !matches!(
                             d.outcome,
@@ -3070,8 +3732,8 @@ mod run_tests;
 mod tests {
     use diag_ir::IR_SCHEMA_VERSION;
     use diag_ir::declaration::{
-        ComParamT, DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement, ProtocolT, ServiceT,
-        VariantPatternT, encode_ecu_document,
+        ComParamT, CompuLinearT, CompuT, DataKind, EcuDocumentT, EcuVariantT, FieldT, Placement,
+        ProtocolT, ServiceT, VariantPatternT, encode_ecu_document,
     };
     use diag_ir::plan::{
         Candidate, Component, Entry, FieldRule, PLAN_SCHEMA_VERSION, PlanDefinition,
@@ -3244,6 +3906,7 @@ mod tests {
     ) -> Result<CheckedPlan, PlanRefused> {
         let mut checked = checked_vin_reading(documents, selection, rules)?;
         checked.ecu_reads.clear();
+        checked.rule_fields.clear();
         Ok(checked)
     }
 
@@ -3261,6 +3924,7 @@ mod tests {
     pub(super) fn checked(documents: &[(Sha256, Vec<u8>)]) -> Result<CheckedPlan, PlanRefused> {
         let mut checked = checked_reading(documents)?;
         checked.ecu_reads.clear();
+        checked.rule_fields.clear();
         Ok(checked)
     }
 
@@ -3950,6 +4614,50 @@ mod tests {
         candidates: &[CandidateEntries<'_>],
         vin_rules: &[CandidateVinRule<'_>],
     ) -> CheckedPlan {
+        ecu_plan_with_rules(
+            selection,
+            documents,
+            definitions,
+            candidates,
+            vin_rules,
+            &[],
+        )
+    }
+
+    /// A field rule: the candidate's id, the index of the source's document, the source's service
+    /// and field, the component, the value the rule gives and the expected bytes.
+    pub(super) type CandidateFieldRule<'a> =
+        (&'a str, usize, u32, u32, Component, &'a str, &'a [u8]);
+
+    /// [`ecu_plan_ruled`] with field rules for the candidates.
+    pub(super) fn ecu_plan_with_rules(
+        selection: Chosen,
+        documents: &[(Sha256, Vec<u8>)],
+        definitions: &[(&str, &[usize])],
+        candidates: &[CandidateEntries<'_>],
+        vin_rules: &[CandidateVinRule<'_>],
+        field_rules: &[CandidateFieldRule<'_>],
+    ) -> CheckedPlan {
+        try_ecu_plan_with_rules(
+            selection,
+            documents,
+            definitions,
+            candidates,
+            vin_rules,
+            field_rules,
+        )
+        .expect("a checked plan")
+    }
+
+    /// [`ecu_plan_with_rules`] that gives the refusal of a plan the agent's check refuses.
+    pub(super) fn try_ecu_plan_with_rules(
+        selection: Chosen,
+        documents: &[(Sha256, Vec<u8>)],
+        definitions: &[(&str, &[usize])],
+        candidates: &[CandidateEntries<'_>],
+        vin_rules: &[CandidateVinRule<'_>],
+        field_rules: &[CandidateFieldRule<'_>],
+    ) -> Result<CheckedPlan, PlanRefused> {
         let plan = IdentificationPlan {
             schema_version: PLAN_SCHEMA_VERSION,
             selection,
@@ -3974,7 +4682,22 @@ mod tests {
                             },
                         })
                         .collect(),
-                    field_rules: Vec::new(),
+                    field_rules: field_rules
+                        .iter()
+                        .filter(|rule| rule.0 == id)
+                        .map(
+                            |&(_, at, service, field, component, value, expected)| FieldRule {
+                                component,
+                                value: value.into(),
+                                source: Source {
+                                    document: documents[at].0,
+                                    service,
+                                    field,
+                                },
+                                expected: expected.to_vec(),
+                            },
+                        )
+                        .collect(),
                     entries: entries
                         .iter()
                         .map(|&(role, optional, alternatives)| Entry {
@@ -3994,7 +4717,28 @@ mod tests {
                 })
                 .collect(),
         };
-        check_plan(&load(&plan, documents).expect("a valid plan")).expect("a checked plan")
+        check_plan(&load(&plan, documents)?)
+    }
+
+    /// `document` with `service` added to its variant's services.
+    pub(super) fn with_service(
+        document: &(Sha256, Vec<u8>),
+        service: ServiceT,
+    ) -> (Sha256, Vec<u8>) {
+        named(edited(&document.1, |variant| {
+            variant.services.as_mut().unwrap().push(service)
+        }))
+    }
+
+    /// Service `id` reading F187 as two ASCII fields: field 1 of two bytes and field 2 of nine.
+    pub(super) fn two_field_service(id: u32) -> ServiceT {
+        let mut service = read_service(id, "readTwo", [0xF1, 0x87], DataKind::Ascii, 2);
+        let fields = service.positive.as_mut().unwrap().fields.as_mut().unwrap();
+        let mut second = fields[0].clone();
+        second.id = 2;
+        second.bit_length = 9 * 8;
+        fields.push(second);
+        service
     }
 
     /// The VIN section serializes to the report's JSON; a VIN is written only as the text of the
@@ -4199,6 +4943,7 @@ mod tests {
         .map(|outcome| DeclarationOutcome {
             document: doc.0,
             service: 1,
+            pattern: true,
             outcome,
         })
         .collect();
@@ -4322,6 +5067,7 @@ mod tests {
                 declarations: vec![DeclarationOutcome {
                     document: [1; 32],
                     service: 1,
+                    pattern: true,
                     outcome,
                 }],
             }],
@@ -4573,7 +5319,7 @@ mod tests {
         set.iter().map(|id| (*id).to_owned()).collect()
     }
 
-    fn vin_rule(candidate: &str, component: Component, outcome: VinRuleOutcome) -> VinRuleResult {
+    fn vin_rule(candidate: &str, component: Component, outcome: RuleOutcome) -> VinRuleResult {
         VinRuleResult {
             candidate: candidate.into(),
             component,
@@ -4617,7 +5363,7 @@ mod tests {
         use Verdict::{Identified, RuledOut};
         let plan = two_engines();
         let dropped = |facts: &[Fact]| -> Vec<(String, Vec<Contradiction>)> {
-            contradictions(&plan, facts, &[])
+            contradictions(&plan, facts, &[], &[])
         };
         // The other candidate's definition identified, own one not read yet: nothing.
         assert!(dropped(&[fact("D2", 0x7E0, Identified)]).is_empty());
@@ -4651,8 +5397,8 @@ mod tests {
 
         // The VIN rules: per component, all not matched.
         use Component::{ModelYear, Oem};
-        use VinRuleOutcome::{Matched, NotMatched, Unevaluated};
-        let by_vin = |rules: &[VinRuleResult]| contradictions(&plan, &[], rules);
+        use RuleOutcome::{Matched, NotMatched, Unevaluated};
+        let by_vin = |rules: &[VinRuleResult]| contradictions(&plan, &[], rules, &[]);
         assert_eq!(
             by_vin(&[vin_rule("c1", ModelYear, NotMatched)]),
             [(
@@ -4686,6 +5432,7 @@ mod tests {
             &plan,
             &[fact("D1", 0x7E0, RuledOut), fact("D2", 0x7E0, Identified)],
             &[vin_rule("c1", ModelYear, NotMatched)],
+            &[],
         );
         assert_eq!(both[0].1.len(), 2);
         assert!(matches!(both[0].1[0], Contradiction::VinRules { .. }));
@@ -4702,17 +5449,17 @@ mod tests {
         let all = ids(&["c1", "c2"]);
         let ruled = [fact("D1", 0x7E0, RuledOut)];
         assert_eq!(
-            outcome_sets(&plan, &ruled, &[], &all, "D2"),
+            outcome_sets(&plan, &ruled, &[], &[], &all, "D2"),
             [ids(&["c2"]), ids(&["c1", "c2"])]
         );
         // Without that fact no outcome of D2 drops c1.
         assert_eq!(
-            outcome_sets(&plan, &[], &[], &all, "D2"),
+            outcome_sets(&plan, &[], &[], &[], &all, "D2"),
             [ids(&["c1", "c2"])]
         );
         // D3 has one endpoint nobody else uses: nothing drops whatever it shows.
         assert_eq!(
-            outcome_sets(&plan, &ruled, &[], &all, "D3"),
+            outcome_sets(&plan, &ruled, &[], &[], &all, "D3"),
             [ids(&["c1", "c2"])]
         );
         // A refused variant: only the identified outcome.
@@ -4731,7 +5478,7 @@ mod tests {
             ],
         );
         assert_eq!(
-            outcome_sets(&refused, &ruled, &[], &all, "D2"),
+            outcome_sets(&refused, &ruled, &[], &[], &all, "D2"),
             [ids(&["c2"])]
         );
         // No pattern: no request, so no outcome, and the definition is never picked.
@@ -4744,7 +5491,7 @@ mod tests {
                 ("c2", &[("engine", false, &["D2"])]),
             ],
         );
-        assert!(outcome_sets(&barren, &[], &[], &all, "D1").is_empty());
+        assert!(outcome_sets(&barren, &[], &[], &[], &all, "D1").is_empty());
         let report = barren.report();
         let picked = next_definition(&barren, &report, &all, &HashSet::new());
         assert_eq!(picked, Some(("D2".to_owned(), 2)));
@@ -4861,7 +5608,7 @@ mod tests {
             ],
         );
         let all = ids(&["c1", "c2"]);
-        let sets = outcome_sets(&plan, &[], &[], &all, "D1");
+        let sets = outcome_sets(&plan, &[], &[], &[], &all, "D1");
         assert_eq!(sets, [all]);
     }
 
@@ -4886,13 +5633,13 @@ mod tests {
         );
         // D5 gave no fact (inconclusive).
         let facts = [fact("D1", 0x7E0, RuledOut), fact("D2", 0x7E0, Identified)];
-        assert!(contradictions(&plan, &facts, &[]).is_empty());
+        assert!(contradictions(&plan, &facts, &[], &[]).is_empty());
         let facts = [
             fact("D1", 0x7E0, RuledOut),
             fact("D5", 0x7E0, RuledOut),
             fact("D2", 0x7E0, Identified),
         ];
-        let found = contradictions(&plan, &facts, &[]);
+        let found = contradictions(&plan, &facts, &[], &[]);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].0, "c1");
     }
@@ -4932,5 +5679,661 @@ mod tests {
         assert!(report.dropped().is_empty());
         assert!(in_play(&manual, &[], "D1"));
         assert!(!in_play(&plan, &ids(&["c1"]), "D2"));
+    }
+
+    // ------------------------------------------------------ The rule fields (ADR-403)
+
+    const YEAR: Component = Component::ModelYear;
+    const VMODEL: Component = Component::VehicleModel;
+
+    /// A document on `endpoint` whose service 1 reads the software version (F189) as five ASCII
+    /// bytes, with a pattern on the text starting with "S".
+    fn sw_doc(name: &str, endpoint: (u32, u32)) -> (Sha256, Vec<u8>) {
+        identified_by(0x89, 5, b"S", name, endpoint, |_| {})
+    }
+
+    /// `document` with `edit` applied to the first field of service 1's positive response.
+    fn with_field(
+        document: &(Sha256, Vec<u8>),
+        edit: impl FnOnce(&mut FieldT),
+    ) -> (Sha256, Vec<u8>) {
+        named(edited(&document.1, |variant| {
+            let service = &mut variant.services.as_mut().unwrap()[0];
+            edit(&mut service.positive.as_mut().unwrap().fields.as_mut().unwrap()[0]);
+        }))
+    }
+
+    const D_ENGINE: &[(&str, bool, &[&str])] = &[("engine", false, &["D"])];
+
+    /// A plan of one definition "D" over `documents`, every candidate listing it, with `rules`.
+    fn rule_plan(
+        documents: &[(Sha256, Vec<u8>)],
+        candidates: &[&str],
+        rules: &[CandidateFieldRule<'_>],
+    ) -> Result<CheckedPlan, PlanRefused> {
+        let all: Vec<usize> = (0..documents.len()).collect();
+        let entries: Vec<CandidateEntries<'_>> =
+            candidates.iter().map(|&id| (id, D_ENGINE)).collect();
+        let selection = if candidates.len() == 1 {
+            Chosen::ChosenDefinition
+        } else {
+            Chosen::Candidates
+        };
+        try_ecu_plan_with_rules(selection, documents, &[("D", &all)], &entries, &[], rules)
+    }
+
+    /// ADR-306 item 5 and ADR-403: a field rule whose source a pattern could not compare, whose
+    /// expected value could never match, whose request needs a value, or whose rule field mixes
+    /// kinds is refused before any link opens, naming the source; the ASCII rule of `plan()`
+    /// passes.
+    #[test]
+    fn a_field_rule_a_pattern_could_not_compare_is_refused() {
+        let refused = |documents: &[(Sha256, Vec<u8>)], expected: &[u8]| {
+            let rule: CandidateFieldRule<'_> = ("c1", 0, 1, 1, YEAR, "2020", expected);
+            match rule_plan(documents, &["c1"], &[rule]) {
+                Err(PlanRefused::FieldSource {
+                    document,
+                    service,
+                    field,
+                    why,
+                }) => {
+                    assert_eq!((document, service, field), (hex(&documents[0].0), 1, 1));
+                    why
+                }
+                other => panic!("not refused as a field source: {other:?}"),
+            }
+        };
+        let text = sw_doc("v1", (0x7E0, 0x7E8));
+        assert!(
+            rule_plan(
+                std::slice::from_ref(&text),
+                &["c1"],
+                &[("c1", 0, 1, 1, YEAR, "y", b"SW")]
+            )
+            .is_ok()
+        );
+        // A float, and a number under a linear conversion, which decodes to one.
+        let float = with_field(&text, |f| f.kind = DataKind::Float);
+        let why = refused(std::slice::from_ref(&float), b"SW");
+        assert!(why.contains("could not compare"), "{why}");
+        let linear = with_field(&text, |f| {
+            f.kind = DataKind::Uint;
+            let mut linear = CompuLinearT::default();
+            linear.numerator = 1.0;
+            linear.denominator = 2.0;
+            f.compu = CompuT::CompuLinear(Box::new(linear));
+        });
+        assert!(refused(std::slice::from_ref(&linear), &[1]).contains("could not compare"));
+        // An expected value no value matches: empty, or over eight bytes for an integer.
+        assert!(refused(std::slice::from_ref(&text), b"").contains("empty"));
+        let number = with_field(&text, |f| {
+            f.kind = DataKind::Uint;
+            f.bit_length = 8;
+        });
+        assert!(refused(std::slice::from_ref(&number), &[0; 9]).contains("eight bytes"));
+        // The same nine bytes are a fine prefix of text.
+        assert!(
+            rule_plan(
+                std::slice::from_ref(&text),
+                &["c1"],
+                &[("c1", 0, 1, 1, YEAR, "y", b"SW1234567")]
+            )
+            .is_ok()
+        );
+        // A request that needs a value, on a service only the rule names.
+        let rule_only = with_service(&sw_doc("v1", (0x7E0, 0x7E8)), {
+            let mut service = read_service(2, "readX", [0xF1, 0x90], DataKind::Ascii, 5);
+            let mut argument = FieldT::default();
+            argument.id = 9;
+            argument.placement = Placement::AfterPrevious;
+            argument.bit_length = 8;
+            argument.kind = DataKind::Uint;
+            service.request.as_mut().unwrap().params = Some(vec![argument]);
+            service
+        });
+        let rule: CandidateFieldRule<'_> = ("c1", 0, 2, 1, YEAR, "2020", b"S");
+        assert!(matches!(
+            rule_plan(std::slice::from_ref(&rule_only), &["c1"], &[rule]),
+            Err(PlanRefused::FieldSource {
+                service: 2,
+                field: 1,
+                ..
+            })
+        ));
+        // Sources of one component on one request that read their value by different kinds.
+        let both = with_service(
+            &text,
+            read_service(2, "readNum", [0xF1, 0x89], DataKind::Uint, 1),
+        );
+        let rules: [CandidateFieldRule<'_>; 2] = [
+            ("c1", 0, 1, 1, YEAR, "a", b"S"),
+            ("c1", 0, 2, 1, YEAR, "b", &[1]),
+        ];
+        match rule_plan(std::slice::from_ref(&both), &["c1"], &rules) {
+            Err(PlanRefused::FieldSource { why, .. }) => assert!(why.contains("different kinds")),
+            other => panic!("{other:?}"),
+        }
+        // Another component on that request is another rule field: accepted.
+        let rules: [CandidateFieldRule<'_>; 2] = [
+            ("c1", 0, 1, 1, YEAR, "a", b"S"),
+            ("c1", 0, 2, 1, VMODEL, "b", &[1]),
+        ];
+        assert!(rule_plan(std::slice::from_ref(&both), &["c1"], &rules).is_ok());
+    }
+
+    /// ADR-403 item 1: a rule on a pattern service adds no declaration; a rule on another service
+    /// is a declaration of the request it builds, flagged as no pattern's, in its document's link
+    /// group; two candidates sharing a source share its entry in the rule field; a rule on a
+    /// second link group of the endpoint is a rule field of its own.
+    #[test]
+    fn rule_sources_join_their_definitions_link_groups_and_requests() {
+        let a = (0x7E0, 0x7E8);
+        let block = |size: i64| {
+            move |p: &mut ProtocolT| {
+                p.functional_id = 0;
+                with_param("CP_BlockSize", size)(p);
+            }
+        };
+        let first = with_service(
+            &identified_by(0x89, 5, b"S", "v1", a, block(8)),
+            read_service(2, "readPart", [0xF1, 0x87], DataKind::Ascii, 11),
+        );
+        // A second document of the definition on the same endpoint with another non-timing
+        // ComParam, so a group of its own.
+        let second = identified_by(0x89, 5, b"S", "v2", a, block(16));
+        let rules: [CandidateFieldRule<'_>; 4] = [
+            ("c1", 0, 1, 1, YEAR, "2021", b"SW1"),
+            ("c1", 0, 2, 1, VMODEL, "m", b"PA"),
+            ("c2", 0, 1, 1, YEAR, "2022", b"SW2"),
+            ("c2", 1, 1, 1, YEAR, "2022", b"SW2"),
+        ];
+        let plan = rule_plan(&[first.clone(), second.clone()], &["c1", "c2"], &rules).unwrap();
+        assert_eq!(plan.rule_fields.len(), 3);
+        // Group 0 holds F189 (pattern, from service 1) and F187 (rule only, service 2).
+        let group = &plan.ecu_reads[0].groups[0];
+        let declared: Vec<_> = group
+            .requests
+            .iter()
+            .map(|r| {
+                (
+                    r.request.clone(),
+                    r.declarations
+                        .iter()
+                        .map(|d| (d.service, d.pattern))
+                        .collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            declared,
+            [
+                (vec![0x22, 0xF1, 0x89], vec![(1, true)]),
+                (vec![0x22, 0xF1, 0x87], vec![(2, false)]),
+            ]
+        );
+        // Two candidates sharing a source share its entry, and the ModelYear sources of group 0
+        // and group 1 are two rule fields.
+        let sources: Vec<(usize, usize, usize, Component, usize)> = plan
+            .rule_fields
+            .iter()
+            .map(|f| (f.read, f.group, f.request, f.component, f.sources.len()))
+            .collect();
+        assert_eq!(
+            sources,
+            [(0, 0, 0, YEAR, 1), (0, 0, 1, VMODEL, 1), (0, 1, 0, YEAR, 1)]
+        );
+        assert!(plan.ecu_reads[0].groups.len() == 2);
+        // The report lists the rule fields in that order with every rule on them.
+        let report = plan.report();
+        let shown: Vec<(&str, Vec<&str>)> = report
+            .rule_fields()
+            .iter()
+            .map(|f| {
+                (
+                    if f.component == YEAR {
+                        "ModelYear"
+                    } else {
+                        "VehicleModel"
+                    },
+                    f.rules.iter().map(|r| r.candidate.as_str()).collect(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            shown,
+            [
+                ("ModelYear", vec!["c1", "c2"]),
+                ("VehicleModel", vec!["c1"]),
+                ("ModelYear", vec!["c2"]),
+            ]
+        );
+    }
+
+    /// ADR-403: the report starts with every rule field's sources not read (or their link refused),
+    /// no value established and every rule unevaluated, and shows requests and expected values as
+    /// hex, the established value by its kind and a `FieldRules` contradiction with the field it
+    /// names; a declaration shows whether a pattern names it.
+    #[test]
+    fn the_rule_fields_start_not_read_and_serialize_with_bytes_as_hex() {
+        let refused = sw_doc_with("v2", (0x7E1, 0x7E9), |p| p.extended_addressing = true);
+        let documents = [sw_doc("v1", (0x7E0, 0x7E8)), refused];
+        let rules: [CandidateFieldRule<'_>; 2] = [
+            ("c1", 0, 1, 1, YEAR, "2021", b"SW"),
+            ("c1", 1, 1, 1, VMODEL, "m", b"S"),
+        ];
+        let plan = rule_plan(&documents, &["c1"], &rules).unwrap();
+        let mut report = plan.report();
+        assert!(report.component_values().is_empty());
+        let fields = report.rule_fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].sources[0].outcome, RuleSourceOutcome::NotRead);
+        assert_eq!(fields[1].sources[0].outcome, RuleSourceOutcome::LinkRefused);
+        assert!(fields[1].endpoint.is_none() && fields[0].endpoint.is_some());
+        assert!(fields.iter().all(|f| {
+            f.established.is_none()
+                && f.rules
+                    .iter()
+                    .all(|r| r.outcome == RuleOutcome::Unevaluated)
+        }));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["component_values"], serde_json::json!([]));
+        let field = &json["rule_fields"][0];
+        assert_eq!(field["definition"], "D");
+        assert_eq!(field["request"], "22f189");
+        assert_eq!(field["component"], "ModelYear");
+        assert_eq!(field["sources"][0]["outcome"], "NotRead");
+        assert_eq!(field["sources"][0]["document"], hex(&documents[0].0));
+        assert!(field["established"].is_null());
+        assert_eq!(field["rules"][0]["expected"], "5357");
+        assert_eq!(field["rules"][0]["outcome"], "Unevaluated");
+        assert!(json["rule_fields"][1]["endpoint"].is_null());
+        assert_eq!(
+            json["rule_fields"][1]["sources"][0]["outcome"],
+            "LinkRefused"
+        );
+        assert_eq!(
+            json["ecu_reads"][0]["requests"][0]["declarations"][0]["pattern"],
+            true
+        );
+        // Judged: the value shows by its kind, the rule's outcome by name.
+        report.rule_fields[0].established = Some(FieldValue::Text("SW123".into()));
+        report.rule_fields[0].sources[0].outcome =
+            RuleSourceOutcome::Decoded(FieldValue::Text("SW123".into()));
+        report.rule_fields[0].rules[0].outcome = RuleOutcome::NotMatched;
+        report.rule_fields[1].sources[0].outcome = RuleSourceOutcome::Negative(0x31);
+        report.component_values = vec![ComponentValue {
+            component: YEAR,
+            value: "2021".into(),
+        }];
+        report.dropped.push(DroppedCandidate {
+            candidate: "c1".into(),
+            after: Some("D".into()),
+            contradictions: vec![Contradiction::FieldRules {
+                component: YEAR,
+                definition: "D".into(),
+                endpoint: endpoint(0x7E0),
+                group: 0,
+                request: vec![0x22, 0xF1, 0x89],
+            }],
+        });
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(
+            json["rule_fields"][0]["established"],
+            serde_json::json!({"Text": "SW123"})
+        );
+        assert_eq!(
+            json["rule_fields"][0]["sources"][0]["outcome"],
+            serde_json::json!({"Decoded": {"Text": "SW123"}})
+        );
+        assert_eq!(
+            json["rule_fields"][1]["sources"][0]["outcome"],
+            serde_json::json!({"Negative": 49})
+        );
+        assert_eq!(json["rule_fields"][0]["rules"][0]["outcome"], "NotMatched");
+        assert_eq!(
+            json["component_values"],
+            serde_json::json!([{"component": "ModelYear", "value": "2021"}])
+        );
+        let contradiction = &json["dropped"][0]["contradictions"][0]["FieldRules"];
+        assert_eq!(contradiction["component"], "ModelYear");
+        assert_eq!(contradiction["definition"], "D");
+        assert_eq!(contradiction["request"], "22f189");
+        assert_eq!(contradiction["endpoint"]["tx_id"], 0x7E0);
+        // `Debug` hides an established value as it hides a decoded field.
+        assert!(!format!("{report:?}").contains("SW123"));
+    }
+
+    /// `sw_doc` with `setup` applied to its protocol.
+    fn sw_doc_with(
+        name: &str,
+        endpoint: (u32, u32),
+        setup: impl FnOnce(&mut ProtocolT),
+    ) -> (Sha256, Vec<u8>) {
+        identified_by(0x89, 5, b"S", name, endpoint, setup)
+    }
+
+    /// ADR-403: per component and rule field, a candidate with rules on an established field none
+    /// of which matched is contradicted, naming the field; one matched rule keeps it, an
+    /// unestablished field drops nothing, another field of the component neither saves nor drops
+    /// it, and the contradictions are listed VIN rules, field rules, then unlisted definitions.
+    #[test]
+    fn a_candidate_is_contradicted_by_a_rule_field_established_outside_its_values() {
+        let a = (0x7E0, 0x7E8);
+        let documents = [with_service(
+            &sw_doc("v1", a),
+            read_service(2, "readPart", [0xF1, 0x87], DataKind::Ascii, 11),
+        )];
+        let rules: [CandidateFieldRule<'_>; 3] = [
+            ("c1", 0, 1, 1, YEAR, "2021", b"SW1"),
+            ("c1", 0, 1, 1, YEAR, "2022", b"SW2"),
+            ("c1", 0, 2, 1, YEAR, "2023", b"PA"),
+        ];
+        let plan = rule_plan(&documents, &["c1", "c2"], &rules).unwrap();
+        let blank = plan.report().rule_fields;
+        assert_eq!(blank.len(), 2);
+        let judged = |first: &[RuleOutcome], second: &[RuleOutcome], established: [bool; 2]| {
+            let mut fields = blank.clone();
+            for (field, (outcomes, established)) in fields
+                .iter_mut()
+                .zip([first, second].into_iter().zip(established))
+            {
+                field.established = established.then(|| FieldValue::Text("x".into()));
+                for (rule, outcome) in field.rules.iter_mut().zip(outcomes) {
+                    rule.outcome = *outcome;
+                }
+            }
+            fields
+        };
+        use RuleOutcome::{Matched, NotMatched, Unevaluated};
+        let field_rules = |fields: &[RuleFieldRead]| contradictions(&plan, &[], &[], fields);
+        let own = |request: &[u8]| {
+            vec![(
+                "c1".to_owned(),
+                vec![Contradiction::FieldRules {
+                    component: YEAR,
+                    definition: "D".into(),
+                    endpoint: endpoint(0x7E0),
+                    group: 0,
+                    request: request.to_vec(),
+                }],
+            )]
+        };
+        // None of the rules on the field matched: contradicted, naming the field.
+        let none = judged(&[NotMatched, NotMatched], &[Matched], [true, true]);
+        assert_eq!(field_rules(&none), own(&[0x22, 0xF1, 0x89]));
+        // One matched: kept, whatever the other field shows.
+        let one = judged(&[NotMatched, Matched], &[Matched], [true, true]);
+        assert!(field_rules(&one).is_empty());
+        // Not established: nothing, however the rules read.
+        let unknown = judged(&[NotMatched, NotMatched], &[Unevaluated], [false, false]);
+        assert!(field_rules(&unknown).is_empty());
+        // The second field of the component alone contradicts, though the first one matched.
+        let second = judged(&[Matched, NotMatched], &[NotMatched], [true, true]);
+        assert_eq!(field_rules(&second), own(&[0x22, 0xF1, 0x87]));
+        // A candidate with no rule on an established field is not contradicted by it.
+        assert!(
+            field_rules(&none)
+                .iter()
+                .all(|(candidate, _)| candidate == "c1")
+        );
+        // The order of the contradictions of one candidate.
+        let documents = [
+            sw_doc("v1", a),
+            identified_by(0x87, 11, b"Q", "v2", a, |_| {}),
+        ];
+        let rules: [CandidateFieldRule<'_>; 1] = [("c1", 0, 1, 1, YEAR, "2021", b"SW1")];
+        let entries: [CandidateEntries<'_>; 2] = [
+            ("c1", &[("engine", false, &["D"])]),
+            ("c2", &[("engine", false, &["E"])]),
+        ];
+        let plan = ecu_plan_with_rules(
+            Chosen::Candidates,
+            &documents,
+            &[("D", &[0]), ("E", &[1])],
+            &entries,
+            &[],
+            &rules,
+        );
+        let mut fields = plan.report().rule_fields;
+        fields[0].established = Some(FieldValue::Text("x".into()));
+        fields[0].rules[0].outcome = NotMatched;
+        let facts = [
+            fact("D", 0x7E0, Verdict::RuledOut),
+            fact("E", 0x7E0, Verdict::Identified),
+        ];
+        let vin = [vin_rule("c1", VMODEL, NotMatched)];
+        let found = contradictions(&plan, &facts, &vin, &fields);
+        assert_eq!(found.len(), 1);
+        let kinds: Vec<&str> = found[0]
+            .1
+            .iter()
+            .map(|c| match c {
+                Contradiction::VinRules { .. } => "vin",
+                Contradiction::FieldRules { .. } => "field",
+                Contradiction::UnlistedDefinition { .. } => "unlisted",
+            })
+            .collect();
+        assert_eq!(kinds, ["vin", "field", "unlisted"]);
+    }
+
+    /// ADR-327 item 4, ADR-403: the classes of a rule field are the distinct values the remaining
+    /// candidates expect, built by the field's kind, each with the candidates it drops, and the
+    /// value no rule matches: a prefix of another expected value lands in one class with it, an
+    /// integer by its number, whatever width it is written in; a text field's classes are bytes.
+    #[test]
+    fn rule_field_outcomes_group_candidates_whose_expected_values_overlap() {
+        let a = (0x7E0, 0x7E8);
+        let all = ids(&["c1", "c2"]);
+        let sets = |plan: &CheckedPlan, remaining: &[String]| {
+            let report = plan.report();
+            let mut sets = outcome_sets(plan, &[], &[], &report.rule_fields, remaining, "D");
+            for set in &mut sets {
+                set.sort();
+            }
+            sets.sort();
+            sets
+        };
+        // "SW" is a prefix of "SW1": the value "SW" satisfies c1 only, "SW1" satisfies both.
+        let text = [sw_doc("v1", a)];
+        let rules: [CandidateFieldRule<'_>; 2] = [
+            ("c1", 0, 1, 1, YEAR, "a", b"SW"),
+            ("c2", 0, 1, 1, YEAR, "b", b"SW1"),
+        ];
+        let plan = rule_plan(&text, &["c1", "c2"], &rules).unwrap();
+        let report = plan.report();
+        assert_eq!(
+            rule_classes(&plan, &[], &[], &report.rule_fields, 0, &all),
+            [ids(&["c2"]), ids(&[]), ids(&["c1", "c2"])],
+            "the values SW, SW1 and the one no rule matches"
+        );
+        assert_eq!(
+            sets(&plan, &all),
+            [ids(&[]), ids(&["c1"]), ids(&["c1", "c2"])]
+        );
+        let worst = sets(&plan, &all).iter().map(Vec::len).max();
+        assert_eq!(worst, Some(2));
+        // A candidate that has left the remaining set gives no class of its own.
+        assert_eq!(
+            rule_classes(&plan, &[], &[], &report.rule_fields, 0, &ids(&["c1"])).len(),
+            2
+        );
+        // Integers: [1] and [0, 1] are the one number 1.
+        let number = with_field(&sw_doc("v1", a), |f| {
+            f.kind = DataKind::Uint;
+            f.bit_length = 8;
+        });
+        let rules: [CandidateFieldRule<'_>; 3] = [
+            ("c1", 0, 1, 1, YEAR, "a", &[1]),
+            ("c2", 0, 1, 1, YEAR, "b", &[0, 1]),
+            ("c3", 0, 1, 1, YEAR, "c", &[2]),
+        ];
+        let plan = rule_plan(&[number], &["c1", "c2", "c3"], &rules).unwrap();
+        let report = plan.report();
+        let every = ids(&["c1", "c2", "c3"]);
+        assert_eq!(
+            rule_classes(&plan, &[], &[], &report.rule_fields, 0, &every),
+            [ids(&["c3"]), ids(&["c1", "c2"]), ids(&["c1", "c2", "c3"])]
+        );
+        // A plan whose selection does not narrow has the one class that drops nothing.
+        let mut manual = rule_plan(&text, &["c1"], &rules[..1]).unwrap();
+        manual.selection = Chosen::ChosenDefinition;
+        let report = manual.report();
+        assert_eq!(
+            rule_classes(&manual, &[], &[], &report.rule_fields, 0, &ids(&["c1"])),
+            [Vec::<String>::new()]
+        );
+    }
+
+    /// ADR-403: an unevaluated rule field is not an outcome, at any endpoint, so a definition read
+    /// at two endpoints whose rule fields separate every candidate has the worst case 1, not the
+    /// remaining count the mixed outcome would give.
+    #[test]
+    fn an_unevaluated_rule_field_is_not_an_outcome() {
+        let documents = [sw_doc("v1", (0x7E0, 0x7E8)), sw_doc("v1b", (0x7E1, 0x7E9))];
+        let mut rules: Vec<CandidateFieldRule<'_>> = Vec::new();
+        for (candidate, value, expected) in [
+            ("c1", "1", &b"SW1"[..]),
+            ("c2", "2", &b"SW2"[..]),
+            ("c3", "3", &b"SW3"[..]),
+        ] {
+            for document in 0..2 {
+                rules.push((candidate, document, 1, 1, YEAR, value, expected));
+            }
+        }
+        let plan = rule_plan(&documents, &["c1", "c2", "c3"], &rules).unwrap();
+        assert_eq!(plan.rule_fields.len(), 2);
+        let report = plan.report();
+        let all = ids(&["c1", "c2", "c3"]);
+        let sets = outcome_sets(&plan, &[], &[], &report.rule_fields, &all, "D");
+        assert!(!sets.is_empty());
+        assert_eq!(sets.iter().map(Vec::len).max(), Some(1), "{sets:?}");
+        // Only the conclusive combinations: one candidate, or none, each class of each field.
+        assert!(sets.contains(&ids(&["c1"])) && sets.contains(&ids(&[])));
+    }
+
+    /// ADR-306 item 5 and ADR-403: a field rule whose expected value no value of its field can
+    /// equal is refused, naming the source: a number the field's fixed width cannot hold (an
+    /// unsigned, signed or BCD field), a value longer than a fixed-length bytes or text field can
+    /// be, and text that is not UTF-8; the boundary values pass.
+    #[test]
+    fn a_field_rule_that_could_never_match_is_refused() {
+        let base = sw_doc("v1", (0x7E0, 0x7E8));
+        let outcome = |edit: &dyn Fn(&mut FieldT), expected: &[u8]| {
+            let document = with_field(&base, |field| edit(field));
+            let rule: CandidateFieldRule<'_> = ("c1", 0, 1, 1, YEAR, "y", expected);
+            rule_plan(std::slice::from_ref(&document), &["c1"], &[rule])
+        };
+        let integer = |kind: DataKind, bits: u32| {
+            move |field: &mut FieldT| {
+                field.kind = kind;
+                field.bit_length = bits;
+            }
+        };
+        let bytes = |length: u32| integer(DataKind::Bytes, length * 8);
+        let text = |kind: DataKind, length: u32| integer(kind, length * 8);
+        let refused = |result: Result<CheckedPlan, PlanRefused>| match result {
+            Err(PlanRefused::FieldSource { why, .. }) => why,
+            other => panic!("not refused as a field source: {other:?}"),
+        };
+        // Numbers: one byte holds 255 but not 256; -128 but not 128; BCD two digits hold 99.
+        assert!(outcome(&integer(DataKind::Uint, 8), &[0xFF]).is_ok());
+        assert!(outcome(&integer(DataKind::Uint, 8), &[0, 0xFF]).is_ok());
+        let why = refused(outcome(&integer(DataKind::Uint, 8), &[1, 0]));
+        assert!(why.contains("width"), "{why}");
+        assert!(outcome(&integer(DataKind::Int, 8), &[0x80]).is_ok());
+        refused(outcome(&integer(DataKind::Int, 8), &[0, 0x80]));
+        assert!(outcome(&integer(DataKind::Bcd, 8), &[99]).is_ok());
+        refused(outcome(&integer(DataKind::Bcd, 8), &[100]));
+        // Fixed-length bytes and text: the expected value must fit the field.
+        assert!(outcome(&bytes(2), &[1, 2]).is_ok());
+        let why = refused(outcome(&bytes(2), &[1, 2, 3]));
+        assert!(why.contains("longer"), "{why}");
+        assert!(outcome(&text(DataKind::Utf8, 2), b"ab").is_ok());
+        refused(outcome(&text(DataKind::Utf8, 2), b"abc"));
+        // An ASCII byte of 0x80 or more is two bytes of UTF-8, so n bytes can reach 2n.
+        assert!(outcome(&text(DataKind::Ascii, 2), b"abcd").is_ok());
+        refused(outcome(&text(DataKind::Ascii, 2), b"abcde"));
+        // Text compares in UTF-8.
+        let why = refused(outcome(&text(DataKind::Ascii, 5), &[0xFF]));
+        assert!(why.contains("UTF-8"), "{why}");
+        // Bytes may hold any byte.
+        assert!(outcome(&bytes(5), &[0xFF]).is_ok());
+    }
+
+    /// ADR-403: sources of one component on one request that cannot decode to one value (a text
+    /// and bytes, or one data kind at two fixed lengths) are refused, so a rule field that can
+    /// never be established has no outcome classes; a text field of another encoding at the same
+    /// length, and a variable-length one, are not refused.
+    #[test]
+    fn sources_of_one_rule_field_that_can_never_agree_are_refused() {
+        let a = (0x7E0, 0x7E8);
+        let rule_pair = |second: (Sha256, Vec<u8>)| {
+            let documents = [sw_doc("v1", a), second];
+            let rules: [CandidateFieldRule<'_>; 2] = [
+                ("c1", 0, 1, 1, YEAR, "a", b"S"),
+                ("c1", 1, 1, 1, YEAR, "a", b"S"),
+            ];
+            rule_plan(&documents, &["c1"], &rules)
+        };
+        let named_with = |name: &str, edit: fn(&mut FieldT)| with_field(&sw_doc(name, a), edit);
+        let why = |result: Result<CheckedPlan, PlanRefused>| match result {
+            Err(PlanRefused::FieldSource { why, .. }) => why,
+            other => panic!("{other:?}"),
+        };
+        assert!(
+            why(rule_pair(named_with("v2", |f| f.kind = DataKind::Bytes)))
+                .contains("cannot decode to one value")
+        );
+        assert!(
+            why(rule_pair(named_with("v2", |f| f.bit_length = 48)))
+                .contains("cannot decode to one value")
+        );
+        assert!(rule_pair(named_with("v2", |f| f.kind = DataKind::Utf8)).is_ok());
+        assert!(rule_pair(named_with("v2", |f| f.length_kind = LengthKind::Terminated)).is_ok());
+        assert!(rule_pair(named_with("v2", |_| {})).is_ok());
+    }
+
+    /// ADR-403: two link groups of one definition at one endpoint that read one request for one
+    /// component are two rule fields, told apart in the report and in the contradiction by the
+    /// group's index.
+    #[test]
+    fn two_link_groups_reading_one_request_report_their_own_rule_fields() {
+        let a = (0x7E0, 0x7E8);
+        let block = |size: i64| {
+            move |p: &mut ProtocolT| {
+                p.functional_id = 0;
+                with_param("CP_BlockSize", size)(p);
+            }
+        };
+        let documents = [
+            identified_by(0x89, 5, b"S", "v1", a, block(8)),
+            identified_by(0x89, 5, b"S", "v2", a, block(16)),
+        ];
+        let rules: [CandidateFieldRule<'_>; 2] = [
+            ("c1", 0, 1, 1, YEAR, "a", b"SW1"),
+            ("c1", 1, 1, 1, YEAR, "a", b"SW1"),
+        ];
+        let plan = rule_plan(&documents, &["c1", "c2"], &rules).unwrap();
+        let mut report = plan.report();
+        let fields = report.rule_fields();
+        assert_eq!(fields.len(), 2);
+        assert_eq!(fields[0].request, fields[1].request);
+        assert_eq!((fields[0].group, fields[1].group), (0, 1));
+        let json = serde_json::to_value(&report).unwrap();
+        assert_eq!(json["rule_fields"][1]["group"], 1);
+        // The contradiction names the group whose field was established outside the values.
+        for field in &mut report.rule_fields {
+            field.established = Some(FieldValue::Text("x".into()));
+            field.rules[0].outcome = RuleOutcome::Matched;
+        }
+        report.rule_fields[1].rules[0].outcome = RuleOutcome::NotMatched;
+        let found = contradictions(&plan, &[], &[], &report.rule_fields);
+        assert_eq!(found.len(), 1);
+        assert!(matches!(
+            found[0].1[..],
+            [Contradiction::FieldRules { group: 1, .. }]
+        ));
+        let json = serde_json::to_value(&found[0].1).unwrap();
+        assert_eq!(json[0]["FieldRules"]["group"], 1);
     }
 }

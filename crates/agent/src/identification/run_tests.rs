@@ -17,12 +17,15 @@ use vci_service_interface::{
 use worker_host::client::WorkerClient;
 
 use super::tests::{
-    CandidateEntries, checked, checked_vin, checked_vin_reading, document, document_reading,
-    ecu_plan, ecu_plan_of, ecu_plan_ruled, edited, identified_by, named,
+    CandidateEntries, CandidateFieldRule, checked, checked_vin, checked_vin_reading, document,
+    document_reading, ecu_plan, ecu_plan_of, ecu_plan_ruled, ecu_plan_with_rules, edited,
+    identified_by, named, two_field_service, with_service,
 };
 use super::*;
 use crate::comm_log::{CommLogSetup, VciFacts};
+use crate::document::tests::read_service;
 use crate::guards::GuardSetup;
+use diag_ir::declaration::DataKind;
 
 /// One event a started primitive gives, in order.
 #[derive(Clone, Debug)]
@@ -1619,7 +1622,7 @@ async fn a_second_read_that_decodes_gives_the_vin_when_the_first_does_not() {
     let results: Vec<_> = report.vin_rules().iter().map(|r| r.outcome).collect();
     assert_eq!(
         results,
-        [VinRuleOutcome::NotMatched, VinRuleOutcome::Matched],
+        [RuleOutcome::NotMatched, RuleOutcome::Matched],
         "reported, and nothing dropped"
     );
     assert_eq!(report.candidates(), ["c1"]);
@@ -1671,7 +1674,7 @@ async fn reads_that_give_different_vins_establish_none() {
         report
             .vin_rules()
             .iter()
-            .all(|r| r.outcome == VinRuleOutcome::Unevaluated)
+            .all(|r| r.outcome == RuleOutcome::Unevaluated)
     );
     assert!(!ran.run.guards.holds_vehicle());
 }
@@ -1940,10 +1943,7 @@ async fn a_manual_plan_with_a_vin_rule_reads_reports_and_takes_the_lock() {
     assert_eq!(report.selection(), Selection::ChosenDefinition);
     assert_eq!(report.vin(), Some(&vin(VIN_A)));
     let results: Vec<_> = report.vin_rules().iter().map(|r| r.outcome).collect();
-    assert_eq!(
-        results,
-        [VinRuleOutcome::Matched, VinRuleOutcome::NotMatched]
-    );
+    assert_eq!(results, [RuleOutcome::Matched, RuleOutcome::NotMatched]);
     assert!(report.vehicle_lock_held() && ran.run.guards.holds_vehicle());
 }
 
@@ -2216,7 +2216,7 @@ async fn guards_still_marked_after_the_last_close_take_no_vehicle_lock() {
     assert_eq!(report.vin(), Some(&vin(VIN_A)));
     assert!(!report.vehicle_lock_held() && !run.guards.holds_vehicle());
     assert!(run.guards.link_unconfirmed(), "the mark stays");
-    assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::Matched);
+    assert_eq!(report.vin_rules()[0].outcome, RuleOutcome::Matched);
     assert!(!report.ecu_reads_interrupted());
 }
 
@@ -3418,6 +3418,14 @@ async fn a_vin_rule_that_does_not_match_drops_the_candidate_before_the_ecu_reads
         }]
     );
     assert_eq!(report.remaining(), ["c2"]);
+    // The matched rule's value is a component value of the report (ADR-403).
+    assert_eq!(
+        report.component_values(),
+        [ComponentValue {
+            component: Component::ModelYear,
+            value: "2020".into()
+        }]
+    );
     assert_eq!(read_order(report), [("D2", 1)]);
     assert_eq!(declarations(report, 0), [&RequestOutcome::NotInPlay]);
     assert_eq!(
@@ -3441,7 +3449,7 @@ async fn a_vin_rule_that_does_not_match_drops_the_candidate_before_the_ecu_reads
     );
     let ran = run(manual, ecus(&[A.0, B.0])).await;
     let report = ran.report();
-    assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::NotMatched);
+    assert_eq!(report.vin_rules()[0].outcome, RuleOutcome::NotMatched);
     assert_eq!(report.remaining(), ["c1"]);
     assert!(report.dropped().is_empty());
     assert!(matches!(
@@ -3474,7 +3482,8 @@ async fn a_vin_rule_that_does_not_match_drops_the_candidate_before_the_ecu_reads
     let ran = run(unevaluated, ecus(&[B.0])).await;
     let report = ran.report();
     assert_eq!(report.vin(), None);
-    assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::Unevaluated);
+    assert_eq!(report.vin_rules()[0].outcome, RuleOutcome::Unevaluated);
+    assert!(report.component_values().is_empty());
     assert_eq!(report.remaining(), ["c1", "c2"]);
     assert!(report.dropped().is_empty());
 }
@@ -3587,5 +3596,635 @@ async fn an_interruption_narrows_on_the_part_read() {
             .entries()
             .iter()
             .all(|e| e.state == EntryState::NotRead)
+    );
+}
+
+// ------------------------------------------------------ The rule fields (ADR-327 item 4, ADR-403)
+
+/// The candidate and outcome of each rule on rule field `k`.
+fn rule_outcomes(report: &IdentificationReport, k: usize) -> Vec<(&str, RuleOutcome)> {
+    report.rule_fields()[k]
+        .rules
+        .iter()
+        .map(|rule| (rule.candidate.as_str(), rule.outcome))
+        .collect()
+}
+
+/// A `Text` value as the report shows an established field.
+fn text_value(value: &str) -> Option<FieldValue> {
+    Some(FieldValue::Text(value.to_owned()))
+}
+
+/// A document at `endpoint` whose service 1 reads the external-supply flag (FD06) as an unsigned
+/// byte and whose pattern expects 1.
+fn supply_reader(name: &str, endpoint: (u32, u32)) -> (Sha256, Vec<u8>) {
+    let base = part_reader(name, b"P", endpoint);
+    named(edited(&base.1, |variant| {
+        variant.services = Some(vec![read_service(
+            1,
+            "supply",
+            [0xFD, 0x06],
+            DataKind::Uint,
+            1,
+        )]);
+        variant.patterns.as_mut().unwrap()[0].expected = Some(vec![1]);
+    }))
+}
+
+/// ADR-327 item 4, ADR-403: two rule sources for one component on one request, two fields of one
+/// kind and length at different offsets, decode the one response to different values and leave
+/// the component unevaluated, narrow nothing, and are both reported.
+#[tokio::test(flavor = "multi_thread")]
+async fn rule_sources_that_decode_a_response_to_different_values_leave_the_component_unevaluated() {
+    let at_offset = |name: &str, bit_offset: u32| {
+        named(edited(&part_reader(name, b"P", A).1, |variant| {
+            let service = &mut variant.services.as_mut().unwrap()[0];
+            let field = &mut service.positive.as_mut().unwrap().fields.as_mut().unwrap()[0];
+            field.placement = diag_ir::declaration::Placement::Absolute;
+            field.bit_offset = bit_offset;
+            field.bit_length = 80;
+        }))
+    };
+    // The response is `62 F1 87` and eleven bytes: ten from the first, ten from the next.
+    let as_bytes = at_offset("v2", 32);
+    let documents = [at_offset("v1", 24), as_bytes];
+    let rules: [CandidateFieldRule<'_>; 2] = [
+        ("c1", 0, 1, 1, Component::ModelYear, "2021", b"PA"),
+        ("c2", 1, 1, 1, Component::ModelYear, "2022", b"A1"),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D", &[0, 1])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(
+        served(&fake),
+        [(A.0, F187.to_vec())],
+        "one request, one send"
+    );
+    let read = &report.ecu_reads()[0];
+    assert_eq!(read.requests.len(), 1);
+    assert!(read.requests[0].declarations.iter().all(|d| d.pattern));
+    assert_eq!(read.requests[0].declarations.len(), 2);
+    assert!(read.conclusive);
+    let field = &report.rule_fields()[0];
+    assert_eq!(report.rule_fields().len(), 1);
+    assert_eq!(
+        field
+            .sources
+            .iter()
+            .map(|s| s.outcome.clone())
+            .collect::<Vec<_>>(),
+        [
+            RuleSourceOutcome::Decoded(FieldValue::Text("PA123     ".into())),
+            RuleSourceOutcome::Decoded(FieldValue::Text("A123      ".into())),
+        ]
+    );
+    assert_eq!(field.established, None);
+    assert_eq!(
+        rule_outcomes(report, 0),
+        [
+            ("c1", RuleOutcome::Unevaluated),
+            ("c2", RuleOutcome::Unevaluated)
+        ]
+    );
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+    assert!(report.dropped().is_empty() && report.component_values().is_empty());
+}
+
+/// ADR-327 item 4, ADR-403: rules for the model and for the model year on one request are each
+/// established from the one response, judged apart, and a candidate with no rule of a component
+/// matching on its established field is dropped naming that field.
+#[tokio::test(flavor = "multi_thread")]
+async fn rules_for_two_components_on_one_request_are_each_established_from_the_one_response() {
+    let two_fields = named(edited(&part_reader("v1", b"P", A).1, |variant| {
+        variant.services = Some(vec![two_field_service(1)]);
+    }));
+    let rules: [CandidateFieldRule<'_>; 4] = [
+        ("c1", 0, 1, 1, Component::VehicleModel, "model-a", b"PA"),
+        ("c1", 0, 1, 2, Component::ModelYear, "2023", b"123"),
+        ("c2", 0, 1, 1, Component::VehicleModel, "model-b", b"PB"),
+        ("c2", 0, 1, 2, Component::ModelYear, "2023", b"123"),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        std::slice::from_ref(&two_fields),
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake), [(A.0, F187.to_vec())]);
+    assert_eq!(report.ecu_reads()[0].requests.len(), 1);
+    assert_eq!(report.rule_fields().len(), 2);
+    let fields = report.rule_fields();
+    assert_eq!(fields[0].component, Component::VehicleModel);
+    assert_eq!(fields[0].established, text_value("PA"));
+    assert_eq!(fields[1].component, Component::ModelYear);
+    assert_eq!(fields[1].established, text_value("123      "));
+    assert_eq!(
+        rule_outcomes(report, 0),
+        [
+            ("c1", RuleOutcome::Matched),
+            ("c2", RuleOutcome::NotMatched)
+        ]
+    );
+    assert_eq!(
+        rule_outcomes(report, 1),
+        [("c1", RuleOutcome::Matched), ("c2", RuleOutcome::Matched)]
+    );
+    assert_eq!(dropped(report), [("c2", Some("D"))]);
+    assert_eq!(
+        report.dropped()[0].contradictions,
+        [Contradiction::FieldRules {
+            component: Component::VehicleModel,
+            definition: "D".into(),
+            endpoint: a_key(report),
+            group: 0,
+            request: F187.to_vec(),
+        }]
+    );
+    assert_eq!(report.remaining(), ["c1"]);
+    let values: Vec<_> = report
+        .component_values()
+        .iter()
+        .map(|v| (v.component, v.value.as_str()))
+        .collect();
+    assert_eq!(
+        values,
+        [
+            (Component::VehicleModel, "model-a"),
+            (Component::ModelYear, "2023")
+        ]
+    );
+    assert!(matches!(
+        &report.entries()[0].state,
+        EntryState::Identified { definition, .. } if definition == "D"
+    ));
+}
+
+/// ADR-327 item 3 and 4, ADR-403: a rule on a service no pattern names is read with the
+/// definition on its link (the request is sent once, flagged as no pattern's), the definition is
+/// still conclusive, and a candidate whose rule field was established outside its own value is
+/// dropped; a manual plan judges the rule and drops nothing.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_field_established_outside_a_candidates_values_drops_it() {
+    let document = with_service(
+        &part_reader("v1", b"P", A),
+        read_service(2, "readSw", [0xF1, 0x89], DataKind::Ascii, 5),
+    );
+    let rules: [CandidateFieldRule<'_>; 2] = [
+        ("c1", 0, 2, 1, Component::ModelYear, "2021", b"SW1"),
+        ("c2", 0, 2, 1, Component::ModelYear, "2022", b"SW2"),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        std::slice::from_ref(&document),
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake), [(A.0, F187.to_vec()), (A.0, F189.to_vec())]);
+    assert_eq!(
+        fake.count("ModuleConnect"),
+        2,
+        "the presence link and one read link"
+    );
+    let read = &report.ecu_reads()[0];
+    assert_eq!(
+        read.requests
+            .iter()
+            .map(|r| (r.request.as_slice(), r.declarations[0].pattern))
+            .collect::<Vec<_>>(),
+        [(F187, true), (F189, false)]
+    );
+    assert!(read.conclusive && read.answered);
+    assert_eq!(report.rule_fields()[0].established, text_value("SW123"));
+    assert_eq!(
+        rule_outcomes(report, 0),
+        [
+            ("c1", RuleOutcome::Matched),
+            ("c2", RuleOutcome::NotMatched)
+        ]
+    );
+    assert_eq!(dropped(report), [("c2", Some("D"))]);
+    assert_eq!(
+        report.dropped()[0].contradictions,
+        [Contradiction::FieldRules {
+            component: Component::ModelYear,
+            definition: "D".into(),
+            endpoint: a_key(report),
+            group: 0,
+            request: F189.to_vec(),
+        }]
+    );
+    assert_eq!(report.remaining(), ["c1"]);
+    assert_eq!(report.component_values().len(), 1);
+    assert_eq!(report.component_values()[0].value, "2021");
+
+    // A manual plan judges the rule and keeps its candidate.
+    let manual = ecu_plan_with_rules(
+        Selection::ChosenDefinition,
+        std::slice::from_ref(&document),
+        &[("D", &[0])],
+        &[("c2", ENGINE)],
+        &[],
+        &rules[1..],
+    );
+    let ran = run(manual, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(rule_outcomes(report, 0), [("c2", RuleOutcome::NotMatched)]);
+    assert_eq!(report.remaining(), ["c2"]);
+    assert!(report.dropped().is_empty());
+    assert!(report.component_values().is_empty());
+}
+
+/// ADR-327 item 4, ADR-403: a definition whose rule field separates the candidates is read before
+/// one that cannot drop anything, though the other sorts first and is named by as many candidates.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_whose_rule_field_separates_the_candidates_is_read_first() {
+    let documents = [part_reader("v1", b"P", A), sw_reader("v2", b"S", B)];
+    let rules: [CandidateFieldRule<'_>; 3] = [
+        ("c1", 1, 1, 1, Component::ModelYear, "2021", b"SW1"),
+        ("c2", 1, 1, 1, Component::ModelYear, "2022", b"SW2"),
+        ("c3", 1, 1, 1, Component::ModelYear, "2023", b"SW3"),
+    ];
+    let entries: [CandidateEntries<'_>; 3] = [
+        (
+            "c1",
+            &[("engine", false, &["D1"]), ("body", false, &["D2"])],
+        ),
+        (
+            "c2",
+            &[("engine", false, &["D1"]), ("body", false, &["D2"])],
+        ),
+        (
+            "c3",
+            &[("engine", false, &["D1"]), ("body", false, &["D2"])],
+        ),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &entries,
+        &[],
+        &rules,
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(read_order(report), [("D2", 1), ("D1", 1)]);
+    assert_eq!(served(&fake), [(B.0, F189.to_vec()), (A.0, F187.to_vec())]);
+    assert_eq!(dropped(report), [("c2", Some("D2")), ("c3", Some("D2"))]);
+    assert_eq!(report.remaining(), ["c1"]);
+}
+
+/// ADR-403: a rule's request the ECU refuses leaves its component unevaluated and the definition's
+/// read conclusive (a rule-only request counts for nothing in conclusiveness), though the ECU is
+/// reported as having answered.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_rule_request_the_ecu_refuses_leaves_the_component_unevaluated_and_the_read_conclusive() {
+    let document = with_service(
+        &part_reader("v1", b"P", A),
+        read_service(2, "readX", [0xF1, 0xA0], DataKind::Ascii, 4),
+    );
+    let rules: [CandidateFieldRule<'_>; 1] = [("c1", 0, 2, 1, Component::ModelYear, "2021", b"X")];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        std::slice::from_ref(&document),
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(
+        report.rule_fields()[0].sources[0].outcome,
+        RuleSourceOutcome::Negative(0x31)
+    );
+    assert_eq!(report.rule_fields()[0].established, None);
+    assert_eq!(rule_outcomes(report, 0), [("c1", RuleOutcome::Unevaluated)]);
+    let read = &report.ecu_reads()[0];
+    assert!(read.conclusive && read.answered && !read.matching.is_empty());
+    assert!(report.dropped().is_empty());
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+}
+
+/// ADR-403: a rule field that was not read says why: its definition was not in play, its link was
+/// refused, the worker refused the link, or nothing answered; each rule stays unevaluated and
+/// nothing is dropped on it.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unread_rule_field_reports_why() {
+    let only = |report: &IdentificationReport| {
+        let field = &report.rule_fields()[0];
+        assert_eq!(field.established, None);
+        assert!(
+            field
+                .rules
+                .iter()
+                .all(|rule| rule.outcome == RuleOutcome::Unevaluated)
+        );
+        field.sources[0].outcome.clone()
+    };
+    // Not in play: a VIN rule drops the candidate that names the definition.
+    let documents = [
+        identified_by(0x90, 17, b"W", "v1", A, |_| {}),
+        identified_by(0x90, 17, b"W", "v2", B, |_| {}),
+    ];
+    let engines: [CandidateEntries<'_>; 2] = [
+        ("c1", &[("engine", false, &["D1"])]),
+        ("c2", &[("engine", false, &["D2"])]),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &engines,
+        &[("c1", 0, 10, 10, "L"), ("c2", 0, 10, 10, "3")],
+        &[("c1", 0, 1, 1, Component::VehicleModel, "m", b"W")],
+    );
+    let ran = run(plan, fake_with(&[(A.0, VIN_A), (B.0, VIN_A)])).await;
+    let report = ran.report();
+    assert_eq!(dropped(report), [("c1", None)]);
+    assert_eq!(only(report), RuleSourceOutcome::NotInPlay);
+
+    // A refused link: the field has no endpoint and its source says so.
+    let refused = identified_by(0x87, 11, b"P", "v9", B, |p| p.extended_addressing = true);
+    let documents = [part_reader("v1", b"P", A), refused];
+    let rule: [CandidateFieldRule<'_>; 1] = [("c1", 1, 1, 1, Component::VehicleModel, "m", b"PA")];
+    let both: [CandidateEntries<'_>; 2] = [
+        ("c1", &[("engine", false, &["D1", "D9"])]),
+        ("c2", &[("engine", false, &["D1"])]),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D1", &[0]), ("D9", &[1])],
+        &both,
+        &[],
+        &rule,
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(report.rule_fields()[0].endpoint, None);
+    assert_eq!(only(report), RuleSourceOutcome::LinkRefused);
+    assert!(report.dropped().is_empty());
+
+    // The worker refuses the read's link (the presence link is the first connect).
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
+    let rule: [CandidateFieldRule<'_>; 1] = [("c1", 0, 1, 1, Component::VehicleModel, "m", b"PA")];
+    let engines: [CandidateEntries<'_>; 2] = [
+        ("c1", &[("engine", false, &["D1"])]),
+        ("c2", &[("engine", false, &["D2"])]),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &engines,
+        &[],
+        &rule,
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    fake.state().connect_fail_at = Some((2, tonic::Status::invalid_argument("refused")));
+    let ran = run(plan, fake).await;
+    let report = ran.report();
+    assert_eq!(only(report), RuleSourceOutcome::WorkerRefused);
+    assert!(report.dropped().is_empty());
+
+    // No ECU at the endpoint.
+    let documents = [part_reader("v1", b"P", C)];
+    let rule: [CandidateFieldRule<'_>; 1] = [("c1", 0, 1, 1, Component::VehicleModel, "m", b"PA")];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rule,
+    );
+    let ran = run(plan, Fake::default()).await;
+    let report = ran.report();
+    assert_eq!(only(report), RuleSourceOutcome::NoUsableAnswer);
+    assert!(report.dropped().is_empty());
+}
+
+/// ADR-306 item 3, ADR-403: an integer rule field is compared by number, whatever width the rule
+/// writes its expected value in.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_integer_rule_field_is_compared_by_number() {
+    let documents = [supply_reader("v1", A)];
+    let rules: [CandidateFieldRule<'_>; 3] = [
+        ("c1", 0, 1, 1, Component::ModelYear, "2021", &[1]),
+        ("c2", 0, 1, 1, Component::ModelYear, "2022", &[0, 1]),
+        ("c3", 0, 1, 1, Component::ModelYear, "2023", &[2]),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE), ("c3", ENGINE)],
+        &[],
+        &rules,
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(
+        report.rule_fields()[0].established,
+        Some(FieldValue::Unsigned(1))
+    );
+    assert_eq!(
+        rule_outcomes(report, 0),
+        [
+            ("c1", RuleOutcome::Matched),
+            ("c2", RuleOutcome::Matched),
+            ("c3", RuleOutcome::NotMatched)
+        ]
+    );
+    assert_eq!(dropped(report), [("c3", Some("D"))]);
+    assert_eq!(report.remaining(), ["c1", "c2"]);
+}
+
+/// ADR-401 item 8 as ADR-403 amends it: a definition with no pattern that a field rule names is
+/// read for the rule: its link opens and the request is sent, the read is never conclusive and
+/// never matches, the rule is judged, and the entry is judged as if the definition had no
+/// declaration.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_field_rule_on_a_definition_without_patterns_is_still_read() {
+    let document = named(edited(&part_reader("v1", b"P", A).1, |variant| {
+        variant.patterns = None;
+    }));
+    let rules: [CandidateFieldRule<'_>; 2] = [
+        ("c1", 0, 1, 1, Component::ModelYear, "2021", b"PA"),
+        ("c2", 0, 1, 1, Component::ModelYear, "2022", b"XX"),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        std::slice::from_ref(&document),
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake), [(A.0, F187.to_vec())]);
+    assert_eq!(fake.count("ModuleConnect"), 2);
+    let read = &report.ecu_reads()[0];
+    assert!(!read.conclusive && read.matching.is_empty() && read.answered);
+    assert!(!read.requests[0].declarations[0].pattern);
+    assert_eq!(
+        rule_outcomes(report, 0),
+        [
+            ("c1", RuleOutcome::Matched),
+            ("c2", RuleOutcome::NotMatched)
+        ]
+    );
+    assert_eq!(dropped(report), [("c2", Some("D"))]);
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+}
+
+/// ADR-402 as ADR-403 extends it: an interruption after a rule field was established keeps the
+/// drop it gave, leaves the sources not sent not read, and the definitions only the dropped
+/// candidate names not in play.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interruption_keeps_the_drop_of_an_established_rule_field() {
+    let documents = [
+        sw_reader("v2a", b"SW", A),
+        sw_reader("v2b", b"SW", B),
+        part_reader("v9", b"P", C),
+    ];
+    let rules: [CandidateFieldRule<'_>; 4] = [
+        ("c1", 0, 1, 1, Component::ModelYear, "2021", b"XX"),
+        ("c1", 1, 1, 1, Component::ModelYear, "2021", b"XX"),
+        ("c2", 0, 1, 1, Component::ModelYear, "2022", b"SW"),
+        ("c2", 1, 1, 1, Component::ModelYear, "2022", b"SW"),
+    ];
+    let entries: [CandidateEntries<'_>; 2] = [
+        ("c1", &[("x", false, &["D2"]), ("w", false, &["D9"])]),
+        ("c2", &[("x", false, &["D2"])]),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D2", &[0, 1]), ("D9", &[2])],
+        &entries,
+        &[],
+        &rules,
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    // The presence request, D2 at A, then the VCI is lost in D2 at B.
+    fake.state().scripts =
+        VecDeque::from([vec![Item::Finish], vec![Item::Routed], vec![Item::VciLost]]);
+    let limits = JobLimits {
+        max_link_reopens: 0,
+        ..limits()
+    };
+    let ran = run_with(plan, fake, limits, false).await;
+    let report = ran.report();
+    assert!(report.ecu_reads_interrupted());
+    assert_eq!(report.rule_fields()[0].established, text_value("SW123"));
+    assert_eq!(
+        report.rule_fields()[1].sources[0].outcome,
+        RuleSourceOutcome::NotRead
+    );
+    assert_eq!(dropped(report), [("c1", Some("D2"))]);
+    assert_eq!(report.remaining(), ["c2"]);
+    assert_eq!(declarations(report, 2), [&RequestOutcome::NotInPlay]);
+}
+
+/// ADR-403: the component values are those of the rules of the candidates that remain; a dropped
+/// candidate's matched rule gives none, though its source still counted in establishing the field.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_dropped_candidates_matched_rule_gives_no_component_value() {
+    let two_fields = named(edited(&part_reader("v1", b"P", A).1, |variant| {
+        variant.services = Some(vec![two_field_service(1)]);
+    }));
+    let rules: [CandidateFieldRule<'_>; 4] = [
+        ("c1", 0, 1, 1, Component::VehicleModel, "model-a", b"PA"),
+        ("c1", 0, 1, 2, Component::ModelYear, "2023", b"123"),
+        // c2's model matches but its model year does not: it is dropped.
+        ("c2", 0, 1, 1, Component::VehicleModel, "model-x", b"PA"),
+        ("c2", 0, 1, 2, Component::ModelYear, "2099", b"999"),
+    ];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        std::slice::from_ref(&two_fields),
+        &[("D", &[0])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(dropped(report), [("c2", Some("D"))]);
+    assert_eq!(
+        rule_outcomes(report, 0),
+        [("c1", RuleOutcome::Matched), ("c2", RuleOutcome::Matched)]
+    );
+    let values: Vec<_> = report
+        .component_values()
+        .iter()
+        .map(|v| v.value.as_str())
+        .collect();
+    assert_eq!(values, ["model-a", "2023"]);
+}
+
+/// ADR-403 as it amends ADR-401 item 4: a variant with no pattern whose link ADR-324 refuses and
+/// that carries only a request read for a field rule does not make its definition inconclusive,
+/// so the definition's read at its endpoint stays conclusive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_variant_with_only_a_rule_request_leaves_the_definition_conclusive() {
+    let refused = named(edited(
+        &identified_by(0x87, 11, b"P", "v9", B, |p| p.extended_addressing = true).1,
+        |variant| variant.patterns = None,
+    ));
+    let documents = [part_reader("v1", b"Q", A), refused];
+    let rules: [CandidateFieldRule<'_>; 1] = [("c1", 1, 1, 1, Component::ModelYear, "2021", b"P")];
+    let plan = ecu_plan_with_rules(
+        Selection::Candidates,
+        &documents,
+        &[("D", &[0, 1])],
+        &[("c1", ENGINE), ("c2", ENGINE)],
+        &[],
+        &rules,
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(report.ecu_reads()[1].endpoint, None);
+    assert_eq!(
+        report.rule_fields()[0].sources[0].outcome,
+        RuleSourceOutcome::LinkRefused
+    );
+    let read = &report.ecu_reads()[0];
+    assert!(read.matching.is_empty());
+    assert!(
+        read.conclusive,
+        "the rule-only refused variant rules nothing out"
     );
 }

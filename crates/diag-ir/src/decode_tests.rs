@@ -2243,3 +2243,87 @@ fn the_first_matching_variant_by_short_name_is_selected() {
     assert_eq!(select(&[&v2, &v1, &any], "1.0"), Some(2));
     assert_eq!(select(&[&v2, &v1], "1.0"), Some(1));
 }
+
+// ------------------------------------------------ The comparator a field rule shares (ADR-306)
+
+#[test]
+fn expected_matches_is_the_comparison_a_pattern_makes() {
+    let value = |kind: DataKind, bits: u32, bytes: &[u8]| {
+        let fields = decode(
+            &[],
+            vec![next(1, kind, bits)],
+            &[&[SID][..], bytes].concat(),
+        )
+        .unwrap();
+        fields[0].value.clone()
+    };
+    for (kind, bits, bytes, expected) in [
+        (DataKind::Bytes, 32, &[1u8, 2, 3, 4][..], &[1u8, 2][..]),
+        (DataKind::Bytes, 32, &[1, 2, 3, 4], &[2]),
+        (DataKind::Ascii, 24, b"SW1", b"SW"),
+        (DataKind::Ascii, 24, b"SW1", b"SX"),
+        (DataKind::Uint, 16, &[0, 7], &[7]),
+        (DataKind::Uint, 16, &[0, 7], &[0, 0, 7]),
+        (DataKind::Uint, 16, &[0, 7], &[8]),
+        (DataKind::Int, 8, &[0xFF], &[0xFF]),
+        (DataKind::Int, 8, &[0xFF], &[0, 0xFF]),
+        (DataKind::Uint, 8, &[7], &[]),
+        (DataKind::Uint, 8, &[7], &[0; 9]),
+    ] {
+        let fields = decode(
+            &[],
+            vec![next(1, kind, bits)],
+            &[&[SID][..], bytes].concat(),
+        )
+        .unwrap();
+        assert_eq!(
+            expected_matches(expected, &value(kind, bits, bytes)),
+            matches(1, expected, &fields),
+            "{kind:?} {bytes:?} {expected:?}"
+        );
+    }
+    assert!(!expected_matches(&[1], &PhysicalValue::Float(1.0)));
+    assert!(!expected_matches(&[1], &PhysicalValue::Group(vec![])));
+}
+
+#[test]
+fn expected_value_reads_expected_by_the_kind_of_its_field() {
+    use ExpectedKind::{Bytes, Signed, Unsigned};
+    assert_eq!(
+        expected_value(Bytes, b"SW"),
+        Some(PhysicalValue::Bytes(b"SW".to_vec()))
+    );
+    assert_eq!(
+        expected_value(Unsigned, &[1, 0]),
+        Some(PhysicalValue::Unsigned(256))
+    );
+    assert_eq!(
+        expected_value(Unsigned, &[0, 0, 1]),
+        Some(PhysicalValue::Unsigned(1))
+    );
+    assert_eq!(
+        expected_value(Signed, &[0xFF]),
+        Some(PhysicalValue::Signed(-1))
+    );
+    assert_eq!(
+        expected_value(Signed, &[0x00, 0xFF]),
+        Some(PhysicalValue::Signed(255))
+    );
+    // No number: empty or over eight bytes.
+    assert_eq!(expected_value(Unsigned, &[]), None);
+    assert_eq!(expected_value(Signed, &[0; 9]), None);
+}
+
+#[test]
+fn an_empty_expected_value_matches_no_value_of_any_kind() {
+    for value in [
+        PhysicalValue::Bytes(vec![1]),
+        PhysicalValue::Text("a".into()),
+        PhysicalValue::Unsigned(1),
+        PhysicalValue::Signed(1),
+    ] {
+        assert!(!expected_matches(&[], &value), "{value:?}");
+    }
+    let fields = decode(&[], vec![next(1, DataKind::Bytes, 16)], &[SID, 1, 2]).unwrap();
+    assert!(!matches(1, &[], &fields));
+}

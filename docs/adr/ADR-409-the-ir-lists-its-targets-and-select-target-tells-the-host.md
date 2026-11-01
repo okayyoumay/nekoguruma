@@ -29,9 +29,11 @@ several.
    the check), so a damaged journal cannot address a target the program does not list.
    `VmState::target` is a `u8` too; the width suits the limit of eight targets (`MAX_TARGETS`).
 3. The notification `DiagHost::select_target` is infallible and has a default empty body. The
-   VM makes it once before the first instruction of every run, new or restored, after the
-   state and the instruction have passed their checks (so a refused state never reaches the
-   host), and on every `SelectTarget` that changes the target; selecting the current target
+   VM makes it once before the first instruction of every run, new or restored, after
+   `check_state` and the instruction's pre-host checks (`check_primitive`), so a refused state
+   or primitive never reaches the host. A non-primitive's run-time error, such as a stack
+   underflow, can follow the notification, which is infallible and changes nothing in the ECU;
+   ADR-233 item 3's "a VM error only before any host call" does not cover it. The VM also tells it on every `SelectTarget` that changes the target; selecting the current target
    makes no call. A finished state runs no instruction and tells nothing. A host that cannot
    serve the target refuses its next exchange.
 4. `SelectTarget` is not a diagnostic primitive: it sends nothing, so nothing is journaled

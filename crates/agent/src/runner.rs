@@ -530,7 +530,9 @@ pub(crate) type GuardSlot = Arc<Mutex<Option<JobGuards>>>;
 /// (`Program::validate`), and the policy must allow every request in it at `permission`
 /// (ADR-247). A caller can make them before it launches a worker for the job, with
 /// [`policy::build_ceiling`] since the VCI is not known yet. Operands are not checked
-/// exhaustively: a bad one, such as a missing constant, fails when the VM reaches it.
+/// exhaustively: a bad one, such as a missing constant, fails when the VM reaches it. A program
+/// that lists more than one target is refused too (`JobError::SeveralTargets`, ADR-409): the
+/// agent opens one link per job.
 ///
 /// A program alone has no declarations, so a `SendReceive` in it is refused here; [`check_job`]
 /// checks one against its job's document.
@@ -539,7 +541,8 @@ pub fn check_program(program: &Program, permission: Permission) -> Result<(), Jo
     refuse_beyond(program, None, permission)
 }
 
-/// The checks of [`check_program`] that need neither the declarations nor the permission.
+/// The checks of [`check_program`] that need neither the declarations nor the permission: the
+/// VM's state check, `Program::validate` and the several-targets refusal (ADR-409).
 fn check_runnable(program: &Program) -> Result<(), JobError> {
     // A program this VM cannot run must not reach the bus.
     Vm::new(program)
@@ -16159,7 +16162,46 @@ def main():
         .await
         .unwrap();
         assert!(
-            matches!(result, Err(HostError::Unsupported("SelectTarget"))),
+            matches!(
+                result,
+                Err(HostError::Unsupported(
+                    "a request to a target other than the primary"
+                ))
+            ),
+            "{result:?}"
+        );
+        assert!(fake.primitive_calls().is_empty(), "{:?}", fake.calls);
+    }
+
+    /// ADR-409: `reopen` keeps the host's target (the VM is not told again), so a request off
+    /// the primary is still refused on the new link, and nothing is sent.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reopening_the_link_keeps_the_target() {
+        use diag_ir::DiagHost;
+        let (mut client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let mut second = client.clone();
+        let relinked = link::open(&mut second, &config, Duration::from_secs(5))
+            .await
+            .expect("the second link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_secs(5),
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.select_target(1);
+            host.reopen(second, relinked, &config);
+            host.service_request(0x22, &[0xF1, 0x90])
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(HostError::Unsupported(_))),
             "{result:?}"
         );
         assert!(fake.primitive_calls().is_empty(), "{:?}", fake.calls);

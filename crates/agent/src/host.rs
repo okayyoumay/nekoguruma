@@ -594,7 +594,7 @@ pub struct WorkerHost<C: WorkerApi> {
     relink: Option<Relink<C>>,
     /// The target the VM told the host to address ([`DiagHost::select_target`], ADR-409). The
     /// agent opens one link per job, so only the primary, 0, can be served until one link per
-    /// target exists (ADR-325 item 8).
+    /// target exists (ADR-325 item 8). Kept by `reopen`; the VM is not told again.
     target: u8,
 }
 
@@ -1297,7 +1297,7 @@ impl<C: WorkerApi> WorkerHost<C> {
     ) -> Result<Vec<u8>, HostError> {
         // The link is the primary's; a request for another target cannot be served (ADR-409).
         if self.target != 0 {
-            let error = HostError::Unsupported("SelectTarget");
+            let error = HostError::Unsupported("a request to a target other than the primary");
             self.log_refused(&request, before, &error, None);
             return Err(error);
         }

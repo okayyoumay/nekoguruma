@@ -767,7 +767,10 @@ impl Vm {
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
         };
-        // After `current_op`'s checks, so a refused state or instruction never reaches the host.
+        // After `check_state` and the instruction's pre-host checks (`check_primitive`), so a
+        // refused state or primitive never reaches the host. A non-primitive's run-time error
+        // (a stack underflow, say) can still follow: the notification is infallible and changes
+        // nothing in the ECU.
         if !self.told_target {
             self.tell_target(host);
         }

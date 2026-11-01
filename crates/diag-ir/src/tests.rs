@@ -4805,6 +4805,24 @@ fn select_target_out_of_range_is_refused_statically_and_at_run_time() {
     );
 }
 
+/// A first instruction that `check_primitive` refuses never reaches the host, the first-step
+/// notification included.
+#[test]
+fn a_refused_first_instruction_tells_the_host_nothing() {
+    for code in [
+        vec![Op::ServiceRequest { service: 0x22 }],
+        vec![Op::SelectTarget { target: 1 }],
+    ] {
+        let program = prog(code, Vec::new());
+        let mut vm = Vm::new(&program);
+        let mut host = MockHost::default();
+        let result = vm.step(&program, &mut host);
+        assert!(matches!(result, Err(StepError::Vm(_))), "{result:?}");
+        assert!(host.targets.is_empty());
+        assert!(host.calls.is_empty());
+    }
+}
+
 #[test]
 fn select_target_switches_across_a_jump_and_a_call() {
     let code = vec![

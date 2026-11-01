@@ -1,6 +1,6 @@
 ---
 name: milestone-exit
-description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take (sweep), or verify the exit criteria and move the plan and backlog to the next milestone (close). Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
+description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), or verify the exit criteria and move the plan and backlog to the next milestone (close). Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
 argument-hint: "status | sweep | close"
 ---
 
@@ -41,7 +41,9 @@ Count the same way every time, so the numbers of two reports can be compared:
 4. Report, leading with the count and the commit: per exit criterion the remaining items in a
    short line each, then work in progress, then development-process items. When the milestone
    count is zero, say that the items are done but the milestone is not yet closed, and propose
-   `sweep` (or `close` when a sweep since the last raise found nothing).
+   `sweep` (or `close` when a sweep since the last raise found nothing). When every milestone
+   item left has a `Blocked on:` clause, say so and propose `sweep`, which judges whether each
+   one still belongs in the milestone.
 
 ## sweep
 
@@ -62,11 +64,34 @@ records. An item belongs in the milestone when one of these holds; note which on
    on with no test.
 
 Everything else stays at its priority; give the reason once per group (later milestone, server
-or hardware work, blocked on a later milestone). Report two lists, **recommended** and
-**optional**, each item with its file, line, current priority and the reason above, then ask the
-maintainer which to raise, offering: recommended only (the recommendation), recommended and
-optional, or none. Change nothing before the answer. Raise the chosen items with the `backlog`
-skill (new items for promises with no item) in one backlog-only PR (no automated review, ADR-251).
+or hardware work, blocked on a later milestone).
+
+Then the other direction: every milestone P1 item with a `Blocked on:` clause (not the
+development-process items or the `Known Flaky Tests` entries, which are P1 whatever the
+milestone). A blocked item stays P1 only while this milestone can unblock it (`work/README.md`,
+ADR-407). Judge each by what its clause waits for:
+
+- **An exit criterion's item.** It is never moved out. Report it as a question for the
+  maintainer: unblock it during this milestone, or change the exit criteria in the plan.
+- **Another P1 item**, or a chain of them, that this milestone works on: it stays P1 (its
+  blocker is P1 already, ADR-388).
+- **Something the maintainer can supply** (a decision, a purchase, hardware, data): a question
+  for the maintainer, supply it during this milestone or move the item out, with a
+  recommendation.
+- **Anything else**: a later milestone's work, or something outside the project (an
+  operating-system facility, a vendor). Recommend moving it to P2; its clause names what
+  unblocks it.
+
+Report the raise candidates as two lists, **recommended** and **optional**, and the move-out
+candidates and questions as a third, each item with its file, line, current priority and the
+reason above. Then ask the maintainer which to raise, offering: recommended only (the
+recommendation), recommended and optional, or none; and which to move out, offering the
+recommended ones or none. Change nothing before the answer. Raise and lower the chosen items with
+the `backlog` skill (new items for promises with no item); lowering an item re-judges the blockers
+that were raised only for it (ADR-388). Put the changes in one backlog-only PR (no automated
+review, ADR-251), unless a moved-out item is promised in the milestone's scope: then the same PR
+moves that promise to the section of the milestone that unblocks it, or to the plan's list of
+open decisions when no milestone does, and the plan change gets the automated review.
 
 After the raised items are done, the next sweep only needs rule 2 for items added since this
 one, plus rules 1, 3 and 4 for code and CI changes merged since (a fix can add a platform or
@@ -76,8 +101,9 @@ finds nothing.
 ## close
 
 Run only when the maintainer asks to finish the milestone. The milestone count is zero and the
-last sweep found nothing; if a sweep has not run since the last raised items merged, run it
-first and stop if it finds something.
+last sweep found nothing; if a sweep has not run since the last raised or lowered items merged,
+run it first and stop if it finds something. A blocked item that serves an exit criterion keeps
+the milestone open until the maintainer unblocks it or changes the exit criteria.
 
 1. **Evidence for each exit criterion**, not only closed items: the test or CI job that shows
    it, in a successful CI run on `main` for the commit the report names (job, run, the log line

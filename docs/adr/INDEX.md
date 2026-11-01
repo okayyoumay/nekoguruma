@@ -398,6 +398,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-406](ADR-406-the-declared-link-rules-live-in-diag-ir-and-the-conversion-applies-them.md) | The Declared-Link Rules Live in `diag-ir` and the Conversion Applies Them | Accepted | `diag-ir` `link`, `agent` link (`LinkConfig::declared`, `validate`), `diag-frontend` resolve and `comparams.csv`; design 8.2.4; ADR-295, ADR-324 consequence 3, ADR-397 |
 | [ADR-407](ADR-407-a-blocked-item-stays-p1-only-while-the-milestone-can-unblock-it.md) | A Blocked Item Stays P1 Only While the Milestone Can Unblock It | Accepted | `work/README.md` (priorities), `.claude/skills/milestone-exit`, `.claude/skills/backlog`, `.claude/skills/backlog-triage`; ADR-388 |
 | [ADR-408](ADR-408-a-suppressed-request-s-silence-within-the-limit-in-force-is-its-result.md) | A Suppressed Request's Silence Within the Limit in Force Is Its Result | Accepted | `diag-ir` (`suppresses_positive_response`, `dry_run`), `agent` host (`exchange`, `Sent`), `sim-ecu` `Fault::ResponsePending`; design 8.2.4 and 8.11; ADR-235 item 3, ADR-328 item 2, ADR-392, ADR-397 |
+| [ADR-409](ADR-409-the-ir-lists-its-targets-and-select-target-tells-the-host.md) | The IR Lists Its Targets and `SelectTarget` Tells the Host | Accepted | `diag-ir` (`Program::targets`, `Op::SelectTarget`, `VmState::target`, `DiagHost::select_target`, `Program::validate`), `agent` (`check_runnable`, `WorkerHost`); design 8.2.4; ADR-233 items 3, 9 and 10, ADR-325 item 3, ADR-397 |
 
 ## Status Legend
 
@@ -907,6 +908,7 @@ the predecessor repository these ADRs came from.
 - ADR-405
 - ADR-406
 - ADR-408
+- ADR-409
 
 ### Acquired Data & Monitoring
 - ADR-236

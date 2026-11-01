@@ -275,6 +275,10 @@ pub enum JobError {
     },
     #[error("the job was cancelled")]
     Cancelled,
+    /// The program lists more than one target, and this agent opens one link per job
+    /// (ADR-325 item 8, ADR-409).
+    #[error("the program lists {count} targets; this agent opens one link per job")]
+    SeveralTargets { count: usize },
     #[error("journal: {0}")]
     Journal(#[from] JournalError),
     #[error("the ECU's {identity:?} could not be read at {pc}, so the plan does not start")]
@@ -542,6 +546,12 @@ fn check_runnable(program: &Program) -> Result<(), JobError> {
         .check_state(program)
         .map_err(|source| JobError::Vm { pc: 0, source })?;
     program.validate()?;
+    // One link per job (ADR-324): a second target has no link to be served on (ADR-409).
+    if program.targets.len() > 1 {
+        return Err(JobError::SeveralTargets {
+            count: program.targets.len(),
+        });
+    }
     Ok(())
 }
 
@@ -2930,6 +2940,7 @@ mod tests {
             identity: Default::default(),
             preconditions: Default::default(),
             flash: Vec::new(),
+            targets: Vec::new(),
         }
     }
 
@@ -2998,6 +3009,38 @@ mod tests {
             ))
         ));
         assert!(check_program(&program(Vec::new()), Permission::ReadOnly).is_ok());
+    }
+
+    /// ADR-409: the agent opens one link per job, so a program that lists several targets is
+    /// refused by both entry points before any worker starts; zero or one is accepted.
+    #[test]
+    fn a_program_with_two_targets_is_refused_before_the_worker_starts() {
+        let with_targets = |count: u8| Program {
+            targets: (0..count)
+                .map(|index| diag_ir::Target {
+                    access: index == 0,
+                    declarations: [index; 32],
+                })
+                .collect(),
+            ..program(Vec::new())
+        };
+        for count in 0..=1 {
+            let one = with_targets(count);
+            assert!(check_program(&one, Permission::ReadOnly).is_ok(), "{count}");
+            assert!(
+                check_job(&one.into(), Permission::ReadOnly).is_ok(),
+                "{count}"
+            );
+        }
+        let two = with_targets(2);
+        assert!(matches!(
+            check_program(&two, Permission::ReadOnly),
+            Err(JobError::SeveralTargets { count: 2 })
+        ));
+        assert!(matches!(
+            check_job(&two.into(), Permission::ReadOnly),
+            Err(JobError::SeveralTargets { count: 2 })
+        ));
     }
 
     #[test]
@@ -16091,6 +16134,35 @@ def main():
         })
         .await
         .unwrap()
+    }
+
+    /// ADR-409: a host told to address another target than the primary refuses the next
+    /// exchange before it sends anything, as an agent refusal.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_request_off_the_primary_target_is_refused_before_it_is_sent() {
+        use diag_ir::DiagHost;
+        let (mut client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_secs(5),
+        };
+        let result = tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.select_target(1);
+            host.service_request(0x22, &[0xF1, 0x90])
+        })
+        .await
+        .unwrap();
+        assert!(
+            matches!(result, Err(HostError::Unsupported("SelectTarget"))),
+            "{result:?}"
+        );
+        assert!(fake.primitive_calls().is_empty(), "{:?}", fake.calls);
     }
 
     /// Design 8.11 "Settlement": a primitive the host stopped waiting for at its own deadline

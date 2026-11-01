@@ -45,6 +45,7 @@ fn program(code: Vec<Op>) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 

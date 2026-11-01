@@ -29,6 +29,10 @@ struct MockHost {
     inputs: Vec<(RuntimeInput, i64)>,
     /// The bytes of every HMI form and record template sent.
     forms: Vec<Vec<u8>>,
+    /// The targets `select_target` was told, kept apart from `calls`.
+    targets: Vec<u8>,
+    /// How many calls had been made when each of `targets` was told.
+    told_after_calls: Vec<usize>,
 }
 
 impl MockHost {
@@ -145,6 +149,12 @@ impl DiagHost for MockHost {
         assert!(!self.forbidden, "the host must not be called");
         self.logs.push((level, message.to_owned()));
     }
+    // Not `forbidden`: the notification precedes a valid step, which may itself be a
+    // non-primitive instruction a `forbidden` host runs.
+    fn select_target(&mut self, target: u8) {
+        self.targets.push(target);
+        self.told_after_calls.push(self.calls.len());
+    }
 }
 
 fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
@@ -157,6 +167,7 @@ fn prog(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -1289,6 +1300,7 @@ fn primitive_classification_covers_every_instruction() {
             input: RuntimeInput::SupplyVoltageMillivolts,
         },
         Op::HmiRequestFromStack { form: 0 },
+        Op::SelectTarget { target: 0 },
     ];
     for (index, op) in all.iter().enumerate() {
         // The postcard encoding starts with the variant index, so this also pins the variant
@@ -1551,12 +1563,18 @@ fn resumed_state_is_checked() {
         pc: 2,
         ..base.clone()
     };
+    // A target outside the program's list: none listed, so only 0 is in range, and two listed.
+    let one_target_state = VmState {
+        target: 1,
+        ..base.clone()
+    };
     for (state, expected) in [
         (oversized_stack, VmError::StackOverflow),
         (deep_calls, VmError::CallDepthExceeded),
         (bad_return, VmError::BadReturnPc(3)),
         (bad_lower_return, VmError::BadReturnPc(3)),
         (finished_oversized, VmError::StackOverflow),
+        (one_target_state, VmError::BadTarget(1)),
     ] {
         let before = postcard::to_allocvec(&state).unwrap();
         let mut vm = Vm::resume(state);
@@ -1694,6 +1712,7 @@ fn unusual_values_round_trip() {
             locals: vec![Some(Value::F64(f64::INFINITY)), None],
         }],
         steps: u64::MAX - 1,
+        target: 0,
     };
     let bytes = postcard::to_allocvec(&state).unwrap();
     let restored: VmState = postcard::from_bytes(&bytes).unwrap();
@@ -4716,4 +4735,240 @@ fn only_odd_levels_up_to_0x41_and_0x5f_are_standard_seed_levels() {
     assert!(is_standard_seed_level(0x5F));
     assert!(!is_standard_seed_level(0x61));
     assert!(!is_standard_seed_level(0x7D));
+}
+
+// ---------------------------------------------------------------- Targets (ADR-325 item 3, ADR-409)
+
+/// A program that lists `n` targets, with distinct declaration hashes.
+fn prog_with_targets(n: u8, code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
+    Program {
+        targets: (0..n)
+            .map(|index| Target {
+                access: index == 0,
+                declarations: [index; 32],
+            })
+            .collect(),
+        ..prog(code, constants)
+    }
+}
+
+#[test]
+fn a_program_without_targets_addresses_the_primary() {
+    let program = prog(
+        vec![i(1), Op::SelectTarget { target: 0 }, Op::Pop],
+        Vec::new(),
+    );
+    assert_eq!(program.validate(), Ok(()));
+    assert_eq!(program.target_count(), 1);
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    run(&mut vm, &program, &mut host);
+    // Told once at the first step; the selection of the current target adds no call.
+    assert_eq!(host.targets, [0]);
+    assert_eq!(vm.state.target, 0);
+}
+
+#[test]
+fn select_target_out_of_range_is_refused_statically_and_at_run_time() {
+    let code = vec![i(1), Op::SelectTarget { target: 1 }];
+    let program = prog(code.clone(), Vec::new());
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::TargetOutOfRange { pc: 1, target: 1 })
+    );
+    assert_eq!(
+        ProgramError::TargetOutOfRange { pc: 1, target: 1 }.pc(),
+        Some(1)
+    );
+    // Not validated: the VM refuses it before any host call, with the state unchanged. The
+    // first step (`i(1)`) is told to the host; the refused one is not.
+    assert_eq!(
+        expect_vm_error(code.clone(), Vec::new(), 1),
+        VmError::BadTarget(1)
+    );
+    let program = prog(code, Vec::new());
+    let mut vm = Vm::resume(Vm::new(&program).state);
+    vm.step(&program, &mut MockHost::default()).unwrap();
+    let mut host = MockHost::default();
+    assert!(matches!(
+        vm.step(&program, &mut host),
+        Err(StepError::Vm(VmError::BadTarget(1)))
+    ));
+    assert!(host.targets.is_empty());
+    // Two listed targets: 1 is in range, 2 is not.
+    let listed =
+        |target| prog_with_targets(2, vec![Op::SelectTarget { target }], Vec::new()).validate();
+    assert_eq!(listed(1), Ok(()));
+    assert_eq!(
+        listed(2),
+        Err(ProgramError::TargetOutOfRange { pc: 0, target: 2 })
+    );
+}
+
+#[test]
+fn select_target_switches_across_a_jump_and_a_call() {
+    let code = vec![
+        Op::SelectTarget { target: 1 }, // 0
+        Op::Jump(2),
+        Op::SelectTarget { target: 0 }, // 2
+        Op::Call(6),
+        Op::Pop,
+        Op::Jump(9),
+        Op::PushBytes(0), // 6: sub
+        Op::ServiceRequest { service: 0x22 },
+        Op::Ret,
+    ];
+    let program = prog_with_targets(2, code, vec![vec![0xF1, 0x90]]);
+    assert_eq!(program.validate(), Ok(()));
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost {
+        responses: [Ok(vec![0x62])].into(),
+        ..MockHost::default()
+    };
+    let mut seen = Vec::new();
+    loop {
+        let outcome = vm.step(&program, &mut host).unwrap();
+        seen.push(vm.state.target);
+        if outcome == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(host.targets, [0, 1, 0]);
+    // The request went out after the host was told target 0 again.
+    assert_eq!(host.calls.len(), 1);
+    assert_eq!(host.told_after_calls, [0, 0, 0]);
+    assert_eq!(seen[0], 1);
+    assert_eq!(vm.state.target, 0);
+}
+
+#[test]
+fn selecting_the_current_target_tells_the_host_nothing() {
+    let program = prog_with_targets(
+        2,
+        vec![
+            Op::SelectTarget { target: 1 },
+            Op::SelectTarget { target: 1 },
+        ],
+        Vec::new(),
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    run(&mut vm, &program, &mut host);
+    assert_eq!(host.targets, [0, 1]);
+    assert_eq!(vm.state.target, 1);
+    assert_eq!(vm.state.steps, 2);
+}
+
+#[test]
+fn a_restored_state_resumes_on_its_target() {
+    let program = prog_with_targets(
+        2,
+        vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }],
+        vec![vec![0xF1, 0x90]],
+    );
+    let mut state = Vm::new(&program).state;
+    state.target = 1;
+    let bytes = postcard::to_allocvec(&state).unwrap();
+    let restored: VmState = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(restored.target, 1);
+    let mut vm = Vm::resume(restored);
+    let mut host = MockHost {
+        responses: [Ok(vec![0x62])].into(),
+        ..MockHost::default()
+    };
+    vm.step(&program, &mut host).unwrap();
+    vm.step(&program, &mut host).unwrap();
+    // Told once, before the request, and not again.
+    assert_eq!(host.targets, [1]);
+    assert_eq!(host.told_after_calls, [0]);
+    assert_eq!(host.calls.len(), 1);
+}
+
+#[test]
+fn a_state_with_a_target_round_trips_at_every_boundary() {
+    let program = prog_with_targets(
+        2,
+        vec![
+            Op::SelectTarget { target: 1 },
+            i(1),
+            Op::Pop,
+            Op::SelectTarget { target: 0 },
+        ],
+        Vec::new(),
+    );
+    let mut vm = Vm::new(&program);
+    let mut host = MockHost::default();
+    loop {
+        let bytes = postcard::to_allocvec(&vm.state).unwrap();
+        let restored: VmState = postcard::from_bytes(&bytes).unwrap();
+        assert_eq!(restored, vm.state);
+        vm = Vm::resume(restored);
+        if vm.step(&program, &mut host).unwrap() == StepOutcome::Finished {
+            break;
+        }
+    }
+    assert_eq!(vm.state.target, 0);
+    // Every resume tells the host once (four steps), and the two changes add theirs.
+    assert_eq!(host.targets, [0, 1, 1, 1, 1, 0]);
+}
+
+#[test]
+fn restored_target_out_of_range_is_refused() {
+    let two = prog_with_targets(2, vec![i(1)], Vec::new());
+    let none = prog(vec![i(1)], Vec::new());
+    for (program, target) in [(&two, 2u8), (&none, 1u8)] {
+        let state = VmState {
+            target,
+            ..Vm::new(program).state
+        };
+        let before = postcard::to_allocvec(&state).unwrap();
+        let mut vm = Vm::resume(state);
+        let expected = VmError::BadTarget(target);
+        assert_eq!(vm.check_state(program), Err(expected.clone()));
+        assert_eq!(vm.current_op(program), Err(expected.clone()));
+        let mut host = MockHost {
+            forbidden: true,
+            ..MockHost::default()
+        };
+        assert!(matches!(vm.step(program, &mut host), Err(StepError::Vm(ref e)) if *e == expected));
+        assert!(host.targets.is_empty());
+        assert_eq!(postcard::to_allocvec(&vm.state).unwrap(), before);
+    }
+}
+
+#[test]
+fn a_finished_state_tells_the_host_nothing() {
+    let program = prog_with_targets(2, vec![i(1)], Vec::new());
+    let state = VmState {
+        pc: 1,
+        target: 1,
+        ..Vm::new(&program).state
+    };
+    let mut vm = Vm::resume(state);
+    let mut host = MockHost::default();
+    assert_eq!(vm.step(&program, &mut host).unwrap(), StepOutcome::Finished);
+    assert!(host.targets.is_empty());
+}
+
+#[test]
+fn too_many_targets_are_refused() {
+    let at_limit = prog_with_targets(MAX_TARGETS as u8, Vec::new(), Vec::new());
+    assert_eq!(at_limit.validate(), Ok(()));
+    let program = prog_with_targets(MAX_TARGETS as u8 + 1, Vec::new(), Vec::new());
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::TooManyTargets {
+            count: MAX_TARGETS + 1
+        })
+    );
+}
+
+#[test]
+fn duplicate_target_declarations_are_refused() {
+    let mut program = prog_with_targets(3, Vec::new(), Vec::new());
+    program.targets[2].declarations = program.targets[0].declarations;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::DuplicateTargetDeclarations { a: 0, b: 2 })
+    );
 }

@@ -102,6 +102,7 @@ fn program(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 
@@ -1257,4 +1258,12 @@ fn a_built_seed_is_never_zero_and_has_the_declared_length() {
         built_seed_response(0x67, 0x03, Some(6)),
         [0x67, 3, 1, 2, 3, 4, 1, 2]
     );
+}
+
+#[test]
+fn select_target_is_accepted_by_the_dry_run() {
+    let buf = document(vec![], vec![]);
+    let code = vec![Op::SelectTarget { target: 0 }, Op::Wait { millis: 1 }];
+    let report = run(&buf, &program(code, Vec::new()), &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
 }

@@ -1,5 +1,5 @@
 EcuDocumentT {
-    schema_version: 20,
+    schema_version: 21,
     source_format: Some(
         "csv-starlark",
     ),
@@ -2525,7 +2525,7 @@ EcuDocumentT {
     ),
 }
 Program {
-    schema_version: 20,
+    schema_version: 21,
     code: [
         PushBytes(
             0,
@@ -5869,4 +5869,5 @@ Program {
             ),
         },
     ],
+    targets: [],
 }

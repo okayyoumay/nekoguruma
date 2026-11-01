@@ -7154,6 +7154,7 @@ impl<'a> Lowerer<'a> {
             identity: self.requests.identity.clone(),
             preconditions: self.preconditions.clone(),
             flash,
+            targets: Vec::new(),
         };
         (program, spans, origins)
     }

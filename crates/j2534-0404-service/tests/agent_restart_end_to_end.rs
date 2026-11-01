@@ -257,6 +257,7 @@ fn program() -> Program {
         },
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     };
     program.preconditions.voltage_mv = Some(Precondition {
         satisfied: Satisfied {

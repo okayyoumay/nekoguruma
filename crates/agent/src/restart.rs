@@ -2144,6 +2144,7 @@ mod tests {
                 version_read_retries: 0,
                 no_application: None,
             }],
+            targets: Vec::new(),
         }
     }
 
@@ -4079,6 +4080,7 @@ def main():
             },
             preconditions: Default::default(),
             flash: Vec::new(),
+            targets: Vec::new(),
         }
     }
 

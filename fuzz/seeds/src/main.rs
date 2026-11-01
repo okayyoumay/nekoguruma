@@ -103,6 +103,7 @@ fn main() {
             identity: Default::default(),
             preconditions: Default::default(),
             flash: Vec::new(),
+            targets: Vec::new(),
         };
         let state = Vm::new(&program).state;
         let bytes = postcard::to_allocvec(&(&program, &state)).expect("a program encodes");

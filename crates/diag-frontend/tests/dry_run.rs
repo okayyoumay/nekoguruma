@@ -98,6 +98,7 @@ fn bare_program(code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 

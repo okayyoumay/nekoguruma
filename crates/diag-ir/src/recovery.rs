@@ -8,7 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, Op, Program};
+use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, MAX_TARGETS, Op, Program};
 
 // ---------------------------------------------------------------- Sources
 
@@ -375,6 +375,14 @@ pub enum ProgramError {
         "flash session {flash_session}: stage {stage} is reserved for the plain procedure's resume count"
     )]
     ReservedStage { flash_session: u32, stage: u32 },
+    #[error("the program lists {count} targets, more than {MAX_TARGETS} (ADR-325 item 1)")]
+    TooManyTargets { count: usize },
+    #[error(
+        "instruction {pc}: target {target} is not in the program's target list (ADR-325 item 3)"
+    )]
+    TargetOutOfRange { pc: u32, target: u8 },
+    #[error("targets {a} and {b} have the same declaration hash (ADR-325 item 1)")]
+    DuplicateTargetDeclarations { a: usize, b: usize },
 }
 
 impl ProgramError {
@@ -396,7 +404,8 @@ impl ProgramError {
             | Self::UndeclaredTransferBoundary { pc, .. }
             | Self::TransferBeforeRequestDownload { pc, .. }
             | Self::TransferInterrupted { pc, .. }
-            | Self::PlanInSubroutine { pc, .. } => Some(*pc),
+            | Self::PlanInSubroutine { pc, .. }
+            | Self::TargetOutOfRange { pc, .. } => Some(*pc),
             Self::TooManyFlashRecoveries { .. }
             | Self::BoundaryOutOfOrder { .. }
             | Self::DuplicateFlashSession(_)
@@ -416,7 +425,9 @@ impl ProgramError {
             | Self::ZeroResumeLimit { .. }
             | Self::InvalidSection { .. }
             | Self::MissingRequestDownload { .. }
-            | Self::ReservedStage { .. } => None,
+            | Self::ReservedStage { .. }
+            | Self::TooManyTargets { .. }
+            | Self::DuplicateTargetDeclarations { .. } => None,
         }
     }
 }
@@ -479,6 +490,20 @@ impl Program {
                 count: self.flash.len(),
             });
         }
+        // The target list's shape (ADR-325 items 1 and 3, ADR-409).
+        if self.targets.len() > MAX_TARGETS {
+            return Err(ProgramError::TooManyTargets {
+                count: self.targets.len(),
+            });
+        }
+        for (b, target) in self.targets.iter().enumerate() {
+            if let Some(a) = self.targets[..b]
+                .iter()
+                .position(|other| other.declarations == target.declarations)
+            {
+                return Err(ProgramError::DuplicateTargetDeclarations { a, b });
+            }
+        }
         // The code of a declared failure is a constant the dry run can check (ADR-280).
         for (pc, op) in self.code.iter().enumerate() {
             if let Op::Fail { code } = op
@@ -489,6 +514,14 @@ impl Program {
                     .is_some_and(|text| (1..=MAX_FAILURE_CODE_LEN).contains(&text.len()))
             {
                 return Err(ProgramError::BadFailureCode { pc: pc as u32 });
+            }
+            if let Op::SelectTarget { target } = op
+                && usize::from(*target) >= self.target_count()
+            {
+                return Err(ProgramError::TargetOutOfRange {
+                    pc: pc as u32,
+                    target: *target,
+                });
             }
             // A form template decodes and has the shape its instruction takes (ADR-340 item 2).
             if let Op::HmiRequest { form: index }

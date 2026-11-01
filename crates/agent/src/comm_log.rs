@@ -1313,6 +1313,7 @@ pub(crate) fn error_outcome_name(error: &JobError) -> &'static str {
         JobError::StepLimit(_) => "StepLimit",
         JobError::Refused { .. } => "Refused",
         JobError::Cancelled => "Cancelled",
+        JobError::SeveralTargets { .. } => "SeveralTargets",
         JobError::Journal(_) => "Journal",
         JobError::IdentityUnreadable { .. } => "IdentityUnreadable",
         JobError::IdentityRead { .. } => "IdentityRead",
@@ -6608,6 +6609,7 @@ mod tests {
                 globals: Vec::new(),
                 call_stack: Vec::new(),
                 steps: 0,
+                target: 0,
             })),
             "ok"
         );

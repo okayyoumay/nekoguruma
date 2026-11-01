@@ -30,8 +30,9 @@ the user named, if any.
      its real priority back plus a `Blocked on:` clause; a resolved blocker
      is removed, and the item's priority is judged again against the current
      milestone. A P2 item whose clause names something the current milestone
-     cannot unblock (a later milestone's work, something outside the project)
-     stays P2: that is milestone membership, not a lowering (ADR-407). An item another item is blocked on goes up to the highest
+     cannot unblock (a later milestone's work, something outside the project),
+     or that the maintainer moved out of the milestone, stays P2: that is
+     milestone membership, not a lowering (ADR-407). An item another item is blocked on goes up to the highest
      priority of the items it blocks (`work/README.md`, ADR-388).
    - **Vague**: add "Done when" and the paths or sections it concerns.
    - **Keep**: no change.

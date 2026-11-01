@@ -1,7 +1,7 @@
 # ADR-399: The Identification Job Reads the VIN, Establishes It on Agreement and Takes the Vehicle's Lock
 
 **Date:** 2026-10-31
-**Status:** Accepted
+**Status:** Accepted (item 4's report with no lock now ends the run in `LinkUnconfirmed` when an ECU read remains, by ADR-401)
 **Affects:** `agent` (`identification`: `check_plan`, `PlanRefused::VinSource`, the VIN phase of
 `run_identification`, the report; `inputs`: `vin_source_field`, `field_bytes_of`; `runner`:
 `promote_to_vehicle`), `crates/agent/docs/ngr-agent.md`, design 8.8.2, `docs/glossary.md`;
@@ -56,7 +56,9 @@ definitions are separate steps.
    The promotion first does what every open does (`settle_before_open`: the cancel, the worker
    found exited with the guards' mark cleared, the mark judged, ADR-394), since the last close
    may have failed with the worker. Guards still marked after it take no lock: the VIN stays
-   established and reported, `vehicle_lock_held` is false and the mark stays (ADR-258).
+   established and reported, `vehicle_lock_held` is false and the mark stays (ADR-258). ADR-401
+   amends this: when an ECU read remains to open, the run then ends in
+   `JobError::LinkUnconfirmed` instead of returning the report.
    When another job holds the vehicle the run waits until the holder lets go, or until the
    cancel (design 8.8.1), with no VCI link open. The report says whether the lock is held; the
    caller's guards release it when they are dropped.

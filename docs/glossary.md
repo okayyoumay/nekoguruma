@@ -193,6 +193,12 @@ A bus and a functional identifier that the declared links of an identification p
 **VIN read** (ADR-399)  
 One read of the VIN by an identification job: one endpoint, the declared link's ComParams other than the timings and one request, shared by every VIN rule source that names them, whose single response is decoded with the declaration of each source. A read is accepted when every declaration decodes it to the same well-formed VIN; the job establishes the VIN when at least one read is accepted and every accepted read gives the same one, and an established VIN takes the per-vehicle lock. Each source's outcome (decoded, not well-formed, undecodable, negative, no answer, link refused, not read) is part of the job's report.
 
+**ECU read** (ADR-401)  
+One read of an ECU definition by an identification job: a definition at one endpoint, its variants grouped by the declared link's ComParams other than the timings, one link per group and each distinct identification request sent once, its response decoded with every (document, service) declaration that shares it. Every variant that matches is reported. A read is conclusive only when every declaration decoded a positive response and no variant of the definition has a link ADR-324 refuses; no negative response is definitive until the IR declares which are. A variant whose link is refused is reported as a read with no endpoint.
+
+**Entry state** (ADR-326 item 3, ADR-327, ADR-401)  
+How a candidate's ECU entry stands after the reads of its alternatives: identified (one alternative has a matching variant), ambiguous (several do), unrecognized variant (an endpoint answered and every read there was conclusive without a match), answered but not identified (an endpoint answered but a read there was inconclusive), not answering (a mandatory entry whose requests got no answer), not fitted (the same for an optional entry) and not read (no request was sent for it).
+
 **ISO 15765-2** (ISO-TP)  
 Transport protocol that provides segmentation and reassembly of large diagnostic messages over CAN. Used by most modern OBD-II and UDS diagnostics.
 

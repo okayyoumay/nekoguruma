@@ -1,7 +1,7 @@
 # ADR-326: Vehicle Definitions for Model Identification and Topology
 
 **Date:** 2026-10-18
-**Status:** Accepted (items 2, 3 and 5 and the Consequences amended by ADR-327: a VIN matching rule, and a read-field matching rule, names the service and field its value is read from as one variant document declares them, and an identified variant that contradicts a candidate's topology is a vehicle-derived value for the candidates and the scope check; when several alternatives of an entry match, the entry is ambiguous and the operator chooses; the agent runs identification from a signed plan and guards jobs that change an ECU, so its variant identification and runtime, the IR (variant attributes, definitive negative responses) and the signed job inputs change; the Consequences' unchanged IR schema also amended by ADR-363: every document carries its ECU definition's identifier)
+**Status:** Accepted (items 2, 3 and 5 and the Consequences amended by ADR-327: a VIN matching rule, and a read-field matching rule, names the service and field its value is read from as one variant document declares them, and an identified variant that contradicts a candidate's topology is a vehicle-derived value for the candidates and the scope check; when several alternatives of an entry match, the entry is ambiguous and the operator chooses; the agent runs identification from a signed plan and guards jobs that change an ECU, so its variant identification and runtime, the IR (variant attributes, definitive negative responses) and the signed job inputs change; the Consequences' unchanged IR schema also amended by ADR-363: every document carries its ECU definition's identifier; item 3 gains a not-read entry state by ADR-401: no request was sent for the entry, which "not answering" would misreport as an absent ECU)
 **Affects:** design 8.1 (L3), 8.3 (ODX subset), 8.8.2 (new), 9.2; `diag-frontend` (a new
 definition kind), `server` (identification, catalog, prefetch), `db/migrations/`
 (`operator_roles.scope`), `schemas/record-template.schema.json` (`appliesTo.models`),
@@ -65,7 +65,8 @@ ODX subset (8.3) neither includes nor excludes it.
    request but no variant matched, the entry is reported as an unrecognized variant (the same
    case as the `VARIANT_MISMATCH` failure), so an installed but unsupported ECU is never hidden
    as absent; only when no identification request was answered is a mandatory entry reported as
-   not answering and an optional one as not fitted. An entry may name the entry of the gateway it is reached through; the gateway
+   not answering and an optional one as not fitted (ADR-401 adds a not-read state for an entry for which
+   no request was sent). An entry may name the entry of the gateway it is reached through; the gateway
    relation is acyclic and every gateway named is an entry of the same definition.
 4. **Link parameters stay with the ECU definition.** How an ECU is reached (protocol, pins,
    identifiers, baud rate, ComParams) is its definition's declared protocol (ADR-324); a vehicle

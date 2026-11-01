@@ -2,7 +2,7 @@
 
 `ngr-agent` is the binary of the `agent` crate (design 3.3). It has two commands, for local
 end-to-end runs and tests: `run` runs the procedure of a variant's document on a VCI, and
-`identify` runs an identification plan's functional presence requests and VIN reads (below). It
+`identify` runs an identification plan's functional presence requests, VIN reads and ECU reads (below). It
 does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
@@ -143,8 +143,9 @@ The worker's own log goes to stderr.
 ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]... [--api <j2534|dpdu>] [--workers <dir>] [--locks <dir>] [--comm-log <dir>]
 ```
 
-Runs the functional presence requests of an identification plan and then reads the VIN its VIN
-rules name (`run_identification`, ADR-396, ADR-399; design 8.8.2) and prints the report. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
+Runs the functional presence requests of an identification plan, then reads the VIN its VIN
+rules name, then reads each ECU definition it names (`run_identification`, ADR-396, ADR-399,
+ADR-401; design 8.8.2) and prints the report. `--vci`, `--api`, `--mode`, `--workers`, `--locks` and
 `--comm-log` mean what they mean for `run`, and both commands run their job in one shell
 (`run_on_vci`, ADR-397): the communication log's setup, the guards, the worker's launch, its
 source with the slot, the report of the log's path, and the worker's stop with the guards'
@@ -158,16 +159,16 @@ release. The differences:
 
 The plan and the documents are read and checked (`load_plan`, `check_plan`) before the log
 directory is made, a lock is taken or a worker starts. The job takes the per-VCI lock
-(`JobGuards::take_vci_only`), since it sends only the presence request and read-only VIN
-requests, and the lock of the vehicle whose VIN it established (below, ADR-399); it keeps a
+(`JobGuards::take_vci_only`), since it sends only the presence request and read-only requests
+(the VIN and the ECU definitions' identification requests), and the lock of the vehicle whose VIN it established (below, ADR-399); it keeps a
 communication log only when `--comm-log` is given. The log's header names the job as an
 identification job and carries the plan's SHA-256 (`job.plan_sha256`); `vci_connected` names the
 API and the width as a procedure's does.
 
 | Exit status | Meaning | Output |
 |---|---|---|
-| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established) |
-| 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout); or the worker may still hold the VCI after a failed link close | The reason on stderr |
+| 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, and the ECU reads and entry states, ADR-401) |
+| 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
 
 ## Operational log
@@ -1484,8 +1485,8 @@ restart's own checks read the same sources and still treat any non-integer readi
 ## The identification plan
 
 The `identification` module (design 8.8.2, ADR-327, ADR-395) loads and checks the plan of an
-identification job, derives its endpoints and sends its functional presence requests
-(`run_identification`, ADR-396). `ngr-agent identify` runs it; the server does not yet.
+identification job, derives its endpoints, sends its functional presence requests, reads the VIN
+and reads the ECU definitions (`run_identification`, ADR-396, ADR-399, ADR-401). `ngr-agent identify` runs it; the server does not yet.
 
 - `load_plan(plan_bytes, supplied)` decodes the plan (`diag_ir::plan::IdentificationPlan`, a
   postcard struct with its own schema version; a chosen-definition plan holds one candidate and
@@ -1500,7 +1501,10 @@ identification job, derives its endpoints and sends its functional presence requ
   `ServiceSources::from_document` uses for the VIN role too); one resource at two baud
   rates; a functional identifier wider than 11 bits or equal to a physical identifier of the bus;
   and declared links of one presence group (bus and functional identifier) that differ in a
-  ComParam other than the listed timings (ADR-395 item 6), which are not compared. A declared link that ADR-324 refuses is reported, not
+  ComParam other than the listed timings (ADR-395 item 6), which are not compared; and a pattern
+  service whose identification request cannot be built without values
+  (`PlanRefused::IdentificationRequest`, through `diag_ir::identify::identification_requests`).
+  A declared link that ADR-324 refuses is reported, not
   refused. `load_plan` also refuses the structural errors listed in ADR-395 item 3.
 - `CheckedPlan::report` derives the `IdentificationReport`: the plan's selection (candidates, a definition chosen by
   hand, or every ECU; only the first narrows), the candidate ids, one entry per
@@ -1508,7 +1512,8 @@ identification job, derives its endpoints and sends its functional presence requ
   (bus and functional identifier) with the group's largest value of each listed timing (P2 among them), the buses that have no group, the
   documents whose link is refused, an empty presence section, and the VIN reads with every source
   `NotRead` (`LinkRefused` for a source whose document's link ADR-324 refuses) and every VIN rule
-  unevaluated.
+  unevaluated, the ECU reads with every declaration `NotRead` (`LinkRefused` for a refused
+  document) and every entry `NotRead`.
 - `run_identification(source, plan, limits, guards, comm_log, vci, cancel)` sends one functional
   presence request (`3E 00`) per presence group, one link at a time, under the per-VCI lock
   (`JobGuards::take_vci_only`), and fills the report's presence section: the answers as bus,
@@ -1566,9 +1571,40 @@ identification job, derives its endpoints and sends its functional presence requ
     release it. Before the promotion the run settles the worker as every open does
     (`settle_before_open`): a worker that exited during the last close is found and the guards'
     mark cleared; guards still marked take no lock, and the report comes back with the VIN and
-    `vehicle_lock_held` false (ADR-258). The VIN is in the report and the communication log only, never in the
+    `vehicle_lock_held` false (ADR-258) when no ECU read remains to open, else the run ends in
+    `JobError::LinkUnconfirmed` as the first ECU link would open (ADR-401). The VIN is in the report and the communication log only, never in the
     operational log. `IdentificationReport` holds the VINs as `journal::Vin`, whose `Debug`
     hides them.
+  - The ECU phase (ADR-401) runs after the promotion, with the vehicle's lock held when a VIN
+    was established, unless the presence or VIN phase was interrupted (then
+    `ecu_reads_interrupted` is set when some read would have opened a link and every declaration
+    stays `NotRead`). `check_plan` derives the reads before any link opens: one `EcuReadPlan` per
+    definition and endpoint, in plan order, whose variants are grouped by the ComParams other
+    than the timings into `LinkGroup`s (`raise_timings` gives the group's link the largest
+    timings), each holding its distinct identification requests
+    (`diag_ir::identify::identification_requests`) with the (document, service) declarations that
+    share the bytes. The documents whose link ADR-324 refuses form a read with `endpoint` null and
+    a group with no link, and make their definition inconclusive at every endpoint. A group
+    opens its link (`open_part`), sends each request once with the origin `identification`
+    (`repeat_within_bounds`, as the VIN read does), decodes the one response with every
+    declaration (`inputs::negative_code`, then `diag_ir::identify::decode_identification_answer`),
+    closes the link, and each variant is judged with `diag_ir::decode::variant_matches`, so every
+    match is reported. A declaration is `Decoded` (the fields), `Undecodable`, `Negative` (not
+    sent again), `NoUsableAnswer`, `LinkRefused`, `WorkerRefused` or `NotRead`; bounds that run
+    out leave the read and the rest `NotRead` and set `ecu_reads_interrupted`. A read is
+    `conclusive` when it has a declaration, all `Decoded`, and its definition has no refused
+    variant (no negative response is definitive yet), and `answered` when a declaration got a
+    response. `evaluate_entries` then sets each entry's state from the reads of its alternatives
+    (every entry stays `NotRead` when the phase was interrupted, and an entry with an
+    alternative that had no physical read, all `NotRead` or `WorkerRefused`, is `NotRead`, an
+    alternative with no declaration (no pattern) is left out, and an entry with none left is `NotRead`; a
+    refused-link alternative is an inconclusive read):
+    `Identified` (one alternative with a matching variant), `Ambiguous` (two or more),
+    `UnrecognizedVariant` (the answered endpoints, every read there conclusive),
+    `AnsweredNotIdentified` (an answered endpoint with an inconclusive read), `NotAnswering` or
+    `NotFitted` (requests sent, nothing answered) or `NotRead` (none sent). The JSON uses serde's
+    default names; field values are the agent's `FieldValue`, with bytes and hashes as lowercase
+    hex. Nothing is narrowed and no definition skipped.
 
 The bus is the link's protocol short name and bus type with its baud rate (ADR-319); two
 spellings of UDS on CAN that ADR-324 item 2 accepts are one bus.

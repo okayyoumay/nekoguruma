@@ -16,7 +16,10 @@ use vci_service_interface::{
 };
 use worker_host::client::WorkerClient;
 
-use super::tests::{checked, checked_vin, document, document_reading, named};
+use super::tests::{
+    checked, checked_vin, checked_vin_reading, document, document_reading, ecu_plan, ecu_plan_of,
+    edited, identified_by, named,
+};
 use super::*;
 use crate::comm_log::{CommLogSetup, VciFacts};
 use crate::guards::GuardSetup;
@@ -1954,6 +1957,11 @@ struct Waiting {
 }
 
 async fn waiting_for_the_vehicle() -> Waiting {
+    waiting_for_the_vehicle_with(reading_all(&[reader(0x90, A)])).await
+}
+
+/// [`waiting_for_the_vehicle`] for `plan`, which reads the VIN of the document on `A`.
+async fn waiting_for_the_vehicle_with(plan: CheckedPlan) -> Waiting {
     let dir = tempfile::tempdir().unwrap();
     let never = AtomicBool::new(false);
     let poll = Duration::from_millis(1);
@@ -1970,7 +1978,7 @@ async fn waiting_for_the_vehicle() -> Waiting {
     let fake = fake_with(&[(A.0, VIN_A)]);
     let cancel = Arc::new(AtomicBool::new(false));
     let task = tokio::spawn(run_shared(
-        reading_all(&[reader(0x90, A)]),
+        plan,
         fake.clone(),
         limits(),
         Arc::clone(&cancel),
@@ -2136,12 +2144,22 @@ impl WorkerSource for ExitsWhenTheCloseHangs {
 }
 
 /// Runs a plan reading one VIN where the close of the read's link (the second disconnect) hangs,
-/// so the guards are marked, on a source `build` makes from the worker and the fake.
+/// so the guards are marked, on a source `build` makes from the worker and the fake. The
+/// document on `A` is read at the VIN's data identifier.
 async fn run_with_the_last_close_hanging<S: WorkerSource>(
     build: impl FnOnce(WorkerClient, Fake) -> S,
 ) -> IdentificationRun {
+    run_with_the_last_close_hanging_plan(reading_all(&[reader(0x90, A)]), 2, build).await
+}
+
+/// [`run_with_the_last_close_hanging`] over `plan`, where the `hang_at`-th disconnect hangs.
+async fn run_with_the_last_close_hanging_plan<S: WorkerSource>(
+    plan: CheckedPlan,
+    hang_at: usize,
+    build: impl FnOnce(WorkerClient, Fake) -> S,
+) -> IdentificationRun {
     let fake = fake_with(&[(A.0, VIN_A)]);
-    fake.state().hang_disconnect_at = Some(2);
+    fake.state().hang_disconnect_at = Some(hang_at);
     let dir = tempfile::tempdir().unwrap();
     let guards = JobGuards::take_vci_only(
         &GuardSetup {
@@ -2155,7 +2173,7 @@ async fn run_with_the_last_close_hanging<S: WorkerSource>(
     let source = build(serve(fake.clone()).await, fake);
     run_identification(
         source,
-        reading_all(&[reader(0x90, A)]),
+        plan,
         limits(),
         guards,
         None,
@@ -2182,9 +2200,9 @@ async fn a_worker_that_exited_in_the_last_close_does_not_keep_the_lock_from_the_
     assert!(!run.guards.link_unconfirmed());
 }
 
-/// ADR-399 item 4 and ADR-258: a live worker whose close of the last VIN link failed leaves the
-/// guards marked; the VIN stays established and reported, no lock is taken and the report comes
-/// back with the mark kept.
+/// ADR-399 item 4 (as ADR-401 amends it) and ADR-258: a live worker whose close of the last VIN
+/// link failed leaves the guards marked; with no ECU read left to open, the VIN stays established
+/// and reported, no lock is taken and the report comes back with the mark kept.
 #[tokio::test(flavor = "multi_thread")]
 async fn guards_still_marked_after_the_last_close_take_no_vehicle_lock() {
     let run = run_with_the_last_close_hanging(|worker, _| {
@@ -2199,4 +2217,736 @@ async fn guards_still_marked_after_the_last_close_take_no_vehicle_lock() {
     assert!(!report.vehicle_lock_held() && !run.guards.holds_vehicle());
     assert!(run.guards.link_unconfirmed(), "the mark stays");
     assert_eq!(report.vin_rules()[0].outcome, VinRuleOutcome::Matched);
+    assert!(!report.ecu_reads_interrupted());
+}
+
+/// ADR-401 (amending ADR-399 item 4) and ADR-396 item 6: guards still marked after the VIN's last
+/// close, with an ECU read to open, end the run in `LinkUnconfirmed` before any ECU link opens;
+/// the mark stays.
+#[tokio::test(flavor = "multi_thread")]
+async fn guards_still_marked_after_the_last_close_end_the_run_before_an_ecu_read() {
+    let documents = [reader(0x90, A)];
+    let plan = checked_vin_reading(&documents, Selection::Candidates, &[(0, 1, 1, "W")]).unwrap();
+    let fake_ref = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&fake_ref);
+    let run = run_with_the_last_close_hanging_plan(plan, 2, move |worker, fake| {
+        *seen.lock().unwrap() = Some(fake);
+        ExitsOnce(worker, Arc::new(Mutex::new(0)), 0, false)
+    })
+    .await;
+    assert!(
+        matches!(run.result, Err(JobError::LinkUnconfirmed)),
+        "{:?}",
+        run.result
+    );
+    assert!(run.guards.link_unconfirmed() && !run.guards.holds_vehicle());
+    let fake = fake_ref.lock().unwrap().take().unwrap();
+    assert_eq!(
+        fake.count("ModuleConnect"),
+        2,
+        "the presence link and the VIN read, no ECU link"
+    );
+    assert_eq!(fake.state().served.len(), 1, "only the VIN request");
+}
+
+// ---------------------------------------------------------------- The ECU reads (ADR-401)
+
+const PART_NUMBER: &str = "PA123";
+const SW_VERSION: &str = "SW123";
+
+/// A fake whose physical primitives are answered by simulated ECUs, one per request identifier,
+/// each with its part number (F187) and software version (F189).
+fn fake_ecus(ecus: &[(u32, &str, &str)]) -> Fake {
+    let fake = Fake::default();
+    for &(tx, part_number, sw_version) in ecus {
+        fake.state().ecus.insert(
+            tx,
+            sim_ecu::SimEcu::new(sim_ecu::EcuConfig {
+                part_number: part_number.to_owned(),
+                sw_version: sw_version.to_owned(),
+                ..Default::default()
+            }),
+        );
+    }
+    fake
+}
+
+/// A document on `endpoint` whose variant `name` reads F187 and expects a part number starting
+/// with `expected`.
+fn part_reader(name: &str, expected: &[u8], endpoint: (u32, u32)) -> (Sha256, Vec<u8>) {
+    identified_by(0x87, 11, expected, name, endpoint, |_| {})
+}
+
+const ENGINE: &[(&str, bool, &[&str])] = &[("engine", false, &["D"])];
+
+/// The identification requests the ECUs were given, as `(request identifier, request)`.
+fn served(fake: &Fake) -> Vec<(u32, Vec<u8>)> {
+    fake.state().served.clone()
+}
+
+fn declarations(report: &IdentificationReport, read: usize) -> Vec<&RequestOutcome> {
+    report.ecu_reads()[read]
+        .requests
+        .iter()
+        .flat_map(|request| &request.declarations)
+        .map(|declaration| &declaration.outcome)
+        .collect()
+}
+
+fn text(value: &str) -> RequestOutcome {
+    RequestOutcome::Decoded(vec![IdentificationField {
+        id: 1,
+        short_name: "value".into(),
+        value: FieldValue::Text(value.to_owned()),
+    }])
+}
+
+fn sorted(mut hashes: Vec<Sha256>) -> Vec<Sha256> {
+    hashes.sort();
+    hashes
+}
+
+/// ADR-401 item 2: two variants of one definition on one link that both match the ECU's answer
+/// send one request, whose one response both declarations decode; every match is reported, the
+/// read is conclusive and the entry identified with both variants.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_matching_variants_are_reported_in_full_from_one_request() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"PA", A)];
+    let plan = ecu_plan(&documents, &[("D", &[0, 1])], &[("c1", ENGINE)]);
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake), [(A.0, vec![0x22, 0xF1, 0x87])]);
+    let read = &report.ecu_reads()[0];
+    assert_eq!(report.ecu_reads().len(), 1);
+    assert_eq!(read.requests.len(), 1);
+    assert_eq!(
+        declarations(report, 0),
+        [&text("PA123      "), &text("PA123      ")]
+    );
+    assert_eq!(
+        sorted(read.matching.clone()),
+        sorted(vec![documents[0].0, documents[1].0])
+    );
+    assert!(read.conclusive && read.answered && !report.ecu_reads_interrupted());
+    let EntryState::Identified {
+        definition,
+        variants,
+    } = &report.entries()[0].state
+    else {
+        panic!("{:?}", report.entries());
+    };
+    assert_eq!(definition, "D");
+    assert_eq!(
+        sorted(variants.clone()),
+        sorted(vec![documents[0].0, documents[1].0])
+    );
+    assert_eq!(origins(&ran), ["identification", "identification"]);
+}
+
+/// ADR-401 item 1: variants of one definition on two declared links are each identified on their
+/// own link, one link open at a time, in plan order.
+#[tokio::test(flavor = "multi_thread")]
+async fn variants_on_two_declared_links_are_each_identified_on_their_own_link() {
+    let documents = [part_reader("v1", b"PA", A), part_reader("v2", b"PB", B)];
+    let plan = ecu_plan(&documents, &[("D", &[0, 1])], &[("c1", ENGINE)]);
+    let fake = fake_ecus(&[(A.0, "PA1", SW_VERSION), (B.0, "PB1", SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(
+        served(&fake),
+        [(A.0, vec![0x22, 0xF1, 0x87]), (B.0, vec![0x22, 0xF1, 0x87])]
+    );
+    assert_eq!(report.ecu_reads().len(), 2);
+    assert_eq!(report.ecu_reads()[0].matching, [documents[0].0]);
+    assert_eq!(report.ecu_reads()[1].matching, [documents[1].0]);
+    assert_eq!(
+        fake.count("ModuleConnect"),
+        3,
+        "the presence link and two reads"
+    );
+    assert_eq!(fake.state().max_open_links, 1);
+    assert_eq!(
+        report.entries()[0].state,
+        EntryState::Identified {
+            definition: "D".into(),
+            variants: vec![documents[0].0, documents[1].0]
+        }
+    );
+}
+
+/// ADR-401 item 4 and ADR-324: a variant whose declared link is refused leaves its definition
+/// inconclusive at every endpoint, reported as a read with no endpoint; the entry is answered but
+/// not identified, and a match is still a match.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_variant_whose_link_is_refused_leaves_its_definition_inconclusive() {
+    let refused = identified_by(0x87, 11, b"P", "v2", B, |p| p.extended_addressing = true);
+    for (expected, identified) in [(b"Q", false), (b"P", true)] {
+        let documents = [part_reader("v1", expected, A), refused.clone()];
+        let plan = ecu_plan(&documents, &[("D", &[0, 1])], &[("c1", ENGINE)]);
+        let fake = fake_ecus(&[
+            (A.0, PART_NUMBER, SW_VERSION),
+            (B.0, PART_NUMBER, SW_VERSION),
+        ]);
+        let ran = run(plan, fake.clone()).await;
+        let report = ran.report();
+        assert_eq!(report.ecu_reads().len(), 2);
+        assert_eq!(declarations(report, 0), [&text("PA123      ")]);
+        assert!(!report.ecu_reads()[0].conclusive);
+        assert_eq!(report.ecu_reads()[1].endpoint, None);
+        assert_eq!(declarations(report, 1), [&RequestOutcome::LinkRefused]);
+        assert_eq!(
+            served(&fake),
+            [(A.0, vec![0x22, 0xF1, 0x87])],
+            "no link for the refused one"
+        );
+        match (&report.entries()[0].state, identified) {
+            (EntryState::Identified { variants, .. }, true) => {
+                assert_eq!(variants, &[documents[0].0]);
+            }
+            (EntryState::AnsweredNotIdentified, false) => {}
+            (state, _) => panic!("{state:?}"),
+        }
+    }
+}
+
+/// ADR-327 item 3 and ADR-401: two alternatives of one entry that both match make it ambiguous,
+/// and both definitions are read.
+#[tokio::test(flavor = "multi_thread")]
+async fn two_matching_alternatives_make_the_entry_ambiguous() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"PA", A)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", false, &["D1", "D2"])])],
+    );
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(served(&fake).len(), 2, "neither definition is skipped");
+    assert_eq!(report.ecu_reads()[0].matching, [documents[0].0]);
+    assert_eq!(report.ecu_reads()[1].matching, [documents[1].0]);
+    assert_eq!(
+        report.entries()[0].state,
+        EntryState::Ambiguous {
+            definitions: vec!["D1".into(), "D2".into()]
+        }
+    );
+}
+
+/// ADR-327 item 3 and ADR-401: a negative response is inconclusive (not resent), so an entry read
+/// only so is answered but not identified.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_entry_read_inconclusively_is_answered_but_not_identified() {
+    // The simulated ECU has no data identifier F1A0 and answers a request-out-of-range code.
+    let documents = [identified_by(0xA0, 4, b"P", "v1", A, |_| {})];
+    let plan = ecu_plan(&documents, &[("D", &[0])], &[("c1", ENGINE)]);
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&RequestOutcome::Negative(0x31)]);
+    let read = &report.ecu_reads()[0];
+    assert!(read.answered && !read.conclusive && read.matching.is_empty());
+    assert_eq!(
+        served(&fake).len(),
+        1,
+        "a negative response is not sent again"
+    );
+    assert!(!origins(&ran).contains(&"repeat"));
+    assert_eq!(report.entries()[0].state, EntryState::AnsweredNotIdentified);
+}
+
+/// ADR-327 item 3: a conclusive read without a match is an unrecognized variant at the endpoint.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_conclusive_read_without_a_match_is_an_unrecognized_variant() {
+    let documents = [part_reader("v1", b"Q", A)];
+    let plan = ecu_plan(&documents, &[("D", &[0])], &[("c1", ENGINE)]);
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&text("PA123      ")]);
+    assert!(report.ecu_reads()[0].conclusive && report.ecu_reads()[0].matching.is_empty());
+    let EntryState::UnrecognizedVariant { endpoints } = &report.entries()[0].state else {
+        panic!("{:?}", report.entries());
+    };
+    assert_eq!(endpoints.len(), 1);
+    assert_eq!((endpoints[0].tx_id, endpoints[0].rx_id), A);
+}
+
+/// ADR-326 item 3 and ADR-392: a definition read at an address nothing answers is sent again
+/// within the repeats and reported as no usable answer: not answering for a mandatory entry, not
+/// fitted for an optional one.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_unanswered_entry_is_not_answering_or_not_fitted() {
+    let documents = [part_reader("v1", b"P", C)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D", &[0])],
+        &[
+            ("c1", &[("engine", false, &["D"])]),
+            ("c2", &[("engine", true, &["D"])]),
+        ],
+    );
+    let ran = run(plan, Fake::default()).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&RequestOutcome::NoUsableAnswer]);
+    assert!(!report.ecu_reads()[0].answered);
+    assert_eq!(report.entries()[0].state, EntryState::NotAnswering);
+    assert_eq!(report.entries()[1].state, EntryState::NotFitted);
+    let repeats = usize::from(limits().max_primitive_repeats);
+    let mut expected = vec!["identification", "identification"];
+    expected.extend(vec!["repeat"; repeats]);
+    assert_eq!(origins(&ran), expected);
+}
+
+/// ADR-327 item 8 and ADR-401: a plan for a definition chosen by hand reads every definition it
+/// names, and reports its entries as any plan does.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_manual_plan_reads_every_definition() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"Q", B)];
+    let plan = ecu_plan_of(
+        Selection::ChosenDefinition,
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("one", false, &["D1"]), ("two", false, &["D2"])])],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.selection(), Selection::ChosenDefinition);
+    assert_eq!(report.candidates(), ["c1"]);
+    assert_eq!(served(&fake).len(), 2);
+    assert!(matches!(
+        &report.entries()[0].state,
+        EntryState::Identified { definition, .. } if definition == "D1"
+    ));
+    assert!(matches!(
+        &report.entries()[1].state,
+        EntryState::UnrecognizedVariant { .. }
+    ));
+}
+
+/// ADR-327 item 8 and ADR-401: a plan for every ECU has no entries and identifies each definition
+/// on its own, in the plan's order.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_plan_for_every_ecu_identifies_each_definition_in_plan_order() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
+    let plan = ecu_plan(&documents, &[("D2", &[1]), ("D1", &[0])], &[]);
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.selection(), Selection::EveryEcu);
+    assert!(report.entries().is_empty());
+    assert_eq!(
+        served(&fake).iter().map(|(tx, _)| *tx).collect::<Vec<_>>(),
+        [B.0, A.0]
+    );
+    let definitions: Vec<_> = report
+        .ecu_reads()
+        .iter()
+        .map(|r| r.definition.as_str())
+        .collect();
+    assert_eq!(definitions, ["D2", "D1"]);
+    assert!(
+        report
+            .ecu_reads()
+            .iter()
+            .all(|read| read.matching.len() == 1)
+    );
+}
+
+/// ADR-327 item 3: a positive response that does not decode (here a longer field than the ECU
+/// sends) is answered, undecodable and inconclusive.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_positive_response_that_does_not_decode_is_undecodable_and_inconclusive() {
+    let documents = [identified_by(0x89, 17, b"S", "v1", A, |_| {})];
+    let plan = ecu_plan(&documents, &[("D", &[0])], &[("c1", ENGINE)]);
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&RequestOutcome::Undecodable]);
+    let read = &report.ecu_reads()[0];
+    assert!(read.answered && !read.conclusive);
+    assert_eq!(report.entries()[0].state, EntryState::AnsweredNotIdentified);
+}
+
+/// ADR-393 and ADR-401: a VCI lost during an ECU read opens the link again and sends the request
+/// again with the origin `repeat`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_vci_lost_in_an_ecu_read_reopens_the_link_and_sends_it_again() {
+    let documents = [part_reader("v1", b"P", A)];
+    let plan = ecu_plan(&documents, &[("D", &[0])], &[("c1", ENGINE)]);
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    fake.state().scripts =
+        VecDeque::from([vec![Item::Finish], vec![Item::VciLost], vec![Item::Routed]]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.ecu_reads()[0].matching, [documents[0].0]);
+    assert_eq!(fake.count("ModuleConnect"), 3, "the link was opened again");
+    assert_eq!(fake.state().max_open_links, 1);
+    assert_eq!(
+        origins(&ran),
+        ["identification", "identification", "repeat"]
+    );
+}
+
+/// ADR-396 item 6 and ADR-401: bounds that run out in an ECU read leave it and the ones after it
+/// not read, report the phase interrupted and keep what the earlier phases heard.
+#[tokio::test(flavor = "multi_thread")]
+async fn bounds_that_run_out_in_an_ecu_read_leave_the_rest_not_read() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", false, &["D1", "D2"])])],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Answer(A.1, POSITIVE), Item::Finish],
+        vec![Item::VciLost],
+    ]);
+    let limits = JobLimits {
+        max_link_reopens: 0,
+        ..limits()
+    };
+    let ran = run_with(plan, fake.clone(), limits, false).await;
+    let report = ran.report();
+    assert!(report.ecu_reads_interrupted());
+    assert_eq!(declarations(report, 0), [&RequestOutcome::NotRead]);
+    assert_eq!(declarations(report, 1), [&RequestOutcome::NotRead]);
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+    assert_eq!(
+        ran.heard(),
+        [(A.1, POSITIVE.to_vec())],
+        "the presence section is kept"
+    );
+    assert!(served(&fake).is_empty());
+    assert_eq!(fake.state().open_links, 0);
+}
+
+/// ADR-401: an interrupted presence phase, and a VIN phase whose bounds ran out, leave the ECU
+/// phase unrun: no ECU link opens and every declaration is not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interrupted_presence_or_vin_phase_leaves_the_ecu_phase_unrun() {
+    // Presence: the lost events run the repeats out.
+    let documents = [reader(0x90, A), reader(0x90, B)];
+    let plan = |documents: &[(Sha256, Vec<u8>)]| {
+        checked_vin_reading(
+            documents,
+            Selection::Candidates,
+            &[(0, 1, 1, "W"), (1, 1, 1, "W")],
+        )
+        .unwrap()
+    };
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_A)]);
+    fake.state().scripts = (0..5)
+        .map(|_| vec![Item::Answer(A.1, POSITIVE), Item::LostEvents, Item::Finish])
+        .collect();
+    let tight = JobLimits {
+        max_primitive_repeats: 1,
+        ..limits()
+    };
+    let ran = run_with(plan(&documents), fake.clone(), tight, false).await;
+    let report = ran.report();
+    assert!(report.presence_interrupted() && report.ecu_reads_interrupted());
+    assert!(
+        report
+            .ecu_reads()
+            .iter()
+            .flat_map(|read| &read.requests)
+            .flat_map(|request| &request.declarations)
+            .all(|declaration| declaration.outcome == RequestOutcome::NotRead)
+    );
+    assert!(fake.state().served.is_empty());
+    assert_eq!(fake.count("ModuleConnect"), 1);
+    // VIN: the second read loses the VCI on the request and again on the one sent again.
+    let documents = [reader(0x90, A), reader(0x90, B)];
+    let fake = fake_with(&[(A.0, VIN_A), (B.0, VIN_A)]);
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Finish],
+        vec![Item::Routed],
+        vec![Item::VciLost],
+        vec![Item::VciLost],
+    ]);
+    let ran = run_with(plan(&documents), fake.clone(), tight, false).await;
+    let report = ran.report();
+    assert!(report.vin_interrupted() && report.ecu_reads_interrupted());
+    assert!(
+        report
+            .ecu_reads()
+            .iter()
+            .flat_map(|read| &read.requests)
+            .flat_map(|request| &request.declarations)
+            .all(|declaration| declaration.outcome == RequestOutcome::NotRead)
+    );
+    assert_eq!(
+        fake.state().served.len(),
+        1,
+        "only the first VIN read was made"
+    );
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+}
+
+/// ADR-399 item 3 as ADR-401 applies it: a link the worker refuses when an ECU read is made marks
+/// that group, and the next definition is still read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_link_the_worker_refuses_marks_the_group_and_the_next_definition_is_read() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", false, &["D1", "D2"])])],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    // The presence link is the first connect; the first read's link is the second.
+    fake.state().connect_fail_at = Some((2, tonic::Status::invalid_argument("refused")));
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(declarations(report, 0), [&RequestOutcome::WorkerRefused]);
+    assert_eq!(declarations(report, 1), [&text("PA123      ")]);
+    assert!(!report.ecu_reads_interrupted());
+    assert_eq!(served(&fake), [(B.0, vec![0x22, 0xF1, 0x87])]);
+    // The refused alternative had no physical read: the entry is not read, and the match of the
+    // other alternative stays listed (ADR-401 item 6).
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+    assert_eq!(report.ecu_reads()[1].matching, [documents[1].0]);
+    assert_eq!(fake.state().open_links, 0);
+}
+
+/// ADR-399 item 3 and design 8.8.1 as ADR-401 applies them: no ECU request is sent while another
+/// job holds the vehicle; the reads run once the holder lets go, with the lock held.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_ecu_reads_wait_for_the_vehicle_lock_another_job_holds() {
+    let documents = [reader(0x90, A)];
+    let plan = checked_vin_reading(&documents, Selection::Candidates, &[(0, 1, 1, "W")]).unwrap();
+    let waiting = waiting_for_the_vehicle_with(plan).await;
+    assert_eq!(
+        waiting.fake.state().served.len(),
+        1,
+        "only the VIN request while waiting"
+    );
+    drop(waiting.holder);
+    let ran = tokio::time::timeout(Duration::from_secs(10), waiting.task)
+        .await
+        .expect("the run goes on once the holder let go")
+        .unwrap();
+    let report = ran.report();
+    assert!(report.vehicle_lock_held() && ran.run.guards.holds_vehicle());
+    assert_eq!(waiting.fake.state().served.len(), 2, "then the ECU read");
+    assert_eq!(declarations(report, 0).len(), 1);
+    assert!(report.ecu_reads()[0].answered);
+}
+
+/// ADR-401: a cancel that comes in during an ECU read ends the run in `Cancelled` before the next
+/// link opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_cancel_during_an_ecu_read_ends_the_run() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", false, &["D1", "D2"])])],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    let cancel = Arc::new(AtomicBool::new(false));
+    // The presence request is the first primitive, the first read the second.
+    fake.state().cancel_at_start = Some((2, Arc::clone(&cancel)));
+    let ran = run_shared(
+        plan,
+        fake.clone(),
+        limits(),
+        cancel,
+        tempfile::tempdir().unwrap(),
+    )
+    .await;
+    assert!(matches!(ran.run.result, Err(JobError::Cancelled)));
+    assert_eq!(served(&fake).len(), 1, "the second read was not made");
+    assert_eq!(fake.state().open_links, 0);
+}
+
+/// ADR-401 item 8: a definition whose variants declare no pattern has no request, so no link
+/// opens for it and its read is reported empty.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_without_identification_requests_opens_no_link() {
+    let bare = named(edited(&part_reader("v1", b"P", A).1, |v| v.patterns = None));
+    let documents = [bare];
+    let plan = ecu_plan(&documents, &[("D", &[0])], &[("c1", ENGINE)]);
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    let read = &report.ecu_reads()[0];
+    assert!(read.requests.is_empty() && read.matching.is_empty());
+    assert!(!read.conclusive && !read.answered);
+    assert_eq!(fake.count("ModuleConnect"), 1, "the presence link only");
+    assert!(served(&fake).is_empty());
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+}
+
+/// ADR-401 item 6: an interruption in the second definition leaves every entry not read, though
+/// the first definition matched; its match stays listed.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interruption_in_the_second_definition_leaves_the_entry_not_read() {
+    let documents = [part_reader("v1", b"P", A), part_reader("v2", b"P", B)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", false, &["D1", "D2"])])],
+    );
+    let fake = fake_ecus(&[
+        (A.0, PART_NUMBER, SW_VERSION),
+        (B.0, PART_NUMBER, SW_VERSION),
+    ]);
+    fake.state().scripts =
+        VecDeque::from([vec![Item::Finish], vec![Item::Routed], vec![Item::VciLost]]);
+    let limits = JobLimits {
+        max_link_reopens: 0,
+        ..limits()
+    };
+    let ran = run_with(plan, fake, limits, false).await;
+    let report = ran.report();
+    assert!(report.ecu_reads_interrupted());
+    assert_eq!(report.ecu_reads()[0].matching, [documents[0].0]);
+    assert_eq!(declarations(report, 1), [&RequestOutcome::NotRead]);
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+}
+
+/// ADR-401 item 6: the same after the first definition went unanswered.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_interruption_after_an_unanswered_definition_leaves_the_entry_not_read() {
+    let documents = [part_reader("v1", b"P", C), part_reader("v2", b"P", B)];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", &[("engine", true, &["D1", "D2"])])],
+    );
+    let fake = fake_ecus(&[(B.0, PART_NUMBER, SW_VERSION)]);
+    // The presence request, the three sends to C (the limit's two repeats), then the VCI lost.
+    fake.state().scripts = VecDeque::from([
+        vec![Item::Finish],
+        vec![Item::Finish],
+        vec![Item::Finish],
+        vec![Item::Finish],
+        vec![Item::VciLost],
+    ]);
+    let limits = JobLimits {
+        max_link_reopens: 0,
+        ..limits()
+    };
+    let ran = run_with(plan, fake, limits, false).await;
+    let report = ran.report();
+    assert!(report.ecu_reads_interrupted());
+    assert_eq!(declarations(report, 0), [&RequestOutcome::NoUsableAnswer]);
+    assert_eq!(report.entries()[0].state, EntryState::NotRead);
+}
+
+/// ADR-401 item 6 and ADR-324: a refused-link alternative is an inconclusive read. Beside an
+/// unanswered one an optional entry is not fitted; beside a conclusive read without a match the
+/// entry is answered but not identified; alone it had no physical read, so the entry is not read.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_refused_link_alternative_makes_the_entry_inconclusive() {
+    let refused = identified_by(0x87, 11, b"P", "v2", B, |p| p.extended_addressing = true);
+    let mandatory: &[(&str, bool, &[&str])] = &[("engine", false, &["D1", "D2"])];
+    let optional: &[(&str, bool, &[&str])] = &[("engine", true, &["D1", "D2"])];
+    // A: optional {D1 at C, D2 refused}.
+    let documents = [part_reader("v1", b"P", C), refused.clone()];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", optional)],
+    );
+    let ran = run(plan, Fake::default()).await;
+    assert_eq!(ran.report().entries()[0].state, EntryState::NotFitted);
+    // B: {D1 at A, no match; D2 refused}.
+    let documents = [part_reader("v1", b"Q", A), refused.clone()];
+    let plan = ecu_plan(
+        &documents,
+        &[("D1", &[0]), ("D2", &[1])],
+        &[("c1", mandatory)],
+    );
+    let ran = run(plan, fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)])).await;
+    assert_eq!(
+        ran.report().entries()[0].state,
+        EntryState::AnsweredNotIdentified
+    );
+    // C: the only alternative is refused.
+    let documents = [refused];
+    let plan = ecu_plan(
+        &documents,
+        &[("D2", &[0])],
+        &[("c1", &[("engine", false, &["D2"])])],
+    );
+    let ran = run(plan, Fake::default()).await;
+    assert_eq!(ran.report().entries()[0].state, EntryState::NotRead);
+}
+
+/// ADR-401 item 1: a definition with two link groups at one endpoint (ComParams other than the
+/// timings differ) opens a link for each and puts each group's outcomes on its own requests.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_definition_with_two_link_groups_at_one_endpoint_reads_each_group() {
+    let block = |size: i64| {
+        move |p: &mut diag_ir::declaration::ProtocolT| {
+            p.functional_id = 0;
+            let mut param = diag_ir::declaration::ComParamT::default();
+            param.short_name = Some("CP_BlockSize".into());
+            param.value = size;
+            p.params.get_or_insert_default().push(param);
+        }
+    };
+    let documents = [
+        identified_by(0x87, 11, b"PA", "v1", A, block(8)),
+        identified_by(0x89, 5, b"SW", "v2", A, block(16)),
+    ];
+    let plan = ecu_plan(&documents, &[("D", &[0, 1])], &[("c1", ENGINE)]);
+    let fake = fake_ecus(&[(A.0, PART_NUMBER, SW_VERSION)]);
+    let ran = run(plan, fake.clone()).await;
+    let report = ran.report();
+    assert_eq!(report.ecu_reads().len(), 1);
+    let read = &report.ecu_reads()[0];
+    assert_eq!(read.requests.len(), 2);
+    assert_eq!(read.requests[0].request, [0x22, 0xF1, 0x87]);
+    assert_eq!(read.requests[1].request, [0x22, 0xF1, 0x89]);
+    assert_eq!(
+        declarations(report, 0),
+        [&text("PA123      "), &text("SW123")]
+    );
+    assert_eq!(read.matching.len(), 2);
+    assert_eq!(fake.count("ModuleConnect"), 2, "one link per group");
+    assert_eq!(fake.state().max_open_links, 1);
+}
+
+/// ADR-401 item 7: a plan with no VIN rule whose last presence close leaves the guards marked
+/// ends the run in `LinkUnconfirmed` before an ECU link opens.
+#[tokio::test(flavor = "multi_thread")]
+async fn guards_marked_by_the_last_presence_close_end_the_run_before_an_ecu_read() {
+    let documents = [part_reader("v1", b"P", A)];
+    let plan = ecu_plan(&documents, &[("D", &[0])], &[("c1", ENGINE)]);
+    let fake_ref = Arc::new(Mutex::new(None));
+    let seen = Arc::clone(&fake_ref);
+    let run = run_with_the_last_close_hanging_plan(plan, 1, move |worker, fake| {
+        *seen.lock().unwrap() = Some(fake);
+        ExitsOnce(worker, Arc::new(Mutex::new(0)), 0, false)
+    })
+    .await;
+    assert!(
+        matches!(run.result, Err(JobError::LinkUnconfirmed)),
+        "{:?}",
+        run.result
+    );
+    assert!(run.guards.link_unconfirmed());
+    let fake = fake_ref.lock().unwrap().take().unwrap();
+    assert_eq!(fake.count("ModuleConnect"), 1, "the presence link only");
+    assert!(fake.state().served.is_empty());
 }

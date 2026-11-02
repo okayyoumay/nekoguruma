@@ -135,7 +135,22 @@ pub(crate) mod tests {
 
     /// A document whose variant declares `services` and carries `procedure`, if any.
     pub(crate) fn document_of(services: Vec<ServiceT>, procedure: Option<Vec<u8>>) -> Vec<u8> {
+        document_with_session(services, procedure, false)
+    }
+
+    /// [`document_of`], which also declares flash session 1 without segments when
+    /// `flash_session` is set: the session the flash recovery plans of the test programs name.
+    pub(crate) fn document_with_session(
+        services: Vec<ServiceT>,
+        procedure: Option<Vec<u8>>,
+        flash_session: bool,
+    ) -> Vec<u8> {
         let mut variant = EcuVariantT::default();
+        if flash_session {
+            let mut session = diag_ir::declaration::FlashSessionT::default();
+            session.id = 1;
+            variant.flash_sessions = Some(vec![session]);
+        }
         variant.id = 1;
         variant.short_name = Some("v".into());
         variant.protocols = Some(vec![uds_on_can()]);

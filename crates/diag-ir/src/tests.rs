@@ -4256,6 +4256,46 @@ mod flash_block {
             Err((1, VmError::UnknownFlashSession { session: 8 }))
         );
     }
+
+    #[test]
+    fn check_declarations_checks_a_recovery_plans_flash_session() {
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let with_plan = |code, session| {
+            let mut program = prog(code, vec![]);
+            program.flash = vec![super::plan(session, 0, 6)];
+            program
+        };
+        // Declared session: accepted.
+        assert_eq!(
+            check_declarations(&with_plan(vec![Op::Pop], 4), &variant),
+            Ok(())
+        );
+        // Undeclared session: reported at the plan's entry.
+        assert_eq!(
+            check_declarations(&with_plan(vec![Op::Pop], 8), &variant),
+            Err((6, VmError::UnknownFlashSession { session: 8 }))
+        );
+        // Instructions are checked first.
+        let code = vec![
+            Op::PushI64(0),
+            Op::FlashBlock {
+                session: 4,
+                segment: 7,
+            },
+        ];
+        assert_eq!(
+            check_declarations(&with_plan(code, 8), &variant),
+            Err((
+                1,
+                VmError::UnknownFlashSegment {
+                    session: 4,
+                    segment: 7
+                }
+            ))
+        );
+    }
 }
 
 #[test]

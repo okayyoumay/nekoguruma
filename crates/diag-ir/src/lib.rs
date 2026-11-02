@@ -1388,6 +1388,11 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 ///   segment with a zero block size, one whose end (offset plus length) passes `u64::MAX`, or one
 ///   whose longest block is longer than [`MAX_BYTES_LEN`] (ADR-336).
 ///
+/// After the instructions, each flash recovery plan of `program.flash`, in plan order, must name
+/// a flash session the variant declares (`FlashSession.id`); otherwise the error is
+/// [`VmError::UnknownFlashSession`], reported at the plan's `boundaries.entry_pc` (ADR-245).
+/// An instruction's error takes precedence over a plan's.
+///
 /// These errors depend only on the declarations, so a caller can refuse such a program before
 /// it runs.
 pub fn check_declarations(
@@ -1411,6 +1416,18 @@ pub fn check_declarations(
             _ => Ok(()),
         };
         checked.map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
+    }
+    for plan in &program.flash {
+        let session = plan.flash_session;
+        let declared = variant
+            .flash_sessions()
+            .is_some_and(|sessions| sessions.iter().any(|s| s.id() == session));
+        if !declared {
+            return Err((
+                plan.boundaries.entry_pc,
+                VmError::UnknownFlashSession { session },
+            ));
+        }
     }
     Ok(())
 }

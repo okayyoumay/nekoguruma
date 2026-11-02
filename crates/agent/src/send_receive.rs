@@ -313,7 +313,11 @@ pub(crate) mod tests {
         };
         let mut no_request = service(NO_REQUEST, 0x22, vec![0xF1, 0x90]);
         no_request.request = None;
+        // Flash session 1, without segments, which the flash recovery plans of the tests name.
+        let mut session = diag_ir::declaration::FlashSessionT::default();
+        session.id = 1;
         let mut variant = EcuVariantT::default();
+        variant.flash_sessions = Some(vec![session]);
         variant.id = 1;
         variant.short_name = Some("v".into());
         variant.protocols = Some(protocols);

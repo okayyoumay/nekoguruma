@@ -65,7 +65,27 @@ pub const STANDARD_PIN_TYPE_HI: UNUM32 = 3311;
 pub const STANDARD_PIN_TYPE_LOW: UNUM32 = 3312;
 const MOCK_LOGICAL_LINK_HANDLE: UNUM32 = 3001;
 const MOCK_COM_PRIMITIVE_HANDLE: UNUM32 = 4001;
-const MOCK_TIMESTAMP: UNUM32 = 4242;
+
+/// The module clock: microseconds since the mock state was created, from a monotonic clock,
+/// truncated to `UNUM32` (ISO 22900-2 (2022) 10.1.4.11.4 times, `PDUGetTimestamp`). Every event
+/// item's `Timestamp` and the transmit-done and start-of-message times come from it.
+///
+/// The epoch is the first call to `state()` or to the clock; `__mock_reset` does not restart it.
+fn clock_now() -> UNUM32 {
+    clock_at(Instant::now())
+}
+
+/// The module clock at `instant`; an instant before the epoch reads 0.
+fn clock_at(instant: Instant) -> UNUM32 {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    instant.saturating_duration_since(epoch).as_micros() as UNUM32
+}
+
+/// `TimestampFlags` bits of a result item: the transmit-done time and the start-of-message time
+/// are valid (ISO 22900-2 (2022) D.2.4: byte 0, bits 7 and 6; the default flag width is 4 bytes).
+const TIMESTAMP_FLAG_TX_DONE: UNUM8 = 0x80;
+const TIMESTAMP_FLAG_START_MSG: UNUM8 = 0x40;
 const MOCK_VERSION_TAG: &[u8] = b"iso22900-mock\0";
 const MOCK_VEHICLE_NAME: &[u8] = b"mock-vehicle\0";
 
@@ -88,8 +108,27 @@ struct PendingEvent {
     h_cll: UNUM32,
     h_cop: UNUM32,
     tag: usize,
+    /// The module clock when the item is produced, set as it is queued ([`stamp`]).
     timestamp: UNUM32,
+    /// For a response of the attached ECU: the module clock when its request was sent, that is,
+    /// when the ComPrimitive began. The item then also carries the start of message.
+    tx_done: Option<UNUM32>,
     kind: EventKind,
+}
+
+/// Sets the item's time to the module clock now. A response is delivered strictly after its
+/// request's transmit done, so a latency measured between them is positive even when the ECU
+/// answers at once.
+fn stamp(event: &mut PendingEvent) {
+    stamp_at(event, clock_now());
+}
+
+/// Like [`stamp`], for the clock reading `now`.
+fn stamp_at(event: &mut PendingEvent, now: UNUM32) {
+    event.timestamp = match event.tx_done {
+        Some(tx_done) if (now.wrapping_sub(tx_done) as i32) <= 0 => tx_done.wrapping_add(1),
+        _ => now,
+    };
 }
 
 /// What an event item carries.
@@ -189,7 +228,11 @@ impl MockState {
 
 fn state() -> &'static Mutex<MockState> {
     static STATE: OnceLock<Mutex<MockState>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(MockState::default()))
+    STATE.get_or_init(|| {
+        // The module clock starts with the state.
+        clock_now();
+        Mutex::new(MockState::default())
+    })
 }
 
 fn no_error() -> T_PDU_ERROR {
@@ -359,12 +402,30 @@ unsafe fn make_event_item(event: PendingEvent) -> *mut PDU_EVENT_ITEM {
                 },
                 UniqueRespIdentifier: 1,
                 AcceptanceId: 1,
-                TimestampFlags: PDU_FLAG_DATA {
-                    NumFlagBytes: 0,
-                    pFlagData: ptr::null_mut(),
+                TimestampFlags: match event.tx_done {
+                    // A response: the request's transmit done and the response's start.
+                    Some(_) => PDU_FLAG_DATA {
+                        NumFlagBytes: 4,
+                        pFlagData: Box::into_raw(Box::new([
+                            TIMESTAMP_FLAG_TX_DONE | TIMESTAMP_FLAG_START_MSG,
+                            0,
+                            0,
+                            0,
+                        ]))
+                        .cast::<UNUM8>(),
+                    },
+                    // No transmission behind the item (the synthetic completion): no time valid.
+                    None => PDU_FLAG_DATA {
+                        NumFlagBytes: 0,
+                        pFlagData: ptr::null_mut(),
+                    },
                 },
-                TxMsgDoneTimestamp: event.timestamp,
-                StartMsgTimestamp: event.timestamp,
+                TxMsgDoneTimestamp: event.tx_done.unwrap_or(0),
+                StartMsgTimestamp: if event.tx_done.is_some() {
+                    event.timestamp
+                } else {
+                    0
+                },
                 pExtraInfo: ptr::null_mut(),
                 NumDataBytes: num_data_bytes,
                 pDataBytes: data_bytes,
@@ -410,7 +471,8 @@ unsafe fn notify_data_available(callback: CALLBACKFNC, event: &PendingEvent, api
     }
 }
 
-unsafe fn queue_event(event: PendingEvent) {
+unsafe fn queue_event(mut event: PendingEvent) {
+    stamp(&mut event);
     let notified = event.clone();
     let (callback, api_tag) = {
         let mut guard = state().lock().expect("mock state poisoned");
@@ -451,11 +513,32 @@ fn begin_next(state: &mut MockState, now: Instant) {
         return;
     };
     let events = match (state.ecu.as_mut(), cop.request) {
-        (Some(ecu), Some((request, cycles))) => ecu_events(ecu, &request, cycles, &cop.event),
+        (Some(ecu), Some((request, cycles))) => {
+            let sent = clock_at(now);
+            let mut events = ecu_events(ecu, &request, cycles, &cop.event);
+            // The request is sent now; each response item carries that as its transmit done.
+            for (_, event) in &mut events {
+                if matches!(event.kind, EventKind::Result(_)) {
+                    event.tx_done = Some(sent);
+                }
+            }
+            events
+        }
         _ => vec![(0, cop.event)],
     };
-    for (delay_ms, event) in events {
+    // Each item is stamped with the clock at its scheduled time, as `sim-vci` does, so a latency
+    // between two items is the ECU's delay and not the delivery thread's scheduling. Items keep
+    // their order: no item is stamped earlier than the one before it.
+    let mut previous: Option<UNUM32> = None;
+    for (delay_ms, mut event) in events {
         let due = now + Duration::from_millis(delay_ms.into());
+        stamp_at(&mut event, clock_at(due));
+        if let Some(previous) = previous
+            && (event.timestamp.wrapping_sub(previous) as i32) < 0
+        {
+            event.timestamp = previous;
+        }
+        previous = Some(event.timestamp);
         state.scheduled.push_back((due, event));
     }
 }
@@ -543,6 +626,7 @@ fn deliver() {
                     .0;
             }
             Some(_) => {
+                // Stamped with its scheduled time when the ComPrimitive began (`begin_next`).
                 let (_, event) = guard.scheduled.pop_front().expect("an event is due");
                 guard.pending_events.push(event.clone());
                 let (callback, api_tag) = (guard.callback, guard.api_tag);
@@ -892,7 +976,7 @@ exported_fn!(PDUGetStatus(_h_mod: UNUM32, _h_cll: UNUM32, h_cop: UNUM32, p_statu
 
     unsafe {
         *p_status_code = status;
-        *p_timestamp = MOCK_TIMESTAMP;
+        *p_timestamp = clock_now();
         *p_extra_info = 0;
     }
     no_error()
@@ -1016,7 +1100,8 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             h_cll: MOCK_LOGICAL_LINK_HANDLE,
             h_cop: handle,
             tag: p_cop_tag as usize,
-            timestamp: MOCK_TIMESTAMP,
+            timestamp: 0,
+            tx_done: None,
             kind: EventKind::Result(Vec::new()),
         };
         // While an ECU is attached, and while other ComPrimitives still wait or run, the
@@ -1177,6 +1262,12 @@ exported_fn!(PDUDestroyItem(p_item: *mut PDU_ITEM) -> T_PDU_ERROR {
                             data.NumDataBytes as usize,
                         ));
                     }
+                    if !data.TimestampFlags.pFlagData.is_null() {
+                        let _ = Box::from_raw(ptr::slice_from_raw_parts_mut(
+                            data.TimestampFlags.pFlagData,
+                            data.TimestampFlags.NumFlagBytes as usize,
+                        ));
+                    }
                 }
             }
         }
@@ -1309,7 +1400,7 @@ exported_fn!(PDUModuleDisconnect(_h_mod: UNUM32) -> T_PDU_ERROR {
 });
 
 exported_fn!(PDUGetTimestamp(_h_mod: UNUM32, p_timestamp: *mut UNUM32) -> T_PDU_ERROR {
-    unsafe { set_out(p_timestamp, MOCK_TIMESTAMP) }
+    unsafe { set_out(p_timestamp, clock_now()) }
 });
 
 // Exported FFI back-door: Reset all mock state for test isolation.
@@ -1848,6 +1939,34 @@ mod sim_ecu_tests {
         state.ecu = None;
         assert!(apply_sim_ecu_command(&mut state, command(too_long)).is_err());
         assert!(state.ecu.is_none());
+    }
+
+    #[test]
+    fn a_response_is_stamped_strictly_after_its_transmit_done() {
+        let event = |tx_done| PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done,
+            kind: EventKind::Result(vec![0x62]),
+        };
+        // Sent at the clock now, so the response cannot be later than one microsecond past it
+        // unless time really passed.
+        let sent = clock_now();
+        let mut response = event(Some(sent));
+        stamp(&mut response);
+        assert!(response.timestamp > sent);
+        // A transmit done in the future still leaves the response after it.
+        let mut early = event(Some(clock_now().wrapping_add(1_000_000)));
+        stamp(&mut early);
+        assert_eq!(early.timestamp, early.tx_done.unwrap().wrapping_add(1));
+        // An item with no transmission is just stamped with the clock.
+        let before = clock_now();
+        let mut plain = event(None);
+        stamp(&mut plain);
+        assert!(plain.timestamp >= before && plain.timestamp <= clock_now());
     }
 
     #[test]

@@ -1388,6 +1388,15 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 ///   segment with a zero block size, one whose end (offset plus length) passes `u64::MAX`, or one
 ///   whose longest block is longer than [`MAX_BYTES_LEN`] (ADR-336).
 ///
+/// After the instructions, each flash recovery plan of `program.flash`, in plan order, must name
+/// a flash session the variant declares (`FlashSession.id`); otherwise the error is
+/// [`VmError::UnknownFlashSession`], reported at the plan's `boundaries.entry_pc` (ADR-245).
+/// An instruction's error takes precedence over a plan's.
+///
+/// The declarations checked are those of one target: a caller of a program with several targets
+/// passes target 0's part, and the agent refuses a program with several targets before this
+/// check (ADR-409, ADR-410).
+///
 /// These errors depend only on the declarations, so a caller can refuse such a program before
 /// it runs.
 pub fn check_declarations(
@@ -1411,6 +1420,10 @@ pub fn check_declarations(
             _ => Ok(()),
         };
         checked.map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
+    }
+    for plan in &program.flash {
+        declared_session(variant, plan.flash_session)
+            .map_err(|error| (plan.boundaries.entry_pc, error))?;
     }
     Ok(())
 }
@@ -1436,14 +1449,23 @@ pub fn flash_session_extents(
     variant: &EcuVariant<'_>,
     session: u32,
 ) -> Result<Vec<(u64, u64)>, VmError> {
-    let declared = variant
-        .flash_sessions()
-        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
-        .ok_or(VmError::UnknownFlashSession { session })?;
+    let declared = declared_session(variant, session)?;
     let count = declared.segments().map_or(0, |segments| segments.len());
     (0..count)
         .map(|segment| flash_segment_extent(variant, session, segment as u32))
         .collect()
+}
+
+/// The flash session `session` (`FlashSession.id`) of `variant`, or
+/// [`VmError::UnknownFlashSession`] when the variant does not declare it.
+fn declared_session<'a>(
+    variant: &EcuVariant<'a>,
+    session: u32,
+) -> Result<crate::declaration::FlashSession<'a>, VmError> {
+    variant
+        .flash_sessions()
+        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
+        .ok_or(VmError::UnknownFlashSession { session })
 }
 
 /// The offset, block size and length of segment `segment` (an index into `segments`) of flash
@@ -1454,10 +1476,7 @@ fn declared_segment(
     session: u32,
     segment: u32,
 ) -> Result<(u64, u32, u64), VmError> {
-    let declared = variant
-        .flash_sessions()
-        .and_then(|sessions| sessions.iter().find(|s| s.id() == session))
-        .ok_or(VmError::UnknownFlashSession { session })?;
+    let declared = declared_session(variant, session)?;
     let found = declared
         .segments()
         .filter(|segments| (segment as usize) < segments.len())

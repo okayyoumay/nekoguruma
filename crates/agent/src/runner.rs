@@ -353,9 +353,13 @@ pub enum JobError {
         end: u64,
         artifact_len: u64,
     },
-    /// Instruction `pc` decodes a field the job's document does not declare as a top-level
-    /// field of the service's positive response, or one with a nested layout.
-    #[error("instruction {pc} decodes a field the job's document does not declare: {source}")]
+    /// The instruction or flash recovery plan at `pc` names a declaration the job's document
+    /// does not declare or declares in a shape it cannot use: a response field (not a top-level
+    /// one of the service's positive response, or one with a nested layout), a service, a flash
+    /// session or segment. A plan is reported at its entry.
+    #[error(
+        "instruction or flash plan at {pc} names a declaration the job's document does not declare: {source}"
+    )]
     Undeclared {
         pc: u32,
         #[source]
@@ -408,7 +412,7 @@ impl crate::oplog::LogSafe for JobError {
                 source.log_text()
             ),
             JobError::Undeclared { pc, source } => format!(
-                "instruction {pc} decodes a field the job's document does not declare: {}",
+                "instruction or flash plan at {pc} names a declaration the job's document does not declare: {}",
                 vm_error_text(source)
             ),
             JobError::ProcedureFailed { pc, code, .. } => {
@@ -561,7 +565,7 @@ fn check_runnable(program: &Program) -> Result<(), JobError> {
 /// [`check_program`] for a job, which also checks the declarations its program names
 /// (`diag_ir::check_declarations`): the response fields it decodes (`Op::DecodeField`,
 /// ADR-316, ADR-318), the services it send-receives (ADR-321) and the flash segments whose blocks
-/// it reads (`Op::FlashBlock`, ADR-336). A job without a document to
+/// it reads (`Op::FlashBlock`, ADR-336), and the flash session of each recovery plan (ADR-245). A job without a document to
 /// decode with, or one whose document does not declare what the program names, is refused here
 /// rather than failing at the instruction, which could be after a write.
 ///
@@ -641,8 +645,8 @@ fn check_declared(job: &Job) -> Result<(), JobError> {
 /// segment of every flash session the program names lies inside it. A session is named by an
 /// `Op::FlashBlock` or by a flash recovery plan; all of its segments are checked, not only the
 /// ones a block read uses, since the document declares them for this artifact. A plan's session
-/// the document does not declare has no segments to check, and a job without an artifact has
-/// none to check them against. Runs after the declarations, which it relies on.
+/// is declared, which the declarations check made sure of, and a job without an artifact has
+/// none to check the segments against. Runs after the declarations, which it relies on.
 fn check_artifact(job: &Job) -> Result<(), JobError> {
     if let Some((named, artifact)) = &job.artifact
         && named != artifact.sha256()
@@ -685,7 +689,6 @@ fn check_artifact(job: &Job) -> Result<(), JobError> {
         };
         let extents = match diag_ir::flash_session_extents(&variant, session) {
             Ok(extents) => extents,
-            Err(VmError::UnknownFlashSession { .. }) if !needs_artifact => continue,
             Err(source) => return Err(JobError::Undeclared { pc, source }),
         };
         for (segment, (offset, length)) in extents.into_iter().enumerate() {
@@ -11393,6 +11396,43 @@ def main():
         );
     }
 
+    /// A flash recovery plan names a flash session of the document, so a job whose document does
+    /// not declare it is refused before any worker starts, at the plan's entry (ADR-245). A job
+    /// without a document is not refused for its plan: restarting replays the plan from the
+    /// journal and the program, not from declarations.
+    #[test]
+    fn a_plan_whose_session_the_document_does_not_declare_is_refused() {
+        let program = flash_program();
+        let session = program.flash[0].flash_session;
+        let entry = program.flash[0].boundaries.entry_pc;
+        let job = Job {
+            program: program.clone(),
+            document: Some(vin_job_document()),
+            artifact: None,
+            comm_log: None,
+            comm_log_dir: None,
+            vci: None,
+            vci_margins: VciMargins::default(),
+        };
+        let refused = check_job(&job, Permission::ReadOnly);
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::Undeclared {
+                    pc,
+                    source: VmError::UnknownFlashSession { session: s }
+                }) if pc == entry && s == session
+            ),
+            "{refused:?}"
+        );
+        assert!(
+            matches!(check_declared(&job), Err(JobError::Undeclared { .. })),
+            "the declarations check refuses it before the artifact and the policy"
+        );
+        // No document: the declarations check has nothing to refuse.
+        check_declared(&program.into()).expect("a plan alone needs no declarations");
+    }
+
     #[tokio::test(flavor = "multi_thread")]
     async fn a_job_that_decodes_without_a_document_is_refused_before_the_link() {
         let JobRun {
@@ -11481,7 +11521,7 @@ def main():
         program: &Program,
         edit: impl FnOnce(&mut Vec<diag_ir::declaration::ServiceT>),
     ) -> Job {
-        use crate::document::tests::{document_of, read_service};
+        use crate::document::tests::{document_with_session, read_service};
         use diag_ir::declaration::DataKind;
         let mut services = vec![
             read_service(1, "readHardware", [0xF1, 0x91], DataKind::Ascii, 4),
@@ -11490,8 +11530,9 @@ def main():
         ];
         edit(&mut services);
         let procedure = postcard::to_allocvec(program).unwrap();
-        Job::from_document(JobDocument::new(document_of(services, Some(procedure))).unwrap())
-            .unwrap()
+        // The program's recovery plan names flash session 1, which the document must declare.
+        let bytes = document_with_session(services, Some(procedure), true);
+        Job::from_document(JobDocument::new(bytes).unwrap()).unwrap()
     }
 
     fn journal_mode_with_empty_table(dir: &std::path::Path, resume: bool) -> JournalMode {

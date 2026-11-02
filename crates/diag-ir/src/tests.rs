@@ -4256,6 +4256,75 @@ mod flash_block {
             Err((1, VmError::UnknownFlashSession { session: 8 }))
         );
     }
+
+    #[test]
+    fn check_declarations_refuses_a_plan_when_the_variant_declares_no_flash_sessions() {
+        use crate::declaration::{EcuDocumentT, EcuVariantT, encode_ecu_document};
+        let document = EcuDocumentT {
+            schema_version: IR_SCHEMA_VERSION,
+            source_format: Some("test".to_owned()),
+            source_digest: Some(String::new()),
+            variant: Some(Box::new(EcuVariantT::default())),
+            ..Default::default()
+        };
+        let bytes = encode_ecu_document(&document);
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let mut program = prog(vec![Op::Pop], vec![]);
+        assert_eq!(check_declarations(&program, &variant), Ok(()));
+        program.flash = vec![super::plan(1, 0, 4)];
+        assert_eq!(
+            check_declarations(&program, &variant),
+            Err((4, VmError::UnknownFlashSession { session: 1 }))
+        );
+    }
+
+    #[test]
+    fn check_declarations_checks_a_recovery_plans_flash_session() {
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let with_plan = |code, session| {
+            let mut program = prog(code, vec![]);
+            program.flash = vec![super::plan(session, 0, 6)];
+            program
+        };
+        // Declared session: accepted.
+        assert_eq!(
+            check_declarations(&with_plan(vec![Op::Pop], 4), &variant),
+            Ok(())
+        );
+        // Undeclared session: reported at the plan's entry.
+        assert_eq!(
+            check_declarations(&with_plan(vec![Op::Pop], 8), &variant),
+            Err((6, VmError::UnknownFlashSession { session: 8 }))
+        );
+        // Two undeclared plans: the first in plan order is reported.
+        let mut two = with_plan(vec![Op::Pop], 8);
+        two.flash = vec![super::plan(9, 0, 3), super::plan(8, 0, 6)];
+        assert_eq!(
+            check_declarations(&two, &variant),
+            Err((3, VmError::UnknownFlashSession { session: 9 }))
+        );
+        // Instructions are checked first.
+        let code = vec![
+            Op::PushI64(0),
+            Op::FlashBlock {
+                session: 4,
+                segment: 7,
+            },
+        ];
+        assert_eq!(
+            check_declarations(&with_plan(code, 8), &variant),
+            Err((
+                1,
+                VmError::UnknownFlashSegment {
+                    session: 4,
+                    segment: 7
+                }
+            ))
+        );
+    }
 }
 
 #[test]

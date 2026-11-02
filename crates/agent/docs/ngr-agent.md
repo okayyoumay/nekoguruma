@@ -50,7 +50,7 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
 
 1. Read the document and its procedure, and check the job (`agent::check_job`):
    a program that decodes a field the document
-   does not declare (ADR-318), a generic send-receive (`Op::SendReceive`, ADR-321) whose
+   does not declare (ADR-318), a flash recovery plan whose flash session the document does not declare (ADR-245), a generic send-receive (`Op::SendReceive`, ADR-321) whose
    service the document does not declare with a request and a positive response, or whose
    variant's negative-response shape the workers do not support (ADR-322), a program whose schema version or
    size this VM does not accept, one whose restart declaration `Program::validate` refuses

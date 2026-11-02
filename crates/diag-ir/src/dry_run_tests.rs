@@ -1553,32 +1553,72 @@ fn security_access_with(at: usize, inserted: &[Op]) -> Program {
 #[test]
 fn a_scripted_seed_addresses_one_target() {
     let bufs = [document(vec![], vec![]), document(vec![], vec![])];
-    // The expansion on target 0, then the same on target 1.
+    // The expansion on target 0, then twice on target 1.
     let first = security_access_program();
-    let mut code = first.code.clone();
-    let shift = code.len() as u32 + 1;
+    let mut code = Vec::new();
+    let expand = |code: &mut Vec<Op>| {
+        let shift = code.len() as u32;
+        code.extend(first.code.iter().map(|op| match op {
+            Op::JumpIfFalse(target) => Op::JumpIfFalse(target + shift),
+            other => other.clone(),
+        }));
+    };
+    expand(&mut code);
     code.push(Op::SelectTarget { target: 1 });
-    code.extend(first.code.iter().map(|op| match op {
-        Op::JumpIfFalse(target) => Op::JumpIfFalse(target + shift),
-        other => other.clone(),
-    }));
+    expand(&mut code);
+    expand(&mut code);
     let program = program_with_targets(code, first.constants.clone(), 2);
-    // Target 0's seed is positive, so its call reaches SecurityAccess; target 1's is negative.
+    // Target 1's list is scripted first and is negative then positive; target 0's is positive.
+    // A list or a count shared by the targets would give target 0 the negative answer or
+    // target 1's first call the positive one.
     let script = Script::new()
-        .seed(vec![0x67, 1, 9, 8])
         .seed_on(1, vec![0x7F, 0x27, 0x37])
+        .seed_on(1, vec![0x67, 1, 7, 6])
+        .seed(vec![0x67, 1, 9, 8])
         .key(vec![0x55]);
     let report = run_targets(&bufs, &program, &script);
     assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
-    let [seed0, access, key0, select, seed1] = &report.events[..] else {
+    let [seed0, access0, key0, select, seed1, seed2, access1, key1] = &report.events[..] else {
         panic!("{report:?}");
     };
     assert_eq!(profile_request(seed0).1, &[0x67, 1, 9, 8][..]);
-    assert!(matches!(access, DryRunEvent::SecurityAccess { .. }));
+    assert!(matches!(access0, DryRunEvent::SecurityAccess { .. }));
     assert_eq!(profile_request(key0).0, PROFILE_KEY_REQUEST);
     assert_eq!(select, &DryRunEvent::SelectTarget { target: 1 });
     assert_eq!(profile_request(seed1).1, &[0x7F, 0x27, 0x37][..]);
+    assert_eq!(profile_request(seed2).1, &[0x67, 1, 7, 6][..]);
+    assert!(matches!(
+        access1,
+        DryRunEvent::SecurityAccess { seed, .. } if seed == &[7, 6]
+    ));
+    assert_eq!(profile_request(key1).0, PROFILE_KEY_REQUEST);
     assert_eq!(report.target, 1);
+}
+
+#[test]
+fn a_select_target_past_the_budget_leaves_the_report_pc_on_it() {
+    let buf = document(Vec::new(), Vec::new());
+    // Eight logs that leave 8 bytes of the budget, less than a change of target costs.
+    let len = MAX_REPORT_BYTES / 8 - EVENT_COST - 1;
+    assert!(len <= crate::MAX_BYTES_LEN);
+    let message = "x".repeat(len);
+    let mut code = Vec::new();
+    for _ in 0..8 {
+        code.extend([Op::PushBytes(0), Op::LogFromStack { level: 1 }]);
+    }
+    let select = code.len() as u32;
+    code.push(Op::SelectTarget { target: 1 });
+    code.push(Op::Wait { millis: 1 });
+    let program = program_with_targets(code, vec![message.into_bytes()], 2);
+    let report = run_targets(&[buf.clone(), buf], &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    // The logs fit, so the change of target is the one that goes over.
+    assert_eq!(report.pc, select, "{report:?}");
+    assert_eq!(report.target, 1);
+    assert!(
+        !matches!(report.events.last(), Some(DryRunEvent::SelectTarget { .. })),
+        "{report:?}"
+    );
 }
 
 #[test]

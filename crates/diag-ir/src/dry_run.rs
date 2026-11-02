@@ -1,20 +1,20 @@
 //! Dry run of a procedure with vehicle access mocked (design 12.1, ADR-328).
 //!
-//! [`dry_run`] steps a [`Program`] with the declaration part of its variant against a host that
-//! sends nothing. Each request is resolved to the declared service it belongs to, answered from
-//! a [`Script`] or, without a scripted answer, with a positive response built from the
-//! service's declaration, and decoded through that declaration. The [`DryRunReport`] lists the
-//! requests with their answers and decoded values, the other primitives the procedure reached,
-//! and how the run ended.
+//! [`dry_run`] steps a [`Program`] with the declaration part of its current target against a host
+//! that sends nothing. Each request is resolved to the declared service it belongs to, answered
+//! from a [`Script`] or, without a scripted answer, with a positive response built from the
+//! service's declaration, and decoded through the current target's declaration part. The
+//! [`DryRunReport`] lists the requests with their answers and decoded values, the other primitives
+//! the procedure reached, and how the run ended.
 //!
 //! A variant that declares no SecurityAccess service still lets `diag.security_access` run: the
 //! requests the frontend lowers it to are the UDS profile's, not a declared service's (ADR-390).
 //! They are found by their place around an `Op::SecurityAccess`: the nearest `ServiceRequest`
 //! before it is the seed request and the nearest one after it is the send-key request, each only
-//! when no other host-facing instruction, call or return lies between. When such a request
-//! belongs to no declared service, the dry run answers it in the profile's shape and reports it
-//! under [`PROFILE_SEED_REQUEST`] or [`PROFILE_KEY_REQUEST`]; a declared service still answers
-//! first, and any other undeclared request ends the run.
+//! when no other host-facing instruction, `SelectTarget`, call or return lies between. When such a
+//! request belongs to no declared service, the dry run answers it in the profile's shape and
+//! reports it under [`PROFILE_SEED_REQUEST`] or [`PROFILE_KEY_REQUEST`]; a declared service still
+//! answers first, and any other undeclared request ends the run.
 
 use std::collections::HashMap;
 
@@ -154,11 +154,12 @@ impl Script {
         self
     }
 
-    /// Adds a whole response, SID included, to the answers to the profile's seed request, in
-    /// place of the built `positive SID, sub-function, 01 02 03 04` answer. A negative response may be
+    /// Adds a whole response, SID included, to the answers to the profile's seed request, in place
+    /// of the built `positive SID, sub-function, 01 02 03 04` answer. A negative response may be
     /// scripted; the call then ends as it would on a vehicle. It applies only when no declared
     /// service answers the request: when a declared service does, it is not used, and that
-    /// service's [`Script::response`] list answers both requests. The answer is target 0's.
+    /// service's [`Script::response`] list *of the same target* answers both requests. The answer
+    /// is target 0's.
     pub fn seed(self, bytes: impl Into<Vec<u8>>) -> Self {
         self.seed_on(0, bytes)
     }
@@ -396,12 +397,12 @@ pub fn dry_run(
 }
 
 /// Runs `program` with vehicle access mocked by `script`, for at most `max_steps` instructions.
-/// `declarations[i]` is the declaration part of `program.targets[i]`, and the run answers,
-/// builds and decodes through the part of the current target (ADR-325 items 3 and 4); a program
-/// with no target list has one target and takes one part. After [`Program::validate`], a number
-/// of parts other than [`Program::target_count`] ends the run before it starts with
-/// [`DryRunError::DeclarationParts`]. The hashes in [`crate::Target::declarations`] are not verified:
-/// matching the parts to them is the caller's, as `check_job`'s is (ADR-411).
+/// `declarations[i]` is the declaration part of `program.targets[i]`, and the run answers, builds
+/// and decodes through the part of the current target (ADR-325 items 3 and 4); a program with no
+/// target list has one target and takes one part. After [`Program::validate`], a number of parts
+/// other than [`Program::target_count`] ends the run before it starts with
+/// [`DryRunError::DeclarationParts`]. The hashes in [`crate::Target::declarations`] are not
+/// verified: matching the parts to them is the caller's, as `check_job`'s is (ADR-411).
 pub fn dry_run_targets(
     program: &Program,
     declarations: &[EcuVariant<'_>],
@@ -476,7 +477,9 @@ enum ProfileRequest {
 /// Whether `op` ends a scan from a `SecurityAccess` for its requests: any instruction that
 /// reaches the host, and a call or return, which leaves the straight-line code of one function.
 /// Every `SelectTarget` does: the scan is static, so it cannot tell whether one changes the
-/// target on the path taken (ADR-411).
+/// target on the path taken (ADR-411). A `SelectTarget` between two requests in code order
+/// keeps them from being paired; the scan does not follow jumps, so a jump can still pair
+/// requests across targets. The lowering never builds such a program, and ADR-390 accepts this.
 fn ends_profile_scan(op: &Op) -> bool {
     matches!(
         op,

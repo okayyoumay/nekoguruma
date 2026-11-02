@@ -41,8 +41,10 @@ per target, how the host follows the notification, what the profile scan of ADR-
    follow jumps, so it cannot tell whether a given `SelectTarget` changes the target on the path
    taken. The lowering emits one before the whole expansion of a handle's `security_access`
    (ADR-325 item 3), which the backward scan never reaches because the seed request stops it
-   first; one between the steps comes only from a hand-built program, whose requests stay
-   unmarked and end the run with `Undeclared`.
+   first; one between them in code order comes only from a hand-built program, whose requests
+   stay unmarked and end the run with `Undeclared`. The scan does not follow jumps, so a jump
+   can still pair requests across targets; the lowering never builds such a program, and
+   ADR-390 accepts this.
 6. The report records the target as additions, widening no variant: `DryRunEvent::SelectTarget
    { target }` at each change of target, and `DryRunReport::target`, the target current at the
    end (0 when the run was refused before it started). The target of an event is the last

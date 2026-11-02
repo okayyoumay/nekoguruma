@@ -5248,3 +5248,40 @@ fn a_precondition_source_may_name_another_target() {
     program.preconditions.engine = Some(precondition(Some(svc_on(0)), Some(svc_on(0))));
     assert_eq!(program.validate(), Ok(()));
 }
+
+#[test]
+fn the_first_access_target_is_the_one_with_the_lowest_index() {
+    let vin_on = |access: &[bool], target| {
+        let mut program = declared_targets_without_a_plan(access);
+        program.identity.vin = Some(svc_on(target));
+        program.validate()
+    };
+    assert_eq!(
+        vin_on(&[true, true], 1),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 1,
+            first_access_target: 0
+        })
+    );
+    assert_eq!(vin_on(&[true, true], 0), Ok(()));
+    assert_eq!(
+        vin_on(&[false, true, true], 2),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 2,
+            first_access_target: 1
+        })
+    );
+    assert_eq!(vin_on(&[false, true, true], 1), Ok(()));
+}
+
+#[test]
+fn source_and_plan_targets_survive_postcard() {
+    let mut program = declared_targets(&[false; 4]);
+    program.identity.vin = Some(svc_on(3));
+    program.flash[0].target = 2;
+    let bytes = postcard::to_allocvec(&program).unwrap();
+    let back: Program = postcard::from_bytes(&bytes).unwrap();
+    assert_eq!(postcard::to_allocvec(&back).unwrap(), bytes);
+    assert_eq!(back.identity.vin, Some(svc_on(3)));
+    assert_eq!(back.reprogramming_target(), Some(2));
+}

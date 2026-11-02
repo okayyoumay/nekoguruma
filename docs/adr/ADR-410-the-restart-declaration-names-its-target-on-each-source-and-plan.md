@@ -26,7 +26,10 @@ read of a source on another target.
    version sources lie on it does not apply there: the rule's reason is the restart's version
    comparison around the erase, and the agent reads those two sources only at a plan's entry
    and in the flash restart.
-3. `validate` refuses, in this order:
+3. `validate` refuses the following. The order inside `validate` is: for each plan, the range
+   check, then the access-target check, then the pairwise check of plans on several targets;
+   then for the identity sources the range check, the reprogramming-target rule and the VIN
+   rules; the precondition sources get their range check inside the precondition checks.
    - a target index at or past `target_count()` on a plan (`PlanTargetOutOfRange`) or on any
      identity or precondition source (`SourceTargetOutOfRange`); `TargetOutOfRange` stays for
      instructions;

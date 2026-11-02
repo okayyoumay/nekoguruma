@@ -3026,7 +3026,7 @@ mod tests {
                     declarations: [index; 32],
                 })
                 .collect(),
-            // A target list of any length but 0 needs a VIN source (ADR-325 item 5, ADR-410).
+            // Target 0 is an access target here, which needs a VIN source (ADR-325 item 5, ADR-410).
             identity: diag_ir::IdentitySources {
                 vin: Some(diag_ir::Source::EcuService {
                     target: 0,

@@ -1451,7 +1451,8 @@ check as well.
   The worker interface has no defined source for external supply, ignition, engine running or
   vehicle speed: raw pin voltages and analog inputs carry no agreed meaning for them, and
   `sim-vci` simulates only the battery voltage (ADR-238). So they read "cannot be established". `FixedInputs` holds fixed readings for tests.
-- Service fields: `ServiceSources` is a table from `(service_id, field_id)` to the request
+- Service fields: `ServiceSources` is a table from `(service_id, field_id)` (every source is on
+  the primary target, and a source off it is refused before it is sent, ADR-410) to the request
   (SID first), the offset after the response SID, the length and the encoding (unsigned
   big-endian integer, or printable ASCII). A job with a document gets its table from the
   document (`ServiceSources::from_document`, ADR-345): one entry per distinct

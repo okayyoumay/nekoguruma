@@ -64,7 +64,9 @@ use crate::declaration::{EcuVariant, Shape};
 /// 21: `Program` gained `targets`, `Op` gained `SelectTarget`, `VmState` gained `target` and
 /// `VmError` gained `BadTarget` (ADR-325 item 3, ADR-409); a program or state of version 20 does
 /// not decode.
-pub const IR_SCHEMA_VERSION: u32 = 21;
+/// 22: `Source::EcuService` and `FlashRecovery` gained `target`, the index into the program's
+/// target list (ADR-325 items 3 and 4, ADR-410); a program of version 21 does not decode.
+pub const IR_SCHEMA_VERSION: u32 = 22;
 
 /// The step budget of one run of a procedure, shared by the agent's default job limit and the
 /// conversion's dry run (ADR-391), so a procedure the conversion accepts does not run out of

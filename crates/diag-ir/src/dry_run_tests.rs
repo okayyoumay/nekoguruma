@@ -957,6 +957,7 @@ fn in_plan(mut ops: Vec<Op>) -> Program {
     ]);
     let mut program = program(ops, vec![vec![]]);
     let source = Some(Source::EcuService {
+        target: 0,
         service_id: 1,
         field_id: 1,
     });
@@ -966,6 +967,7 @@ fn in_plan(mut ops: Vec<Op>) -> Program {
         software_version: source,
     };
     program.flash.push(FlashRecovery {
+        target: 0,
         flash_session: 2,
         stage: 1,
         max_resumes: 3,

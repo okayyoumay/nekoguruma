@@ -3134,6 +3134,7 @@ fn restart_index() -> RequestIndex {
     };
     let supply = diag_ir::Source::RuntimeInput(diag_ir::RuntimeInput::SupplyVoltageMillivolts);
     let read = diag_ir::Source::EcuService {
+        target: 0,
         service_id: 4,
         field_id: 9,
     };
@@ -3623,6 +3624,7 @@ fn flash_index(identity: &[&str]) -> RequestIndex {
         programming_session: Some(diag_ir::Source::RuntimeInput(input)),
     };
     let read = Some(diag_ir::Source::EcuService {
+        target: 0,
         service_id: 4,
         field_id: 9,
     });

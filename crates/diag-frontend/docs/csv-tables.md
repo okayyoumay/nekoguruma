@@ -515,9 +515,9 @@ without the row cannot use that key. A kind is given once per variant
 
 The field starts at byte 0 of the record (no `byte` other than 0, no `bit`). The unsigned integer
 is a `uint` field of whole bytes, up to seven, in big-endian order, the one encoding the agent
-reads; the agent holds the value as a signed 64-bit integer, which every seven-byte value fits. The row becomes `Source::EcuService { service_id, field_id }`, the
-`Service.id` of the read and the `Field.id` of the field in the variant's document (section 3),
-the pair the agent's source table is keyed by. The field rules of section 5 run first: these
+reads; the agent holds the value as a signed 64-bit integer, which every seven-byte value fits. The row becomes `Source::EcuService { target, service_id, field_id }` with `target` 0 until
+the format declares targets (ADR-410), the `Service.id` of the read and the `Field.id` of the field in the variant's document (section 3),
+the pair of ids the agent's source table is keyed by. The field rules of section 5 run first: these
 checks follow them (section 7), and a definition with an error in `fields.csv` reports no
 identity or precondition field error.
 

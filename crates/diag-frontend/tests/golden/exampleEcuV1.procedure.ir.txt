@@ -1,5 +1,5 @@
 EcuDocumentT {
-    schema_version: 21,
+    schema_version: 22,
     source_format: Some(
         "csv-starlark",
     ),
@@ -2525,7 +2525,7 @@ EcuDocumentT {
     ),
 }
 Program {
-    schema_version: 21,
+    schema_version: 22,
     code: [
         PushBytes(
             0,
@@ -5732,18 +5732,21 @@ Program {
     identity: IdentitySources {
         vin: Some(
             EcuService {
+                target: 0,
                 service_id: 12,
                 field_id: 23,
             },
         ),
         hardware_part_number: Some(
             EcuService {
+                target: 0,
                 service_id: 10,
                 field_id: 21,
             },
         ),
         software_version: Some(
             EcuService {
+                target: 0,
                 service_id: 11,
                 field_id: 22,
             },
@@ -5843,6 +5846,7 @@ Program {
     },
     flash: [
         FlashRecovery {
+            target: 0,
             flash_session: 1,
             stage: 1,
             max_resumes: 3,

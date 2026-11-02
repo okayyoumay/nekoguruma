@@ -357,6 +357,7 @@ impl ServiceSources {
             if let Source::EcuService {
                 service_id,
                 field_id,
+                ..
             } = source
             {
                 match named
@@ -559,6 +560,28 @@ fn field_encoding(field: &Field<'_>) -> Result<Encoding, String> {
     }
 }
 
+/// Sends the request of a service source: the one place the agent's own source reads reach the
+/// host (ADR-397, ADR-410 item 4). The host serves one link, the primary target's, so a source
+/// on another target is refused and nothing is sent, as the host refuses a request the program
+/// addresses to another target. [`Program::validate`](diag_ir::Program::validate) and the job
+/// runner's one-target check keep such a source from getting here today.
+fn send_source_request<H>(
+    target: u8,
+    sid: u8,
+    payload: &[u8],
+    host: &mut H,
+) -> Result<Vec<u8>, HostError>
+where
+    H: DiagHost<Error = HostError>,
+{
+    if target != 0 {
+        return Err(HostError::Unsupported(
+            "a source on a target other than the primary",
+        ));
+    }
+    host.service_request(u16::from(sid), payload)
+}
+
 /// Reads one source with one value that is both the sender and the runtime inputs (the
 /// [`crate::WorkerHost`]): a runtime input through [`RuntimeInputs`], an `EcuService` field
 /// through `table` by sending its request. A source the table lacks, a negative response, a
@@ -576,6 +599,7 @@ where
     match source {
         Source::RuntimeInput(input) => host.read(input),
         Source::EcuService {
+            target,
             service_id,
             field_id,
         } => {
@@ -585,7 +609,7 @@ where
             let Some((&sid, payload)) = field.request.split_first() else {
                 return Ok(Reading::CannotBeDecoded);
             };
-            let response = host.service_request(u16::from(sid), payload)?;
+            let response = send_source_request(target, sid, payload, host)?;
             Ok(decode_field(field, sid, &response))
         }
     }
@@ -645,6 +669,7 @@ where
     let reading = match source {
         Source::RuntimeInput(input) => host.read(input)?,
         Source::EcuService {
+            target,
             service_id,
             field_id,
         } => match table
@@ -653,7 +678,7 @@ where
         {
             None => Reading::CannotBeDecoded,
             Some((field, (&sid, payload))) => {
-                let response = host.service_request(u16::from(sid), payload)?;
+                let response = send_source_request(target, sid, payload, host)?;
                 if let [0x7F, echoed, nrc] = response[..]
                     && echoed == sid
                 {
@@ -692,6 +717,7 @@ where
     H: DiagHost<Error = HostError>,
 {
     let Source::EcuService {
+        target,
         service_id,
         field_id,
     } = source
@@ -704,7 +730,7 @@ where
     let Some((&sid, payload)) = field.request.split_first() else {
         return Ok(FieldBytes::Unreadable);
     };
-    let response = host.service_request(u16::from(sid), payload)?;
+    let response = send_source_request(target, sid, payload, host)?;
     Ok(field_bytes_of(field, sid, &response))
 }
 
@@ -1017,6 +1043,7 @@ mod tests {
 
     fn ecu(service_id: u32, field_id: u32) -> Source {
         Source::EcuService {
+            target: 0,
             service_id,
             field_id,
         }
@@ -1140,6 +1167,33 @@ mod tests {
             Reading::Text("WVWZZZ1JZXW000001".to_owned())
         );
         assert_eq!(host.sent, [(0x22, vec![0xF1, 0x90])]);
+    }
+
+    /// ADR-410 item 4: a source on a target other than the primary is refused by all three
+    /// readers, and the host sees no request.
+    #[test]
+    fn a_source_off_the_primary_is_refused_and_not_sent() {
+        let off = Source::EcuService {
+            target: 1,
+            service_id: 1,
+            field_id: 1,
+        };
+        let refused = |e: &HostError| matches!(e, HostError::Unsupported(_));
+        let mut host = Fake::answering(&vin_response(b"WVWZZZ1JZXW000001"));
+        assert!(refused(
+            &resolve_source(off, &table(), &mut host).unwrap_err()
+        ));
+        assert!(refused(
+            &resolve_identity(diag_ir::IdentityKind::Vin, off, &table(), &mut host).unwrap_err()
+        ));
+        assert!(refused(
+            &read_field_bytes(off, &table(), &mut host).unwrap_err()
+        ));
+        assert!(host.sent.is_empty());
+        assert!(host.noted.is_empty());
+        // The same field on the primary is sent.
+        assert!(resolve_source(ecu(1, 1), &table(), &mut host).is_ok());
+        assert_eq!(host.sent.len(), 1);
     }
 
     #[test]
@@ -1365,6 +1419,7 @@ mod tests {
 
         fn ecu(service_id: u32) -> Source {
             Source::EcuService {
+                target: 0,
                 service_id,
                 field_id: 1,
             }
@@ -1497,6 +1552,7 @@ mod tests {
             // A field the service does not have.
             let mut program = named();
             program.identity.vin = Some(Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 2,
             });
@@ -1724,6 +1780,7 @@ mod tests {
                     let Source::EcuService {
                         service_id,
                         field_id,
+                        ..
                     } = source
                     else {
                         panic!("{source:?}");

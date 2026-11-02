@@ -238,6 +238,7 @@ fn program() -> Program {
         },
     ]);
     let ecu = |field_id| Source::EcuService {
+        target: 0,
         service_id: 1,
         field_id,
     };
@@ -268,6 +269,7 @@ fn program() -> Program {
         programming_session: vbatt,
     });
     program.flash.push(FlashRecovery {
+        target: 0,
         flash_session: 1,
         stage: STAGE,
         max_resumes: 2,

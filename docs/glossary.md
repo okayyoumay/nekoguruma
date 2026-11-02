@@ -117,7 +117,7 @@ Ethernet-based diagnostic transport (ISO 13400). Supported by D-PDU API but not 
 ---
 
 **Flash recovery plan** (IR)  
-The procedure part's declaration of how an interrupted flash session restarts (`diag_ir::FlashRecovery`, ADR-245): the flash session it covers, the journal stage and its resume limit, the **recovery boundaries**, the point from which an interruption requires on-site intervention (or none), the session timeout, teardown margin, ECU startup time and confirmation window, the version-read retry limit and the response that means no application is present. `Program::validate` checks it at load (ADR-229, ADR-245).
+The procedure part's declaration of how an interrupted flash session restarts (`diag_ir::FlashRecovery`, ADR-245): the flash session it covers, the target it is on, the journal stage and its resume limit, the **recovery boundaries**, the point from which an interruption requires on-site intervention (or none), the session timeout, teardown margin, ECU startup time and confirmation window, the version-read retry limit and the response that means no application is present. `Program::validate` checks it at load (ADR-229, ADR-245).
 
 ## E–G
 
@@ -378,6 +378,9 @@ A ComParam data type whose value is an array of same-sized struct entries, the l
 
 **Recovery boundary** (IR)  
 One of a **flash recovery plan**'s four positions in the bytecode: where the replayable pre-erase steps begin, the erase (or RequestDownload when there is no erase) that the transfer-start marker precedes, the RequestTransferExit that its marker precedes, and the end of the post-transfer steps, where they are journaled as complete (ADR-245).
+
+**Reprogramming target** (IR)  
+The one target that every flash plan of a program names (`Program::reprogramming_target`, ADR-325 item 9, ADR-410); a program without a flash plan has none. The restart's hardware identity and software version sources must lie on it, and the flash plan may not be on an access target.
 
 **Runtime input** (IR)  
 A state the agent or the VCI reports rather than an ECU service: supply voltage, external supply connected, ignition, engine running, vehicle speed. A precondition's source in the procedure part names either a runtime input or an ECU service field; an identity source is always an ECU service field (`diag_ir::Source`, ADR-245); a running procedure reads one with `Op::ReadInput`, which `diag.precondition` lowers to for such a source (ADR-338).

@@ -17,8 +17,14 @@ use crate::{Idempotency, Interruptible, MAX_FAILURE_CODE_LEN, MAX_TARGETS, Op, P
 #[serde(deny_unknown_fields)]
 pub enum Source {
     /// A field of a diagnostic service response. Both ids start at 1 (`Service` and `Field` in
-    /// the declaration part, `ir.fbs`).
-    EcuService { service_id: u32, field_id: u32 },
+    /// the declaration part, `ir.fbs`) and index the declaration part of `target`, the index
+    /// into [`Program::targets`] (0 is the primary; ADR-325 items 3 and 4, ADR-410).
+    EcuService {
+        #[serde(default)]
+        target: u8,
+        service_id: u32,
+        field_id: u32,
+    },
     /// A value the agent measures or derives itself.
     RuntimeInput(RuntimeInput),
 }
@@ -117,7 +123,9 @@ pub struct Precondition {
     pub default_session: Option<Source>,
     /// Where the value is read in the programming session: the source the restart's second check
     /// reads immediately before the erase, after the plan's steps from its entry have run
-    /// (ADR-229 item 2 step 4). It must be usable in the programming session. The agent tracks
+    /// (ADR-229 item 2 step 4). It must be usable in the programming session; that remark
+    /// concerns the reprogramming target, and a source on another target is read in whatever
+    /// session that target is in (ADR-410). The agent tracks
     /// no session: a plan whose `[entry_pc, erase_pc)` re-enters no programming session leaves
     /// the ECU in its default session at that point, and a source that answers only in the
     /// programming session then fails the check, with nothing erased.
@@ -163,6 +171,11 @@ impl Preconditions {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct FlashRecovery {
+    /// The target the plan is on: an index into [`Program::targets`] (ADR-325 item 9,
+    /// ADR-410). Every plan of a program names the same one
+    /// ([`Program::reprogramming_target`]).
+    #[serde(default)]
+    pub target: u8,
     /// `FlashSession.id` in the declaration part (`ir.fbs`).
     pub flash_session: u32,
     /// The stage of the agent's journal this plan drives (ADR-229).
@@ -383,6 +396,32 @@ pub enum ProgramError {
     TargetOutOfRange { pc: u32, target: u8 },
     #[error("targets {a} and {b} have the same declaration hash (ADR-325 item 1)")]
     DuplicateTargetDeclarations { a: usize, b: usize },
+    #[error(
+        "recovery plans of flash sessions {a} and {b} are on different targets; a program reprograms one target (ADR-325 item 9)"
+    )]
+    FlashPlansOnSeveralTargets { a: u32, b: u32 },
+    #[error(
+        "{kind:?} source is on target {target} but the reprogramming target is {reprogramming_target} (ADR-325 item 4)"
+    )]
+    SourceOffReprogrammingTarget {
+        kind: IdentityKind,
+        target: u8,
+        reprogramming_target: u8,
+    },
+    #[error(
+        "flash session {flash_session}: target {target} is an access target, which takes no flash plan (ADR-325 item 13)"
+    )]
+    FlashPlanOnAccessTarget { flash_session: u32, target: u8 },
+    #[error(
+        "the VIN source is on target {target} but the first access target is {first_access_target} (ADR-325 item 5)"
+    )]
+    VinOffFirstAccessTarget { target: u8, first_access_target: u8 },
+    #[error("target {target} of the source ({owner:?}) is not in the program's target list")]
+    SourceTargetOutOfRange { owner: SourceOwner, target: u8 },
+    #[error(
+        "flash session {flash_session}: target {target} is not in the program's target list (ADR-325 item 3)"
+    )]
+    PlanTargetOutOfRange { flash_session: u32, target: u8 },
 }
 
 impl ProgramError {
@@ -427,7 +466,13 @@ impl ProgramError {
             | Self::MissingRequestDownload { .. }
             | Self::ReservedStage { .. }
             | Self::TooManyTargets { .. }
-            | Self::DuplicateTargetDeclarations { .. } => None,
+            | Self::DuplicateTargetDeclarations { .. }
+            | Self::FlashPlansOnSeveralTargets { .. }
+            | Self::SourceOffReprogrammingTarget { .. }
+            | Self::FlashPlanOnAccessTarget { .. }
+            | Self::VinOffFirstAccessTarget { .. }
+            | Self::SourceTargetOutOfRange { .. }
+            | Self::PlanTargetOutOfRange { .. } => None,
         }
     }
 }
@@ -463,17 +508,42 @@ fn is_download(op: &Op) -> bool {
     )
 }
 
-fn check_ids(source: Source, owner: SourceOwner) -> Result<(), ProgramError> {
+/// The checks every source passes: ids start at 1 and the target is in the list of
+/// `target_count` targets (ADR-410).
+fn check_source(
+    source: Source,
+    owner: SourceOwner,
+    target_count: usize,
+) -> Result<(), ProgramError> {
     match source {
+        Source::EcuService { target, .. } if usize::from(target) >= target_count => {
+            Err(ProgramError::SourceTargetOutOfRange { owner, target })
+        }
         Source::EcuService {
             service_id,
             field_id,
+            ..
         } if service_id == 0 || field_id == 0 => Err(ProgramError::ZeroId { owner }),
         _ => Ok(()),
     }
 }
 
+/// The target of a service source; `None` for a runtime input.
+fn source_target(source: Option<Source>) -> Option<u8> {
+    match source {
+        Some(Source::EcuService { target, .. }) => Some(target),
+        _ => None,
+    }
+}
+
 impl Program {
+    /// The target the flash plans name, which [`Program::validate`] requires them to share
+    /// (ADR-325 item 9, ADR-410); `None` for a program without a plan. Meaningful once
+    /// `validate` has passed.
+    pub fn reprogramming_target(&self) -> Option<u8> {
+        self.flash.first().map(|plan| plan.target)
+    }
+
     /// Checks the restart declaration (ADR-245): the sections, each plan's boundaries and the
     /// instructions at them, where download instructions sit, the control flow into, inside
     /// and out of each plan, and the identity and precondition sources. It does not check the
@@ -542,6 +612,7 @@ impl Program {
                 return Err(ProgramError::InvalidSection { section });
             }
         }
+        let target_count = self.target_count();
         for (index, plan) in self.flash.iter().enumerate() {
             if plan.stage == PLAIN_PROCEDURE_STAGE {
                 return Err(ProgramError::ReservedStage {
@@ -549,8 +620,31 @@ impl Program {
                     stage: plan.stage,
                 });
             }
+            // The plan's target (ADR-325 items 3 and 13, ADR-410).
+            if usize::from(plan.target) >= target_count {
+                return Err(ProgramError::PlanTargetOutOfRange {
+                    flash_session: plan.flash_session,
+                    target: plan.target,
+                });
+            }
+            if self
+                .targets
+                .get(usize::from(plan.target))
+                .is_some_and(|t| t.access)
+            {
+                return Err(ProgramError::FlashPlanOnAccessTarget {
+                    flash_session: plan.flash_session,
+                    target: plan.target,
+                });
+            }
             self.validate_plan(plan)?;
             for other in &self.flash[..index] {
+                if other.target != plan.target {
+                    return Err(ProgramError::FlashPlansOnSeveralTargets {
+                        a: other.flash_session,
+                        b: plan.flash_session,
+                    });
+                }
                 if other.flash_session == plan.flash_session {
                     return Err(ProgramError::DuplicateFlashSession(plan.flash_session));
                 }
@@ -609,9 +703,49 @@ impl Program {
                 Some(Source::RuntimeInput(_)) => {
                     return Err(ProgramError::IdentityFromRuntimeInput(kind));
                 }
-                Some(source) => check_ids(source, SourceOwner::Identity(kind))?,
+                Some(source) => check_source(source, SourceOwner::Identity(kind), target_count)?,
                 None => {}
             }
+        }
+        // The reprogramming target's own sources (ADR-325 item 4): the plan's entry record reads
+        // the hardware part number and the software version whether or not the plan allows a
+        // restart. A program without a plan has no such rule (ADR-410 item 2).
+        if let Some(reprogramming) = self.reprogramming_target() {
+            for (kind, source) in [
+                (
+                    IdentityKind::HardwarePartNumber,
+                    self.identity.hardware_part_number,
+                ),
+                (
+                    IdentityKind::SoftwareVersion,
+                    self.identity.software_version,
+                ),
+            ] {
+                if let Some(target) = source_target(source)
+                    && target != reprogramming
+                {
+                    return Err(ProgramError::SourceOffReprogrammingTarget {
+                        kind,
+                        target,
+                        reprogramming_target: reprogramming,
+                    });
+                }
+            }
+        }
+        // The VIN (ADR-325 items 4 and 5): required with several targets or an access target
+        // (a lone access primary included), and then on the first access target when there is
+        // one.
+        let first_access = self.targets.iter().position(|t| t.access);
+        if (self.target_count() > 1 || first_access.is_some()) && self.identity.vin.is_none() {
+            return Err(ProgramError::MissingIdentitySource(IdentityKind::Vin));
+        }
+        if let (Some(first), Some(target)) = (first_access, source_target(self.identity.vin))
+            && usize::from(target) != first
+        {
+            return Err(ProgramError::VinOffFirstAccessTarget {
+                target,
+                first_access_target: first as u8,
+            });
         }
         for (kind, precondition) in self.preconditions.declared() {
             let Some(precondition) = precondition else {
@@ -646,7 +780,11 @@ impl Program {
                     Some(Source::RuntimeInput(input)) if !input.reports(kind) => {
                         return Err(ProgramError::InputDoesNotReport { kind, input });
                     }
-                    Some(source) => check_ids(source, SourceOwner::Precondition { kind, session })?,
+                    Some(source) => check_source(
+                        source,
+                        SourceOwner::Precondition { kind, session },
+                        target_count,
+                    )?,
                     None => {}
                 }
             }

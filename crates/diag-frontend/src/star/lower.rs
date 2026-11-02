@@ -5326,14 +5326,17 @@ impl<'a> Lowerer<'a> {
             );
             return none();
         };
+        // The tables resolve against the primary only; a source on another target is not
+        // lowered against them (ADR-410).
         let diag_ir::Source::EcuService {
+            target: 0,
             service_id,
             field_id,
         } = source
         else {
             self.not_lowerable(
                 key_arg.span,
-                format!("the {label} identity row is not a service source (3.2)"),
+                format!("the {label} identity row is not a service source on the primary (3.2)"),
             );
             return none();
         };
@@ -5491,9 +5494,21 @@ impl<'a> Lowerer<'a> {
                 Tys::of(Ty::Int),
                 vec![(Ins::Op(Op::ReadInput { input }), span)],
             ),
+            // The tables resolve against the primary only (ADR-410).
+            diag_ir::Source::EcuService { target, .. } if target != 0 => {
+                self.not_lowerable(
+                    name_arg.span,
+                    format!(
+                        "the source of the {name} precondition is on a target other than the \
+                         primary (3.2)"
+                    ),
+                );
+                none()
+            }
             diag_ir::Source::EcuService {
                 service_id,
                 field_id,
+                ..
             } => {
                 let request = self
                     .service_at
@@ -7178,6 +7193,8 @@ impl<'a> Lowerer<'a> {
             RecoveryRequired::FromPc(range.recovery.unwrap_or(erase))
         };
         FlashRecovery {
+            // The format declares no targets yet (ADR-410).
+            target: 0,
             flash_session: info.session,
             stage: info.session,
             max_resumes: info.max_resumes,

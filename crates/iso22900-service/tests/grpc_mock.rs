@@ -263,6 +263,10 @@ async fn module_time(client: &mut VciServiceClient<Channel>) -> u32 {
 /// arrived: the item's time comes from that clock, between the two reads.
 fn assert_result_event_item(event_item: &EventItem, expected_cop_handle: u32, window: (u32, u32)) {
     assert!(
+        window.0 < window.1,
+        "the clock reads {window:?} do not grow"
+    );
+    assert!(
         (window.0..=window.1).contains(&event_item.timestamp),
         "item time {} outside the clock reads {window:?}",
         event_item.timestamp
@@ -388,6 +392,7 @@ async fn grpc_server_responds_through_mock_library() {
     assert!(status.status.is_some());
 
     let clock_before = module_time(&mut client).await;
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let timestamp = client
         .get_timestamp(GetTimestampRequest {
             module_handle: Some(ModuleHandle {
@@ -399,8 +404,19 @@ async fn grpc_server_responds_through_mock_library() {
         .into_inner();
     // The module clock only moves forward: a read before the call is not later than it, and a
     // read after is not earlier.
-    assert!(timestamp.timestamp >= clock_before);
-    assert!(module_time(&mut client).await >= timestamp.timestamp);
+    // and the clock grows with real time: at least the 2 ms slept between the reads.
+    assert!(
+        timestamp.timestamp.wrapping_sub(clock_before) >= 2_000,
+        "clock {clock_before} then {}",
+        timestamp.timestamp
+    );
+    tokio::time::sleep(Duration::from_millis(2)).await;
+    let clock_after = module_time(&mut client).await;
+    assert!(
+        clock_after.wrapping_sub(timestamp.timestamp) >= 2_000,
+        "clock {} then {clock_after}",
+        timestamp.timestamp
+    );
     assert_eq!(
         timestamp.timestamp_clock(),
         vci_service_interface::TimestampClock::Device
@@ -589,6 +605,7 @@ async fn grpc_server_responds_through_mock_library() {
         .into_inner();
 
     let event_item = event_item.event_item.expect("event_item should be present");
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let clock_after_item = module_time(&mut client).await;
     assert_result_event_item(
         &event_item,
@@ -880,6 +897,7 @@ async fn grpc_subscribe_event_streams_mock_event() {
         .expect("stream should remain open")
         .expect("streamed event should be present");
 
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let clock_after_item = module_time(&mut command_client).await;
     assert_result_notification(notification, (clock_before_start, clock_after_item));
 
@@ -940,6 +958,7 @@ async fn subscribe_event_echoes_cop_tag_racing_start_response() {
     );
 
     start_result.expect("start_com_primitive should succeed");
+    tokio::time::sleep(Duration::from_millis(2)).await;
     let clock_after_item = module_time(&mut command_client).await;
 
     let notification = event_result

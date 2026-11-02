@@ -69,13 +69,21 @@ const MOCK_COM_PRIMITIVE_HANDLE: UNUM32 = 4001;
 /// The module clock: microseconds since the mock state was created, from a monotonic clock,
 /// truncated to `UNUM32` (ISO 22900-2 (2022) 10.1.4.11.4 times, `PDUGetTimestamp`). Every event
 /// item's `Timestamp` and the transmit-done and start-of-message times come from it.
+///
+/// The epoch is the first call to `state()` or to the clock; `__mock_reset` does not restart it.
 fn clock_now() -> UNUM32 {
+    clock_at(Instant::now())
+}
+
+/// The module clock at `instant`; an instant before the epoch reads 0.
+fn clock_at(instant: Instant) -> UNUM32 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
-    EPOCH.get_or_init(Instant::now).elapsed().as_micros() as UNUM32
+    let epoch = *EPOCH.get_or_init(Instant::now);
+    instant.saturating_duration_since(epoch).as_micros() as UNUM32
 }
 
 /// `TimestampFlags` bits of a result item: the transmit-done time and the start-of-message time
-/// are valid (ISO 22900-2 (2022) D.2: byte 0, bits 7 and 6).
+/// are valid (ISO 22900-2 (2022) D.2.4: byte 0, bits 7 and 6; the default flag width is 4 bytes).
 const TIMESTAMP_FLAG_TX_DONE: UNUM8 = 0x80;
 const TIMESTAMP_FLAG_START_MSG: UNUM8 = 0x40;
 const MOCK_VERSION_TAG: &[u8] = b"iso22900-mock\0";
@@ -112,9 +120,13 @@ struct PendingEvent {
 /// request's transmit done, so a latency measured between them is positive even when the ECU
 /// answers at once.
 fn stamp(event: &mut PendingEvent) {
-    let now = clock_now();
+    stamp_at(event, clock_now());
+}
+
+/// Like [`stamp`], for the clock reading `now`.
+fn stamp_at(event: &mut PendingEvent, now: UNUM32) {
     event.timestamp = match event.tx_done {
-        Some(tx_done) if now <= tx_done => tx_done.wrapping_add(1),
+        Some(tx_done) if (now.wrapping_sub(tx_done) as i32) <= 0 => tx_done.wrapping_add(1),
         _ => now,
     };
 }
@@ -393,9 +405,12 @@ unsafe fn make_event_item(event: PendingEvent) -> *mut PDU_EVENT_ITEM {
                 TimestampFlags: match event.tx_done {
                     // A response: the request's transmit done and the response's start.
                     Some(_) => PDU_FLAG_DATA {
-                        NumFlagBytes: 1,
+                        NumFlagBytes: 4,
                         pFlagData: Box::into_raw(Box::new([
-                            TIMESTAMP_FLAG_TX_DONE | TIMESTAMP_FLAG_START_MSG
+                            TIMESTAMP_FLAG_TX_DONE | TIMESTAMP_FLAG_START_MSG,
+                            0,
+                            0,
+                            0,
                         ]))
                         .cast::<UNUM8>(),
                     },
@@ -499,7 +514,7 @@ fn begin_next(state: &mut MockState, now: Instant) {
     };
     let events = match (state.ecu.as_mut(), cop.request) {
         (Some(ecu), Some((request, cycles))) => {
-            let sent = clock_now();
+            let sent = clock_at(now);
             let mut events = ecu_events(ecu, &request, cycles, &cop.event);
             // The request is sent now; each response item carries that as its transmit done.
             for (_, event) in &mut events {
@@ -511,8 +526,19 @@ fn begin_next(state: &mut MockState, now: Instant) {
         }
         _ => vec![(0, cop.event)],
     };
-    for (delay_ms, event) in events {
+    // Each item is stamped with the clock at its scheduled time, as `sim-vci` does, so a latency
+    // between two items is the ECU's delay and not the delivery thread's scheduling. Items keep
+    // their order: no item is stamped earlier than the one before it.
+    let mut previous: Option<UNUM32> = None;
+    for (delay_ms, mut event) in events {
         let due = now + Duration::from_millis(delay_ms.into());
+        stamp_at(&mut event, clock_at(due));
+        if let Some(previous) = previous
+            && (event.timestamp.wrapping_sub(previous) as i32) < 0
+        {
+            event.timestamp = previous;
+        }
+        previous = Some(event.timestamp);
         state.scheduled.push_back((due, event));
     }
 }
@@ -600,8 +626,8 @@ fn deliver() {
                     .0;
             }
             Some(_) => {
-                let (_, mut event) = guard.scheduled.pop_front().expect("an event is due");
-                stamp(&mut event);
+                // Stamped with its scheduled time when the ComPrimitive began (`begin_next`).
+                let (_, event) = guard.scheduled.pop_front().expect("an event is due");
                 guard.pending_events.push(event.clone());
                 let (callback, api_tag) = (guard.callback, guard.api_tag);
                 drop(guard);

@@ -29,7 +29,7 @@ fn mock_library_supports_basic_wrapper_calls() {
         .get_timestamp(module_handle)
         .expect("timestamp should succeed");
     assert!(
-        second >= first + 2_000,
+        second.wrapping_sub(first) >= 2_000,
         "the module clock should advance by at least the 2 ms slept: {first} then {second}"
     );
 }

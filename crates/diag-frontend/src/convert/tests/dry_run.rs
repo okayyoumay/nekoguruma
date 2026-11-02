@@ -295,6 +295,7 @@ fn report(end: DryRunEnd, events: Vec<DryRunEvent>) -> DryRunReport {
         end,
         steps: 1,
         pc: 0,
+        target: 0,
     }
 }
 

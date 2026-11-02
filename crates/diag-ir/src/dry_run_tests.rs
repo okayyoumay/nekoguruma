@@ -1076,7 +1076,8 @@ fn a_flash_transfer_event_holds_the_blocks_length_and_digest() {
     let variant = loaded.variant().expect("a variant");
     let script = Script::new();
     let mut host = ScriptedHost {
-        variant: &variant,
+        declarations: std::slice::from_ref(&variant),
+        target: 0,
         script: &script,
         used: HashMap::new(),
         marks: HashMap::new(),
@@ -1268,4 +1269,396 @@ fn select_target_is_accepted_by_the_dry_run() {
     let code = vec![Op::SelectTarget { target: 0 }, Op::Wait { millis: 1 }];
     let report = run(&buf, &program(code, Vec::new()), &Script::new());
     assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    // The target did not change, so the run records no change.
+    assert_eq!(report.events, [DryRunEvent::Wait { millis: 1 }]);
+    assert_eq!(report.target, 0);
+}
+
+// ---------------------------------------------------------------- Several targets (ADR-411)
+
+/// `program` listing `count` targets, each with its own declaration hash. The VIN is read from
+/// target 0, which a program of several targets requires.
+fn program_with_targets(code: Vec<Op>, constants: Vec<Vec<u8>>, count: u8) -> Program {
+    let mut program = program(code, constants);
+    program.targets = (0..count)
+        .map(|index| crate::Target {
+            access: false,
+            declarations: [index + 1; 32],
+        })
+        .collect();
+    program.identity.vin = Some(crate::Source::EcuService {
+        target: 0,
+        service_id: 1,
+        field_id: 1,
+    });
+    program
+}
+
+/// A dry run with one declaration part per buffer, in order.
+fn run_targets(bufs: &[Vec<u8>], program: &Program, script: &Script) -> DryRunReport {
+    let loaded: Vec<_> = bufs
+        .iter()
+        .map(|buf| load_ecu_document(buf).expect("test document loads"))
+        .collect();
+    let parts: Vec<_> = loaded
+        .iter()
+        .map(|document| document.variant().expect("a variant"))
+        .collect();
+    dry_run_targets(program, &parts, script, 10_000)
+}
+
+/// A document whose "read" service (0x22, prefix F1 89) has a positive response of one field of
+/// `bits` bits, so the answer built from it is `1 + bits / 8` bytes.
+fn read_document(bits: u32) -> Vec<u8> {
+    document(
+        vec![service(
+            1,
+            "read",
+            0x22,
+            &[0xF1, 0x89],
+            vec![next(1, DataKind::Uint, bits)],
+        )],
+        vec![],
+    )
+}
+
+/// The request `22 F1 89` of the "read" service, as `ServiceRequest` takes it (constant 0 holds
+/// the payload), and a pop of the answer.
+fn read_request() -> [Op; 3] {
+    [
+        Op::PushBytes(0),
+        Op::ServiceRequest { service: 0x22 },
+        Op::Pop,
+    ]
+}
+
+fn read_constants() -> Vec<Vec<u8>> {
+    vec![vec![0xF1, 0x89]]
+}
+
+/// The answers and whether they were built, of the report's `Request` events.
+fn answers(report: &DryRunReport) -> Vec<(Vec<u8>, bool)> {
+    report
+        .events
+        .iter()
+        .filter_map(|event| match event {
+            DryRunEvent::Request { answer, built, .. } => Some((answer.clone(), *built)),
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn a_request_is_answered_from_the_current_targets_declarations() {
+    // Part 0 builds a 3-byte answer to the read, part 1 an 8-byte one.
+    let bufs = [read_document(16), read_document(56)];
+    let mut code = Vec::new();
+    code.extend(read_request());
+    code.push(Op::SelectTarget { target: 1 });
+    code.extend(read_request());
+    code.push(Op::SelectTarget { target: 0 });
+    code.extend(read_request());
+    let program = program_with_targets(code, read_constants(), 2);
+    // The built defaults script nothing per service, so the answers are built the same way.
+    for script in [Script::new(), Script::built_defaults()] {
+        let report = run_targets(&bufs, &program, &script);
+        assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+        let lens: Vec<_> = answers(&report).iter().map(|(a, _)| a.len()).collect();
+        assert_eq!(lens, [3, 8, 3], "{report:?}");
+        let kinds: Vec<_> = report
+            .events
+            .iter()
+            .map(|event| match event {
+                DryRunEvent::Request { .. } => "request",
+                DryRunEvent::SelectTarget { target: 1 } => "select 1",
+                DryRunEvent::SelectTarget { target: 0 } => "select 0",
+                other => panic!("{other:?}"),
+            })
+            .collect();
+        assert_eq!(
+            kinds,
+            ["request", "select 1", "request", "select 0", "request"]
+        );
+        assert_eq!(report.target, 0);
+    }
+}
+
+#[test]
+fn a_program_that_never_switches_answers_from_the_primary() {
+    let bufs = [read_document(16), read_document(56)];
+    let mut code = Vec::new();
+    code.extend(read_request());
+    // Never taken: the jump over it is unconditional.
+    code.push(Op::Jump(5));
+    code.push(Op::SelectTarget { target: 1 });
+    code.push(Op::Wait { millis: 1 });
+    let program = program_with_targets(code, read_constants(), 2);
+    let report = run_targets(&bufs, &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(answers(&report), [(vec![0x62, 0, 0], true)]);
+    assert!(
+        !report
+            .events
+            .iter()
+            .any(|event| matches!(event, DryRunEvent::SelectTarget { .. })),
+        "{report:?}"
+    );
+    assert_eq!(report.target, 0);
+}
+
+/// Target 0 declares service 1 only. Target 1 declares service 7 (request 22, a one-byte
+/// field).
+fn two_distinct_parts() -> [Vec<u8>; 2] {
+    [
+        read_document(16),
+        document(
+            vec![service(
+                7,
+                "other",
+                0x22,
+                &[],
+                vec![next(1, DataKind::Uint, 8)],
+            )],
+            vec![],
+        ),
+    ]
+}
+
+#[test]
+fn a_field_is_decoded_through_the_current_targets_declarations() {
+    let program = program_with_targets(
+        vec![
+            Op::SelectTarget { target: 1 },
+            Op::PushBytes(0),
+            Op::SendReceive { service: 7 },
+            Op::DecodeField {
+                service: 7,
+                field: 1,
+            },
+            Op::Pop,
+        ],
+        vec![vec![0x22]],
+        2,
+    );
+    let report = run_targets(&two_distinct_parts(), &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(report.target, 1);
+}
+
+#[test]
+fn a_service_only_another_target_declares_is_unknown() {
+    // Service 1 is target 0's; target 1 is current.
+    let program = program_with_targets(
+        vec![
+            Op::SelectTarget { target: 1 },
+            Op::PushBytes(0),
+            Op::SendReceive { service: 1 },
+            Op::Pop,
+        ],
+        vec![vec![0x22]],
+        2,
+    );
+    let report = run_targets(&two_distinct_parts(), &program, &Script::new());
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::UnknownService { service: 1 }),
+        "{report:?}"
+    );
+    assert_eq!(report.target, 1);
+}
+
+#[test]
+fn a_part_count_other_than_the_targets_is_refused() {
+    let part = read_document(16);
+    let wait = vec![Op::Wait { millis: 1 }];
+    let refused =
+        |expected, given| DryRunEnd::Host(DryRunError::DeclarationParts { expected, given });
+    // Two targets, one part; one target, two parts.
+    let two = program_with_targets(wait.clone(), Vec::new(), 2);
+    let report = run_targets(std::slice::from_ref(&part), &two, &Script::new());
+    assert_eq!(report.end, refused(2, 1));
+    assert_eq!((report.steps, report.pc, report.target), (0, 0, 0));
+    assert!(report.events.is_empty());
+    let one = program(wait, Vec::new());
+    let report = run_targets(&[part.clone(), part.clone()], &one, &Script::new());
+    assert_eq!(report.end, refused(1, 2));
+    // No part at all is a mismatch too, even for a program with no target list.
+    let report = run_targets(&[], &one, &Script::new());
+    assert_eq!(report.end, refused(1, 0));
+    // The program's own fault is reported first.
+    let out_of_range = program_with_targets(vec![Op::SelectTarget { target: 2 }], Vec::new(), 2);
+    let report = run_targets(&[part], &out_of_range, &Script::new());
+    assert_eq!(
+        report.end,
+        DryRunEnd::Invalid(ProgramError::TargetOutOfRange { pc: 0, target: 2 })
+    );
+}
+
+#[test]
+fn a_scripted_response_addresses_one_target() {
+    let bufs = [read_document(16), read_document(16)];
+    let mut code = Vec::new();
+    code.extend(read_request());
+    code.extend(read_request());
+    code.push(Op::SelectTarget { target: 1 });
+    code.extend(read_request());
+    code.extend(read_request());
+    let program = program_with_targets(code, read_constants(), 2);
+    // `response` is target 0's, so target 1 builds its answers; `response_on(1, ..)` is target
+    // 1's own list, used up in its own order; an answer for target 5 is never used.
+    let script = Script::new()
+        .response("read", vec![0x62, 0xA1])
+        .response_on(1, "read", vec![0x62, 0xB1])
+        .response_on(1, "read", vec![0x62, 0xB2])
+        .response_on(5, "read", vec![0x62, 0xEE]);
+    let report = run_targets(&bufs, &program, &script);
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    assert_eq!(
+        answers(&report),
+        [
+            (vec![0x62, 0xA1], false),
+            // Target 0's list is used up: its last answer again.
+            (vec![0x62, 0xA1], false),
+            (vec![0x62, 0xB1], false),
+            (vec![0x62, 0xB2], false),
+        ]
+    );
+    // Only target 0 scripted: target 1 builds.
+    let report = run_targets(
+        &bufs,
+        &program,
+        &Script::new().response("read", vec![0x62, 1]),
+    );
+    assert_eq!(
+        answers(&report)[2..],
+        [(vec![0x62, 0, 0], true), (vec![0x62, 0, 0], true)]
+    );
+}
+
+/// `security_access_program`'s code with `inserted` ops put in at `at`, the jump target moved
+/// with them.
+fn security_access_with(at: usize, inserted: &[Op]) -> Program {
+    let mut code = security_access_program().code;
+    for op in &mut code {
+        if let Op::JumpIfFalse(target) = op
+            && *target as usize >= at
+        {
+            *target += inserted.len() as u32;
+        }
+    }
+    code.splice(at..at, inserted.iter().cloned());
+    program_with_targets(code, vec![vec![1], vec![0x7F], vec![2]], 2)
+}
+
+#[test]
+fn a_scripted_seed_addresses_one_target() {
+    let bufs = [document(vec![], vec![]), document(vec![], vec![])];
+    // The expansion on target 0, then twice on target 1.
+    let first = security_access_program();
+    let mut code = Vec::new();
+    let expand = |code: &mut Vec<Op>| {
+        let shift = code.len() as u32;
+        code.extend(first.code.iter().map(|op| match op {
+            Op::JumpIfFalse(target) => Op::JumpIfFalse(target + shift),
+            other => other.clone(),
+        }));
+    };
+    expand(&mut code);
+    code.push(Op::SelectTarget { target: 1 });
+    expand(&mut code);
+    expand(&mut code);
+    let program = program_with_targets(code, first.constants.clone(), 2);
+    // Target 1's list is scripted first and is negative then positive; target 0's is positive.
+    // A list or a count shared by the targets would give target 0 the negative answer or
+    // target 1's first call the positive one.
+    let script = Script::new()
+        .seed_on(1, vec![0x7F, 0x27, 0x37])
+        .seed_on(1, vec![0x67, 1, 7, 6])
+        .seed(vec![0x67, 1, 9, 8])
+        .key(vec![0x55]);
+    let report = run_targets(&bufs, &program, &script);
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    let [seed0, access0, key0, select, seed1, seed2, access1, key1] = &report.events[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!(profile_request(seed0).1, &[0x67, 1, 9, 8][..]);
+    assert!(matches!(access0, DryRunEvent::SecurityAccess { .. }));
+    assert_eq!(profile_request(key0).0, PROFILE_KEY_REQUEST);
+    assert_eq!(select, &DryRunEvent::SelectTarget { target: 1 });
+    assert_eq!(profile_request(seed1).1, &[0x7F, 0x27, 0x37][..]);
+    assert_eq!(profile_request(seed2).1, &[0x67, 1, 7, 6][..]);
+    assert!(matches!(
+        access1,
+        DryRunEvent::SecurityAccess { seed, .. } if seed == &[7, 6]
+    ));
+    assert_eq!(profile_request(key1).0, PROFILE_KEY_REQUEST);
+    assert_eq!(report.target, 1);
+}
+
+#[test]
+fn a_select_target_past_the_budget_leaves_the_report_pc_on_it() {
+    let buf = document(Vec::new(), Vec::new());
+    // Eight logs that leave 8 bytes of the budget, less than a change of target costs.
+    let len = MAX_REPORT_BYTES / 8 - EVENT_COST - 1;
+    assert!(len <= crate::MAX_BYTES_LEN);
+    let message = "x".repeat(len);
+    let mut code = Vec::new();
+    for _ in 0..8 {
+        code.extend([Op::PushBytes(0), Op::LogFromStack { level: 1 }]);
+    }
+    let select = code.len() as u32;
+    code.push(Op::SelectTarget { target: 1 });
+    code.push(Op::Wait { millis: 1 });
+    let program = program_with_targets(code, vec![message.into_bytes()], 2);
+    let report = run_targets(&[buf.clone(), buf], &program, &Script::new());
+    assert_eq!(report.end, DryRunEnd::Host(DryRunError::ReportTooLarge));
+    // The logs fit, so the change of target is the one that goes over.
+    assert_eq!(report.pc, select, "{report:?}");
+    assert_eq!(report.target, 1);
+    assert!(
+        !matches!(report.events.last(), Some(DryRunEvent::SelectTarget { .. })),
+        "{report:?}"
+    );
+}
+
+#[test]
+fn a_select_target_between_the_seed_and_the_access_step_ends_the_scan() {
+    let bufs = [document(vec![], vec![]), document(vec![], vec![])];
+    // Between the seed request (pc 1) and `SecurityAccess` (pc 16).
+    let program = security_access_with(11, &[Op::SelectTarget { target: 1 }]);
+    let report = run_targets(&bufs, &program, &Script::new().key(vec![1]));
+    assert_eq!(
+        report.end,
+        DryRunEnd::Host(DryRunError::Undeclared {
+            request: vec![0x27, 1]
+        }),
+        "{report:?}"
+    );
+    assert_eq!(report.pc, 1);
+
+    // Between `SecurityAccess` and the send-key request.
+    let program = security_access_with(17, &[Op::SelectTarget { target: 1 }]);
+    let script = Script::new().seed(vec![0x67, 1, 9, 8]).key(vec![0x55]);
+    let report = run_targets(&bufs, &program, &script);
+    assert!(
+        matches!(report.end, DryRunEnd::Host(DryRunError::Undeclared { .. })),
+        "{report:?}"
+    );
+    assert_eq!(report.pc, 19, "{report:?}");
+    assert_eq!(report.target, 1);
+}
+
+#[test]
+fn a_select_target_before_the_expansion_leaves_it_paired() {
+    let bufs = [document(vec![], vec![]), document(vec![], vec![])];
+    let program = security_access_with(0, &[Op::SelectTarget { target: 1 }]);
+    let report = run_targets(&bufs, &program, &Script::new().key(vec![0xAA]));
+    assert_eq!(report.end, DryRunEnd::Finished, "{report:?}");
+    let [select, seed, access, key] = &report.events[..] else {
+        panic!("{report:?}");
+    };
+    assert_eq!(select, &DryRunEvent::SelectTarget { target: 1 });
+    assert_eq!(profile_request(seed).0, PROFILE_SEED_REQUEST);
+    assert!(matches!(access, DryRunEvent::SecurityAccess { .. }));
+    assert_eq!(profile_request(key).0, PROFILE_KEY_REQUEST);
 }

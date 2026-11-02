@@ -364,6 +364,7 @@ fn program(service: u16) -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 

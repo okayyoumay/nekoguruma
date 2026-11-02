@@ -99,6 +99,7 @@ pub fn identification_document(document: &[u8]) -> Result<(Vec<u8>, Vec<u32>), I
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     };
     let mut services = Vec::with_capacity(requests.len());
     for (id, message) in requests {

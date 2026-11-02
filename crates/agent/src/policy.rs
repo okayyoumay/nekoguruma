@@ -250,6 +250,7 @@ pub fn check_program(
             | Op::HmiRequestFromStack { .. }
             | Op::RecordInput { .. }
             | Op::MonitorCapture { .. }
+            | Op::SelectTarget { .. }
             | Op::Log { .. } => None,
             Op::PushI64(_)
             | Op::PushF64(_)
@@ -505,6 +506,7 @@ mod tests {
             identity: Default::default(),
             preconditions: Default::default(),
             flash: Vec::new(),
+            targets: Vec::new(),
         }
     }
 

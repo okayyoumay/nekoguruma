@@ -3366,6 +3366,7 @@ mod tests {
             },
             VmError::BadHmiForm(0),
             VmError::HmiFormTooLong(0),
+            VmError::BadTarget(0),
         ];
         // The match fails to compile when a variant is added, so the list above stays complete.
         for error in &errors {
@@ -3402,7 +3403,8 @@ mod tests {
                 | VmError::BlockOutOfRange { .. }
                 | VmError::ArtifactLength { .. }
                 | VmError::BadHmiForm(_)
-                | VmError::HmiFormTooLong(_) => {}
+                | VmError::HmiFormTooLong(_)
+                | VmError::BadTarget(_) => {}
             }
         }
         let encoded = |reason: RunStop| {

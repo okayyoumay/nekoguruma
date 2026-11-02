@@ -87,6 +87,7 @@ fn read_vin() -> Program {
         identity: Default::default(),
         preconditions: Default::default(),
         flash: Vec::new(),
+        targets: Vec::new(),
     }
 }
 

@@ -196,6 +196,7 @@ fn download_program(segments: &[Segment]) -> Program {
         },
         preconditions: Default::default(),
         flash,
+        targets: Vec::new(),
     }
 }
 

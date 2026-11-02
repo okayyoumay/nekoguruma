@@ -61,7 +61,10 @@ use crate::declaration::{EcuVariant, Shape};
 /// [`hmi::HmiTemplate`] (ADR-340).
 /// 20: `EcuDocument` gained `definition_id`, the identifier of the ECU definition a vehicle
 /// definition names (ADR-363); a document of version 19 has none.
-pub const IR_SCHEMA_VERSION: u32 = 20;
+/// 21: `Program` gained `targets`, `Op` gained `SelectTarget`, `VmState` gained `target` and
+/// `VmError` gained `BadTarget` (ADR-325 item 3, ADR-409); a program or state of version 20 does
+/// not decode.
+pub const IR_SCHEMA_VERSION: u32 = 21;
 
 /// The step budget of one run of a procedure, shared by the agent's default job limit and the
 /// conversion's dry run (ADR-391), so a procedure the conversion accepts does not run out of
@@ -341,6 +344,17 @@ pub enum Op {
     HmiRequestFromStack {
         form: u32,
     },
+
+    // Targets. Appended after `HmiRequestFromStack` (ADR-233, ADR-325 item 3).
+    /// Makes target `target` (an index into `Program::targets`; 0, the primary, is the only
+    /// index of a program with no list) current for the instructions that address an ECU. The
+    /// host is told through `DiagHost::select_target` when the target changes; naming the
+    /// current target completes without a host call. An index at or past
+    /// `Program::target_count()` is `VmError::BadTarget`, before anything changes. Sends
+    /// nothing and is no diagnostic primitive.
+    SelectTarget {
+        target: u8,
+    },
 }
 
 // ---------------------------------------------------------------- Program
@@ -363,6 +377,32 @@ pub struct Program {
     /// Recovery plans, one per flash session (8.10.1, ADR-245). [`Program::validate`] checks them.
     #[serde(default)]
     pub flash: Vec<FlashRecovery>,
+    /// The ECUs the program addresses (ADR-325 item 3). Empty means the primary alone: the
+    /// program addresses the ECU of the document it travels in, as a program that declares no
+    /// target does. `SelectTarget` indexes this list.
+    #[serde(default)]
+    pub targets: Vec<Target>,
+}
+
+/// One ECU a program addresses (ADR-325 item 3), in declaration order, the primary first.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Target {
+    /// An access target (ADR-325 item 5): its session and unlock other targets depend on.
+    pub access: bool,
+    /// The content hash (design 8.2.6) of the declaration-only document of the variant this
+    /// program was lowered against for this target.
+    pub declarations: plan::Sha256,
+}
+
+/// The most targets a program may list (ADR-325 item 1's limit, applied to the IR as well).
+pub const MAX_TARGETS: usize = 8;
+
+impl Program {
+    /// How many targets `SelectTarget` may name: the list's length, or one for an empty list.
+    pub fn target_count(&self) -> usize {
+        self.targets.len().max(1)
+    }
 }
 
 /// Interruptibility sections from 8.10.1. Expressed with the same mechanism as the idempotency attribute of the resume model (8.2.5).
@@ -464,6 +504,7 @@ impl Op {
             | Op::DecodeField { .. }
             | Op::FlashBlock { .. }
             | Op::ReadInput { .. }
+            | Op::SelectTarget { .. }
             | Op::Fail { .. } => false,
         }
     }
@@ -492,6 +533,8 @@ pub struct VmState {
     /// Instructions completed so far. Survives resumption; used for audit and for step limits
     /// the job runner may enforce.
     pub steps: u64,
+    /// The current target, an index into `Program::targets` (ADR-325 item 3); 0 at the start.
+    pub target: u8,
 }
 
 /// A suspended caller: where to return to and its locals.
@@ -577,12 +620,22 @@ pub trait DiagHost {
     /// declares (the communication log's `identity` event, design 8.11). The VM never calls it;
     /// a host that keeps no such record ignores it.
     fn note_identity(&mut self, _kind: IdentityKind, _read: IdentityRead<'_>) {}
+    /// The target the following instructions address (ADR-325 item 3, ADR-409): called once
+    /// before the first instruction of a run, new or restored, and whenever
+    /// [`Op::SelectTarget`] changes the target. A notification, not a request: it cannot fail,
+    /// and a host that serves one target refuses the next exchange instead. A host with one
+    /// target ignores it.
+    fn select_target(&mut self, _target: u8) {}
 }
 
 // ---------------------------------------------------------------- VM
 
 pub struct Vm {
     pub state: VmState,
+    /// Whether the host has been told the current target in this run
+    /// ([`DiagHost::select_target`]). False after `new` and `resume`; set at the first
+    /// instruction that runs.
+    told_target: bool,
 }
 
 impl Vm {
@@ -596,13 +649,24 @@ impl Vm {
                 globals: Vec::new(),
                 call_stack: Vec::new(),
                 steps: 0,
+                target: 0,
             },
+            told_target: false,
         }
     }
 
     /// Resume from an interrupted journal.
     pub fn resume(state: VmState) -> Self {
-        Self { state }
+        Self {
+            state,
+            told_target: false,
+        }
+    }
+
+    /// The one call of [`DiagHost::select_target`] (ADR-409).
+    fn tell_target<H: DiagHost>(&mut self, host: &mut H) {
+        host.select_target(self.state.target);
+        self.told_target = true;
     }
 
     /// The instruction the next [`Vm::step`] executes, or `None` when the program has finished.
@@ -666,6 +730,9 @@ impl Vm {
         if self.state.pc as usize > program.code.len() {
             return Err(VmError::BadPc(self.state.pc));
         }
+        if usize::from(self.state.target) >= program.target_count() {
+            return Err(VmError::BadTarget(self.state.target));
+        }
         Ok(())
     }
 
@@ -700,6 +767,13 @@ impl Vm {
         let Some(op) = self.current_op(program)? else {
             return Ok(StepOutcome::Finished);
         };
+        // After `check_state` and the instruction's pre-host checks (`check_primitive`), so a
+        // refused state or primitive never reaches the host. A non-primitive's run-time error
+        // (a stack underflow, say) can still follow: the notification is infallible and changes
+        // nothing in the ECU.
+        if !self.told_target {
+            self.tell_target(host);
+        }
         match self.execute(op, program, declarations, host)? {
             Executed::Done => {
                 self.state.steps += 1;
@@ -1012,6 +1086,14 @@ impl Vm {
                 self.state.stack.pop();
             }
 
+            Op::SelectTarget { target } => {
+                // Range checked in `check_primitive`, before any host call.
+                if *target != self.state.target {
+                    self.state.target = *target;
+                    self.tell_target(host);
+                }
+            }
+
             // Terminal and not a primitive: the state stays on the instruction, like a wait, so
             // stepping again gives the same outcome (ADR-280).
             Op::Fail { code } => {
@@ -1112,6 +1194,13 @@ impl Vm {
             | Op::ReadInput { .. } => HostInput::Nothing,
             // The checks of `Fail` run in `execute`, before it changes anything.
             Op::Fail { .. } => HostInput::Nothing,
+            // Not a primitive, but its range check precedes the host's first-step notification.
+            Op::SelectTarget { target } => {
+                if usize::from(*target) >= program.target_count() {
+                    return Err(VmError::BadTarget(*target));
+                }
+                HostInput::Nothing
+            }
         })
     }
 
@@ -1691,6 +1780,8 @@ pub enum VmError {
     /// The encoded length, or the length of the text operands alone when they already pass it.
     #[error("the HMI form encodes to {0} bytes or more, more than {max}", max = hmi::MAX_HMI_FORM_LEN)]
     HmiFormTooLong(u64),
+    #[error("target {0} is not in the program's target list")]
+    BadTarget(u8),
 }
 
 #[cfg(test)]

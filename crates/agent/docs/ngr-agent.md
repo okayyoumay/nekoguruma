@@ -56,7 +56,8 @@ Steps (`agent::check_job`, `agent::guards::JobGuards`, `agent::launch::launch_wo
    size this VM does not accept, one whose restart declaration `Program::validate` refuses
    (ADR-245), one with a request this build may never send (a release build sends only
    the read-only requests of the variant's application layer; ADR-235 item 8, ADR-247,
-   ADR-342), or one with a `ReadDtc`, which no build serves (ADR-342), fails here,
+   ADR-342), one with a `ReadDtc`, which no build serves (ADR-342), or one that lists more
+   than one target (`JobError::SeveralTargets`; the agent opens one link per job, ADR-409), fails here,
    before any worker starts. The same check refuses a job whose artifact does not hash to the name it gives (also when no instruction reads it), a program with a `FlashBlock` and no artifact, and any segment of a flash session the program names (by a `FlashBlock` or a flash recovery plan; artifact offset plus length, overflow-checked) that reaches past the end of the file (`JobError::ArtifactMismatch`, `NoArtifact`, `SegmentOutsideArtifact`). A bad operand, such as a missing constant, fails only when the VM
    reaches it, after the worker has started.
 2. Take the job's guards from the `--locks` directory, named by `--vci` ("Job guards" below):

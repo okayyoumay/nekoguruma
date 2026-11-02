@@ -592,6 +592,10 @@ pub struct WorkerHost<C: WorkerApi> {
     /// What opens the link again after the path to the VCI was lost (ADR-393); without it the
     /// host cannot.
     relink: Option<Relink<C>>,
+    /// The target the VM told the host to address ([`DiagHost::select_target`], ADR-409). The
+    /// agent opens one link per job, so only the primary, 0, can be served until one link per
+    /// target exists (ADR-325 item 8). Kept by `reopen`; the VM is not told again.
+    target: u8,
 }
 
 /// The link that is open on the worker: the client it was opened on and its handles.
@@ -703,6 +707,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             stray: None,
             job_end_wait: crate::link::JOB_END_WAIT_MAX,
             relink: None,
+            target: 0,
         }
     }
 
@@ -1290,6 +1295,12 @@ impl<C: WorkerApi> WorkerHost<C> {
         progress: Progress,
         before: Option<AgentNow>,
     ) -> Result<Vec<u8>, HostError> {
+        // The link is the primary's; a request for another target cannot be served (ADR-409).
+        if self.target != 0 {
+            let error = HostError::Unsupported("a request to a target other than the primary");
+            self.log_refused(&request, before, &error, None);
+            return Err(error);
+        }
         self.exchange(request, progress, before).result
     }
 
@@ -3470,6 +3481,10 @@ impl<C: WorkerApi> crate::inputs::RuntimeInputs for WorkerHost<C> {
 impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     type Error = HostError;
 
+    fn select_target(&mut self, target: u8) {
+        self.target = target;
+    }
+
     fn service_request(&mut self, service: u16, payload: &[u8]) -> Result<Vec<u8>, HostError> {
         let before = self.log_clock();
         let request = match service_request_bytes(service, payload) {
@@ -4125,6 +4140,7 @@ mod tests {
             identity: Default::default(),
             preconditions: Default::default(),
             flash: Vec::new(),
+            targets: Vec::new(),
         };
         let at = at_of(&program, 2, 9);
         assert_eq!((at.pc, at.steps), (2, 9));

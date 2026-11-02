@@ -71,7 +71,7 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUGetObjectId` | Resolves the mock's own test names (`mock-bus`, `mock-protocol`, `mock-resource`, `mock-com-param`, `mock-pin-type`) and the ISO 22900-2 (2022) short names in the constants below; returns `PDU_ERR_INVALID_PARAMETERS` for any other name. |
 | `PDUGetUniqueRespIdTable` | Returns empty table. |
 | `PDUSetUniqueRespIdTable` | Always succeeds. |
-| `PDUGetTimestamp` | Returns `MOCK_TIMESTAMP` = 4242. |
+| `PDUGetTimestamp` | Returns the module clock (see "Timestamps"). |
 | `PDUIoCtl` | Returns `PDU_STATUS_NOERROR` for most commands; `PDU_ERR_VALUE_NOT_SUPPORTED` for unsupported. For `MOCK_IOCTL_NULL_OUTPUT` it returns `PDU_STATUS_NOERROR` and leaves the output item null. |
 | `PDUDestroyItem` | Frees heap-allocated PDU items, including a result item's data bytes and a status or error item's payload. |
 
@@ -91,6 +91,12 @@ With a `sim-ecu` attached (ADR-299), a `PDU_COPT_SENDRECV` ComPrimitive with req
 The control data's cycles decide what is sent and received: with no send cycles nothing reaches the ECU and only the two status items follow; with no receive cycles the request reaches the ECU and only the two status items follow. Any other combination runs as one send and one response, and so does a ComPrimitive without control data.
 
 While an ECU is attached, and while other ComPrimitives still wait or run after it is detached, a ComPrimitive waits its turn (the synthetic completion event of the other ComPrimitive types too): it begins when the one before it has finished, and only then does its request reach the ECU, so the ECU's timers run from then. Its events are due at the delays the ECU gives them, counted from when it begins. A delivery thread begins each ComPrimitive in turn, queues each event when it is due and fires the callback. `PDUConstruct` and a reset discard waiting ComPrimitives and scheduled events; `PDUDestruct` discards them and waits for the delivery thread to end, so no callback runs after it returns. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. Without an ECU every ComPrimitive gets the synthetic completion event at once.
+
+### Timestamps
+
+The mock has one module clock: microseconds since the mock state was created, from a monotonic clock, truncated to `UNUM32`. `PDUGetTimestamp` and `PDUGetStatus` return it, and every event item's `Timestamp` is the clock when the item is produced (queued, or due on the delivery thread).
+
+A result item that carries a response of the attached ECU has `TimestampFlags` of one byte, `0x80 | 0x40` (ISO 22900-2 (2022) 10.1.4.11.4, D.2): `TxMsgDoneTimestamp` is the clock when the ComPrimitive began and its request was sent, and `StartMsgTimestamp` is the clock when the response is delivered, which is also the item's `Timestamp`. The response is always at least 1 microsecond after the transmit done, so a latency measured between them is positive even when the ECU answers at once. A result with no transmission behind it (the synthetic completion event, with or without an ECU) has no flag bytes and both times 0. The mock produces no result item for a send-only ComPrimitive, so there is no transmit-done-only item. It sends no transmit or start-of-message indication items.
 
 An ECU is attached in one of two ways:
 
@@ -171,7 +177,6 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 | `STANDARD_COMPARAMS` | 3210 to 3235 | `PDUGetObjectId` of the ISO 22900-2 (2022) ComParams (Annex B.3, B.5) the agent sets on a UDS on CAN link: `CP_Baudrate`, `CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RCByteOffset`, `CP_RC78CompletionTimeout`, `CP_CanPhysReqId`, `CP_CanRespUSDTId` (3210 to 3217), `CP_RC21Handling`, `CP_RC23Handling`, `CP_TransmitIndEnable`, `CP_StartMsgIndEnable` (3220 to 3223); and `CP_BlockSize` and `CP_StMin` (3218, 3219), the block size and minimum separation time of ISO 15765-2 (2024) 9.6.5.3 and 9.6.5.4, which the example ECU declares (ADR-324); and those the hardware-check guard sets when it completes a job's link from its profile (ADR-334): `CP_CanFuncReqId`, `CP_RequestAddrMode`, `CP_TesterPresentAddrMode`, `CP_CanPhysReqFormat`, `CP_CanRespUSDTFormat`, `CP_CanFuncReqFormat`, `CP_CanPhysReqExtAddr`, `CP_CanRespUSDTExtAddr`, `CP_CanFuncReqExtAddr`, `CP_CanFillerByteHandling`, `CP_CanFillerByte`, `CP_TesterPresentMessage` (3224 to 3235). The mock keeps no ComParam values |
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
-| `MOCK_TIMESTAMP` | 4242 | Timestamp returned by `PDUGetTimestamp` |
 | `MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP` | `0x0000_0101` | The additional error code (ISO 22900-2:2022 D.4.2, `ExtraErrorInfoId`) of the `PDU_ERR_EVT_RX_TIMEOUT` error item for a ComPrimitive the attached ECU does not answer; D.4.2 leaves these codes to the vendor's MDF, so the value is the mock's own (ADR-350) |
 | `MOCK_IOCTL_NULL_OUTPUT` | `0x7FFF_FF00` | IOCTL command id that succeeds without an output item (public, for null-item tests) |
 

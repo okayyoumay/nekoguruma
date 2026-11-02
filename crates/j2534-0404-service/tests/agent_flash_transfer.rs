@@ -158,6 +158,7 @@ fn download_program(segments: &[Segment]) -> Program {
     // The validator wants download instructions inside a flash session's plan. The plan never
     // allows a restart (a recovery point at the erase), so it declares nothing else.
     let flash = vec![FlashRecovery {
+        target: 0,
         flash_session: FLASH_SESSION,
         stage: 1,
         max_resumes: 1,
@@ -186,10 +187,12 @@ fn download_program(segments: &[Segment]) -> Program {
         identity: IdentitySources {
             vin: None,
             hardware_part_number: Some(Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 1,
             }),
             software_version: Some(Source::EcuService {
+                target: 0,
                 service_id: 2,
                 field_id: 1,
             }),

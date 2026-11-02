@@ -908,6 +908,7 @@ and `Program.flash`.
 - **UDS only, one segment.** `diag.flash_transfer` or `@flashPlan` in a variant whose application
   layer is not UDS is `STAR_NOT_IN_PROFILE`. A session has one segment per plan.
 - **Recovery facts.** The plan's `FlashRecovery` has the session id as `flash_session` and stage,
+  `target` 0 (the format declares no targets yet, ADR-410),
   `maxResumes` from `@flashPlan`, the recovery point and boundaries above, and, from the session's
   row in `flash_sessions.csv` (`csv-tables.md` 4.12), `RecoveryTiming`, `version_read_retries` and
   `no_application`. A plan needs the five columns that are required "with a plan" there

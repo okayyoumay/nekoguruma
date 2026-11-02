@@ -2073,6 +2073,7 @@ fn schema_version_one_is_refused() {
 }
 
 const SVC: Source = Source::EcuService {
+    target: 0,
     service_id: 1,
     field_id: 1,
 };
@@ -2087,6 +2088,7 @@ fn precondition(default: Option<Source>, programming: Option<Source>) -> Precond
 
 fn plan(flash_session: u32, stage: u32, entry: u32) -> FlashRecovery {
     FlashRecovery {
+        target: 0,
         flash_session,
         stage,
         max_resumes: 3,
@@ -3116,6 +3118,7 @@ fn sources_are_checked() {
 
     for (service_id, field_id) in [(0, 1), (1, 0)] {
         let zero = Source::EcuService {
+            target: 0,
             service_id,
             field_id,
         };
@@ -4748,6 +4751,11 @@ fn prog_with_targets(n: u8, code: Vec<Op>, constants: Vec<Vec<u8>>) -> Program {
                 declarations: [index; 32],
             })
             .collect(),
+        // Several targets or an access target need a VIN source (ADR-325 item 5, ADR-410).
+        identity: IdentitySources {
+            vin: Some(SVC),
+            ..IdentitySources::default()
+        },
         ..prog(code, constants)
     }
 }
@@ -4989,4 +4997,254 @@ fn duplicate_target_declarations_are_refused() {
         program.validate(),
         Err(ProgramError::DuplicateTargetDeclarations { a: 0, b: 2 })
     );
+}
+
+// ---------------------------------------------------------------- Restart declaration targets
+// (ADR-325 items 3, 4, 5, 9 and 13, ADR-410)
+
+fn svc_on(target: u8) -> Source {
+    Source::EcuService {
+        target,
+        service_id: 1,
+        field_id: 1,
+    }
+}
+
+/// `recovery_program()` with a target list whose entries have the given access flags, every
+/// source and the plan on target 0.
+fn declared_targets(access: &[bool]) -> Program {
+    let mut program = recovery_program();
+    program.targets = access
+        .iter()
+        .enumerate()
+        .map(|(index, &access)| Target {
+            access,
+            declarations: [index as u8 + 1; 32],
+        })
+        .collect();
+    program
+}
+
+/// `declared_targets` without a plan (and so without download instructions).
+fn declared_targets_without_a_plan(access: &[bool]) -> Program {
+    let mut program = declared_targets(access);
+    program.flash.clear();
+    program.code = vec![Op::Pop; 10];
+    program
+}
+
+fn with_plan_on(mut program: Program, target: u8) -> Program {
+    program.flash[0].target = target;
+    program
+}
+
+#[test]
+fn a_program_without_target_fields_decodes_on_the_primary() {
+    let source: Source = serde_json::from_str(r#"{"EcuService":{"service_id":1,"field_id":1}}"#)
+        .expect("a source without a target decodes");
+    assert_eq!(source, SVC);
+    let mut plan_json = serde_json::to_value(plan(1, 1, 0)).unwrap();
+    assert!(
+        plan_json
+            .as_object_mut()
+            .unwrap()
+            .remove("target")
+            .is_some()
+    );
+    let decoded: FlashRecovery = serde_json::from_value(plan_json).unwrap();
+    assert_eq!(decoded, plan(1, 1, 0));
+    assert_eq!(recovery_program().reprogramming_target(), Some(0));
+    assert_eq!(prog(Vec::new(), Vec::new()).reprogramming_target(), None);
+}
+
+#[test]
+fn a_source_target_outside_the_list_is_refused() {
+    let mut program = recovery_program();
+    program.identity.vin = Some(svc_on(1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::SourceTargetOutOfRange {
+            owner: SourceOwner::Identity(IdentityKind::Vin),
+            target: 1
+        })
+    );
+    let mut program = declared_targets(&[false, false]);
+    program.preconditions.engine = Some(precondition(Some(SVC), Some(svc_on(2))));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::SourceTargetOutOfRange {
+            owner: SourceOwner::Precondition {
+                kind: PreconditionKind::Engine,
+                session: SessionKind::Programming
+            },
+            target: 2
+        })
+    );
+}
+
+#[test]
+fn a_plan_target_outside_the_list_is_refused() {
+    let program = with_plan_on(recovery_program(), 1);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanTargetOutOfRange {
+            flash_session: 1,
+            target: 1
+        })
+    );
+    // The plan loop runs before the identity loop.
+    let mut program = with_plan_on(declared_targets(&[false, false]), 5);
+    program.identity.vin = Some(svc_on(1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::PlanTargetOutOfRange {
+            flash_session: 1,
+            target: 5
+        })
+    );
+}
+
+#[test]
+fn two_plans_on_two_targets_are_refused() {
+    let mut program = declared_targets(&[false, false]);
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 2, 5));
+    assert_eq!(program.validate(), Ok(()));
+    program.flash[1].target = 1;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashPlansOnSeveralTargets { a: 1, b: 2 })
+    );
+}
+
+#[test]
+fn a_software_version_source_off_the_reprogramming_target_is_refused() {
+    let mut program = declared_targets(&[false, false]);
+    program.identity.software_version = Some(svc_on(1));
+    let software = ProgramError::SourceOffReprogrammingTarget {
+        kind: IdentityKind::SoftwareVersion,
+        target: 1,
+        reprogramming_target: 0,
+    };
+    assert_eq!(program.validate(), Err(software.clone()));
+    // The plan's entry record reads it whether or not the plan allows a restart.
+    program.flash[0].recovery_required = RecoveryRequired::FromPc(1);
+    assert!(!program.flash[0].allows_restart());
+    assert_eq!(program.validate(), Err(software));
+
+    let mut program = with_plan_on(declared_targets(&[false, false]), 1);
+    program.identity.hardware_part_number = Some(svc_on(0));
+    program.identity.software_version = Some(svc_on(1));
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::SourceOffReprogrammingTarget {
+            kind: IdentityKind::HardwarePartNumber,
+            target: 0,
+            reprogramming_target: 1,
+        })
+    );
+    program.identity.hardware_part_number = Some(svc_on(1));
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn identity_sources_may_name_any_target_without_a_plan() {
+    let mut program = declared_targets_without_a_plan(&[false, false]);
+    program.identity = IdentitySources {
+        vin: Some(svc_on(0)),
+        hardware_part_number: Some(svc_on(1)),
+        software_version: Some(svc_on(0)),
+    };
+    assert_eq!(program.reprogramming_target(), None);
+    assert_eq!(program.validate(), Ok(()));
+}
+
+#[test]
+fn a_flash_plan_on_an_access_target_is_refused() {
+    let on_access = |session, target| {
+        Err(ProgramError::FlashPlanOnAccessTarget {
+            flash_session: session,
+            target,
+        })
+    };
+    assert_eq!(declared_targets(&[true]).validate(), on_access(1, 0));
+    assert_eq!(
+        with_plan_on(declared_targets(&[false, true]), 1).validate(),
+        on_access(1, 1)
+    );
+    let mut program = with_plan_on(declared_targets(&[true, false]), 1);
+    program.identity.hardware_part_number = Some(svc_on(1));
+    program.identity.software_version = Some(svc_on(1));
+    assert_eq!(program.validate(), Ok(()));
+    // The per-plan check precedes the pairwise ones: the first plan is the offending one.
+    let mut program = with_plan_on(declared_targets(&[false, true]), 1);
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 2, 5));
+    assert_eq!(program.validate(), on_access(1, 1));
+}
+
+#[test]
+fn a_vin_source_is_required_with_several_targets_or_an_access_target() {
+    let missing = Err(ProgramError::MissingIdentitySource(IdentityKind::Vin));
+    for access in [&[false, false][..], &[true][..]] {
+        let mut program = declared_targets_without_a_plan(access);
+        program.identity = IdentitySources::default();
+        assert_eq!(program.validate(), missing, "{access:?}");
+        program.identity.vin = Some(svc_on(0));
+        assert_eq!(program.validate(), Ok(()), "{access:?}");
+    }
+    for access in [&[][..], &[false][..]] {
+        let mut program = declared_targets_without_a_plan(access);
+        program.identity = IdentitySources::default();
+        assert_eq!(program.validate(), Ok(()), "{access:?}");
+    }
+}
+
+#[test]
+fn a_vin_source_off_the_first_access_target_is_refused() {
+    let set_vin = |mut program: Program, target| {
+        program.identity.vin = Some(svc_on(target));
+        program
+    };
+    assert_eq!(
+        set_vin(declared_targets_without_a_plan(&[false, true]), 0).validate(),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 0,
+            first_access_target: 1
+        })
+    );
+    assert_eq!(
+        set_vin(declared_targets_without_a_plan(&[true, false]), 1).validate(),
+        Err(ProgramError::VinOffFirstAccessTarget {
+            target: 1,
+            first_access_target: 0
+        })
+    );
+    assert_eq!(
+        set_vin(declared_targets_without_a_plan(&[true, false]), 0).validate(),
+        Ok(())
+    );
+    // With no access target the VIN may be on any target, the reprogramming target included.
+    for target in [0, 1] {
+        assert_eq!(
+            set_vin(declared_targets_without_a_plan(&[false, false]), target).validate(),
+            Ok(())
+        );
+        let mut program = declared_targets(&[false, false]);
+        program.identity.vin = Some(svc_on(target));
+        assert_eq!(program.validate(), Ok(()));
+    }
+}
+
+#[test]
+fn a_precondition_source_may_name_another_target() {
+    let mut program = declared_targets(&[false, false]);
+    program.preconditions.engine = Some(precondition(Some(svc_on(1)), Some(svc_on(1))));
+    assert_eq!(program.validate(), Ok(()));
+    // An access target too: a read.
+    let mut program = with_plan_on(declared_targets(&[true, false]), 1);
+    program.identity.hardware_part_number = Some(svc_on(1));
+    program.identity.software_version = Some(svc_on(1));
+    program.preconditions.engine = Some(precondition(Some(svc_on(0)), Some(svc_on(0))));
+    assert_eq!(program.validate(), Ok(()));
 }

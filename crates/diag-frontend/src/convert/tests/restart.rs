@@ -29,6 +29,7 @@ fn source_names(document: &EcuDocumentT, source: Source) -> (String, String) {
     let Source::EcuService {
         service_id,
         field_id,
+        ..
     } = source
     else {
         panic!("{source:?} is not a service source");

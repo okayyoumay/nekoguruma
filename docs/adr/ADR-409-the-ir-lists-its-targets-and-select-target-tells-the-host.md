@@ -1,7 +1,7 @@
 # ADR-409: The IR Lists Its Targets and `SelectTarget` Tells the Host
 
 **Date:** 2026-11-01
-**Status:** Accepted
+**Status:** Accepted (part 2 realized by ADR-410: the restart declaration's target index and rules)
 **Affects:** `diag-ir` (`Program::targets`, `Target`, `Op::SelectTarget`, `VmState::target`, `DiagHost::select_target`, `VmError::BadTarget`, `Program::validate`, `IR_SCHEMA_VERSION` 21), `agent` (`check_runnable`, `WorkerHost`), design 8.2.4; ADR-233 items 3, 9 and 10, ADR-325 item 3, ADR-397
 
 ## Context

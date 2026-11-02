@@ -2986,6 +2986,7 @@ mod tests {
     fn a_program_with_an_invalid_declaration_is_refused() {
         let mut bad = program(two_requests());
         bad.flash.push(diag_ir::FlashRecovery {
+            target: 0,
             flash_session: 1,
             stage: 1,
             max_resumes: 1,
@@ -3025,6 +3026,15 @@ mod tests {
                     declarations: [index; 32],
                 })
                 .collect(),
+            // A target list of any length but 0 needs a VIN source (ADR-325 item 5, ADR-410).
+            identity: diag_ir::IdentitySources {
+                vin: Some(diag_ir::Source::EcuService {
+                    target: 0,
+                    service_id: 1,
+                    field_id: 1,
+                }),
+                ..diag_ir::IdentitySources::default()
+            },
             ..program(Vec::new())
         };
         for count in 0..=1 {
@@ -3046,9 +3056,34 @@ mod tests {
         ));
     }
 
+    /// ADR-410: a source on a target the program does not list is refused by both entry points
+    /// before any worker starts.
+    #[test]
+    fn a_source_on_an_unlisted_target_is_refused_before_the_worker_starts() {
+        let mut off = program(Vec::new());
+        off.identity.vin = Some(diag_ir::Source::EcuService {
+            target: 1,
+            service_id: 1,
+            field_id: 1,
+        });
+        let expected = diag_ir::ProgramError::SourceTargetOutOfRange {
+            owner: diag_ir::SourceOwner::Identity(diag_ir::IdentityKind::Vin),
+            target: 1,
+        };
+        assert!(matches!(
+            check_program(&off, Permission::ReadOnly),
+            Err(JobError::Program(ref e)) if *e == expected
+        ));
+        assert!(matches!(
+            check_job(&off.into(), Permission::ReadOnly),
+            Err(JobError::Program(e)) if e == expected
+        ));
+    }
+
     #[test]
     fn a_restartable_plan_with_an_unmapped_precondition_is_refused() {
         let source = diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id: 1,
         };
@@ -3070,6 +3105,7 @@ mod tests {
             programming_session: None,
         });
         bad.flash.push(diag_ir::FlashRecovery {
+            target: 0,
             flash_session: 1,
             stage: 1,
             max_resumes: 1,
@@ -4078,6 +4114,7 @@ def main():
         let shift = erase - ERASE;
         let mut program = program(code);
         let ecu = |field_id| diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id,
         };
@@ -4087,6 +4124,7 @@ def main():
             software_version: Some(ecu(2)),
         };
         program.flash.push(diag_ir::FlashRecovery {
+            target: 0,
             flash_session: 1,
             stage: 7,
             max_resumes: 1,
@@ -6315,6 +6353,7 @@ def main():
         let mut program = program(code);
         program.sections = sections;
         program.identity.vin = Some(diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id: 3,
         });
@@ -8184,6 +8223,7 @@ def main():
         let program = flash_program_with_engine(
             input(RuntimeInput::EngineRunning),
             diag_ir::Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 3,
             },
@@ -8211,6 +8251,7 @@ def main():
 
         // A source the table lacks cannot be established; no request is sent for it.
         let missing = |field_id| diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id,
         };
@@ -8241,6 +8282,7 @@ def main():
         // The default-session source is not in the table; the other gives an in-range value.
         let program = flash_program_with_engine(
             diag_ir::Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 8,
             },
@@ -8325,6 +8367,7 @@ def main():
         // A precondition read through the ECU, with the programming-session source giving
         // nothing either.
         let ecu = |field_id| diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id,
         };
@@ -8345,6 +8388,7 @@ def main():
         use diag_ir::{PreconditionKind, RuntimeInput};
         let program = flash_program_with_engine(
             diag_ir::Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 2,
             },
@@ -8369,6 +8413,7 @@ def main():
     fn a_vin_source_the_table_lacks_leaves_the_teardown_passive() {
         let mut program = flash_program();
         program.identity.vin = Some(diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id: 9,
         });
@@ -11177,6 +11222,7 @@ def main():
             code.splice(at..at, [Op::PushBytes(0), Op::SendReceive { service }]);
             let mut program = program(code);
             program.flash.push(diag_ir::FlashRecovery {
+                target: 0,
                 flash_session: 1,
                 stage: 1,
                 max_resumes: 0,
@@ -11417,6 +11463,7 @@ def main():
     fn document_sourced_program() -> Program {
         let mut program = flash_program();
         let ecu = |service_id| diag_ir::Source::EcuService {
+            target: 0,
             service_id,
             field_id: 1,
         };
@@ -11565,6 +11612,7 @@ def main():
         use diag_ir::declaration::DataKind;
         let mut program = plain_steps(&[(0x22, Unsafe), (0x22, Safe)]);
         program.identity.vin = Some(diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id: 1,
         });
@@ -13137,6 +13185,7 @@ def main():
     fn step_3b_with_a_source_the_table_lacks_is_not_established() {
         let mut program = flash_program();
         program.identity.software_version = Some(diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id: 9,
         });
@@ -13589,6 +13638,7 @@ def main():
         // programming-session one gives an in-range value, which lets the gates pass.
         let program = flash_program_with_engine(
             diag_ir::Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 3,
             },
@@ -13885,6 +13935,7 @@ def main():
             satisfied: diag_ir::Satisfied { lower: 0, upper: 0 },
             default_session: Some(input(RuntimeInput::EngineRunning)),
             programming_session: Some(diag_ir::Source::EcuService {
+                target: 0,
                 service_id: 1,
                 field_id: 3,
             }),
@@ -18216,6 +18267,7 @@ def main():
         code.push(Op::ServiceRequest { service: 0x37 });
         let mut program = program(code);
         let ecu = |service_id| diag_ir::Source::EcuService {
+            target: 0,
             service_id,
             field_id: 1,
         };
@@ -18225,6 +18277,7 @@ def main():
             software_version: Some(ecu(2)),
         };
         program.flash.push(diag_ir::FlashRecovery {
+            target: 0,
             flash_session: 1,
             stage: 7,
             max_resumes: 1,

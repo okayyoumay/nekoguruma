@@ -2125,6 +2125,7 @@ mod tests {
             identity: Default::default(),
             preconditions: Default::default(),
             flash: vec![FlashRecovery {
+                target: 0,
                 flash_session: 1,
                 stage: 7,
                 max_resumes: 3,
@@ -4073,6 +4074,7 @@ def main():
             source_map: Vec::new(),
             identity: diag_ir::IdentitySources {
                 vin: Some(diag_ir::Source::EcuService {
+                    target: 0,
                     service_id: 1,
                     field_id: 3,
                 }),
@@ -4532,6 +4534,7 @@ def main():
         // The checkpoint at 0 of the plan fixture: its entry (2) is ahead, and so is its erase (3).
         let mut program = program(RecoveryRequired::Never);
         program.identity.vin = Some(diag_ir::Source::EcuService {
+            target: 0,
             service_id: 1,
             field_id: 3,
         });

@@ -5329,6 +5329,7 @@ impl<'a> Lowerer<'a> {
         let diag_ir::Source::EcuService {
             service_id,
             field_id,
+            ..
         } = source
         else {
             self.not_lowerable(
@@ -5494,6 +5495,7 @@ impl<'a> Lowerer<'a> {
             diag_ir::Source::EcuService {
                 service_id,
                 field_id,
+                ..
             } => {
                 let request = self
                     .service_at
@@ -7178,6 +7180,8 @@ impl<'a> Lowerer<'a> {
             RecoveryRequired::FromPc(range.recovery.unwrap_or(erase))
         };
         FlashRecovery {
+            // The format declares no targets yet (ADR-410).
+            target: 0,
             flash_session: info.session,
             stage: info.session,
             max_resumes: info.max_resumes,

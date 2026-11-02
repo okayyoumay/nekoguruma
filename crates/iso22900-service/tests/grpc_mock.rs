@@ -34,7 +34,6 @@ const MOCK_MODULE_HANDLE: u32 = 1001;
 const MOCK_CLL_HANDLE: u32 = 3001;
 const MOCK_COP_HANDLE: u32 = 4001;
 const MOCK_RESOURCE_ID: u32 = 2001;
-const MOCK_TIMESTAMP: u32 = 4242;
 
 struct TestServer {
     port: u16,
@@ -246,8 +245,28 @@ async fn create_default_cll(client: &mut VciServiceClient<Channel>) -> ComLogica
     cll_handle
 }
 
-fn assert_result_event_item(event_item: &EventItem, expected_cop_handle: u32) {
-    assert_eq!(event_item.timestamp, MOCK_TIMESTAMP);
+/// The mock module's clock (`GetTimestamp`), in microseconds since the mock was created.
+async fn module_time(client: &mut VciServiceClient<Channel>) -> u32 {
+    client
+        .get_timestamp(GetTimestampRequest {
+            module_handle: Some(ModuleHandle {
+                module_handle: MOCK_MODULE_HANDLE,
+            }),
+        })
+        .await
+        .expect("get_timestamp should succeed")
+        .into_inner()
+        .timestamp
+}
+
+/// `window` is the module clock read before the item's primitive started and after the item
+/// arrived: the item's time comes from that clock, between the two reads.
+fn assert_result_event_item(event_item: &EventItem, expected_cop_handle: u32, window: (u32, u32)) {
+    assert!(
+        (window.0..=window.1).contains(&event_item.timestamp),
+        "item time {} outside the clock reads {window:?}",
+        event_item.timestamp
+    );
     // ADR-353: every item is the library's, on the VCI's own clock.
     assert_eq!(
         event_item.timestamp_clock,
@@ -267,12 +286,15 @@ fn assert_result_event_item(event_item: &EventItem, expected_cop_handle: u32) {
             assert_eq!(result_data.unique_resp_identifier, 1);
             assert_eq!(result_data.acceptance_id, 1);
             assert!(result_data.data_bytes.is_empty());
+            // The mock's synthetic completion has no transmission behind it: no time valid.
+            assert_eq!(result_data.tx_msg_done_timestamp, None);
+            assert_eq!(result_data.start_msg_timestamp, None);
         }
         other => panic!("expected result data event, got {other:?}"),
     }
 }
 
-fn assert_result_notification(notification: EventNotification) {
+fn assert_result_notification(notification: EventNotification, window: (u32, u32)) {
     let handle = notification
         .handle
         .expect("notification handle should be present");
@@ -289,7 +311,7 @@ fn assert_result_notification(notification: EventNotification) {
         .expect("notification event should be present")
     {
         vci_service_interface::event_notification::EventData::Item(event_item) => {
-            assert_result_event_item(&event_item, MOCK_COP_HANDLE);
+            assert_result_event_item(&event_item, MOCK_COP_HANDLE, window);
         }
         other => panic!("expected item event, got {other:?}"),
     }
@@ -365,6 +387,7 @@ async fn grpc_server_responds_through_mock_library() {
         .into_inner();
     assert!(status.status.is_some());
 
+    let clock_before = module_time(&mut client).await;
     let timestamp = client
         .get_timestamp(GetTimestampRequest {
             module_handle: Some(ModuleHandle {
@@ -374,7 +397,10 @@ async fn grpc_server_responds_through_mock_library() {
         .await
         .expect("get_timestamp should succeed")
         .into_inner();
-    assert_eq!(timestamp.timestamp, MOCK_TIMESTAMP);
+    // The module clock only moves forward: a read before the call is not later than it, and a
+    // read after is not earlier.
+    assert!(timestamp.timestamp >= clock_before);
+    assert!(module_time(&mut client).await >= timestamp.timestamp);
     assert_eq!(
         timestamp.timestamp_clock(),
         vci_service_interface::TimestampClock::Device
@@ -533,6 +559,7 @@ async fn grpc_server_responds_through_mock_library() {
         .await
         .expect("set_unique_resp_id_table should succeed");
 
+    let clock_before_start = module_time(&mut client).await;
     let primitive_response = client
         .start_com_primitive(StartComPrimitiveRequest {
             cll_handle: Some(cll_handle),
@@ -562,7 +589,12 @@ async fn grpc_server_responds_through_mock_library() {
         .into_inner();
 
     let event_item = event_item.event_item.expect("event_item should be present");
-    assert_result_event_item(&event_item, MOCK_COP_HANDLE);
+    let clock_after_item = module_time(&mut client).await;
+    assert_result_event_item(
+        &event_item,
+        MOCK_COP_HANDLE,
+        (clock_before_start, clock_after_item),
+    );
     // ADR-204: no cop_tag was supplied at StartComPrimitive above, so the
     // echo must be absent, never a zero-length sentinel.
     assert!(event_item.cop_tag.is_none());
@@ -828,6 +860,7 @@ async fn grpc_subscribe_event_streams_mock_event() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 
     let mut command_client = server.client().await;
+    let clock_before_start = module_time(&mut command_client).await;
     command_client
         .start_com_primitive(StartComPrimitiveRequest {
             cll_handle: Some(cll_handle),
@@ -847,7 +880,8 @@ async fn grpc_subscribe_event_streams_mock_event() {
         .expect("stream should remain open")
         .expect("streamed event should be present");
 
-    assert_result_notification(notification);
+    let clock_after_item = module_time(&mut command_client).await;
+    assert_result_notification(notification, (clock_before_start, clock_after_item));
 
     // Ensure the streaming RPC is closed before server shutdown.
     drop(event_stream);
@@ -893,6 +927,7 @@ async fn subscribe_event_echoes_cop_tag_racing_start_response() {
     let mut command_client = server.client().await;
     let cop_tag = vec![0xDE, 0xAD, 0xBE, 0xEF];
 
+    let clock_before_start = module_time(&mut command_client).await;
     let (event_result, start_result) = tokio::join!(
         timeout(Duration::from_secs(5), event_stream.message()),
         command_client.start_com_primitive(StartComPrimitiveRequest {
@@ -905,6 +940,7 @@ async fn subscribe_event_echoes_cop_tag_racing_start_response() {
     );
 
     start_result.expect("start_com_primitive should succeed");
+    let clock_after_item = module_time(&mut command_client).await;
 
     let notification = event_result
         .expect("timed out waiting for streamed event")
@@ -927,7 +963,11 @@ async fn subscribe_event_echoes_cop_tag_racing_start_response() {
         .expect("notification event should be present")
     {
         vci_service_interface::event_notification::EventData::Item(event_item) => {
-            assert_result_event_item(&event_item, MOCK_COP_HANDLE);
+            assert_result_event_item(
+                &event_item,
+                MOCK_COP_HANDLE,
+                (clock_before_start, clock_after_item),
+            );
             assert_eq!(event_item.cop_tag.as_deref(), Some(cop_tag.as_slice()));
         }
         other => panic!("expected item event, got {other:?}"),

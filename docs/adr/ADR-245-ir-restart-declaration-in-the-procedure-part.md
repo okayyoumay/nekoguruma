@@ -122,8 +122,9 @@ runner in M1.
 - Until the declaration part has a decoder, a runner that reads a source of the form "service
   and field" needs a resolver for the request and the field. Part 3 of the restart work supplies
   one for its tests.
-- At M2 the loader also checks each plan's flash-session id against the variant's flash
-  sessions.
+- Each plan's flash-session id is checked against the variant's flash sessions by
+  `diag_ir::check_declarations` when the agent checks the job (`check_job`), not by the document
+  loader.
 - A plan has one RequestTransferExit, so a flash session that downloads several regions still
   cannot be declared.
 - A tool that reads only the FlatBuffers declaration does not see the restart parameters; the

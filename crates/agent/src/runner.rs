@@ -353,9 +353,13 @@ pub enum JobError {
         end: u64,
         artifact_len: u64,
     },
-    /// Instruction `pc` decodes a field the job's document does not declare as a top-level
-    /// field of the service's positive response, or one with a nested layout.
-    #[error("instruction {pc} decodes a field the job's document does not declare: {source}")]
+    /// The instruction or flash recovery plan at `pc` names a declaration the job's document
+    /// does not declare or declares in a shape it cannot use: a response field (not a top-level
+    /// one of the service's positive response, or one with a nested layout), a service, a flash
+    /// session or segment. A plan is reported at its entry.
+    #[error(
+        "instruction or flash plan at {pc} names a declaration the job's document does not declare: {source}"
+    )]
     Undeclared {
         pc: u32,
         #[source]
@@ -408,7 +412,7 @@ impl crate::oplog::LogSafe for JobError {
                 source.log_text()
             ),
             JobError::Undeclared { pc, source } => format!(
-                "instruction {pc} decodes a field the job's document does not declare: {}",
+                "instruction or flash plan at {pc} names a declaration the job's document does not declare: {}",
                 vm_error_text(source)
             ),
             JobError::ProcedureFailed { pc, code, .. } => {

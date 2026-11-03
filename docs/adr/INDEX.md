@@ -396,11 +396,12 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-404](ADR-404-a-hung-test-fails-the-ci-job-instead-of-holding-it.md) | A Hung Test Fails the CI Job Instead of Holding It | Accepted | `.config/nextest.toml` CI profiles, `.github/workflows/ci.yml` (`core-linux`, `core-windows`) |
 | [ADR-405](ADR-405-a-zero-seed-ends-security-access-as-unlocked.md) | A Zero Seed Ends `diag.security_access` as Unlocked | Accepted | `diag-frontend` profile and lowering, Starlark subset 3.2, 3.4 and 6; design 8.10; ADR-314 items 4 and 5, ADR-390, ADR-397 |
 | [ADR-406](ADR-406-the-declared-link-rules-live-in-diag-ir-and-the-conversion-applies-them.md) | The Declared-Link Rules Live in `diag-ir` and the Conversion Applies Them | Accepted | `diag-ir` `link`, `agent` link (`LinkConfig::declared`, `validate`), `diag-frontend` resolve and `comparams.csv`; design 8.2.4; ADR-295, ADR-324 consequence 3, ADR-397 |
-| [ADR-407](ADR-407-a-blocked-item-stays-p1-only-while-the-milestone-can-unblock-it.md) | A Blocked Item Stays P1 Only While the Milestone Can Unblock It | Accepted | `work/README.md` (priorities), `.claude/skills/milestone-exit`, `.claude/skills/backlog`, `.claude/skills/backlog-triage`; ADR-388 |
+| [ADR-407](ADR-407-a-blocked-item-stays-p1-only-while-the-milestone-can-unblock-it.md) | A Blocked Item Stays P1 Only While the Milestone Can Unblock It | Accepted (item 4 amended by ADR-413) | `work/README.md` (priorities), `.claude/skills/milestone-exit`, `.claude/skills/backlog`, `.claude/skills/backlog-triage`; ADR-388 |
 | [ADR-408](ADR-408-a-suppressed-request-s-silence-within-the-limit-in-force-is-its-result.md) | A Suppressed Request's Silence Within the Limit in Force Is Its Result | Accepted | `diag-ir` (`suppresses_positive_response`, `dry_run`), `agent` host (`exchange`, `Sent`), `sim-ecu` `Fault::ResponsePending`; design 8.2.4 and 8.11; ADR-235 item 3, ADR-328 item 2, ADR-392, ADR-397 |
 | [ADR-409](ADR-409-the-ir-lists-its-targets-and-select-target-tells-the-host.md) | The IR Lists Its Targets and `SelectTarget` Tells the Host | Accepted (part 2 realized by ADR-410: the restart declaration's target index and rules; part 4 realized by ADR-411: the dry run takes one declaration part per target) | `diag-ir` (`Program::targets`, `Op::SelectTarget`, `VmState::target`, `DiagHost::select_target`, `Program::validate`), `agent` (`check_runnable`, `WorkerHost`); design 8.2.4; ADR-233 items 3, 9 and 10, ADR-325 item 3, ADR-397 |
 | [ADR-410](ADR-410-the-restart-declaration-names-its-target-on-each-source-and-plan.md) | The Restart Declaration Names Its Target on Each Source and Plan | Accepted | `diag-ir` (`Source::EcuService::target`, `FlashRecovery::target`, `Program::reprogramming_target`, `Program::validate`), `agent` (`inputs::send_source_request`), `diag-frontend`; design 8.2.4; ADR-245, ADR-325 items 4, 5, 9 and 13, ADR-336 item 7, ADR-397, ADR-409 |
 | [ADR-411](ADR-411-the-dry-run-answers-from-the-current-target-s-declarations.md) | The Dry Run Answers from the Current Target's Declarations | Accepted | `diag-ir` (`dry_run_targets`, `dry_run`, `Script::response_on`, `Script::seed_on`, `DryRunEvent::SelectTarget`, `DryRunReport::target`, `DryRunError::DeclarationParts`, `ends_profile_scan`); design 12.1; ADR-325 items 3 and 4, ADR-328, ADR-390, ADR-397, ADR-409, ADR-410 |
+| [ADR-413](ADR-413-the-milestone-close-starts-with-a-sweep.md) | The Milestone Close Starts with a Sweep | Accepted | `.claude/skills/milestone-exit`, `.claude/skills/backlog-loop`, `work/README.md`; ADR-407 item 4 |
 
 ## Status Legend
 
@@ -766,7 +767,8 @@ the predecessor repository these ADRs came from.
 - ADR-388
 - ADR-397
 - ADR-404
-- ADR-407
+- ADR-407 (item 4 amended by ADR-413: `status` proposes `close`, which starts with the sweep)
+- ADR-413
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

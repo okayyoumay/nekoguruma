@@ -3083,6 +3083,72 @@ mod tests {
         ));
     }
 
+    /// ADR-412: a plan that addresses another target between its erase and its post-transfer end
+    /// is refused by `validate`, which `check_runnable` runs before the several-targets refusal.
+    #[test]
+    fn another_target_inside_a_plan_is_refused_by_the_program_not_as_several_targets() {
+        let on = |target| diag_ir::Source::EcuService {
+            target,
+            service_id: 1,
+            field_id: 1,
+        };
+        let mut bad = program(vec![
+            Op::SelectTarget { target: 1 },
+            Op::RoutineControl { routine: 1, sub: 1 },
+            Op::ServiceRequest { service: 0x34 },
+            Op::ServiceRequest { service: 0x37 },
+            Op::SelectTarget { target: 0 },
+            Op::Pop,
+        ]);
+        bad.targets = (0..2)
+            .map(|index| diag_ir::Target {
+                access: index == 0,
+                declarations: [index; 32],
+            })
+            .collect();
+        bad.identity = diag_ir::IdentitySources {
+            vin: Some(on(0)),
+            hardware_part_number: Some(on(1)),
+            software_version: Some(on(1)),
+        };
+        bad.flash.push(diag_ir::FlashRecovery {
+            target: 1,
+            flash_session: 1,
+            stage: 1,
+            max_resumes: 1,
+            recovery_required: diag_ir::RecoveryRequired::Never,
+            boundaries: diag_ir::RecoveryBoundaries {
+                entry_pc: 0,
+                erase_pc: 1,
+                transfer_exit_pc: 3,
+                post_transfer_end_pc: 5,
+            },
+            timing: diag_ir::RecoveryTiming {
+                session_timeout_millis: 5000,
+                teardown_margin_millis: 0,
+                ecu_startup_millis: 0,
+                confirmation_window_millis: 0,
+            },
+            version_read_retries: 0,
+            no_application: None,
+        });
+        let expected = diag_ir::ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 4,
+            target: 0,
+        };
+        assert!(matches!(
+            check_program(&bad, Permission::ReadOnly),
+            Err(JobError::Program(ref e)) if *e == expected
+        ));
+        // The plan with the select removed passes `validate` and is refused as several targets.
+        bad.code[4] = Op::Pop;
+        assert!(matches!(
+            check_program(&bad, Permission::ReadOnly),
+            Err(JobError::SeveralTargets { count: 2 })
+        ));
+    }
+
     #[test]
     fn a_restartable_plan_with_an_unmapped_precondition_is_refused() {
         let source = diag_ir::Source::EcuService {
@@ -11785,6 +11851,27 @@ def main():
                 "{name}: {result:?}"
             );
         }
+    }
+
+    /// ADR-325 item 4, the VIN read: a VIN source whose service is not a read is refused by the
+    /// source table at the check, before a link opens.
+    #[test]
+    fn a_vin_service_that_is_not_a_read_refuses_the_job_at_the_check() {
+        let program = document_sourced_program();
+        let job = identity_document_job(&program, |services| {
+            services[2].request.as_mut().unwrap().sid = 0x2E;
+            services[2].positive.as_mut().unwrap().sid = 0x6E;
+        });
+        let refused = check_job(&job, Permission::ReadOnly);
+        assert!(
+            matches!(
+                refused,
+                Err(JobError::Sources(
+                    crate::inputs::TableError::Unsupported { .. }
+                ))
+            ),
+            "{refused:?}"
+        );
     }
 
     // --------------------- restart step 4c (ADR-276)

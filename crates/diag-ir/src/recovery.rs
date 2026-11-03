@@ -422,6 +422,22 @@ pub enum ProgramError {
         "flash session {flash_session}: target {target} is not in the program's target list (ADR-325 item 3)"
     )]
     PlanTargetOutOfRange { flash_session: u32, target: u8 },
+    #[error(
+        "flash session {flash_session}: the steps before the erase at {pc} do not select the plan's target {target} on every path (ADR-325 item 4)"
+    )]
+    PlanTargetNotSelected {
+        flash_session: u32,
+        pc: u32,
+        target: u8,
+    },
+    #[error(
+        "flash session {flash_session}: instruction {pc} selects target {target} between the erase and the post-transfer end, which run on the plan's target (ADR-325 item 4)"
+    )]
+    OtherTargetInPlan {
+        flash_session: u32,
+        pc: u32,
+        target: u8,
+    },
 }
 
 impl ProgramError {
@@ -444,7 +460,9 @@ impl ProgramError {
             | Self::TransferBeforeRequestDownload { pc, .. }
             | Self::TransferInterrupted { pc, .. }
             | Self::PlanInSubroutine { pc, .. }
-            | Self::TargetOutOfRange { pc, .. } => Some(*pc),
+            | Self::TargetOutOfRange { pc, .. }
+            | Self::PlanTargetNotSelected { pc, .. }
+            | Self::OtherTargetInPlan { pc, .. } => Some(*pc),
             Self::TooManyFlashRecoveries { .. }
             | Self::BoundaryOutOfOrder { .. }
             | Self::DuplicateFlashSession(_)
@@ -550,6 +568,10 @@ impl Program {
     /// schema version or the program's size ([`crate::Vm::check_state`]) or each instruction's
     /// operands, which fail when the VM reaches them. It also checks the constants it can
     /// check without running: a `Fail`'s code (ADR-280) and an HMI form's template (ADR-340).
+    ///
+    /// Each plan must select its own target on every path before the erase and select no other
+    /// target up to the post-transfer end (ADR-325 item 4, ADR-412). Whether a VIN source's
+    /// service is a read is checked where the document is (the agent's source table), not here.
     ///
     /// The restart rules (identity sources, session mapping, timeout, resume limit) apply only
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
@@ -984,7 +1006,77 @@ impl Program {
                 }
             }
         }
-        self.validate_control_flow(plan)
+        self.validate_control_flow(plan)?;
+        self.validate_plan_target(plan)
+    }
+
+    /// The target of every instruction between a plan's erase and its post-transfer end is the
+    /// plan's (ADR-325 item 4, ADR-412). `validate_control_flow` has made the plan a
+    /// single-entry region, so the window is entered only at the erase. The checks are local
+    /// to the plan: the target before the plan is not trusted.
+    ///
+    /// (a) The window selects no other target. (b) On every path from the entry to the erase
+    /// the last `SelectTarget` names the plan's target; a forward dataflow over the pre-erase
+    /// window alone, the state a bitmask of the targets that may be current (at most
+    /// [`MAX_TARGETS`], so it fits a `u8`).
+    fn validate_plan_target(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
+        let flash_session = plan.flash_session;
+        let b = &plan.boundaries;
+        for pc in b.erase_pc..b.post_transfer_end_pc {
+            if let Op::SelectTarget { target } = self.code[pc as usize]
+                && target != plan.target
+            {
+                return Err(ProgramError::OtherTargetInPlan {
+                    flash_session,
+                    pc,
+                    target,
+                });
+            }
+        }
+        let all = ((1u16 << self.target_count()) - 1) as u8;
+        let width = (b.erase_pc - b.entry_pc + 1) as usize;
+        // 0 = not reached yet.
+        let mut states = vec![0u8; width];
+        states[0] = all;
+        let mut pending = vec![b.entry_pc];
+        while let Some(pc) = pending.pop() {
+            if pc >= b.erase_pc {
+                continue;
+            }
+            let mut state = states[(pc - b.entry_pc) as usize];
+            let successors: &[u32] = match self.code[pc as usize] {
+                Op::SelectTarget { target } => {
+                    state = 1 << target;
+                    &[pc + 1]
+                }
+                Op::Ret | Op::Fail { .. } => &[],
+                Op::Jump(to) => &[to],
+                Op::JumpIfFalse(to) => &[to, pc + 1],
+                _ => &[pc + 1],
+            };
+            for &next in successors {
+                // `validate_control_flow` keeps a pre-erase jump inside the window.
+                let Some(slot) = next
+                    .checked_sub(b.entry_pc)
+                    .and_then(|i| states.get_mut(i as usize))
+                else {
+                    continue;
+                };
+                let merged = *slot | state;
+                if merged != *slot {
+                    *slot = merged;
+                    pending.push(next);
+                }
+            }
+        }
+        if states[width - 1] != 1 << plan.target {
+            return Err(ProgramError::PlanTargetNotSelected {
+                flash_session,
+                pc: b.erase_pc,
+                target: plan.target,
+            });
+        }
+        Ok(())
     }
 
     /// The plan's range is a single-entry region whose stages follow in order: no call or

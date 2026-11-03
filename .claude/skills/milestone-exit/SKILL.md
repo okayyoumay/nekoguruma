@@ -1,6 +1,6 @@
 ---
 name: milestone-exit
-description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), or verify the exit criteria and move the plan and backlog to the next milestone (close). Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
+description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), or close it (close), which sweeps what changed since the last sweep, then verifies the exit criteria and moves the plan and backlog to the next milestone. Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
 argument-hint: "status | sweep | close"
 ---
 
@@ -41,11 +41,18 @@ Count the same way every time, so the numbers of two reports can be compared:
 4. Report, leading with the count and the commit: per exit criterion the remaining items in a
    short line each, then work in progress, then development-process items. When the milestone
    count is zero, say that the items are done but the milestone is not yet closed, and propose
-   `sweep` (or `close` when a sweep since the last raise found nothing). When every milestone
-   item left has a `Blocked on:` clause, say so and propose `sweep`, which judges whether each
-   one still belongs in the milestone.
+   `close`, which starts with a sweep (ADR-413). When every milestone item left has a
+   `Blocked on:` clause, say so and propose `close` too: its sweep judges whether each one
+   still belongs in the milestone, and it stops there with the questions.
 
 ## sweep
+
+`close` starts with this sweep, so the maintainer does not have to ask for it separately
+(ADR-413); asked for on its own, it shows the candidates earlier, while milestone items are
+still open. Every sweep report names the commit it read and whether it found anything; the next
+sweep, and the one `close` starts with, takes that commit as its base. Look for it where
+`status` looks for an earlier count; the backlog PR a sweep opens and the PR `close` opens name
+it in their descriptions.
 
 One pass over every P2 and P3 item in both backlog files, plus a search for work no item
 records. An item belongs in the milestone when one of these holds; note which one:
@@ -91,21 +98,37 @@ the `backlog` skill (new items for promises with no item); lowering an item re-j
 that were raised only for it (ADR-388). Put the changes in one backlog-only PR (no automated
 review, ADR-251), unless a moved-out item is promised in the milestone's scope: then the same PR
 moves that promise to the section of the milestone that unblocks it, or to the plan's list of
-open decisions when no milestone does, and the plan change gets the automated review.
+open decisions when no milestone does, and the plan change gets the automated review. The PR
+description names the sweep's commit.
 
 After the raised items are done, the next sweep only needs rule 2 for items added since this
-one, plus rules 1, 3 and 4 for code and CI changes merged since (a fix can add a platform or
-release-only path that CI does not run). The milestone is ready to close when a sweep
-finds nothing.
+one's commit, plus rules 1, 3 and 4 for code and CI changes merged since (a fix can add a
+platform or release-only path that CI does not run). Such a **sweep of the changes** still
+judges every blocked milestone P1 item, since a clause can change without the item moving.
+When no earlier sweep report and its commit can be found, the sweep covers every item. The
+milestone is ready to close when a sweep on the commit `close` reports finds nothing.
 
 ## close
 
-Run only when the maintainer asks to finish the milestone. The milestone count is zero and the
-last sweep found nothing; if a sweep has not run since the last raised or lowered items merged,
-run it first and stop if it finds something. A blocked item that serves an exit criterion keeps
-the milestone open until the maintainer unblocks it or changes the exit criteria.
+Run only when the maintainer asks to finish the milestone. A sweep is part of `close`, and the
+maintainer never has to ask for one first: an earlier sweep's result can be out of date by the
+time the maintainer asks, since items and code merged after it are not in it (ADR-413).
 
-1. **Evidence for each exit criterion**, not only closed items: the test or CI job that shows
+1. **Count and sweep** on the latest `origin/main`, and name that commit; every later step
+   reports on the same commit.
+   - Milestone items left and not all blocked: report as `status` does and stop. The milestone
+     is not finished.
+   - Otherwise run the sweep: a sweep of the changes since the last sweep report's commit, or
+     every item when none is found. It finds something when it has a raise candidate, a
+     move-out candidate or a question, which includes every milestone item left, since all of
+     them are blocked. Report as `sweep` does, ask the same questions, and stop: the close
+     goes no further in this run. The maintainer's answer is applied as `sweep` applies it,
+     and once those changes and any raised items are merged, the maintainer asks for `close`
+     again, which sweeps the changes since this sweep's commit.
+   - The sweep finds nothing: say so with its commit and go on. A blocked item that serves an
+     exit criterion keeps the milestone open until the maintainer unblocks it or changes the
+     exit criteria; the sweep reports it as a question, so the close never gets past it.
+2. **Evidence for each exit criterion**, not only closed items: the test or CI job that shows
    it, in a successful CI run on `main` for the commit the report names (job, run, the log line
    that says it passed). If that run is still going, use an earlier green run only after
    checking that the commits between it and the reported one cannot affect the criterion, and
@@ -113,19 +136,20 @@ the milestone open until the maintainer unblocks it or changes the exit criteria
    pull requests. A criterion that the plan says needs real hardware (design 13.5, ADR-275)
    is shown by the recorded hardware run instead (what ran, on which equipment, the result). A
    criterion without evidence becomes a P1 item and the close stops.
-2. **Plan.** Delete the milestone's section. Carry over to the next milestone's section
+3. **Plan.** Delete the milestone's section. Carry over to the next milestone's section
    anything that still applies (optional hardware checks, notes on values still to be checked).
    Update the overview table and the order-of-work paragraph (the finish date). Move any lasting
    decision into `docs/system-architecture.md` or an ADR.
-3. **Status.** Name the next milestone in the project-wide backlog's Status section with the
+4. **Status.** Name the next milestone in the project-wide backlog's Status section with the
    date and the maintainer's decision, summarize its goal, and bring the "where the crates
    stand" list up to date.
-4. **Re-check P1 and P2 against the next milestone** (`work/README.md`). Go through its scope
+5. **Re-check P1 and P2 against the next milestone** (`work/README.md`). Go through its scope
    and exit criteria one by one: an item on the path becomes P1, a P1 off the path becomes P2,
    a piece with no item becomes a new item, an item holding several pieces is split, and an item
    that waits on another gets a `Blocked on:` clause. Leave development-process items as they
    are.
-5. Run `scripts/check-backlog.sh` and `scripts/check-work-refs.sh`, open one draft PR with the
+6. Run `scripts/check-backlog.sh` and `scripts/check-work-refs.sh`, open one draft PR with the
    plan and backlog changes, and run `pr-review-loop` (the plan is not a backlog file, so
-   it gets the automated review). The PR description names the raised, lowered and added items by their
-   wording, and the next milestone's P1 count per file. The maintainer merges.
+   it gets the automated review). The PR description names the commit and the result of step
+   1's sweep, the raised, lowered and added items by their wording, and the next milestone's P1
+   count per file. The maintainer merges.

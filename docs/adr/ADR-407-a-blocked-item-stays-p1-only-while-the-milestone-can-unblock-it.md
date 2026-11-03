@@ -1,7 +1,7 @@
 # ADR-407: A Blocked Item Stays P1 Only While the Milestone Can Unblock It
 
 **Date:** 2026-11-01
-**Status:** Accepted
+**Status:** Accepted (Decision item 4 amended by ADR-413: `status` proposes `close`, which starts with the sweep)
 **Affects:** `work/README.md` (priorities), `.claude/skills/milestone-exit` (`status`, `sweep`,
 `close`), `.claude/skills/backlog` (update an item), `.claude/skills/backlog-triage` (blocked
 items), `CLAUDE.md` and `.claude/README.md` (skill summaries)

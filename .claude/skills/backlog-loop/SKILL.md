@@ -318,9 +318,10 @@ One message to the maintainer:
   recommendation; for the rest (another precondition is still open), give only their count;
 - one line on the current milestone: its P1 count now, counted the same way on the latest
   `origin/main`, and the change from the count at the start. Give no per-item list; the
-  `milestone-exit` skill's `status` mode gives the full report. When the count is zero, say so
-  and recommend that the maintainer run its `sweep` mode. Never run `sweep` or `close` from the
-  loop: both need the maintainer;
+  `milestone-exit` skill's `status` mode gives the full report. When the count is zero, or every
+  milestone item left is blocked, say so and recommend that the maintainer ask for its `close`
+  mode, which starts with a sweep (ADR-413). Never run `sweep` or `close` from the loop: both
+  need the maintainer;
 - why the run stopped (no items left, nothing eligible within the cap or five `next-task` calls
   without a pick, `main` red, another loop PR open or a lost claim race, a PR closed without merging, a Dependabot replacement the loop could not finish (with the
   branch the maintainer should delete), or three backlog-only PRs);

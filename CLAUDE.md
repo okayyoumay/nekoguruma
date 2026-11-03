@@ -60,7 +60,7 @@ The format, the P0-P3 scale and the file list are in `work/README.md` ("Backlog 
 - `backlog-triage` (run on request only): clean up stale, duplicate or mis-prioritized items
 - `milestone-exit`: count what is left of the current milestone per exit criterion, sweep the
   lower priorities for work it should still take and its blocked P1 items for work it cannot
-  unblock, and close it on request
+  unblock, and close it on request (the close starts with that sweep)
 - `backlog-loop` (run on request only): work through the backlog one item and one pull request
   at a time, replacing failing Dependabot pull requests first; the next PR opens only after
   the maintainer merges the previous one, and the next item may be prepared locally meanwhile

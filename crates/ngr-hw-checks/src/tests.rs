@@ -398,7 +398,7 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
     let ch1 = with_channel(jvci, "CAN_CH1");
     parse(&loopback(&ch1, &partner(&with_channel(jvci, "CAN_CH2")))).unwrap();
     // The same channel, however it is spelled, or a channel at one end only, in either order.
-    for other in ["CAN_CH1", "can_ch1", " CAN_CH01 "] {
+    for other in ["CAN_CH1", "can_ch1", "CAN_CH01"] {
         refused_for(
             &loopback(&ch1, &partner(&with_channel(jvci, other))),
             "must be different channels",
@@ -417,6 +417,54 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         "must be different channels",
     );
     assert!(parse(&loopback(&with_channel(jvci, " "), &partner(&ch1))).is_err());
+    // A channel has no surrounding whitespace: the worker does not trim it.
+    for padded in [" CAN_CH2", "CAN_CH2 "] {
+        refused_for(
+            &loopback(&ch1, &partner(&with_channel(jvci, padded))),
+            "no surrounding whitespace",
+        );
+    }
+    // A channel is of the link's protocol family: ISO 15765 or K-line channels do not fit a CAN
+    // link, and a CAN channel does not fit an ISO 15765 link.
+    for wrong in ["ISO15765_CH1", "ISO9141_CH1", "J1850VPW_CH1"] {
+        refused_for(
+            &loopback(
+                &with_channel(jvci, wrong),
+                &partner(&with_channel(jvci, "CAN_CH2")),
+            ),
+            "channel of the `link`'s protocol family",
+        );
+    }
+    let iso_link = |end: &str, channel: &str| {
+        with_channel(
+            &end.replacen(
+                "protocol = \"CAN\"",
+                "protocol = \"ISO_14229_3_on_ISO_15765_2\"",
+                1,
+            ),
+            channel,
+        )
+    };
+    refused_for(
+        &loopback(
+            &iso_link(jvci, "CAN_CH1"),
+            &partner(&iso_link(jvci, "ISO15765_CH2")),
+        ),
+        "channel of the `link`'s protocol family",
+    );
+    parse(&loopback(
+        &iso_link(jvci, "ISO15765_CH1"),
+        &partner(&iso_link(jvci, "ISO15765_CH2")),
+    ))
+    .unwrap();
+    // Two names of one family are one channel when the number agrees.
+    refused_for(
+        &loopback(
+            &iso_link(jvci, "ISO15765_CH1"),
+            &partner(&iso_link(jvci, "ISO_14229_3_on_ISO_15765_2_CH1")),
+        ),
+        "must be different channels",
+    );
 
     // Names are matched exactly, as the library resolvers match them: a library in another
     // case is another library.
@@ -447,11 +495,14 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         ),
         "both raw CAN or both ISO 15765",
     );
-    parse(&loopback(
-        &with_protocol(vci_end, "CAN"),
-        &partner(&with_protocol(&second_module, "can_ch1")),
-    ))
-    .unwrap();
+    // A channel is given in `channel`, never as a `_CHn` suffix of the protocol.
+    refused_for(
+        &loopback(
+            &with_protocol(vci_end, "CAN"),
+            &partner(&with_protocol(&second_module, "can_ch1")),
+        ),
+        "names no `_CHn` channel",
+    );
     // Names are matched ignoring case, aliases of one family agree, and a protocol outside the
     // two families is refused.
     refused_for(
@@ -970,4 +1021,18 @@ fn comparams_the_worker_cannot_set_are_not_pinnable() {
     }
     assert!(!crate::comparam::profile_may_pin("cp_testerpresentimmed"));
     assert!(!crate::comparam::ALLOWED.contains(&"cp_testerpresentimmed"));
+}
+
+#[test]
+fn can_and_iso15765_channels_with_one_number_are_one_physical_channel() {
+    use crate::profile::physical_channel;
+    // A raw CAN and an ISO 15765 channel can share hardware, so the profile conservatively takes
+    // the two for one when the number agrees; the worker's synonyms agree, and the base is 0.
+    let one = |name| physical_channel(name).expect(name);
+    assert_eq!(one("CAN_CH1"), one("ISO15765_CH01"));
+    assert_eq!(one("ISO_11898_RAW_CH2"), one("iso-tp_ch2"));
+    assert_eq!(one("CAN"), one("ISO_14229_3_on_ISO_15765_2"));
+    assert_ne!(one("CAN_CH1"), one("CAN_CH2"));
+    assert_ne!(one("CAN"), one("CAN_CH1"));
+    assert_eq!(physical_channel("ISO9141_CH1"), None);
 }

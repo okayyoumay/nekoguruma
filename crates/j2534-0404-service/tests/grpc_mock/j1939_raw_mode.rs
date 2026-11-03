@@ -337,6 +337,72 @@ async fn raw_mode_j1939_rx_drops_destination_address() {
     server.shutdown().await;
 }
 
+/// ADR-414: a J1939 link named by its `_PS` id or its `_CHx` id gets the same RawMode shim as the
+/// resource-table link: the sent frame gains the derived destination address, and a received
+/// frame loses it.
+#[tokio::test]
+#[serial]
+async fn raw_mode_j1939_ps_and_chx_links_use_the_destination_address_shim() {
+    for (name, id, pins) in [
+        ("J1939_PS", j2534_0404::PROTOCOL_J1939_PS, CAN_PINS),
+        ("J1939_CH1", j2534_0404::PROTOCOL_J1939_CH1, &[][..]),
+    ] {
+        let server = start_j2534_2_server().await;
+        let mut client = server.client().await;
+        let cll_handle = create_and_connect_j1939_cll_raw_mode(
+            &mut client,
+            id,
+            pins,
+            &[
+                (CP_J1939_ADDR_NEG_RULE, 0b10),
+                (CP_J1939_TARGET_ADDRESS, 0x00),
+            ],
+            1,
+        )
+        .await;
+        start_comm(&mut client, cll_handle).await;
+
+        let cop_data = vec![0x18, 0x00, 0x21, 0x80, 0x01, 0x02];
+        send_data(&mut client, cll_handle, cop_data, vec![]).await;
+        assert_eq!(
+            server.backdoor.written_data(MOCK_CHANNEL_ID, 0),
+            vec![0x18, 0x00, 0x21, 0x80, 0x21, 0x01, 0x02],
+            "{name}: the destination address is derived from the PS byte"
+        );
+
+        client
+            .start_com_primitive(StartComPrimitiveRequest {
+                cop_tag: None,
+                cll_handle: Some(cll_handle),
+                cop_type: vci_service_interface::ComOperationType::CoptSendrecv as i32,
+                cop_data: vec![0x18, 0x00, 0x21, 0x80],
+                cop_ctrl_data: Some(ComPrimitiveCtrlData {
+                    time: 0,
+                    num_send_cycles: 0,
+                    num_receive_cycles: -1,
+                    temp_param_update: 0,
+                    expected_response_array: vec![ExpectedResponseData {
+                        response_type: 0,
+                        acceptance_id: 0,
+                        mask_data: vec![],
+                        pattern_data: vec![],
+                        unique_resp_ids: vec![],
+                    }],
+                    tx_flag: None,
+                }),
+            })
+            .await
+            .expect("the receive-only monitor starts");
+        let frame = vec![0x18, 0x00, 0x21, 0x91, 0x21, 0x01, 0x02];
+        server
+            .backdoor
+            .inject_rx(MOCK_CHANNEL_ID, &frame, j2534_0404::PROTOCOL_J1939_PS);
+        let result = wait_for_result_data(&mut client, cll_handle).await;
+        assert_result_data(&result, &[], &[], &[0x18, 0x00, 0x21, 0x91, 0x01, 0x02]);
+        server.shutdown().await;
+    }
+}
+
 /// Resolves a `PDU_IOCTL_*` shortname to its numeric `io_ctrl_command_id`.
 /// Local copy, matching `j1939.rs`'s/`repeat_message.rs`'s own per-file
 /// convention.

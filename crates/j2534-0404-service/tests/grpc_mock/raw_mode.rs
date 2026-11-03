@@ -330,6 +330,16 @@ async fn create_raw_by_id(
     protocol_id: u32,
     checksum: bool,
 ) -> Result<vci_service_interface::ComLogicalLinkHandle, tonic::Status> {
+    create_raw_by_id_and_pins(client, protocol_id, checksum, &[]).await
+}
+
+/// Like [`create_raw_by_id`], with the DLC pins a `_PS` id needs.
+async fn create_raw_by_id_and_pins(
+    client: &mut VciServiceClient<tonic::transport::Channel>,
+    protocol_id: u32,
+    checksum: bool,
+    pins: &[(u32, &str)],
+) -> Result<vci_service_interface::ComLogicalLinkHandle, tonic::Status> {
     let mut bits = vec![CllCreateFlagBit::CllCreateFlagRawMode as i32];
     if checksum {
         bits.push(CllCreateFlagBit::CllCreateFlagChecksumMode as i32);
@@ -340,7 +350,7 @@ async fn create_raw_by_id(
                 module_handle: MOCK_MODULE_HANDLE,
             }),
             resource: Some(create_com_logical_link_request::Resource::RscData(
-                resource_with_protocol(protocol_id),
+                resource_with_protocol_id_and_pins(protocol_id, pins),
             )),
             cll_create_flag: Some(
                 create_com_logical_link_request::CllCreateFlag::CllCreateFlagBits(CllCreateFlag {
@@ -441,69 +451,254 @@ async fn raw_mode_on_an_iso15765_channel_ignores_software_isotp_mode() {
     server.shutdown().await;
 }
 
-/// ADR-414: an additional channel is allowed exactly when its base protocol is: one channel of
-/// each family, with the J1850 families needing ChecksumMode as their base does (ADR-200).
+/// One row of the per-family RawMode table: a link id to create by, whether the link needs
+/// ChecksumMode with RawMode, the data rate to stage, and a raw frame to send and to receive.
+struct RawFamily {
+    name: &'static str,
+    id: u32,
+    checksum: bool,
+    rate: u32,
+    frame: &'static [u8],
+    /// The DLC pins a `_PS` id needs (a `_CHx` id takes none).
+    pins: &'static [(u32, &'static str)],
+}
+
+/// A raw CAN-family frame: a 4-byte CAN ID, then data.
+const CAN_FRAME: &[u8] = &[0x00, 0x00, 0x01, 0x23, 0x02, 0x10, 0x03];
+/// A raw K-line frame, header only: ChecksumMode ON leaves the checksum to the service.
+const KLINE_FRAME: &[u8] = &[0x83, 0x22, 0xF1, 0x90];
+/// A raw J1850 frame: three header bytes, then data.
+const J1850_FRAME: &[u8] = &[0x68, 0x6A, 0xF1, 0x01, 0x02, 0x03];
+
+/// A raw SCI frame: SCI passes the bytes through in both modes.
+const SCI_FRAME: &[u8] = &[0x01, 0x02, 0x03];
+
+/// Creates, connects and exchanges one raw frame on `family`: the frame written reaches the
+/// wire unchanged, and a frame received is delivered whole. Returns the first problem.
+async fn raw_frame_round_trip(family: &RawFamily) -> Result<(), String> {
+    let server = TestServer::start_with_modules(CHX_MODULES).await;
+    let mut client = server.client().await;
+    let result = async {
+        let cll_handle =
+            create_raw_by_id_and_pins(&mut client, family.id, family.checksum, family.pins)
+                .await
+                .map_err(|status| format!("create: {status}"))?;
+        set_com_param_unum32(&mut client, cll_handle, j2534_0404::DATA_RATE, family.rate).await;
+        client
+            .connect_com_logical_link(vci_service_interface::ConnectComLogicalLinkRequest {
+                cll_handle: Some(cll_handle),
+            })
+            .await
+            .map_err(|status| format!("connect: {status}"))?;
+        arm_receive_only_monitor_raw_mode(&mut client, cll_handle).await;
+        send_data(&mut client, cll_handle, family.frame.to_vec(), vec![]).await;
+        if server.backdoor.written_count(MOCK_CHANNEL_ID) != 1
+            || server.backdoor.written_data(MOCK_CHANNEL_ID, 0) != family.frame
+        {
+            return Err("the frame did not reach the wire unchanged".to_owned());
+        }
+        server
+            .backdoor
+            .inject_rx(MOCK_CHANNEL_ID, family.frame, family.id);
+        let received = wait_for_result_data(&mut client, cll_handle).await;
+        if received.data_bytes != family.frame || received.extra_info.is_some() {
+            return Err(format!("received {received:?}"));
+        }
+        Ok(())
+    }
+    .await;
+    server.shutdown().await;
+    result
+}
+
+/// ADR-414: a `_PS` or `_CHx` link sends and receives a raw frame like the protocol it stands
+/// for, for each family of the RawMode list that has such links in the mock.
+#[tokio::test]
+#[serial]
+async fn raw_mode_sends_and_receives_on_ps_and_chx_links() {
+    use j2534_0404::*;
+    const CAN_PINS: &[(u32, &str)] = &[(3, "HI"), (11, "LOW")];
+    const FT_PINS: &[(u32, &str)] = &[(1, "HI"), (9, "LOW")];
+    const K_PINS: &[(u32, &str)] = &[(1, "K"), (8, "L")];
+    let row = |name, id, checksum, rate, frame, pins: &'static [(u32, &'static str)]| RawFamily {
+        name,
+        id,
+        checksum,
+        rate,
+        frame,
+        pins: if name.ends_with("_PS") { pins } else { &[] },
+    };
+    let can = |name, id| row(name, id, false, 500_000, CAN_FRAME, CAN_PINS);
+    let ft = |name, id| row(name, id, false, 125_000, CAN_FRAME, FT_PINS);
+    let sw = |name, id| row(name, id, false, 33_333, CAN_FRAME, &[(1, "HI")]);
+    let kline = |name, id| row(name, id, true, 10_400, KLINE_FRAME, K_PINS);
+    let vpw = |name, id| row(name, id, true, 10_400, J1850_FRAME, &[(1, "PLUS")]);
+    let pwm = |name, id| {
+        row(
+            name,
+            id,
+            true,
+            41_600,
+            J1850_FRAME,
+            &[(1, "PLUS"), (9, "MINUS")],
+        )
+    };
+    let families = [
+        can("CAN_PS", PROTOCOL_CAN_PS),
+        can("CAN_CH1", PROTOCOL_CAN_CH1),
+        can("ISO15765_PS", PROTOCOL_ISO15765_PS),
+        can("ISO15765_CH1", PROTOCOL_ISO15765_CH1),
+        kline("ISO9141_PS", PROTOCOL_ISO9141_PS),
+        kline("ISO9141_CH1", PROTOCOL_ISO9141_CH1),
+        kline("ISO14230_PS", PROTOCOL_ISO14230_PS),
+        kline("ISO14230_CH1", PROTOCOL_ISO14230_CH1),
+        vpw("J1850VPW_PS", PROTOCOL_J1850VPW_PS),
+        vpw("J1850VPW_CH1", PROTOCOL_J1850VPW_CH1),
+        pwm("J1850PWM_PS", PROTOCOL_J1850PWM_PS),
+        pwm("J1850PWM_CH1", PROTOCOL_J1850PWM_CH1),
+        sw("SW_CAN_PS", PROTOCOL_SW_CAN_PS),
+        sw("SW_CAN_CAN_CH1", PROTOCOL_SW_CAN_CAN_CH1),
+        sw("SW_ISO15765_PS", PROTOCOL_SW_ISO15765_PS),
+        sw("SW_CAN_ISO15765_CH1", PROTOCOL_SW_CAN_ISO15765_CH1),
+        ft("FT_CAN_PS", PROTOCOL_FT_CAN_PS),
+        ft("FT_CAN_CH1", PROTOCOL_FT_CAN_CH1),
+        ft("FT_ISO15765_PS", PROTOCOL_FT_ISO15765_PS),
+        ft("FT_ISO15765_CH1", PROTOCOL_FT_ISO15765_CH1),
+        row(
+            "J2610_PS",
+            PROTOCOL_J2610_PS,
+            false,
+            7_812,
+            SCI_FRAME,
+            &[(6, "TX"), (7, "RX")],
+        ),
+        row(
+            "J2610_CH1",
+            PROTOCOL_J2610_CH1,
+            false,
+            7_812,
+            SCI_FRAME,
+            &[],
+        ),
+    ];
+    let mut problems = Vec::new();
+    for family in &families {
+        if let Err(problem) = raw_frame_round_trip(family).await {
+            problems.push(format!("{}: {problem}", family.name));
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+}
+
+/// ADR-414: a RawMode `CAN_CH1` or `CAN_PS` link that FD ComParams promote at connect keeps
+/// RawMode. The service sets the FD format and rate-switch flags from the link, not from the
+/// client's raw message; the identifier and the data bytes are the client's, unpadded.
+#[tokio::test]
+#[serial]
+async fn raw_mode_survives_the_fd_promotion_of_a_can_channel() {
+    use j2534_0404::*;
+    for (id, pins, fd_id) in [
+        (PROTOCOL_CAN_CH1, &[][..], PROTOCOL_FD_CAN_CH1),
+        (
+            PROTOCOL_CAN_PS,
+            &[(3, "HI"), (11, "LOW")][..],
+            PROTOCOL_FD_CAN_PS,
+        ),
+    ] {
+        let server = TestServer::start_with_modules(CHX_MODULES).await;
+        let mut client = server.client().await;
+        let cll_handle = create_raw_by_id_and_pins(&mut client, id, false, pins)
+            .await
+            .expect("the link accepts RawMode");
+        for (param, value) in [
+            (DATA_RATE, 500_000),
+            (CP_CANFD_TX_MAX_DATA_LENGTH, 64),
+            (CP_CANFD_BAUDRATE, 2_000_000),
+        ] {
+            set_com_param_unum32(&mut client, cll_handle, param, value).await;
+        }
+        client
+            .connect_com_logical_link(vci_service_interface::ConnectComLogicalLinkRequest {
+                cll_handle: Some(cll_handle),
+            })
+            .await
+            .expect("the FD promotion connects");
+        assert_eq!(server.backdoor.channel_protocol_id(MOCK_CHANNEL_ID), fd_id);
+
+        // Twenty data bytes are not a legal FD length: with RawMode the service leaves them
+        // as sent.
+        let mut frame = 0x123_u32.to_be_bytes().to_vec();
+        frame.extend((1..=20).map(|b| b as u8));
+        send_data(&mut client, cll_handle, frame.clone(), vec![]).await;
+        assert_eq!(server.backdoor.written_data(MOCK_CHANNEL_ID, 0), frame);
+        let flags = server.backdoor.written_tx_flags(MOCK_CHANNEL_ID, 0);
+        assert_ne!(flags & TX_FD_CAN_FORMAT, 0);
+        assert_ne!(flags & TX_FD_CAN_BRS, 0);
+        server.shutdown().await;
+    }
+}
+
+/// ADR-414: a family with no base on the RawMode list stays refused on its `_PS` id and on its
+/// `_CHx` id, whichever way the link is named.
+#[tokio::test]
+#[serial]
+async fn raw_mode_stays_refused_on_the_excluded_families() {
+    use j2534_0404::*;
+    let server = TestServer::start_with_modules(CHX_MODULES).await;
+    let mut client = server.client().await;
+    let k: &[(u32, &str)] = &[(1, "K")];
+    let can: &[(u32, &str)] = &[(6, "HI"), (14, "LOW")];
+    let refused = [
+        ("GM_UART_PS", PROTOCOL_GM_UART_PS, k),
+        ("GM_UART_CH1", PROTOCOL_GM_UART_CH1, &[][..]),
+        ("UART_ECHO_BYTE_PS", PROTOCOL_UART_ECHO_BYTE_PS, k),
+        ("ECHO_BYTE_CH1", PROTOCOL_ECHO_BYTE_CH1, &[][..]),
+        ("HONDA_DIAGH_PS", PROTOCOL_HONDA_DIAGH_PS, k),
+        ("HONDA_DIAGH_CH1", PROTOCOL_HONDA_DIAGH_CH1, &[][..]),
+        ("J1708_PS", PROTOCOL_J1708_PS, &[(1, "PLUS")][..]),
+        ("J1708_CH1", PROTOCOL_J1708_CH1, &[][..]),
+        ("TP2_0_PS", PROTOCOL_TP2_0_PS, can),
+        ("TP2_0_CH1", PROTOCOL_TP2_0_CH1, &[][..]),
+    ];
+    let mut problems = Vec::new();
+    for (name, id, pins) in refused {
+        match create_raw_by_id_and_pins(&mut client, id, false, pins).await {
+            Err(status)
+                if status.code() == Code::Unimplemented && status.message().contains("RawMode") => {
+            }
+            other => problems.push(format!("{name}: {other:?}")),
+        }
+    }
+    assert!(problems.is_empty(), "{problems:#?}");
+    server.shutdown().await;
+}
+
+/// ADR-414: creation by `_CHx` id follows the base protocol, including the J1850 ChecksumMode
+/// rule (ADR-200), for the families that need no frame exchange to show it.
 #[tokio::test]
 #[serial]
 async fn raw_mode_on_an_additional_channel_follows_its_base_protocol() {
     let server = TestServer::start_with_modules(CHX_MODULES).await;
     let mut client = server.client().await;
-
-    let allowed = [
-        ("CAN_CH1", j2534_0404::PROTOCOL_CAN_CH1, false),
-        ("ISO15765_CH1", j2534_0404::PROTOCOL_ISO15765_CH1, false),
-        ("ISO9141_CH1", j2534_0404::PROTOCOL_ISO9141_CH1, false),
-        ("ISO14230_CH1", j2534_0404::PROTOCOL_ISO14230_CH1, false),
-        ("J1850VPW_CH1", j2534_0404::PROTOCOL_J1850VPW_CH1, true),
-        ("J1850PWM_CH1", j2534_0404::PROTOCOL_J1850PWM_CH1, true),
-        ("J1939_CH1", j2534_0404::PROTOCOL_J1939_CH1, false),
-        ("J2610_CH1", j2534_0404::PROTOCOL_J2610_CH1, false),
-    ];
-    for (name, id, checksum) in allowed {
-        create_raw_by_id(&mut client, id, checksum)
+    for (name, id) in [
+        ("J1939_CH1", j2534_0404::PROTOCOL_J1939_CH1),
+        ("J2610_CH1", j2534_0404::PROTOCOL_J2610_CH1),
+    ] {
+        create_raw_by_id(&mut client, id, false)
             .await
             .unwrap_or_else(|status| panic!("{name} should accept RawMode: {status}"));
     }
-    // A J1850 channel without ChecksumMode is refused for the same reason as its base.
-    for id in [
-        j2534_0404::PROTOCOL_J1850VPW_CH1,
-        j2534_0404::PROTOCOL_J1850PWM_CH1,
+    for (id, pins) in [
+        (j2534_0404::PROTOCOL_J1850VPW_CH1, &[][..]),
+        (j2534_0404::PROTOCOL_J1850PWM_CH1, &[][..]),
+        (j2534_0404::PROTOCOL_J1850VPW_PS, &[(1, "PLUS")][..]),
     ] {
-        let status = create_raw_by_id(&mut client, id, false)
+        let status = create_raw_by_id_and_pins(&mut client, id, false, pins)
             .await
-            .expect_err("a J1850 channel needs ChecksumMode with RawMode");
+            .expect_err("a J1850 link needs ChecksumMode with RawMode");
         assert_eq!(status.code(), Code::Unimplemented);
         assert!(status.message().contains("ChecksumMode"), "{status}");
     }
-
-    // Families whose base is not on the list (or is excluded for good, TP2.0) stay refused.
-    let refused = [
-        ("GM_UART_CH1", j2534_0404::PROTOCOL_GM_UART_CH1),
-        ("ECHO_BYTE_CH1", j2534_0404::PROTOCOL_ECHO_BYTE_CH1),
-        ("HONDA_DIAGH_CH1", j2534_0404::PROTOCOL_HONDA_DIAGH_CH1),
-        ("J1708_CH1", j2534_0404::PROTOCOL_J1708_CH1),
-        ("TP2_0_CH1", j2534_0404::PROTOCOL_TP2_0_CH1),
-        ("FT_CAN_CH1", j2534_0404::PROTOCOL_FT_CAN_CH1),
-        ("FT_ISO15765_CH1", j2534_0404::PROTOCOL_FT_ISO15765_CH1),
-        ("SW_CAN_CAN_CH1", j2534_0404::PROTOCOL_SW_CAN_CAN_CH1),
-        (
-            "SW_CAN_ISO15765_CH1",
-            j2534_0404::PROTOCOL_SW_CAN_ISO15765_CH1,
-        ),
-        // The CAN FD ids (clause 21, 22) cannot be named directly at all: FD follows from
-        // ComParams on an ordinary CAN or ISO 15765 channel, which RawMode rules as its base.
-    ];
-    for (name, id) in refused {
-        let status = create_raw_by_id(&mut client, id, false)
-            .await
-            .expect_err("RawMode stays refused on this channel");
-        assert_eq!(status.code(), Code::Unimplemented, "{name}: {status}");
-        assert!(
-            status.message().contains("RawMode"),
-            "{name} is refused by the RawMode rule: {status}"
-        );
-    }
-
     server.shutdown().await;
 }
 

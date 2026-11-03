@@ -1817,9 +1817,8 @@ pub(super) fn resolve_tester_present(
     // ADR-196 Decision items 1/2: the calling CLL's `LogicalLinkState::
     // raw_mode` -- see `resolve_send_recv_tx`'s identical parameter for the
     // full rationale. TesterPresent is unreachable for TP2.0 regardless (see
-    // this function's own `build_tx_message` call below), and Phase 1's
-    // protocol allowlist means `raw_mode` is only ever `true` for a base CAN
-    // or hardware ISO15765 link, so the two never conflict.
+    // this function's own `build_tx_message` call below), and the
+    // RawMode protocol allowlist (ADR-414) never admits TP2.0, so the two never conflict.
     raw_mode: bool,
 ) -> Result<ResolvedTesterPresent, String> {
     // ADR-137 Codex-review fix: the master enable switch is checked FIRST,

@@ -98,7 +98,13 @@ The profile cannot see the hardware, so it only refuses what cannot be two chann
   same `pname` (ADR-281), whatever their `module` says. Two D-PDU API ends are on one module
   when they name the same library and `module`.
 - Two ends on one module must describe it identically and name different `channel`s, compared
-  as the J2534 worker reads them: `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
+  as the J2534 worker reads them: `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel, and so are
+  the worker's synonyms of a family (`ISO15765_CH2` and `ISO_14229_3_on_ISO_15765_2_CH2`). `CAN_CHn`
+  and `ISO15765_CHn` with one `n` are taken, conservatively, for one physical channel as well (a raw CAN and an ISO
+  15765 link can share one), so they are refused as two ends. A bare family name is channel 0.
+- A `channel` is a channel of its link's protocol family (`CAN_CHn` on a raw CAN link,
+  `ISO15765_CHn` on an ISO 15765 link), has no surrounding whitespace (the worker does not trim
+  it) and is the only place a channel is named: a `_CHn` suffix on the link's `protocol` is refused.
 - One device reached through both APIs, one at each end, looks like two modules here. Design
   13.5's procedure (only the profile's VCIs connected) and the module match against the attached
   device cover it.
@@ -483,7 +489,7 @@ carrying its own address byte.
   creates an endpoint that names a `channel` from resource data carrying that name (the profile
   decides, not the worker), and the guard admits it only when the name, the bus type and the
   pins are the profile link's. The module must have opted into J2534-2 (`pname` prefixed
-  `J2534-2:`), and `j2534-0404-service` accepts RawMode on `CAN_CHx` and `ISO15765_CHx`
+  `J2534-2:`), and `j2534-0404-service` accepts RawMode on a `CAN_CHx` or `ISO15765_CHx` link
   (ADR-414). The test runs two channels of one module and two modules. A `channel` is a J2534
   notion: the profile refuses it on a D-PDU API `vci`.
 

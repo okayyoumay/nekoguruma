@@ -10,7 +10,8 @@
              (J1850 via the existing generic passthrough plus a new ChecksumMode=ON
              requirement; J1939 via a dedicated destination-address TX/RX shim), and
              TP2.0 is resolved as a permanent RawMode exclusion, not left unscoped.
-             Every other Decision item remains in force)
+             ADR-414 extends the allowlist to the `_PS` and `_CHx` links of the
+             protocols it lists. Every other Decision item remains in force)
 **Affects:** `j2534-0404-service/src/service/rpc_link.rs` (`resolve_cll_create_flag`,
              `rpc_create_com_logical_link`'s protocol allowlist, `connect_flags`,
              the shared-channel join-compatibility check),

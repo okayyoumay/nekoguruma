@@ -13,7 +13,7 @@ use vci_service_interface::{
 
 use super::{Context, Grant, GuardRefusal, uds};
 use crate::comparam::{ALLOWED, canonical};
-use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS, channel_key};
+use crate::profile::{Addressing, Class, Link, PHYSICAL_COMPARAMS, channel_key, framing};
 
 /// The bus type the agent names a CAN link's resource by (ISO 22900-2 (2022) Annex B.1).
 pub(super) const BUS_TYPE: &str = "ISO_11898_2_DWCAN";
@@ -156,6 +156,12 @@ fn resource_matches(
             if channel_key(&protocol) != channel_key(channel) {
                 return Err(refuse(format!(
                     "protocol {protocol:?} is not the endpoint's channel {channel:?}"
+                )));
+            }
+            // The channel is of the link's own framing, as the profile requires of it.
+            if framing(&protocol).is_none() || framing(&protocol) != framing(&link.protocol) {
+                return Err(refuse(format!(
+                    "channel {protocol:?} is not of the profile link's protocol family"
                 )));
             }
         }

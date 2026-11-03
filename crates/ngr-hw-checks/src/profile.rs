@@ -553,6 +553,40 @@ pub(crate) fn framing(protocol: &str) -> Option<Framing> {
     }
 }
 
+/// Splits an additional channel's `_CHn` suffix off a protocol or channel name (matched as
+/// `framing` matches it): the name before the suffix and the channel number without leading
+/// zeros, or the whole name and `None` when there is no suffix.
+fn split_channel_suffix(name: &str) -> (&str, Option<&str>) {
+    let lower_at = name.to_ascii_lowercase().rfind("_ch");
+    match lower_at {
+        Some(index)
+            if !name[index + 3..].is_empty()
+                && name[index + 3..].bytes().all(|b| b.is_ascii_digit()) =>
+        {
+            let digits = name[index + 3..].trim_start_matches('0');
+            (
+                &name[..index],
+                Some(if digits.is_empty() { "0" } else { digits }),
+            )
+        }
+        _ => (name, None),
+    }
+}
+
+/// Whether `protocol` carries a `_CHn` suffix, which `channel` is the one place to give.
+pub(crate) fn has_channel_suffix(protocol: &str) -> bool {
+    split_channel_suffix(protocol).1.is_some()
+}
+
+/// The physical channel a name stands for, as the J2534 worker reads it: the channel number (0
+/// for the base channel, with no suffix) of a CAN or ISO 15765 name. `CAN_CHn` and `ISO15765_CHn`
+/// with one `n` are one channel: a raw CAN and an ISO 15765 link can share a hardware
+/// channel, so the profile conservatively takes them for one and refuses them as two ends. `None` for a name that is neither family.
+pub(crate) fn physical_channel(name: &str) -> Option<String> {
+    framing(name)?;
+    Some(split_channel_suffix(name).1.unwrap_or("0").to_owned())
+}
+
 /// A channel name as the J2534 worker reads it: ASCII case ignored, surrounding spaces dropped,
 /// and a `_CH` index read as a number, so `CAN_CH1`, `can_ch1` and `CAN_CH01` are one channel.
 pub(crate) fn channel_key(name: &str) -> String {
@@ -749,6 +783,31 @@ fn check_endpoint(endpoint: &Endpoint) -> Result<(), ProfileError> {
             "a `channel` names an additional channel of a J2534 module; a D-PDU API `vci` has none",
         ));
     }
+    if let Some(channel) = &endpoint.channel {
+        // The worker does not trim a protocol name, so a channel with spaces names nothing.
+        if channel.trim() != channel {
+            return Err(invalid(
+                "a `channel` has no surrounding whitespace: the worker does not trim it",
+            ));
+        }
+        // A channel is a channel of the link's own family.
+        let family = framing(channel);
+        if endpoint.vci.is_some()
+            && !channel.trim().is_empty()
+            && (family.is_none() || family != framing(&endpoint.link.protocol))
+        {
+            return Err(invalid(
+                "a `channel` is a channel of the `link`'s protocol family: raw CAN (`CAN_CHn`) or \
+                 ISO 15765 (`ISO15765_CHn`), the same as the `protocol`",
+            ));
+        }
+    }
+    // The channel is named in `channel` only, never as a `_CHn` suffix of the protocol.
+    if has_channel_suffix(&endpoint.link.protocol) {
+        return Err(invalid(
+            "a `link`'s `protocol` names no `_CHn` channel: give it in the endpoint's `channel`",
+        ));
+    }
     match (&endpoint.vci, &endpoint.socketcan) {
         (Some(vci), None)
             if endpoint
@@ -792,7 +851,11 @@ fn check_loopback(a: &Endpoint, b: &Endpoint) -> Result<(), ProfileError> {
     };
     let same_vci_channel = same_module
         && match (&a.channel, &b.channel) {
-            (Some(x), Some(y)) => channel_key(x) == channel_key(y),
+            // The same physical channel, however it is spelled or paired.
+            (Some(x), Some(y)) => match (physical_channel(x), physical_channel(y)) {
+                (Some(x), Some(y)) => x == y,
+                _ => channel_key(x) == channel_key(y),
+            },
             _ => true,
         };
     if same_vci_channel {

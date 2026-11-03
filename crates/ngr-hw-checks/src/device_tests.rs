@@ -12,6 +12,7 @@ fn j2534() -> Vci {
         timing_margin_us: None,
         drift_bound_ppm: None,
         clock_margin_us: None,
+        worker_abi: None,
     }
 }
 
@@ -27,6 +28,7 @@ fn dpdu() -> Vci {
         timing_margin_us: None,
         drift_bound_ppm: None,
         clock_margin_us: None,
+        worker_abi: None,
     }
 }
 

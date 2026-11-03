@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use serde::Deserialize;
+use worker_host::abi::Abi;
 
 /// The environment variable that names the profile file.
 pub const PROFILE_VAR: &str = "NGR_HW_PROFILE";
@@ -114,6 +115,30 @@ pub struct Vci {
     /// bound"); without it the agent takes its default (ADR-357).
     #[serde(default)]
     pub clock_margin_us: Option<u32>,
+    /// The worker ABI to test, by the name of the ABI table (design 7.1.2, e.g. `win-x86`): the
+    /// check launches only the worker build for it. Without it the agent's preference decides,
+    /// which on a 64-bit Windows host is the x64 build whenever the VCI has a library for it. The
+    /// report states the ABI that ran either way.
+    #[serde(default, deserialize_with = "abi_by_name")]
+    pub worker_abi: Option<Abi>,
+}
+
+/// Reads an optional ABI by the name `Abi::name` gives it.
+fn abi_by_name<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Option<Abi>, D::Error> {
+    let Some(name) = Option::<String>::deserialize(de)? else {
+        return Ok(None);
+    };
+    Abi::ALL
+        .into_iter()
+        .find(|abi| abi.name() == name)
+        .map(Some)
+        .ok_or_else(|| {
+            let known: Vec<_> = Abi::ALL.iter().map(|abi| abi.name()).collect();
+            serde::de::Error::custom(format!(
+                "unknown `worker_abi` {name:?} (expected one of {})",
+                known.join(", ")
+            ))
+        })
 }
 
 impl Vci {
@@ -626,6 +651,14 @@ fn check_vci(vci: &Vci) -> Result<(), ProfileError> {
             "a D-PDU API `vci` writes `firmware_version` and `library_version` as \
              `major.minor.revision`, each 0 to 255 with no leading zero",
         ));
+    }
+    if let Some(abi) = vci.worker_abi
+        && !agent::launch::host_runs(abi)
+    {
+        return Err(invalid(format!(
+            "`worker_abi` {:?} is not an ABI this host can run a worker for",
+            abi.name()
+        )));
     }
     match vci.api {
         // A J2534 library reports no serial number, so the module is matched through its

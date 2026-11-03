@@ -117,6 +117,49 @@ fn a_profile_s_vci_margins_are_the_keys_it_gives() {
     );
 }
 
+/// The worker ABI to test is optional, named as the ABI table names it, and refused when the name
+/// is unknown or the host cannot run it.
+#[test]
+fn a_profile_names_the_worker_abi_by_its_table_name() {
+    let worker_abi = |name: Option<&str>| {
+        let text = match name {
+            Some(name) => t1("").replace(
+                "library_version = \"4.5\"\n",
+                &format!("library_version = \"4.5\"\nworker_abi = \"{name}\"\n"),
+            ),
+            None => t1(""),
+        };
+        parse(&text).map(|profile| match profile.setup {
+            Setup::Link { vci, .. } => vci.worker_abi,
+            other => panic!("{other:?}"),
+        })
+    };
+    assert_eq!(worker_abi(None), Ok(None));
+    // Every name of the table parses where the host can run it, and is refused where it cannot.
+    for abi in worker_host::abi::Abi::ALL {
+        let parsed = worker_abi(Some(abi.name()));
+        if agent::launch::host_runs(abi) {
+            assert_eq!(parsed, Ok(Some(abi)), "{abi:?}");
+        } else {
+            let ProfileError::Invalid(message) = parsed.unwrap_err() else {
+                panic!("{abi:?}");
+            };
+            assert!(
+                message.contains("worker_abi") && message.contains(abi.name()),
+                "{message}"
+            );
+        }
+    }
+    // An unknown name is a syntax error that lists the known ones.
+    let ProfileError::Syntax(message) = worker_abi(Some("win-arm64")).unwrap_err() else {
+        panic!("expected a syntax error");
+    };
+    assert!(
+        message.contains("win-arm64") && message.contains("win-x86"),
+        "{message}"
+    );
+}
+
 #[test]
 fn a_profile_can_only_narrow_its_class() {
     // T1 narrowed to reads and routines.

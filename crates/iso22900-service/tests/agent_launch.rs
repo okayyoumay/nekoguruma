@@ -62,6 +62,7 @@ async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
         OperatingMode::User,
         &workers,
         &LaunchOptions::default(),
+        None,
     )
     .await
     .expect("the agent should launch iso22900-service for the mock");
@@ -125,6 +126,7 @@ async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
         OperatingMode::User,
         &workers,
         &LaunchOptions::default(),
+        None,
     )
     .await
     .err()

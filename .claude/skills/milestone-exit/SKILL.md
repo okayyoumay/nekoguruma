@@ -1,6 +1,6 @@
 ---
 name: milestone-exit
-description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), or close it (close): sweep what changed since the last sweep, then verify the exit criteria and move the plan and backlog to the next milestone. Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
+description: Track the current nekoguruma milestone to its exit and close it. Count the open P1 items per exit criterion with the change since the last count (status), sweep the P2/P3 items for work the milestone should still take and its blocked P1 items for work it cannot unblock (sweep), or close it (close), which sweeps what changed since the last sweep, then verifies the exit criteria and moves the plan and backlog to the next milestone. Use when the maintainer asks how far the milestone is, what is left, whether anything else belongs in it, or to finish it.
 argument-hint: "status | sweep | close"
 ---
 

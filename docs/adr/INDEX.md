@@ -186,12 +186,12 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-193](ADR-193-tp20-broadcast-periodic-start-cancel-fence.md) | TP2.0 Broadcast-Periodic Start/Cancel Serialization Fence | Accepted | `j2534-0404-service` rpc_primitive/rpc_misc/rpc_link/rpc_module/events/service |
 | [ADR-194](ADR-194-j2534-2-ethernet-ndis-phase16.md) | SAE J2534-2 Ethernet_NDIS — Phase 16 | Accepted | `j2534-0404-service` protocol/resources/rpc_link/rpc_primitive/rpc_misc/names/service_params/events/comparam_id/comparam_defaults/discovery, `j2534-0404-mock` |
 | [ADR-195](ADR-195-cross-process-test-config-race.md) | Cross-Process Test-Harness Startup Race (Per-Process-Unique Config Paths) | Accepted (the test config files lose `library_path`, ADR-281; the per-process-unique path rule stands) | `j2534-0404-service/tests/grpc_mock/harness.rs`, `j2534-0404-service/tests/live_grpc_flow.rs`, `iso22900-service/tests/grpc_mock.rs`, `iso22900-service/src/service/rpc.rs` |
-| [ADR-196](ADR-196-cll-create-flag-raw-mode-checksum-mode-phase1.md) | `CllCreateFlag` RawMode/ChecksumMode Support, Phase 1 (CAN Family) | Accepted (Decision item 1's protocol allowlist extended to hardware K-line by ADR-198, then SAE J1850/J1939 by ADR-200) | `j2534-0404-service` rpc_link/service/tx_header/rpc_primitive/events |
+| [ADR-196](ADR-196-cll-create-flag-raw-mode-checksum-mode-phase1.md) | `CllCreateFlag` RawMode/ChecksumMode Support, Phase 1 (CAN Family) | Accepted (Decision item 1's protocol allowlist extended to hardware K-line by ADR-198, then SAE J1850/J1939 by ADR-200, then to `_PS` and `_CHx` links by ADR-414) | `j2534-0404-service` rpc_link/service/tx_header/rpc_primitive/events |
 | [ADR-197](ADR-197-iso15765-rx-extended-addressing-detection-fix.md) | ISO15765 RX Extended-Addressing Detection Uses RxStatus Bit 7 Too | Accepted | `j2534-0404-service/src/service/events.rs`, `j2534-0404-mock/src/lib.rs` |
-| [ADR-198](ADR-198-cll-create-flag-raw-mode-checksum-mode-phase2.md) | `CllCreateFlag` RawMode/ChecksumMode Support, Phase 2 (Hardware K-Line) | Accepted (Consequences' Repeat Messaging RawMode-rejection residual closed by ADR-199; Phase 3 residual closed by ADR-200) | `j2534-0404-service` rpc_link/service/tx_header/rpc_primitive/events/protocol |
+| [ADR-198](ADR-198-cll-create-flag-raw-mode-checksum-mode-phase2.md) | `CllCreateFlag` RawMode/ChecksumMode Support, Phase 2 (Hardware K-Line) | Accepted (Consequences' Repeat Messaging RawMode-rejection residual closed by ADR-199; Phase 3 residual closed by ADR-200; allowlist extended to `_PS` and `_CHx` links by ADR-414) | `j2534-0404-service` rpc_link/service/tx_header/rpc_primitive/events/protocol |
 | [ADR-199](ADR-199-repeat-messaging-raw-mode-support.md) | SAE J2534-2 Clause 14 Repeat Messaging RawMode Support | Accepted (Decision item 3's response-template addressing reuse superseded by ADR-214) | `j2534-0404-service` rpc_misc/rpc_primitive |
 | [ADR-214](ADR-214-repeat-messaging-rawmode-response-addressing.md) | SAE J2534-2 Clause 14 Repeat Messaging — RawMode Response-Template Addressing | Accepted | `j2534-0404-service` rpc_misc, tests/grpc_mock/harness.rs, tests/grpc_mock/repeat_message.rs, docs |
-| [ADR-200](ADR-200-cll-create-flag-raw-mode-phase3.md) | `CllCreateFlag` RawMode Support, Phase 3 (SAE J1850/J1939, TP2.0 Closed Out) | Accepted | `j2534-0404-service` rpc_link/tx_header/events/rpc_primitive/rpc_misc |
+| [ADR-200](ADR-200-cll-create-flag-raw-mode-phase3.md) | `CllCreateFlag` RawMode Support, Phase 3 (SAE J1850/J1939, TP2.0 Closed Out) | Accepted (allowlist extended to `_PS` and `_CHx` links by ADR-414) | `j2534-0404-service` rpc_link/tx_header/events/rpc_primitive/rpc_misc |
 | [ADR-201](ADR-201-pin-selection-general-secondary-pin-validation.md) | General Clause 6 Pin Selection — Per-Bus Secondary-Pin Validation | Accepted | `j2534-0404-service` resources/names |
 | [ADR-202](ADR-202-j1850-unique-id-comparam-reclassification.md) | SAE J1850 Response-Addressing ComParam Reclassification to `PDU_PC_UNIQUE_ID` | Accepted (RX-side per-ECU URID tagging limitation resolved by ADR-203) | `j2534-0404-service` comparam_support, docs |
 | [ADR-203](ADR-203-kwp-j1850-source-address-rx-routing.md) | KWP/J1850 `CP_EcuRespSourceAddress`-Based RX Routing | Accepted | `j2534-0404-service` events, events_rx_routing, docs, tests/live_grpc_flow.rs |
@@ -403,6 +403,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-411](ADR-411-the-dry-run-answers-from-the-current-target-s-declarations.md) | The Dry Run Answers from the Current Target's Declarations | Accepted | `diag-ir` (`dry_run_targets`, `dry_run`, `Script::response_on`, `Script::seed_on`, `DryRunEvent::SelectTarget`, `DryRunReport::target`, `DryRunError::DeclarationParts`, `ends_profile_scan`); design 12.1; ADR-325 items 3 and 4, ADR-328, ADR-390, ADR-397, ADR-409, ADR-410 |
 | [ADR-412](ADR-412-a-flash-plan-selects-its-target-before-the-erase.md) | A Flash Plan Selects Its Target Before the Erase and Keeps It to the Post-Transfer End | Accepted | `diag-ir` (`Program::validate`, `ProgramError::PlanTargetNotSelected`, `ProgramError::OtherTargetInPlan`), `diag-frontend`, `agent` (tests); design 8.2.4; ADR-325 items 3, 4 and 9, ADR-245 items 4 and 6, ADR-345, ADR-409, ADR-410, ADR-411 |
 | [ADR-413](ADR-413-the-milestone-close-starts-with-a-sweep.md) | The Milestone Close Starts with a Sweep | Accepted | `.claude/skills/milestone-exit`, `.claude/skills/backlog-loop`, `work/README.md`; ADR-407 item 4 |
+| [ADR-414](ADR-414-rawmode-follows-the-base-protocol-on-ps-and-chx-links.md) | RawMode Follows the Base Protocol on `_PS` and `_CHx` Links | Accepted | `j2534-0404-service` (`rpc_link`), `ngr-hw-checks` (`GuardedHandle::open_link`, `profile`, `guard::link`); ADR-157, ADR-158, ADR-196, ADR-198, ADR-200, ADR-213, ADR-333 |
 
 ## Status Legend
 
@@ -502,9 +503,10 @@ the predecessor repository these ADRs came from.
 - ADR-193
 
 ### RawMode / ChecksumMode
-- ADR-196 (Decision item 1's protocol allowlist extended to hardware K-line, and Decision item 3b's `AccessTimingConfig::with_request` claim superseded, by ADR-198; allowlist further extended to SAE J1850/J1939 by ADR-200)
-- ADR-198 (Consequences' Repeat Messaging RawMode-rejection residual closed by ADR-199; Phase 3 residual closed by ADR-200)
-- ADR-200
+- ADR-196 (Decision item 1's protocol allowlist extended to hardware K-line, and Decision item 3b's `AccessTimingConfig::with_request` claim superseded, by ADR-198; allowlist further extended to SAE J1850/J1939 by ADR-200, and to `_PS` and `_CHx` links by ADR-414)
+- ADR-198 (Consequences' Repeat Messaging RawMode-rejection residual closed by ADR-199; Phase 3 residual closed by ADR-200; allowlist extended to `_PS` and `_CHx` links by ADR-414)
+- ADR-200 (allowlist extended to `_PS` and `_CHx` links by ADR-414)
+- ADR-414
 
 ### ComParam Model & Mapping
 - ADR-017 (superseded by ADR-152)

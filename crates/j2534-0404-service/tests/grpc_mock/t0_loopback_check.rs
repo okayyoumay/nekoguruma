@@ -201,6 +201,81 @@ async fn the_loopback_check_passes_through_a_relay() {
     b.shutdown().await;
 }
 
+/// A T0 loopback between two additional channels of one module (SAE J2534-2 clause 7), the
+/// ends told apart by their `channel`.
+fn one_module(first_channel: &str, second_channel: &str) -> Profile {
+    let end = |channel: &str, request: u32, response: u32| {
+        format!(
+            "[[endpoint]]\nchannel = \"{channel}\"\n[endpoint.vci]\n{}[endpoint.link]\n{LINK}\
+             request_id = {request}\nresponse_id = {response}\n",
+            vci_toml("Bench A", "J2534-2:a")
+        )
+    };
+    profile::parse(&format!(
+        "class = \"T0\"\n{}{}",
+        end(first_channel, 0x123, 0x124),
+        end(second_channel, 0x124, 0x123)
+    ))
+    .expect("a T0 profile of two channels of one module")
+}
+
+/// Two channels of one module: the handle creates each link from its channel's name as resource
+/// data (the worker lists resource ids for base protocol names only), and the check passes through
+/// a relay between the two channels.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn the_loopback_check_passes_between_two_channels_of_one_module() {
+    // An additional channel needs a module that opted into J2534-2 (clause 5).
+    let server = TestServer::start_with_modules(&[("Bench A", "J2534-2:a")]).await;
+    let profile = one_module("ISO15765_CH1", "ISO15765_CH2");
+    let Setup::Loopback(ends) = &profile.setup else {
+        panic!("a loopback");
+    };
+    let vci = ends[0].vci.clone().expect("a VCI end");
+    let dir = tempfile::tempdir().unwrap();
+    let mut run = RunGuard::start_in(
+        &profile,
+        "hw_t0_two_endpoint_loopback",
+        dir.path().join("reports"),
+    );
+    let mut handle = GuardedHandle::attach(
+        &profile,
+        &vci,
+        server.worker_client().await,
+        ModuleHandle {
+            module_handle: MOCK_MODULE_HANDLE,
+        },
+        HandleOptions {
+            request_timeout: Duration::from_secs(5),
+            response_timeout: Some(Duration::from_secs(5)),
+        },
+        &run,
+    )
+    .await
+    .expect("both channels of the module open in RawMode");
+    let (task, stop) = relay(|_, _| false);
+    let message = run_check(
+        &profile,
+        Ends::OneModule(&mut handle),
+        &[facts()],
+        &Masker::unmasked(),
+        Duration::from_secs(5),
+    )
+    .await
+    .expect("the check passes");
+    assert!(
+        message.contains("7 frame lengths in both directions"),
+        "{message}"
+    );
+    stop.store(true, std::sync::atomic::Ordering::Relaxed);
+    task.await.unwrap();
+    drop(handle);
+    run.pass();
+    assert!(run.run_teardown().is_empty());
+    drop(run);
+    server.shutdown().await;
+}
+
 /// A frame that never arrives fails the check and names the frame.
 #[tokio::test(flavor = "multi_thread")]
 #[serial]

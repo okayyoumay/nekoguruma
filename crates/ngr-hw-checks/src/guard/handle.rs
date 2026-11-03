@@ -23,7 +23,8 @@
 //!
 //! The handle creates the profile's links itself ([`GuardedHandle::open`] and
 //! [`GuardedHandle::attach`]): per worker endpoint of the profile, `GetResourceIds` and
-//! `CreateComLogicalLink` (RawMode on T0 only), the ComParams `link::required` lists with the
+//! `CreateComLogicalLink` (RawMode on T0 only; an endpoint with a `channel` skips `GetResourceIds`
+//! and is created by resource data naming the channel), the ComParams `link::required` lists with the
 //! profile's values (those a response table holds in `SetUniqueRespIdTable` with one entry, the
 //! others in `SetComParam`), the same timing and response-pending defaults the agent's link sets
 //! (unless the profile pins them), on T1 to T3 the transmit and start-of-message indications the
@@ -1911,25 +1912,33 @@ impl GuardedHandle {
         // Planned first, so that a link the handle cannot set up is not created.
         let Plan { own, table } = plan(link, class)?;
         let timings = Timings::of(&own);
-        let found = self
-            .get_resource_ids(GetResourceIdsRequest {
-                module_handle: Some(module),
-                resource_data: Some(resource_for(link, channel)),
-            })
-            .await?;
-        let resource = found
-            .resource_id_list
-            .and_then(|list| list.resource_id_data_array.into_iter().next())
-            .and_then(|data| data.resource_id_array.into_iter().next())
-            .ok_or_else(|| {
-                HandleError::Setup("the worker has no resource for the link".to_owned())
-            })?;
+        // A link on an additional channel (SAE J2534-2 clause 7) is created from the channel's
+        // compound protocol name as resource data: a worker lists resource ids for the base
+        // protocol names only. The guard compares the data with the profile's link as it does a
+        // learned resource (`guard::link`). The profile decides, not the worker (design
+        // principle 6).
+        let resource = if let Some(channel) = channel {
+            create_com_logical_link_request::Resource::RscData(resource_for(link, Some(channel)))
+        } else {
+            let found = self
+                .get_resource_ids(GetResourceIdsRequest {
+                    module_handle: Some(module),
+                    resource_data: Some(resource_for(link, None)),
+                })
+                .await?;
+            let id = found
+                .resource_id_list
+                .and_then(|list| list.resource_id_data_array.into_iter().next())
+                .and_then(|data| data.resource_id_array.into_iter().next())
+                .ok_or_else(|| {
+                    HandleError::Setup("the worker has no resource for the link".to_owned())
+                })?;
+            create_com_logical_link_request::Resource::ResourceId(id)
+        };
         let created = self
             .create_com_logical_link(CreateComLogicalLinkRequest {
                 module_handle: Some(module),
-                resource: Some(create_com_logical_link_request::Resource::ResourceId(
-                    resource,
-                )),
+                resource: Some(resource),
                 // T0 exchanges raw frames only (the guard refuses RawMode elsewhere).
                 cll_create_flag: (class == Class::T0).then(|| {
                     create_com_logical_link_request::CllCreateFlag::CllCreateFlagBits(

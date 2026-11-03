@@ -2149,8 +2149,9 @@ impl J2534Service {
         // from `cll_create_flag_bits`/`cll_create_flag_raw` -- a pure
         // function of the request itself, so this runs before any protocol
         // resolution below. The protocol-allowlist half of Decision item 1
-        // (RawMode=ON restricted to base CAN/hardware ISO15765, with a
-        // documented Analog Inputs/SCI no-op exception) runs further down,
+        // (RawMode=ON restricted to the CAN/ISO15765/K-line/J1850/J1939 family
+        // and its `_PS`/`_CHx` links, ADR-414, with a documented Analog
+        // Inputs/SCI no-op exception) runs further down,
         // once `hw_protocol_id`/`software_isotp` are resolved.
         let (raw_mode, checksum_mode) = resolve_cll_create_flag(request.cll_create_flag)?;
         // Legacy fallback (no resources table row matched): the pre-table
@@ -2288,11 +2289,9 @@ impl J2534Service {
             && self.can_channel_mode.is_software_isotp(protocol);
         // ADR-196 Decision item 1 (protocol allowlist), extended by ADR-198
         // Phase 2 and ADR-200 Phase 3: RawMode=ON is accepted for a base CAN
-        // or hardware ISO15765 link -- i.e. `hw_protocol_id` exactly
-        // `CAN`/`ISO15765` (NOT a `_PS`/`_CHx` qualified variant: SW/FT/FD-CAN
-        // all normalize away from these two exact values via
-        // `resources::base_protocol_id`, but this phase deliberately does not
-        // extend RawMode to them) and not running in software ISO-TP mode
+        // or hardware ISO15765 link -- i.e. the link's `base_protocol_id` is
+        // `CAN`/`ISO15765`; ADR-414 resolves a `_PS`/`_CHx` link (SW/FT/FD-CAN
+        // included) to that base before the test below -- and not running in software ISO-TP mode
         // (`!software_isotp`, checked separately since a software-ISO-TP
         // link's `hw_protocol_id` is the raw CAN channel underneath --
         // exactly `CAN` -- which would otherwise pass the bare
@@ -2330,27 +2329,34 @@ impl J2534Service {
         // (`tp20_broadcast_address()`), so a "raw" CLL that still needs a
         // ComParam-driven flag to send correctly isn't actually raw.
         if raw_mode {
-            let raw_mode_allowed =
-                (matches!(hw_protocol_id, j2534_0404::CAN | j2534_0404::ISO15765)
-                    && !software_isotp)
-                    || matches!(hw_protocol_id, j2534_0404::ISO9141 | j2534_0404::ISO14230)
-                    || matches!(hw_protocol_id, j2534_0404::J1850VPW | j2534_0404::J1850PWM)
-                    || hw_protocol_id == j2534_0404::PROTOCOL_J1939_PS
-                    || resources::is_analog_in_protocol_id(hw_protocol_id)
-                    || matches!(
-                        hw_protocol_id,
-                        j2534_0404::SCI_A_ENGINE
-                            | j2534_0404::SCI_A_TRANS
-                            | j2534_0404::SCI_B_ENGINE
-                            | j2534_0404::SCI_B_TRANS
-                    );
+            // ADR-414: a `_PS` or `_CHx` link (SAE J2534-2 clauses 6 and 7) changes where the
+            // physical layer is connected, not the protocol, so the allowlist is applied to the
+            // protocol it stands for: `base_protocol_id` resolves a `_PS` id and a `_CHx` id
+            // (and, through the latter, the Single Wire, Fault-Tolerant and CAN FD families to
+            // CAN or ISO15765). The families with no base on the list (TP2.0, UART Echo Byte,
+            // Honda DIAG-H, GM UART, J1708) stay refused in every form.
+            let rawmode_base = resources::base_protocol_id(hw_protocol_id);
+            let raw_mode_allowed = (matches!(rawmode_base, j2534_0404::CAN | j2534_0404::ISO15765)
+                && !software_isotp)
+                || matches!(rawmode_base, j2534_0404::ISO9141 | j2534_0404::ISO14230)
+                || matches!(rawmode_base, j2534_0404::J1850VPW | j2534_0404::J1850PWM)
+                || rawmode_base == j2534_0404::PROTOCOL_J1939_PS
+                || resources::is_analog_in_protocol_id(rawmode_base)
+                || matches!(
+                    rawmode_base,
+                    j2534_0404::SCI_A_ENGINE
+                        | j2534_0404::SCI_A_TRANS
+                        | j2534_0404::SCI_B_ENGINE
+                        | j2534_0404::SCI_B_TRANS
+                );
             if !raw_mode_allowed {
                 return Err(state_guard_status(
                     Code::Unimplemented,
                     "PDU_ERR_ID_NOT_SUPPORTED: RawMode (CllCreateFlag byte 0 bit 7 / \
-                     CLL_CREATE_FLAG_RAW_MODE) is supported in this phase only for a base CAN, \
-                     hardware ISO15765, hardware K-line (ISO9141/ISO14230), SAE J1850 (VPW/PWM), \
-                     or SAE J1939 ComLogicalLink (Analog Inputs/SCI accept it as a no-op); TP2.0 \
+                     CLL_CREATE_FLAG_RAW_MODE) is supported only for a CAN, hardware \
+                     ISO15765, hardware K-line (ISO9141/ISO14230), SAE J1850 (VPW/PWM) or SAE \
+                     J1939 ComLogicalLink, or a pin-selected (_PS) or additional-channel (_CHx) \
+                     link that resolves to one of them (Analog Inputs/SCI accept it as a no-op); TP2.0 \
                      is a permanent exclusion (ISO 22900-2:2022 defines no RawMode wire shape for \
                      it, and this service's own TX-ID rewriting at every send is fundamentally \
                      incompatible with a client-owned raw header); every other protocol, and any \
@@ -2375,8 +2381,7 @@ impl J2534Service {
             // actually be honored for J1850 in v04.04, and silently giving
             // ON's behavior anyway would recreate the exact
             // silently-ignored-flag defect ADR-196 exists to close.
-            if matches!(hw_protocol_id, j2534_0404::J1850VPW | j2534_0404::J1850PWM)
-                && !checksum_mode
+            if matches!(rawmode_base, j2534_0404::J1850VPW | j2534_0404::J1850PWM) && !checksum_mode
             {
                 return Err(state_guard_status(
                     Code::Unimplemented,

@@ -1,7 +1,8 @@
 # ADR-200: `CllCreateFlag` RawMode Support, Phase 3 (SAE J1850/J1939, TP2.0 Closed Out)
 
 **Date:** 2026-08-29
-**Status:** Accepted
+**Status:** Accepted (the allowlist is extended to the `_PS` and `_CHx` links of the
+             protocols it lists by ADR-414; TP2.0 stays excluded on every link)
 **Affects:** `j2534-0404-service/src/service/rpc_link.rs` (`rpc_create_com_logical_link`'s
              protocol allowlist), `j2534-0404-service/src/service/tx_header.rs`
              (`build_tx_message`, new `raw_j1939_tx_message`), `j2534-0404-service/src/service/events.rs`

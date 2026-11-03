@@ -16,7 +16,9 @@
              NOT the generic passthrough Decision item 2's own "`build_tx_message`'s raw
              branch is protocol-agnostic" claim describes -- that claim is now false for
              SAE J1939 specifically, see ADR-200), and closes TP2.0 out as a permanent
-             exclusion rather than a residual; every other Decision item is unaffected)
+             exclusion rather than a residual; every other Decision item is unaffected.
+             ADR-414 further extends Decision item 1's allowlist to the `_PS` and `_CHx`
+             links of the protocols it lists)
 **Affects:** `j2534-0404-service/src/service/rpc_link.rs` (`rpc_create_com_logical_link`),
              `j2534-0404-service/src/service.rs` (`LogicalLinkState`, `RcHandlingConfig::
              detect_pending_rc`/`is_unhandled_negative`, `SessionTimingConfig::with_request`),

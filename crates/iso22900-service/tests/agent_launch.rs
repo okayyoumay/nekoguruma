@@ -214,6 +214,11 @@ async fn naming_another_abi_is_refused_without_a_fallback() {
 #[tokio::test(flavor = "multi_thread")]
 #[serial]
 async fn naming_an_abi_the_host_cannot_run_is_refused_first() {
+    // An ABI this agent build cannot run: every host leaves out at least the other OS's ABIs.
+    let foreign = Abi::ALL
+        .into_iter()
+        .find(|abi| !host_runs(*abi))
+        .expect("every host leaves out some ABI");
     let temp = tempfile::tempdir().expect("temporary directory");
     let (workers, _) = set_up_mock(temp.path());
     let error = launch_worker(
@@ -222,22 +227,13 @@ async fn naming_an_abi_the_host_cannot_run_is_refused_first() {
         OperatingMode::User,
         &workers,
         &LaunchOptions::default(),
-        Some(Abi::WinX64),
+        Some(foreign),
     )
     .await
     .err()
-    .expect("a Windows ABI should not launch on this host");
-    if cfg!(windows) {
-        return;
-    }
+    .expect("an ABI this agent build cannot run should not launch");
     assert!(
-        matches!(
-            error,
-            LaunchError::AbiNotRunnable {
-                abi: Abi::WinX64,
-                ..
-            }
-        ),
+        matches!(error, LaunchError::AbiNotRunnable { abi, .. } if abi == foreign),
         "{error}"
     );
 }

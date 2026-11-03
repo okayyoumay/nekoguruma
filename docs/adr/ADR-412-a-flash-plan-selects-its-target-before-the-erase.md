@@ -21,7 +21,11 @@ targets, and a restored state's target is journaled (ADR-409).
    The second check is a forward dataflow over the pre-erase window alone, its state a bitmask
    of at most eight targets. Together they make every instruction of the window run on the
    plan's target (item 4's third refusal). A `SelectTarget` of the plan's own target inside the
-   window is allowed. A program with one target satisfies both trivially.
+   window is allowed. A program with one target satisfies both trivially. An erase that no path
+   from the entry reaches enters nothing and is accepted. A plan whose entry is its erase is
+   entered from outside, by a jump or by falling through, so the target before it is unknown
+   and it passes only in a program with one target. The checks run after the cross-plan errors
+   (plans on two targets, duplicates, overlap), so those are reported first.
 2. A lowering that emits a target list begins every flash plan's expansion with `SelectTarget`
    of the plan's target, whatever is current before it. This narrows item 3's "only where not
    certainly current" at this one point, because the validator does not trust the target

@@ -554,6 +554,18 @@ fn source_target(source: Option<Source>) -> Option<u8> {
     }
 }
 
+/// Where execution goes after `op` at `pc`, a call taken to continue at the next instruction: a
+/// return or a declared failure ends the path (ADR-280), a jump goes to its target, a
+/// conditional jump to both its target and the next instruction.
+fn successors(op: &Op, pc: u32) -> [Option<u32>; 2] {
+    match *op {
+        Op::Ret | Op::Fail { .. } => [None, None],
+        Op::Jump(to) => [Some(to), None],
+        Op::JumpIfFalse(to) => [Some(to), Some(pc + 1)],
+        _ => [Some(pc + 1), None],
+    }
+}
+
 impl Program {
     /// The target the flash plans name, which [`Program::validate`] requires them to share
     /// (ADR-325 item 9, ADR-410); `None` for a program without a plan. Meaningful once
@@ -681,6 +693,8 @@ impl Program {
                     });
                 }
             }
+            // After the cross-plan errors, so a program with plans on two targets is told so.
+            self.validate_plan_target(plan)?;
         }
 
         for (index, op) in self.code.iter().enumerate() {
@@ -1006,8 +1020,7 @@ impl Program {
                 }
             }
         }
-        self.validate_control_flow(plan)?;
-        self.validate_plan_target(plan)
+        self.validate_control_flow(plan)
     }
 
     /// The target of every instruction between a plan's erase and its post-transfer end is the
@@ -1018,7 +1031,10 @@ impl Program {
     /// (a) The window selects no other target. (b) On every path from the entry to the erase
     /// the last `SelectTarget` names the plan's target; a forward dataflow over the pre-erase
     /// window alone, the state a bitmask of the targets that may be current (at most
-    /// [`MAX_TARGETS`], so it fits a `u8`).
+    /// [`MAX_TARGETS`], so it fits a `u8`). The target before the entry counts as every target,
+    /// so a plan whose entry is its erase (entered from outside, by a jump or by falling
+    /// through) satisfies (b) only in a program with one target. An erase no path from the
+    /// entry reaches enters nothing and is accepted.
     fn validate_plan_target(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
         let flash_session = plan.flash_session;
         let b = &plan.boundaries;
@@ -1044,17 +1060,11 @@ impl Program {
                 continue;
             }
             let mut state = states[(pc - b.entry_pc) as usize];
-            let successors: &[u32] = match self.code[pc as usize] {
-                Op::SelectTarget { target } => {
-                    state = 1 << target;
-                    &[pc + 1]
-                }
-                Op::Ret | Op::Fail { .. } => &[],
-                Op::Jump(to) => &[to],
-                Op::JumpIfFalse(to) => &[to, pc + 1],
-                _ => &[pc + 1],
-            };
-            for &next in successors {
+            let op = &self.code[pc as usize];
+            if let Op::SelectTarget { target } = *op {
+                state = 1 << target;
+            }
+            for next in successors(op, pc).into_iter().flatten() {
                 // `validate_control_flow` keeps a pre-erase jump inside the window.
                 let Some(slot) = next
                     .checked_sub(b.entry_pc)
@@ -1069,7 +1079,7 @@ impl Program {
                 }
             }
         }
-        if states[width - 1] != 1 << plan.target {
+        if states[width - 1] & !(1u8 << plan.target) != 0 {
             return Err(ProgramError::PlanTargetNotSelected {
                 flash_session,
                 pc: b.erase_pc,
@@ -1091,14 +1101,7 @@ impl Program {
         let mut predecessors = vec![Vec::new(); len];
         for (index, op) in self.code.iter().enumerate() {
             let pc = index as u32;
-            let successors: &[u32] = match *op {
-                // A return or a declared failure ends the path (ADR-280).
-                Op::Ret | Op::Fail { .. } => &[],
-                Op::Jump(to) => &[to],
-                Op::JumpIfFalse(to) => &[to, pc + 1],
-                _ => &[pc + 1],
-            };
-            for &next in successors {
+            for next in successors(op, pc).into_iter().flatten() {
                 if (next as usize) < len {
                     predecessors[next as usize].push(pc);
                 }

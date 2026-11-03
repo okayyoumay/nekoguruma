@@ -5186,7 +5186,6 @@ fn two_plans_on_two_targets_are_refused() {
     program.flash.push(plan(2, 2, 5));
     assert_eq!(program.validate(), Ok(()));
     program.flash[1].target = 1;
-    program.code[5] = Op::SelectTarget { target: 1 };
     assert_eq!(
         program.validate(),
         Err(ProgramError::FlashPlansOnSeveralTargets { a: 1, b: 2 })
@@ -5562,4 +5561,140 @@ fn the_target_errors_name_the_instruction() {
         .pc(),
         Some(9)
     );
+}
+
+fn with_failure_code(mut program: Program) -> Program {
+    program.constants = vec![b"E1".to_vec()];
+    program
+}
+
+#[test]
+fn an_erase_no_path_reaches_enters_nothing_and_is_accepted() {
+    // The entry fails or loops, so the erase is dead: accepted with or without targets.
+    for first in [Op::Fail { code: 0 }, Op::Jump(0)] {
+        let mut one = with_failure_code(recovery_program());
+        one.code[0] = first.clone();
+        assert_eq!(one.validate(), Ok(()), "{first:?}");
+        let mut two = with_failure_code(declared_targets(&[false, false]));
+        two.code[0] = first.clone();
+        assert_eq!(two.validate(), Ok(()), "{first:?}");
+    }
+}
+
+#[test]
+fn a_plan_whose_entry_is_its_erase_passes_only_with_one_target() {
+    // Entered from outside (here by falling through), so the target before it is unknown.
+    let mut one = recovery_program();
+    one.code[0] = Op::RoutineControl { routine: 1, sub: 1 };
+    one.flash[0].boundaries.entry_pc = 0;
+    one.flash[0].boundaries.erase_pc = 0;
+    one.code[1] = Op::ServiceRequest { service: 0x34 };
+    one.code[2] = Op::ServiceRequest { service: 0x37 };
+    one.code[3] = Op::Pop;
+    one.flash[0].boundaries.transfer_exit_pc = 2;
+    one.flash[0].boundaries.post_transfer_end_pc = 4;
+    assert_eq!(one.validate(), Ok(()));
+    let mut two = declared_targets(&[false, false]);
+    two.code = one.code.clone();
+    two.flash[0].boundaries = one.flash[0].boundaries;
+    assert_eq!(two.validate(), Err(not_selected(0, 0)));
+}
+
+#[test]
+fn plans_on_two_targets_are_reported_before_a_missing_select() {
+    // The second plan also lacks its select; the cross-plan error comes first.
+    let mut program = declared_targets(&[false, false]);
+    second_plan_ops(&mut program);
+    program.flash.push(plan(2, 2, 5));
+    program.flash[1].target = 1;
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::FlashPlansOnSeveralTargets { a: 1, b: 2 })
+    );
+}
+
+#[test]
+fn a_control_flow_fault_is_reported_before_a_missing_select() {
+    // No select before the erase, and a return inside the plan.
+    let program = plan_with_target_ops(vec![Op::Pop], vec![Op::Ret], 0);
+    assert_eq!(
+        program.validate(),
+        Err(ProgramError::CallOrReturnInPlan {
+            flash_session: 1,
+            pc: 4
+        })
+    );
+}
+
+#[test]
+fn eight_targets_fit_the_state_mask() {
+    let eight = |pre: Vec<Op>, post: Vec<Op>| {
+        let mut program = plan_with_target_ops(pre, post, 7);
+        program.targets = (0..8)
+            .map(|index| Target {
+                access: false,
+                declarations: [index + 1; 32],
+            })
+            .collect();
+        program.identity = IdentitySources {
+            vin: Some(svc_on(7)),
+            hardware_part_number: Some(svc_on(7)),
+            software_version: Some(svc_on(7)),
+        };
+        program
+    };
+    assert_eq!(eight(vec![sel(7)], vec![Op::Pop]).validate(), Ok(()));
+    assert_eq!(
+        eight(vec![sel(6)], vec![Op::Pop]).validate(),
+        Err(not_selected(1, 7))
+    );
+    assert_eq!(
+        eight(vec![sel(7)], vec![sel(6), Op::Pop]).validate(),
+        Err(ProgramError::OtherTargetInPlan {
+            flash_session: 1,
+            pc: 4,
+            target: 6
+        })
+    );
+}
+
+#[test]
+fn branches_and_loops_are_checked_in_a_plan_that_does_not_start_at_zero() {
+    let mut skipped = plan_with_target_ops(
+        vec![Op::Pop, Op::Pop, Op::PushI64(1), Op::JumpIfFalse(5), sel(0)],
+        vec![Op::Pop],
+        0,
+    );
+    skipped.flash[0].boundaries.entry_pc = 2;
+    assert_eq!(skipped.validate(), Err(not_selected(5, 0)));
+    let mut looped = plan_with_target_ops(
+        vec![Op::Pop, sel(1), sel(0), Op::PushI64(1), Op::JumpIfFalse(2)],
+        vec![Op::Pop],
+        0,
+    );
+    looped.flash[0].boundaries.entry_pc = 1;
+    assert_eq!(looped.validate(), Ok(()));
+    // The loop's back edge reaches the entry, which selects the other target.
+    let mut back = plan_with_target_ops(
+        vec![Op::Pop, sel(1), Op::PushI64(1), Op::JumpIfFalse(1), sel(0)],
+        vec![Op::Pop],
+        0,
+    );
+    back.flash[0].boundaries.entry_pc = 1;
+    assert_eq!(back.validate(), Ok(()));
+    back.code[4] = Op::Pop;
+    assert_eq!(back.validate(), Err(not_selected(5, 0)));
+}
+
+#[test]
+fn a_pre_erase_failure_on_one_branch_leaves_the_other_to_select() {
+    let pre = vec![
+        Op::PushI64(1),
+        Op::JumpIfFalse(4),
+        sel(0),
+        Op::Jump(5),
+        Op::Fail { code: 0 },
+    ];
+    let program = with_failure_code(plan_with_target_ops(pre, vec![Op::Pop], 0));
+    assert_eq!(program.validate(), Ok(()));
 }

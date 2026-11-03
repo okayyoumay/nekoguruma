@@ -1,7 +1,7 @@
 # ADR-410: The Restart Declaration Names Its Target on Each Source and Plan
 
 **Date:** 2026-11-02
-**Status:** Accepted
+**Status:** Accepted (the refusals listed as not done in the Consequences given their form by ADR-412, and the dry run's per-target declarations by ADR-411)
 **Affects:** `diag-ir` (`Source::EcuService::target`, `FlashRecovery::target`, `Program::reprogramming_target`, `Program::validate`, six `ProgramError` variants, `IR_SCHEMA_VERSION` 22), `agent` (`inputs::send_source_request`), `diag-frontend` (emits 0), design 8.2.4, glossary; ADR-325 items 4, 5, 9 and 13, ADR-245, ADR-336 item 7, ADR-397, ADR-409
 
 ## Context

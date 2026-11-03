@@ -422,6 +422,22 @@ pub enum ProgramError {
         "flash session {flash_session}: target {target} is not in the program's target list (ADR-325 item 3)"
     )]
     PlanTargetOutOfRange { flash_session: u32, target: u8 },
+    #[error(
+        "flash session {flash_session}: the steps before the erase at {pc} do not select the plan's target {target} on every path (ADR-325 item 4)"
+    )]
+    PlanTargetNotSelected {
+        flash_session: u32,
+        pc: u32,
+        target: u8,
+    },
+    #[error(
+        "flash session {flash_session}: instruction {pc} selects target {target} between the erase and the post-transfer end, which run on the plan's target (ADR-325 item 4)"
+    )]
+    OtherTargetInPlan {
+        flash_session: u32,
+        pc: u32,
+        target: u8,
+    },
 }
 
 impl ProgramError {
@@ -444,7 +460,9 @@ impl ProgramError {
             | Self::TransferBeforeRequestDownload { pc, .. }
             | Self::TransferInterrupted { pc, .. }
             | Self::PlanInSubroutine { pc, .. }
-            | Self::TargetOutOfRange { pc, .. } => Some(*pc),
+            | Self::TargetOutOfRange { pc, .. }
+            | Self::PlanTargetNotSelected { pc, .. }
+            | Self::OtherTargetInPlan { pc, .. } => Some(*pc),
             Self::TooManyFlashRecoveries { .. }
             | Self::BoundaryOutOfOrder { .. }
             | Self::DuplicateFlashSession(_)
@@ -536,6 +554,18 @@ fn source_target(source: Option<Source>) -> Option<u8> {
     }
 }
 
+/// Where execution goes after `op` at `pc`, a call taken to continue at the next instruction: a
+/// return or a declared failure ends the path (ADR-280), a jump goes to its target, a
+/// conditional jump to both its target and the next instruction.
+fn successors(op: &Op, pc: u32) -> [Option<u32>; 2] {
+    match *op {
+        Op::Ret | Op::Fail { .. } => [None, None],
+        Op::Jump(to) => [Some(to), None],
+        Op::JumpIfFalse(to) => [Some(to), Some(pc + 1)],
+        _ => [Some(pc + 1), None],
+    }
+}
+
 impl Program {
     /// The target the flash plans name, which [`Program::validate`] requires them to share
     /// (ADR-325 item 9, ADR-410); `None` for a program without a plan. Meaningful once
@@ -550,6 +580,10 @@ impl Program {
     /// schema version or the program's size ([`crate::Vm::check_state`]) or each instruction's
     /// operands, which fail when the VM reaches them. It also checks the constants it can
     /// check without running: a `Fail`'s code (ADR-280) and an HMI form's template (ADR-340).
+    ///
+    /// Each plan must select its own target on every path before the erase and select no other
+    /// target up to the post-transfer end (ADR-325 item 4, ADR-412). Whether a VIN source's
+    /// service is a read is checked where the document is (the agent's source table), not here.
     ///
     /// The restart rules (identity sources, session mapping, timeout, resume limit) apply only
     /// when some plan allows a restart ([`FlashRecovery::allows_restart`]); a program whose
@@ -659,6 +693,8 @@ impl Program {
                     });
                 }
             }
+            // After the cross-plan errors, so a program with plans on two targets is told so.
+            self.validate_plan_target(plan)?;
         }
 
         for (index, op) in self.code.iter().enumerate() {
@@ -987,6 +1023,72 @@ impl Program {
         self.validate_control_flow(plan)
     }
 
+    /// The target of every instruction between a plan's erase and its post-transfer end is the
+    /// plan's (ADR-325 item 4, ADR-412). `validate_control_flow` has made the plan a
+    /// single-entry region, so the window is entered only at the erase. The checks are local
+    /// to the plan: the target before the plan is not trusted.
+    ///
+    /// (a) The window selects no other target. (b) On every path from the entry to the erase
+    /// the last `SelectTarget` names the plan's target; a forward dataflow over the pre-erase
+    /// window alone, the state a bitmask of the targets that may be current (at most
+    /// [`MAX_TARGETS`], so it fits a `u8`). The target before the entry counts as every target,
+    /// so a plan whose entry is its erase (entered from outside, by a jump or by falling
+    /// through) satisfies (b) only in a program with one target. An erase no path from the
+    /// entry reaches enters nothing and is accepted.
+    fn validate_plan_target(&self, plan: &FlashRecovery) -> Result<(), ProgramError> {
+        let flash_session = plan.flash_session;
+        let b = &plan.boundaries;
+        for pc in b.erase_pc..b.post_transfer_end_pc {
+            if let Op::SelectTarget { target } = self.code[pc as usize]
+                && target != plan.target
+            {
+                return Err(ProgramError::OtherTargetInPlan {
+                    flash_session,
+                    pc,
+                    target,
+                });
+            }
+        }
+        let all = ((1u16 << self.target_count()) - 1) as u8;
+        let width = (b.erase_pc - b.entry_pc + 1) as usize;
+        // 0 = not reached yet.
+        let mut states = vec![0u8; width];
+        states[0] = all;
+        let mut pending = vec![b.entry_pc];
+        while let Some(pc) = pending.pop() {
+            if pc >= b.erase_pc {
+                continue;
+            }
+            let mut state = states[(pc - b.entry_pc) as usize];
+            let op = &self.code[pc as usize];
+            if let Op::SelectTarget { target } = *op {
+                state = 1 << target;
+            }
+            for next in successors(op, pc).into_iter().flatten() {
+                // `validate_control_flow` keeps a pre-erase jump inside the window.
+                let Some(slot) = next
+                    .checked_sub(b.entry_pc)
+                    .and_then(|i| states.get_mut(i as usize))
+                else {
+                    continue;
+                };
+                let merged = *slot | state;
+                if merged != *slot {
+                    *slot = merged;
+                    pending.push(next);
+                }
+            }
+        }
+        if states[width - 1] & !(1u8 << plan.target) != 0 {
+            return Err(ProgramError::PlanTargetNotSelected {
+                flash_session,
+                pc: b.erase_pc,
+                target: plan.target,
+            });
+        }
+        Ok(())
+    }
+
     /// The plan's range is a single-entry region whose stages follow in order: no call or
     /// return inside, no way in except at the entry, and jumps inside only where the stage they
     /// sit in allows.
@@ -999,14 +1101,7 @@ impl Program {
         let mut predecessors = vec![Vec::new(); len];
         for (index, op) in self.code.iter().enumerate() {
             let pc = index as u32;
-            let successors: &[u32] = match *op {
-                // A return or a declared failure ends the path (ADR-280).
-                Op::Ret | Op::Fail { .. } => &[],
-                Op::Jump(to) => &[to],
-                Op::JumpIfFalse(to) => &[to, pc + 1],
-                _ => &[pc + 1],
-            };
-            for &next in successors {
+            for next in successors(op, pc).into_iter().flatten() {
                 if (next as usize) < len {
                     predecessors[next as usize].push(pc);
                 }

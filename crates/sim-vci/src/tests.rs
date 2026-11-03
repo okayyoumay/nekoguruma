@@ -1684,6 +1684,10 @@ impl Drop for StateDir {
 #[test]
 fn a_config_file_with_an_over_long_value_is_refused() {
     let _serial = SERIAL.lock().unwrap_or_else(|e| e.into_inner());
+    // Start from a connected, closed device: an earlier test may have left the VCI unplugged,
+    // lost or crashed, and `PassThruOpen` would then refuse with that state's status
+    // (`ERR_DEVICE_NOT_CONNECTED`) before it reaches the ECU this test removes.
+    reset(default_ecu_config());
     let dir = StateDir::new("config");
     let file = dir.0.join("ecu.json");
     let write = |config: &EcuConfig| {

@@ -66,6 +66,7 @@ does not take. A T3 profile can add nothing.
 | `timing_margin_us` | Optional: the VCI's timing margin in microseconds (design 8.11 "Timing margin"), the key the agent reads too. The T2 timing check judges the latency the VCI measured only beyond it, and without it judges nothing (see "The T2 timing check", ADR-356). A job the harness runs takes it as its links' timing margin; without it the job's log judges no time against a limit, since the agent has no default (ADR-377) |
 | `drift_bound_ppm` | Optional: how far the VCI's clock may run from the agent's, in parts per million (design 8.11 "Drift bound"). A job the harness runs takes it; without it the job takes the agent's default (100 ppm, ADR-357) for placing clock times, and judges no loss's settlement (ADR-378) |
 | `clock_margin_us` | Optional: the tolerance of one reading of the VCI's clock in microseconds (design 8.11 "Drift bound"). A job the harness runs takes it; without it the job takes the agent's default (1 ms, ADR-357) for placing clock times, and judges no loss's settlement (ADR-378) |
+| `worker_abi` | Optional: the worker ABI to test, by the name of the ABI table (design 7.1.2): `win-x86`, `win-x64`, `linux-x86`, `linux-x86_64`, `linux-arm64` or `linux-armhf`. The check launches only the worker build for that ABI. An ABI other than the harness build's own needs `NGR_HW_WORKERS` to name a directory holding that build, since the hardware tests install only the host-ABI worker (ADR-415). Without it the agent picks as it does for a job: on a 64-bit Windows host the x64 build whenever the VCI has an x64 library, so a vendor's x86 library is checked only by naming `win-x86` (a VCI without an x64 registration runs the x86 build either way). A profile whose name is unknown, or names an ABI of another OS than the host's or one the host's registry views do not serve, is refused when it is loaded. A VCI with no library of the named ABI, or no installed worker for it, fails the open with the reason; it is never checked with another ABI. The report's `device.abi` states the ABI that ran, named or resolved |
 
 `[link]`, the values an IR `Protocol` declaration carries:
 
@@ -146,7 +147,8 @@ device (design 13.5, ADR-275 item 4). It takes the `Vci`, the workers directory
 
 1. Starts the worker for the profile's `library` through the agent's launch path
    (`agent::launch::launch_worker`), so the library is resolved, and the worker build chosen, as
-   in production (design 7.1, 7.3).
+   in production (design 7.1, 7.3), except that a profile's `worker_abi` restricts the choice to
+   that build and never falls back to another (ADR-415).
 2. Asks the worker for its modules (`GetModuleIds`), reads the `modules` entries of the
    configuration for J2534 (`vci-service-config`, in the harness's process), and runs
    `select_module`. A refusal here comes before anything is opened. For J2534 the worker must
@@ -459,7 +461,8 @@ carrying its own address byte.
   addressed: every frame would be dropped, and the failure would look like a hardware fault.
 - **Workers and the library.** The worker directory (`<abi>/j2534-0404-service`, design 7.3) is
   the root `NGR_HW_WORKERS` names, else this workspace's build for the host ABI, installed in a
-  temporary directory. The vendor's library is found by the OS lookup (design 7.1.1): the test fails
+  temporary directory (a profile's `worker_abi` other than the host's needs `NGR_HW_WORKERS`
+  to name a directory holding that build). The vendor's library is found by the OS lookup (design 7.1.1): the test fails
   if `NGR_J2534_DEFINITION_DIR`, the debug override of that lookup (ADR-282), is set. The test is
   not gated on `debug_assertions`. A launch that finds no worker for a library's ABI (a 32-bit DLL on Windows without
   `NGR_HW_WORKERS`) fails the check with a message that says to set it, and the temporary

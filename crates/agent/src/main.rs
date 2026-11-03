@@ -538,6 +538,7 @@ where
         shell.mode,
         &workers,
         &LaunchOptions::default(),
+        None,
     )
     .await
     .map_err(|error| error.to_string())?;

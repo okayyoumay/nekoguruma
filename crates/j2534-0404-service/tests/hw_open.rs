@@ -51,6 +51,7 @@ fn vci(label: &str, pname: &str, firmware: &str, library: &str) -> Vci {
         timing_margin_us: None,
         drift_bound_ppm: None,
         clock_margin_us: None,
+        worker_abi: None,
     }
 }
 

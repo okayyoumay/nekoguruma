@@ -229,7 +229,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-237](ADR-237-regulatory-scope-access-routes-without-tool-certification.md) | Regulatory Scope: Use the Access Routes Regulations Open, Without Tool Certification | Accepted | design 8.1 / 9.2 / 16.1 / 16.2 / 17, `db/` retention |
 | [ADR-238](ADR-238-sim-vci-control-commands-and-device-loss.md) | sim-vci Control Commands and Device Loss | Accepted (the VCI crash consequence settled by ADR-292: a crashed VCI fails every call with `ERR_FAILED`) | `sim-vci` control export and directory, `ERR_DEVICE_NOT_CONNECTED` |
 | [ADR-239](ADR-239-sim-ecu-session-timer-and-injectable-clock.md) | sim-ecu Session Timer and Injectable Clock | Accepted | `sim-ecu` clock, tS3_Server, security delay |
-| [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284) | `agent` launch, `ngr-agent run` |
+| [ADR-240](ADR-240-agent-worker-build-selection.md) | Agent Worker-Build Selection by Per-Build Library Resolution | Accepted (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284; extended by ADR-415) | `agent` launch, `ngr-agent run` |
 | [ADR-241](ADR-241-sim-ecu-state-file.md) | Simulated ECU State Kept in a File Across Worker Processes | Accepted | `sim-ecu` snapshot, `sim-vci` `NGR_SIM_ECU_STATE` |
 | [ADR-242](ADR-242-ir-variable-length-and-nested-layouts.md) | IR Variable-Length Fields and Nested Layouts | Accepted | `diag-ir` declaration schema (`ir.fbs`) |
 | [ADR-243](ADR-243-codeql-and-backlog-loops-share-one-claim.md) | The CodeQL and Backlog Loops Share One PR-Based Claim | Accepted (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283) | `.claude/skills/codeql-alerts`, `backlog-loop` |
@@ -404,6 +404,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-412](ADR-412-a-flash-plan-selects-its-target-before-the-erase.md) | A Flash Plan Selects Its Target Before the Erase and Keeps It to the Post-Transfer End | Accepted | `diag-ir` (`Program::validate`, `ProgramError::PlanTargetNotSelected`, `ProgramError::OtherTargetInPlan`), `diag-frontend`, `agent` (tests); design 8.2.4; ADR-325 items 3, 4 and 9, ADR-245 items 4 and 6, ADR-345, ADR-409, ADR-410, ADR-411 |
 | [ADR-413](ADR-413-the-milestone-close-starts-with-a-sweep.md) | The Milestone Close Starts with a Sweep | Accepted | `.claude/skills/milestone-exit`, `.claude/skills/backlog-loop`, `work/README.md`; ADR-407 item 4 |
 | [ADR-414](ADR-414-rawmode-follows-the-base-protocol-on-ps-and-chx-links.md) | RawMode Follows the Base Protocol on `_PS` and `_CHx` Links | Accepted | `j2534-0404-service` (`rpc_link`), `ngr-hw-checks` (`GuardedHandle::open_link`, `profile`, `guard::link`); ADR-157, ADR-158, ADR-196, ADR-198, ADR-200, ADR-213, ADR-333 |
+| [ADR-415](ADR-415-hardware-profile-names-the-worker-abi.md) | The Hardware Profile Names the Worker ABI to Launch | Accepted | `agent` launch (`launch_worker`, `host_runs`), `ngr-hw-checks` (`profile`, `open`); ADR-240, ADR-275 |
 
 ## Status Legend
 
@@ -707,11 +708,12 @@ the predecessor repository these ADRs came from.
 - ADR-223 (ADR-036, which the text calls not superseded, is superseded by ADR-281)
 - ADR-224
 - ADR-228 (the Linux definition format and the shared crate's name settled by ADR-266; item 3 extended and the configuration file no longer names a library, ADR-281; item 1's debug override also replaces the Windows registry, ADR-282)
-- ADR-240 (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284)
+- ADR-240 (the `config.toml` lookup, with its architecture key, superseded by ADR-281; the per-build registry view stays; Decision item 4 superseded by ADR-284; extended by ADR-415)
 - ADR-266
 - ADR-281
 - ADR-282
 - ADR-284
+- ADR-415
 
 ### vci-service-manager Process Startup
 - ADR-073

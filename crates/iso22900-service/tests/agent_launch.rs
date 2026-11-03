@@ -12,12 +12,13 @@ use std::path::Path;
 use std::time::Duration;
 
 use agent::LinkConfig;
-use agent::launch::{Api, launch_worker};
+use agent::launch::{Api, LaunchError, host_runs, launch_worker};
 use serial_test::serial;
 use vci_service_interface::{
     CreateComLogicalLinkRequest, GetModuleIdsRequest, GetResourceIdsRequest, ModuleConnectRequest,
     create_com_logical_link_request,
 };
+use worker_host::abi::Abi;
 use worker_host::service::{LaunchOptions, OperatingMode, Stopped, WorkerLayout};
 
 const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
@@ -133,4 +134,110 @@ async fn the_agent_launches_iso22900_service_for_a_d_pdu_api_vci() {
     .expect("an unknown name should not launch")
     .to_string();
     assert!(error.contains("Unknown D-PDU API"), "{error}");
+}
+
+/// Points the agent's lookup at the mock, as the launch test above does; returns the workers
+/// directory (holding the host-ABI worker) and the mock's ABI.
+fn set_up_mock(root: &Path) -> (WorkerLayout, Abi) {
+    let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
+    let abi = worker_host::abi::detect_file(&library).expect("the mock should have a known ABI");
+    let workers = WorkerLayout {
+        root: root.join("workers"),
+    };
+    install_worker(&workers.root, abi.name());
+    let config_path = root.join("config.toml");
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    let root_file = iso22900_mock::write_root_file(root, LIBRARY_NAME, &library)
+        .expect("root description file should be writable");
+    // SAFETY: the tests of this file are `#[serial]`, so none reads the environment meanwhile.
+    unsafe {
+        std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
+        std::env::set_var("VCI_CONFIG_PATH", &config_path);
+        std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
+    }
+    (workers, abi)
+}
+
+/// ADR-415: naming the library's own ABI launches the worker, and it reports that ABI.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn naming_the_mocks_own_abi_launches_its_worker() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (workers, abi) = set_up_mock(temp.path());
+    let worker = launch_worker(
+        Api::Dpdu,
+        LIBRARY_NAME,
+        OperatingMode::User,
+        &workers,
+        &LaunchOptions::default(),
+        Some(abi),
+    )
+    .await
+    .expect("the mock's own ABI should launch");
+    assert_eq!(worker.abi, abi);
+    assert_eq!(
+        worker.process.stop(Duration::from_secs(5)).await.ok(),
+        Some(Stopped::Exited)
+    );
+}
+
+/// ADR-415: another runnable ABI is refused for a library built for the mock's, with the
+/// build's reason, and the worker is never started (a launch would also need its binary, which
+/// the directory does not hold for that ABI).
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn naming_another_abi_is_refused_without_a_fallback() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (workers, abi) = set_up_mock(temp.path());
+    let Some(other) = Abi::ALL
+        .into_iter()
+        .find(|&other| other != abi && host_runs(other))
+    else {
+        return;
+    };
+    let error = launch_worker(
+        Api::Dpdu,
+        LIBRARY_NAME,
+        OperatingMode::User,
+        &workers,
+        &LaunchOptions::default(),
+        Some(other),
+    )
+    .await
+    .err()
+    .expect("another ABI should not launch");
+    assert!(matches!(error, LaunchError::Resolve { .. }), "{error}");
+    assert!(error.to_string().contains("is built for"), "{error}");
+}
+
+/// ADR-415: an ABI the agent build cannot run is refused before any lookup.
+#[tokio::test(flavor = "multi_thread")]
+#[serial]
+async fn naming_an_abi_the_host_cannot_run_is_refused_first() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let (workers, _) = set_up_mock(temp.path());
+    let error = launch_worker(
+        Api::Dpdu,
+        LIBRARY_NAME,
+        OperatingMode::User,
+        &workers,
+        &LaunchOptions::default(),
+        Some(Abi::WinX64),
+    )
+    .await
+    .err()
+    .expect("a Windows ABI should not launch on this host");
+    if cfg!(windows) {
+        return;
+    }
+    assert!(
+        matches!(
+            error,
+            LaunchError::AbiNotRunnable {
+                abi: Abi::WinX64,
+                ..
+            }
+        ),
+        "{error}"
+    );
 }

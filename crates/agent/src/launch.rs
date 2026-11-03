@@ -80,8 +80,8 @@ pub enum LaunchError {
         abi: Abi,
         long_size: u8,
     },
-    /// The caller named a worker ABI this host cannot run (7.3), so no resolution is tried.
-    #[error("VCI {vci:?}: this host cannot run a {} worker", abi.name())]
+    /// The caller named a worker ABI this agent build cannot run (7.3), so no resolution is tried.
+    #[error("VCI {vci:?}: this agent build cannot run a {} worker", abi.name())]
     AbiNotRunnable { vci: String, abi: Abi },
     #[error(transparent)]
     Service(#[from] ServiceError),
@@ -133,21 +133,39 @@ const RESOLUTIONS: &[Resolution] = &[Resolution {
     abi: None,
 }];
 
-/// Whether `abi` is a Windows ABI.
-fn is_windows_abi(abi: Abi) -> bool {
-    matches!(abi, Abi::WinX86 | Abi::WinX64)
-}
+/// The ABIs a worker build without an ABI of its own (`Resolution::abi` is `None`: one build per
+/// host, the library's header decides) can serve on this host (7.3 "Bundled workers"): an x86_64
+/// Linux host the x64 and x86 workers, an aarch64 one the arm64 and armhf workers, and a 32-bit
+/// one its own. No other host (macOS, a Windows host, whose builds name their ABI) serves any.
+#[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+const HOST_ABIS: &[Abi] = &[Abi::LinuxX86_64, Abi::LinuxX86];
+#[cfg(all(target_os = "linux", target_arch = "aarch64"))]
+const HOST_ABIS: &[Abi] = &[Abi::LinuxArm64, Abi::LinuxArmhf];
+#[cfg(all(target_os = "linux", target_arch = "x86"))]
+const HOST_ABIS: &[Abi] = &[Abi::LinuxX86];
+#[cfg(all(target_os = "linux", target_arch = "arm"))]
+const HOST_ABIS: &[Abi] = &[Abi::LinuxArmhf];
+#[cfg(not(all(
+    target_os = "linux",
+    any(
+        target_arch = "x86_64",
+        target_arch = "aarch64",
+        target_arch = "x86",
+        target_arch = "arm"
+    )
+)))]
+const HOST_ABIS: &[Abi] = &[];
 
 /// The resolutions that may serve a caller who names the worker `abi`: those built for it. A
-/// resolution without an ABI (Linux: one build per host, the library's header decides) stays only
-/// when `abi` belongs to the host's OS (`host_windows`), and then requires exactly `abi`, so a
-/// library of another ABI is refused instead of launched. Empty when this host cannot run `abi`.
-fn restrict(resolutions: &[Resolution], abi: Abi, host_windows: bool) -> Vec<Resolution> {
+/// resolution without an ABI stays only when `abi` is one of `served` (the ABIs such a build can
+/// serve, [`HOST_ABIS`]), and then requires exactly `abi`, so a library of another ABI is refused
+/// instead of launched. Empty when this agent build cannot run `abi`.
+fn restrict(resolutions: &[Resolution], abi: Abi, served: &[Abi]) -> Vec<Resolution> {
     resolutions
         .iter()
         .filter(|r| match r.abi {
             Some(built) => built == abi,
-            None => is_windows_abi(abi) == host_windows,
+            None => served.contains(&abi),
         })
         .map(|r| Resolution {
             abi: Some(abi),
@@ -156,11 +174,11 @@ fn restrict(resolutions: &[Resolution], abi: Abi, host_windows: bool) -> Vec<Res
         .collect()
 }
 
-/// Whether this host can run a worker built for `abi` (7.3): a Windows host the ABIs its registry
-/// views serve, another host any ABI of its own OS (whether the worker binary is installed is
-/// found when it is launched). A hardware profile checks it when it is loaded.
+/// Whether this agent build can run a worker built for `abi` (7.3): on Windows the ABIs its
+/// registry views serve, on Linux the ABIs of the host table (whether the worker binary is
+/// installed is found when it is launched). A hardware profile checks it when it is loaded.
 pub fn host_runs(abi: Abi) -> bool {
-    !restrict(RESOLUTIONS, abi, cfg!(windows)).is_empty()
+    !restrict(RESOLUTIONS, abi, HOST_ABIS).is_empty()
 }
 
 /// What one worker build would load for a VCI: the library, and the `LongSize` its J2534
@@ -222,7 +240,7 @@ pub struct LaunchedWorker {
 ///
 /// `abi` restricts the launch to the worker build for that ABI (`None`: the agent's own
 /// preference, the first build whose registry view lists a library of its ABI). The named ABI is
-/// never replaced by another: a host that cannot run it fails with
+/// never replaced by another: an agent build that cannot run it fails with
 /// [`LaunchError::AbiNotRunnable`], a VCI with no library of it (or, outside Windows, a library of
 /// another ABI) with [`LaunchError::Resolve`].
 pub async fn launch_worker(
@@ -237,7 +255,7 @@ pub async fn launch_worker(
     let resolutions: &[Resolution] = match abi {
         None => RESOLUTIONS,
         Some(abi) => {
-            named = restrict(RESOLUTIONS, abi, cfg!(windows));
+            named = restrict(RESOLUTIONS, abi, HOST_ABIS);
             if named.is_empty() {
                 return Err(LaunchError::AbiNotRunnable {
                     vci: vci.to_owned(),
@@ -527,6 +545,7 @@ mod tests {
         view: RegistryViewMode::Native,
         abi: Some(Abi::WinX86),
     };
+    const LINUX_X64_HOST: &[Abi] = &[Abi::LinuxX86_64, Abi::LinuxX86];
 
     /// `x64.dll` and `x86.dll` are built for their names; anything else is unreadable.
     fn detect(path: &Path) -> Result<Abi, AbiError> {
@@ -621,7 +640,7 @@ mod tests {
     fn a_named_abi_keeps_only_its_own_build() {
         let both = [X64, X86];
         let only = |abi| {
-            restrict(&both, abi, true)
+            restrict(&both, abi, &[])
                 .iter()
                 .map(|r| r.abi)
                 .collect::<Vec<_>>()
@@ -630,7 +649,7 @@ mod tests {
         assert_eq!(only(Abi::WinX64), [Some(Abi::WinX64)]);
         // A Windows host has no Linux build, and a 32-bit one no x64 build.
         assert!(only(Abi::LinuxX86_64).is_empty());
-        assert!(restrict(&[X86], Abi::WinX64, true).is_empty());
+        assert!(restrict(&[X86], Abi::WinX64, &[]).is_empty());
     }
 
     #[test]
@@ -641,7 +660,7 @@ mod tests {
         ];
         let both = [X64, X86];
         let picked = |abi| {
-            resolve("v", &restrict(&both, abi, true), lookup_in(paths), detect).map(|(_, abi)| abi)
+            resolve("v", &restrict(&both, abi, &[]), lookup_in(paths), detect).map(|(_, abi)| abi)
         };
         assert_eq!(picked(Abi::WinX86).unwrap(), Abi::WinX86);
         assert_eq!(picked(Abi::WinX64).unwrap(), Abi::WinX64);
@@ -652,7 +671,7 @@ mod tests {
         let both = [X64, X86];
         let error = resolve(
             "v",
-            &restrict(&both, Abi::WinX86, true),
+            &restrict(&both, Abi::WinX86, &[]),
             lookup_in(&[(Some(Abi::WinX64), "x64.dll")]),
             detect,
         )
@@ -665,16 +684,16 @@ mod tests {
     #[test]
     fn on_a_host_with_one_build_the_named_abi_must_match_the_library() {
         let any = Resolution { abi: None, ..X86 };
-        // Non-Windows host: a Windows ABI is not runnable.
-        assert!(restrict(&[any], Abi::WinX64, false).is_empty());
-        let kept = restrict(&[any], Abi::LinuxX86_64, false);
+        // An x86_64 Linux host: a Windows ABI is not runnable.
+        assert!(restrict(&[any], Abi::WinX64, LINUX_X64_HOST).is_empty());
+        let kept = restrict(&[any], Abi::LinuxX86_64, LINUX_X64_HOST);
         assert_eq!(kept.len(), 1);
         // The library is the win-x64 one, which is not the named ABI: refused.
         let paths = &[(Some(Abi::LinuxX86_64), "x64.dll")];
         let error = resolve("v", &kept, lookup_in(paths), detect).unwrap_err();
         assert!(error.to_string().contains("built for win-x64"), "{error}");
         // The named ABI equal to the detected one is launched.
-        let kept = restrict(&[any], Abi::WinX64, true);
+        let kept = restrict(&[any], Abi::WinX64, &[Abi::WinX64]);
         let paths = &[(Some(Abi::WinX64), "x64.dll")];
         assert_eq!(
             resolve("v", &kept, lookup_in(paths), detect).unwrap().1,
@@ -683,15 +702,39 @@ mod tests {
     }
 
     #[test]
-    fn this_host_runs_an_abi_of_its_own_os_only() {
-        assert_eq!(
-            host_runs(Abi::WinX86) || host_runs(Abi::WinX64),
-            cfg!(windows)
-        );
-        assert_eq!(
-            Abi::ALL.iter().any(|&a| !is_windows_abi(a) && host_runs(a)),
-            !cfg!(windows)
-        );
+    fn a_resolution_without_a_build_serves_the_host_table_only() {
+        let any = Resolution { abi: None, ..X86 };
+        let kept = |served: &[Abi], abi| restrict(&[any], abi, served).len();
+        // 7.3: an x86_64 Linux host bundles x64 and x86, an aarch64 one arm64 and armhf.
+        assert_eq!(kept(LINUX_X64_HOST, Abi::LinuxX86), 1);
+        assert_eq!(kept(LINUX_X64_HOST, Abi::LinuxArm64), 0);
+        let arm = [Abi::LinuxArm64, Abi::LinuxArmhf];
+        assert_eq!(kept(&arm, Abi::LinuxArmhf), 1);
+        assert_eq!(kept(&arm, Abi::LinuxX86_64), 0);
+        // A host with no Linux table (macOS) serves none.
+        assert_eq!(kept(&[], Abi::LinuxX86_64), 0);
+    }
+
+    #[test]
+    fn this_agent_build_runs_the_abis_of_its_host_table() {
+        let runs: Vec<Abi> = Abi::ALL.into_iter().filter(|&a| host_runs(a)).collect();
+        if cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            assert_eq!(runs, [Abi::LinuxX86, Abi::LinuxX86_64]);
+        } else if cfg!(all(target_os = "linux", target_arch = "aarch64")) {
+            assert_eq!(runs, [Abi::LinuxArm64, Abi::LinuxArmhf]);
+        } else if cfg!(all(windows, target_arch = "x86_64")) {
+            assert_eq!(runs, [Abi::WinX86, Abi::WinX64]);
+        }
+    }
+
+    /// The x86 build of a 64-bit Windows agent is reachable by name, and reads the 32-bit view.
+    #[cfg(all(windows, target_arch = "x86_64"))]
+    #[test]
+    fn windows_x64_agent_restricts_to_the_x86_build_and_its_view() {
+        let kept = restrict(RESOLUTIONS, Abi::WinX86, HOST_ABIS);
+        assert_eq!(kept.len(), 1);
+        assert_eq!(kept[0].view, RegistryViewMode::W32);
+        assert_eq!(kept[0].abi, Some(Abi::WinX86));
     }
 
     #[test]

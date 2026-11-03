@@ -2330,27 +2330,34 @@ impl J2534Service {
         // (`tp20_broadcast_address()`), so a "raw" CLL that still needs a
         // ComParam-driven flag to send correctly isn't actually raw.
         if raw_mode {
-            let raw_mode_allowed =
-                (matches!(hw_protocol_id, j2534_0404::CAN | j2534_0404::ISO15765)
-                    && !software_isotp)
-                    || matches!(hw_protocol_id, j2534_0404::ISO9141 | j2534_0404::ISO14230)
-                    || matches!(hw_protocol_id, j2534_0404::J1850VPW | j2534_0404::J1850PWM)
-                    || hw_protocol_id == j2534_0404::PROTOCOL_J1939_PS
-                    || resources::is_analog_in_protocol_id(hw_protocol_id)
-                    || matches!(
-                        hw_protocol_id,
-                        j2534_0404::SCI_A_ENGINE
-                            | j2534_0404::SCI_A_TRANS
-                            | j2534_0404::SCI_B_ENGINE
-                            | j2534_0404::SCI_B_TRANS
-                    );
+            // ADR-414: an additional channel (SAE J2534-2 clause 7) follows its base protocol's
+            // rule, so the allowlist is applied to the base `chx_base_protocol_id` names for a
+            // `_CHx` id (the id itself otherwise). A family whose base is not on the list
+            // today (Fault-Tolerant, Single Wire and FD CAN/ISO15765, GM UART, UART Echo Byte,
+            // Honda DIAG-H, J1708, TP2.0) stays refused.
+            let rawmode_base = resources::chx_base_protocol_id(hw_protocol_id)
+                .map_or(hw_protocol_id, |(base, _)| base);
+            let raw_mode_allowed = (matches!(rawmode_base, j2534_0404::CAN | j2534_0404::ISO15765)
+                && !software_isotp)
+                || matches!(rawmode_base, j2534_0404::ISO9141 | j2534_0404::ISO14230)
+                || matches!(rawmode_base, j2534_0404::J1850VPW | j2534_0404::J1850PWM)
+                || rawmode_base == j2534_0404::PROTOCOL_J1939_PS
+                || resources::is_analog_in_protocol_id(rawmode_base)
+                || matches!(
+                    rawmode_base,
+                    j2534_0404::SCI_A_ENGINE
+                        | j2534_0404::SCI_A_TRANS
+                        | j2534_0404::SCI_B_ENGINE
+                        | j2534_0404::SCI_B_TRANS
+                );
             if !raw_mode_allowed {
                 return Err(state_guard_status(
                     Code::Unimplemented,
                     "PDU_ERR_ID_NOT_SUPPORTED: RawMode (CllCreateFlag byte 0 bit 7 / \
-                     CLL_CREATE_FLAG_RAW_MODE) is supported in this phase only for a base CAN, \
+                     CLL_CREATE_FLAG_RAW_MODE) is supported in this phase only for a CAN, \
                      hardware ISO15765, hardware K-line (ISO9141/ISO14230), SAE J1850 (VPW/PWM), \
-                     or SAE J1939 ComLogicalLink (Analog Inputs/SCI accept it as a no-op); TP2.0 \
+                     or SAE J1939 ComLogicalLink, or an additional channel (_CHx) of one of \
+                     them (Analog Inputs/SCI accept it as a no-op); TP2.0 \
                      is a permanent exclusion (ISO 22900-2:2022 defines no RawMode wire shape for \
                      it, and this service's own TX-ID rewriting at every send is fundamentally \
                      incompatible with a client-owned raw header); every other protocol, and any \
@@ -2375,8 +2382,7 @@ impl J2534Service {
             // actually be honored for J1850 in v04.04, and silently giving
             // ON's behavior anyway would recreate the exact
             // silently-ignored-flag defect ADR-196 exists to close.
-            if matches!(hw_protocol_id, j2534_0404::J1850VPW | j2534_0404::J1850PWM)
-                && !checksum_mode
+            if matches!(rawmode_base, j2534_0404::J1850VPW | j2534_0404::J1850PWM) && !checksum_mode
             {
                 return Err(state_guard_status(
                     Code::Unimplemented,

@@ -526,6 +526,30 @@ fn a_loopback_takes_one_link_per_channel_and_binds_the_one_named() {
 }
 
 #[test]
+fn a_channel_resource_must_match_the_profile_link_in_bus_type_and_pins() {
+    // A channel of the profile named by resource data is admitted only with the profile's bus
+    // type and exactly its two pins (6 high, 14 low); a resource by name is refused.
+    let env = Env::new(loopback());
+    assert_eq!(create_channel(&env, "CAN_CH1"), creates(0));
+    for bad in [
+        resource("CAN_CH1", "ISO_11898_2_DWCAN", &[(6, "HI"), (13, "LOW")]),
+        resource("CAN_CH1", "ISO_11898_2_DWCAN", &[(6, "LOW"), (14, "HI")]),
+        resource("CAN_CH1", "ISO_11898_2_DWCAN", &[(6, "HI")]),
+        resource("CAN_CH1", "ISO_9141_K", &[(6, "HI"), (14, "LOW")]),
+    ] {
+        assert!(
+            matches!(create_with(&env, &bad), Err(GuardRefusal::LinkSetup(_))),
+            "{bad:?}"
+        );
+    }
+    let by_name = create_request(create::Resource::ResourceName("CAN_CH1".to_owned()));
+    assert!(matches!(
+        env.decide(Request::CreateComLogicalLink(&by_name)),
+        Err(GuardRefusal::LinkSetup(_))
+    ));
+}
+
+#[test]
 fn a_socketcan_end_has_no_worker_link() {
     let text = format!(
         "class = \"T0\"\n[[endpoint]]\nsocketcan = \"can0\"\n[endpoint.link]\n{}\

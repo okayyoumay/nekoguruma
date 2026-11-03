@@ -34,7 +34,7 @@ A TOML file outside the repository. Unknown keys are refused.
 | `class` | `"T0"`, `"T1"`, `"T2"` or `"T3"` (design 13.5) |
 | `[vci]` | T1 to T3: the VCI (below) |
 | `[link]` | T1 to T3: the link (below) |
-| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (such as the protocol name of an SAE J2534-2 clause 7 additional channel) at both ends when both are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
+| `[[endpoint]]` | T0 only, exactly two: each names a `[endpoint.vci]`, with its `channel` (the protocol name of an SAE J2534-2 clause 7 additional channel; J2534 only, a D-PDU API `vci` takes none) at both ends when both are on one VCI, or a `socketcan` interface (such as `"can0"`), and a `[endpoint.link]`. At least one end is a VCI channel, the two ends differ (two ends on one VCI by their `channel`), and their links are one bus: the same `baud_rate` and `id_bits`, each end's `request_id` the other's `response_id` |
 | `allow` | Optional. Narrows the class to the listed operations: `"configuration-write"`, `"routine"`, `"reprogramming"`, `"fault-injection"`. Without it the profile keeps its class's operations |
 | `report_full_identifiers` | Optional, `false` by default: `true` puts VINs and serial numbers in the run's report in full instead of masked (see "Reports") |
 | `expendable_ecu` | T2 only: the ECU may be reprogrammed |
@@ -200,7 +200,8 @@ Anything it cannot classify is refused.
 - **Link setup.** `ModuleConnect` is refused (the harness opens the device). A link is created
   only from the profile link's protocol, the bus type the agent uses
   (`ISO_11898_2_DWCAN`) and exactly its two pins (the first of `pins` as `HI`, the second as
-  `LOW`), by resource data or by a learned resource id; a resource by name, or an id not learned,
+  `LOW`), by resource data (an endpoint with a `channel` is created this way, from that name) or by a
+  learned resource id; a resource by name, or an id not learned,
   is refused. A create flag may carry RawMode only, and RawMode only on T0 (a worker passes raw
   data through, so on any other class the guard cannot classify its identifier or payload). One link per profile endpoint (T0: one per
   VCI end, created for the end whose `channel` the resource's protocol name is, or else whose
@@ -477,10 +478,14 @@ carrying its own address byte.
   is `SendFailed`, which the check reports as a send failure of that end. A link has one monitor:
   a second `raw_listen` returns it.
 - **One module, two channels.** The check takes the two ends as one handle with two links or as
-  two handles. The test runs two modules: a link on an additional channel (`..._CH1`, SAE J2534-2
-  clause 7) is made by the worker from a compound protocol name that `GetResourceIds` does not
-  accept, and the handle creates links through `GetResourceIds`, so a loopback of two channels of
-  one module is refused by the test with that reason.
+  two handles. A link on an additional channel (`..._CH1`, SAE J2534-2 clause 7) is made by the
+  worker from a compound protocol name that `GetResourceIds` does not accept, so the handle
+  creates an endpoint that names a `channel` from resource data carrying that name (the profile
+  decides, not the worker), and the guard admits it only when the name, the bus type and the
+  pins are the profile link's. The module must have opted into J2534-2 (`pname` prefixed
+  `J2534-2:`), and `j2534-0404-service` accepts RawMode on `CAN_CHx` and `ISO15765_CHx`
+  (ADR-414). The test runs two channels of one module and two modules. A `channel` is a J2534
+  notion: the profile refuses it on a D-PDU API `vci`.
 
 ## The T2/T3 read check
 

@@ -378,39 +378,52 @@ fn a_loopback_runs_between_two_ends_of_one_bus() {
         .replacen("response_id = 0x124", "response_id = 0x123", 1)
         .replacen("request_id = 0x999", "request_id = 0x124", 1);
     refused_for(&loopback(can_end, &can_partner), "VCI channel at one end");
+    // A channel names an additional channel of a J2534 module (SAE J2534-2 clause 7); a D-PDU
+    // API `vci` has none.
+    let jvci = &vci_end
+        .replacen("api = \"iso22900\"", "api = \"j2534-0404\"", 1)
+        .replacen(
+            "module = \"SN-0001\"",
+            "module = \"SN-0001\"\nlabel = \"bench-a\"\npname = \"J2534-2:a\"",
+            1,
+        );
+    refused_for(
+        &loopback(can_end, &with_channel(vci_end, "CAN_CH1")),
+        "`channel`",
+    );
     // One VCI end with a channel, opposite a SocketCAN end, is a valid loopback.
-    parse(&loopback(can_end, &with_channel(vci_end, "CAN_CH1"))).unwrap();
+    parse(&loopback(can_end, &with_channel(jvci, "CAN_CH1"))).unwrap();
 
     // Two channels of one VCI, the preferred loopback, differ by their channel.
-    let ch1 = with_channel(vci_end, "CAN_CH1");
-    parse(&loopback(&ch1, &partner(&with_channel(vci_end, "CAN_CH2")))).unwrap();
+    let ch1 = with_channel(jvci, "CAN_CH1");
+    parse(&loopback(&ch1, &partner(&with_channel(jvci, "CAN_CH2")))).unwrap();
     // The same channel, however it is spelled, or a channel at one end only, in either order.
     for other in ["CAN_CH1", "can_ch1", " CAN_CH01 "] {
         refused_for(
-            &loopback(&ch1, &partner(&with_channel(vci_end, other))),
+            &loopback(&ch1, &partner(&with_channel(jvci, other))),
             "must be different channels",
         );
     }
     refused_for(
-        &loopback(vci_end, &partner(vci_end)),
+        &loopback(jvci, &partner(jvci)),
         "must be different channels",
     );
     refused_for(
-        &loopback(&ch1, &partner(vci_end)),
+        &loopback(&ch1, &partner(jvci)),
         "must be different channels",
     );
     refused_for(
-        &loopback(vci_end, &partner(&ch1)),
+        &loopback(jvci, &partner(&ch1)),
         "must be different channels",
     );
-    assert!(parse(&loopback(&with_channel(vci_end, " "), &partner(&ch1))).is_err());
+    assert!(parse(&loopback(&with_channel(jvci, " "), &partner(&ch1))).is_err());
 
     // Names are matched exactly, as the library resolvers match them: a library in another
     // case is another library.
     let shouted = vci_end.replacen("library = \"Vendor PDU\"", "library = \"VENDOR PDU\"", 1);
     parse(&loopback(vci_end, &partner(&shouted))).unwrap();
     // One module described with two versions.
-    let other_version = vci_end.replacen(
+    let other_version = jvci.replacen(
         "firmware_version = \"2.0.0\"",
         "firmware_version = \"2.1.0\"",
         1,

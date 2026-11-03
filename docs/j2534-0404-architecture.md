@@ -1844,6 +1844,21 @@ above is rejected with `PDU_ERR_INVALID_PARAMETERS` (ADR-078), superseding
 the `0`-fallback this section previously described. See ADR-069 for the full
 design rationale.
 
+### RawMode on Additional Channels (ADR-196, ADR-200, ADR-414)
+
+`CreateComLogicalLink` accepts the RawMode create flag for a fixed set of protocol
+families (ADR-196 and its Phase 2 and 3 extensions: CAN, hardware ISO15765, K-line,
+J1850 with ChecksumMode ON, J1939 and the SCI and analog protocols; TP2.0 is excluded for good).
+An SAE J2534-2 clause 7 additional channel (`_CHx`) follows the rule of its base
+protocol (ADR-414). The service derives the base with `resources::chx_base_protocol_id` and
+applies the same list to it, so `CAN_CHx`, `ISO15765_CHx`, `ISO9141_CHx`, `ISO14230_CHx`,
+`J1850VPW_CHx` and `J1850PWM_CHx` (both needing ChecksumMode ON), `J1939_CHx` and `J2610_CHx`
+accept RawMode. The families whose `_CHx` block extends their own `_PS` id (GM UART, UART Echo
+Byte, Honda DIAG-H, J1708, TP2.0, Fault-Tolerant CAN and ISO15765, Single Wire CAN and ISO15765,
+CAN FD and ISO15765-on-CAN-FD) stay refused, as their `_PS` links are. An additional channel is
+never software ISO-TP (ADR-157), so the software-ISO-TP refusal does not reach it. The hardware
+harness uses this for a T0 loopback between two channels of one module.
+
 ### BUSTYPE (Physical Layer) Resolution — Legacy Fallback
 
 This is the pre-ADR-069 `map_bustype_name()` mapping, still consulted as the

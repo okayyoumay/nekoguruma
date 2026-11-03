@@ -320,6 +320,193 @@ async fn raw_mode_on_a_software_isotp_link_is_rejected_at_create_time() {
     server.shutdown().await;
 }
 
+/// A module opted into J2534-2 (clause 5), which an additional channel needs.
+const CHX_MODULES: &[(&str, &str)] = &[("Bench 1", "J2534-2:mock")];
+
+/// Creates a link on `protocol_id` with RawMode (and ChecksumMode when `checksum`) as a direct
+/// protocol id, and returns the result of the create call.
+async fn create_raw_by_id(
+    client: &mut VciServiceClient<tonic::transport::Channel>,
+    protocol_id: u32,
+    checksum: bool,
+) -> Result<vci_service_interface::ComLogicalLinkHandle, tonic::Status> {
+    let mut bits = vec![CllCreateFlagBit::CllCreateFlagRawMode as i32];
+    if checksum {
+        bits.push(CllCreateFlagBit::CllCreateFlagChecksumMode as i32);
+    }
+    client
+        .create_com_logical_link(vci_service_interface::CreateComLogicalLinkRequest {
+            module_handle: Some(ModuleHandle {
+                module_handle: MOCK_MODULE_HANDLE,
+            }),
+            resource: Some(create_com_logical_link_request::Resource::RscData(
+                resource_with_protocol(protocol_id),
+            )),
+            cll_create_flag: Some(
+                create_com_logical_link_request::CllCreateFlag::CllCreateFlagBits(CllCreateFlag {
+                    bits,
+                }),
+            ),
+        })
+        .await
+        .map(|r| r.into_inner().cll_handle.expect("a link handle"))
+}
+
+/// ADR-414: RawMode on a CAN additional channel (`CAN_CH1`) behaves as on the base CAN link: the
+/// client's frame is written unchanged and a received frame is delivered whole.
+#[tokio::test]
+#[serial]
+async fn raw_mode_on_can_ch1_sends_and_receives_raw_frames() {
+    let server = TestServer::start_with_modules(CHX_MODULES).await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll_raw_mode(
+        &mut client,
+        j2534_0404::PROTOCOL_CAN_CH1,
+        &[(j2534_0404::DATA_RATE, 500_000)],
+    )
+    .await;
+    arm_receive_only_monitor_raw_mode(&mut client, cll_handle).await;
+
+    let mut cop_data = 0x123_u32.to_be_bytes().to_vec();
+    cop_data.extend_from_slice(&[0x02, 0x10, 0x03]);
+    send_data(&mut client, cll_handle, cop_data.clone(), vec![]).await;
+    assert_eq!(server.backdoor.written_count(MOCK_CHANNEL_ID), 1);
+    assert_eq!(server.backdoor.written_data(MOCK_CHANNEL_ID, 0), cop_data);
+
+    let mut frame = 0x124_u32.to_be_bytes().to_vec();
+    frame.extend_from_slice(&[0x01, 0x02, 0x03, 0x04]);
+    server
+        .backdoor
+        .inject_rx(MOCK_CHANNEL_ID, &frame, j2534_0404::CAN);
+    let result = wait_for_result_data(&mut client, cll_handle).await;
+    assert_result_data(&result, &[], &[], &frame);
+
+    server.shutdown().await;
+}
+
+/// ADR-414: the same for a hardware ISO 15765 additional channel (`ISO15765_CH1`).
+#[tokio::test]
+#[serial]
+async fn raw_mode_on_iso15765_ch1_sends_and_receives_raw_frames() {
+    let server = TestServer::start_with_modules(CHX_MODULES).await;
+    let mut client = server.client().await;
+    let cll_handle = create_and_connect_cll_raw_mode(
+        &mut client,
+        j2534_0404::PROTOCOL_ISO15765_CH1,
+        &[(j2534_0404::DATA_RATE, 500_000)],
+    )
+    .await;
+    arm_receive_only_monitor_raw_mode(&mut client, cll_handle).await;
+
+    let mut cop_data = 0x123_u32.to_be_bytes().to_vec();
+    cop_data.extend_from_slice(&[0x02, 0x10, 0x03]);
+    send_data(&mut client, cll_handle, cop_data.clone(), vec![]).await;
+    assert_eq!(server.backdoor.written_count(MOCK_CHANNEL_ID), 1);
+    assert_eq!(server.backdoor.written_data(MOCK_CHANNEL_ID, 0), cop_data);
+
+    let mut frame = 0x124_u32.to_be_bytes().to_vec();
+    frame.extend_from_slice(&[0x01, 0x02, 0x03]);
+    server
+        .backdoor
+        .inject_rx(MOCK_CHANNEL_ID, &frame, j2534_0404::ISO15765);
+    let result = wait_for_result_data(&mut client, cll_handle).await;
+    assert_result_data(&result, &[], &[], &frame);
+
+    server.shutdown().await;
+}
+
+/// ADR-414: an additional channel is never software ISO-TP (ADR-157), so a module configured for
+/// software ISO-TP still accepts RawMode on `ISO15765_CH1`, while its base `ISO15765` link stays
+/// refused.
+#[tokio::test]
+#[serial]
+async fn raw_mode_on_an_iso15765_channel_ignores_software_isotp_mode() {
+    let extra = format!(
+        "can_channel_mode = \"software-isotp\"\n{}",
+        modules_toml(CHX_MODULES)
+    );
+    let server = TestServer::try_start_with_extra_config(&extra)
+        .await
+        .expect("service should start");
+    let mut client = server.client().await;
+
+    let base = create_raw_by_id(&mut client, j2534_0404::ISO15765, false)
+        .await
+        .expect_err("the software-ISO-TP base link is refused");
+    assert_eq!(base.code(), Code::Unimplemented);
+    create_raw_by_id(&mut client, j2534_0404::PROTOCOL_ISO15765_CH1, false)
+        .await
+        .expect("a hardware ISO 15765 channel accepts RawMode");
+
+    server.shutdown().await;
+}
+
+/// ADR-414: an additional channel is allowed exactly when its base protocol is: one channel of
+/// each family, with the J1850 families needing ChecksumMode as their base does (ADR-200).
+#[tokio::test]
+#[serial]
+async fn raw_mode_on_an_additional_channel_follows_its_base_protocol() {
+    let server = TestServer::start_with_modules(CHX_MODULES).await;
+    let mut client = server.client().await;
+
+    let allowed = [
+        ("CAN_CH1", j2534_0404::PROTOCOL_CAN_CH1, false),
+        ("ISO15765_CH1", j2534_0404::PROTOCOL_ISO15765_CH1, false),
+        ("ISO9141_CH1", j2534_0404::PROTOCOL_ISO9141_CH1, false),
+        ("ISO14230_CH1", j2534_0404::PROTOCOL_ISO14230_CH1, false),
+        ("J1850VPW_CH1", j2534_0404::PROTOCOL_J1850VPW_CH1, true),
+        ("J1850PWM_CH1", j2534_0404::PROTOCOL_J1850PWM_CH1, true),
+        ("J1939_CH1", j2534_0404::PROTOCOL_J1939_CH1, false),
+        ("J2610_CH1", j2534_0404::PROTOCOL_J2610_CH1, false),
+    ];
+    for (name, id, checksum) in allowed {
+        create_raw_by_id(&mut client, id, checksum)
+            .await
+            .unwrap_or_else(|status| panic!("{name} should accept RawMode: {status}"));
+    }
+    // A J1850 channel without ChecksumMode is refused for the same reason as its base.
+    for id in [
+        j2534_0404::PROTOCOL_J1850VPW_CH1,
+        j2534_0404::PROTOCOL_J1850PWM_CH1,
+    ] {
+        let status = create_raw_by_id(&mut client, id, false)
+            .await
+            .expect_err("a J1850 channel needs ChecksumMode with RawMode");
+        assert_eq!(status.code(), Code::Unimplemented);
+        assert!(status.message().contains("ChecksumMode"), "{status}");
+    }
+
+    // Families whose base is not on the list (or is excluded for good, TP2.0) stay refused.
+    let refused = [
+        ("GM_UART_CH1", j2534_0404::PROTOCOL_GM_UART_CH1),
+        ("ECHO_BYTE_CH1", j2534_0404::PROTOCOL_ECHO_BYTE_CH1),
+        ("HONDA_DIAGH_CH1", j2534_0404::PROTOCOL_HONDA_DIAGH_CH1),
+        ("J1708_CH1", j2534_0404::PROTOCOL_J1708_CH1),
+        ("TP2_0_CH1", j2534_0404::PROTOCOL_TP2_0_CH1),
+        ("FT_CAN_CH1", j2534_0404::PROTOCOL_FT_CAN_CH1),
+        ("FT_ISO15765_CH1", j2534_0404::PROTOCOL_FT_ISO15765_CH1),
+        ("SW_CAN_CAN_CH1", j2534_0404::PROTOCOL_SW_CAN_CAN_CH1),
+        (
+            "SW_CAN_ISO15765_CH1",
+            j2534_0404::PROTOCOL_SW_CAN_ISO15765_CH1,
+        ),
+        // The CAN FD ids (clause 21, 22) cannot be named directly at all: FD follows from
+        // ComParams on an ordinary CAN or ISO 15765 channel, which RawMode rules as its base.
+    ];
+    for (name, id) in refused {
+        let status = create_raw_by_id(&mut client, id, false)
+            .await
+            .expect_err("RawMode stays refused on this channel");
+        assert_eq!(status.code(), Code::Unimplemented, "{name}: {status}");
+        assert!(
+            status.message().contains("RawMode"),
+            "{name} is refused by the RawMode rule: {status}"
+        );
+    }
+
+    server.shutdown().await;
+}
+
 /// ADR-196 Decision item 1: a reserved bit (byte 0 bit 5, Table D.6 Unused)
 /// in `cll_create_flag_raw` is rejected `invalid_argument` at create time --
 /// this phase must not repeat the silently-ignored-flag defect it closes for

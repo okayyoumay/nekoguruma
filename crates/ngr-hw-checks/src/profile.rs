@@ -737,6 +737,18 @@ fn check_link(link: &Link) -> Result<(), ProfileError> {
 }
 
 fn check_endpoint(endpoint: &Endpoint) -> Result<(), ProfileError> {
+    // A channel is an SAE J2534-2 clause 7 additional channel, made from its compound protocol
+    // name; a D-PDU API library has no such name to create a link by.
+    if endpoint.channel.is_some()
+        && endpoint
+            .vci
+            .as_ref()
+            .is_some_and(|v| v.api == Api::Iso22900)
+    {
+        return Err(invalid(
+            "a `channel` names an additional channel of a J2534 module; a D-PDU API `vci` has none",
+        ));
+    }
     match (&endpoint.vci, &endpoint.socketcan) {
         (Some(vci), None)
             if endpoint

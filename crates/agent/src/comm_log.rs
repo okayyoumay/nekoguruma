@@ -2758,11 +2758,8 @@ impl CommLog {
         // the agent's deadline ended by its primitive's end (ADR-366), and one whose start the
         // worker did not answer by the end of the primitive it may have started (ADR-416).
         if kept.evidence.vci_ended
-            || matches!(
-                kept.evidence.end,
-                exchange::End::VciDidNotEnd
-                    | exchange::End::Unknown(exchange::UnknownCause::WorkerNotAnswering)
-            )
+            || kept.evidence.start_unresolved
+            || matches!(kept.evidence.end, exchange::End::VciDidNotEnd)
         {
             inner.links[at].1.keep(
                 seq,
@@ -2914,10 +2911,7 @@ impl CommLog {
         let mut observed = kept.evidence.vci_limits_past_by_us.is_some();
         // The system fault of a start the worker did not answer stands whatever the end read
         // later (ADR-416).
-        let unanswered = matches!(
-            kept.evidence.end,
-            exchange::End::Unknown(exchange::UnknownCause::WorkerNotAnswering)
-        );
+        let unanswered = kept.evidence.start_unresolved;
         let mut evidence = kept.evidence.clone();
         let lost = matches!(end, exchange::End::VciLost { .. });
         evidence.end = end;
@@ -13608,7 +13602,9 @@ mod tests {
             Some(true),
         )
         .unwrap();
+        let unresolved = matches!(end, exchange::End::Unknown(_));
         let mut waited = evidence(endpoint(0x7E0), &[0x22, 0xF1, 0x90], end);
+        waited.start_unresolved = unresolved;
         waited.pending_visibility = exchange::PendingVisibility::Forwarded;
         waited.times.agent.before_us = 10_000;
         waited.times.agent.end_us = JOB_END_US;
@@ -13708,7 +13704,7 @@ mod tests {
             let (dir, setup, log, seq) = stray_log_ending(
                 facts(),
                 None,
-                exchange::End::Unknown(exchange::UnknownCause::WorkerNotAnswering),
+                exchange::End::Unknown(exchange::UnknownCause::PrimitiveFailedToStart),
             );
             let reads = match &end {
                 Some(exchange::End::NoResponse) => {
@@ -13726,6 +13722,23 @@ mod tests {
             assert_eq!(entry["exchanges"][0]["classification"], "system", "{entry}");
             assert_eq!(entry["classification"], "system", "{entry}");
         }
+    }
+
+    /// ADR-416: an unresolved start is kept until the host releases it (the stray was dropped),
+    /// and then no end can settle it.
+    #[test]
+    fn a_released_unresolved_start_is_no_longer_kept() {
+        let (dir, setup, log, seq) = stray_log_ending(
+            facts(),
+            None,
+            exchange::End::Unknown(exchange::UnknownCause::PrimitiveFailedToStart),
+        );
+        log.release_kept(seq);
+        assert!(
+            log.primitive_ended(seq, ended_with(positive(), Vec::new()))
+                .is_none()
+        );
+        finished(&log, &setup, &dir);
     }
 
     /// A time read behind its clock's latest, more than the margin and with no wrap that the

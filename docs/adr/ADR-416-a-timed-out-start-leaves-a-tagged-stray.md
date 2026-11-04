@@ -46,8 +46,10 @@ already absorb their APIs' differences into one tagged event stream).
      did for a stray with a handle, from that read. None found: nothing is cancelled and nothing
      is written for the exchange, since its end is unknown; teardown proceeds.
 4. **The exchange of the start is settled by the primitive's end.** The log keeps an exchange
-   whose end is `unknown` with the cause `worker_not_answering` for its `primitive_ended`
-   entry, as it keeps one the agent's deadline ended. The `system` fault that exchange was
+   whose start left such a stray (`unknown`, with the cause `worker_not_answering`, or
+   `primitive_failed_to_start` for a start answered with no handle) for its `primitive_ended`
+   entry, as it keeps one the agent's deadline ended; other failures to start are not kept. The
+   host releases it when it drops the stray without finding the handle. The `system` fault that exchange was
    classified with stands: the entry takes the more severe of it and the classification of the
    end read, and restates `sent` from all the evidence.
 5. **Hand-offs between the two waits.** A lost-events notice does not end the wait for the tag,
@@ -61,7 +63,8 @@ Decisions on the edges:
 - (a) If the item that gives the handle is the primitive's end (finished or cancelled status, or
   a lost VCI bound to it), no stray remains and no cancel is sent; its `primitive_ended` is
   written at once with that end.
-- (b) A lost-events notice does not end the tag wait (item 5).
+- (b) A lost-events notice does not end the tag wait (item 5). It is remembered, and once the
+  handle is known the primitive's end is unknown, as for a stray that had a handle.
 - (c) If the event stream ends or fails during the wait before a request, the stray is dropped
   (its end cannot be read, as `worker_gone` drops it), its reads are written as unattached, and
   the request goes on to its start, whose own failure is judged as ADR-389 judges it. It is

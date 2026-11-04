@@ -1123,6 +1123,10 @@ pub(crate) struct Evidence {
     /// deadline, was past the VCI's own limits with no response under way
     /// (`timing::past_vci_limits`); `None` when that is not shown.
     pub vci_limits_past_by_us: Option<i64>,
+    /// The exchange's start got no handle, so the host keeps a stray that it finds again by the
+    /// tag the start carried (ADR-416): the primitive's end settles the exchange later, and the
+    /// `system` the start's failure gave stands under it.
+    pub start_unresolved: bool,
     /// A flow-control frame from the ECU was seen (`partial`).
     pub flow_control: bool,
     /// Link errors the exchange's own link reported during it, other than its outcome.
@@ -1197,6 +1201,7 @@ impl Evidence {
             vci_ended: false,
             bound_start: false,
             vci_limits_past_by_us: None,
+            start_unresolved: false,
             flow_control: false,
             link_errors: Vec::new(),
             link_errors_before_answer: false,

@@ -405,7 +405,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-413](ADR-413-the-milestone-close-starts-with-a-sweep.md) | The Milestone Close Starts with a Sweep | Accepted | `.claude/skills/milestone-exit`, `.claude/skills/backlog-loop`, `work/README.md`; ADR-407 item 4 |
 | [ADR-414](ADR-414-rawmode-follows-the-base-protocol-on-ps-and-chx-links.md) | RawMode Follows the Base Protocol on `_PS` and `_CHx` Links | Accepted | `j2534-0404-service` (`rpc_link`), `ngr-hw-checks` (`GuardedHandle::open_link`, `profile`, `guard::link`); ADR-157, ADR-158, ADR-196, ADR-198, ADR-200, ADR-213, ADR-333 |
 | [ADR-415](ADR-415-hardware-profile-names-the-worker-abi.md) | The Hardware Profile Names the Worker ABI to Launch | Accepted | `agent` launch (`launch_worker`, `host_runs`), `ngr-hw-checks` (`profile`, `open`); ADR-240, ADR-275 |
-| [ADR-416](ADR-416-a-timed-out-start-leaves-a-tagged-stray.md) | A Timed-Out Start Leaves a Tagged Stray That the Host Finds Again by Its Tag | Accepted | `agent` host (`send_recv_async`, `settle_at_end`, `Stray`, `resolve_tag`), communication log (`primitive_ended`, `settle_primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-204, ADR-358, ADR-367, ADR-386, ADR-389, ADR-394, ADR-397 |
+| [ADR-416](ADR-416-a-timed-out-start-leaves-a-tagged-stray.md) | A Timed-Out Start Leaves a Tagged Stray That the Host Finds Again by Its Tag | Accepted | `agent` host (`send_recv_async`, `settle_at_end`, `Stray`, `resolve_tag`), communication log (`primitive_ended`, `settle_primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-204, ADR-358, ADR-367, ADR-372, ADR-386, ADR-389, ADR-393, ADR-394, ADR-397 |
 
 ## Status Legend
 

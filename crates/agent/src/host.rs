@@ -959,6 +959,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 TagWait::Ended(result) => tagged_end = Some(result),
                 TagWait::NotFound | TagWait::Dropped => {
                     self.log_unattached(&unattached, stray.seq);
+                    self.release_kept(stray.seq);
                     return;
                 }
             }
@@ -969,6 +970,11 @@ impl<C: WorkerApi> WorkerHost<C> {
         // Its items are read as its exchange's were, so its end is the one the exchange would
         // have had (design 8.11 `primitive_ended`).
         let mut progress = stray.take_progress();
+        // Lost events read before the handle was known leave its end unknown, as they do for a
+        // stray with a handle.
+        if tagged_end.is_none() && progress.events_lost.is_some() {
+            tagged_end = Some(Err(HostError::EventsLost));
+        }
         // `Some(None)` when the event stream failed or ended, `None` when the wait passed.
         let ended = if let Some(result) = tagged_end {
             Some(Some(result))
@@ -1072,8 +1078,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         }
         // What was read and no entry carries, because the primitive has none to write: its
         // handle was invalid, or the cancel failed with no end read.
-        let rest = progress.take_reads(0, None);
-        self.log_unattached(&rest, stray.seq);
+        self.log_rest(&mut progress, stray.seq);
     }
 
     /// Hands the link errors among `reads` to the log, for a job end that has no
@@ -1133,6 +1138,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             cop: _,
             mut progress,
             carried_out,
+            carried,
             end,
             items,
         } = settling;
@@ -1151,15 +1157,24 @@ impl<C: WorkerApi> WorkerHost<C> {
                 Vec::new()
             }
             Some(SettlingEnd::Cancelled) => {
-                // The errors it read go on in `items`, to the exchange in flight as its own
-                // (ADR-372): the cancel entry does not write them too.
-                progress
-                    .reads
-                    .retain(|read| !matches!(read.item, EndItem::Error(_)));
+                // The errors it read in this wait go on in `items`, to the exchange in flight as
+                // its own (ADR-372): the cancel entry does not write them too. Those an earlier
+                // wait read are in no `items`, so the entry keeps them.
+                let mut at = 0;
+                progress.reads.retain(|read| {
+                    at += 1;
+                    at <= carried || !matches!(read.item, EndItem::Error(_))
+                });
                 self.log_primitive_end(&stray, &mut progress, StrayEnd::Cancelled);
                 items
             }
-            None => items,
+            None => {
+                // No entry is written; what this wait read goes on in `items`, and what an
+                // earlier wait read goes to the log alone.
+                progress.reads.truncate(carried);
+                self.log_rest(&mut progress, stray.seq);
+                items
+            }
         };
         if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
             log.release_kept(seq);
@@ -1167,15 +1182,18 @@ impl<C: WorkerApi> WorkerHost<C> {
         left
     }
 
-    /// Settles a primitive whose end the wait for its tag read, so it is not cancelled
-    /// (ADR-416): the `primitive_ended` entry of its exchange, or, when the exchange has no
-    /// entry, the link errors read, which go to the log alone.
-    fn settle_ended_at_once(&self, mut settling: Settling) {
-        if settling.stray.seq.is_some() && self.comm_log.is_some() {
-            self.settle_cancelled(settling, false);
-        } else {
-            let reads = settling.progress.take_reads(0, None);
-            self.log_unattached(&reads, settling.stray.seq);
+    /// Hands the log what `progress` read and no entry carries (a primitive with no entry to
+    /// write: its handle was invalid, its cancel failed with no end read, or its exchange has
+    /// no entry): the link errors among them, for the exchange `seq` if there is one.
+    fn log_rest(&self, progress: &mut Progress, seq: Option<u64>) {
+        let rest = progress.take_reads(0, None);
+        self.log_unattached(&rest, seq);
+    }
+
+    /// Releases what the log kept of the exchange `seq`: nothing will settle it.
+    fn release_kept(&self, seq: Option<u64>) {
+        if let (Some(seq), Some(log)) = (seq, &self.comm_log) {
+            log.release_kept(seq);
         }
     }
 
@@ -1450,6 +1468,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 evidence.end_rejected = end_rejected;
                 evidence.expected = expected;
                 evidence.vci_ended = vci_ended;
+                evidence.start_unresolved = tag_only_stray;
                 evidence.bound_start = sent.bound_start;
                 if bound_tx {
                     evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
@@ -1561,21 +1580,30 @@ impl<C: WorkerApi> WorkerHost<C> {
                         return Sent::not_started(Err(HostError::LinkHeld));
                     }
                     // Its end cannot be read; the request goes on to its start.
-                    TagWait::Dropped => self.log_unattached(&unattached, stray.seq),
+                    TagWait::Dropped => {
+                        self.log_unattached(&unattached, stray.seq);
+                        self.release_kept(stray.seq);
+                    }
                 }
             }
             if let Some(cop) = stray.cop {
                 if let Some(end) = preset_end {
                     // The wait read its end: nothing is left to cancel (design 8.11
                     // "Settlement").
-                    self.settle_ended_at_once(Settling {
-                        progress: stray.take_progress(),
-                        cop,
-                        stray,
-                        carried_out: false,
-                        end: Some(end),
-                        items: Vec::new(),
-                    });
+                    let progress = stray.take_progress();
+                    let carried = progress.reads.len();
+                    self.settle_cancelled(
+                        Settling {
+                            progress,
+                            cop,
+                            stray,
+                            carried_out: false,
+                            carried,
+                            end: Some(end),
+                            items: Vec::new(),
+                        },
+                        false,
+                    );
                 } else {
                     let cancelled = unary(
                         self.timings.unary,
@@ -1604,18 +1632,27 @@ impl<C: WorkerApi> WorkerHost<C> {
                     // during this exchange (design 8.11 "Settlement"); only an exchange whose
                     // entry was written has one to settle.
                     if stray.seq.is_some() && self.comm_log.is_some() {
+                        let progress = stray.take_progress();
+                        let carried = progress.reads.len();
+                        // Lost events read before the handle was known leave its end unknown,
+                        // as they do for a stray with a handle.
+                        let end = progress
+                            .events_lost
+                            .is_some()
+                            .then_some(SettlingEnd::Ended(Err(HostError::EventsLost)));
                         settling = Some(Settling {
-                            progress: stray.take_progress(),
+                            progress,
                             cop,
                             stray,
                             carried_out,
-                            end: None,
+                            carried,
+                            end,
                             items: Vec::new(),
                         });
                     } else if stray.progress.is_some() {
                         // The tag wait read items that no entry carries.
-                        let reads = stray.take_progress().take_reads(0, None);
-                        self.log_unattached(&reads, stray.seq);
+                        let mut progress = stray.take_progress();
+                        self.log_rest(&mut progress, stray.seq);
                     }
                 }
             }
@@ -2267,8 +2304,15 @@ async fn resolve_tag(
                 Ok(None) | Err(_) => return TagWait::Dropped,
             };
             let read = log.filter(|log| log.is_open()).map(|log| log.now());
-            let Some(event_notification::EventData::Item(item)) = notification.event_data else {
-                continue;
+            let item = match notification.event_data {
+                Some(event_notification::EventData::Item(item)) => item,
+                // Every later item of the primitive carries the tag, so the wait goes on; the
+                // loss is remembered for when the handle is known.
+                Some(event_notification::EventData::Lost(_)) => {
+                    progress.events_lost.get_or_insert(read);
+                    continue;
+                }
+                None => continue,
             };
             if let (Some(handle), Some(tag)) = (item.cop_handle, &item.cop_tag)
                 && *tag == stray.tag
@@ -2280,9 +2324,10 @@ async fn resolve_tag(
                     handle,
                     read,
                 );
+                // Lost events came first: the end is unknown, whatever this item shows.
                 return match ended {
-                    Some(result) => TagWait::Ended(result),
-                    None => TagWait::Resolved,
+                    Some(result) if progress.events_lost.is_none() => TagWait::Ended(result),
+                    _ => TagWait::Resolved,
                 };
             }
             match &item.data {
@@ -2332,6 +2377,9 @@ struct Settling {
     progress: Progress,
     /// The worker carried out the cancel: the primitive was still running.
     carried_out: bool,
+    /// How many of `progress.reads` an earlier wait for the stray read, its tag wait among them:
+    /// the errors among them are in no `items`, so the cancel's entry keeps them (ADR-416).
+    carried: usize,
     /// Its end, once read.
     end: Option<SettlingEnd>,
     /// Its results and error events read, with when the host read them: the exchange in
@@ -5241,6 +5289,7 @@ mod tests {
                 cop: COP,
                 stray,
                 carried_out,
+                carried: 0,
                 end: None,
                 items: Vec::new(),
             }

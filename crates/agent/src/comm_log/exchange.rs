@@ -3675,10 +3675,12 @@ fn started_in_time(at_us: i64) -> (Classification, String) {
 /// A final response is `system` whatever its time: within the limit the job gave up on it, and
 /// after it the late row is `system` too. `observed` is the earlier entry's `system` that
 /// rested on the VCI's own clock past its limits, which an end that shows no response under way
-/// at that reading does not refute.
+/// at that reading does not refute. `unanswered` is an exchange whose start the worker did not
+/// answer (ADR-416): its `system` stands under any end.
 pub(crate) fn settle_primitive_ended(
     entry: &ExchangeEntry,
     observed: bool,
+    unanswered: bool,
 ) -> (Classification, String) {
     let final_response = matches!(
         entry.outcome,
@@ -3705,6 +3707,17 @@ pub(crate) fn settle_primitive_ended(
             Classification::System,
             format!(
                 "{} The VCI's clock, read when the agent stopped waiting, had shown it past its own limits with no response under way, which this end does not refute.",
+                entry.reason
+            ),
+        );
+    }
+    // The start the worker did not answer was a system fault, which the end of the primitive it
+    // may have started does not undo: the more severe of the two stands (ADR-416).
+    if unanswered && entry.classification != Classification::System {
+        return (
+            Classification::System,
+            format!(
+                "{} The worker had not answered the request's start in time, which the end of its primitive, read later, does not refute.",
                 entry.reason
             ),
         );
@@ -7075,12 +7088,17 @@ mod tests {
         );
         assert_eq!(entry.classification, Classification::Undetermined);
         assert_eq!(
-            settle_primitive_ended(&entry, false).0,
+            settle_primitive_ended(&entry, false, false).0,
             Classification::Undetermined
         );
-        let (class, reason) = settle_primitive_ended(&entry, true);
+        let (class, reason) = settle_primitive_ended(&entry, true, false);
         assert_eq!(class, Classification::System);
         assert!(reason.contains("does not refute"), "{reason}");
+        // The system fault of a start the worker did not answer stands under the same end
+        // (ADR-416).
+        let (class, reason) = settle_primitive_ended(&entry, false, true);
+        assert_eq!(class, Classification::System);
+        assert!(reason.contains("had not answered"), "{reason}");
         // A final response is `system` whatever its time.
         let positive = ExchangeEntry::build(
             1,
@@ -7088,7 +7106,7 @@ mod tests {
             LinkHistory::empty(),
         );
         assert_eq!(
-            settle_primitive_ended(&positive, false).0,
+            settle_primitive_ended(&positive, false, false).0,
             Classification::System
         );
     }

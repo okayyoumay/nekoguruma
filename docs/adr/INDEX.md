@@ -406,7 +406,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-414](ADR-414-rawmode-follows-the-base-protocol-on-ps-and-chx-links.md) | RawMode Follows the Base Protocol on `_PS` and `_CHx` Links | Accepted | `j2534-0404-service` (`rpc_link`), `ngr-hw-checks` (`GuardedHandle::open_link`, `profile`, `guard::link`); ADR-157, ADR-158, ADR-196, ADR-198, ADR-200, ADR-213, ADR-333 |
 | [ADR-415](ADR-415-hardware-profile-names-the-worker-abi.md) | The Hardware Profile Names the Worker ABI to Launch | Accepted | `agent` launch (`launch_worker`, `host_runs`), `ngr-hw-checks` (`profile`, `open`); ADR-240, ADR-275 |
 | [ADR-416](ADR-416-a-timed-out-start-leaves-a-tagged-stray.md) | A Timed-Out Start Leaves a Tagged Stray That the Host Finds Again by Its Tag | Accepted | `agent` host (`send_recv_async`, `settle_at_end`, `Stray`, `resolve_tag`), communication log (`primitive_ended`, `settle_primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-204, ADR-358, ADR-367, ADR-372, ADR-386, ADR-389, ADR-393, ADR-394, ADR-397 |
-| [ADR-417](ADR-417-a-job-keeps-its-own-targets-session-alive.md) | A Job Keeps the Session of Its Own Targets Alive | Accepted | `agent` (`LinkConfig`, host, runner, restart), communication log `keep_alive`; design 8.2.4, 8.2.5, 8.10; ADR-264, ADR-325, ADR-389, ADR-392, ADR-393, ADR-416 |
+| [ADR-417](ADR-417-a-job-keeps-its-own-targets-session-alive.md) | A Job Keeps the Session of Its Own Targets Alive | Accepted (items 1, 4, 5 and 8's last sentence superseded, item 6's trigger replaced and item 9 amended by ADR-418: the worker sends the tester-present and the agent decides when) | `agent` (`LinkConfig`, host, runner, restart), communication log `keep_alive`; design 8.2.4, 8.2.5, 8.10; ADR-264, ADR-325, ADR-389, ADR-392, ADR-393, ADR-416 |
+| [ADR-418](ADR-418-the-worker-keeps-a-jobs-session-alive.md) | The Worker Keeps a Job's Session Alive, the Agent Decides When | Accepted | `agent` (`LinkConfig`, link open, host), `j2534-0404-service` tester-present, `iso22900-service`, `ngr-hw-checks`, communication log `keep_alive`; design 8.2.5, 8.10, 8.11, 13.5; ADR-084, ADR-088, ADR-093, ADR-099, ADR-137, ADR-264, ADR-275, ADR-325, ADR-417 |
 
 ## Status Legend
 
@@ -859,7 +860,8 @@ the predecessor repository these ADRs came from.
 - ADR-393 (item 2's "a worker that crashed is not restarted" superseded by ADR-394)
 - ADR-394 (the settle step of item 3 also runs after a link fails to open and to close again, in both runners, by ADR-396)
 - ADR-416
-- ADR-417
+- ADR-417 (items 1, 4, 5 and 8's last sentence superseded, item 6's trigger replaced and item 9 amended by ADR-418)
+- ADR-418
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1); `Op::FlashBlock` appended, a block of a declared flash segment read through `DiagHost::artifact_bytes`, by ADR-336 item 11; `Op::ReadInput` appended, a runtime input read through `DiagHost::runtime_input`, by ADR-338; `Op::HmiRequestFromStack` appended, a form whose run-time parameters come from the stack, and item 7's constant of `HmiRequest` and `RecordInput` read as an encoded `HmiTemplate`, by ADR-340; item 2's repeat policy realized by ADR-392)

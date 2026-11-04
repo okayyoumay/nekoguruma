@@ -1,7 +1,7 @@
 # ADR-417: A Job Keeps the Session of Its Own Targets Alive
 
 **Date:** 2026-11-04
-**Status:** Accepted
+**Status:** Accepted (items 1, 4, 5 and 8's last sentence superseded, item 6's trigger replaced and item 9 amended by ADR-418: the worker sends the tester-present and the agent decides when)
 **Affects:** `agent` (`link.rs` `LinkConfig`, `host.rs`, `policy.rs` unchanged, `runner.rs`, `restart.rs`,
 the communication log's `Origin::KeepAlive`), design 8.2.4, 8.2.5 and 8.10; ADR-264 item 4;
 ADR-325 items 8, 11 and 12; ADR-389; ADR-392; ADR-393; ADR-416

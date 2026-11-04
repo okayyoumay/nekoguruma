@@ -1294,6 +1294,21 @@ per-shared-channel `last_bus_activity` clock (stamped on TX and RX) for its
 own idle-triggered dispatch — mode 0 never reads it. See "Service-Level
 Parameters" (§7) for the full gap-state model.
 
+**Use by the agent (ADR-418).** The agent keeps a job's non-default session
+alive with this dispatch rather than a sender of its own: it sets the
+tester-present ComParams at link open (`3E 00`, response expected, physical
+addressing, mode 0 with the keep-alive period, since mode 1's idle clock is
+per shared channel and another link's traffic would hold it off), starts the link with the
+first non-default DiagnosticSessionControl as the request of `CoptStartcomm`
+(which sends it and receives its response like `CoptSendrecv`, then arms
+tester-present), and switches `CP_TesterPresentHandling` on and off by
+`CoptUpdateparam` (the live re-arm above), never by `CoptStopcomm`. What the
+agent relies on from this service is that a tester-present is serialized with
+client primitives as ISO 22900-2:2022 8.1.3 Table 1 requires, that its
+discard window ends at the final response, not at a fixed `CP_P2Max`, and
+that a missing or negative answer raises `PduErrEvtTesterPresentError` while
+sending continues.
+
 ### ComParamSet — parameter storage
 
 ```rust

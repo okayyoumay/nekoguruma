@@ -21220,6 +21220,12 @@ def main():
     #[tokio::test(flavor = "multi_thread")]
     async fn a_worker_that_does_not_answer_the_close_is_ended_and_started_again() {
         use std::sync::atomic::AtomicU32;
+        // The one deadline of every unary call, the hung disconnect's included, which waits it out
+        // once per case. It must be long enough for the calls that do answer, the replacement
+        // worker's open among them, to finish on a loaded machine: a call that timed out there
+        // would be taken as a worker that does not answer (a failed open, and a second ask to end
+        // the worker), which is not what the cases check.
+        const UNARY: Duration = Duration::from_secs(5);
         // (tag, the process's answers, grace, what ending it gives, the attempt, marks, clears,
         // workers started, questions about the process, asks to end it)
         let alive = || vec![WorkerStatus::Alive, WorkerStatus::Alive];
@@ -21286,127 +21292,136 @@ def main():
                 1,
             ),
         ];
+        // The cases run at once: each waits out the hung close's deadline, which would add up.
+        let mut runs = tokio::task::JoinSet::new();
         for (tag, statuses, grace, ending, expected, marks, clears, started, questions, ends) in
             cases
         {
-            let dir = journal_dir(tag);
-            let (first, _) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
-            let (second, second_calls) =
-                fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
-            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
-            let mut client = first.clone();
-            let link = match link::open_tracked(&mut client, &config, Duration::from_secs(5)).await
-            {
-                Ok(link) => link,
-                Err(failure) => panic!("{tag}: {}", failure.error),
-            };
-            let handles = (link.module_handle, link.cll_handle);
-            let hung = Hung(first, false);
-            let log =
-                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
-            log.begin(
-                &crate::comm_log::RunFacts {
-                    job_id: "crash".to_owned(),
-                    generation: 1,
-                    kind: crate::comm_log::JobKind::Procedure,
-                    plan_sha256: None,
-                    document_sha256: None,
-                    variant_name: None,
-                    target_vin: None,
-                    writes: false,
-                    vci: None,
-                    margins: Default::default(),
-                },
-                crate::comm_log::RunKind::First,
-            );
-            let mut host = WorkerHost::new(
-                Handle::current(),
-                hung.clone(),
-                link,
-                crate::host::Timings {
-                    unary: Duration::from_millis(100),
-                    send_recv: Duration::from_secs(5),
-                },
-            );
-            host.set_comm_log(Some(log));
-            let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
-            // The process answers alive before the close and after it hung.
-            let (source, asked_of) = scripted(
-                hung.clone(),
-                vec![Ok(Hung(second, false))],
-                statuses,
-                vec![ending],
-            );
-            host.set_relink(Relink {
-                source: Box::new(source),
-                config,
-                open: Arc::new(Mutex::new(Some(OpenOn {
-                    client: hung,
-                    module_handle: handles.0,
-                    cll_handle: handles.1,
-                }))),
-                mark_unconfirmed: {
-                    let marks = Arc::clone(&counts.0);
-                    Box::new(move || {
-                        marks.fetch_add(1, Ordering::Relaxed);
-                    })
-                },
-                worker_gone: {
-                    let clears = Arc::clone(&counts.1);
-                    Box::new(move || {
-                        clears.fetch_add(1, Ordering::Relaxed);
-                    })
-                },
-                old_open: true,
-                path_lost: Arc::new(AtomicBool::new(false)),
-                worker_ended: false,
-                exit_grace: grace,
-            });
-            let (attempt, host) = tokio::task::spawn_blocking(move || {
-                let attempt = host.reopen_link();
-                (attempt, host)
-            })
-            .await
-            .unwrap();
-            drop(host);
-            assert_eq!(attempt, expected, "{tag}");
-            assert_eq!(counts.0.load(Ordering::Relaxed), marks, "{tag}");
-            assert_eq!(counts.1.load(Ordering::Relaxed), clears, "{tag}");
-            assert_eq!(asked(&asked_of, "status"), questions, "{tag}");
-            assert_eq!(asked(&asked_of, "end"), ends, "{tag}");
-            assert_eq!(asked(&asked_of, "launch"), started, "{tag}");
-            let connects = second_calls
-                .lock()
-                .unwrap()
-                .iter()
-                .filter(|call| **call == "ModuleConnect")
-                .count();
-            assert_eq!(connects, started, "{tag}");
-            let events = worker_events(&dir);
-            if started == 1 {
-                assert_eq!(
-                    events,
-                    [
-                        "worker_exit",
-                        "worker_restart",
-                        "vci_connected",
-                        "link_opened"
-                    ],
-                    "{tag}"
-                );
-                assert_eq!(
-                    of_event(&comm_log_lines(&dir), "worker_exit")[0]["exit"],
-                    if tag == "late-exit" {
-                        serde_json::json!({"signal": 9})
-                    } else {
-                        serde_json::json!("killed_by_agent")
+            runs.spawn(async move {
+                let dir = journal_dir(tag);
+                let (first, _) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+                let (second, second_calls) =
+                    fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+                let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+                let mut client = first.clone();
+                let link =
+                    match link::open_tracked(&mut client, &config, Duration::from_secs(5)).await {
+                        Ok(link) => link,
+                        Err(failure) => panic!("{tag}: {}", failure.error),
+                    };
+                let handles = (link.module_handle, link.cll_handle);
+                let hung = Hung(first, false);
+                let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir))
+                    .expect("the log opens");
+                log.begin(
+                    &crate::comm_log::RunFacts {
+                        job_id: "crash".to_owned(),
+                        generation: 1,
+                        kind: crate::comm_log::JobKind::Procedure,
+                        plan_sha256: None,
+                        document_sha256: None,
+                        variant_name: None,
+                        target_vin: None,
+                        writes: false,
+                        vci: None,
+                        margins: Default::default(),
                     },
-                    "{tag}"
+                    crate::comm_log::RunKind::First,
                 );
-            } else {
-                assert_eq!(events, Vec::<String>::new(), "{tag}");
+                let mut host = WorkerHost::new(
+                    Handle::current(),
+                    hung.clone(),
+                    link,
+                    crate::host::Timings {
+                        unary: UNARY,
+                        send_recv: Duration::from_secs(5),
+                    },
+                );
+                host.set_comm_log(Some(log));
+                let counts = (Arc::new(AtomicU32::new(0)), Arc::new(AtomicU32::new(0)));
+                // The process answers alive before the close and after it hung.
+                let (source, asked_of) = scripted(
+                    hung.clone(),
+                    vec![Ok(Hung(second, false))],
+                    statuses,
+                    vec![ending],
+                );
+                host.set_relink(Relink {
+                    source: Box::new(source),
+                    config,
+                    open: Arc::new(Mutex::new(Some(OpenOn {
+                        client: hung,
+                        module_handle: handles.0,
+                        cll_handle: handles.1,
+                    }))),
+                    mark_unconfirmed: {
+                        let marks = Arc::clone(&counts.0);
+                        Box::new(move || {
+                            marks.fetch_add(1, Ordering::Relaxed);
+                        })
+                    },
+                    worker_gone: {
+                        let clears = Arc::clone(&counts.1);
+                        Box::new(move || {
+                            clears.fetch_add(1, Ordering::Relaxed);
+                        })
+                    },
+                    old_open: true,
+                    path_lost: Arc::new(AtomicBool::new(false)),
+                    worker_ended: false,
+                    exit_grace: grace,
+                });
+                let (attempt, host) = tokio::task::spawn_blocking(move || {
+                    let attempt = host.reopen_link();
+                    (attempt, host)
+                })
+                .await
+                .unwrap();
+                drop(host);
+                assert_eq!(attempt, expected, "{tag}");
+                assert_eq!(counts.0.load(Ordering::Relaxed), marks, "{tag}");
+                assert_eq!(counts.1.load(Ordering::Relaxed), clears, "{tag}");
+                assert_eq!(asked(&asked_of, "status"), questions, "{tag}");
+                assert_eq!(asked(&asked_of, "end"), ends, "{tag}");
+                assert_eq!(asked(&asked_of, "launch"), started, "{tag}");
+                let connects = second_calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| **call == "ModuleConnect")
+                    .count();
+                assert_eq!(connects, started, "{tag}");
+                let events = worker_events(&dir);
+                if started == 1 {
+                    assert_eq!(
+                        events,
+                        [
+                            "worker_exit",
+                            "worker_restart",
+                            "vci_connected",
+                            "link_opened"
+                        ],
+                        "{tag}"
+                    );
+                    assert_eq!(
+                        of_event(&comm_log_lines(&dir), "worker_exit")[0]["exit"],
+                        if tag == "late-exit" {
+                            serde_json::json!({"signal": 9})
+                        } else {
+                            serde_json::json!("killed_by_agent")
+                        },
+                        "{tag}"
+                    );
+                } else {
+                    assert_eq!(events, Vec::<String>::new(), "{tag}");
+                }
+                std::fs::remove_dir_all(&dir).unwrap();
+            });
+        }
+        while let Some(run) = runs.join_next().await {
+            if let Err(error) = run {
+                std::panic::resume_unwind(error.into_panic());
             }
-            std::fs::remove_dir_all(&dir).unwrap();
         }
     }
 

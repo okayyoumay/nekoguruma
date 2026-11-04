@@ -63,13 +63,19 @@ item 6's trigger and item 8's last sentence, and amends item 9.
 2. **ComParams set at link open.** When the keep-alive is on, the agent sets on the link:
    message `3E 00`; `CP_TesterPresentReqRsp` 1 (a response is expected); expected positive
    response `7E 00`; expected negative response `7F 3E`; `CP_TesterPresentAddrMode` 0 (physical);
-   `CP_TesterPresentSendType` 1 (send once the bus has been idle for the time, which realizes
-   ADR-417 item 4's rule that the period counts from the last exchange on the link: every
-   request restarts the server's session timer, ISO 14229-2 (2021) 9.5); `CP_TesterPresentTime`
+   `CP_TesterPresentSendType` 0 (send every period, whatever else the bus carries);
+   `CP_TesterPresentTime`
    the `LinkConfig` period; and `CP_TesterPresentHandling` 1. `LinkConfig` carries the on/off
    setting and the period as ADR-417 item 2 says (on, 2 s by default, a period that is not
    positive or is below 200 ms refused). With the keep-alive off the agent sets nothing and the
    behaviour of ADR-264 item 4 holds for the link.
+   The period is fixed rather than counted from the last exchange on the link, which replaces
+   that rule of ADR-417 item 4 (the maintainer's decision, 2026-11-04): send type 1 waits for
+   the bus to be idle for the period, and the bus is shared, so another ECU's or another
+   logical link's traffic on it can hold this link's tester-present off while its own link is
+   idle, and the session lapses (the J2534 worker's idle clock is per shared channel, see
+   `docs/j2534-0404-architecture.md` "Tester-Present Dispatch"). A tester-present sent while
+   the link's own traffic would already have kept the session costs one frame per period.
 3. **Tester-present runs only in COMM_STARTED, so the first session control starts it.** A link
    opens ONLINE and stays so until the first non-default session. The agent sends the link's
    first DiagnosticSessionControl request into a non-default session as the request of a

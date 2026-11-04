@@ -1,7 +1,7 @@
 # ADR-389: The Host Says Whether a Failed Request May Have Reached the ECU
 
 **Date:** 2026-10-30
-**Status:** Accepted
+**Status:** Accepted (the last Consequences bullet, a timed-out start's primitive unknown to the host, addressed by ADR-416)
 **Affects:** `agent` host (`host.rs` `HostError::send_state`, `SendState`, `HostError::VciLost`,
 `sent_end`, `Sent`), communication log (design 8.11 `sent`); `docs/rpc-api-guide.md` "Reading a
 Worker's Answer"; ADR-289; ADR-294 item 1; ADR-350 item 2

@@ -15305,6 +15305,30 @@ def main():
         destroy_script: Mutex<std::collections::VecDeque<Option<tonic::Status>>>,
         /// What the first StartComPrimitive calls fail with, one per call.
         start_failures: Mutex<std::collections::VecDeque<tonic::Status>>,
+        /// The tags of the starts and how late the starts are answered.
+        tagging: Tagging,
+    }
+
+    /// How a [`FakeWorker`] answers a start (ADR-416): the primitive is always started and its
+    /// events always come, only the answer to the call differs.
+    #[derive(Clone, Copy)]
+    enum StartAnswer {
+        /// The answer comes that long after the start.
+        Late(Duration),
+        /// The answer is a success with no primitive handle.
+        NoHandle,
+    }
+
+    /// What a [`FakeWorker`] records of the tags (ADR-204) and how it answers the first starts.
+    #[derive(Default)]
+    struct Tagging {
+        /// The `cop_tag` of each StartComPrimitive that reached a primitive, in order.
+        start_tags: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+        /// The tag of each primitive by its handle, which the link's event stream echoes on the
+        /// items that carry that handle, and on no other.
+        by_handle: Arc<Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
+        /// How the first starts are answered, one per call.
+        answers: Mutex<std::collections::VecDeque<StartAnswer>>,
     }
 
     /// How a scripted item of a [`FakeWorker`] is bound (design 8.11 "Link settings for the
@@ -15338,6 +15362,8 @@ def main():
         Finish,
         /// The worker reports the VCI lost: an error of no primitive.
         LostVci(u32),
+        /// The worker reports lost events: a notification that carries no item.
+        LostEvents,
     }
 
     /// When a [`FakeWorker`] gives a start's event.
@@ -15616,9 +15642,10 @@ def main():
         }
         async fn start_com_primitive(
             &self,
-            _: tonic::Request<vci_service_interface::StartComPrimitiveRequest>,
+            request: tonic::Request<vci_service_interface::StartComPrimitiveRequest>,
         ) -> Result<tonic::Response<vci_service_interface::ComPrimitiveResponse>, tonic::Status>
         {
+            let tag = request.into_inner().cop_tag;
             self.note("StartComPrimitive");
             if !self.starts {
                 return unimplemented();
@@ -15632,6 +15659,15 @@ def main():
                 started.push(next);
                 next
             };
+            self.tagging.start_tags.lock().unwrap().push(tag.clone());
+            if let Some(tag) = tag {
+                self.tagging
+                    .by_handle
+                    .lock()
+                    .unwrap()
+                    .insert(cop_handle, tag);
+            }
+            let answer = self.tagging.answers.lock().unwrap().pop_front();
             let scripted = self.start_script.lock().unwrap().pop_front();
             if let Some((when, event)) = scripted.or(self.on_start) {
                 if let StartEvent::Die = event {
@@ -15670,6 +15706,18 @@ def main():
                             let (bound, at, data) = match *step {
                                 Step::Release => {
                                     released.acquire().await.unwrap().forget();
+                                    continue;
+                                }
+                                Step::LostEvents => {
+                                    if let Some(sender) = &sender {
+                                        let _ =
+                                            sender.send(Ok(vci_service_interface::EventNotification {
+                                                event_data: Some(EventData::Lost(
+                                                    Default::default(),
+                                                )),
+                                                ..Default::default()
+                                            }));
+                                    }
                                     continue;
                                 }
                                 Step::Error(bound, at) => (
@@ -15876,6 +15924,16 @@ def main():
                     }
                 });
             }
+            match answer {
+                // The primitive runs on; only the call's answer is late.
+                Some(StartAnswer::Late(after)) => tokio::time::sleep(after).await,
+                Some(StartAnswer::NoHandle) => {
+                    return Ok(tonic::Response::new(
+                        vci_service_interface::ComPrimitiveResponse { cop_handle: None },
+                    ));
+                }
+                None => {}
+            }
             Ok(tonic::Response::new(
                 vci_service_interface::ComPrimitiveResponse {
                     cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
@@ -15933,8 +15991,28 @@ def main():
         ) -> Result<tonic::Response<Self::SubscribeEventStream>, tonic::Status> {
             // The sender stays here, so the stream stays open with no events unless a start
             // gives one.
-            let (sender, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let (sender, mut inner) = tokio::sync::mpsc::unbounded_channel();
             *self.events.lock().unwrap() = Some(sender);
+            // The worker echoes a start's tag on every item that carries the primitive's handle
+            // (ADR-204), and on no other.
+            let (out, receiver) = tokio::sync::mpsc::unbounded_channel();
+            let by_handle = Arc::clone(&self.tagging.by_handle);
+            tokio::spawn(async move {
+                while let Some(mut notification) = inner.recv().await {
+                    if let Ok(vci_service_interface::EventNotification {
+                        event_data:
+                            Some(vci_service_interface::event_notification::EventData::Item(item)),
+                        ..
+                    }) = &mut notification
+                        && let Some(handle) = &item.cop_handle
+                    {
+                        item.cop_tag = by_handle.lock().unwrap().get(&handle.cop_handle).cloned();
+                    }
+                    if out.send(notification).is_err() {
+                        break;
+                    }
+                }
+            });
             Ok(tonic::Response::new(
                 tonic::codegen::tokio_stream::wrappers::UnboundedReceiverStream::new(receiver),
             ))
@@ -16019,6 +16097,7 @@ def main():
             module_script: Mutex::new([Some(unavailable())].into()),
             destroy_script: Mutex::default(),
             start_failures: Mutex::default(),
+            tagging: Tagging::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (client, calls)
@@ -16052,6 +16131,7 @@ def main():
             module_script: Mutex::new(modules.into()),
             destroy_script: Mutex::new(destroys.into()),
             start_failures: Mutex::default(),
+            tagging: Tagging::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (client, calls)
@@ -16087,6 +16167,7 @@ def main():
             module_script: Mutex::new(modules.into()),
             destroy_script: Mutex::default(),
             start_failures: Mutex::new(starts.into()),
+            tagging: Tagging::default(),
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (client, calls)
@@ -16131,6 +16212,7 @@ def main():
             module_script: Mutex::default(),
             destroy_script: Mutex::default(),
             start_failures: Mutex::default(),
+            tagging: Tagging::default(),
         };
         serve(service, calls, set).await
     }
@@ -16143,6 +16225,8 @@ def main():
         cancelled: Arc<Mutex<Vec<u32>>>,
         /// One permit per primitive whose events the test releases ([`When::Released`]).
         released: Arc<tokio::sync::Semaphore>,
+        /// The `cop_tag` each start carried, in order.
+        start_tags: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
     }
 
     impl Started {
@@ -16192,6 +16276,32 @@ def main():
         fail_disconnect: bool,
         script: Vec<(When, StartEvent)>,
     ) -> (WorkerClient, Started) {
+        fake_worker_answering(
+            cancel,
+            on_start,
+            device_clock,
+            fail_disconnect,
+            script,
+            Vec::new(),
+        )
+        .await
+    }
+
+    /// [`fake_worker_scripted`] whose first starts are answered as `answers` say, one each
+    /// (ADR-416).
+    async fn fake_worker_answering(
+        cancel: CancelAnswer,
+        on_start: Option<(When, StartEvent)>,
+        device_clock: bool,
+        fail_disconnect: bool,
+        script: Vec<(When, StartEvent)>,
+        answers: Vec<StartAnswer>,
+    ) -> (WorkerClient, Started) {
+        let tagging = Tagging {
+            answers: Mutex::new(answers.into()),
+            ..Tagging::default()
+        };
+        let start_tags = Arc::clone(&tagging.start_tags);
         let calls = Arc::new(Mutex::new(Vec::new()));
         let set = Arc::new(Mutex::new(Vec::new()));
         let (started, cancelled) = (Arc::default(), Arc::default());
@@ -16216,6 +16326,7 @@ def main():
             module_script: Mutex::default(),
             destroy_script: Mutex::default(),
             start_failures: Mutex::default(),
+            tagging,
         };
         let (client, calls, _) = serve(service, calls, set).await;
         (
@@ -16225,6 +16336,7 @@ def main():
                 started,
                 cancelled,
                 released,
+                start_tags,
             },
         )
     }
@@ -17649,6 +17761,776 @@ def main():
             ]
         );
         assert_eq!(*fake.cancelled.lock().unwrap(), [7, 7]);
+    }
+
+    // ---------------------------------------- a start the worker did not answer (ADR-416)
+
+    /// The first start is answered later than the host waits, and the primitive runs all the
+    /// same.
+    const LATE_START: Duration = Duration::from_secs(30);
+
+    /// Runs `body` on a logging host over a fake worker whose first start is answered as
+    /// `answers` say and whose first primitives give `script`; the host waits `unary` for a
+    /// start and `send_recv` for an end. Returns what the worker recorded and the log's lines.
+    async fn tagged_run(
+        script: Vec<(When, StartEvent)>,
+        answers: Vec<StartAnswer>,
+        unary: Duration,
+        send_recv: Duration,
+        job_end_wait: Duration,
+        body: impl FnOnce(&mut WorkerHost<WorkerClient>, &TaggedCtx) + Send + 'static,
+    ) -> (Started, Vec<serde_json::Value>) {
+        tagged_run_with(
+            CancelAnswer::Done,
+            script,
+            answers,
+            unary,
+            send_recv,
+            job_end_wait,
+            body,
+        )
+        .await
+    }
+
+    /// What a [`tagged_run`] body can reach besides its host.
+    struct TaggedCtx {
+        /// One permit per primitive whose events the body releases ([`When::Released`], [`Step::Release`]).
+        released: Arc<tokio::sync::Semaphore>,
+        log: crate::comm_log::CommLog,
+        dir: std::path::PathBuf,
+    }
+
+    impl TaggedCtx {
+        /// The `seq` of the first exchange written.
+        fn first_exchange(&self) -> u64 {
+            comm_log_lines(&self.dir)
+                .iter()
+                .find(|line| line["event"] == "exchange")
+                .map(|line| line["seq"].as_u64().unwrap())
+                .expect("an exchange was written")
+        }
+
+        /// Whether the log still keeps the exchange `seq` for the end of its primitive: a
+        /// cancel entry for it is written only then.
+        fn keeps(&self, seq: u64) -> bool {
+            self.log
+                .primitive_ended(
+                    seq,
+                    crate::comm_log::PrimitiveEnded {
+                        end: None,
+                        detail: Default::default(),
+                        vci_ended: false,
+                        reads: Vec::new(),
+                    },
+                )
+                .is_some()
+        }
+    }
+
+    /// [`tagged_run`] with the worker's answer to a cancel chosen.
+    async fn tagged_run_with(
+        cancel: CancelAnswer,
+        script: Vec<(When, StartEvent)>,
+        answers: Vec<StartAnswer>,
+        unary: Duration,
+        send_recv: Duration,
+        job_end_wait: Duration,
+        body: impl FnOnce(&mut WorkerHost<WorkerClient>, &TaggedCtx) + Send + 'static,
+    ) -> (Started, Vec<serde_json::Value>) {
+        let dir = journal_dir("tagged-start");
+        let (mut client, fake) =
+            fake_worker_answering(cancel, None, false, false, script, answers).await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings { unary, send_recv };
+        let ctx = TaggedCtx {
+            released: Arc::clone(&fake.released),
+            log: log.clone(),
+            dir: dir.clone(),
+        };
+        tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(job_end_wait);
+            body(&mut host, &ctx);
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        (fake, lines)
+    }
+
+    const TAGGED_TX: &[Step] = &[Step::Transmit(10_000)];
+
+    /// Rows 1, 4 and 5 of ADR-416: the start that got no answer leaves a stray with its tag; the
+    /// next request finds the handle from the first item carrying the tag, cancels that
+    /// primitive first, and starts. Every start carries a tag of its own. The exchange of the
+    /// start is `unknown` (`worker_not_answering`), and the agent's cancel is written as its
+    /// `primitive_ended`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_with_no_answer_is_found_by_its_tag_and_cancelled_before_the_next_request() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(TAGGED_TX),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(400),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(
+                    matches!(
+                        first,
+                        Err(HostError::WorkerUnresponsive("StartComPrimitive"))
+                    ),
+                    "{first:?}"
+                );
+                // The tagged item is on the stream before the next request.
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert_eq!(
+            fake.primitive_calls(),
+            [
+                "StartComPrimitive",
+                "CancelComPrimitive",
+                "StartComPrimitive",
+                "CancelComPrimitive"
+            ]
+        );
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+        let tags = fake.start_tags.lock().unwrap().clone();
+        assert_eq!(tags.len(), 2);
+        let tags: Vec<_> = tags.into_iter().map(Option::unwrap).collect();
+        assert!(tags.iter().all(|tag| tag.len() == 8), "{tags:?}");
+        assert_ne!(tags[0], tags[1]);
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges[0]["outcome"]["result"], "unknown", "{lines:#?}");
+        assert_eq!(
+            exchanges[0]["outcome"]["cause"], "worker_not_answering",
+            "{lines:#?}"
+        );
+        assert_eq!(exchanges[0]["classification"], "system", "{lines:#?}");
+        let ended: Vec<_> = of_event(&lines, "primitive_ended")
+            .into_iter()
+            .filter(|line| line["refers_to"] == serde_json::json!([exchanges[0]["seq"]]))
+            .collect();
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(ended[0]["cancelled_by_agent"], true, "{lines:#?}");
+        assert!(
+            ended[0]["seq"].as_u64() < exchanges[1]["seq"].as_u64(),
+            "written during the second exchange, before its entry"
+        );
+    }
+
+    /// Rows 6 and 7 of ADR-416: with no tagged item within the wait the request is refused as
+    /// `link_held`, no cancel is sent and no start made, and the stray stays; the request after
+    /// the tagged item came finds the handle and goes on.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_with_no_tagged_item_holds_the_link_until_one_comes() {
+        let (fake, lines) = tagged_run(
+            vec![(When::Released, StartEvent::Script(TAGGED_TX))],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(200),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, ctx| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(
+                    matches!(first, Err(HostError::WorkerUnresponsive(_))),
+                    "{first:?}"
+                );
+                for _ in 0..2 {
+                    let held = host.service_request(0x22, &[0xF1, 0x90]);
+                    assert!(matches!(held, Err(HostError::LinkHeld)), "{held:?}");
+                }
+                ctx.released.add_permits(1);
+                std::thread::sleep(Duration::from_millis(200));
+                let third = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(third, Err(HostError::NoResponse)), "{third:?}");
+                host.settle_at_end();
+            },
+        )
+        .await;
+        // The refusals sent nothing: the cancel came once the handle was known.
+        assert_eq!(
+            fake.primitive_calls(),
+            [
+                "StartComPrimitive",
+                "CancelComPrimitive",
+                "StartComPrimitive",
+                "CancelComPrimitive"
+            ]
+        );
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 4, "{lines:#?}");
+        for held in &exchanges[1..3] {
+            assert_eq!(held["outcome"]["result"], "not_sent", "{held}");
+            assert_eq!(held["outcome"]["cause"], "link_held", "{held}");
+            assert_eq!(held["classification"], "system", "{held}");
+        }
+    }
+
+    /// Row 13 of ADR-416: the first tagged item is the primitive's finished status, so nothing
+    /// is left to cancel: no cancel is sent, the end is written as the exchange's
+    /// `primitive_ended` at once and the request starts.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tagged_finished_status_leaves_nothing_to_cancel() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(&[Step::Finish]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            },
+        )
+        .await;
+        assert_eq!(
+            fake.primitive_calls(),
+            ["StartComPrimitive", "StartComPrimitive"]
+        );
+        let exchanges = of_event(&lines, "exchange");
+        let ended: Vec<_> = of_event(&lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(
+            ended[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]])
+        );
+        assert_eq!(ended[0]["cancelled_by_agent"], false, "{lines:#?}");
+        assert_eq!(ended[0]["classification"], "system", "{lines:#?}");
+        assert!(ended[0]["seq"].as_u64() < exchanges[1]["seq"].as_u64());
+    }
+
+    /// Rows 16 and 17 of ADR-416: a lost VCI, or an event stream that ends, before a handle
+    /// is known drops the stray: nothing is cancelled, nothing is written for the exchange, and
+    /// the request goes on to its start, which is judged as it always was.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lost_vci_or_an_ended_stream_before_a_handle_drops_the_stray() {
+        for (event, ends) in [
+            (StartEvent::Script(&[Step::LostVci(5_000)]), false),
+            (StartEvent::Die, true),
+        ] {
+            let (fake, lines) = tagged_run(
+                vec![(When::After(Duration::from_millis(50)), event)],
+                vec![StartAnswer::Late(LATE_START)],
+                Duration::from_millis(300),
+                Duration::from_millis(300),
+                Duration::from_millis(100),
+                move |host, ctx| {
+                    use diag_ir::DiagHost;
+                    let first = host.service_request(0x22, &[0xF1, 0x90]);
+                    assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                    std::thread::sleep(Duration::from_millis(200));
+                    let second = host.service_request(0x22, &[0xF1, 0x90]);
+                    // The dropped stray's exchange is released: nothing can settle it, and a
+                    // later unbound indication is not attributed to it.
+                    assert!(!ctx.keeps(ctx.first_exchange()));
+                    if ends {
+                        assert!(
+                            matches!(second, Err(HostError::EventStreamEnded)),
+                            "{second:?}"
+                        );
+                    } else {
+                        assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+                    }
+                },
+            )
+            .await;
+            assert_eq!(
+                fake.primitive_calls(),
+                ["StartComPrimitive", "StartComPrimitive"]
+            );
+            // Both starts carried a tag of their own, and the first exchange is the unanswered
+            // start's, which nothing settled.
+            let tags = fake.start_tags.lock().unwrap().clone();
+            assert!(
+                tags.iter().all(Option::is_some) && tags[0] != tags[1],
+                "{tags:?}"
+            );
+            let exchanges = of_event(&lines, "exchange");
+            assert_eq!(exchanges[0]["outcome"]["cause"], "worker_not_answering");
+            assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// The lines of `lines` that carry an `error_event` of `PDU_ERR_EVT_RX_ERROR` as a late item
+    /// or an unattached one.
+    fn rx_error_lines(lines: &[serde_json::Value]) -> usize {
+        lines
+            .iter()
+            .filter(|line| {
+                matches!(line["event"].as_str(), Some("late_item" | "unattached"))
+                    && line["error_event"] == "PDU_ERR_EVT_RX_ERROR"
+            })
+            .count()
+    }
+
+    /// Row 11 of ADR-416 with a cancel the worker carries out: the error that was the first
+    /// tagged item was read before the cancel, so no `items` carries it and the cancel's entry
+    /// does; it is written, not lost.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tagged_error_read_before_a_carried_out_cancel_is_logged() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(&[Step::Error(Bound::Own, 5_000)]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            },
+        )
+        .await;
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+        assert_eq!(rx_error_lines(&lines), 1, "{lines:#?}");
+    }
+
+    /// Decision (g) of ADR-416: a link error of no primitive read before the tagged item, with a
+    /// cancel that finds the handle invalid and no end read, reaches the log: no entry is
+    /// written for the primitive, and the carried reads go to the log alone.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn reads_before_the_tagged_item_reach_the_log_when_no_entry_is_written() {
+        let (fake, lines) = tagged_run_with(
+            CancelAnswer::InvalidHandle,
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(&[Step::Error(Bound::None, 5_000), Step::Transmit(6_000)]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            },
+        )
+        .await;
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+        assert_eq!(rx_error_lines(&lines), 1, "{lines:#?}");
+    }
+
+    /// Decision (h) of ADR-416: what the tag wait read survives a cancel that failed, and is
+    /// logged when the job end settles the stray.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn what_the_tag_wait_read_survives_a_failed_cancel_to_the_job_end() {
+        let (fake, lines) = tagged_run_with(
+            CancelAnswer::Failed,
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(&[Step::Error(Bound::None, 5_000), Step::Transmit(6_000)]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::LinkHeld)), "{second:?}");
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7, 7]);
+        assert_eq!(rx_error_lines(&lines), 1, "{lines:#?}");
+    }
+
+    /// Row 15 of ADR-416: a lost-events notice before the first tagged item does not end the
+    /// wait; once the handle is known the primitive's end is unknown, as for a stray with a
+    /// handle, and the request that waited is not ended by the loss.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn lost_events_before_the_tagged_item_leave_the_end_unknown() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(&[Step::LostEvents, Step::Transmit(6_000)]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            },
+        )
+        .await;
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+        let ended = of_event(&lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(ended[0]["outcome"]["result"], "unknown", "{lines:#?}");
+        assert_eq!(ended[0]["outcome"]["cause"], "events_lost", "{lines:#?}");
+    }
+
+    /// Row 23 of ADR-416: at job end a lost-events notice before the handle is known keeps the
+    /// wait going, and the end is unknown once a tagged item gives the handle; the primitive is
+    /// then cancelled.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_job_end_lost_events_before_the_tagged_item_leave_the_end_unknown() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::ZERO),
+                StartEvent::Script(&[
+                    Step::Release,
+                    Step::LostEvents,
+                    Step::Transmit(6_000),
+                    Step::Finish,
+                ]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            |host, ctx| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                ctx.released.add_permits(1);
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert_eq!(*fake.cancelled.lock().unwrap(), [7]);
+        let ended = of_event(&lines, "primitive_ended");
+        assert_eq!(ended[0]["outcome"]["cause"], "events_lost", "{lines:#?}");
+    }
+
+    /// Row 24 of ADR-416: an event stream that ends at job end before a handle is known leaves
+    /// nothing to cancel and nothing to write.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_job_end_an_ended_stream_before_a_handle_cancels_and_writes_nothing() {
+        let (fake, lines) = tagged_run(
+            vec![(When::After(Duration::from_millis(50)), StartEvent::Die)],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert_eq!(fake.primitive_calls(), ["StartComPrimitive"]);
+        assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+    }
+
+    /// Row 9 of ADR-416: the first tagged item is the final response; the cancel finds the
+    /// primitive, and its settling reads the end as the response: positive, `system` (the job
+    /// gave up on an exchange that ended), with the send restated.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_tagged_final_response_settles_the_exchange_of_the_start() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(&[Step::Respond(600_000, None)]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            },
+        )
+        .await;
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+        let exchanges = of_event(&lines, "exchange");
+        let ended: Vec<_> = of_event(&lines, "primitive_ended")
+            .into_iter()
+            .filter(|line| line["refers_to"] == serde_json::json!([exchanges[0]["seq"]]))
+            .collect();
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(ended[0]["outcome"]["result"], "positive", "{lines:#?}");
+        assert_eq!(ended[0]["classification"], "system", "{lines:#?}");
+        assert_eq!(ended[0]["sent"], "confirmed", "{lines:#?}");
+    }
+
+    /// Row 19 of ADR-416, the stray resolved: the next start times out too. The first stray is
+    /// cancelled and written, the second takes its place and is found by its own tag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_second_unanswered_start_replaces_a_resolved_stray() {
+        let item = (
+            When::After(Duration::from_millis(50)),
+            StartEvent::Script(TAGGED_TX),
+        );
+        let (fake, lines) = tagged_run(
+            vec![item, item],
+            vec![StartAnswer::Late(LATE_START), StartAnswer::Late(LATE_START)],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                for _ in 0..2 {
+                    let timed_out = host.service_request(0x22, &[0xF1, 0x90]);
+                    assert!(matches!(timed_out, Err(HostError::WorkerUnresponsive(_))));
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                let third = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(third, Err(HostError::NoResponse)), "{third:?}");
+            },
+        )
+        .await;
+        assert_eq!(fake.cancelled.lock().unwrap()[..2], [7, 8]);
+        let exchanges = of_event(&lines, "exchange");
+        for first_two in &exchanges[..2] {
+            let ended = of_event(&lines, "primitive_ended")
+                .into_iter()
+                .filter(|line| line["refers_to"] == serde_json::json!([first_two["seq"]]))
+                .count();
+            assert_eq!(ended, 1, "{lines:#?}");
+        }
+    }
+
+    /// Row 19 of ADR-416, the stray unresolved: the request is refused, no start is made, so
+    /// no second stray exists.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unresolved_stray_leaves_no_second_start() {
+        let (fake, _lines) = tagged_run(
+            vec![(When::Released, StartEvent::Script(TAGGED_TX))],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(150),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                let held = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(held, Err(HostError::LinkHeld)), "{held:?}");
+            },
+        )
+        .await;
+        assert_eq!(fake.primitive_calls(), ["StartComPrimitive"]);
+        assert_eq!(fake.start_tags.lock().unwrap().len(), 1);
+    }
+
+    /// Row 31 of ADR-416: with no communication log the handle still resolves and the cancel
+    /// still runs.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn without_a_communication_log_the_tagged_stray_is_still_cancelled() {
+        let (mut client, fake) = fake_worker_answering(
+            CancelAnswer::Done,
+            None,
+            false,
+            false,
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(TAGGED_TX),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+        )
+        .await;
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_millis(300),
+            send_recv: Duration::from_millis(300),
+        };
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            let first = host.service_request(0x22, &[0xF1, 0x90]);
+            assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+            std::thread::sleep(Duration::from_millis(200));
+            let second = host.service_request(0x22, &[0xF1, 0x90]);
+            assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+        })
+        .await
+        .unwrap();
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+    }
+
+    /// Row 20 of ADR-416: at job end a start with no tagged item by the bound is not cancelled
+    /// and nothing is written for its exchange.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_job_end_a_start_with_no_tagged_item_is_neither_cancelled_nor_written() {
+        let wait = Duration::from_millis(300);
+        let began = std::time::Instant::now();
+        let (fake, lines) = tagged_run(
+            Vec::new(),
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            wait,
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert!(began.elapsed() >= wait, "the bound was waited for");
+        assert_eq!(fake.primitive_calls(), ["StartComPrimitive"]);
+        assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+    }
+
+    /// Row 21 of ADR-416: a tagged item that comes within the job-end wait gives the handle, and
+    /// the wait goes on from that read: the response and the finished status that follow end the
+    /// primitive, which is then not cancelled; its end settles the exchange of the start.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_job_end_a_tagged_item_gives_the_handle_and_the_wait_goes_on() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::ZERO),
+                StartEvent::Script(&[Step::Release, Step::Respond(600_000, None), Step::Finish]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(5),
+            |host, ctx| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                ctx.released.add_permits(1);
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert_eq!(fake.primitive_calls(), ["StartComPrimitive"]);
+        let exchanges = of_event(&lines, "exchange");
+        let ended = of_event(&lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(
+            ended[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]])
+        );
+        assert_eq!(ended[0]["outcome"]["result"], "positive", "{lines:#?}");
+        assert_eq!(ended[0]["classification"], "system", "{lines:#?}");
+    }
+
+    /// Row 25 of ADR-416: a lost VCI before a handle ends the job-end wait; nothing is cancelled
+    /// or written for the exchange.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn at_job_end_a_lost_vci_before_a_handle_ends_the_wait() {
+        let began = std::time::Instant::now();
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::ZERO),
+                StartEvent::Script(&[Step::Release, Step::LostVci(5_000)]),
+            )],
+            vec![StartAnswer::Late(LATE_START)],
+            Duration::from_millis(100),
+            Duration::from_millis(100),
+            Duration::from_secs(30),
+            |host, ctx| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
+                ctx.released.add_permits(1);
+                host.settle_at_end();
+            },
+        )
+        .await;
+        assert!(
+            began.elapsed() < Duration::from_secs(10),
+            "{:?}",
+            began.elapsed()
+        );
+        assert_eq!(fake.primitive_calls(), ["StartComPrimitive"]);
+        assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+    }
+
+    /// Row 3 and decision (d) of ADR-416: a start answered with no handle is treated as one that
+    /// got no answer: the next request finds the primitive by its tag.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_start_answered_with_no_handle_is_found_by_its_tag() {
+        let (fake, lines) = tagged_run(
+            vec![(
+                When::After(Duration::from_millis(50)),
+                StartEvent::Script(TAGGED_TX),
+            )],
+            vec![StartAnswer::NoHandle],
+            Duration::from_millis(300),
+            Duration::from_millis(300),
+            Duration::from_millis(100),
+            |host, _| {
+                use diag_ir::DiagHost;
+                let first = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(first, Err(HostError::Setup(_))), "{first:?}");
+                std::thread::sleep(Duration::from_millis(200));
+                let second = host.service_request(0x22, &[0xF1, 0x90]);
+                assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
+            },
+        )
+        .await;
+        assert_eq!(
+            fake.primitive_calls(),
+            [
+                "StartComPrimitive",
+                "CancelComPrimitive",
+                "StartComPrimitive"
+            ]
+        );
+        assert_eq!(fake.cancelled.lock().unwrap()[0], 7);
+        // The exchange of the start failed to start; the agent's cancel of its primitive is
+        // written against it all the same.
+        let exchanges = of_event(&lines, "exchange");
+        let ended = of_event(&lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(
+            ended[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]])
+        );
+        assert_eq!(ended[0]["cancelled_by_agent"], true, "{lines:#?}");
     }
 
     /// The host checks every request against its link's application layer (ADR-342): on a
@@ -20926,6 +21808,51 @@ def main():
             vci_only_guards(tag),
         )
         .await
+    }
+
+    /// Row 27 of ADR-416: a worker that exited while its start was unanswered is told from the
+    /// lost VCI by its process; the stray is dropped with nothing cancelled through the dead
+    /// worker, and the exit names the exchange of the start as the one in flight.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_worker_that_exited_under_an_unanswered_start_names_that_exchange() {
+        let dir = journal_dir("exit-unanswered-start");
+        let (first, started) = fake_worker_answering(
+            CancelAnswer::Done,
+            None,
+            false,
+            false,
+            Vec::new(),
+            vec![StartAnswer::Late(Duration::from_secs(60))],
+        )
+        .await;
+        let (second, _second_calls) = fake_worker_losing(Vec::new(), Vec::new(), Vec::new()).await;
+        let (source, _asked_of) = scripted(
+            first,
+            vec![Ok(second)],
+            vec![exited(ExitHow::Signal(9))],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Safe)]),
+            Some(dir.as_path()),
+            after_loss_limits(),
+            "exit-unanswered-start",
+        )
+        .await;
+        run.result.unwrap_or_else(|error| panic!("{error}"));
+        assert_eq!(closes(&started.calls), Vec::<&str>::new());
+        let lines = comm_log_lines(&dir);
+        let exchanges = of_event(&lines, "exchange");
+        let exit = &of_event(&lines, "worker_exit")[0];
+        assert_eq!(
+            exit["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{exit}"
+        );
+        assert_eq!(exchanges[0]["outcome"]["cause"], "worker_not_answering");
+        assert!(of_event(&lines, "primitive_ended").is_empty(), "{lines:#?}");
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// ADR-394: a worker that exited under a `Safe` read is told from a lost VCI by its process.

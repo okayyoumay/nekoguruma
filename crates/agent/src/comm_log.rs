@@ -2755,8 +2755,12 @@ impl CommLog {
             _ => None,
         };
         // Only an exchange the VCI ended can be settled by a late response (ADR-365), and one
-        // the agent's deadline ended by its primitive's end (ADR-366).
-        if kept.evidence.vci_ended || matches!(kept.evidence.end, exchange::End::VciDidNotEnd) {
+        // the agent's deadline ended by its primitive's end (ADR-366), and one whose start the
+        // worker did not answer by the end of the primitive it may have started (ADR-416).
+        if kept.evidence.vci_ended
+            || kept.evidence.start_unresolved
+            || matches!(kept.evidence.end, exchange::End::VciDidNotEnd)
+        {
             inner.links[at].1.keep(
                 seq,
                 exchange::Kept {
@@ -2905,6 +2909,9 @@ impl CommLog {
             return Some(written);
         };
         let mut observed = kept.evidence.vci_limits_past_by_us.is_some();
+        // The system fault of a start the worker did not answer stands whatever the end read
+        // later (ADR-416).
+        let unanswered = kept.evidence.start_unresolved;
         let mut evidence = kept.evidence.clone();
         let lost = matches!(end, exchange::End::VciLost { .. });
         evidence.end = end;
@@ -3193,7 +3200,8 @@ impl CommLog {
         let times = evidence.times.vci;
         let settled_evidence = evidence.clone();
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
-        let (classification, reason) = exchange::settle_primitive_ended(&entry, observed);
+        let (classification, reason) =
+            exchange::settle_primitive_ended(&entry, observed, unanswered);
         // The answers its end adds count for the later exchanges on the link.
         let state = &mut inner.links[at].1;
         state.settled(
@@ -13570,6 +13578,15 @@ mod tests {
         facts: RunFacts,
         start_us: Option<u64>,
     ) -> (PathBuf, CommLogSetup, CommLog, u64) {
+        stray_log_ending(facts, start_us, exchange::End::VciDidNotEnd)
+    }
+
+    /// [`stray_log_with`], whose exchange ended as `end` instead.
+    fn stray_log_ending(
+        facts: RunFacts,
+        start_us: Option<u64>,
+        end: exchange::End,
+    ) -> (PathBuf, CommLogSetup, CommLog, u64) {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
@@ -13585,11 +13602,9 @@ mod tests {
             Some(true),
         )
         .unwrap();
-        let mut waited = evidence(
-            endpoint(0x7E0),
-            &[0x22, 0xF1, 0x90],
-            exchange::End::VciDidNotEnd,
-        );
+        let unresolved = matches!(end, exchange::End::Unknown(_));
+        let mut waited = evidence(endpoint(0x7E0), &[0x22, 0xF1, 0x90], end);
+        waited.start_unresolved = unresolved;
         waited.pending_visibility = exchange::PendingVisibility::Forwarded;
         waited.times.agent.before_us = 10_000;
         waited.times.agent.end_us = JOB_END_US;
@@ -13675,6 +13690,55 @@ mod tests {
         assert_eq!(of_event(&lines, "primitive_ended").len(), 1);
         assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
         assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-416: an exchange whose start the worker did not answer is kept for the end of the
+    /// primitive it may have started, and its `system` stands under any end read later.
+    #[test]
+    fn an_unanswered_start_is_settled_by_the_primitive_s_end_and_stays_system() {
+        for end in [
+            positive(),
+            Some(exchange::End::NoResponse),
+            Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+        ] {
+            let (dir, setup, log, seq) = stray_log_ending(
+                facts(),
+                None,
+                exchange::End::Unknown(exchange::UnknownCause::PrimitiveFailedToStart),
+            );
+            let reads = match &end {
+                Some(exchange::End::NoResponse) => {
+                    vec![end_read(500_000, EndItem::RxTimeout(dev(1_000_000)))]
+                }
+                _ => vec![response_read(600_000, 510_500)],
+            };
+            let written = log.primitive_ended(seq, ended_with(end.clone(), reads));
+            assert!(written.is_some(), "{end:?}: the exchange was kept");
+            let lines = finished(&log, &setup, &dir);
+            let exchange = line_of(&lines, "exchange");
+            assert_eq!(exchange["classification"], "system", "{exchange}");
+            let entry = line_of(&lines, "primitive_ended");
+            assert_eq!(entry["refers_to"], serde_json::json!([seq]), "{entry}");
+            assert_eq!(entry["exchanges"][0]["classification"], "system", "{entry}");
+            assert_eq!(entry["classification"], "system", "{entry}");
+        }
+    }
+
+    /// ADR-416: an unresolved start is kept until the host releases it (the stray was dropped),
+    /// and then no end can settle it.
+    #[test]
+    fn a_released_unresolved_start_is_no_longer_kept() {
+        let (dir, setup, log, seq) = stray_log_ending(
+            facts(),
+            None,
+            exchange::End::Unknown(exchange::UnknownCause::PrimitiveFailedToStart),
+        );
+        log.release_kept(seq);
+        assert!(
+            log.primitive_ended(seq, ended_with(positive(), Vec::new()))
+                .is_none()
+        );
+        finished(&log, &setup, &dir);
     }
 
     /// A time read behind its clock's latest, more than the margin and with no wrap that the

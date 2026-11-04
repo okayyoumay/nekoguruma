@@ -491,7 +491,15 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   succeeds, when the worker names its handle invalid (`PDU_ERR_INVALID_HANDLE`: it had ended), or
   when the VCI was lost. Any other answer leaves the link held: the request is not started
   (`HostError::LinkHeld`, logged `not_sent`, refused by the agent with the cause `link_held`), and
-  the next request tries the cancel again. The cancelled primitive's end, when the next
+  the next request tries the cancel again. Every start carries a `cop_tag` of the host's own
+  (an 8-byte counter, never reset, ADR-204), so a start that got no answer in time, or answered
+  with no handle, leaves a stray with its tag and no handle (ADR-416). The next request waits
+  one unary call's time for an item carrying the tag; the first one gives the handle and the
+  cancel above runs, and with none the request is refused as `link_held` and the stray stays.
+  A lost VCI or an ended event stream during that wait drops the stray (its end cannot be
+  read), and the request goes on to its start. At job end the same wait is bounded by the
+  job-end wait below, and with no tagged item nothing is cancelled and nothing is written for
+  the exchange. The cancelled primitive's end, when the next
   exchange's wait reads it (its own items until its finished or cancelled status, lost events,
   a lost VCI), settles its exchange in a `primitive_ended` entry, as at job end; with no end
   read, a cancel the worker carried out is recorded as the agent's (ADR-367). Its results and

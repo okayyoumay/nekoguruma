@@ -658,6 +658,44 @@ fn a_replaced_reassembly_is_taken_as_an_unexpected_pdu() {
     assert_eq!(take_replaced_reassembly(&mut map, &key, false), None);
 }
 
+/// A first or single frame reaching a reassembly already past N_Cr, with no
+/// sweep since, raises the one `ISO15765_CF_TIMEOUT` and no
+/// `ISO15765_UNEXPECTED_PDU`; an unfinished one still within N_Cr raises only
+/// the latter, and an echo of the service's own request nothing.
+#[test]
+fn a_frame_ending_an_expired_reassembly_raises_only_the_timeout() {
+    let start = Instant::now();
+    let key = (0x7E8, false);
+    let mut map = HashMap::new();
+    let mut late = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    late.waiting_cop = Some(5);
+    map.insert(key, late);
+    let after = start + Duration::from_millis(11);
+    assert_eq!(
+        end_unfinished_reassembly(&mut map, &key, after, false),
+        [n_cr_expired(Some(5))]
+    );
+    assert!(map.is_empty());
+
+    let mut open = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_secs(60));
+    open.waiting_cop = Some(5);
+    map.insert(key, open);
+    assert_eq!(
+        end_unfinished_reassembly(&mut map, &key, after, false),
+        [IsoTpRxNote::Failed {
+            error: PduErrorEvent::PduErrEvtFrameStruct,
+            name: ISO15765_UNEXPECTED_PDU_NAME,
+            waiting_cop: Some(5),
+        }]
+    );
+
+    let mut echo = isotp::Reassembly::start(20, &[0; 6], start, Duration::from_millis(10));
+    echo.tx_echo = true;
+    map.insert(key, echo);
+    assert_eq!(end_unfinished_reassembly(&mut map, &key, after, false), []);
+    assert!(map.is_empty());
+}
+
 /// Only the reassemblies past N_Cr are taken, each as a receive timeout named
 /// `ISO15765_CF_TIMEOUT` carrying the COP recorded at its first frame; the
 /// echo of the service's own request is dropped with no failure.

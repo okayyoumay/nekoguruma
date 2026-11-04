@@ -1497,10 +1497,10 @@ async fn process_frame_for_entry(
                     // report a message the ECU already ended. One already
                     // past N_Cr is raised first as `CF_TIMEOUT`, as there.
                     let mut reassembly = ctx.reassembly.lock().await;
-                    notes.extend(take_expired_reassemblies(&mut reassembly, now));
-                    notes.extend(take_replaced_reassembly(
+                    notes.extend(end_unfinished_reassembly(
                         &mut reassembly,
                         &reassembly_key,
+                        now,
                         is_tx_side,
                     ));
                     drop(reassembly);
@@ -1556,27 +1556,26 @@ async fn process_frame_for_entry(
                         );
                     }
                     let mut reassembly = ctx.reassembly.lock().await;
-                    // Drop reassemblies whose N_Cr expired without a final
-                    // CF, raising each one's failure, so abandoned transfers
-                    // don't accumulate (`raise_expired_reassemblies` sweeps
-                    // the rest each poll pass).
-                    notes.extend(take_expired_reassemblies(&mut reassembly, now));
                     // ADR-222: keyed by (can_id, canonical width), not can_id
                     // alone -- see `IsoTpRxContext::reassembly`'s and
                     // `CanIdWidthGate::reassembly_key_width`'s own doc
                     // comments for why this uses `reassembly_key` (the
                     // matched entry's own gate), never the raw
                     // `frame.frame_is_29bit` bit.
-                    // The COP a failure of this message binds to (ADR-351):
-                    // the one waiting on this response ID now, if only one
-                    // does. A first frame that replaces an unfinished one
-                    // raises `ISO15765_UNEXPECTED_PDU` for the replaced
-                    // message, bound to the COP recorded at its own first
-                    // frame (ISO 15765-2:2024 9.8.3). The echo of this
+                    // Reassemblies whose N_Cr expired without a final CF raise
+                    // their failure first, so abandoned transfers don't
+                    // accumulate (`raise_expired_reassemblies` sweeps the rest
+                    // each poll pass). A first frame that replaces an
+                    // unfinished one raises `ISO15765_UNEXPECTED_PDU` for the
+                    // replaced message, bound to the COP recorded at its own
+                    // first frame (ISO 15765-2:2024 9.8.3). A failure of this
+                    // message binds to the COP waiting on this response ID
+                    // now, if only one does (ADR-351). The echo of this
                     // service's own request starts no response.
-                    notes.extend(take_replaced_reassembly(
+                    notes.extend(end_unfinished_reassembly(
                         &mut reassembly,
                         &reassembly_key,
+                        now,
                         is_tx_side,
                     ));
                     let mut started = isotp::Reassembly::start(total_len, payload, now, ctx.n_cr);
@@ -3873,17 +3872,46 @@ fn frame_structure_failure(name: &'static str, waiting_cop: Option<u32>) -> IsoT
 /// Removes the unfinished reassembly under `key`, which a first or single
 /// frame from the same response ID has just replaced (ISO 15765-2:2024
 /// 9.8.3), returning its `ISO15765_UNEXPECTED_PDU` note. Nothing is raised
-/// when there was none, for the echo of this service's own request, or when
-/// the replacing frame is itself that echo (`replaced_by_tx_side`). Call it
-/// after `take_expired_reassemblies`, so an expired one is `CF_TIMEOUT`.
+/// when there was none or for the echo of this service's own request. A
+/// replacing frame that is itself that echo (`replaced_by_tx_side`, reachable
+/// only when the request and response CAN IDs are equal) drops a response
+/// reassembly without an error.
 fn take_replaced_reassembly(
     reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
     key: &(u32, bool),
     replaced_by_tx_side: bool,
 ) -> Option<IsoTpRxNote> {
     let replaced = reassembly.remove(key)?;
-    (!replaced.tx_echo && !replaced_by_tx_side)
-        .then(|| frame_structure_failure(ISO15765_UNEXPECTED_PDU_NAME, replaced.waiting_cop))
+    if replaced.tx_echo || replaced_by_tx_side {
+        return None;
+    }
+    warn!(
+        can_id = key.0,
+        "software ISO-TP: first or single frame replaced an unfinished reassembly; reassembly aborted"
+    );
+    Some(frame_structure_failure(
+        ISO15765_UNEXPECTED_PDU_NAME,
+        replaced.waiting_cop,
+    ))
+}
+
+/// What a first or single frame at `now` ends under `key`: every reassembly
+/// past N_Cr first (`ISO15765_CF_TIMEOUT`), then the one it replaces
+/// (`ISO15765_UNEXPECTED_PDU`). The order matters: an expired reassembly of
+/// the same response ID must be reported as the timeout it is.
+fn end_unfinished_reassembly(
+    reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
+    key: &(u32, bool),
+    now: Instant,
+    replaced_by_tx_side: bool,
+) -> Vec<IsoTpRxNote> {
+    let mut notes = take_expired_reassemblies(reassembly, now);
+    notes.extend(take_replaced_reassembly(
+        reassembly,
+        key,
+        replaced_by_tx_side,
+    ));
+    notes
 }
 
 /// The failure note of a reassembly whose N_Cr expired before its next

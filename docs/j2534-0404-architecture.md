@@ -1299,7 +1299,10 @@ does not restrict them); case (c) is restricted to tester-present's own
 frozen outgoing TX CAN ID (`tx_can_id`). A match is discarded outright.
 
 **Serialization with client primitives (ADR-419, ISO 22900-2:2022 8.1.3
-Table 1).** Every send on the shared channel goes through
+Table 1).** Every diagnostic request written on the shared channel (client
+primitives, the `CoptStartcomm` request and arm, the K-line init exchange after
+its top-up, the `CoptStopcomm` message, re-arms and tester-present dispatches;
+not the J1939 address-claim frames or the TP2.0 transport frames) goes through
 `wait_for_bus_clear`, which applies the pure per-channel rule
 `bus_hold(prev, next)` and then the `CP_P3Func`/`CP_P3Phys` gap wait. An
 exchange that expects an answer is outstanding until it completes: after a
@@ -1323,7 +1326,9 @@ send's entry ends at its final answer (the expected positive answer, or the
 expected negative answer with a code other than 0x78); 0x78 reloads the
 window to `CP_P2Star` limited by the `CP_RC78CompletionTimeout` ceiling
 anchored at the first pending answer. A functional send's entry lasts to its
-window end, and any ECU's 0x78 reloads it. The entry outlives `until` until
+window end, and any ECU's 0x78 reloads it (upward only). An expired entry is
+swept only after an exhaustive RX drain at or after its end, and until then
+the read-side snapshot still lets it settle a late-read answer. The entry outlives `until` until
 the per-tick sweep, which removes it and raises `PduErrEvtTesterPresentError`
 for a send that ended with a negative final answer or without an answer
 (functional: without a positive answer) while the link's tester-present is

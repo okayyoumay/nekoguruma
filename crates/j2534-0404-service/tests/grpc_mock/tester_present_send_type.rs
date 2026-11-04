@@ -4208,13 +4208,20 @@ async fn isotp_fc_wait_excludes_a_sibling_clls_tester_present_at_the_same_wire_t
     let server = TestServer::start_with_can_mode(Some("software-isotp")).await;
     let mut client = server.client().await;
 
-    // cll_a: mode-0 tester-present armed on ITSELF, physically addressed to
-    // the SAME CAN ID (0x7E0) cll_b's in-flight transfer below targets --
-    // the specific collision this fix closes. A short 300ms interval so a
-    // regression (the pre-fix behavior) would visibly fire at least twice
-    // during the ~700ms sample window below.
+    // cll_a: mode-0 tester-present armed on ITSELF, functionally addressed
+    // with a `CP_CanFuncReqId` equal to the SAME CAN ID (0x7E0) cll_b's
+    // in-flight transfer below targets, and expecting no response -- the
+    // specific collision this fix closes. ADR-419 holds a physical
+    // tester-present back during a segmented send anyway, so only a
+    // functional one without a response reaches the dispatch's wire-target
+    // exclusion at all. A short 300ms interval so a regression (the pre-fix
+    // behavior) would visibly fire at least twice during the ~700ms sample
+    // window below.
     let cll_a = create_cll(&mut client, j2534_0404::ISO15765, 1).await;
     set_com_param_unum32(&mut client, cll_a, j2534_0404::DATA_RATE, 500_000).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_ADDR_MODE, 1).await;
+    set_com_param_unum32(&mut client, cll_a, CP_CAN_FUNC_REQ_ID, 0x7E0).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_REQ_RSP, 0).await;
     set_com_param_bytes(&mut client, cll_a, CP_TESTER_PRESENT_MESSAGE, vec![0x11]).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 300_000).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_HANDLING, 1).await;
@@ -4914,6 +4921,92 @@ async fn kline_five_baud_init_force_fires_mode_0_sibling_pre_init_topup() {
             .written_data(MOCK_CHANNEL_ID, 2)
             .ends_with(&[0x11]),
         "the third frame should still be cll_a's tester-present message"
+    );
+
+    drop(events_a);
+    drop(events_b);
+    server.shutdown().await;
+}
+
+/// ADR-419: the K-line init exchange is a request on the shared bus, so it
+/// waits (ISO 22900-2:2022 8.1.3 Table 1) for the answer to the sibling
+/// tester-present the pre-init top-up just fired when that one expects a
+/// response. K-line has no functional class here, so the tester-present counts
+/// as physical and holds. The init runs after the sibling's window (600 ms)
+/// ends, not at once.
+#[tokio::test]
+#[serial]
+async fn kline_five_baud_init_waits_for_the_pre_init_topup_tester_present_answer() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+
+    let cll_a = create_cll(&mut client, j2534_0404::ISO9141, 1).await;
+    set_com_param_unum32(&mut client, cll_a, j2534_0404::DATA_RATE, 9_600).await;
+    set_com_param_unum32(&mut client, cll_a, CP_INIT_SETTINGS, 3).await;
+    set_com_param_bytes(&mut client, cll_a, CP_TESTER_PRESENT_MESSAGE, vec![0x11]).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 5_000_000).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_SEND_TYPE, 0).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_REQ_RSP, 1).await;
+    set_com_param_unum32(&mut client, cll_a, j2534_0404::P2_MAX, 600_000).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_HANDLING, 1).await;
+    client
+        .connect_com_logical_link(ConnectComLogicalLinkRequest {
+            cll_handle: Some(cll_a),
+        })
+        .await
+        .expect("connect_com_logical_link should succeed for cll_a");
+
+    let cll_b = create_cll(&mut client, j2534_0404::ISO9141, 2).await;
+    set_com_param_unum32(&mut client, cll_b, j2534_0404::DATA_RATE, 9_600).await;
+    set_com_param_unum32(&mut client, cll_b, CP_INIT_SETTINGS, 1).await;
+    client
+        .connect_com_logical_link(ConnectComLogicalLinkRequest {
+            cll_handle: Some(cll_b),
+        })
+        .await
+        .expect("connect_com_logical_link should succeed for cll_b");
+    assert_eq!(server.backdoor.connect_count(), 1);
+    set_com_param_unum32(&mut client, cll_b, CP_5BAUD_ADDR_PHYS, 0x2A).await;
+    promote_via_update_param(&mut client, cll_b).await;
+
+    let mut events_a = client
+        .subscribe_event(vci_service_interface::SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_a)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+    let mut events_b = client
+        .subscribe_event(vci_service_interface::SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_b)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+
+    start_comm(&mut client, cll_a).await;
+    wait_for_cop_finished(&mut events_a).await;
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+
+    // Let the arm-time send's own window end first, or the top-up would be
+    // held behind it and fire nothing.
+    tokio::time::sleep(std::time::Duration::from_millis(700)).await;
+    let started = std::time::Instant::now();
+    let init_cop = start_comm(&mut client, cll_b).await;
+    // The top-up's frame goes at once; the init does not.
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 2).await;
+    tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+    assert_eq!(
+        server.backdoor.five_baud_init_count(),
+        0,
+        "the init must wait for the answer to the top-up's tester-present"
+    );
+    wait_for_cop_finished_matching(&mut events_b, init_cop).await;
+    assert_eq!(server.backdoor.five_baud_init_count(), 1);
+    assert!(
+        started.elapsed() >= std::time::Duration::from_millis(450),
+        "the init ran before the tester-present's window ended ({:?})",
+        started.elapsed()
     );
 
     drop(events_a);
@@ -6314,6 +6407,22 @@ async fn handling_1_to_0_then_0_to_1_with_changed_signature_still_discards_pre_d
     start_comm(&mut client, cll_handle).await;
     wait_for_cop_finished(&mut events).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await; // send #1: pos = [0x7E]
+    // ADR-419: with a receive-only monitor armed, a frame inside send #1's
+    // window is taken for the tester-present and not delivered.
+    arm_receive_only_monitor(&mut client, cll_handle).await;
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7E, 0x00]),
+        j2534_0404::ISO15765,
+    );
+    assert!(
+        !wait_for_event(&mut events, 250, |item| matches!(
+            item.data,
+            Some(event_item::Data::ResultData(_))
+        ))
+        .await,
+        "an answer inside the send's window must be taken for the tester-present, not delivered"
+    );
 
     // Disarm while send #1's window is still open.
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_HANDLING, 0).await;
@@ -6348,16 +6457,12 @@ async fn handling_1_to_0_then_0_to_1_with_changed_signature_still_discards_pre_d
     );
 
     assert!(
-        !wait_for_event(&mut events, 300, |item| matches!(
+        wait_for_event(&mut events, 2000, |item| matches!(
             item.data,
             Some(event_item::Data::ResultData(_))
         ))
         .await,
-        "a delayed response matching the pre-disable send's own signature must still be \
-         discarded after a 0->1 re-enable that also changed the wire signature for future sends \
-         -- open discard windows are a per-CLL list (LogicalLinkState::open_tp_discards), not a \
-         single slot the fresh re-arm's write-back can silently overwrite (ADR-137 fourth \
-         Codex-review fix / round-4 restructure)"
+        "a frame matching only send #1's pre-disable signature arrives after that window ended and the re-enable's send (pos = [0x7F]) opened another, so it must be delivered (ADR-419: windows of sends that expect a response no longer overlap)"
     );
 
     drop(events);
@@ -6401,6 +6506,22 @@ async fn clear_periodic_msgs_then_rearm_with_changed_signature_still_discards_pr
     start_comm(&mut client, cll_handle).await;
     wait_for_cop_finished(&mut events).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await; // send #1: pos = [0x7E]
+    // ADR-419: with a receive-only monitor armed, a frame inside send #1's
+    // window is taken for the tester-present and not delivered.
+    arm_receive_only_monitor(&mut client, cll_handle).await;
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7E, 0x00]),
+        j2534_0404::ISO15765,
+    );
+    assert!(
+        !wait_for_event(&mut events, 250, |item| matches!(
+            item.data,
+            Some(event_item::Data::ResultData(_))
+        ))
+        .await,
+        "an answer inside the send's window must be taken for the tester-present, not delivered"
+    );
 
     clear_periodic_msgs(&mut client, cll_handle).await;
     assert!(
@@ -6436,14 +6557,12 @@ async fn clear_periodic_msgs_then_rearm_with_changed_signature_still_discards_pr
     );
 
     assert!(
-        !wait_for_event(&mut events, 300, |item| matches!(
+        wait_for_event(&mut events, 2000, |item| matches!(
             item.data,
             Some(event_item::Data::ResultData(_))
         ))
         .await,
-        "a delayed response matching the pre-clear send's own signature must still be discarded \
-         after PDU_IOCTL_CLEAR_PERIODIC_MSGS followed by a re-arm with a different signature \
-         (ADR-137 fourth Codex-review fix / round-4 restructure)"
+        "a frame matching only send #1's pre-clear signature arrives after that window ended and the re-arm's send (pos = [0x7F]) opened another, so it must be delivered (ADR-419)"
     );
 
     drop(events);
@@ -6486,6 +6605,22 @@ async fn continuously_armed_unrelated_field_promotion_still_discards_prior_send_
     wait_for_cop_finished(&mut events).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await; // send #1: pos = [0x7E]
     let send_1_at = std::time::Instant::now();
+    // ADR-419: with a receive-only monitor armed, a frame inside send #1's
+    // window is taken for the tester-present and not delivered.
+    arm_receive_only_monitor(&mut client, cll_handle).await;
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7E, 0x00]),
+        j2534_0404::ISO15765,
+    );
+    assert!(
+        !wait_for_event(&mut events, 250, |item| matches!(
+            item.data,
+            Some(event_item::Data::ResultData(_))
+        ))
+        .await,
+        "an answer inside the send's window must be taken for the tester-present, not delivered"
+    );
 
     // Excluded from `same_wire_behavior` -- does not re-arm, no resend.
     set_com_param_bytes(
@@ -6522,16 +6657,12 @@ async fn continuously_armed_unrelated_field_promotion_still_discards_prior_send_
     );
 
     assert!(
-        !wait_for_event(&mut events, 300, |item| matches!(
+        wait_for_event(&mut events, 2000, |item| matches!(
             item.data,
             Some(event_item::Data::ResultData(_))
         ))
         .await,
-        "a delayed reply matching the FIRST send's pre-promotion signature must still be \
-         discarded after the SECOND per-tick send opened a window with a different signature \
-         while the CLL stayed continuously Armed (no state transition at all) -- \
-         dispatch_due_tester_present's per-tick write-back must push into a list, not overwrite \
-         a single slot (ADR-137 fourth Codex-review fix / round-4 restructure)"
+        "a frame matching only send #1's pre-promotion signature arrives after that window ended, and send #2 expects pos = [0x7F], so it must be delivered (ADR-419)"
     );
 
     drop(events);

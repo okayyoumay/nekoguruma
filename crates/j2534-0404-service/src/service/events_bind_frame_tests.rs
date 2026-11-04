@@ -6070,24 +6070,27 @@ fn push_open_tp_discard_keeps_an_expired_holding_entry_and_the_sweep_removes_it(
 
     // Armed: the sweep removes it and reports one missing answer.
     let mut armed = list.clone();
-    assert_eq!(sweep_expired_holds(&mut armed, now, true), 1);
+    assert_eq!(sweep_expired_holds(&mut armed, now, true, &|_| true), 1);
     assert_eq!(armed.len(), 1);
     assert!(!armed[0].holds_bus());
 
     // Disarmed or stopped: removed all the same, silently.
     let mut disarmed = list.clone();
-    assert_eq!(sweep_expired_holds(&mut disarmed, now, false), 0);
+    assert_eq!(sweep_expired_holds(&mut disarmed, now, false, &|_| true), 0);
     assert_eq!(disarmed.len(), 1);
 
     // A functional send that had a positive answer ends without a report.
     let mut functional = vec![hold_entry(-10, false, tp_rc_cfg(true, None))];
     functional[0].hold.as_mut().unwrap().got_response = true;
-    assert_eq!(sweep_expired_holds(&mut functional, now, true), 0);
+    assert_eq!(
+        sweep_expired_holds(&mut functional, now, true, &|_| true),
+        0
+    );
     assert!(functional.is_empty());
 
     // An unexpired holding entry stays.
     let mut open = vec![hold_entry(10_000, true, tp_rc_cfg(true, None))];
-    assert_eq!(sweep_expired_holds(&mut open, now, true), 0);
+    assert_eq!(sweep_expired_holds(&mut open, now, true, &|_| true), 0);
     assert_eq!(open.len(), 1);
 }
 
@@ -6363,4 +6366,89 @@ fn tester_present_discard_entry_holds_only_for_a_send_that_expects_an_answer() {
     assert!(entry(Some(false), true).hold.unwrap().physical);
     assert!(entry(None, true).hold.unwrap().physical);
     assert!(!entry(Some(true), true).hold.unwrap().physical);
+}
+
+/// An expired holding entry is kept until a drained poll ran at or after its
+/// `until`, so an answer sent in time but read one poll late can still settle
+/// it (and the send is not reported as missing).
+#[test]
+fn sweep_waits_for_a_drained_poll_past_the_window() {
+    let now = tokio::time::Instant::now();
+    let mut list = vec![hold_entry(-10, true, tp_rc_cfg(true, None))];
+    assert_eq!(sweep_expired_holds(&mut list, now, true, &|_| false), 0);
+    assert_eq!(
+        list.len(),
+        1,
+        "no drained poll since `until`: the entry stays"
+    );
+    assert_eq!(sweep_expired_holds(&mut list, now, true, &|_| true), 1);
+    assert!(list.is_empty());
+}
+
+/// The read-side snapshot keeps a holding entry past `until` (and still drops
+/// an expired non-holding one), so `bind_frame` settles a late-read answer
+/// instead of leaving it unbound for a client `3E 00` COP to take.
+#[test]
+fn a_holding_entry_past_its_window_still_settles_a_late_read_answer() {
+    let now = tokio::time::Instant::now();
+    let list = vec![
+        hold_entry(-5, true, tp_rc_cfg(true, None)),
+        discard_at(-5, 0x03),
+    ];
+    let discards = tester_present_discards_at(&list, now);
+    assert_eq!(
+        discards.len(),
+        1,
+        "only the holding entry is kept past `until`"
+    );
+    let mut entry = test_entry(1, vec![registrant(100, 1)], discards);
+    assert!(matches!(
+        step3_frame(&mut entry, &[0x7E, 0x00], false),
+        FrameBinding::TesterPresent
+    ));
+    assert_eq!(entry.tp_settlements.len(), 1);
+    assert_eq!(entry.tp_settlements[0].kind, TpSettleKind::Positive);
+}
+
+/// A pending answer of a functional send never shortens a window that another
+/// ECU's answer had extended; a physical send follows ADR-102's reload.
+#[test]
+fn a_pending_answer_reloads_a_functional_window_only_upward() {
+    let at = tokio::time::Instant::now();
+    let mut f = hold_entry(0, false, tp_rc_cfg(true, None));
+    f.window.until = at + Duration::from_millis(9_000);
+    let mut list = vec![f.clone()];
+    let mut s = settlement(&f, TpSettleKind::Pending);
+    s.at = at;
+    apply_tp_settlement(&mut list, &s, true);
+    assert_eq!(list[0].window.until, at + Duration::from_millis(9_000));
+
+    let mut p = hold_entry(0, true, tp_rc_cfg(true, None));
+    p.window.until = at + Duration::from_millis(9_000);
+    let mut list = vec![p.clone()];
+    let mut s = settlement(&p, TpSettleKind::Pending);
+    s.at = at;
+    apply_tp_settlement(&mut list, &s, true);
+    assert_eq!(list[0].window.until, at + Duration::from_millis(5_000));
+}
+
+/// A COP created receive only (IS-MULTIPLE included) still runs an inline
+/// wait, so its dispatches defer (ADR-083), but it holds nothing; a request
+/// with a response holds with its own class, and an unresolved addressing
+/// (K-line, J1850) is physical.
+#[test]
+fn inline_wait_for_defers_always_and_holds_only_for_an_outstanding_request() {
+    assert_eq!(inline_wait_for(true, Some(false), -2).hold, None);
+    assert_eq!(
+        inline_wait_for(false, None, 1).hold,
+        Some(outstanding(false, false))
+    );
+    assert_eq!(
+        inline_wait_for(false, Some(true), -2).hold,
+        Some(outstanding(true, false))
+    );
+    assert_eq!(
+        inline_wait_for(false, Some(false), -1).hold,
+        Some(outstanding(false, true))
+    );
 }

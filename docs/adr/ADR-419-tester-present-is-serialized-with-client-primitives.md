@@ -35,6 +35,13 @@ the timing rows apply (`CP_P3Phys`, `CP_P3Func`), which ADR-060 already implemen
 paragraph asks the protocol handler to serialize across logical links, and 8.1.4 describes links
 sharing a bus.
 
+8.1.3's fourth paragraph also allows a tester-present to go at once, even while a request is
+extended by a pending-response chain, so long as that has no undesirable effect. This design holds
+the physical tester-present for the whole chain anyway: the server's session timer is stopped while
+it has a pending response (ISO 14229-2 (2021) 9.5), so holding cannot lapse the session, and a
+tester-present sent into the chain would have its answer compete with the chain's frames and could
+not be attributed safely.
+
 ## Decision
 
 1. **One rule per shared channel.** `bus_hold(prev, next)` is a pure function over the exchange
@@ -48,9 +55,13 @@ sharing a bus.
      `CP_P3Func` rows of ADR-060 govern what follows it, unchanged, and remain CAN-only.
    Addressing classes come from the resolved `can_functional`; an unresolved one (K-line, J1850
    style protocols) counts as physical, so the hold applies on every protocol family.
-2. **One gate.** Every send on the channel (client send-receive, the `CoptStartcomm` request and
-   the arm's first send, the `CoptStopcomm` message, the re-arm's send, and every tester-present
-   dispatch) goes through `wait_for_bus_clear`: first the hold, then the gap wait of ADR-060.
+2. **One gate.** Every diagnostic request the worker writes on the channel (client send-receive,
+   the `CoptStartcomm` request and the arm's first send, the K-line wakeup/StartCommunication
+   exchange of `CoptStartcomm` (after the pre-init top-up), the `CoptStopcomm` message, the
+   re-arm's send, and every tester-present dispatch) goes through `wait_for_bus_clear`: first the
+   hold, then the gap wait of ADR-060. Not gated, since they are not requests that Table 1
+   serializes: the SAE J1939 address-claim frames (broadcast claims, J1939-81) and the TP2.0
+   connection and keep-alive frames (transport layer, no diagnostic response to wait for).
    A client primitive, `CoptStartcomm`/`CoptStopcomm` and a re-arm wait there, polling RX in the
    usual chunks (cancellable where they were; a hard channel error ends the wait). A tester-present
    dispatch, and any dispatch made from inside an inline wait, never waits there: a held send is
@@ -71,7 +82,8 @@ sharing a bus.
    expected positive answer, or the expected negative answer with a code other than 0x78. A 0x78
    (when `CP_RC78Handling` is set; otherwise it is a final negative) reloads the window to the
    `CP_P2Star` span from that frame, limited by the completion ceiling anchored at the first
-   pending answer, as ADR-102 does for a send-receive. There is no 0x21/0x23 re-request for a
+   pending answer, as ADR-102 does for a send-receive. For a functional send the reload only
+   extends: it never shortens a window another ECU's pending answer has already extended. There is no 0x21/0x23 re-request for a
    tester-present. For a functional send the hold lasts until the window ends (several ECUs may
    answer); any ECU's 0x78 reloads it, and a positive answer only records that one came. A send
    that expected no answer has the fixed window of ADR-099. This replaces the fixed
@@ -88,7 +100,10 @@ sharing a bus.
    physical send's final negative answer, or the end of the window of a physical send (the last
    reload included) or of a functional send that got no positive answer. A per-tick sweep removes
    an expired holding entry (it is not pruned at `until`, so the hold lasts to the sweep) and
-   raises the event. It is raised only while the link's tester-present is still armed: after a
+   raises the event. The sweep removes an entry only after an exhaustive RX drain at or after its
+   `until` on every channel serving the link (the drain watermark of ADR-101 Decision E, as the
+   cyclic reap uses it), and the read-side snapshot keeps a holding entry past `until` until then,
+   so an answer sent in time but read one poll late still settles the send. It is raised only while the link's tester-present is still armed: after a
    disarm (`CP_TesterPresentHandling` back to 0, `CoptStopcomm`) the entry stays and still holds
    the channel until the answer or the expiry, but a missing answer is not reported.
 7. **Entry lifetime.** The dedup signature of an entry adds whether it holds, and a new holding

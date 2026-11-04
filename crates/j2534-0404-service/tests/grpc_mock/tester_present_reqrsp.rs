@@ -1176,6 +1176,9 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
         "the re-arm should have sent a new tester-present frame addressed via the new first \
          entry's CP_CanPhysReqId"
     );
+    // A receive-only monitor makes a frame that is NOT taken for the
+    // tester-present visible as `ResultData`.
+    arm_receive_only_monitor(&mut client, cll_handle).await;
     // Entry 2's CAN ID (0x7E9) -- the NEW frozen target -- should now be
     // discarded.
     server.backdoor.inject_rx(
@@ -1193,28 +1196,24 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
          target after the reorder-triggered re-arm"
     );
 
-    // Entry 1's CAN ID (0x7E8) -- the OLD target -- is not delivered either
-    // (ADR-137 fourth Codex-review fix / round-4 restructure kept the
-    // arm-time send's window as an independent entry of
-    // `LogicalLinkState.open_tp_discards`; since ADR-419 that entry ended with
-    // the answer injected above, so the frame is now simply an unbound one,
-    // which the unbound-discard model never delivers).
+    // Entry 1's CAN ID (0x7E8) -- the OLD target. ADR-137's round-4 list kept
+    // the arm-time send's window as an independent entry; since ADR-419 that
+    // entry ended with the answer injected above (and the new send's entry
+    // with the 0x7E9 answer), so this frame is no tester-present traffic any
+    // more and the monitor receives it.
     server.backdoor.inject_rx(
         MOCK_CHANNEL_ID,
         &can_frame(0x7E8, &[0x7E, 0x00]),
         j2534_0404::ISO15765,
     );
     assert!(
-        !wait_for_event(&mut events, 300, |item| matches!(
+        wait_for_event(&mut events, 2000, |item| matches!(
             item.data,
             Some(event_item::Data::ResultData(_))
         ))
         .await,
-        "entry 1's frame must still be discarded after the reorder-triggered re-arm -- it was \
-         the target of the arm-time send, whose own still-open discard window is an \
-         independently elicited entry in LogicalLinkState.open_tp_discards (ADR-137 fourth \
-         Codex-review fix / round-4 restructure), not a single slot the fresh re-arm silently \
-         overwrites"
+        "entry 1's frame arrives after the arm-time send's entry ended with its answer, so it is \
+         no tester-present traffic any more and must be delivered to the monitor"
     );
 
     drop(events);

@@ -95,6 +95,7 @@ response and its times on every answer, while the entry took the first answer's 
 - A stray primitive's answers after the agent's deadline are not carried into its
   `primitive_ended` entry.
 - On the J2534 worker the functional presence primitive gives the log no transmit time, and an
-  identification job is given no timing margin, so its answers are placed on their clock and
+  identification job `ngr-agent identify` starts is given no timing margin (a caller of
+  `run_identification` may pass one), so its answers are placed on their clock and
   `undetermined`, with no response time (`no_transmit_time`, `no_margin`); the rows judge them
   once either is supplied.

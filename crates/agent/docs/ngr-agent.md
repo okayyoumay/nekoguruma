@@ -390,7 +390,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   Its `drift_bound` (`ppm`) and `clock_margin` (`us`), and `link_opened`'s `timing_margin`
   (`us`), each give the value in force and its `source` (ADR-357): `profile` when the job was
   given it (`Job::with_vci_margins`, which the hardware harness fills from its profile's
-  `[vci]` keys), else, for the drift bound and the clock margin, `default`, the agent's own
+  `[vci]` keys; an identification run takes the same margins as a parameter of
+  `run_identification`, and `ngr-agent identify` passes none, as `ngr-agent run` does), else, for the drift bound and the clock margin, `default`, the agent's own
   (`VciMargins::DEFAULT_DRIFT_BOUND_PPM` 100 ppm, `DEFAULT_CLOCK_MARGIN_US` 1 ms), which place
   a clock's times, telling a wrap from a step back but never deciding how many wraps a silence
   holds (half a wrap of silence opens an epoch, ADR-383), and never settle a loss: with

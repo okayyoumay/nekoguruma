@@ -232,6 +232,7 @@ async fn run_once(
             api: Api::J2534,
             long_size: long_size(),
         }),
+        agent::VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
     )
     .await;

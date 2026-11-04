@@ -1492,12 +1492,17 @@ async fn process_frame_for_entry(
                 Some(isotp::Frame::Single { payload }) => {
                     // A single frame ends any unfinished message from this
                     // response ID (ISO 15765-2:2024 9.8.3) like a first frame
-                    // that replaces it: dropped with no error, so the N_Cr
-                    // sweep does not report a message the ECU already ended.
-                    // One already past N_Cr is raised first, as there.
+                    // that replaces it: dropped and raised as
+                    // `ISO15765_UNEXPECTED_PDU`, so the N_Cr sweep does not
+                    // report a message the ECU already ended. One already
+                    // past N_Cr is raised first as `CF_TIMEOUT`, as there.
                     let mut reassembly = ctx.reassembly.lock().await;
                     notes.extend(take_expired_reassemblies(&mut reassembly, now));
-                    reassembly.remove(&reassembly_key);
+                    notes.extend(take_replaced_reassembly(
+                        &mut reassembly,
+                        &reassembly_key,
+                        is_tx_side,
+                    ));
                     drop(reassembly);
                     let mut msg = can_id.to_be_bytes().to_vec();
                     msg.extend_from_slice(payload);
@@ -1565,8 +1570,15 @@ async fn process_frame_for_entry(
                     // The COP a failure of this message binds to (ADR-351):
                     // the one waiting on this response ID now, if only one
                     // does. A first frame that replaces an unfinished one
-                    // raises nothing for the replaced message. The echo of
-                    // this service's own request starts no response.
+                    // raises `ISO15765_UNEXPECTED_PDU` for the replaced
+                    // message, bound to the COP recorded at its own first
+                    // frame (ISO 15765-2:2024 9.8.3). The echo of this
+                    // service's own request starts no response.
+                    notes.extend(take_replaced_reassembly(
+                        &mut reassembly,
+                        &reassembly_key,
+                        is_tx_side,
+                    ));
                     let mut started = isotp::Reassembly::start(total_len, payload, now, ctx.n_cr);
                     if is_tx_side {
                         started.tx_echo = true;
@@ -1606,11 +1618,10 @@ async fn process_frame_for_entry(
                             let (waiting_cop, tx_echo) = (state.waiting_cop, state.tx_echo);
                             reassembly.remove(&key);
                             if !tx_echo {
-                                notes.push(IsoTpRxNote::Failed {
-                                    error: PduErrorEvent::PduErrEvtFrameStruct,
-                                    name: ISO15765_FRAME_NUM_NAME,
+                                notes.push(frame_structure_failure(
+                                    ISO15765_FRAME_NUM_NAME,
                                     waiting_cop,
-                                });
+                                ));
                             }
                             Vec::new()
                         }
@@ -3841,6 +3852,39 @@ enum IsoTpRxNote {
 /// consecutive frame carries an unexpected sequence number (ISO 15765-2:2024
 /// 9.6.4.4 aborts the reception; ISO 22900-2:2022 Table D.8's name).
 pub(super) const ISO15765_FRAME_NUM_NAME: &str = "ISO15765_FRAME_NUM";
+
+/// Name of the frame-structure error raised when a first or single frame
+/// arrives while a reassembly from the same response ID is unfinished (ISO
+/// 15765-2:2024 9.8.3 aborts the reception in progress and reports the
+/// unexpected frame upward). A name of this worker's own, like
+/// `ISO15765_FC_OVERFLOW`; ISO 22900-2:2022 Table D.8 gives none for it.
+pub(super) const ISO15765_UNEXPECTED_PDU_NAME: &str = "ISO15765_UNEXPECTED_PDU";
+
+/// The failure note of a reassembly aborted by `ISO15765_FRAME_NUM` or
+/// `ISO15765_UNEXPECTED_PDU`, recorded for `waiting_cop`.
+fn frame_structure_failure(name: &'static str, waiting_cop: Option<u32>) -> IsoTpRxNote {
+    IsoTpRxNote::Failed {
+        error: PduErrorEvent::PduErrEvtFrameStruct,
+        name,
+        waiting_cop,
+    }
+}
+
+/// Removes the unfinished reassembly under `key`, which a first or single
+/// frame from the same response ID has just replaced (ISO 15765-2:2024
+/// 9.8.3), returning its `ISO15765_UNEXPECTED_PDU` note. Nothing is raised
+/// when there was none, for the echo of this service's own request, or when
+/// the replacing frame is itself that echo (`replaced_by_tx_side`). Call it
+/// after `take_expired_reassemblies`, so an expired one is `CF_TIMEOUT`.
+fn take_replaced_reassembly(
+    reassembly: &mut HashMap<(u32, bool), isotp::Reassembly>,
+    key: &(u32, bool),
+    replaced_by_tx_side: bool,
+) -> Option<IsoTpRxNote> {
+    let replaced = reassembly.remove(key)?;
+    (!replaced.tx_echo && !replaced_by_tx_side)
+        .then(|| frame_structure_failure(ISO15765_UNEXPECTED_PDU_NAME, replaced.waiting_cop))
+}
 
 /// The failure note of a reassembly whose N_Cr expired before its next
 /// consecutive frame (ISO 15765-2:2024 9.8.2), recorded for `waiting_cop`.

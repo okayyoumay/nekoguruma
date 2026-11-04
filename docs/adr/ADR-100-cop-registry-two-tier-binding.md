@@ -7,7 +7,7 @@ ADR-095, ADR-098, ADR-099; amended by ADR-101 — cross-channel registrant write
 amended by ADR-151 — SOM/TxDone indication delivery gated by CP_StartMsgIndEnable/
 CP_TransmitIndEnable; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and the Out of
 scope section's Stage 3 inline-execution boundary for created-receive-only COPs superseded by
-ADR-182; amended by ADR-352 — a TX-side frame on CAN routes by the entry's CP_CanPhysReqId)
+ADR-182; amended by ADR-352 — a TX-side frame on CAN routes by the entry's CP_CanPhysReqId; step 3 gains a settlement writeback and the out-of-scope Stage 2 stamp item is closed by ADR-419)
 **Affects:** `j2534-0404-service` service, events, rpc_primitive, rpc_link, names/comparam
 support (`CP_CyclicRespTimeout`), docs (GLOSSARY, RPC_API_GUIDE, j2534-0404-architecture)
 
@@ -462,7 +462,8 @@ implemented. This flip must be called out in release notes / RPC_API_GUIDE, and 
   `:3544`, `:4426`, `:6509`, `:6729`); and correcting `send_tester_present_once`'s
   `no_response_required` stamp to `true` (ADR-093's derivation conflated "the ECU replies"
   with "a wait paces the bus") — deferred because it changes wire timing, which must not ride
-  an attribution ADR.
+  an attribution ADR. (The stamp item is closed by ADR-419: once a send that expects an answer
+  holds the channel until the answer, the stamp is right as it is.)
 - **Stage 3 — detaching finite/IS-MULTIPLE receive *execution*** for cross-CLL responsiveness.
   Key scope boundary: finite receives **join the registry in this ADR** (the spec's binding
   algorithm requires their participation — a periodic COP and an executing one-shot must be

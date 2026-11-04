@@ -1278,6 +1278,7 @@ pub(super) async fn build_cll_rx_entries(
                     neg: r.window.neg.clone(),
                     target_can_ids: r.target_can_ids,
                     tx_can_id: r.tx_can_id,
+                    hold: r.hold.clone(),
                 })
                 .collect();
             let registrant_baselines = l
@@ -1333,6 +1334,7 @@ pub(super) async fn build_cll_rx_entries(
                 // this function.
                 set_seq_at_read: set_seq_snapshot.get(&h).copied(),
                 tester_present_discard,
+                tp_settlements: Vec::new(),
                 registrants: l.registrants.clone(),
                 registrant_baselines,
                 queue_error_class: None,

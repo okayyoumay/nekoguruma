@@ -81,6 +81,10 @@
 //! - [`tester_present_addr_mode`] — `CP_TesterPresentAddrMode` selecting
 //!   tester-present's own functional-vs-physical addressing, independently
 //!   of `CP_RequestAddrMode` (ADR-138)
+//! - [`tester_present_serialization`] — the tester-present serialized with
+//!   client primitives per ISO 22900-2:2022 8.1.3 Table 1, its window ending
+//!   at the final answer, and the error event for a missing or negative
+//!   answer (ADR-419)
 //! - [`modules`] — config-declared multi-module device selection: `GetModuleIds`/
 //!   `ModuleConnect` over N configured entries, `pname` reaching `PassThruOpen`,
 //!   single-open-device reject-on-switch, and `modules = []` startup failure
@@ -205,6 +209,7 @@ mod tester_present_addr_mode;
 mod tester_present_message_length;
 mod tester_present_reqrsp;
 mod tester_present_send_type;
+mod tester_present_serialization;
 mod tp20;
 mod uart_echo_byte;
 mod unique_resp_id_table_binding;

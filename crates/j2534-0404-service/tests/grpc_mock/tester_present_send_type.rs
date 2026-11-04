@@ -4317,8 +4317,10 @@ async fn isotp_fc_wait_excludes_a_sibling_clls_tester_present_at_the_same_wire_t
 /// above): `exclude_isotp_target` must only suppress a sibling CLL whose own
 /// tester-present would collide with the in-flight transfer's actual wire
 /// target -- proven here with the same physical-addressing construction as
-/// the test above, but with cll_a targeting a DIFFERENT CAN ID (0x7E4) than
-/// cll_b's in-flight transfer (0x7E0): cll_a's tester-present must keep
+/// the test above, but with cll_a targeting a DIFFERENT CAN ID than cll_b's
+/// in-flight transfer (0x7E0), functionally (0x7DF, no response expected,
+/// since ADR-419 holds a physical tester-present back while a segmented send
+/// is in flight): cll_a's tester-present must keep
 /// firing normally throughout cll_b's FlowControl (N_Bs) wait, proving the
 /// new exclusion is scoped to actual same-target collisions and not overly
 /// broad.
@@ -4328,10 +4330,17 @@ async fn isotp_fc_wait_still_dispatches_a_sibling_at_a_different_wire_target() {
     let server = TestServer::start_with_can_mode(Some("software-isotp")).await;
     let mut client = server.client().await;
 
-    // cll_a: mode-0, physically addressed to 0x7E4 -- a DIFFERENT CAN ID
-    // than cll_b's in-flight transfer target below.
+    // cll_a: mode-0, functionally addressed (0x7DF) without a response -- a
+    // DIFFERENT CAN ID than cll_b's in-flight transfer target below. ADR-419
+    // (ISO 22900-2:2022 8.1.3 Table 1): a segmented send in flight holds a
+    // physical tester-present back, so the sibling that must keep dispatching
+    // during the FlowControl wait is a functional one that expects no
+    // response (it was a physical one, 0x7E4, before the hold).
     let cll_a = create_cll(&mut client, j2534_0404::ISO15765, 1).await;
     set_com_param_unum32(&mut client, cll_a, j2534_0404::DATA_RATE, 500_000).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_ADDR_MODE, 1).await;
+    set_com_param_unum32(&mut client, cll_a, CP_CAN_FUNC_REQ_ID, 0x7DF).await;
+    set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_REQ_RSP, 0).await;
     set_com_param_bytes(&mut client, cll_a, CP_TESTER_PRESENT_MESSAGE, vec![0x11]).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_TIME, 100_000).await;
     set_com_param_unum32(&mut client, cll_a, CP_TESTER_PRESENT_HANDLING, 1).await;
@@ -4407,7 +4416,7 @@ async fn isotp_fc_wait_still_dispatches_a_sibling_at_a_different_wire_target() {
     // N_Bs (default 1000ms) expires with PduErrEvtRxTimeout.
     wait_for_cop_finished_matching(&mut events_b, cll_b_cop).await;
 
-    let expected_a_prefix = 0x7E4_u32.to_be_bytes();
+    let expected_a_prefix = 0x7DF_u32.to_be_bytes();
     let total_written = server.backdoor.written_count(MOCK_CHANNEL_ID);
     let a_frame_count = (0..total_written)
         .filter(|&i| server.backdoor.written_data(MOCK_CHANNEL_ID, i)[..4] == expected_a_prefix)
@@ -4418,7 +4427,7 @@ async fn isotp_fc_wait_still_dispatches_a_sibling_at_a_different_wire_target() {
     assert!(
         a_frame_count >= 4,
         "expected at least 3 due-triggered mode-0 tester-present sends (plus the 1 arm-time \
-         send) from cll_a (0x7E4) while cll_b's isotp_send was blocked in its FlowControl (N_Bs) \
+         send) from cll_a (0x7DF) while cll_b's isotp_send was blocked in its FlowControl (N_Bs) \
          wait targeting a DIFFERENT CAN ID (0x7E0) -- exclude_isotp_target must be scoped to \
          actual same-target collisions, not overly broad; got {a_frame_count} total cll_a frames"
     );
@@ -5251,6 +5260,11 @@ async fn handling_unrelated_updateparam_does_not_disarm_or_rearm() {
     set_com_param_unum32(&mut client, cll_handle, CP_REQUEST_ADDR_MODE, 2).await;
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_ADDR_MODE, 1).await;
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_TIME, 300_000).await;
+    // ADR-419: the resource defaults `CP_TesterPresentReqRsp` to 1, and a send
+    // that ends its (50 ms) window without an answer raises
+    // PduErrEvtTesterPresentError. This test is about the promotion not
+    // raising it, so the tester-present expects no response here.
+    set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_REQ_RSP, 0).await;
 
     client
         .connect_com_logical_link(ConnectComLogicalLinkRequest {
@@ -6280,9 +6294,13 @@ async fn handling_1_to_0_then_0_to_1_with_changed_signature_still_discards_pre_d
 
     let cll_handle = create_functional_reqrsp_cll(&mut client).await;
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_TIME, 5_000_000).await;
-    // Generous CP_P2Max (5s): both windows in this test stay open for its
-    // whole duration, no timing pressure.
-    set_com_param_unum32(&mut client, cll_handle, j2534_0404::P2_MAX, 5_000_000).await;
+    // ADR-419: send #1 expects a response (functional, `CP_TesterPresentReqRsp`
+    // 1), so it holds the channel until its window ends (ISO 22900-2:2022
+    // 8.1.3 Table 1), disarm or not, and the re-enable's send below waits for
+    // that. The window is therefore short (400 ms) instead of the former 5 s
+    // that let both windows overlap; the re-enable's send is awaited, not
+    // asserted immediately.
+    set_com_param_unum32(&mut client, cll_handle, j2534_0404::P2_MAX, 400_000).await;
     promote_via_update_param(&mut client, cll_handle).await;
 
     let mut events = client
@@ -6317,11 +6335,8 @@ async fn handling_1_to_0_then_0_to_1_with_changed_signature_still_discards_pre_d
     )
     .await;
     promote_via_update_param(&mut client, cll_handle).await;
-    assert_eq!(
-        server.backdoor.written_count(MOCK_CHANNEL_ID),
-        2,
-        "a live 0->1 re-enable should send immediately"
-    );
+    // ADR-419: sent as soon as send #1's window has ended, not before.
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 2).await;
 
     // A delayed response matching send #1's ORIGINAL signature (pos =
     // [0x7E]) -- not send #2's new pos ([0x7F]) -- arriving after the
@@ -6368,7 +6383,11 @@ async fn clear_periodic_msgs_then_rearm_with_changed_signature_still_discards_pr
 
     let cll_handle = create_functional_reqrsp_cll(&mut client).await;
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_TIME, 5_000_000).await;
-    set_com_param_unum32(&mut client, cll_handle, j2534_0404::P2_MAX, 5_000_000).await;
+    // ADR-419: send #1 expects a response, so it holds the channel until its
+    // window ends and the re-arm's send below waits for that (a Cleared CLL
+    // keeps the entry, whose end is then silent). A short window (400 ms)
+    // replaces the former 5 s that let the two windows overlap.
+    set_com_param_unum32(&mut client, cll_handle, j2534_0404::P2_MAX, 400_000).await;
     promote_via_update_param(&mut client, cll_handle).await;
 
     let mut events = client
@@ -6404,11 +6423,8 @@ async fn clear_periodic_msgs_then_rearm_with_changed_signature_still_discards_pr
     )
     .await;
     promote_via_update_param(&mut client, cll_handle).await;
-    assert_eq!(
-        server.backdoor.written_count(MOCK_CHANNEL_ID),
-        2,
-        "a wire-content-changing CoptUpdateparam should immediately re-arm a Cleared CLL"
-    );
+    // ADR-419: re-armed with a send as soon as send #1's window has ended.
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 2).await;
 
     // A delayed response matching send #1's ORIGINAL signature (pos =
     // [0x7E]) must still be discarded after the re-arm's own fresh send
@@ -6452,9 +6468,10 @@ async fn continuously_armed_unrelated_field_promotion_still_discards_prior_send_
 
     let cll_handle = create_functional_reqrsp_cll(&mut client).await;
     set_com_param_unum32(&mut client, cll_handle, CP_TESTER_PRESENT_TIME, 300_000).await;
-    // Generous CP_P2Max (5s): both sends' windows stay open for the whole
-    // test.
-    set_com_param_unum32(&mut client, cll_handle, j2534_0404::P2_MAX, 5_000_000).await;
+    // ADR-419: send #1 expects a response, so it holds the channel until its
+    // window ends and the next per-tick send (due after 300 ms) waits for that
+    // (600 ms here, instead of the former 5 s that let both windows overlap).
+    set_com_param_unum32(&mut client, cll_handle, j2534_0404::P2_MAX, 600_000).await;
     promote_via_update_param(&mut client, cll_handle).await;
 
     let mut events = client
@@ -6468,6 +6485,7 @@ async fn continuously_armed_unrelated_field_promotion_still_discards_prior_send_
     start_comm(&mut client, cll_handle).await;
     wait_for_cop_finished(&mut events).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await; // send #1: pos = [0x7E]
+    let send_1_at = std::time::Instant::now();
 
     // Excluded from `same_wire_behavior` -- does not re-arm, no resend.
     set_com_param_bytes(
@@ -6486,9 +6504,16 @@ async fn continuously_armed_unrelated_field_promotion_still_discards_prior_send_
 
     // The next periodic tick's own send re-reads CP_TesterPresentExpPosResp
     // live from Active (`dispatch_due_tester_present`'s `StillDueSnapshot`),
-    // so send #2 opens a window with pos = [0x7F] while send #1's still-open
-    // pos = [0x7E] window (5s CP_P2Max) remains untouched.
+    // so send #2 opens a window with pos = [0x7F]. ADR-419: it is due after
+    // 300 ms but goes only once send #1's 600 ms window has ended (Table 1
+    // hold), which also reports the unanswered send #1.
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 2).await;
+    assert!(
+        send_1_at.elapsed() >= std::time::Duration::from_millis(500),
+        "send #2 must wait for send #1's window to end, not go at its 300 ms interval \
+         (waited {:?})",
+        send_1_at.elapsed()
+    );
 
     server.backdoor.inject_rx(
         MOCK_CHANNEL_ID,

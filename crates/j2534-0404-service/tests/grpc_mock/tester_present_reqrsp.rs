@@ -1128,6 +1128,15 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
     start_comm(&mut client, cll_handle).await;
     wait_for_cop_finished(&mut events).await;
     wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+    // ADR-419: the arm-time send expects a response, so it holds the channel
+    // until it is answered (ISO 22900-2:2022 8.1.3 Table 1), and the
+    // reorder-triggered re-arm's send below waits for that. Answer it from the
+    // old target, as that ECU would.
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x7E, 0x00]),
+        j2534_0404::ISO15765,
+    );
 
     // Reorder the live table: entry 2 (0x7E9, phys 0x7E1) is now first. Its
     // CP_CanPhysReqId (0x7E1) differs from entry 1's (0x7E0), so
@@ -1184,12 +1193,12 @@ async fn reqrsp_1_mode_0_rearms_and_retargets_on_table_reorder_that_changes_tx_d
          target after the reorder-triggered re-arm"
     );
 
-    // Entry 1's CAN ID (0x7E8) -- the OLD target -- should ALSO still be
-    // discarded (ADR-137 fourth Codex-review fix / round-4 restructure): the
-    // arm-time send's own window (generous 5s CP_P2Max, still open) is an
-    // independently elicited discard candidate in
-    // `LogicalLinkState.open_tp_discards`, not a single slot the
-    // reorder-triggered re-arm's own write-back silently overwrote.
+    // Entry 1's CAN ID (0x7E8) -- the OLD target -- is not delivered either
+    // (ADR-137 fourth Codex-review fix / round-4 restructure kept the
+    // arm-time send's window as an independent entry of
+    // `LogicalLinkState.open_tp_discards`; since ADR-419 that entry ended with
+    // the answer injected above, so the frame is now simply an unbound one,
+    // which the unbound-discard model never delivers).
     server.backdoor.inject_rx(
         MOCK_CHANNEL_ID,
         &can_frame(0x7E8, &[0x7E, 0x00]),

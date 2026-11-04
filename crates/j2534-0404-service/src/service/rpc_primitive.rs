@@ -1718,6 +1718,12 @@ pub(super) struct ResolvedTesterPresent {
     /// wire content. Both call sites (`handle_start_comm`,
     /// `handle_update_param`) branch on it explicitly instead.
     pub(super) handling_enabled: bool,
+    /// Response-code handling of the tester-present's own answer (ADR-419),
+    /// resolved from the same call-time Active snapshot, with `request_sid`
+    /// set to the message's service identifier. Frozen into the hold entry a
+    /// send opens (`TpHold::rc_cfg`); excluded from `same_wire_behavior` like
+    /// the other response-side fields.
+    pub(super) rc_cfg: RcHandlingConfig,
 }
 
 impl ResolvedTesterPresent {
@@ -1853,6 +1859,7 @@ pub(super) fn resolve_tester_present(
             exp_pos_resp: Vec::new(),
             exp_neg_resp: Vec::new(),
             handling_enabled: false,
+            rc_cfg: RcHandlingConfig::default(),
         });
     }
 
@@ -2210,6 +2217,8 @@ pub(super) fn resolve_tester_present(
         exp_pos_resp,
         exp_neg_resp,
         handling_enabled: true,
+        rc_cfg: RcHandlingConfig::from_params(active, protocol)
+            .with_request_sid(tp_payload.first().copied()),
     })
 }
 

@@ -3,7 +3,7 @@
 **Date:** 2026-07-27
 **Status:** Accepted (ADR-084's "an already-armed CLL whose new resolution disables
 tester-present keeps running" precedent is amended by this ADR for the specific case of a live
-`CP_TesterPresentHandling` transition to `0` — see Decision)
+`CP_TesterPresentHandling` transition to `0` — see Decision; the prune rule of `push_open_tp_discard` amended by ADR-419: an entry that holds the channel outlives its window until the sweep)
 **Affects:** `j2534-0404-service` service (`ComParamSet::tester_present_handling`,
 `TesterPresentState::Disarmed`/`Cleared`, `ResidualTesterPresentDiscard`,
 `LogicalLinkState.open_tp_discards`), rpc_primitive (`resolve_tester_present`,

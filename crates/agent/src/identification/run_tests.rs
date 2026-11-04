@@ -631,6 +631,18 @@ async fn run_shared(
     cancel: Arc<AtomicBool>,
     dir: tempfile::TempDir,
 ) -> Ran {
+    run_shared_with_margins(plan, fake, limits, cancel, dir, VciMargins::default()).await
+}
+
+/// [`run_shared`] with the VCI's margins the run is given.
+async fn run_shared_with_margins(
+    plan: CheckedPlan,
+    fake: Fake,
+    limits: JobLimits,
+    cancel: Arc<AtomicBool>,
+    dir: tempfile::TempDir,
+    margins: VciMargins,
+) -> Ran {
     let setup = CommLogSetup::for_run(dir.path().join("log")).unwrap();
     let guards = JobGuards::take_vci_only(
         &GuardSetup {
@@ -651,6 +663,7 @@ async fn run_shared(
             api: crate::launch::Api::J2534,
             long_size: 8,
         }),
+        margins,
         cancel,
     )
     .await;
@@ -751,6 +764,66 @@ async fn one_functional_request_collects_the_answers_of_the_whole_table() {
     assert_eq!(ids, [u64::from(A.1), u64::from(B.1)]);
     assert_eq!(ran.run.comm_log, CommLogStatus::Complete);
     assert!(!ran.run.guards.link_unconfirmed());
+}
+
+/// ADR-357, ADR-397: margins given to an identification run are in the header's `vci_connected`
+/// and in `link_opened`, with source `profile`; a run given none records the timing margin as
+/// none and takes the defaults for the drift bound and the clock margin.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_identification_run_records_the_margins_it_is_given() {
+    let script = || {
+        let fake = Fake::default();
+        fake.state().scripts = VecDeque::from([vec![Item::Answer(A.1, POSITIVE), Item::Finish]]);
+        fake
+    };
+    let ran = run_shared_with_margins(
+        plan_of(&[A, B], Some(0x7DF)),
+        script(),
+        limits(),
+        Arc::new(AtomicBool::new(false)),
+        tempfile::tempdir().unwrap(),
+        VciMargins {
+            timing_margin_us: Some(500),
+            drift_bound_ppm: Some(30),
+            clock_margin_us: None,
+        },
+    )
+    .await;
+    let event = |ran: &Ran, name: &str| {
+        ran.log
+            .iter()
+            .find(|line| line["event"] == name)
+            .unwrap_or_else(|| panic!("{name} in {:#?}", ran.log))
+            .clone()
+    };
+    let connected = event(&ran, "vci_connected");
+    assert_eq!(
+        connected["drift_bound"],
+        serde_json::json!({ "ppm": 30, "source": "profile" })
+    );
+    assert_eq!(
+        connected["clock_margin"],
+        serde_json::json!({ "us": 1_000, "source": "default" })
+    );
+    assert_eq!(
+        event(&ran, "link_opened")["timing_margin"],
+        serde_json::json!({ "us": 500, "source": "profile" })
+    );
+
+    let bare = run(plan_of(&[A, B], Some(0x7DF)), script()).await;
+    let connected = event(&bare, "vci_connected");
+    assert_eq!(
+        connected["drift_bound"],
+        serde_json::json!({ "ppm": 100, "source": "default" })
+    );
+    assert_eq!(
+        connected["clock_margin"],
+        serde_json::json!({ "us": 1_000, "source": "default" })
+    );
+    assert_eq!(
+        event(&bare, "link_opened")["timing_margin"],
+        serde_json::json!({ "source": "none" })
+    );
 }
 
 /// ADR-398 and ADR-397: the header names the job as an identification job, with the plan's hash
@@ -1317,6 +1390,7 @@ async fn a_worker_that_exits_between_parts_is_logged() {
         guards,
         Some(setup.clone()),
         None,
+        VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -1390,6 +1464,7 @@ async fn run_with_worker_lost_in_setup(exits: u32) -> (IdentificationRun, Vec<St
         guards,
         Some(setup.clone()),
         None,
+        VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -1470,6 +1545,7 @@ async fn run_with_a_hung_worker(ends: bool) -> (IdentificationRun, Vec<String>) 
         guards,
         Some(setup.clone()),
         None,
+        VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -2178,6 +2254,7 @@ async fn run_with_the_last_close_hanging_plan<S: WorkerSource>(
         guards,
         None,
         None,
+        VciMargins::default(),
         Arc::new(AtomicBool::new(false)),
     )
     .await

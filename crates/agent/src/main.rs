@@ -19,7 +19,7 @@ use agent::launch::{Api, RelaunchingWorker, launch_worker};
 use agent::policy::build_ceiling;
 use agent::{
     CommLogSetup, CommLogStatus, Job, JobDocument, JobError, JobLimits, JobRun, VciFacts,
-    check_job, run_key, run_program,
+    VciMargins, check_job, run_key, run_program,
 };
 use diag_ir::plan::Sha256;
 use diag_ir::{Value, VmState};
@@ -459,6 +459,8 @@ async fn identify_job(args: IdentifyArgs, key: JobKey) -> Result<String, String>
                 guards,
                 setup,
                 Some(vci),
+                // No VCI profile gives the agent margins, as for `run`.
+                VciMargins::default(),
                 Arc::new(AtomicBool::new(false)),
             )
             .await;

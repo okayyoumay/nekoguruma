@@ -1815,6 +1815,7 @@ fn identification_facts(
     plan: &CheckedPlan,
     comm_log: Option<&CommLogSetup>,
     vci: Option<VciFacts>,
+    margins: VciMargins,
 ) -> RunFacts {
     RunFacts {
         plan_sha256: Some(plan.plan_sha256),
@@ -1822,7 +1823,7 @@ fn identification_facts(
             JobKind::Identification,
             comm_log.map(|setup| &setup.key),
             vci,
-            VciMargins::default(),
+            margins,
         )
     }
 }
@@ -1837,7 +1838,10 @@ fn identification_facts(
 /// (ADR-392); what was heard before the loss stays, and a run whose bounds run out reports
 /// `presence_interrupted`. A cancel (`cancel`, also set when the future is dropped) ends the run
 /// in [`JobError::Cancelled`]. `source` also gives the clients of the later links. `vci` is what
-/// the agent knows of the VCI the worker was launched for, for the log's `vci_connected`.
+/// the agent knows of the VCI the worker was launched for, for the log's `vci_connected`, and
+/// `margins` are the VCI's margins as a procedure job is given them (`Job::with_vci_margins`,
+/// ADR-357): the log's header and `link_opened` record them, and with a timing margin the
+/// presence answers are judged against it (ADR-400).
 ///
 /// Then, unless the presence phase was interrupted, it reads the VIN once per read of the plan's
 /// VIN rules (ADR-399): a link and a read-only request at a time, under the same bounds. The VIN
@@ -1847,6 +1851,10 @@ fn identification_facts(
 /// communication log only. Last, unless the VIN phase was interrupted, it reads each ECU
 /// definition of the plan (ADR-401) the same way, with the lock held, and reports the entry
 /// states; guards still marked end the run in [`JobError::LinkUnconfirmed`] when a read remains.
+#[expect(
+    clippy::too_many_arguments,
+    reason = "the run's whole context, each part owned by the caller"
+)]
 pub async fn run_identification<W: WorkerSource>(
     mut source: W,
     plan: CheckedPlan,
@@ -1854,6 +1862,7 @@ pub async fn run_identification<W: WorkerSource>(
     guards: JobGuards,
     comm_log: Option<CommLogSetup>,
     vci: Option<VciFacts>,
+    margins: VciMargins,
     cancel: Arc<AtomicBool>,
 ) -> IdentificationRun {
     let handle = Handle::current();
@@ -1878,7 +1887,7 @@ pub async fn run_identification<W: WorkerSource>(
     }
     let log = JobLog::new(
         comm_log.clone(),
-        identification_facts(&plan, comm_log.as_ref(), vci),
+        identification_facts(&plan, comm_log.as_ref(), vci, margins),
     );
     let cancelled = CancelOnDrop(Arc::clone(&cancel));
     let job_slot = Arc::clone(&slot);

@@ -1719,12 +1719,131 @@ async fn software_isotp_mode_wrong_sequence_number_names_the_error_and_the_deadl
     server.shutdown().await;
 }
 
-/// A single frame from the response ID ends an unfinished message as a first
-/// frame does: the reassembly is dropped with no error, so N_Cr passing
-/// afterwards raises nothing, and the single frame answers the COP.
+/// ISO 15765-2:2024 9.8.3, software ISO-TP (ADR-046): a first frame from the
+/// response ID while a reassembly from it is unfinished replaces it and raises
+/// a frame-structure error named `ISO15765_UNEXPECTED_PDU`, bound to the COP
+/// recorded at the replaced first frame. The new message is then handled as
+/// usual: it is acknowledged with a FlowControl frame and completes.
 #[tokio::test]
 #[serial]
-async fn software_isotp_mode_single_frame_drops_an_unfinished_reassembly() {
+async fn software_isotp_mode_first_frame_replacing_a_reassembly_names_the_error() {
+    let (server, mut events, cop_handle) = software_isotp_response_started(
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (CP_N_CR, 2_000_000),
+            (j2534_0404::P2_MAX, 3_000_000),
+        ],
+        false,
+        0x62,
+    )
+    .await;
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x10, 0x0A, 0x62, 0xF1, 0x90, 9, 8, 7]),
+        j2534_0404::CAN,
+    );
+    let item = next_error_item(&mut events, 3000).await;
+    assert_named_error(
+        &item,
+        vci_service_interface::PduErrorEvent::PduErrEvtFrameStruct,
+        "ISO15765_UNEXPECTED_PDU",
+        Some(cop_handle),
+        "replaced by a first frame",
+    );
+    // The new first frame is answered with its own FlowControl frame.
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 3).await;
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x21, 4, 5, 6, 7]),
+        j2534_0404::CAN,
+    );
+
+    let mut answer = None;
+    wait_for_event(&mut events, 3000, |item| {
+        if let Some(event_item::Data::ResultData(data)) = &item.data {
+            answer = Some((item.cop_handle, data.data_bytes.clone()));
+            return true;
+        }
+        assert!(
+            !matches!(item.data, Some(event_item::Data::ErrorData(_))),
+            "no further error before the answer: {item:?}"
+        );
+        false
+    })
+    .await;
+    assert_eq!(
+        answer,
+        Some((
+            Some(cop_handle),
+            vec![0x62, 0xF1, 0x90, 9, 8, 7, 4, 5, 6, 7]
+        )),
+        "the new message completes and answers the COP"
+    );
+
+    drop(events);
+    server.shutdown().await;
+}
+
+/// A reassembly that N_Cr already ended is reported as `ISO15765_CF_TIMEOUT`;
+/// a single frame arriving afterwards finds none to replace, so it raises no
+/// `ISO15765_UNEXPECTED_PDU` and still answers the COP.
+#[tokio::test]
+#[serial]
+async fn software_isotp_mode_expired_reassembly_is_not_an_unexpected_pdu() {
+    let (server, mut events, cop_handle) = software_isotp_response_started(
+        &[
+            (j2534_0404::DATA_RATE, 500_000),
+            (CP_N_CR, 100_000),
+            (j2534_0404::P2_MAX, 3_000_000),
+        ],
+        false,
+        0x62,
+    )
+    .await;
+    let item = next_error_item(&mut events, 3000).await;
+    assert_named_error(
+        &item,
+        vci_service_interface::PduErrorEvent::PduErrEvtRxTimeout,
+        "ISO15765_CF_TIMEOUT",
+        Some(cop_handle),
+        "expired",
+    );
+    server.backdoor.inject_rx(
+        MOCK_CHANNEL_ID,
+        &can_frame(0x7E8, &[0x03, 0x62, 0xF1, 0x90]),
+        j2534_0404::CAN,
+    );
+    let mut answer = None;
+    wait_for_event(&mut events, 3000, |item| {
+        if let Some(event_item::Data::ResultData(data)) = &item.data {
+            answer = Some((item.cop_handle, data.data_bytes.clone()));
+            return true;
+        }
+        assert!(
+            !matches!(item.data, Some(event_item::Data::ErrorData(_))),
+            "no error before the answer: {item:?}"
+        );
+        false
+    })
+    .await;
+    assert_eq!(
+        answer,
+        Some((Some(cop_handle), vec![0x62, 0xF1, 0x90])),
+        "the single frame answers the COP"
+    );
+
+    drop(events);
+    server.shutdown().await;
+}
+
+/// ISO 15765-2:2024 9.8.3, software ISO-TP (ADR-046): a single frame from the
+/// response ID while a reassembly from it is unfinished ends that message as
+/// a first frame does, raising `ISO15765_UNEXPECTED_PDU` bound to the waiting
+/// COP before the single frame is delivered and answers the COP. The dropped
+/// reassembly leaves nothing for N_Cr to report afterwards.
+#[tokio::test]
+#[serial]
+async fn software_isotp_mode_single_frame_replacing_a_reassembly_names_the_error() {
     let (server, mut events, cop_handle) = software_isotp_response_started(
         &[
             (j2534_0404::DATA_RATE, 500_000),
@@ -1743,6 +1862,14 @@ async fn software_isotp_mode_single_frame_drops_an_unfinished_reassembly() {
         j2534_0404::CAN,
     );
 
+    let item = next_error_item(&mut events, 3000).await;
+    assert_named_error(
+        &item,
+        vci_service_interface::PduErrorEvent::PduErrEvtFrameStruct,
+        "ISO15765_UNEXPECTED_PDU",
+        Some(cop_handle),
+        "replaced by a single frame",
+    );
     let mut answer = None;
     wait_for_event(&mut events, 3000, |item| {
         if let Some(event_item::Data::ResultData(data)) = &item.data {
@@ -1751,7 +1878,7 @@ async fn software_isotp_mode_single_frame_drops_an_unfinished_reassembly() {
         }
         assert!(
             !matches!(item.data, Some(event_item::Data::ErrorData(_))),
-            "no error before the answer: {item:?}"
+            "no second error before the answer: {item:?}"
         );
         false
     })

@@ -174,6 +174,7 @@ mod fd_can;
 mod fd_iso15765;
 mod flow_control_filters;
 mod ft_can;
+mod functional_txdone;
 mod gm_uart;
 mod guarded_handle;
 mod honda_diagh;

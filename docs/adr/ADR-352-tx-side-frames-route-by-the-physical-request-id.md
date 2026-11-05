@@ -1,7 +1,7 @@
 # ADR-352: TX-Side Frames Route by the Unique Response Entry's Physical Request ID
 
 **Date:** 2026-10-24
-**Status:** Accepted
+**Status:** Accepted (Decision item 3 superseded in part by ADR-421)
 **Affects:** `j2534-0404-service` (`events_rx_routing.rs`: `UniqueRespIdKey`, `route_frame`,
 `build_cll_rx_entries`), `sim-vci` (TxDone indications), `docs/j2534-0404-architecture.md`,
 `docs/rpc-api-guide.md`; design 8.11 "Link settings for the log", ADR-098, ADR-100, ADR-151,
@@ -56,8 +56,8 @@ transmit ID (`tp20_tx_id`); CAN had no counterpart.
   allow for an indication more than one exchange could own.
 - A client that reads `PassThruReadMsgs` from `sim-vci` directly now reads a TxDone before each
   response, as on a real ISO 15765 device; the tests that do so read it first.
-- A TxDone of a functional request, or of an extended-addressed one, does not reach a link with
-  a table. No caller sends either on such a link yet.
+- A TxDone of an extended-addressed request does not reach a link with a table. A TxDone of a
+  functional request reaches the link that sent it while its receive phase runs (ADR-421).
 - A link with a table now receives its tester present's own TxDone or loopback echo when it is
   read after ADR-099's discard window, and a sibling that shares the request ID receives it
   too, since each link's discard covers its own tester present only. A link without a table

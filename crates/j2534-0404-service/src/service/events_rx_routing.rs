@@ -600,10 +600,19 @@ pub(super) fn route_frame_with_role(
         });
     }
     match frame_can_id {
-        Some(can_id) => entry.unique_resp_ids.iter().find_map(|key| {
-            key.matched(can_id, is_tx_side, uudt_eligible, frame_is_29bit)
-                .map(|kind| (key.unique_resp_identifier, kind == MatchKind::Uudt))
-        }),
+        Some(can_id) => entry
+            .unique_resp_ids
+            .iter()
+            .find_map(|key| {
+                key.matched(can_id, is_tx_side, uudt_eligible, frame_is_29bit)
+                    .map(|kind| (key.unique_resp_identifier, kind == MatchKind::Uudt))
+            })
+            // ADR-421: the transmit indication of a functional request that
+            // this link's own receive phase is waiting on belongs to this link
+            // although no table row names the functional ID. URID 0, and
+            // `bind_frame` leaves a TX-side frame unbound (ADR-100 Decision
+            // item 3, step 1), so it reaches the log as a plain indication.
+            .or_else(|| (is_tx_side && entry.func_tx_can_id == Some(can_id)).then_some((0, false))),
         None => Some((0, false)), // frame too short for CAN ID extraction; deliver without routing
     }
 }
@@ -1330,6 +1339,8 @@ pub(super) async fn build_cll_rx_entries(
                 start_msg_ind_enable: l.active.start_msg_ind_enable(),
                 transmit_ind_enable: l.active.transmit_ind_enable(),
                 cop_tags,
+                // ADR-421: see `CllRxEntry::func_tx_can_id`.
+                func_tx_can_id: l.open_func_tx,
             })
         })
         .collect()

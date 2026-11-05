@@ -2556,6 +2556,7 @@ impl J2534Service {
                 tester_present_state: TesterPresentState::None,
                 tester_present_base_tx_flags: 0,
                 open_tp_discards: Vec::new(),
+                open_func_tx: None,
                 working_unique_resp_id_table: Vec::new(),
                 active_unique_resp_id_table: Vec::new(),
                 unique_resp_filter_ids: Vec::new(),
@@ -3885,6 +3886,8 @@ impl J2534Service {
             // default` already starts this field `None`), the actual fix
             // only for a reconnect.
             link.tp20_connection = None;
+            // ADR-421: a fresh generation never inherits a send's marker.
+            link.open_func_tx = None;
             // ADR-180 Decision 18: same reconnect-only reasoning as
             // Decision 17 just above -- a fresh `connect_generation` must
             // not inherit a prior generation's negotiation posture either,
@@ -7254,6 +7257,7 @@ impl J2534Service {
             // way but must leave `open_tp_discards` untouched -- see that
             // function's own note.
             link.open_tp_discards.clear();
+            link.open_func_tx = None; // ADR-421
             let channel_id = link.channel_id;
             link.channel_id = None;
             link.connected = false;
@@ -9105,6 +9109,7 @@ mod tests {
             tester_present_state: TesterPresentState::None,
             tester_present_base_tx_flags: 0,
             open_tp_discards: Vec::new(),
+            open_func_tx: None,
             working_unique_resp_id_table: Vec::new(),
             active_unique_resp_id_table: Vec::new(),
             unique_resp_filter_ids: Vec::new(),

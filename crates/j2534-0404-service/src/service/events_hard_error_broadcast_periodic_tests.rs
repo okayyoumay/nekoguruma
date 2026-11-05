@@ -76,6 +76,7 @@ fn link_with_a_live_broadcast_periodic() -> LogicalLinkState {
         tester_present_state: TesterPresentState::None,
         tester_present_base_tx_flags: 0,
         open_tp_discards: Vec::new(),
+        open_func_tx: None,
         working_unique_resp_id_table: Vec::new(),
         active_unique_resp_id_table: Vec::new(),
         unique_resp_filter_ids: Vec::new(),

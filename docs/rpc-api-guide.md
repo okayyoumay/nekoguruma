@@ -1207,7 +1207,9 @@ loopback/RxBreak) bypass attribution entirely and are handled separately
 (see `RxStatus / RxFlag` in the glossary), delivered with no `cop_handle`;
 on a CAN CLL with a UniqueRespIdTable a TxDone or loopback echo, which
 carries the request's CAN ID, reaches the CLL whose normally addressed
-entry names that `CP_CanPhysReqId` (ADR-352); (2) active Send/Receive COPs with
+entry names that `CP_CanPhysReqId` (ADR-352), and a TxDone or loopback echo of
+a functional request reaches the CLL waiting on that request's receive phase
+(ADR-421); (2) active Send/Receive COPs with
 a non-vacuous (specifically-expected) `expected_response_array`; (3) the
 service's own tester-present reply/SOM-herald/TX-echo signature, when
 `CP_TesterPresentReqRsp = 1` — a match here is discarded, per spec, and

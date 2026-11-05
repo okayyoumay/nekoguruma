@@ -341,7 +341,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-349](ADR-349-pause-the-review-loop-on-long-specification-pull-requests.md) | Pause the Review Loop on Long Specification Pull Requests | Accepted (Decision items 1 and 4 amended by ADR-381: the pause applies to code pull requests too) | `.claude/skills/pr-review-loop` (Step 4), `CLAUDE.md`, `.github/copilot-instructions.md`; ADR-251 |
 | [ADR-350](ADR-350-worker-error-events-carry-extra-information-and-refusals-name-their-reason.md) | Worker Error Events Carry Their Extra Information, and Refusals Name Their Reason | Accepted (Decision item 1's agent use of a known code superseded by ADR-351: the worker names the information and the agent does not interpret it) | `vci-service-interface` (`EventItem`, `ErrorDetail`), `iso22900-service`, `j2534-0404-service`, `iso22900-mock`, `docs/rpc-api-guide.md`; design 8.11, ADR-105, ADR-346 |
 | [ADR-351](ADR-351-workers-name-their-extra-error-information.md) | Workers Name Their Extra Error Information, and the Agent Does Not Interpret It | Accepted | `vci-service-interface` (`ErrorData`), `iso22900-service`, `j2534-0404-service`, `ngr-library-resolver`, `agent` host and communication log, `docs/rpc-api-guide.md`; design 8.11, ADR-346 item 6, ADR-350 item 1 |
-| [ADR-352](ADR-352-tx-side-frames-route-by-the-physical-request-id.md) | TX-Side Frames Route by the Unique Response Entry's Physical Request ID | Accepted | `j2534-0404-service` RX routing, `sim-vci` TxDone indications, `docs/j2534-0404-architecture.md`, `docs/rpc-api-guide.md`; design 8.11, ADR-098, ADR-100, ADR-151, ADR-346 item 4 |
+| [ADR-352](ADR-352-tx-side-frames-route-by-the-physical-request-id.md) | TX-Side Frames Route by the Unique Response Entry's Physical Request ID | Accepted (Decision item 3 superseded in part by ADR-421) | `j2534-0404-service` RX routing, `sim-vci` TxDone indications, `docs/j2534-0404-architecture.md`, `docs/rpc-api-guide.md`; design 8.11, ADR-098, ADR-100, ADR-151, ADR-346 item 4 |
 | [ADR-353](ADR-353-event-items-name-the-clock-of-their-time.md) | Event Items Name the Clock of Their Time | Accepted | `vci-service-interface` (`EventItem.timestamp_clock`), `j2534-0404-service` and `iso22900-service` event items, `agent` communication log; design 8.11 "On one clock", design principle 6, ADR-120 |
 | [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`, `crates/agent/docs/ngr-agent.md`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`, "Settlement" `late_item`; ADR-346 item 6 |
 | [ADR-355](ADR-355-a-link-says-whether-it-forwards-every-pending.md) | A Link Says Whether It Forwards Every Pending | Accepted | `vci-service-interface` (`ComLogicalLinkResponse.pending_forwarding`), `j2534-0404-service` and `iso22900-service` `CreateComLogicalLink`, `agent` link and communication log; design 8.11 `link_opened`, `pending`, H4; design principle 6, ADR-346 item 3 |
@@ -410,6 +410,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-418](ADR-418-the-worker-keeps-a-jobs-session-alive.md) | The Worker Keeps a Job's Session Alive, the Agent Decides When | Accepted (items 5 and 6 implemented by the J2534 worker as ADR-419 decides; items 3, 6 and 9 amended by ADR-420) | `agent` (`LinkConfig`, link open, host), `j2534-0404-service` tester-present, `iso22900-service`, `ngr-hw-checks`, communication log `keep_alive`; design 8.2.5, 8.10, 8.11, 13.5; ADR-084, ADR-088, ADR-093, ADR-099, ADR-137, ADR-264, ADR-275, ADR-325, ADR-417 |
 | [ADR-419](ADR-419-tester-present-is-serialized-with-client-primitives.md) | The J2534 Worker's Tester-Present Is Serialized With Client Primitives | Accepted | `j2534-0404-service` (`wait_for_bus_clear`, tester-present dispatch, `bind_frame` step 3, open-discard entries), `docs/j2534-0404-architecture.md`; ADR-060, ADR-083, ADR-088, ADR-093, ADR-095, ADR-099, ADR-100, ADR-102, ADR-137, ADR-418 |
 | [ADR-420](ADR-420-the-agents-keep-alive-mechanics.md) | The Agent's Keep-Alive Mechanics | Accepted | `agent` (`LinkConfig`, link open, `keep_alive.rs`, host, `WorkerApi`), communication log `keep_alive` and `link_opened`, `diag-ir` `SET_BY_LINK`, `ngr-hw-checks`; design 8.2.5, 8.11; ADR-264, ADR-324, ADR-389, ADR-392, ADR-393, ADR-408, ADR-417, ADR-418, ADR-419 |
+| [ADR-421](ADR-421-a-functional-requests-txdone-reaches-the-link-that-sent-it.md) | A Functional Request's TxDone Reaches the Link That Sent It | Accepted | `j2534-0404-service` (`open_func_tx`, `handle_send_recv`, `route_frame_with_role`), `docs/j2534-0404-architecture.md`; design 8.11; ADR-099, ADR-100, ADR-352 item 3, ADR-400, ADR-419 |
 
 ## Status Legend
 
@@ -643,7 +644,8 @@ the predecessor repository these ADRs came from.
 - ADR-184
 - ADR-203
 - ADR-222
-- ADR-352
+- ADR-352 (Decision item 3 superseded in part by ADR-421)
+- ADR-421
 
 ### CAN Channel Modes
 - ADR-046

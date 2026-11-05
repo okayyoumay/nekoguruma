@@ -24517,6 +24517,11 @@ def main():
                             vci_service_interface::PduErrorEvent::PduErrEvtLostCommToVci,
                             5_000,
                         );
+                        // The two notifications cross the fake worker's gRPC stream one at a
+                        // time; the test is about one drain reading both, so it lets both reach
+                        // the host before the first drain. Read in separate drains, the first
+                        // item alone is the lost session (ADR-420 item 8), a different case.
+                        std::thread::sleep(Duration::from_millis(300));
                         let waits = poll_waits(host);
                         (waits, host.service_request(0x22, &[0xF1, 0x90]))
                     },

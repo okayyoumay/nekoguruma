@@ -177,6 +177,13 @@ pub enum HostError {
     /// error is in the communication log.
     #[error("the ECU's session was lost: the worker's tester-present reported an error")]
     SessionLost,
+    /// The link's event stream failed while nothing was pending, and the host found it before
+    /// the request started a primitive, so no answer could be read and nothing was sent
+    /// (ADR-420 item 8). The failure is the inner error; the request is judged as that error
+    /// would judge it, except that it is known not to have been sent. A stream failure seen
+    /// after a start is the inner error alone.
+    #[error("the link's event stream failed before the request was sent: {0}")]
+    StreamFailedBeforeSend(Box<HostError>),
 }
 
 /// Whether a failed send-receive's request may have reached the ECU.
@@ -223,7 +230,8 @@ impl HostError {
             | HostError::DeclaredLink(_)
             | HostError::InputNotEstablished(_)
             | HostError::KeepAliveFailed
-            | HostError::SessionLost => SendState::NotSent,
+            | HostError::SessionLost
+            | HostError::StreamFailedBeforeSend(_) => SendState::NotSent,
             // The worker refused the start after a lost VCI (ADR-294).
             HostError::VciLost {
                 refused_after_loss: true,
@@ -276,6 +284,7 @@ impl HostError {
     /// The class of this error for a resend (ADR-392).
     pub fn resend_class(&self) -> ResendClass {
         match self {
+            HostError::StreamFailedBeforeSend(inner) => inner.resend_class(),
             HostError::NoResponse | HostError::PrimitiveFailed(_) | HostError::EventsLost => {
                 ResendClass::EcuLevel
             }
@@ -1436,6 +1445,15 @@ impl<C: WorkerApi> WorkerHost<C> {
             self.log_refused(&request, before, &error, caused_by);
             return Err(error);
         }
+        // A stream the drain found failed: no answer could be read, so nothing is started. A
+        // lost VCI the drain read is reported first.
+        if self.vci_lost_read.is_none()
+            && let Some(error) = self.stream_failed.take()
+        {
+            let error = HostError::StreamFailedBeforeSend(Box::new(error));
+            self.log_refused(&request, before, &error, None);
+            return Err(error);
+        }
         // The link is the primary's; a request for another target cannot be served (ADR-409).
         if self.target != 0 {
             let error = HostError::Unsupported("a request to a target other than the primary");
@@ -2472,10 +2490,15 @@ impl<C: WorkerApi> WorkerHost<C> {
         // The log's `not_sent` and `send_state` are one judgement (ADR-389).
         debug_assert_eq!(error.send_state(), SendState::NotSent, "{error:?}");
         let end = End::NotSent(refusal_cause(request, error));
-        let detail = Detail {
+        let mut detail = Detail {
             host_error: Some(host_error_name(error)),
             ..Detail::default()
         };
+        if let HostError::StreamFailedBeforeSend(inner) = error
+            && let HostError::Rpc { status, .. } = &**inner
+        {
+            detail.grpc_status = Some(grpc_code_name(status.code()));
+        }
         self.log(request, before, end, detail, Vec::new(), |evidence| {
             evidence.caused_by = caused_by;
         });
@@ -3584,6 +3607,7 @@ fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
         HostError::NoBlockLength { .. } => RefusalCause::EarlierResponse,
         HostError::KeepAliveFailed => RefusalCause::KeepAliveFailed,
         HostError::SessionLost => RefusalCause::SessionLost,
+        HostError::StreamFailedBeforeSend(_) => RefusalCause::StreamFailed,
         _ => RefusalCause::PreparationError,
     }
 }
@@ -3623,6 +3647,7 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::InputNotEstablished(_) => "InputNotEstablished",
         HostError::KeepAliveFailed => "KeepAliveFailed",
         HostError::SessionLost => "SessionLost",
+        HostError::StreamFailedBeforeSend(_) => "StreamFailedBeforeSend",
     }
 }
 
@@ -3640,6 +3665,10 @@ impl crate::oplog::LogSafe for HostError {
                 }
                 _ => format!("the ECU refused TransferData block {block}"),
             },
+            HostError::StreamFailedBeforeSend(inner) => format!(
+                "the link's event stream failed before the request was sent: {}",
+                inner.log_text()
+            ),
             HostError::TransferEchoMismatch { block, counter, .. } => format!(
                 "the ECU's TransferData response to block {block} (counter {counter:#04x}) is wrong"
             ),
@@ -5011,6 +5040,29 @@ mod tests {
             true,
         );
         assert!(none.is_empty());
+    }
+
+    /// A stream failure found before the request started is a refusal: not sent, and judged for
+    /// a resend as the failure itself is.
+    #[test]
+    fn a_failed_stream_before_the_start_is_not_sent_and_keeps_its_class() {
+        for (code, class) in [
+            (tonic::Code::Unavailable, ResendClass::PathLost),
+            (tonic::Code::Internal, ResendClass::Other),
+        ] {
+            let inner = HostError::Rpc {
+                rpc: "SubscribeEvent",
+                status: Box::new(tonic::Status::new(code, "x")),
+            };
+            // After a start the failure alone stays unknown.
+            assert_eq!(inner.send_state(), SendState::MayHaveReached);
+            let error = HostError::StreamFailedBeforeSend(Box::new(inner));
+            assert_eq!(error.send_state(), SendState::NotSent);
+            assert_eq!(error.resend_class(), class);
+            assert_eq!(host_error_name(&error), "StreamFailedBeforeSend");
+            assert_eq!(refusal_cause(&[0x22], &error), RefusalCause::StreamFailed);
+            assert!(error.log_text().contains(grpc_code_name(code)));
+        }
     }
 
     /// An error event without extra error information.

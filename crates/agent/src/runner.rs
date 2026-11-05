@@ -20848,6 +20848,48 @@ def main():
         assert!(journal.journal().state().facts.last_request_withdrawn());
     }
 
+    /// A request refused because the event stream failed (ADR-420 item 8) was never sent: a lost
+    /// path (`Unavailable`) opens the link again and sends it, whatever its idempotency, with its
+    /// one marker; any other failure ends the run with the marker withdrawn.
+    #[test]
+    fn a_request_refused_for_a_failed_stream_is_sent_again_or_withdrawn() {
+        let refused = |code| {
+            HostError::StreamFailedBeforeSend(Box::new(HostError::Rpc {
+                rpc: "SubscribeEvent",
+                status: Box::new(tonic::Status::new(code, "x")),
+            }))
+        };
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let (result, host, _) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x10, [refused(tonic::Code::Unavailable)].into()));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        result.expect("the run completes on the new link");
+        assert_eq!(sends_of(&host, 0x10), 2);
+        assert_eq!(host.reopen_calls, 1);
+
+        let (result, host, journal) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x10, [refused(tonic::Code::Internal)].into()));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        assert!(
+            matches!(&result, Err(JobError::Host { pc: 4, .. })),
+            "{result:?}"
+        );
+        assert_eq!(host.reopen_calls, 0);
+        assert!(journal.journal().state().facts.last_request_withdrawn());
+    }
+
     /// Each resend of a step is announced to the host (`step_resends`), which is what gives its
     /// exchange the origin `repeat`: two failures, two announcements, none for the first send
     /// or the next arrival.
@@ -24506,10 +24548,14 @@ def main():
                     .await;
                 let (waits, request) = results;
                 assert!(waits.is_ok(), "{waits:?}");
-                match request {
-                    Err(HostError::Rpc { rpc, status }) => {
-                        assert_eq!(rpc, "SubscribeEvent");
-                        assert_eq!(status.code(), tonic::Code::Internal);
+                match &request {
+                    Err(error @ HostError::StreamFailedBeforeSend(inner)) => {
+                        assert!(
+                            matches!(&**inner, HostError::Rpc { rpc, status }
+                                if *rpc == "SubscribeEvent" && status.code() == tonic::Code::Internal),
+                            "{inner:?}"
+                        );
+                        assert_eq!(error.send_state(), crate::host::SendState::NotSent);
                     }
                     other => panic!("{other:?}"),
                 }

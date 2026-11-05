@@ -591,6 +591,9 @@ pub(crate) enum RefusalCause {
     /// session, so the session may have ended and the job stops (design 8.2.5, ADR-420 item 8).
     /// `caused_by` is the `keep_alive` entry of that error.
     SessionLost,
+    /// The link's event stream failed before the request started, so no answer could have been
+    /// read (design 8.11).
+    StreamFailed,
 }
 
 impl RefusalCause {
@@ -619,6 +622,7 @@ impl RefusalCause {
             Self::SystemOwnReasons => "the system refused it for its own reasons (invalid parameters, a full queue or a request the protocol cannot carry)".to_owned(),
             Self::LinkHeld => "an earlier request the agent stopped waiting for still holds the link, and the system could not cancel it".to_owned(),
             Self::KeepAliveFailed => "the system could not keep the session alive, so the job's next request was not sent".to_owned(),
+            Self::StreamFailed => "the system lost the link's stream of events, so no answer could be read and the request was not sent".to_owned(),
             Self::SessionLost => match caused_by {
                 Some(entry) => format!(
                     "the tester-present kept running on the link reported an error (entry {entry}) while the ECU was in a non-default session, so the session may have ended"
@@ -6918,6 +6922,7 @@ mod tests {
             RefusalCause::SystemOwnReasons,
             RefusalCause::LinkHeld,
             RefusalCause::KeepAliveFailed,
+            RefusalCause::StreamFailed,
         ] {
             let evidence = evidence(&[0x36, 1], End::NotSent(cause));
             let entry = ExchangeEntry::build(4, evidence, LinkHistory::empty());
@@ -7752,6 +7757,7 @@ mod tests {
             End::NotSent(RefusalCause::KeepAliveFailed),
             End::NotSent(RefusalCause::EarlierResponse),
             End::NotSent(RefusalCause::SessionLost),
+            End::NotSent(RefusalCause::StreamFailed),
             End::Unknown(UnknownCause::RpcFailure),
             End::Unknown(UnknownCause::WorkerNotAnswering),
             End::Unknown(UnknownCause::EventsEnded),

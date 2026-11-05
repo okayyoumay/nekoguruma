@@ -180,9 +180,14 @@ worker kinds and does not branch on which it is.
      `VciLost { refused_after_loss: true }` without being sent, as the worker would refuse it
      (ADR-294); it enters the exchange entry as the lost VCI's error. A stream that ended is
      dropped, so the next request starts its primitive and fails on it as it does without the
-     drain; one that failed with a status is kept, and the next request is refused with that
-     status (`HostError::Rpc` of `SubscribeEvent`, as the wait would have given it) before
-     anything is sent, since no answer can be read from it. What the drain read that no exchange
+     drain; one that failed with a status is kept, and the next request is refused with it before
+     anything is sent, since no answer can be read from it: `HostError::StreamFailedBeforeSend`
+     wraps the failure (`Rpc` of `SubscribeEvent`), is `NotSent`, takes the resend class of the
+     failure (`Unavailable` and `Unknown` are a lost path, so the host opens the link again and
+     sends the request, whatever its idempotency; any other status ends the run, the marker
+     withdrawn), and is logged as a refusal, cause `stream_failed` (`system`), with the status
+     in `detail.grpc_status`. A failure seen after a start stays the inner error, which may have
+     reached the ECU. What the drain read that no exchange
      took (results, indications, an earlier primitive's timeout, as well as link errors) is
      placed by the same code as an exchange's unbound items (ADR-397) when the session is
      refused, at reopen and at job end, with no exchange in flight; the drain also runs once

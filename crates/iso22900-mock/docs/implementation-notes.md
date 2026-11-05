@@ -9,6 +9,7 @@ Native-library test double used by wrapper and service tests, with deterministic
 - Global mock state is shared for process lifetime and requires deliberate reset discipline.
 - Deterministic constants are preferred for reproducible tests.
 - Exported ABI must mirror target-specific calling-convention constraints from real bindings.
+- The link's state and tester-present (ADR-423) live in `MockState` and are scheduled by the delivery thread that already orders ComPrimitive events (ADR-299): a tester-present is a marker in the same schedule, so it is serialized with ComPrimitives by construction. State changes of STARTCOMM, UPDATEPARAM and STOPCOMM take effect when their last event is delivered, not when they start.
 
 ## Implementation Policy
 

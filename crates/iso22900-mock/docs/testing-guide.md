@@ -51,19 +51,19 @@ unsafe { libloading::Library::new(&lib_path).unwrap().get::<fn()>(b"__mock_reset
 | `PDUModuleConnect` | Always succeeds. |
 | `PDUModuleDisconnect` | Always succeeds. |
 | `PDUGetVersion` | Returns canned version data (`"iso22900-mock"` strings). |
-| `PDUGetStatus` | Returns `PDU_CLLST_ONLINE` for CLL handles; `PDU_MODST_READY` for module handles. For a ComPrimitive handle it reports the status code `PDU_COPST_FINISHED`, `PDU_COPST_IDLE` while the ComPrimitive waits its turn, or `PDU_COPST_EXECUTING` while its events are still to come (ADR-299). |
+| `PDUGetStatus` | For a link with no ComPrimitive (hCoP `PDU_HANDLE_UNDEF`) it reports `PDU_CLLST_ONLINE`, or `PDU_CLLST_COMM_STARTED` after a `PDU_COPT_STARTCOMM` finished (ADR-423); the module status is as before. For a ComPrimitive handle it reports the status code `PDU_COPST_FINISHED`, `PDU_COPST_IDLE` while the ComPrimitive waits its turn, or `PDU_COPST_EXECUTING` while its events are still to come (ADR-299). |
 | `PDUGetLastError` | Returns `PDU_ERR_EVT_NOERROR` (0). |
 | `PDUGetModuleIds` | Returns a single module entry (`MOCK_MODULE_HANDLE` = 1001). |
 | `PDUGetResourceIds` | Returns a single resource ID (`MOCK_RESOURCE_ID` = 2001). |
 | `PDUGetConflictingResources` | Returns empty conflict list. |
 | `PDUGetResourceStatus` | Returns available (not locked) status. |
 | `PDUCreateComLogicalLink` | Allocates a CLL handle (returns `MOCK_LOGICAL_LINK_HANDLE` = 3001). |
-| `PDUDestroyComLogicalLink` | Always succeeds. |
+| `PDUDestroyComLogicalLink` | Succeeds. Resets the link state and the tester-present ComParams (ADR-423). |
 | `PDUConnect` | Always succeeds. |
-| `PDUDisconnect` | Always succeeds. |
+| `PDUDisconnect` | Succeeds. The link is `PDU_CLLST_ONLINE` again and its tester-present stops (ADR-423). |
 | `PDULockResource` / `PDUUnlockResource` | Always succeed. |
-| `PDUGetComParam` | Returns `PDU_ERR_ID_NOT_SUPPORTED` (params not stored). |
-| `PDUSetComParam` | Always succeeds (params not stored). |
+| `PDUGetComParam` | Returns an item whose data is the number 0, except for a numeric tester-present ComParam, which reads back its working value (class `PDU_PC_TESTER_PRESENT`; ADR-423). |
+| `PDUSetComParam` | Stores the eight tester-present ComParams in the working buffer ("Tester-present" below); succeeds and forgets every other ComParam. Refuses a tester-present ComParam of the wrong data type or a byte field over 12 bytes with `PDU_ERR_INVALID_PARAMETERS`. |
 | `PDUStartComPrimitive` | Allocates a new COP handle. Immediately queues a completion event via the registered callback, or, with a simulated ECU attached, the ECU's answer to a send-and-receive request (see "Simulated ECU"). |
 | `PDUCancelComPrimitive` | Always succeeds. |
 | `PDUGetEventItem` | Dequeues one pending event. Returns `PDU_ERR_EVENT_QUEUE_EMPTY` when empty. |
@@ -91,6 +91,16 @@ With a `sim-ecu` attached (ADR-299), a `PDU_COPT_SENDRECV` ComPrimitive with req
 The control data's cycles decide what is sent and received: with no send cycles nothing reaches the ECU and only the two status items follow; with no receive cycles the request reaches the ECU and only the two status items follow. Any other combination runs as one send and one response, and so does a ComPrimitive without control data.
 
 While an ECU is attached, and while other ComPrimitives still wait or run after it is detached, a ComPrimitive waits its turn (the synthetic completion event of the other ComPrimitive types too): it begins when the one before it has finished, and only then does its request reach the ECU, so the ECU's timers run from then. Its events are due at the delays the ECU gives them, counted from when it begins. A delivery thread begins each ComPrimitive in turn, queues each event when it is due and fires the callback. `PDUConstruct` and a reset discard waiting ComPrimitives and scheduled events; `PDUDestruct` discards them and waits for the delivery thread to end, so no callback runs after it returns. The receive timeout comes right after the last message the ECU sent, since the mock keeps no ComParams and so has no P2 to wait for. Without an ECU every ComPrimitive gets the synthetic completion event at once.
+
+### Tester-present
+
+The mock keeps the link's state (`PDU_CLLST_ONLINE` or `PDU_CLLST_COMM_STARTED`) and the tester-present ComParams, and with an ECU attached sends the link's tester-present (ADR-423). `PDUGetObjectId` resolves `CP_TesterPresentHandling`, `Message`, `ReqRsp`, `ExpPosResp`, `ExpNegResp`, `SendType`, `Time` and `AddrMode` (ISO 22900-2:2022 Annex B.5.1); `PDUSetComParam` writes them to a working buffer that starts at the B.5.1 defaults of UDS on CAN (handling on, message `3E 80`, no response expected, functional addressing, 2 s). A `PDU_COPT_STARTCOMM` or `PDU_COPT_UPDATEPARAM` copies the working buffer to the active one when it finishes (8.2.6.1), so a ComParam set alone changes nothing on the wire.
+
+- A `PDU_COPT_STARTCOMM` with request bytes runs as a send-receive (the events above, the control data's cycles included); with none it gets the synthetic completion. Either way the link is `PDU_CLLST_COMM_STARTED` when it finishes, whatever the ECU answered, and a second one on a started link is a send-receive and leaves it started. `PDU_COPT_STOPCOMM`, `PDUDisconnect`, `PDUDestroyComLogicalLink` and `__mock_reset` make the link `PDU_CLLST_ONLINE` again.
+- While the link is COMM_STARTED and the active handling is 1, the delivery thread sends the active message to the ECU (`SimEcu::exchange`; physical addressing for address mode 0, functional otherwise): at once when the link starts or an UPDATEPARAM changes an active value, then every `CP_TesterPresentTime` microseconds (at least 1 ms) after each send. Send type 1 is sent as type 0. Without an ECU a send is skipped without an error.
+- It goes only when no ComPrimitive runs or waits (8.1.3 Table 1); a waiting ComPrimitive goes first and the tester-present stays due. With `CP_TesterPresentReqRsp` 1 the send holds the next ComPrimitive back until the ECU's final answer is due. The answer is positive when it starts with `CP_TesterPresentExpPosResp` (non-empty); a missing answer, a negative one and any other answer queue one `PDU_IT_ERROR` item `PDU_ERR_EVT_TESTER_PRESENT_ERROR` with hCop `PDU_HANDLE_UNDEF` and the additional error code `MOCK_XTRA_ERR_TP_NO_RSP` or `MOCK_XTRA_ERR_TP_NEG_RSP`, once per send, and the sending goes on. Nothing is queued for a positive answer, with `CP_TesterPresentReqRsp` 0, or when the tester-present was switched off or the link left COMM_STARTED before the answer was due. The ECU's answer is never delivered as a result item.
+- `PDUGetComParam` reads only the numeric ones back; a byte field reads as 0.
+- `NGR_SIM_ECU_COMMANDS` (JSON array of `__mock_sim_ecu_control` commands) is applied by `PDUConstruct` after the ECU of `NGR_SIM_ECU_CONFIG` is attached, when none is attached yet; for a worker process under test, e.g. `[{"attach":{"config":{"s3_server_ms":1500}}},{"inject_fault":{"fault":"drop_response","service":62}}]` loses the answer to the first tester-present. A command that does not parse or cannot apply fails `PDUConstruct`.
 
 ### Timestamps
 
@@ -174,17 +184,20 @@ The `rlib` portion exports the following Rust functions for use in test setup:
 | `STANDARD_BUS_TYPE_DWCAN` | 3111 | `PDUGetObjectId` of the bus type `ISO_11898_2_DWCAN` (ADR-319) |
 | `STANDARD_PROTOCOL_UDS_ON_CAN` | 3112 | `PDUGetObjectId` of the protocol `ISO_14229_3_on_ISO_15765_2` (ADR-319) |
 | `STANDARD_PIN_TYPE_HI`, `STANDARD_PIN_TYPE_LOW` | 3311, 3312 | `PDUGetObjectId` of the pin types `HI` and `LOW` (ADR-319) |
-| `STANDARD_COMPARAMS` | 3210 to 3235 | `PDUGetObjectId` of the ISO 22900-2 (2022) ComParams (Annex B.3, B.5) the agent sets on a UDS on CAN link: `CP_Baudrate`, `CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RCByteOffset`, `CP_RC78CompletionTimeout`, `CP_CanPhysReqId`, `CP_CanRespUSDTId` (3210 to 3217), `CP_RC21Handling`, `CP_RC23Handling`, `CP_TransmitIndEnable`, `CP_StartMsgIndEnable` (3220 to 3223); and `CP_BlockSize` and `CP_StMin` (3218, 3219), the block size and minimum separation time of ISO 15765-2 (2024) 9.6.5.3 and 9.6.5.4, which the example ECU declares (ADR-324); and those the hardware-check guard sets when it completes a job's link from its profile (ADR-334): `CP_CanFuncReqId`, `CP_RequestAddrMode`, `CP_TesterPresentAddrMode`, `CP_CanPhysReqFormat`, `CP_CanRespUSDTFormat`, `CP_CanFuncReqFormat`, `CP_CanPhysReqExtAddr`, `CP_CanRespUSDTExtAddr`, `CP_CanFuncReqExtAddr`, `CP_CanFillerByteHandling`, `CP_CanFillerByte`, `CP_TesterPresentMessage` (3224 to 3235). The mock keeps no ComParam values |
+| `STANDARD_COMPARAMS` | 3210 to 3241 | `PDUGetObjectId` of the ISO 22900-2 (2022) ComParams (Annex B.3, B.5) the agent sets on a UDS on CAN link: `CP_Baudrate`, `CP_P2Max`, `CP_P2Star`, `CP_RC78Handling`, `CP_RCByteOffset`, `CP_RC78CompletionTimeout`, `CP_CanPhysReqId`, `CP_CanRespUSDTId` (3210 to 3217), `CP_RC21Handling`, `CP_RC23Handling`, `CP_TransmitIndEnable`, `CP_StartMsgIndEnable` (3220 to 3223); and `CP_BlockSize` and `CP_StMin` (3218, 3219), the block size and minimum separation time of ISO 15765-2 (2024) 9.6.5.3 and 9.6.5.4, which the example ECU declares (ADR-324); and those the hardware-check guard sets when it completes a job's link from its profile (ADR-334): `CP_CanFuncReqId`, `CP_RequestAddrMode`, `CP_TesterPresentAddrMode`, `CP_CanPhysReqFormat`, `CP_CanRespUSDTFormat`, `CP_CanFuncReqFormat`, `CP_CanPhysReqExtAddr`, `CP_CanRespUSDTExtAddr`, `CP_CanFuncReqExtAddr`, `CP_CanFillerByteHandling`, `CP_CanFillerByte`, `CP_TesterPresentMessage` (3224 to 3235); and the other tester-present ComParams of the agent's keep-alive (ADR-418): `CP_TesterPresentHandling`, `CP_TesterPresentReqRsp`, `CP_TesterPresentExpPosResp`, `CP_TesterPresentExpNegResp`, `CP_TesterPresentSendType`, `CP_TesterPresentTime` (3236 to 3241). The mock keeps the values of the eight tester-present ComParams only (ADR-423) |
 | `MOCK_LOGICAL_LINK_HANDLE` | 3001 | Base CLL handle (first `PDUCreateComLogicalLink`) |
 | `MOCK_COM_PRIMITIVE_HANDLE` | 4001 | Base COP handle (first `PDUStartComPrimitive`) |
 | `MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP` | `0x0000_0101` | The additional error code (ISO 22900-2:2022 D.4.2, `ExtraErrorInfoId`) of the `PDU_ERR_EVT_RX_TIMEOUT` error item for a ComPrimitive the attached ECU does not answer; D.4.2 leaves these codes to the vendor's MDF, so the value is the mock's own (ADR-350) |
+| `MOCK_XTRA_ERR_TP_NO_RSP` | `0x0000_0102` | The additional error code of a `PDU_ERR_EVT_TESTER_PRESENT_ERROR` item for a tester-present the ECU did not answer (ADR-423); the mock's own value, as D.4.2 leaves them to the MDF |
+| `MOCK_XTRA_ERR_TP_NEG_RSP` | `0x0000_0103` | The same, for a tester-present answered with anything but the expected positive response (ADR-423) |
+| `ECU_COMMANDS_ENV` | `NGR_SIM_ECU_COMMANDS` | Environment variable with the JSON array of ECU commands `PDUConstruct` applies (ADR-423) |
 | `MOCK_IOCTL_NULL_OUTPUT` | `0x7FFF_FF00` | IOCTL command id that succeeds without an output item (public, for null-item tests) |
 
 ---
 
 ## Known Limitations
 
-- ComParams are not stored or returned (`PDUGetComParam` returns `PDU_ERR_ID_NOT_SUPPORTED`).
+- Only the eight tester-present ComParams are stored (ADR-423); every other ComParam is accepted and forgotten, and `PDUGetComParam` returns the number 0 for it.
 - The UniqueRespIdTable is accepted but not applied to event routing.
 - The mock uses a process-global singleton. Tests in the same process share state; always call `__mock_reset()` between tests.
-- No bus communication is simulated. With a `sim-ecu` attached, the ECU's response delays are applied, but there is no P2 timing, no functional addressing and no `PDUCancelComPrimitive` (ADR-299).
+- No bus communication is simulated. With a `sim-ecu` attached, the ECU's response delays are applied, but there is no P2 timing and no `PDUCancelComPrimitive` (ADR-299). The tester-present is sent functionally for address mode other than 0, but the mock models no bus, no P3 timing and one link (ADR-423).

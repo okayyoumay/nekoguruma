@@ -1,7 +1,7 @@
 # ADR-299: iso22900-mock Answers ComPrimitives from sim-ecu
 
 **Date:** 2026-10-15
-**Status:** Accepted
+**Status:** Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request)
 **Affects:** `crates/iso22900-mock` (`PDUStartComPrimitive`, event items, `__mock_sim_ecu_control`,
 `NGR_SIM_ECU_CONFIG`), `crates/iso22900-service/tests/grpc_mock.rs`
 

@@ -31,8 +31,9 @@ pub const MAX_TIMING_US: u32 = MAX_TIMING_MS * 1_000;
 /// microseconds ([`Timing`]).
 pub const TIMING_COMPARAMS: [&str; 3] = ["CP_P2Max", "CP_P2Star", "CP_RC78CompletionTimeout"];
 /// The ComParams the link sets itself (the agent's link set-up): from the protocol row, or for
-/// its response pending handling, indications and addressing. A further one would override it.
-pub const SET_BY_LINK: [&str; 14] = [
+/// its response pending handling, indications, addressing and the keep-alive's cyclic tester
+/// present (ADR-418, ADR-420). A further one would override it.
+pub const SET_BY_LINK: [&str; 22] = [
     "CP_Baudrate",
     "CP_P2Max",
     "CP_P2Star",
@@ -47,6 +48,14 @@ pub const SET_BY_LINK: [&str; 14] = [
     "CP_CanRespUSDTId",
     "CP_RequestAddrMode",
     "CP_CanFuncReqId",
+    "CP_TesterPresentHandling",
+    "CP_TesterPresentMessage",
+    "CP_TesterPresentReqRsp",
+    "CP_TesterPresentExpPosResp",
+    "CP_TesterPresentExpNegResp",
+    "CP_TesterPresentAddrMode",
+    "CP_TesterPresentSendType",
+    "CP_TesterPresentTime",
 ];
 /// ComParams that let a primitive run longer than the host's send-receive ceiling allows:
 /// the limits and request times of repeating the request on a busy (0x21) or not-yet-complete

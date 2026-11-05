@@ -42,6 +42,27 @@ The job opens the link its variant declares (`agent::Job::declared_link`, ADR-32
   does not know, or resolves to one the link already set, fails when the link is set up,
   naming the ComParam.
 
+Keeping a session alive (design 8.2.5, ADR-418, ADR-420). `LinkConfig::keep_alive` is the period
+of the worker's cyclic tester present on the job's own link: `Some(2 s)` from
+`LinkConfig::iso15765` and from a declared link, `None` for off (a functional link has none). A
+period below 200 ms is refused, zero included. With it on, the link open sets, after the
+declared ComParams and before the indications, `CP_TesterPresentMessage` `3E 00`,
+`CP_TesterPresentReqRsp` 1, `CP_TesterPresentExpPosResp` `7E 00`, `CP_TesterPresentExpNegResp`
+`7F 3E`, `CP_TesterPresentAddrMode` 0, `CP_TesterPresentSendType` 0 (every period),
+`CP_TesterPresentTime` (microseconds) and `CP_TesterPresentHandling` 1, under the class
+`PDU_PC_TESTER_PRESENT`, the message and the two responses as byte fields; a library that
+refuses one opens the link without the keep-alive, and `link_opened` says so. A document cannot
+declare them. The link's `CP_RC78Handling` and `CP_RCByteOffset` stay as the link sets them, so a
+`7F 3E 78` keeps the worker's window open (ADR-419). The worker's tester present runs only in the
+link state COMM_STARTED, so a request that is a DiagnosticSessionControl into a non-default
+session, sent while the link is still ONLINE, goes as a `CoptStartcomm` (`detail.cop_type`
+`startcomm` in its exchange entry), judged as a send-receive is; a start that got no positive
+answer makes the host ask the link's status (`GetStatus`). From then on the agent switches
+`CP_TesterPresentHandling` by `CoptUpdateparam` as the host's session record (`keep_alive.rs`,
+written after every exchange) enters and leaves a non-default session, never by `CoptStopcomm`,
+and writes a `keep_alive` entry for each switch; a failed switch-on fails the next request with
+`HostError::KeepAliveFailed` before it is sent.
+
 The link's resource is named by the ISO 22900-2 (2022)
 short names of UDS on dual-wire CAN (Annex B.1, B.2), which both worker kinds resolve
 (`agent::link::resource_data`, ADR-319).
@@ -537,9 +558,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   send and gives the transmit time whatever other exchange could own an unbound one, in the
   exchange's entry and, read at job end, in its `primitive_ended` entry (`Progress::bound_tx`).
   Design 8.11's other conditions hold on the agent's link by construction: one primitive runs at
-  a time on the job's one link, and the link starts no communication, so the API sends no
-  tester present of its own (ISO 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1 run it only on a link
-  whose communication was started). A start-of-message indication that carries the exchange's
+  a time on the job's one link, and the API's own tester present, which runs once the link's
+  first session control has started communication ("Keeping a session alive" below), sends no
+  request while a primitive is outstanding (ISO 22900-2:2022 8.1.3 Table 1, ADR-419) and has its
+  own transmit indications discarded by the worker (ADR-099). A start-of-message indication that carries the exchange's
   response identifier is the first frame of its response, which counts as an answer of the ECU
   (design 8.11 "Link settings for the log", "Answer of the ECU"), unless an owed request on the
   link expecting a response on that identifier could own it (one that stays owed after a reopened
@@ -1128,7 +1150,8 @@ gates before and after each read.
    `Passive(ResetOutcomeUnknown)`.
 
 A passive teardown sends nothing further (when it follows a refused or unknown ECUReset, that
-reset was the last request; the agent runs no TesterPresent, so there is none to stop) and
+reset was the last request; the teardown's link is new, so no session control has started the
+worker's tester present on it and there is none to stop) and
 waits the flash session's `session_timeout_millis + teardown_margin_millis`, in steps of the
 job's `wait_poll`; a cancel during the wait ends the job in `JobError::Cancelled`.
 

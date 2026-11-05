@@ -1351,7 +1351,8 @@ pub(crate) fn completed_pass_interrupted(facts: &RecoveryFacts) -> bool {
 ///
 /// A passive teardown waits `timing.session_timeout_millis + timing.teardown_margin_millis` and
 /// sends nothing further meanwhile (after a refused or unknown reset, the reset was the last
-/// request): the agent runs no TesterPresent, so there is none to stop. The wait
+/// request): the teardown's link is new, so no session control has started the worker's tester
+/// present on it (ADR-420) and there is none to stop. The wait
 /// sleeps in steps of `poll` and checks `cancelled` at the start of each; a cancel ends it in
 /// [`JobError::Cancelled`]. A cancel set when the teardown starts ends it before anything, on
 /// the completed path too, and sends no reset; one that arrives while

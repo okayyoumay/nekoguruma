@@ -956,7 +956,10 @@ fn assert_comm_log(setup: &CommLogSetup) {
         ("CP_RC23Handling", "link"),
         ("CP_TransmitIndEnable", "link"),
         ("CP_StartMsgIndEnable", "link"),
-        ("CP_TesterPresentHandling", "library_default"),
+        // The keep-alive is on (ADR-420), so the link sets the tester present's ComParams.
+        ("CP_TesterPresentHandling", "link"),
+        ("CP_TesterPresentTime", "link"),
+        ("CP_TesterPresentMessage", "link"),
     ] {
         assert!(
             comparams

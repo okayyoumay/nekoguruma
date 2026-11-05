@@ -13,8 +13,10 @@ use diag_ir::{DiagHost, suppresses_positive_response};
 use tokio::runtime::Handle;
 use vci_service_interface::{
     CancelComPrimitiveRequest, ComOperationType, ComPrimitiveCtrlData, ComPrimitiveHandle,
-    ErrorData, EventItem, ExpectedResponseData, GetTimestampRequest, PduComPrimitiveStatus,
-    PduErrorEvent, StartComPrimitiveRequest, TimestampClock, event_item, event_notification,
+    ErrorData, EventItem, ExpectedResponseData, GetStatusRequest, GetTimestampRequest,
+    PduComLogicalLinkStatus, PduComPrimitiveStatus, PduErrorEvent, PduParamClass,
+    SetComParamRequest, StartComPrimitiveRequest, TimestampClock, event_item, event_notification,
+    get_status_request, param_item, status_response,
 };
 
 use crate::comm_log::exchange::{
@@ -23,7 +25,9 @@ use crate::comm_log::exchange::{
     SectionAttrs, SourcePos, Target, Timing, TransmitEvidence, UnknownCause, VciTime, VciTimes,
 };
 use crate::comm_log::{AgentNow, EndError, EndItem, EndRead, UnattachedData, UnattachedItem};
+use crate::keep_alive::{KeepAlive, LinkState, Switch};
 use crate::link::{CAN_SINGLE_FRAME_BYTES, CloseEvidence, Link, LinkConfig};
+use crate::oplog::LogSafe as _;
 use crate::send_receive::{Expectation, NegativeShape};
 
 /// The `link` of the host's exchange entries and of the log's `link_opened`: a job has one
@@ -162,6 +166,11 @@ pub enum HostError {
     /// can be resumed once the input can be read (ADR-338, ADR-288).
     #[error("the runtime input {0:?} cannot be established")]
     InputNotEstablished(diag_ir::RuntimeInput),
+    /// Switching the worker's tester-present on failed after a session was entered, so the
+    /// session is no longer kept alive; the request was refused before it was sent
+    /// (ADR-420 item 6). Which call failed is in the `keep_alive` entry of the communication log.
+    #[error("the keep-alive could not be switched on, so the session is no longer kept alive")]
+    KeepAliveFailed,
 }
 
 /// Whether a failed send-receive's request may have reached the ECU.
@@ -206,7 +215,8 @@ impl HostError {
             | HostError::ArtifactRange { .. }
             | HostError::Unsupported(_)
             | HostError::DeclaredLink(_)
-            | HostError::InputNotEstablished(_) => SendState::NotSent,
+            | HostError::InputNotEstablished(_)
+            | HostError::KeepAliveFailed => SendState::NotSent,
             // The worker refused the start after a lost VCI (ADR-294).
             HostError::VciLost {
                 refused_after_loss: true,
@@ -599,6 +609,9 @@ pub struct WorkerHost<C: WorkerApi> {
     /// agent opens one link per job, so only the primary, 0, can be served until one link per
     /// target exists (ADR-325 item 8). Kept by `reopen`; the VM is not told again.
     target: u8,
+    /// The agent's record of the link's keep-alive: the session, the link's state, the
+    /// tester-present handling and a failed switch (ADR-420). Starts over when a link opens.
+    keep_alive: KeepAlive,
 }
 
 /// The link that is open on the worker: the client it was opened on and its handles.
@@ -690,6 +703,7 @@ pub(crate) fn settle_worker<S: crate::client::WorkerSource + ?Sized>(
 
 impl<C: WorkerApi> WorkerHost<C> {
     pub fn new(handle: Handle, client: C, link: Link, timings: Timings) -> Self {
+        let keep_alive = KeepAlive::new(link.indications.tester_present);
         Self {
             handle,
             client,
@@ -712,6 +726,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             job_end_wait: crate::link::JOB_END_WAIT_MAX,
             relink: None,
             target: 0,
+            keep_alive,
         }
     }
 
@@ -740,6 +755,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             );
         }
         self.client = client;
+        self.keep_alive = KeepAlive::new(link.indications.tester_present);
         self.link = link;
         self.waits.clear();
         self.vbatt_id = crate::inputs::VbattId::Unknown;
@@ -1351,6 +1367,12 @@ impl<C: WorkerApi> WorkerHost<C> {
         progress: Progress,
         before: Option<AgentNow>,
     ) -> Result<Vec<u8>, HostError> {
+        // A failed switch of the keep-alive is reported at the next request (ADR-420 item 6).
+        if self.keep_alive.failed() {
+            let error = HostError::KeepAliveFailed;
+            self.log_refused(&request, before, &error, None);
+            return Err(error);
+        }
         // The link is the primary's; a request for another target cannot be served (ADR-409).
         if self.target != 0 {
             let error = HostError::Unsupported("a request to a target other than the primary");
@@ -1364,6 +1386,10 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// sends a request and writes its exchange entry.
     fn exchange(&mut self, request: Vec<u8>, progress: Progress, before: Option<AgentNow>) -> Sent {
         let collecting = progress.collecting;
+        // The link's first session control into a non-default session starts communication,
+        // and with it the worker's tester-present (ADR-420 item 3).
+        let start_comm = self.keep_alive.starts_comm(&request);
+        let sent_request = self.keep_alive.enabled().then(|| request.clone());
         let logged = before.map(|_| {
             let expected = Expected {
                 positive_prefix: progress.positive_prefix.clone(),
@@ -1382,7 +1408,13 @@ impl<C: WorkerApi> WorkerHost<C> {
         // carries as a single frame, whatever the addressing (`LinkConfig::single_frame`).
         let one_frame = request.len() <= CAN_SINGLE_FRAME_BYTES;
         let handle = self.handle.clone();
-        let mut sent = handle.block_on(self.send_recv_async(request, progress, logged.is_some()));
+        let cop_type = if start_comm {
+            ComOperationType::CoptStartcomm
+        } else {
+            ComOperationType::CoptSendrecv
+        };
+        let mut sent =
+            handle.block_on(self.send_recv_async(request, progress, logged.is_some(), cop_type));
         sent.silence_is_result(silent, one_frame);
         if let Some((request, expected, negative, sid)) = logged {
             // A request that collects every answer lists them; any other lists them when it got
@@ -1412,6 +1444,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
                 _ => sent_end(&request, &sent.result, &negative, sid),
             };
+            detail.cop_type = start_comm.then_some("startcomm");
             let end = deadline_end(end, sent.agent_deadline);
             let end = unanswered_end(end, &sent);
             let end_rejected = matches!(end, End::PositiveUnusable(_)) && sent.result.is_err();
@@ -1485,7 +1518,178 @@ impl<C: WorkerApi> WorkerHost<C> {
                 stray.exchange = stray.exchange.or(seq);
             }
         }
+        if let Some(request) = sent_request {
+            self.after_exchange(&request, start_comm, &sent.result);
+        }
         sent
+    }
+
+    /// What an exchange that ended as `result` changes in the keep-alive (ADR-420): the session
+    /// record and the link's state (resolved by the link's status when a start got no positive
+    /// answer), then the switch of the worker's tester-present they call for. The only writer
+    /// of the session record, since every request leaves through [`WorkerHost::exchange`].
+    fn after_exchange(
+        &mut self,
+        request: &[u8],
+        start_comm: bool,
+        result: &Result<Vec<u8>, HostError>,
+    ) {
+        let mut recorded = self.keep_alive.record(request, start_comm, result);
+        // A start that was not answered positively, or one whose status could not be read
+        // earlier: ask the link whether it reached COMM_STARTED (ADR-420 item 3).
+        if self.keep_alive.needs_status()
+            && let Some(started) = self.link_started()
+        {
+            self.keep_alive.resolved(started, &mut recorded);
+        }
+        let Some(switch) = self.keep_alive.wanted(recorded) else {
+            // A started link that is in a non-default session by the StartComm itself has its
+            // tester-present on since: the log shows it (ADR-420 item 7).
+            if start_comm
+                && self.keep_alive.link() == LinkState::Started
+                && self.keep_alive.handling()
+                && self.keep_alive.session() != crate::keep_alive::DEFAULT_SESSION
+            {
+                self.log_keep_alive("on", "start_comm", None);
+            }
+            return;
+        };
+        self.switch_handling(switch);
+    }
+
+    /// Asks the worker for the link's status (`GetStatus` of the logical link): whether it is
+    /// COMM_STARTED (`Some(true)`) or ONLINE (`Some(false)`); `None` when the answer fails or
+    /// names another state, and the link stays unknown until the next exchange asks again.
+    fn link_started(&mut self) -> Option<bool> {
+        let request = GetStatusRequest {
+            handle: Some(get_status_request::Handle::CllHandle(self.link.cll_handle)),
+        };
+        let handle = self.handle.clone();
+        let answer = handle.block_on(unary(
+            self.timings.unary,
+            "GetStatus",
+            self.client.get_status(request),
+        ));
+        match answer {
+            Ok(response) => match response.status {
+                Some(status_response::Status::CllStatus(status)) => {
+                    match PduComLogicalLinkStatus::try_from(status) {
+                        Ok(PduComLogicalLinkStatus::PduCllstCommStarted) => Some(true),
+                        Ok(PduComLogicalLinkStatus::PduCllstOnline) => Some(false),
+                        _ => None,
+                    }
+                }
+                _ => None,
+            },
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.log_text(),
+                    "could not read the link's status after a session control started it"
+                );
+                None
+            }
+        }
+    }
+
+    /// Switches the worker's tester-present on or off (ADR-418 item 4): sets
+    /// `CP_TesterPresentHandling` and applies it with a `CoptUpdateparam` primitive, whose
+    /// finished status is not waited for (the link runs its primitives in order, ISO 22900-2:2022
+    /// 8.4.17, so the next one starts after it). Never `CoptStopcomm`. A success is recorded
+    /// as the handling's new state; a failed switch-on is held for the next request
+    /// ([`HostError::KeepAliveFailed`]), a failed switch-off only logged (ADR-420 item 6).
+    fn switch_handling(&mut self, switch: Switch) {
+        let on = switch == Switch::On;
+        let handle = self.handle.clone();
+        let outcome = handle.block_on(self.send_handling(on));
+        let action = if on { "on" } else { "off" };
+        match outcome {
+            Ok(()) => {
+                self.keep_alive.switched(switch);
+                self.log_keep_alive(action, "update_param", None);
+            }
+            Err(error) => {
+                tracing::warn!(
+                    error = %error.log_text(),
+                    action,
+                    "could not switch the tester-present"
+                );
+                let mut detail = Detail {
+                    host_error: Some(host_error_name(&error)),
+                    ..Detail::default()
+                };
+                if let HostError::Rpc { status, .. } = &error {
+                    detail.grpc_status = Some(grpc_code_name(status.code()));
+                }
+                self.log_keep_alive(action, "update_param", Some(detail));
+                if on {
+                    self.keep_alive.fail();
+                }
+            }
+        }
+    }
+
+    /// The two calls of [`WorkerHost::switch_handling`].
+    async fn send_handling(&mut self, on: bool) -> Result<(), HostError> {
+        let name = crate::link::TESTER_PRESENT_HANDLING;
+        let id = unary(
+            self.timings.unary,
+            "GetObjectId",
+            self.client
+                .get_object_id(vci_service_interface::GetObjectIdRequest {
+                    object_type: vci_service_interface::ObjectType::ObjtComparam as i32,
+                    shortname: name.to_owned(),
+                }),
+        )
+        .await?
+        .pdu_object_id;
+        unary(
+            self.timings.unary,
+            "SetComParam",
+            self.client.set_com_param(SetComParamRequest {
+                cll_handle: Some(self.link.cll_handle),
+                param_item: Some(vci_service_interface::ParamItem {
+                    id: Some(param_item::Id::ParamId(id)),
+                    com_param_class: PduParamClass::PduPcTesterPresent as i32,
+                    param_data: Some(param_item::ParamData::Unum32(u32::from(on))),
+                }),
+            }),
+        )
+        .await?;
+        // No data and no control data: the primitive only applies the ComParams set on the link.
+        let tag = self.next_tag.to_be_bytes().to_vec();
+        self.next_tag = self.next_tag.wrapping_add(1);
+        unary(
+            self.timings.unary,
+            "StartComPrimitive",
+            self.client.start_com_primitive(StartComPrimitiveRequest {
+                cop_tag: Some(tag),
+                cll_handle: Some(self.link.cll_handle),
+                cop_type: ComOperationType::CoptUpdateparam as i32,
+                cop_data: Vec::new(),
+                cop_ctrl_data: None,
+            }),
+        )
+        .await?;
+        Ok(())
+    }
+
+    /// Writes the `keep_alive` entry of a switch of the tester-present to `action` by `means`,
+    /// when the host logs (design 8.11, ADR-420 item 7). `failure` is the switch's failure.
+    fn log_keep_alive(&self, action: &'static str, means: &'static str, failure: Option<Detail>) {
+        let (Some(log), Some((tx_id, rx_id))) = (&self.comm_log, self.link_ids) else {
+            return;
+        };
+        let target = Target::Endpoint {
+            link: LOG_LINK,
+            tx_id,
+            rx_id,
+        };
+        let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.keep_alive(target, LOG_LINK, action, means, failure);
+        }));
+        if written.is_err() {
+            tracing::warn!("writing a keep_alive entry panicked");
+        }
     }
 
     /// Sends the functional presence request and collects every answer to it until the VCI ends
@@ -1534,7 +1738,12 @@ impl<C: WorkerApi> WorkerHost<C> {
         request: Vec<u8>,
         mut progress: Progress,
         logged: bool,
+        cop_type: ComOperationType,
     ) -> Sent {
+        debug_assert!(
+            carries_a_request(cop_type),
+            "a request goes as a send-receive or as the StartComm that starts the keep-alive"
+        );
         let request_bytes = request.clone();
         // Every start carries a tag of its own, which the worker echoes on the primitive's items,
         // so a start that gets no answer can still be found on the event stream (ADR-416).
@@ -1543,7 +1752,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         let start = StartComPrimitiveRequest {
             cop_tag: Some(tag.clone()),
             cll_handle: Some(self.link.cll_handle),
-            cop_type: ComOperationType::CoptSendrecv as i32,
+            cop_type: cop_type as i32,
             cop_data: request,
             cop_ctrl_data: Some(ComPrimitiveCtrlData {
                 time: 0,
@@ -1982,6 +2191,16 @@ impl<C: WorkerApi> WorkerHost<C> {
             evidence.caused_by = caused_by;
         });
     }
+}
+
+/// Whether `cop_type` is a primitive a request goes as: a send-receive, or the StartComm that
+/// starts the keep-alive (ADR-420 item 3). Never a StopComm, which would cancel the link's queued
+/// and running primitives (ISO 22900-2:2022 8.2.6.3.3, ADR-418 item 4).
+fn carries_a_request(cop_type: ComOperationType) -> bool {
+    matches!(
+        cop_type,
+        ComOperationType::CoptSendrecv | ComOperationType::CoptStartcomm
+    )
 }
 
 /// The end an exchange's entry gives when the agent's own deadline (`agent_deadline`) ended the
@@ -3025,6 +3244,7 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::TransferInterrupted(_) => "TransferInterrupted",
         HostError::Setup(_) => "Setup",
         HostError::InputNotEstablished(_) => "InputNotEstablished",
+        HostError::KeepAliveFailed => "KeepAliveFailed",
     }
 }
 
@@ -4476,6 +4696,27 @@ mod tests {
                 ),
                 "{reading:?}"
             );
+        }
+    }
+
+    /// ADR-420 item 3: a request goes as a send-receive, or as the StartComm that starts the
+    /// keep-alive; the debug assertion of `send_recv_async` refuses every other primitive, a
+    /// StopComm above all, which would cancel the link's primitives.
+    #[test]
+    fn only_a_send_receive_or_a_start_comm_carries_a_request() {
+        for cop_type in [
+            ComOperationType::CoptSendrecv,
+            ComOperationType::CoptStartcomm,
+        ] {
+            assert!(carries_a_request(cop_type), "{cop_type:?}");
+        }
+        for cop_type in [
+            ComOperationType::CoptStopcomm,
+            ComOperationType::CoptUpdateparam,
+            ComOperationType::CoptDelay,
+            ComOperationType::CoptRestoreParam,
+        ] {
+            assert!(!carries_a_request(cop_type), "{cop_type:?}");
         }
     }
 

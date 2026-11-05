@@ -33,6 +33,7 @@ pub mod identification;
 pub mod inputs;
 pub mod journal;
 mod journaling;
+mod keep_alive;
 pub mod launch;
 pub mod link;
 pub mod logging;

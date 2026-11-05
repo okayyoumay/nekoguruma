@@ -497,6 +497,11 @@ pub(crate) struct Detail {
     /// The native library's return code, as a name or a number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_return_code: Option<String>,
+    /// The primitive the request went as, when it was not a send-receive: `startcomm` for the
+    /// session control that starts the link's communication, and with it the worker's
+    /// tester-present (ADR-420 item 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cop_type: Option<&'static str>,
 }
 
 /// What kind of error a link reported (design 8.11 "Link error").
@@ -8066,9 +8071,10 @@ mod tests {
             grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
             native_return_code: Some("f".to_owned()),
+            cop_type: Some("startcomm"),
         })
         .unwrap();
-        assert_eq!(keys(&detail).len(), 7);
+        assert_eq!(keys(&detail).len(), 8);
         let span = SourceSpan {
             pc: 1,
             file: 2,

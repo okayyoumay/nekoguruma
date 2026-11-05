@@ -1187,12 +1187,25 @@ fn kill_while_unanswered(
     // The program waits right before the request, so the fault is armed before it goes out,
     // and nothing else is sent in between to take it.
     env.wait_for(spec, "the wait before the request", WAIT_FOR_BLOCK, &parked);
+    // Aimed at the request: the job's link keeps its session alive (ADR-420), so the worker's
+    // tester-present may reach the ECU first, and an unaimed fault would be spent on it.
+    let hex: String = request.split_whitespace().skip(1).collect();
+    let bytes: Vec<String> = (0..hex.len())
+        .step_by(2)
+        .map(|at| {
+            u8::from_str_radix(&hex[at..at + 2], 16)
+                .expect("hex")
+                .to_string()
+        })
+        .collect();
     env.inject(&format!(
         concat!(
-            r#"{{"command": "inject_fault", "fault": {{"response_pending": "#,
+            r#"{{"command": "inject_fault", "request": [{}], "fault": {{"response_pending": "#,
             r#"{{"count": {}, "interval_ms": {}}}}}}}"#
         ),
-        PENDING_COUNT, PENDING_INTERVAL_MS
+        bytes.join(", "),
+        PENDING_COUNT,
+        PENDING_INTERVAL_MS
     ));
     env.wait_for(spec, request, WAIT_FOR_BLOCK, |state| {
         // A fault still waiting when the program has moved on was missed: fail on that. The

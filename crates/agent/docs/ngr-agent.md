@@ -60,8 +60,20 @@ session, sent while the link is still ONLINE, goes as a `CoptStartcomm` (`detail
 answer makes the host ask the link's status (`GetStatus`). From then on the agent switches
 `CP_TesterPresentHandling` by `CoptUpdateparam` as the host's session record (`keep_alive.rs`,
 written after every exchange) enters and leaves a non-default session, never by `CoptStopcomm`,
-and writes a `keep_alive` entry for each switch; a failed switch-on fails the next request with
-`HostError::KeepAliveFailed` before it is sent.
+and writes a `keep_alive` entry for each switch; a failed switch-on fails the next call (a
+request before it is sent, a `Wait` poll, a runtime read) with `HostError::KeepAliveFailed`.
+
+The link's event stream is read only inside a send-receive's wait and at job end, so the host
+also reads it, without waiting, at the start of each request, `Wait` poll and runtime read (the
+drain), and passes every notification of every reader through one observer (`KeepAlive::observe`,
+ADR-420 item 8). A tester-present error event is noted in a `keep_alive` entry (`action` `error`);
+it also makes the session lost when the session record holds a non-default session, and the
+next call then fails with `HostError::SessionLost`: a request is refused unsent (cause
+`session_lost`, `caused_by` the error's entry, `undetermined`), a `Wait` ends at its next poll,
+and the run ends in the host error without a repeat or a new link. An error read with the record
+in the default session, or after a lost VCI that ends the link, is logged only; a lost VCI the drain read is reported first (the request is refused after the loss and the link is opened again). A lost-events notice read outside an exchange with a session kept is the session lost too, with a `keep_alive` entry of `action` `events_lost` (the error may have been among the events lost). A stream that failed is reported by refusing the next request, unsent, with `HostError::StreamFailedBeforeSend` wrapping its status (a lost path is then reopened and the request sent; cause `stream_failed` in the log). What the drain reads that
+belongs to no exchange keeps its place in the log, and a lost VCI it reads makes the next request
+refused after the loss.
 
 The link's resource is named by the ISO 22900-2 (2022)
 short names of UDS on dual-wire CAN (Annex B.1, B.2), which both worker kinds resolve

@@ -308,8 +308,8 @@ fn a_run_starts_a_worker_that_crashed_again() {
 }
 
 async fn flow(paths: &TempPaths, setup: GuardSetup) {
-    safe_reads_go_on(paths, &setup).await;
-    unsafe_reads_end_on_site(paths, &setup).await;
+    reads_go_on(paths, &setup, Idempotency::Safe, "safe").await;
+    reads_go_on(paths, &setup, Idempotency::Unsafe, "unsafe").await;
     a_worker_dead_before_the_run_ends_it_in_the_link_error(&setup).await;
     a_start_the_system_refuses_is_a_spawn_failure().await;
 }
@@ -483,9 +483,11 @@ fn event<'a>(lines: &'a [serde_json::Value], event: &str) -> &'a serde_json::Val
         .unwrap_or_else(|| panic!("no {event} in {lines:#?}"))
 }
 
-async fn safe_reads_go_on(paths: &TempPaths, setup: &GuardSetup) {
-    let (run, lines, killed, slot) =
-        crash_during_the_wait(paths, setup, Idempotency::Safe, "safe").await;
+/// The worker crashes during the wait, so the next read is refused unsent by the host (the
+/// event stream failed, ADR-420 item 8) and sent again on the new worker, whatever its
+/// idempotency: it never reached the ECU, so even an `Unsafe` read goes on.
+async fn reads_go_on(paths: &TempPaths, setup: &GuardSetup, idempotency: Idempotency, name: &str) {
+    let (run, lines, killed, slot) = crash_during_the_wait(paths, setup, idempotency, name).await;
     let JobRun {
         result,
         guards,
@@ -539,50 +541,6 @@ async fn safe_reads_go_on(paths: &TempPaths, setup: &GuardSetup) {
         .take()
         .expect("the slot holds a worker");
     assert_eq!(process.id().map(u64::from), Some(restarted));
-    assert_eq!(
-        process
-            .stop(Duration::from_secs(5))
-            .await
-            .expect("worker should stop"),
-        Stopped::Exited
-    );
-}
-
-async fn unsafe_reads_end_on_site(paths: &TempPaths, setup: &GuardSetup) {
-    // An `Unsafe` read that may have reached the ECU is not sent again, so the run starts no
-    // worker and ends where the crash caught it.
-    let (run, lines, killed, slot) =
-        crash_during_the_wait(paths, setup, Idempotency::Unsafe, "unsafe").await;
-    let JobRun {
-        result,
-        guards,
-        comm_log: _,
-    } = run;
-    let text = || format!("{lines:#?}");
-    assert!(
-        matches!(&result, Err(JobError::OnSiteInterventionRequired(_))),
-        "{result:?}\n{}",
-        text()
-    );
-    assert_eq!(
-        crash_events(&lines),
-        ["vci_connected", "link_opened", "worker_exit"],
-        "{}",
-        text()
-    );
-    let exit = event(&lines, "worker_exit");
-    assert_eq!(exit["pid"], killed, "{exit}");
-    assert_eq!(exit["exit"], killed_exit(), "{exit}");
-    // The dead worker was reaped at the run's end, so its link counts as closed with no close
-    // made through it, which would have failed and marked the guards.
-    assert!(!guards.link_unconfirmed(), "{}", text());
-    drop(guards);
-    // The process in the slot is the dead one, already reaped: stopping it finds it gone.
-    let process = slot
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the slot holds a worker");
     assert_eq!(
         process
             .stop(Duration::from_secs(5))

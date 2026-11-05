@@ -4295,12 +4295,41 @@ def main():
             RepeatDecision::End
         );
         // Refusals that do not pass, and errors of the link's set-up, end the run.
-        for error in [HostError::Setup("link"), HostError::NotAllowed(0x10)] {
+        // A request refused because the event stream failed before it started (ADR-420 item
+        // 8) was never sent: a lost path opens the link again and sends it whatever its
+        // idempotency, any other failure ends the run.
+        let stream_failed = |code| {
+            HostError::StreamFailedBeforeSend(Box::new(HostError::Rpc {
+                rpc: "SubscribeEvent",
+                status: Box::new(tonic::Status::new(code, "x")),
+            }))
+        };
+        for pc in [1, 4] {
             assert_eq!(
-                decide(1, &error, 0, Some(&some)),
-                RepeatDecision::End,
-                "{error:?}"
+                decide(pc, &stream_failed(tonic::Code::Unavailable), 0, Some(&some)),
+                RepeatDecision::ReopenThenRepeat
             );
+            assert_eq!(
+                decide(pc, &stream_failed(tonic::Code::Internal), 0, Some(&some)),
+                RepeatDecision::End
+            );
+        }
+        // A lost session (ADR-420 item 8) and a failed switch-on of the keep-alive are refused
+        // unsent and are neither sent again nor followed by a new link, whatever the
+        // idempotency of the request.
+        for error in [
+            HostError::Setup("link"),
+            HostError::NotAllowed(0x10),
+            HostError::SessionLost,
+            HostError::KeepAliveFailed,
+        ] {
+            for pc in [1, 4] {
+                assert_eq!(
+                    decide(pc, &error, 0, Some(&some)),
+                    RepeatDecision::End,
+                    "{error:?}"
+                );
+            }
         }
         // A lost path to the VCI (ADR-393): a request that may have reached the ECU is sent
         // again, on a new link, only when it is safe to repeat, within the bound.

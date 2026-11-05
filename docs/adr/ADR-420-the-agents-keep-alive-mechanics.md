@@ -160,9 +160,15 @@ worker kinds and does not branch on which it is.
      event code, not by whether it names a primitive, since the J2534 worker's first
      tester-present of a switch-on runs inside the `CoptUpdateparam` primitive and its error may
      carry that handle; it is never taken as the result of the primitive it names or of the
-     exchange that read it (an error naming an earlier primitive stays an unbound item of the
-     exchange). A lost VCI read makes the errors after it unlatched until the link opens again
-     (ADR-393), so the loss, not the lapsed session, is what the run reports.
+     exchange that read it: an error of any handle, the exchange's own included (the J2534 worker
+     raises the first one with the StartComm's handle before its finished status), stays an
+     unbound item and never ends the exchange, so a StartComm's positive answer or the silence of
+     a suppressed one is not turned into a failure. A lost VCI that ends the link (one of no
+     primitive or of the primitive waited for, ADR-294) makes the errors after it unlatched until
+     the link opens again (ADR-393), and one the drain read before the report point is what the
+     run reports: the next request is refused after the loss and the host opens the link again,
+     which ends a latch read before it. The loss, not the lapsed session, is what the run
+     reports, as it is for the same items read inside an exchange.
    - The drain (`WorkerHost::drain_link_items`) reads the stream without waiting at the start of
      `send`, `wait` and `runtime_input` (one poll of the read per notification; a read that
      would wait is dropped, which `tonic::Streaming::message` allows without loss). It does not
@@ -172,10 +178,22 @@ worker kinds and does not branch on which it is.
      placement is the one the exchange would have given them; what no exchange takes goes to the
      log at job end. A lost VCI of no primitive is kept, and the next request is refused as
      `VciLost { refused_after_loss: true }` without being sent, as the worker would refuse it
-     (ADR-294); it enters the exchange entry as the lost VCI's error. A stream that ended or
-     failed is dropped, so the next request fails on it as it does without the drain. A
-     lost-events notice read outside an exchange changes no outcome and is written to the
-     operational log only.
+     (ADR-294); it enters the exchange entry as the lost VCI's error. A stream that ended is
+     dropped, so the next request starts its primitive and fails on it as it does without the
+     drain; one that failed with a status is kept, and the next request is refused with that
+     status (`HostError::Rpc` of `SubscribeEvent`, as the wait would have given it) before
+     anything is sent, since no answer can be read from it. What the drain read that no exchange
+     took (results, indications, an earlier primitive's timeout, as well as link errors) is
+     placed by the same code as an exchange's unbound items (ADR-397) when the session is
+     refused, at reopen and at job end, with no exchange in flight; the drain also runs once
+     at job end, so an error queued after the VM's last call is logged.
+   - Lost events. A lost-events notice read outside an exchange (by the drain, a tag wait or the
+     job-end settlement) while the record holds a non-default session and the handling is on is
+     the session lost, latched and reported like a tester-present error: the error may have been
+     among the events lost (the maintainer's decision, 2026-11-05). The log gets a `keep_alive`
+     entry with `action` `events_lost` and `session_lost` `true`. Outside that state it changes
+     no outcome (a notice inside an exchange ends it as lost events as before) and is written to
+     the operational log only.
    - The latch is reported by `check_session` at the start of `send` (the request is refused
      unsent, `NotSent`, `Other`, so `repeat_decision` ends the run and the request marker is
      withdrawn as not sent), of `wait` (a `Wait` ends at its next poll) and of `runtime_input`.
@@ -188,8 +206,9 @@ worker kinds and does not branch on which it is.
      error information (ADR-351), `link_error` `tester_present`, the agent's time and no VCI time
      of its own. Its `refers_to` names the entries that placed the item's VCI time: the exchange
      entry that took it and the `unattached` or `late_item` lines the log wrote for it, so the
-     time is placed once. The entry is written once those exist, not when the error is read: after
-     the exchange entry, after the lines the drain's items get, or at job end. The refused
+     time is placed once; with one such line per error, each entry refers to the line that
+     placed its own error. The entry is written once those exist, not when the error is read:
+     after the exchange entry, after the lines the drain's items get, or at job end. The refused
      request's entry has the cause `session_lost`, `caused_by` the error entry, and the
      classification `undetermined` (design 8.11).
 

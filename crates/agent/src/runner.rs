@@ -20818,6 +20818,36 @@ def main():
         assert!(journal.journal().state().facts.last_request_withdrawn());
     }
 
+    /// ADR-420 item 8: a request refused for a lost session was never sent, so the run ends in
+    /// the host error at once (no resend, no new link) and the request's marker is withdrawn as
+    /// not sent, as it is for any other refusal before the start.
+    #[test]
+    fn a_request_refused_for_a_lost_session_ends_the_run_with_its_marker_withdrawn() {
+        let program = plain_steps(&[(0x22, Safe), (0x10, Unsafe), (0x3E, Safe)]);
+        let (result, host, journal) = run_repeating(
+            &program,
+            after_loss_limits(),
+            &AtomicBool::new(false),
+            |host| {
+                host.fail_service = Some((0x10, [HostError::SessionLost].into()));
+                host.reopen_script = [ReopenAttempt::Opened].into();
+            },
+        );
+        assert!(
+            matches!(
+                &result,
+                Err(JobError::Host {
+                    source: HostError::SessionLost,
+                    ..
+                })
+            ),
+            "{result:?}"
+        );
+        assert_eq!(sends_of(&host, 0x10), 1);
+        assert_eq!(host.reopen_calls, 0);
+        assert!(journal.journal().state().facts.last_request_withdrawn());
+    }
+
     /// Each resend of a step is announced to the host (`step_resends`), which is what gives its
     /// exchange the origin `repeat`: two failures, two announcements, none for the first send
     /// or the next arrival.
@@ -23843,6 +23873,70 @@ def main():
             const TESTER_PRESENT_ERROR: vci_service_interface::PduErrorEvent =
                 vci_service_interface::PduErrorEvent::PduErrEvtTesterPresentError;
 
+            type Events = Arc<Mutex<Option<EventSender>>>;
+
+            fn send_notification(
+                events: &Events,
+                notification: Result<vci_service_interface::EventNotification, tonic::Status>,
+            ) {
+                let sender = events
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .expect("the link is subscribed");
+                let _ = sender.send(notification);
+            }
+
+            /// A received message of no primitive, as another node's answer.
+            fn inject_result(events: &Events, at: u32) {
+                send_notification(
+                    events,
+                    Ok(vci_service_interface::EventNotification {
+                        event_data: Some(
+                            vci_service_interface::event_notification::EventData::Item(
+                                vci_service_interface::EventItem {
+                                    timestamp: at,
+                                    data: Some(
+                                        vci_service_interface::event_item::Data::ResultData(
+                                            vci_service_interface::ResultData {
+                                                data_bytes: vec![0x62, 0xF1, 0x90, 0x41],
+                                                ..Default::default()
+                                            },
+                                        ),
+                                    ),
+                                    ..Default::default()
+                                },
+                            ),
+                        ),
+                        ..Default::default()
+                    }),
+                );
+            }
+
+            fn inject_lost_events(events: &Events) {
+                send_notification(
+                    events,
+                    Ok(vci_service_interface::EventNotification {
+                        event_data: Some(
+                            vci_service_interface::event_notification::EventData::Lost(
+                                Default::default(),
+                            ),
+                        ),
+                        ..Default::default()
+                    }),
+                );
+            }
+
+            /// Polls the host's waits for a while, so what the test gave the stream has arrived
+            /// and been taken in; a wait that fails stops it with that error.
+            fn poll_waits(host: &mut WorkerHost<WorkerClient>) -> Result<(), HostError> {
+                for _ in 0..30 {
+                    host.wait(1, 600_000)?;
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Ok(())
+            }
+
             /// Calls `call` every 10 ms until it gives a value, for at most ten seconds: the event the
             /// test gave the stream takes a moment to reach the host.
             fn until<T>(mut call: impl FnMut() -> Option<T>) -> T {
@@ -24360,6 +24454,203 @@ def main():
                 .unwrap();
                 assert!(matches!(lost, HostError::SessionLost));
                 assert!(after.is_ok(), "{after:?}");
+            }
+
+            /// A drain batch of a tester-present error then a lost VCI reports the loss, as the
+            /// same two items inside an exchange do: the request is refused after the loss, so
+            /// the host opens the link again (which ends the latch), not a lost session.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_lost_vci_read_with_a_tester_present_error_is_the_loss_that_is_reported() {
+                let (results, _) = keep_host(
+                    Setup::default(),
+                    &[POSITIVE_02, READ_ANSWERED],
+                    None,
+                    |host, events| {
+                        host.service_request(0x10, &[0x02]).unwrap();
+                        inject(events, None, TESTER_PRESENT_ERROR, 4_000);
+                        inject(
+                            events,
+                            None,
+                            vci_service_interface::PduErrorEvent::PduErrEvtLostCommToVci,
+                            5_000,
+                        );
+                        let waits = poll_waits(host);
+                        (waits, host.service_request(0x22, &[0xF1, 0x90]))
+                    },
+                )
+                .await;
+                let (waits, request) = results;
+                assert!(waits.is_ok(), "{waits:?}");
+                assert!(
+                    matches!(
+                        request,
+                        Err(HostError::VciLost {
+                            refused_after_loss: true
+                        })
+                    ),
+                    "{request:?}"
+                );
+            }
+
+            /// A failed stream the drain finds is kept with its status and the next request is
+            /// refused with it before anything is sent; a stream that merely ended lets the
+            /// request start its primitive and fail on it, as without the drain.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_stream_the_drain_finds_failed_refuses_the_next_request_with_its_status() {
+                let (results, fake) =
+                    keep_host(Setup::default(), &[READ_ANSWERED], None, |host, events| {
+                        send_notification(events, Err(tonic::Status::internal("broken")));
+                        let waits = poll_waits(host);
+                        (waits, host.service_request(0x22, &[0xF1, 0x90]))
+                    })
+                    .await;
+                let (waits, request) = results;
+                assert!(waits.is_ok(), "{waits:?}");
+                match request {
+                    Err(HostError::Rpc { rpc, status }) => {
+                        assert_eq!(rpc, "SubscribeEvent");
+                        assert_eq!(status.code(), tonic::Code::Internal);
+                    }
+                    other => panic!("{other:?}"),
+                }
+                // Nothing was started.
+                assert!(fake.keep.types().is_empty());
+
+                let (request, fake) =
+                    keep_host(Setup::default(), &[READ_ANSWERED], None, |host, events| {
+                        *events.lock().unwrap() = None;
+                        poll_waits(host).unwrap();
+                        host.service_request(0x22, &[0xF1, 0x90])
+                    })
+                    .await;
+                assert!(
+                    matches!(request, Err(HostError::EventStreamEnded)),
+                    "{request:?}"
+                );
+                assert_eq!(fake.keep.types().len(), 1);
+            }
+
+            /// The J2534 worker raises the first tester-present of a StartComm with the
+            /// StartComm's own handle, before its finished status. It is not the primitive's
+            /// error: a positive answer and the silence of a suppressed one stay what they are,
+            /// and the handling the StartComm left on is not switched off.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_tester_present_error_of_the_start_comm_s_own_handle_is_not_its_result() {
+                const TP_POSITIVE: &[Step] = &[
+                    Step::TesterPresentError(Bound::Own, 500_000),
+                    Step::Bytes(600_000, &[0x50, 0x02]),
+                    FINISH,
+                ];
+                const TP_SILENT: &[Step] = &[
+                    Step::TesterPresentError(Bound::Own, 500_000),
+                    Step::TimeOut(1_000_000),
+                    FINISH,
+                ];
+                let run = keep_run(Setup::default(), &[TP_POSITIVE], &[DSC_02], None).await;
+                assert_eq!(shown(&run.results), [Ok(vec![0x50, 0x02])]);
+                assert_eq!(run.types(), [Startcomm]);
+                assert_eq!(run.handling(), [1]);
+                let run = keep_run(Setup::default(), &[TP_SILENT], &[DSC_82], None).await;
+                assert_eq!(shown(&run.results), [Ok(Vec::new())]);
+                assert_eq!(run.types(), [Startcomm]);
+                assert_eq!(run.handling(), [1]);
+            }
+
+            /// Items the drain read that are not link errors keep their place when the session
+            /// is lost: the result is written `unattached` at the refusal, and the error entry
+            /// refers to the line that placed the error, not the result's.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn what_the_drain_read_is_logged_when_the_session_is_lost() {
+                let (dir, log) = opened_log("drained-result-lost");
+                let (results, _) = keep_host(
+                    Setup::default(),
+                    &[POSITIVE_02],
+                    Some(log),
+                    |host, events| {
+                        host.log(1, "begin");
+                        host.service_request(0x10, &[0x02]).unwrap();
+                        inject_result(events, 3_000);
+                        inject(events, None, TESTER_PRESENT_ERROR, 4_000);
+                        until(|| host.wait(1, 60_000).err())
+                    },
+                )
+                .await;
+                assert!(matches!(results, HostError::SessionLost));
+                let lines = comm_log_lines(&dir);
+                let received = lines
+                    .iter()
+                    .find(|line| line["event"] == "unattached" && line["item"] == "received")
+                    .expect("the drained result is logged");
+                let errors = error_entries(&lines);
+                assert_eq!(errors.len(), 1, "{lines:?}");
+                let refers = errors[0]["refers_to"].as_array().unwrap();
+                assert_eq!(refers.len(), 1, "{lines:?}");
+                assert_ne!(refers[0], received["seq"]);
+                let placed = lines.iter().find(|line| line["seq"] == refers[0]).unwrap();
+                assert!(
+                    placed["error_event"] == "PDU_ERR_EVT_TESTER_PRESENT_ERROR"
+                        || placed["item"]["error_event"] == "PDU_ERR_EVT_TESTER_PRESENT_ERROR",
+                    "{placed}"
+                );
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+
+            /// The maintainer's decision of 2026-11-05: a lost-events notice read outside an
+            /// exchange, with a session kept, is the session lost (the error may have been among
+            /// the events lost), with its own `keep_alive` entry. In the default session it is
+            /// not.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_lost_events_notice_outside_an_exchange_is_a_lost_session_when_one_is_kept() {
+                let (dir, log) = opened_log("lost-events-kept");
+                let (results, _) = keep_host(
+                    Setup::default(),
+                    &[POSITIVE_02],
+                    Some(log),
+                    |host, events| {
+                        host.service_request(0x10, &[0x02]).unwrap();
+                        inject_lost_events(events);
+                        until(|| host.wait(1, 60_000).err())
+                    },
+                )
+                .await;
+                assert!(matches!(results, HostError::SessionLost));
+                let lines = comm_log_lines(&dir);
+                let entry = lines
+                    .iter()
+                    .find(|line| line["event"] == "keep_alive" && line["action"] == "events_lost")
+                    .expect("the entry");
+                assert_eq!(entry["session_lost"], true);
+                assert_eq!(entry["origin"], "keep_alive");
+                std::fs::remove_dir_all(&dir).unwrap();
+
+                let (waits, _) = keep_host(Setup::default(), &[], None, |host, events| {
+                    inject_lost_events(events);
+                    poll_waits(host)
+                })
+                .await;
+                assert!(waits.is_ok(), "{waits:?}");
+            }
+
+            /// A tester-present error that came after the VM's last call is read and logged at
+            /// job end even with no stray primitive, and nothing is reported.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn a_tester_present_error_queued_after_the_last_call_is_logged_at_job_end() {
+                let (dir, log) = opened_log("queued-at-end");
+                let (_, _) = keep_host(
+                    Setup::default(),
+                    &[POSITIVE_02],
+                    Some(log),
+                    |host, events| {
+                        host.service_request(0x10, &[0x02]).unwrap();
+                        inject(events, None, TESTER_PRESENT_ERROR, 4_000);
+                        std::thread::sleep(Duration::from_millis(300));
+                        host.settle_at_end();
+                    },
+                )
+                .await;
+                let lines = comm_log_lines(&dir);
+                assert_eq!(error_entries(&lines).len(), 1, "{lines:?}");
+                std::fs::remove_dir_all(&dir).unwrap();
             }
         }
     }

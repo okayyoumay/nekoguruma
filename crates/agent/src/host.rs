@@ -630,6 +630,9 @@ pub struct WorkerHost<C: WorkerApi> {
     /// The `seq` of the `keep_alive` entry of the error that made the session lost, once
     /// written: the `caused_by` of the refusals that follow.
     loss_entry: Option<u64>,
+    /// The failure of the event stream that the drain read: the next request is refused with it
+    /// before anything is sent.
+    stream_failed: Option<HostError>,
 }
 
 /// The link that is open on the worker: the client it was opened on and its handles.
@@ -748,6 +751,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             pending_unbound: Vec::new(),
             vci_lost_read: None,
             loss_entry: None,
+            stream_failed: None,
         }
     }
 
@@ -782,6 +786,7 @@ impl<C: WorkerApi> WorkerHost<C> {
         self.pending_unbound.clear();
         self.vci_lost_read = None;
         self.loss_entry = None;
+        self.stream_failed = None;
         self.link = link;
         self.waits.clear();
         self.vbatt_id = crate::inputs::VbattId::Unknown;
@@ -981,6 +986,8 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// Every result and error item of the link read meanwhile, of the primitive, of none or of an
     /// earlier one, goes to the log with it, in read order (ADR-386).
     pub(crate) fn settle_at_end(&mut self) {
+        // What the link holds after the VM's last call is read too (nothing is reported).
+        self.drain_link_items();
         let owner = self
             .stray
             .as_ref()
@@ -1049,7 +1056,12 @@ impl<C: WorkerApi> WorkerHost<C> {
                         };
                         match events.message().await {
                             Ok(Some(notification)) => {
-                                keep.observe(&notification, log.map(|log| log.now()));
+                                keep.observe(
+                                    &notification,
+                                    log.map(|log| log.now()),
+                                    Some(cop),
+                                    false,
+                                );
                                 // A lost-events notice ends the wait as it does an exchange's.
                                 let lost = matches!(
                                     notification.event_data,
@@ -1474,9 +1486,16 @@ impl<C: WorkerApi> WorkerHost<C> {
                 sent.vci_lost = Some(lost);
                 sent
             }
-            None => {
-                handle.block_on(self.send_recv_async(request, progress, logged.is_some(), cop_type))
-            }
+            None => match self.stream_failed.take() {
+                // The drain found the stream failed: no answer could be read.
+                Some(error) => Sent::not_started(Err(error)),
+                None => handle.block_on(self.send_recv_async(
+                    request,
+                    progress,
+                    logged.is_some(),
+                    cop_type,
+                )),
+            },
         };
         // What the drain read in front of the request's own items (ADR-372, ADR-386).
         sent.unbound
@@ -1652,7 +1671,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// session first. The error of a lost session is written to the log first, with the items
     /// the drain read, so the call's refusal can name its entry.
     fn check_session(&mut self) -> Result<(), HostError> {
-        if self.keep_alive.session_lost() {
+        // A lost VCI the drain read is what the run reports: the next request is refused after
+        // the loss, and the host opens the link again, which ends the latch (ADR-393).
+        if self.keep_alive.session_lost() && self.vci_lost_read.is_none() {
             self.flush_pending(&[]);
             return Err(HostError::SessionLost);
         }
@@ -1675,20 +1696,20 @@ impl<C: WorkerApi> WorkerHost<C> {
         }
         let _enter = self.handle.enter();
         let log = self.comm_log.as_ref().filter(|log| log.is_open());
-        let mut ended = false;
+        let mut drained = Drained::Idle;
         if let Some(events) = self.link.events.as_mut() {
             let keep = &mut self.keep_alive;
             let pending = &mut self.pending_unbound;
             let lost_vci = &mut self.vci_lost_read;
-            ended = drain_ready(events, |notification| {
+            drained = drain_ready(events, |notification| {
                 let read = log.map(|log| log.now());
-                keep.observe(&notification, read);
+                keep.observe(&notification, read, None, false);
                 match notification.event_data {
                     Some(event_notification::EventData::Item(item)) => {
                         take_drained(item, read, pending, lost_vci, log.is_some());
                     }
-                    // Dropped events outside an exchange change no outcome: nothing is
-                    // pending that they could have been the end of.
+                    // Dropped events outside an exchange end no exchange; with a session kept
+                    // the observer takes them as the session lost.
                     Some(event_notification::EventData::Lost(_)) => {
                         tracing::warn!("the worker dropped events of the link between requests");
                     }
@@ -1696,8 +1717,20 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
             });
         }
-        if ended {
-            self.link.events = None;
+        match drained {
+            Drained::Idle => {}
+            // The next request starts its primitive and finds the stream ended, as it would
+            // without the drain.
+            Drained::Ended => self.link.events = None,
+            // The failure is kept for the next request, which is refused with it before
+            // anything is sent: no answer can be read from a failed stream.
+            Drained::Failed(status) => {
+                self.link.events = None;
+                self.stream_failed = Some(HostError::Rpc {
+                    rpc: "SubscribeEvent",
+                    status: Box::new(status),
+                });
+            }
         }
     }
 
@@ -1729,29 +1762,51 @@ impl<C: WorkerApi> WorkerHost<C> {
             return;
         };
         let lines = log.take_tester_present_lines();
-        for error in seen {
+        // With one line per error, each refers to the line that placed its own; otherwise (an
+        // exchange took some as its own link errors) each refers to all of them.
+        let one_each = lines.len() == seen.len();
+        for (index, error) in seen.into_iter().enumerate() {
             let target = Target::Endpoint {
                 link: LOG_LINK,
                 tx_id,
                 rx_id,
             };
-            let detail = Detail {
-                error_event: Some(error_event_name(
-                    PduErrorEvent::PduErrEvtTesterPresentError as i32,
-                )),
-                extra_error_info: error.extra_error_info,
-                extra_error_info_name: error.extra_error_info_name,
-                ..Detail::default()
+            let (action, detail, link_error) = if error.events_lost {
+                ("events_lost", None, None)
+            } else {
+                (
+                    "error",
+                    Some(Detail {
+                        error_event: Some(error_event_name(
+                            PduErrorEvent::PduErrEvtTesterPresentError as i32,
+                        )),
+                        extra_error_info: error.extra_error_info,
+                        extra_error_info_name: error.extra_error_info_name,
+                        ..Detail::default()
+                    }),
+                    Some(LinkErrorKind::TesterPresent),
+                )
             };
-            let refers_to: Vec<u64> = lines.iter().chain(placed).copied().collect();
+            let mut refers_to: Vec<u64> = if one_each {
+                vec![lines[index]]
+            } else if error.events_lost {
+                Vec::new()
+            } else {
+                lines.clone()
+            };
+            refers_to.extend(placed.iter().filter(|_| !error.events_lost));
             let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 log.keep_alive_error(
                     target,
                     LOG_LINK,
-                    detail,
-                    error.latched,
-                    error.read,
-                    refers_to,
+                    crate::comm_log::KeepAliveError {
+                        action,
+                        detail,
+                        link_error,
+                        session_lost: error.latched,
+                        read: error.read,
+                        refers_to,
+                    },
                 )
             }));
             match written {
@@ -2170,6 +2225,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                 keep.observe(
                     &notification,
                     log.filter(|log| log.is_open()).map(|log| log.now()),
+                    Some(cop),
+                    true,
                 );
                 // The cancelled primitive's own items go to its end; lost events and a lost
                 // VCI end this exchange too.
@@ -2454,17 +2511,28 @@ impl EventSource for tonic::Streaming<vci_service_interface::EventNotification> 
     }
 }
 
-/// Hands `take` every notification `source` gives without waiting, in order. Returns whether the
-/// stream ended or failed. The read that finds nothing ready is dropped unfinished.
+/// How [`drain_ready`] stopped.
+enum Drained {
+    /// Nothing more is ready.
+    Idle,
+    /// The stream ended.
+    Ended,
+    /// The stream failed with this status.
+    Failed(tonic::Status),
+}
+
+/// Hands `take` every notification `source` gives without waiting, in order, and says how it
+/// stopped. The read that finds nothing ready is dropped unfinished.
 fn drain_ready<S: EventSource>(
     source: &mut S,
     mut take: impl FnMut(vci_service_interface::EventNotification),
-) -> bool {
+) -> Drained {
     loop {
         match poll_now(source.next_message()) {
-            None => return false,
+            None => return Drained::Idle,
             Some(Ok(Some(notification))) => take(notification),
-            Some(Ok(None) | Err(_)) => return true,
+            Some(Ok(None)) => return Drained::Ended,
+            Some(Err(status)) => return Drained::Failed(status),
         }
     }
 }
@@ -2829,7 +2897,7 @@ async fn resolve_tag(
                 Ok(None) | Err(_) => return TagWait::Dropped,
             };
             let read = log.filter(|log| log.is_open()).map(|log| log.now());
-            keep.observe(&notification, read);
+            keep.observe(&notification, read, stray.cop, false);
             let item = match notification.event_data {
                 Some(event_notification::EventData::Item(item)) => item,
                 // Every later item of the primitive carries the tag, so the wait goes on; the
@@ -4078,9 +4146,17 @@ impl Progress {
                 refused_after_loss: false,
             }));
         }
+        // A tester-present error of any handle is the worker's own tester-present reporting, not
+        // this primitive's end (the J2534 worker raises the first one with the StartComm's
+        // handle before its finished status, ADR-420 item 8): it is kept as an unbound item.
+        let tester_present = matches!(
+            &item.data,
+            Some(event_item::Data::ErrorData(data))
+                if data.error_event == PduErrorEvent::PduErrEvtTesterPresentError as i32
+        );
         // Events of earlier primitives, and of none, are not this request's; their results and
         // errors are kept for the communication log.
-        if item.cop_handle != Some(cop) {
+        if item.cop_handle != Some(cop) || tester_present {
             if matches!(
                 item.data,
                 Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_))
@@ -4817,17 +4893,30 @@ mod tests {
             .into(),
         );
         let mut taken = 0;
-        assert!(!drain_ready(&mut source, |_| taken += 1));
+        assert!(matches!(
+            drain_ready(&mut source, |_| taken += 1),
+            Drained::Idle
+        ));
         assert_eq!(taken, 2);
         // The third item was behind the pending read; the script then runs out, which is an
         // end.
-        assert!(drain_ready(&mut source, |_| taken += 1));
+        assert!(matches!(
+            drain_ready(&mut source, |_| taken += 1),
+            Drained::Ended
+        ));
         assert_eq!(taken, 3);
         let mut ended = Scripted([Feed::Item(rx_error()), Feed::End].into());
-        assert!(drain_ready(&mut ended, |_| taken += 1));
+        assert!(matches!(
+            drain_ready(&mut ended, |_| taken += 1),
+            Drained::Ended
+        ));
         assert_eq!(taken, 4);
+        // A failure keeps its status.
         let mut failed = Scripted([Feed::Fail].into());
-        assert!(drain_ready(&mut failed, |_| taken += 1));
+        assert!(matches!(
+            drain_ready(&mut failed, |_| taken += 1),
+            Drained::Failed(status) if status.code() == tonic::Code::Internal
+        ));
         assert_eq!(taken, 4);
         // A future that is never ready is dropped, and `poll_now` says so.
         assert_eq!(poll_now(std::future::pending::<u8>()), None);

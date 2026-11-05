@@ -812,7 +812,13 @@ fn a_worker_crashed_mid_transfer_is_restarted_like_a_killed_agent() {
         &env,
         &spec,
         &crash,
-        |cause| matches!(cause, HostError::Rpc { status, .. } if status.code() == tonic::Code::Unavailable),
+        // The dead worker's event stream fails while the `Wait` runs, which the host reads at the
+        // `Wait`'s next poll and reports by refusing the next request with that failure
+        // (ADR-420 item 8); a request that reached the worker first fails to start instead.
+        |cause| {
+            matches!(cause, HostError::Rpc { rpc, status }
+                if status.code() == tonic::Code::Unavailable || *rpc == "SubscribeEvent")
+        },
     );
     assert!(
         crash.link_unconfirmed,

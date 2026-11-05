@@ -8,7 +8,9 @@
 
 use crate::comm_log::AgentNow;
 use crate::host::HostError;
-use vci_service_interface::{EventNotification, PduErrorEvent, event_item, event_notification};
+use vci_service_interface::{
+    ComPrimitiveHandle, EventNotification, PduErrorEvent, event_item, event_notification,
+};
 
 /// The sub-function of the default session.
 pub(crate) const DEFAULT_SESSION: u8 = 0x01;
@@ -69,6 +71,9 @@ pub(crate) struct KeepAlive {
 /// A tester-present error event ([`KeepAlive::observe`]) read from the link's event stream.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct TesterPresentSeen {
+    /// A lost-events notice read outside an exchange while a session was kept (ADR-420 item 8):
+    /// the tester-present error may have been among the events lost.
+    pub(crate) events_lost: bool,
     /// The extra error information as the worker gave it (ADR-351): its code and its name.
     pub(crate) extra_error_info: Option<u32>,
     pub(crate) extra_error_info_name: Option<String>,
@@ -117,11 +122,40 @@ impl KeepAlive {
     /// the log; it also makes the session lost when the session record holds a non-default
     /// session and no loss is latched yet. A lost VCI is noted so that errors read after it
     /// latch nothing. Returns whether the notification was a tester-present error.
+    ///
+    /// `own` is the primitive the reader waits for, `in_exchange` whether the reader is the wait
+    /// of an exchange. A lost-events notice read outside an exchange, while the record holds a
+    /// non-default session and the handling is on, makes the session lost too: the error may
+    /// have been among the events lost (the maintainer's decision, 2026-11-05). In an exchange
+    /// it ends the exchange, as without a session.
     pub(crate) fn observe(
         &mut self,
         notification: &EventNotification,
         read: Option<AgentNow>,
+        own: Option<ComPrimitiveHandle>,
+        in_exchange: bool,
     ) -> bool {
+        if matches!(
+            notification.event_data,
+            Some(event_notification::EventData::Lost(_))
+        ) {
+            if !in_exchange
+                && self.session != DEFAULT_SESSION
+                && self.handling
+                && !self.lost
+                && !self.vci_lost
+            {
+                self.lost = true;
+                self.seen.push(TesterPresentSeen {
+                    events_lost: true,
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                    read,
+                    latched: true,
+                });
+            }
+            return false;
+        }
         let Some(event_notification::EventData::Item(item)) = &notification.event_data else {
             return false;
         };
@@ -129,7 +163,11 @@ impl KeepAlive {
             return false;
         };
         if error.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32 {
-            self.vci_lost = true;
+            // Only a loss that ends the link: one of no primitive, or of the one waited for
+            // (ADR-294); an earlier primitive's is that primitive's.
+            if item.cop_handle.is_none() || item.cop_handle == own {
+                self.vci_lost = true;
+            }
             return false;
         }
         if error.error_event != PduErrorEvent::PduErrEvtTesterPresentError as i32 {
@@ -138,6 +176,7 @@ impl KeepAlive {
         let latched = self.session != DEFAULT_SESSION && !self.lost && !self.vci_lost;
         self.lost |= latched;
         self.seen.push(TesterPresentSeen {
+            events_lost: false,
             extra_error_info: error.extra_error_info,
             extra_error_info_name: error.extra_error_info_name.clone(),
             read,
@@ -556,7 +595,7 @@ mod tests {
     #[test]
     fn a_tester_present_error_latches_the_loss_only_in_a_non_default_session() {
         let mut keep = KeepAlive::new(true);
-        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None, None, false));
         assert!(!keep.session_lost());
         let seen = keep.take_seen();
         assert_eq!(seen.len(), 1);
@@ -566,10 +605,10 @@ mod tests {
         assert!(keep.take_seen().is_empty());
 
         keep.record(&[0x10, 0x03], false, &positive(&[0x50, 0x03]));
-        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None, None, false));
         assert!(keep.session_lost());
         // A second error is noted, not latched again.
-        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None, None, false));
         let latched: Vec<bool> = keep.take_seen().iter().map(|seen| seen.latched).collect();
         assert_eq!(latched, [true, false]);
         // A link that opens again starts over.
@@ -583,13 +622,23 @@ mod tests {
     fn the_event_code_decides_not_the_primitive_handle() {
         let mut keep = KeepAlive::new(true);
         keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
-        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, Some(9)), None));
+        assert!(keep.observe(
+            &error_item(TESTER_PRESENT_ERROR, Some(9)),
+            None,
+            None,
+            false
+        ));
         assert!(keep.session_lost());
         // Other errors, with or without a handle, are not it.
         let mut keep = KeepAlive::new(true);
         keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
         for handle in [None, Some(9)] {
-            assert!(!keep.observe(&error_item(PduErrorEvent::PduErrEvtRxError, handle), None));
+            assert!(!keep.observe(
+                &error_item(PduErrorEvent::PduErrEvtRxError, handle),
+                None,
+                None,
+                false
+            ));
         }
         let status = EventNotification {
             event_data: Some(event_notification::EventData::Item(
@@ -597,8 +646,8 @@ mod tests {
             )),
             ..Default::default()
         };
-        assert!(!keep.observe(&status, None));
-        assert!(!keep.observe(&EventNotification::default(), None));
+        assert!(!keep.observe(&status, None, None, false));
+        assert!(!keep.observe(&EventNotification::default(), None, None, false));
         assert!(!keep.session_lost() && keep.take_seen().is_empty());
     }
 
@@ -610,10 +659,65 @@ mod tests {
         keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
         assert!(!keep.observe(
             &error_item(PduErrorEvent::PduErrEvtLostCommToVci, None),
-            None
+            None,
+            None,
+            false
         ));
-        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None, None, false));
         assert!(!keep.session_lost());
         assert!(!keep.take_seen()[0].latched);
+    }
+
+    /// A lost VCI that names an earlier primitive is that primitive's, not the link's, so errors
+    /// after it still latch; one of the primitive waited for, or of none, is the link's.
+    #[test]
+    fn only_a_lost_vci_that_ends_the_link_blocks_the_latch() {
+        let own = Some(ComPrimitiveHandle {
+            module_handle: 1,
+            cll_handle: 1,
+            cop_handle: 9,
+        });
+        for (handle, blocks) in [(Some(3), false), (Some(9), true), (None, true)] {
+            let mut keep = KeepAlive::new(true);
+            keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
+            keep.observe(
+                &error_item(PduErrorEvent::PduErrEvtLostCommToVci, handle),
+                None,
+                own,
+                true,
+            );
+            keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None, own, true);
+            assert_eq!(keep.session_lost(), !blocks, "{handle:?}");
+        }
+    }
+
+    /// A lost-events notice outside an exchange, with a session kept by a running handling, may
+    /// have hidden the tester-present error: the session is lost. Not in an exchange (it ends
+    /// that exchange), not in the default session, not with the handling off.
+    #[test]
+    fn a_lost_events_notice_outside_an_exchange_latches_in_a_kept_session() {
+        let lost = EventNotification {
+            event_data: Some(event_notification::EventData::Lost(Default::default())),
+            ..Default::default()
+        };
+        let kept = || {
+            let mut keep = KeepAlive::new(true);
+            keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
+            keep
+        };
+        let mut keep = kept();
+        keep.observe(&lost, None, None, true);
+        assert!(!keep.session_lost() && keep.take_seen().is_empty());
+        keep.observe(&lost, None, None, false);
+        assert!(keep.session_lost());
+        let seen = keep.take_seen();
+        assert!(seen[0].events_lost && seen[0].latched);
+        let mut keep = KeepAlive::new(true);
+        keep.observe(&lost, None, None, false);
+        assert!(!keep.session_lost());
+        let mut keep = kept();
+        keep.switched(Switch::Off);
+        keep.observe(&lost, None, None, false);
+        assert!(!keep.session_lost());
     }
 }

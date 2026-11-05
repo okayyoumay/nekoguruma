@@ -71,7 +71,7 @@ it also makes the session lost when the session record holds a non-default sessi
 next call then fails with `HostError::SessionLost`: a request is refused unsent (cause
 `session_lost`, `caused_by` the error's entry, `undetermined`), a `Wait` ends at its next poll,
 and the run ends in the host error without a repeat or a new link. An error read with the record
-in the default session, or after the VCI was lost, is logged only. What the drain reads that
+in the default session, or after a lost VCI that ends the link, is logged only; a lost VCI the drain read is reported first (the request is refused after the loss and the link is opened again). A lost-events notice read outside an exchange with a session kept is the session lost too, with a `keep_alive` entry of `action` `events_lost` (the error may have been among the events lost). A stream that failed is reported by refusing the next request with its status before anything is sent. What the drain reads that
 belongs to no exchange keeps its place in the log, and a lost VCI it reads makes the next request
 refused after the loss.
 

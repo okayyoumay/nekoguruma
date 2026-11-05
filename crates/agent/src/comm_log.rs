@@ -1257,6 +1257,18 @@ struct KeepAliveEntry {
     agent: KeepAliveTime,
 }
 
+/// What a `keep_alive` entry for a tester-present error or for lost events says
+/// ([`CommLog::keep_alive_error`]).
+pub(crate) struct KeepAliveError {
+    /// `error` or `events_lost`.
+    pub action: &'static str,
+    pub detail: Option<exchange::Detail>,
+    pub link_error: Option<exchange::LinkErrorKind>,
+    pub session_lost: bool,
+    pub read: Option<AgentNow>,
+    pub refers_to: Vec<u64>,
+}
+
 /// The agent's clocks at a `keep_alive` entry: the agent epoch, the monotonic microseconds since
 /// the log began, and the wall clock.
 #[derive(Serialize)]
@@ -2697,37 +2709,10 @@ impl CommLog {
         let mut may_own_transmit = false;
         let mut may_own_start = false;
         for (item, placed) in unbound.iter().zip(unbound_placed) {
-            let owner = late_response_owner(&inner.links[at].1, item, &evidence);
-            if let Some(LateOwner::One(owner)) = owner {
-                inner.late_response(at, owner, item, placed)?;
-                continue;
-            }
-            let event = Event::Unattached(UnattachedEntry::of(item, placed));
-            let unattached = inner.append_with(|seq, line| {
-                serde_json::to_writer(line, &Line { seq, event: &event })
-            })?;
-            inner.note_tester_present_line(item, unattached);
-            if let Some(LateOwner::Several(owners, in_flight)) = owner {
-                may_own_unattached |= in_flight;
-                if !owners.is_empty() {
-                    inner.late_response_unowned(at, &owners, item, placed, unattached)?;
-                }
-            }
-            if let Some((kind, id)) = item.late_indication() {
-                let (owners, all) = late_indication_owners(&inner.links[at].1, item, kind, id);
-                let in_flight = in_flight(item, placed, kind, id);
-                if owners.len() + usize::from(in_flight) + usize::from(!all) >= 2 {
-                    match kind {
-                        LateIndication::Transmit(_) => may_own_transmit |= in_flight,
-                        LateIndication::Start | LateIndication::Pending => {
-                            may_own_start |= in_flight
-                        }
-                    }
-                    if !owners.is_empty() {
-                        inner.late_item_unowned(at, &owners, kind, item, placed, unattached)?;
-                    }
-                }
-            }
+            let flags = inner.place_unbound_item(at, item, placed, Some(&evidence), &in_flight)?;
+            may_own_unattached |= flags.unattached;
+            may_own_transmit |= flags.transmit;
+            may_own_start |= flags.start;
         }
         // Each answer's history as an exchange of its own: the owed requests it could belong to
         // are its identifier's. The one derivation the link also reads again at a settlement.
@@ -2867,8 +2852,39 @@ impl CommLog {
                 item: EndItem::Unattached(item),
             })
             .collect();
-        let placed = inner.place_end_reads(&reads, true, None)?;
-        inner.job_end_link_errors(None, 0, &reads, &placed, None, false)?;
+        let placed = inner.place_end_reads(&reads, false, None)?;
+        // In the order the host read them: a link error as at a job end, any other item as an
+        // exchange places its unbound items (ADR-397), with no exchange in flight.
+        for (index, read) in reads.iter().enumerate() {
+            let EndItem::Unattached(item) = &read.item else {
+                inner.job_end_link_errors(
+                    None,
+                    0,
+                    &reads[index..=index],
+                    &placed[index..=index],
+                    None,
+                    false,
+                )?;
+                continue;
+            };
+            if item.link_error().is_some() {
+                inner.job_end_link_errors(
+                    None,
+                    0,
+                    &reads[index..=index],
+                    &placed[index..=index],
+                    None,
+                    false,
+                )?;
+            } else if inner.links.is_empty() {
+                let event = Event::Unattached(UnattachedEntry::of(item, placed[index].time));
+                inner.append_with(|seq, line| {
+                    serde_json::to_writer(line, &Line { seq, event: &event })
+                })?;
+            } else {
+                inner.place_unbound_item(0, item, placed[index].time, None, &|_, _, _, _| false)?;
+            }
+        }
         for read in &reads {
             if let EndItem::Unattached(item) = &read.item {
                 inner.note_reads(&[(item.link, read.read)]);
@@ -3740,32 +3756,30 @@ impl CommLog {
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
-    /// Writes a `keep_alive` event of `action` `error`: the worker's tester-present reported an
-    /// error event (design 8.11, ADR-420 item 8), read at `read` (now, without it). `detail`
-    /// names the event and its extra error information; `session_lost` tells whether it made the
-    /// session lost. `refers_to` are the entries that place the item's VCI time, which this
-    /// entry has none of. The event's `seq`; `None` once the log has failed.
+    /// Writes a `keep_alive` event for a tester-present error (`action` `error`, with `detail`
+    /// naming the event and its extra error information, `link_error` `tester_present`) or for
+    /// lost events that made the session lost (`action` `events_lost`), read at `read` (now,
+    /// without it; design 8.11, ADR-420 item 8). `session_lost` tells whether it made the session
+    /// lost; `refers_to` are the entries that place the item's VCI time, which this entry has none
+    /// of. The event's `seq`; `None` once the log has failed.
     pub(crate) fn keep_alive_error(
         &self,
         target: exchange::Target,
         link: u32,
-        detail: exchange::Detail,
-        session_lost: bool,
-        read: Option<AgentNow>,
-        refers_to: Vec<u64>,
+        error: KeepAliveError,
     ) -> Option<u64> {
-        let now = read.unwrap_or_else(|| self.now());
+        let now = error.read.unwrap_or_else(|| self.now());
         let event = Event::KeepAlive(KeepAliveEntry {
             origin: exchange::Origin::KeepAlive,
             target,
             link,
-            action: "error",
+            action: error.action,
             means: None,
             result: None,
-            detail: Some(detail),
-            link_error: Some(exchange::LinkErrorKind::TesterPresent),
-            session_lost: Some(session_lost),
-            refers_to: Some(refers_to),
+            detail: error.detail,
+            link_error: error.link_error,
+            session_lost: Some(error.session_lost),
+            refers_to: Some(error.refers_to),
             agent: KeepAliveTime {
                 epoch: now.epoch,
                 us: now.monotonic_us,
@@ -3863,7 +3877,7 @@ enum LateOwner {
 fn late_response_owner(
     state: &exchange::LinkState,
     item: &UnattachedItem,
-    evidence: &exchange::Evidence,
+    evidence: Option<&exchange::Evidence>,
 ) -> Option<LateOwner> {
     let UnattachedData::Result {
         rx_flag,
@@ -3877,8 +3891,9 @@ fn late_response_owner(
     if bytes.is_empty() || !is_received(rx_flag) || item.pending_bytes().is_some() {
         return None;
     }
-    let in_flight =
-        identifier.is_none_or(|id| id == evidence.rx_id) && evidence.expected.matches(bytes);
+    let in_flight = evidence.is_some_and(|evidence| {
+        identifier.is_none_or(|id| id == evidence.rx_id) && evidence.expected.matches(bytes)
+    });
     let owners = state.late_response_owners(*identifier, bytes);
     // A pending is a late item, not a late response.
     let pending = |kept: &exchange::Kept| {
@@ -3899,6 +3914,69 @@ fn late_response_owner(
         .filter(|owner| state.kept(*owner).is_some_and(|kept| !pending(kept)))
         .collect();
     (!kept.is_empty() || in_flight).then_some(LateOwner::Several(kept, in_flight))
+}
+
+/// Whether an indication of the item may be the exchange in flight's own.
+type InFlight<'a> =
+    dyn Fn(&UnattachedItem, Option<clocks::Placed>, LateIndication, u32) -> bool + 'a;
+
+/// What placing one unbound item leaves the exchange that read it to judge.
+#[derive(Debug, Default, Clone, Copy)]
+struct UnboundFlags {
+    /// A response it or an earlier exchange could own was read (`late_response`).
+    unattached: bool,
+    /// An indication it or an earlier exchange could own, in flight (`late_item`).
+    transmit: bool,
+    start: bool,
+}
+
+impl Inner {
+    /// Places one item of no primitive, or of an earlier one, that the host read (design 8.11
+    /// `unattached`, `late_response`, `late_item`, ADR-397): a response only one owed exchange
+    /// could own settles it, any other item is written `unattached`, and the indications that
+    /// owners could share are settled as late items. `evidence` is the exchange that read the
+    /// item, `in_flight` tells whether an indication may be that exchange's own; with none in
+    /// flight (items read between exchanges, or at job end) nothing is. `None` once the log has
+    /// failed.
+    fn place_unbound_item(
+        &mut self,
+        at: usize,
+        item: &UnattachedItem,
+        placed: Option<clocks::Placed>,
+        evidence: Option<&exchange::Evidence>,
+        in_flight: &InFlight<'_>,
+    ) -> Option<UnboundFlags> {
+        let mut flags = UnboundFlags::default();
+        let owner = late_response_owner(&self.links[at].1, item, evidence);
+        if let Some(LateOwner::One(owner)) = owner {
+            self.late_response(at, owner, item, placed)?;
+            return Some(flags);
+        }
+        let event = Event::Unattached(UnattachedEntry::of(item, placed));
+        let unattached = self
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        self.note_tester_present_line(item, unattached);
+        if let Some(LateOwner::Several(owners, in_flight)) = owner {
+            flags.unattached |= in_flight;
+            if !owners.is_empty() {
+                self.late_response_unowned(at, &owners, item, placed, unattached)?;
+            }
+        }
+        if let Some((kind, id)) = item.late_indication() {
+            let (owners, all) = late_indication_owners(&self.links[at].1, item, kind, id);
+            let in_flight = in_flight(item, placed, kind, id);
+            if owners.len() + usize::from(in_flight) + usize::from(!all) >= 2 {
+                match kind {
+                    LateIndication::Transmit(_) => flags.transmit |= in_flight,
+                    LateIndication::Start | LateIndication::Pending => flags.start |= in_flight,
+                }
+                if !owners.is_empty() {
+                    self.late_item_unowned(at, &owners, kind, item, placed, unattached)?;
+                }
+            }
+        }
+        Some(flags)
+    }
 }
 
 impl Inner {

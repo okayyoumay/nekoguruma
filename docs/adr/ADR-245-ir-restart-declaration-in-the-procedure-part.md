@@ -124,7 +124,10 @@ runner in M1.
   one for its tests.
 - Each plan's flash-session id is checked against the variant's flash sessions by
   `diag_ir::check_declarations` when the agent checks the job (`check_job`), not by the document
-  loader.
+  loader. Amendment (2026-11-05, the maintainer's decision): the same check also reads every
+  segment of that session as the artifact check does (`diag_ir::flash_session_extents`: a zero
+  block size, an end past the offset range, a block longer than a byte string may be), so the
+  error does not depend on whether the job has an artifact.
 - A plan has one RequestTransferExit, so a flash session that downloads several regions still
   cannot be declared.
 - A tool that reads only the FlatBuffers declaration does not see the restart parameters; the

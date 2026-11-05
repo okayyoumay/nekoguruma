@@ -44,6 +44,11 @@ pub const JOB_END_DEFAULT_CR_US: u64 = 1_000_000;
 /// The job-end wait's cap (ADR-358).
 pub const JOB_END_WAIT_MAX: Duration = Duration::from_secs(10);
 
+/// The keep-alive's period when a link gives none (ADR-417 item 2).
+pub const DEFAULT_KEEP_ALIVE: Duration = Duration::from_secs(2);
+/// The shortest keep-alive period a link accepts (ADR-417 item 2).
+pub const MIN_KEEP_ALIVE: Duration = Duration::from_millis(200);
+
 /// What a job's link needs: from the protocol a job's document declares
 /// ([`LinkConfig::declared`], ADR-324), or built by the caller for a program without one.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -69,6 +74,12 @@ pub struct LinkConfig {
     /// `tx_id` and `rx_id`. On a functional link `tx_id` is the functional identifier and `rx_id`
     /// is 0, since no one response identifier is the link's.
     pub functional: Option<FunctionalAddressing>,
+    /// The period of the worker's cyclic tester-present that keeps a non-default session alive
+    /// on this link (design 8.2.5, ADR-418, ADR-420), or `None` for a link that keeps none
+    /// (ADR-264 item 4 then holds for it). On by default, every
+    /// [`DEFAULT_KEEP_ALIVE`]; a period below [`MIN_KEEP_ALIVE`] is refused by
+    /// [`LinkConfig::validate`].
+    pub keep_alive: Option<Duration>,
 }
 
 /// A link that sends its request to a functional identifier and receives from several ECUs
@@ -96,12 +107,14 @@ impl LinkConfig {
             rc78_completion_ms: 25_000,
             params: Vec::new(),
             functional: None,
+            keep_alive: Some(DEFAULT_KEEP_ALIVE),
         }
     }
 
     /// This link's protocol, baud rate, timings and ComParams on a functional link to
     /// `functional_id` that receives from `table` (ADR-396). The caller has set the timings it
-    /// wants on `self`.
+    /// wants on `self`. A functional link keeps no session alive: its requests are presence
+    /// requests, and the tester-present ComParams address one ECU physically.
     pub fn functional(&self, functional_id: u32, table: Vec<(u32, u32)>) -> Self {
         Self {
             tx_id: functional_id,
@@ -110,6 +123,7 @@ impl LinkConfig {
                 functional_id,
                 table,
             }),
+            keep_alive: None,
             ..self.clone()
         }
     }
@@ -226,6 +240,20 @@ impl LinkConfig {
         }
         if let Some(functional) = &self.functional {
             functional.validate()?;
+        }
+        if let Some(period) = self.keep_alive
+            && period < MIN_KEEP_ALIVE
+        {
+            return Err(HostError::Setup(
+                "the keep-alive period must be at least 200 ms (a zero period is not one)",
+            ));
+        }
+        if let Some(period) = self.keep_alive
+            && period > Duration::from_micros(u64::from(u32::MAX))
+        {
+            return Err(HostError::Setup(
+                "the keep-alive period does not fit the worker's microsecond ComParam",
+            ));
         }
         // The link sets some itself, from the fields above or for its response pending
         // handling, and a further one would override it; others would let a primitive run past
@@ -355,6 +383,11 @@ pub(crate) struct Indications {
     pub(crate) transmit: bool,
     /// `CP_StartMsgIndEnable`.
     pub(crate) start_of_message: bool,
+    /// Not an indication: whether the library accepted the keep-alive's tester-present ComParams
+    /// ([`tester_present_comparams`]), the other thing a library may refuse at open. A link whose
+    /// library refused one opens without the keep-alive (design 8.2.5); false too when the link
+    /// asked for none.
+    pub(crate) tester_present: bool,
 }
 
 impl Indications {
@@ -376,11 +409,74 @@ impl Link {
 }
 
 fn param(id: u32, class: PduParamClass, value: u32) -> ParamItem {
+    param_valued(id, class, ParamValue::U32(value))
+}
+
+/// A ComParam's value as the link sets it: a number, or a byte field (ISO 22900-2 (2022)
+/// Annex B gives three of the tester-present ComParams that form).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ParamValue {
+    U32(u32),
+    Bytes(&'static [u8]),
+}
+
+fn param_valued(id: u32, class: PduParamClass, value: ParamValue) -> ParamItem {
     ParamItem {
         id: Some(param_item::Id::ParamId(id)),
         com_param_class: class as i32,
-        param_data: Some(param_item::ParamData::Unum32(value)),
+        param_data: Some(match value {
+            ParamValue::U32(value) => param_item::ParamData::Unum32(value),
+            ParamValue::Bytes(bytes) => param_item::ParamData::Bytefield(bytes.to_vec()),
+        }),
     }
+}
+
+/// The tester-present request the worker sends cyclically: TesterPresent with sub-function 0,
+/// the two bytes the policy accepts for it (`policy::check_presence_request`).
+const TESTER_PRESENT_MESSAGE: &[u8] = &[0x3E, 0x00];
+/// The positive response to it the worker expects.
+const TESTER_PRESENT_POSITIVE: &[u8] = &[0x7E, 0x00];
+/// The negative response to it the worker expects: the negative-response SID and the service.
+const TESTER_PRESENT_NEGATIVE: &[u8] = &[0x7F, 0x3E];
+
+/// The name of the ComParam that switches the cyclic tester-present on and off: set last when
+/// the link opens, and by itself afterwards (`host`'s switch, ADR-420).
+pub(crate) const TESTER_PRESENT_HANDLING: &str = "CP_TesterPresentHandling";
+
+/// The ComParams of the worker's cyclic tester-present that the link sets when its keep-alive is
+/// on (ADR-418 item 2), by name, in the order they are set: [`TESTER_PRESENT_HANDLING`] last, so
+/// that it switches on only a complete set. Empty when the keep-alive is off. The message and
+/// the two expected responses are byte fields, the others numbers; the period is in
+/// microseconds. They are set under the class `PDU_PC_TESTER_PRESENT`, the concrete class the
+/// D-PDU worker passes to its library for these ComParams. The communication log's `link_opened`
+/// names the same (design 8.11).
+pub(crate) fn tester_present_comparams(config: &LinkConfig) -> Vec<(&'static str, ParamValue)> {
+    let Some(period) = config.keep_alive else {
+        return Vec::new();
+    };
+    vec![
+        (
+            "CP_TesterPresentMessage",
+            ParamValue::Bytes(TESTER_PRESENT_MESSAGE),
+        ),
+        ("CP_TesterPresentReqRsp", ParamValue::U32(1)),
+        (
+            "CP_TesterPresentExpPosResp",
+            ParamValue::Bytes(TESTER_PRESENT_POSITIVE),
+        ),
+        (
+            "CP_TesterPresentExpNegResp",
+            ParamValue::Bytes(TESTER_PRESENT_NEGATIVE),
+        ),
+        ("CP_TesterPresentAddrMode", ParamValue::U32(0)),
+        // Every period, whatever else the bus carries (ADR-418 item 2).
+        ("CP_TesterPresentSendType", ParamValue::U32(0)),
+        (
+            "CP_TesterPresentTime",
+            ParamValue::U32(u32::try_from(period.as_micros()).unwrap_or(u32::MAX)),
+        ),
+        (TESTER_PRESENT_HANDLING, ParamValue::U32(1)),
+    ]
 }
 
 /// `ms` is at most [`MAX_TIMING_MS`] after [`LinkConfig::validate`].
@@ -844,6 +940,11 @@ async fn set_up_link<C: WorkerApi>(
         .await?;
     }
     let mut indications = Indications::default();
+    let tester_present = tester_present_comparams(config);
+    if !tester_present.is_empty() {
+        indications.tester_present =
+            set_tester_present(client, deadline, cll_handle, &tester_present, &mut set).await?;
+    }
     for name in INDICATION_COMPARAMS {
         let accepted = set_indication(client, deadline, cll_handle, name, &mut set).await?;
         if name == INDICATION_COMPARAMS[0] {
@@ -940,6 +1041,79 @@ async fn set_indication<C: WorkerApi>(
         }
         Err(error) => Err(error),
     }
+}
+
+/// Sets the keep-alive's tester-present ComParams `comparams` and returns whether the library
+/// accepted them all. A library that does not know one, or refuses one, leaves the link without
+/// the keep-alive, as for an indication (design 8.2.5, 8.11): the handling is then set to 0
+/// (best effort), so that a library whose default is on does not send a half-set message. A worker
+/// that does not answer, or whose connection is gone, fails the link as for any other ComParam.
+async fn set_tester_present<C: WorkerApi>(
+    client: &mut C,
+    deadline: Duration,
+    cll_handle: ComLogicalLinkHandle,
+    comparams: &[(&'static str, ParamValue)],
+    set: &mut Vec<u32>,
+) -> Result<bool, HostError> {
+    for &(name, value) in comparams {
+        let id = match comparam_id(client, deadline, name).await {
+            Ok(id) => id,
+            Err(HostError::DeclaredLink(_)) => {
+                return Ok(refused_tester_present(client, deadline, cll_handle, name, set).await);
+            }
+            Err(HostError::Rpc { status, .. }) if refused(&status) => {
+                return Ok(refused_tester_present(client, deadline, cll_handle, name, set).await);
+            }
+            Err(error) => return Err(error),
+        };
+        set.push(id);
+        match unary(
+            deadline,
+            "SetComParam",
+            client.set_com_param(SetComParamRequest {
+                cll_handle: Some(cll_handle),
+                param_item: Some(param_valued(id, PduParamClass::PduPcTesterPresent, value)),
+            }),
+        )
+        .await
+        {
+            Ok(_) => {}
+            Err(HostError::Rpc { status, .. }) if refused(&status) => {
+                return Ok(refused_tester_present(client, deadline, cll_handle, name, set).await);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(true)
+}
+
+/// The library refused the keep-alive's ComParam `name`: switches its handling off, ignoring
+/// the answer, and returns false.
+async fn refused_tester_present<C: WorkerApi>(
+    client: &mut C,
+    deadline: Duration,
+    cll_handle: ComLogicalLinkHandle,
+    name: &str,
+    set: &[u32],
+) -> bool {
+    tracing::info!(
+        comparam = name,
+        "the library refused a tester-present ComParam; the link opens without the keep-alive"
+    );
+    if let Ok(id) = comparam_id(client, deadline, TESTER_PRESENT_HANDLING).await
+        && !set.contains(&id)
+    {
+        let _ = unary(
+            deadline,
+            "SetComParam",
+            client.set_com_param(SetComParamRequest {
+                cll_handle: Some(cll_handle),
+                param_item: Some(param(id, PduParamClass::PduPcTesterPresent, 0)),
+            }),
+        )
+        .await;
+    }
+    false
 }
 
 /// Whether `status` is the worker refusing a request, rather than the connection to it failing.
@@ -1486,6 +1660,11 @@ mod tests {
             .collect();
         written.extend(own_comparams(&physical).into_iter().map(|(name, _)| name));
         written.extend(INDICATION_COMPARAMS);
+        written.extend(
+            tester_present_comparams(&physical)
+                .into_iter()
+                .map(|(name, _)| name),
+        );
         written.extend(["CP_CanPhysReqId", "CP_CanRespUSDTId"]);
         written.sort_unstable();
         written.dedup();
@@ -1625,5 +1804,114 @@ mod tests {
             },
         );
         assert!(!refuses_receive_table(&rpc("ConnectComLogicalLink", lost)));
+    }
+
+    /// ADR-420 item 1: the keep-alive is on at 2 s by default, from `iso15765` and from a
+    /// declared link; a period under 200 ms, zero included, is refused, and so is one the
+    /// worker's microsecond ComParam cannot hold; off is `None`; a functional link has none.
+    #[test]
+    fn the_keep_alive_is_on_at_two_seconds_and_no_shorter_than_200_ms() {
+        let base = LinkConfig::iso15765(0x7E0, 0x7E8);
+        assert_eq!(base.keep_alive, Some(Duration::from_secs(2)));
+        assert_eq!(
+            declared(vec![protocol(&[])]).expect("usable").keep_alive,
+            Some(Duration::from_secs(2))
+        );
+        for period in [
+            Some(Duration::from_millis(200)),
+            Some(Duration::from_secs(2)),
+            Some(Duration::from_secs(60)),
+            None,
+        ] {
+            let config = LinkConfig {
+                keep_alive: period,
+                ..base.clone()
+            };
+            config.validate().expect("usable");
+        }
+        for period in [
+            Duration::ZERO,
+            Duration::from_millis(1),
+            Duration::from_millis(199),
+            Duration::from_secs(4_295),
+        ] {
+            let config = LinkConfig {
+                keep_alive: Some(period),
+                ..base.clone()
+            };
+            assert!(
+                matches!(config.validate(), Err(HostError::Setup(_))),
+                "{period:?}"
+            );
+        }
+        let functional = base.functional(0x7DF, table());
+        assert_eq!(functional.keep_alive, None);
+        assert!(tester_present_comparams(&functional).is_empty());
+    }
+
+    /// ADR-418 item 2, ADR-420 item 2: the tester-present ComParams, in the order they are set,
+    /// the handling last; the message and the expected responses as byte fields; the period in
+    /// microseconds; none when the keep-alive is off.
+    #[test]
+    fn the_tester_present_comparams_are_the_set_adr_418_names() {
+        use ParamValue::{Bytes, U32};
+        let config = LinkConfig {
+            keep_alive: Some(Duration::from_millis(750)),
+            ..LinkConfig::iso15765(0x7E0, 0x7E8)
+        };
+        assert_eq!(
+            tester_present_comparams(&config),
+            [
+                ("CP_TesterPresentMessage", Bytes(&[0x3E, 0x00])),
+                ("CP_TesterPresentReqRsp", U32(1)),
+                ("CP_TesterPresentExpPosResp", Bytes(&[0x7E, 0x00])),
+                ("CP_TesterPresentExpNegResp", Bytes(&[0x7F, 0x3E])),
+                ("CP_TesterPresentAddrMode", U32(0)),
+                ("CP_TesterPresentSendType", U32(0)),
+                ("CP_TesterPresentTime", U32(750_000)),
+                ("CP_TesterPresentHandling", U32(1)),
+            ]
+        );
+        let off = LinkConfig {
+            keep_alive: None,
+            ..config
+        };
+        assert!(tester_present_comparams(&off).is_empty());
+        // The class the byte fields go out under, and as which data.
+        let item = param_valued(
+            7,
+            PduParamClass::PduPcTesterPresent,
+            ParamValue::Bytes(&[0x7F, 0x3E]),
+        );
+        assert_eq!(
+            item.com_param_class,
+            PduParamClass::PduPcTesterPresent as i32
+        );
+        assert_eq!(
+            item.param_data,
+            Some(param_item::ParamData::Bytefield(vec![0x7F, 0x3E]))
+        );
+    }
+
+    /// ADR-324 item 3, ADR-420 item 2: a document cannot declare a tester-present ComParam, whose
+    /// values the keep-alive sets, in any spelling.
+    #[test]
+    fn a_document_cannot_declare_a_tester_present_comparam() {
+        for name in [
+            "CP_TesterPresentHandling",
+            "cp_testerpresentmessage",
+            "CP_TESTERPRESENTREQRSP",
+            "CP_TesterPresentExpPosResp",
+            "CP_TesterPresentExpNegResp",
+            "CP_TesterPresentAddrMode",
+            "CP_TesterPresentSendType",
+            "CP_TesterPresentTime",
+        ] {
+            let error = declared(vec![protocol(&[(name, 1)])]).expect_err("refused");
+            assert!(
+                matches!(error, HostError::DeclaredLink(_)),
+                "{name}: {error}"
+            );
+        }
     }
 }

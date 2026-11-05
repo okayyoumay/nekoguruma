@@ -236,7 +236,8 @@ and a timing of 0 or above 4294967000 is rejected (`CSV_BAD_VALUE`); a value und
 case. Rejected on `name`:
 
 - a ComParam the link sets itself, such as `CP_Baudrate`, the CAN identifiers, the response
-  pending and indication ComParams and the addressing mode (`CSV_UNSUPPORTED`);
+  pending and indication ComParams, the addressing mode and the tester-present ComParams
+  (`CP_TesterPresent*`, which the keep-alive sets, ADR-420) (`CSV_UNSUPPORTED`);
 - one that lets a primitive outlast the host's deadline: `CP_RC21*`, `CP_RC23*`,
   `CP_RepeatReqCount*` and `CP_ModifyTiming` (`CSV_UNSUPPORTED`);
 - one declared twice for a variant's protocol, on the later row (`CSV_DUPLICATE`);

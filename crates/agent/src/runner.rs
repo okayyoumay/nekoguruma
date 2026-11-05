@@ -15329,6 +15329,51 @@ def main():
         by_handle: Arc<Mutex<std::collections::HashMap<u32, Vec<u8>>>>,
         /// How the first starts are answered, one per call.
         answers: Mutex<std::collections::VecDeque<StartAnswer>>,
+        /// What the keep-alive's traffic shows (ADR-420).
+        keep: KeepRecord,
+    }
+
+    /// The type and the data of a primitive started.
+    type StartedPrimitive = (i32, Vec<u8>);
+
+    /// How the switches answer, one entry per call (see [`KeepRecord::updates`]).
+    type UpdateScript = std::collections::VecDeque<Option<tonic::Status>>;
+
+    /// What a [`FakeWorker`] records of the keep-alive (ADR-420) and how it answers `GetStatus`
+    /// and a switch.
+    #[derive(Default, Clone)]
+    struct KeepRecord {
+        /// The type and data of each StartComPrimitive, in order.
+        starts: Arc<Mutex<Vec<StartedPrimitive>>>,
+        /// The logical link status `GetStatus` gives (`PduComLogicalLinkStatus` as a number);
+        /// none: the fake does not implement the call.
+        status: Arc<Mutex<Option<i32>>>,
+        /// What the first `GetStatus` calls give instead, one per call (`None`: the call fails).
+        status_script: Arc<Mutex<std::collections::VecDeque<Option<i32>>>>,
+        /// What the first StartComPrimitive calls of type UpdateParam answer (`None`: success,
+        /// `Some`: fail with the status), one per call; later ones succeed.
+        updates: Arc<Mutex<UpdateScript>>,
+    }
+
+    impl KeepRecord {
+        /// The types of the primitives started, in order.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(
+                dead_code,
+                reason = "only the session tests, which need the simulator permission of a debug build, use it"
+            )
+        )]
+        fn types(&self) -> Vec<vci_service_interface::ComOperationType> {
+            self.starts
+                .lock()
+                .unwrap()
+                .iter()
+                .map(|(cop_type, _)| {
+                    vci_service_interface::ComOperationType::try_from(*cop_type).unwrap()
+                })
+                .collect()
+        }
     }
 
     /// How a scripted item of a [`FakeWorker`] is bound (design 8.11 "Link settings for the
@@ -15356,6 +15401,15 @@ def main():
         Respond(u32, Option<u32>),
         /// A pending (`7F 22 78`) bound to the primitive.
         Pending(u32),
+        /// A received result bound to the primitive, with these bytes.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(
+                dead_code,
+                reason = "only the session tests, which need the simulator permission of a debug build, use it"
+            )
+        )]
+        Bytes(u32, &'static [u8]),
         /// A receive timeout bound to the primitive.
         TimeOut(u32),
         /// The primitive's finished status.
@@ -15622,10 +15676,21 @@ def main():
             request: tonic::Request<vci_service_interface::SetComParamRequest>,
         ) -> Result<tonic::Response<vci_service_interface::Response>, tonic::Status> {
             let item = request.into_inner().param_item.unwrap_or_default();
+            // A byte field is recorded by its bytes read as one big-endian number.
+            let data = match item.param_data {
+                Some(vci_service_interface::param_item::ParamData::Bytefield(bytes)) => {
+                    Some(vci_service_interface::param_item::ParamData::Unum32(
+                        bytes
+                            .iter()
+                            .fold(0, |all, byte| all << 8 | u32::from(*byte)),
+                    ))
+                }
+                data => data,
+            };
             if let (
                 Some(vci_service_interface::param_item::Id::ParamId(id)),
                 Some(vci_service_interface::param_item::ParamData::Unum32(value)),
-            ) = (item.id, item.param_data)
+            ) = (item.id, data)
             {
                 let name = self.comparams.lock().unwrap()[usize::try_from(id - 1).unwrap()].clone();
                 if self.refuse_set == Some(name.as_str()) {
@@ -15645,10 +15710,34 @@ def main():
             request: tonic::Request<vci_service_interface::StartComPrimitiveRequest>,
         ) -> Result<tonic::Response<vci_service_interface::ComPrimitiveResponse>, tonic::Status>
         {
-            let tag = request.into_inner().cop_tag;
+            let request = request.into_inner();
+            let tag = request.cop_tag.clone();
             self.note("StartComPrimitive");
             if !self.starts {
                 return unimplemented();
+            }
+            let keep = &self.tagging.keep;
+            keep.starts
+                .lock()
+                .unwrap()
+                .push((request.cop_type, request.cop_data.clone()));
+            // A switch of the tester-present: nothing is sent, so there are no events to give.
+            if request.cop_type == vci_service_interface::ComOperationType::CoptUpdateparam as i32 {
+                if let Some(Some(status)) = keep.updates.lock().unwrap().pop_front() {
+                    return Err(status);
+                }
+                let mut started = self.started.lock().unwrap();
+                let cop_handle = 7 + u32::try_from(started.len()).unwrap();
+                started.push(cop_handle);
+                return Ok(tonic::Response::new(
+                    vci_service_interface::ComPrimitiveResponse {
+                        cop_handle: Some(vci_service_interface::ComPrimitiveHandle {
+                            module_handle: 1,
+                            cll_handle: 1,
+                            cop_handle,
+                        }),
+                    },
+                ));
             }
             if let Some(status) = self.start_failures.lock().unwrap().pop_front() {
                 return Err(status);
@@ -15753,6 +15842,14 @@ def main():
                                     at,
                                     Data::ResultData(vci_service_interface::ResultData {
                                         data_bytes: vec![0x7F, 0x22, 0x78],
+                                        ..Default::default()
+                                    }),
+                                ),
+                                Step::Bytes(at, bytes) => (
+                                    Bound::Own,
+                                    at,
+                                    Data::ResultData(vci_service_interface::ResultData {
+                                        data_bytes: bytes.to_vec(),
                                         ..Default::default()
                                     }),
                                 ),
@@ -15973,7 +16070,20 @@ def main():
             &self,
             _: tonic::Request<vci_service_interface::GetStatusRequest>,
         ) -> Result<tonic::Response<vci_service_interface::StatusResponse>, tonic::Status> {
-            unimplemented()
+            self.note("GetStatus");
+            let scripted = self.tagging.keep.status_script.lock().unwrap().pop_front();
+            let status = scripted.unwrap_or(*self.tagging.keep.status.lock().unwrap());
+            let Some(status) = status else {
+                return unimplemented();
+            };
+            Ok(tonic::Response::new(
+                vci_service_interface::StatusResponse {
+                    status: Some(vci_service_interface::status_response::Status::CllStatus(
+                        status,
+                    )),
+                    ..Default::default()
+                },
+            ))
         }
         async fn get_event_item(
             &self,
@@ -16227,6 +16337,17 @@ def main():
         released: Arc<tokio::sync::Semaphore>,
         /// The `cop_tag` each start carried, in order.
         start_tags: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
+        /// The keep-alive's traffic and how the fake answers it.
+        keep: KeepRecord,
+        /// Each SetComParam: the ComParam's name, its value and its class.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(
+                dead_code,
+                reason = "only the session tests, which need the simulator permission of a debug build, use it"
+            )
+        )]
+        set: SetComParams,
     }
 
     impl Started {
@@ -16302,8 +16423,10 @@ def main():
             ..Tagging::default()
         };
         let start_tags = Arc::clone(&tagging.start_tags);
+        let keep = tagging.keep.clone();
         let calls = Arc::new(Mutex::new(Vec::new()));
-        let set = Arc::new(Mutex::new(Vec::new()));
+        let set: SetComParams = Arc::new(Mutex::new(Vec::new()));
+        let recorded_set = Arc::clone(&set);
         let (started, cancelled) = (Arc::default(), Arc::default());
         let released = Arc::new(tokio::sync::Semaphore::new(0));
         let service = FakeWorker {
@@ -16337,6 +16460,8 @@ def main():
                 cancelled,
                 released,
                 start_tags,
+                keep,
+                set: recorded_set,
             },
         )
     }
@@ -18572,8 +18697,8 @@ def main():
     }
 
     /// The link sets its own ComParams, then the declared ones as declared, each with the class
-    /// the worker takes from the ComParam (ADR-324 item 3), then its indications (design 8.11
-    /// "Link settings for the log").
+    /// the worker takes from the ComParam (ADR-324 item 3), then the keep-alive's tester-present
+    /// ComParams (ADR-420), then its indications (design 8.11 "Link settings for the log").
     #[tokio::test(flavor = "multi_thread")]
     async fn declared_comparams_are_set_after_the_links_own() {
         let (mut client, _calls, set) = fake_worker_recording(false, false).await;
@@ -18590,6 +18715,7 @@ def main():
         let set = set.lock().unwrap().clone();
         let com = vci_service_interface::PduParamClass::PduPcCom as i32;
         let specified = vci_service_interface::PduParamClass::PduPcSpecified as i32;
+        let tester_present = vci_service_interface::PduParamClass::PduPcTesterPresent as i32;
         assert_eq!(
             set,
             [
@@ -18603,6 +18729,24 @@ def main():
                 ("cp_rc23handling".to_owned(), 0, com),
                 ("cp_blocksize".to_owned(), 8, specified),
                 ("cp_stmin".to_owned(), 20, specified),
+                // The keep-alive's tester-present ComParams (ADR-420): the message and the two
+                // expected responses are byte fields, recorded as one number each.
+                ("cp_testerpresentmessage".to_owned(), 0x3E00, tester_present),
+                ("cp_testerpresentreqrsp".to_owned(), 1, tester_present),
+                (
+                    "cp_testerpresentexpposresp".to_owned(),
+                    0x7E00,
+                    tester_present
+                ),
+                (
+                    "cp_testerpresentexpnegresp".to_owned(),
+                    0x7F3E,
+                    tester_present
+                ),
+                ("cp_testerpresentaddrmode".to_owned(), 0, tester_present),
+                ("cp_testerpresentsendtype".to_owned(), 0, tester_present),
+                ("cp_testerpresenttime".to_owned(), 2_000_000, tester_present),
+                ("cp_testerpresenthandling".to_owned(), 1, tester_present),
                 ("cp_transmitindenable".to_owned(), 1, com),
                 ("cp_startmsgindenable".to_owned(), 1, com),
             ]
@@ -18620,6 +18764,7 @@ def main():
                 link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    tester_present: true,
                 },
             ),
             (
@@ -18627,6 +18772,7 @@ def main():
                 link::Indications {
                     transmit: false,
                     start_of_message: true,
+                    tester_present: true,
                 },
             ),
             (
@@ -18634,6 +18780,7 @@ def main():
                 link::Indications {
                     transmit: true,
                     start_of_message: false,
+                    tester_present: true,
                 },
             ),
         ] {
@@ -18765,6 +18912,7 @@ def main():
             set_unique_resp_id_table(vci_service_interface::SetUniqueRespIdTableRequest) -> vci_service_interface::Response;
             start_com_primitive(vci_service_interface::StartComPrimitiveRequest) -> vci_service_interface::ComPrimitiveResponse;
             cancel_com_primitive(vci_service_interface::CancelComPrimitiveRequest) -> vci_service_interface::Response;
+            get_status(vci_service_interface::GetStatusRequest) -> vci_service_interface::StatusResponse;
             subscribe_event(vci_service_interface::SubscribeEventRequest) -> tonic::Streaming<vci_service_interface::EventNotification>;
             io_ctl(vci_service_interface::IoCtlRequest) -> vci_service_interface::IoCtlResponse;
         }
@@ -19654,11 +19802,21 @@ def main():
             assert_eq!(comparam(name)["set_by"], "link", "{name}");
             assert_eq!(comparam(name)["accepted"], true, "{name}");
         }
-        assert!(comparam("CP_TesterPresentHandling").get("value").is_none());
-        assert_eq!(
-            comparam("CP_TesterPresentHandling")["set_by"],
-            "library_default"
-        );
+        // The keep-alive is on: the tester-present ComParams are the link's own (ADR-420), the
+        // byte fields by `value_hex`.
+        assert_eq!(comparam("CP_TesterPresentHandling")["value"], 1);
+        assert_eq!(comparam("CP_TesterPresentHandling")["set_by"], "link");
+        assert_eq!(comparam("CP_TesterPresentHandling")["accepted"], true);
+        assert_eq!(comparam("CP_TesterPresentTime")["value"], 2_000_000);
+        for (name, hex) in [
+            ("CP_TesterPresentMessage", "3e00"),
+            ("CP_TesterPresentExpPosResp", "7e00"),
+            ("CP_TesterPresentExpNegResp", "7f3e"),
+        ] {
+            let param = comparam(name);
+            assert_eq!(param["value_hex"], hex, "{name}");
+            assert!(param.get("value").is_none(), "{name}");
+        }
         // The library accepted `CP_TransmitIndEnable`.
         assert_eq!(
             opened["transmit_confirmation"],
@@ -22103,6 +22261,7 @@ def main():
             set_unique_resp_id_table(vci_service_interface::SetUniqueRespIdTableRequest) -> vci_service_interface::Response;
             start_com_primitive(vci_service_interface::StartComPrimitiveRequest) -> vci_service_interface::ComPrimitiveResponse;
             cancel_com_primitive(vci_service_interface::CancelComPrimitiveRequest) -> vci_service_interface::Response;
+            get_status(vci_service_interface::GetStatusRequest) -> vci_service_interface::StatusResponse;
             subscribe_event(vci_service_interface::SubscribeEventRequest) -> tonic::Streaming<vci_service_interface::EventNotification>;
             io_ctl(vci_service_interface::IoCtlRequest) -> vci_service_interface::IoCtlResponse;
         }
@@ -22844,5 +23003,736 @@ def main():
             1
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------------------------------------------- the keep-alive on a job's link (ADR-420)
+
+    /// The steps a fake worker gives a request of the keep-alive tests.
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            dead_code,
+            unused_imports,
+            reason = "only the session tests, which need the simulator permission of a debug build, use these"
+        )
+    )]
+    mod keep_alive_host {
+        use super::*;
+        use diag_ir::DiagHost;
+        use vci_service_interface::ComOperationType::{
+            CoptSendrecv as Sendrecv, CoptStartcomm as Startcomm, CoptUpdateparam as Updateparam,
+        };
+        use vci_service_interface::PduComLogicalLinkStatus as LinkStatus;
+
+        const FINISH: Step = Step::Finish;
+        const POSITIVE_02: &[Step] = &[Step::Bytes(600_000, &[0x50, 0x02]), FINISH];
+        const POSITIVE_03: &[Step] = &[Step::Bytes(600_000, &[0x50, 0x03]), FINISH];
+        const POSITIVE_01: &[Step] = &[Step::Bytes(600_000, &[0x50, 0x01]), FINISH];
+        const NEGATIVE_10: &[Step] = &[Step::Bytes(600_000, &[0x7F, 0x10, 0x22]), FINISH];
+        const NO_ANSWER: &[Step] = &[Step::TimeOut(1_000_000), FINISH];
+        const PENDING_THEN_02: &[Step] = &[
+            Step::Bytes(300_000, &[0x7F, 0x10, 0x78]),
+            Step::Bytes(600_000, &[0x50, 0x02]),
+            FINISH,
+        ];
+        const RESET_ACCEPTED: &[Step] = &[Step::Bytes(600_000, &[0x51, 0x01]), FINISH];
+        const RESET_REFUSED: &[Step] = &[Step::Bytes(600_000, &[0x7F, 0x11, 0x33]), FINISH];
+        const READ_ANSWERED: &[Step] = &[Step::Respond(600_000, None), FINISH];
+
+        /// A request of a run: the service and its payload.
+        type Request = (u16, &'static [u8]);
+        const DSC_02: Request = (0x10, &[0x02]);
+        const DSC_03: Request = (0x10, &[0x03]);
+        const DSC_01: Request = (0x10, &[0x01]);
+        const DSC_81: Request = (0x10, &[0x81]);
+        const DSC_82: Request = (0x10, &[0x82]);
+        const RESET: Request = (0x11, &[0x01]);
+        const READ: Request = (0x22, &[0xF1, 0x90]);
+
+        /// How a run of requests ended, and what the fake saw of it.
+        struct KeepRun {
+            results: Vec<Result<Vec<u8>, HostError>>,
+            fake: Started,
+        }
+
+        impl KeepRun {
+            fn types(&self) -> Vec<vci_service_interface::ComOperationType> {
+                self.fake.keep.types()
+            }
+
+            /// The values `CP_TesterPresentHandling` was set to, in order: the open's first.
+            fn handling(&self) -> Vec<u32> {
+                self.fake
+                    .set
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(name, _, _)| name == "cp_testerpresenthandling")
+                    .map(|(_, value, _)| *value)
+                    .collect()
+            }
+
+            fn called(&self, rpc: &str) -> usize {
+                self.fake
+                    .calls
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|call| **call == rpc)
+                    .count()
+            }
+        }
+
+        /// What a run of `requests` is given: each request starts one primitive and takes the
+        /// next of `script` (a switch's `CoptUpdateparam` takes none), `status` is what
+        /// `GetStatus` of the link answers (none: the call fails), `updates` how the first
+        /// switches answer.
+        #[derive(Default)]
+        struct Setup {
+            keep_alive_off: bool,
+            status: Option<LinkStatus>,
+            /// What the first `GetStatus` calls answer instead, one per call.
+            status_script: Vec<Option<LinkStatus>>,
+            updates: Vec<Option<tonic::Status>>,
+            /// The agent's deadline for a request; zero for the default.
+            deadline: Duration,
+        }
+
+        async fn keep_run(
+            setup: Setup,
+            script: &[&'static [Step]],
+            requests: &[Request],
+            comm_log: Option<crate::comm_log::CommLog>,
+        ) -> KeepRun {
+            let script = script
+                .iter()
+                .map(|steps| (When::After(Duration::ZERO), StartEvent::Script(steps)))
+                .collect();
+            let (mut client, fake) =
+                fake_worker_answering(CancelAnswer::Done, None, false, false, script, Vec::new())
+                    .await;
+            *fake.keep.status.lock().unwrap() = setup.status.map(|status| status as i32);
+            fake.keep
+                .status_script
+                .lock()
+                .unwrap()
+                .extend(setup.status_script.iter().map(|s| s.map(|s| s as i32)));
+            fake.keep.updates.lock().unwrap().extend(setup.updates);
+            let config = LinkConfig {
+                keep_alive: (!setup.keep_alive_off).then_some(Duration::from_secs(2)),
+                ..LinkConfig::iso15765(0x7E0, 0x7E8)
+            };
+            #[cfg_attr(not(debug_assertions), expect(unused_mut))]
+            let mut link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            // The fake's VCI is no simulator: a session control would be refused as the job
+            // being read-only (ADR-247).
+            #[cfg(debug_assertions)]
+            {
+                link.permission = Permission::Simulator;
+            }
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: if setup.deadline.is_zero() {
+                    Duration::from_secs(5)
+                } else {
+                    setup.deadline
+                },
+            };
+            let requests = requests.to_vec();
+            let results = tokio::task::spawn_blocking(move || {
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                if comm_log.is_some() {
+                    host.set_comm_log(comm_log);
+                    host.set_link_ids(0x7E0, 0x7E8);
+                    host.own_reads(Some(OwnRead::Identification));
+                }
+                requests
+                    .into_iter()
+                    .map(|(service, payload)| host.service_request(service, payload))
+                    .collect()
+            })
+            .await
+            .unwrap();
+            KeepRun { results, fake }
+        }
+
+        /// The result as a comparable value.
+        fn shown(results: &[Result<Vec<u8>, HostError>]) -> Vec<Result<Vec<u8>, String>> {
+            results
+                .iter()
+                .map(|result| match result {
+                    Ok(bytes) => Ok(bytes.clone()),
+                    Err(error) => Err(error.to_string()),
+                })
+                .collect()
+        }
+
+        /// Design 8.2.5: with the keep-alive on, the first session control into a non-default
+        /// session goes as the request of a StartComm and is answered as a send-receive is; it
+        /// starts the worker's tester present, which the open left on, so nothing is switched
+        /// and the link's status is not asked. The log shows the StartComm in the exchange and
+        /// the tester present on in a `keep_alive` entry.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_first_non_default_session_control_starts_communication() {
+            let dir = journal_dir("keep-alive-start");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let run = keep_run(Setup::default(), &[POSITIVE_02], &[DSC_02], Some(log)).await;
+            assert_eq!(shown(&run.results), [Ok(vec![0x50, 0x02])]);
+            assert_eq!(run.types(), [Startcomm]);
+            assert_eq!(run.fake.keep.starts.lock().unwrap()[0].1, [0x10, 0x02]);
+            assert_eq!(run.handling(), [1]);
+            assert_eq!(run.called("GetStatus"), 0);
+            let lines = comm_log_lines(&dir);
+            let exchange = lines
+                .iter()
+                .find(|line| line["event"] == "exchange")
+                .expect("the exchange");
+            assert_eq!(exchange["detail"]["cop_type"], "startcomm");
+            assert_eq!(exchange["outcome"]["result"], "positive");
+            let alive: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .collect();
+            assert_eq!(alive.len(), 1, "{lines:?}");
+            assert_eq!(alive[0]["origin"], "keep_alive");
+            assert_eq!(alive[0]["action"], "on");
+            assert_eq!(alive[0]["means"], "start_comm");
+            assert_eq!(alive[0]["result"], "ok");
+            assert_eq!(alive[0]["link"], 1);
+            assert!(alive[0]["agent"]["us"].is_u64(), "{alive:?}");
+            assert!(alive[0].get("times").is_none());
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A StartComm whose request got a negative answer: the host asks the link's status.
+        /// COMM_STARTED: the tester present the StartComm left running is switched off by a
+        /// `CoptUpdateparam` after `CP_TesterPresentHandling` is set to 0, and the log says so;
+        /// ONLINE: nothing was started, nothing is switched, and the next such request is a
+        /// StartComm again.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_start_without_a_positive_answer_asks_the_links_status() {
+            let dir = journal_dir("keep-alive-negative");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                ..Setup::default()
+            };
+            let run = keep_run(setup, &[NEGATIVE_10], &[DSC_02], Some(log)).await;
+            assert_eq!(shown(&run.results), [Ok(vec![0x7F, 0x10, 0x22])]);
+            assert_eq!(run.types(), [Startcomm, Updateparam]);
+            assert!(run.fake.keep.starts.lock().unwrap()[1].1.is_empty());
+            assert_eq!(run.handling(), [1, 0]);
+            let calls = run.fake.calls.lock().unwrap().clone();
+            let status = calls.iter().position(|call| *call == "GetStatus").unwrap();
+            let update = calls.iter().rposition(|call| *call == "StartComPrimitive");
+            assert!(Some(status) < update, "{calls:?}");
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .collect();
+            assert_eq!(alive.len(), 1, "{lines:?}");
+            assert_eq!(alive[0]["action"], "off");
+            assert_eq!(alive[0]["means"], "update_param");
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstOnline),
+                ..Setup::default()
+            };
+            let run = keep_run(setup, &[NEGATIVE_10, POSITIVE_02], &[DSC_02, DSC_02], None).await;
+            assert_eq!(run.results.len(), 2);
+            assert_eq!(run.types(), [Startcomm, Startcomm]);
+            assert_eq!(run.handling(), [1]);
+            assert_eq!(run.called("GetStatus"), 1);
+        }
+
+        /// A status that cannot be read leaves the link unknown: the next session control goes as
+        /// a send-receive (a second StartComm would be refused on a started link), and the
+        /// question is asked again after it.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_status_that_cannot_be_read_is_asked_again_after_the_next_exchange() {
+            let run = keep_run(
+                Setup::default(),
+                &[NEGATIVE_10, POSITIVE_02],
+                &[DSC_02, DSC_02],
+                None,
+            )
+            .await;
+            assert_eq!(run.types(), [Startcomm, Sendrecv]);
+            assert_eq!(run.called("GetStatus"), 2);
+            assert_eq!(run.handling(), [1]);
+        }
+
+        /// No answer is the same as a negative one (the link may have started); the repeated
+        /// session control then goes as a send-receive on a started link, and entering the
+        /// session switches the handling on again, since the first answer left it off.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_repeated_session_control_on_a_started_link_switches_the_handling_on() {
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                ..Setup::default()
+            };
+            let run = keep_run(setup, &[NO_ANSWER, POSITIVE_02], &[DSC_02, DSC_02], None).await;
+            assert!(
+                matches!(run.results[0], Err(HostError::NoResponse)),
+                "{:?}",
+                run.results
+            );
+            assert_eq!(shown(&run.results[1..]), [Ok(vec![0x50, 0x02])]);
+            assert_eq!(run.types(), [Startcomm, Updateparam, Sendrecv, Updateparam]);
+            assert_eq!(run.handling(), [1, 0, 1]);
+            assert_eq!(run.called("GetStatus"), 1);
+        }
+
+        /// A response-pending chain before the positive answer is waited for as a
+        /// send-receive's is; the answer then starts communication.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_pending_chain_before_the_positive_answer_starts_communication() {
+            let run = keep_run(Setup::default(), &[PENDING_THEN_02], &[DSC_02], None).await;
+            assert_eq!(shown(&run.results), [Ok(vec![0x50, 0x02])]);
+            assert_eq!(run.types(), [Startcomm]);
+            assert_eq!(run.called("GetStatus"), 0);
+        }
+
+        /// ADR-408: the silence of a session control whose positive response is suppressed is
+        /// its result, and it starts communication.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_silence_of_a_suppressed_session_control_starts_communication() {
+            let run = keep_run(Setup::default(), &[NO_ANSWER], &[DSC_82], None).await;
+            assert_eq!(shown(&run.results), [Ok(Vec::new())]);
+            assert_eq!(run.types(), [Startcomm]);
+            assert_eq!(run.handling(), [1]);
+            assert_eq!(run.called("GetStatus"), 0);
+        }
+
+        /// Returning to the default session on a started link, by a positive answer or by the
+        /// silence of a suppressed one, switches the handling off.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_default_session_switches_the_handling_off() {
+            for (back, answer) in [(DSC_01, POSITIVE_01), (DSC_81, NO_ANSWER)] {
+                let run = keep_run(
+                    Setup::default(),
+                    &[POSITIVE_02, answer],
+                    &[DSC_02, back],
+                    None,
+                )
+                .await;
+                assert_eq!(run.results.len(), 2);
+                assert_eq!(run.types(), [Startcomm, Sendrecv, Updateparam], "{back:?}");
+                assert_eq!(run.handling(), [1, 0], "{back:?}");
+            }
+        }
+
+        /// A second non-default session keeps the handling on; an ECUReset refused changes
+        /// nothing, one accepted returns to the default session and switches it off.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_handling_follows_the_session_record() {
+            let run = keep_run(
+                Setup::default(),
+                &[POSITIVE_02, POSITIVE_03],
+                &[DSC_02, DSC_03],
+                None,
+            )
+            .await;
+            assert_eq!(run.types(), [Startcomm, Sendrecv]);
+            assert_eq!(run.handling(), [1]);
+
+            let run = keep_run(
+                Setup::default(),
+                &[POSITIVE_02, RESET_REFUSED, RESET_ACCEPTED],
+                &[DSC_02, RESET, RESET],
+                None,
+            )
+            .await;
+            assert_eq!(run.types(), [Startcomm, Sendrecv, Sendrecv, Updateparam]);
+            assert_eq!(run.handling(), [1, 0]);
+        }
+
+        /// A restart's teardown, passive wait and confirmations on a fresh link are ordinary
+        /// send-receives that switch nothing, and the replay's session control after them is
+        /// the link's first into a non-default session: a StartComm.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_fresh_links_teardown_switches_nothing_and_the_replay_starts_communication() {
+            let run = keep_run(
+                Setup::default(),
+                &[RESET_ACCEPTED, READ_ANSWERED, POSITIVE_01, POSITIVE_02],
+                &[RESET, READ, DSC_01, DSC_02],
+                None,
+            )
+            .await;
+            assert_eq!(run.results.len(), 4);
+            assert_eq!(run.types(), [Sendrecv, Sendrecv, Sendrecv, Startcomm]);
+            assert_eq!(run.handling(), [1]);
+            assert_eq!(run.called("GetStatus"), 0);
+        }
+
+        /// A read-only link never leaves the default session: the policy refuses the session
+        /// control, nothing is started and nothing is switched.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_read_only_job_starts_and_switches_nothing() {
+            let (mut client, fake) = fake_worker_starting(CancelAnswer::Done).await;
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            assert_eq!(link.permission(), Permission::ReadOnly);
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: Duration::from_secs(5),
+            };
+            let result = tokio::task::spawn_blocking(move || {
+                let mut host = WorkerHost::new(handle, client, link, timings);
+                host.service_request(0x10, &[0x02])
+            })
+            .await
+            .unwrap();
+            assert!(
+                matches!(result, Err(HostError::NotAllowed(0x10))),
+                "{result:?}"
+            );
+            assert!(fake.keep.starts.lock().unwrap().is_empty());
+            assert!(!fake.calls.lock().unwrap().contains(&"GetStatus"));
+        }
+
+        /// With the keep-alive off the link sets no tester-present ComParam, every request is a
+        /// send-receive and nothing is switched.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_link_with_the_keep_alive_off_sends_every_request_as_a_send_receive() {
+            let setup = Setup {
+                keep_alive_off: true,
+                ..Setup::default()
+            };
+            let run = keep_run(setup, &[POSITIVE_02, POSITIVE_01], &[DSC_02, DSC_01], None).await;
+            assert_eq!(run.types(), [Sendrecv, Sendrecv]);
+            assert!(run.handling().is_empty());
+            let set = run.fake.set.lock().unwrap().clone();
+            assert!(
+                set.iter()
+                    .all(|(name, _, _)| !name.starts_with("cp_testerpresent")),
+                "{set:?}"
+            );
+            assert_eq!(run.called("GetStatus"), 0);
+        }
+
+        /// A library that refuses one of the tester-present ComParams opens the link without the
+        /// keep-alive: the handling is set to 0, the link records that, and its session control
+        /// goes as a send-receive.
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_library_that_refuses_a_tester_present_comparam_opens_without_the_keep_alive() {
+            let (mut client, _calls, set) =
+                fake_worker_refusing(false, false, Some("cp_testerpresentexpposresp")).await;
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let link = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            assert!(!link.indications.tester_present);
+            assert!(link.indications.transmit && link.indications.start_of_message);
+            let set = set.lock().unwrap().clone();
+            let tester_present = vci_service_interface::PduParamClass::PduPcTesterPresent as i32;
+            let names: Vec<&str> = set
+                .iter()
+                .filter(|(name, _, _)| name.starts_with("cp_testerpresent"))
+                .map(|(name, _, _)| name.as_str())
+                .collect();
+            // Set up to the refused one, then the handling off; the time and the final handling
+            // 1 were never set.
+            assert_eq!(
+                names,
+                [
+                    "cp_testerpresentmessage",
+                    "cp_testerpresentreqrsp",
+                    "cp_testerpresenthandling"
+                ]
+            );
+            // The indications follow, as for a link that has the keep-alive.
+            assert_eq!(
+                set.last().map(|(name, _, _)| name.as_str()),
+                Some("cp_startmsgindenable")
+            );
+            assert!(
+                set.contains(&("cp_testerpresenthandling".to_owned(), 0, tester_present)),
+                "{set:?}"
+            );
+        }
+
+        /// A failed switch-off is logged and the handling stays believed on; a failed switch-on
+        /// leaves the triggering request's result as it was and fails the next request before it
+        /// is sent (ADR-420 item 6).
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_failed_switch_off_is_logged_and_a_failed_switch_on_fails_the_next_request() {
+            let refusal = || tonic::Status::internal("PDU_ERR_FCT_FAILED");
+            // A refusal that proves the update was not started (the worker names its reason).
+            let refused = || {
+                vci_service_interface::status_with_error_detail(
+                    tonic::Code::InvalidArgument,
+                    "refused",
+                    vci_service_interface::ErrorDetail {
+                        refusal: Some(
+                            vci_service_interface::RefusalReason::InvalidParameters as i32,
+                        ),
+                        ..Default::default()
+                    },
+                )
+            };
+            // An update that may have reached the worker before it failed: the handling is
+            // believed off, so entering a session switches it on again.
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                updates: vec![Some(refusal())],
+                ..Setup::default()
+            };
+            let run = keep_run(setup, &[NEGATIVE_10, POSITIVE_02], &[DSC_02, DSC_02], None).await;
+            assert_eq!(run.types(), [Startcomm, Updateparam, Sendrecv, Updateparam]);
+            // Off fails with a proof that it was not started: the handling stays on, so
+            // entering a session switches nothing.
+            let dir = journal_dir("keep-alive-off-fails");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                updates: vec![Some(refused())],
+                ..Setup::default()
+            };
+            let run = keep_run(
+                setup,
+                &[NEGATIVE_10, POSITIVE_02, READ_ANSWERED],
+                &[DSC_02, DSC_02, READ],
+                Some(log),
+            )
+            .await;
+            assert_eq!(run.types(), [Startcomm, Updateparam, Sendrecv, Sendrecv]);
+            assert!(run.results[2].is_ok(), "{:?}", run.results);
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .collect();
+            assert_eq!(alive.len(), 1, "{lines:?}");
+            assert_eq!(alive[0]["action"], "off");
+            assert_eq!(alive[0]["result"], "failed");
+            assert_eq!(alive[0]["detail"]["host_error"], "Rpc");
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            // On fails: the request that entered the session keeps its result, the next fails
+            // before anything is sent.
+            let dir = journal_dir("keep-alive-on-fails");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                updates: vec![None, Some(refusal())],
+                ..Setup::default()
+            };
+            let run = keep_run(
+                setup,
+                &[NEGATIVE_10, POSITIVE_02, READ_ANSWERED],
+                &[DSC_02, DSC_02, READ],
+                Some(log),
+            )
+            .await;
+            assert_eq!(shown(&run.results[1..2]), [Ok(vec![0x50, 0x02])]);
+            assert!(
+                matches!(run.results[2], Err(HostError::KeepAliveFailed)),
+                "{:?}",
+                run.results
+            );
+            assert_eq!(
+                run.results[2].as_ref().unwrap_err().send_state(),
+                crate::host::SendState::NotSent
+            );
+            assert_eq!(run.types(), [Startcomm, Updateparam, Sendrecv, Updateparam]);
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<(&str, &str)> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .map(|line| {
+                    (
+                        line["action"].as_str().unwrap(),
+                        line["result"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(alive, [("off", "ok"), ("on", "failed")]);
+            let refused = lines
+                .iter()
+                .rfind(|line| line["event"] == "exchange")
+                .expect("the refused request has an entry");
+            assert_eq!(refused["outcome"]["result"], "not_sent");
+            assert_eq!(refused["outcome"]["cause"], "keep_alive_failed");
+            assert_eq!(refused["detail"]["host_error"], "KeepAliveFailed");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A status that comes late: the start got no answer, its status could not be read, and
+        /// the next session control was answered before the status said anything. ONLINE then
+        /// means no tester-present runs for a session that is entered: the same failure as a
+        /// failed switch-on (the next request is refused, the log says so). COMM_STARTED means
+        /// the start's tester-present keeps it, and the log shows it on.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_late_status_decides_whether_the_entered_session_is_kept() {
+            let dir = journal_dir("keep-alive-late-online");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status_script: vec![None, Some(LinkStatus::PduCllstOnline)],
+                ..Setup::default()
+            };
+            let run = keep_run(
+                setup,
+                &[NO_ANSWER, POSITIVE_03, READ_ANSWERED],
+                &[DSC_02, DSC_03, READ],
+                Some(log),
+            )
+            .await;
+            assert!(matches!(run.results[2], Err(HostError::KeepAliveFailed)));
+            assert_eq!(run.types(), [Startcomm, Sendrecv]);
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .collect();
+            assert_eq!(alive.len(), 1, "{lines:?}");
+            assert_eq!(alive[0]["action"], "on");
+            assert_eq!(alive[0]["result"], "failed");
+            assert_eq!(alive[0]["detail"]["host_error"], "KeepAliveFailed");
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            let dir = journal_dir("keep-alive-late-started");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status_script: vec![None, Some(LinkStatus::PduCllstCommStarted)],
+                ..Setup::default()
+            };
+            let run = keep_run(
+                setup,
+                &[NO_ANSWER, POSITIVE_03, READ_ANSWERED],
+                &[DSC_02, DSC_03, READ],
+                Some(log),
+            )
+            .await;
+            assert!(run.results[2].is_ok(), "{:?}", run.results);
+            assert_eq!(run.types(), [Startcomm, Sendrecv, Sendrecv]);
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<(&str, &str, &str)> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .map(|line| {
+                    (
+                        line["action"].as_str().unwrap(),
+                        line["means"].as_str().unwrap(),
+                        line["result"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(alive, [("on", "start_comm", "ok")]);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A StartComm the agent's deadline ended is a stray the next request cancels: the
+        /// link's status is not asked while it may still change the link, and is asked after the
+        /// next exchange has settled it.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_status_is_not_asked_while_the_start_is_unsettled() {
+            let setup = || Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                deadline: Duration::from_secs(1),
+                ..Setup::default()
+            };
+            let hung: &[Step] = &[];
+            let run = keep_run(setup(), &[hung], &[DSC_02], None).await;
+            assert!(matches!(run.results[0], Err(HostError::NoResponse)));
+            assert_eq!(run.called("GetStatus"), 0);
+            assert_eq!(run.called("CancelComPrimitive"), 0);
+
+            let run = keep_run(setup(), &[hung, READ_ANSWERED], &[DSC_02, READ], None).await;
+            assert!(run.results[1].is_ok(), "{:?}", run.results);
+            assert_eq!(run.called("GetStatus"), 1);
+            let calls = run.fake.calls.lock().unwrap().clone();
+            let cancel = calls
+                .iter()
+                .position(|c| *c == "CancelComPrimitive")
+                .unwrap();
+            let status = calls.iter().position(|c| *c == "GetStatus").unwrap();
+            assert!(cancel < status, "{calls:?}");
+            // The link started and the record is the default session: the tester-present the
+            // start left on is switched off.
+            assert_eq!(run.types(), [Startcomm, Sendrecv, Updateparam]);
+        }
+
+        /// ADR-393: a link opened again starts the record over: ONLINE, the default session and
+        /// the handling on, so the next non-default session control is a StartComm.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_reopened_link_starts_the_keep_alive_over() {
+            let script = vec![
+                (When::After(Duration::ZERO), StartEvent::Script(NEGATIVE_10)),
+                (When::After(Duration::ZERO), StartEvent::Script(POSITIVE_02)),
+            ];
+            let (mut client, fake) =
+                fake_worker_answering(CancelAnswer::Done, None, false, false, script, Vec::new())
+                    .await;
+            *fake.keep.status.lock().unwrap() = Some(LinkStatus::PduCllstCommStarted as i32);
+            let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+            let mut first = link::open(&mut client, &config, Duration::from_secs(5))
+                .await
+                .expect("the link opens");
+            first.permission = Permission::Simulator;
+            let handle = tokio::runtime::Handle::current();
+            let timings = Timings {
+                unary: Duration::from_secs(5),
+                send_recv: Duration::from_secs(5),
+            };
+            let reopened = client.clone();
+            let handle2 = handle.clone();
+            tokio::task::spawn_blocking(move || {
+                let mut host = WorkerHost::new(handle, client, first, timings);
+                // Started, then switched off: COMM_STARTED, handling off.
+                host.service_request(0x10, &[0x02]).unwrap();
+                // The worker's event stream is the newest link's: the new link opens when the
+                // old one is given up.
+                let mut reopened = reopened;
+                let mut second = handle2
+                    .block_on(link::open(&mut reopened, &config, Duration::from_secs(5)))
+                    .expect("the link opens again");
+                second.permission = Permission::Simulator;
+                host.reopen(reopened, second, &config);
+                host.service_request(0x10, &[0x02]).unwrap();
+            })
+            .await
+            .unwrap();
+            assert_eq!(fake.keep.types(), [Startcomm, Updateparam, Startcomm]);
+            let handling: Vec<u32> = fake
+                .set
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(name, _, _)| name == "cp_testerpresenthandling")
+                .map(|(_, value, _)| *value)
+                .collect();
+            // The open's 1, the switch-off's 0, the new link's open 1, and no switch after the
+            // second StartComm, which left the handling on.
+            assert_eq!(handling, [1, 0, 1]);
+        }
     }
 }

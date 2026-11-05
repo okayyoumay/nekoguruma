@@ -497,6 +497,11 @@ pub(crate) struct Detail {
     /// The native library's return code, as a name or a number.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_return_code: Option<String>,
+    /// The primitive the request went as, when it was not a send-receive: `startcomm` for the
+    /// session control that starts the link's communication, and with it the worker's
+    /// tester-present (ADR-420 item 3).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cop_type: Option<&'static str>,
 }
 
 /// What kind of error a link reported (design 8.11 "Link error").
@@ -579,6 +584,9 @@ pub(crate) enum RefusalCause {
     /// An earlier primitive the agent stopped waiting for still holds the link, and the worker
     /// did not cancel it (design 8.11 "Settlement").
     LinkHeld,
+    /// Switching the worker's tester present on failed, or could not be done, so the job's
+    /// session is no longer kept alive (design 8.2.5, ADR-420 item 6).
+    KeepAliveFailed,
 }
 
 impl RefusalCause {
@@ -606,6 +614,7 @@ impl RefusalCause {
             }
             Self::SystemOwnReasons => "the system refused it for its own reasons (invalid parameters, a full queue or a request the protocol cannot carry)".to_owned(),
             Self::LinkHeld => "an earlier request the agent stopped waiting for still holds the link, and the system could not cancel it".to_owned(),
+            Self::KeepAliveFailed => "the system could not keep the session alive, so the job's next request was not sent".to_owned(),
         }
     }
 }
@@ -6897,6 +6906,7 @@ mod tests {
             RefusalCause::UndeclaredService,
             RefusalCause::SystemOwnReasons,
             RefusalCause::LinkHeld,
+            RefusalCause::KeepAliveFailed,
         ] {
             let evidence = evidence(&[0x36, 1], End::NotSent(cause));
             let entry = ExchangeEntry::build(4, evidence, LinkHistory::empty());
@@ -7708,6 +7718,7 @@ mod tests {
             End::NotSent(RefusalCause::EmptyRequest),
             End::NotSent(RefusalCause::UndeclaredService),
             End::NotSent(RefusalCause::SystemOwnReasons),
+            End::NotSent(RefusalCause::KeepAliveFailed),
             End::NotSent(RefusalCause::EarlierResponse),
             End::Unknown(UnknownCause::RpcFailure),
             End::Unknown(UnknownCause::WorkerNotAnswering),
@@ -8066,9 +8077,10 @@ mod tests {
             grpc_status: Some("d"),
             worker_detail: Some("e".to_owned()),
             native_return_code: Some("f".to_owned()),
+            cop_type: Some("startcomm"),
         })
         .unwrap();
-        assert_eq!(keys(&detail).len(), 7);
+        assert_eq!(keys(&detail).len(), 8);
         let span = SourceSpan {
             pc: 1,
             file: 2,

@@ -204,6 +204,7 @@ enum Event<'a> {
     JobStart(JobStart),
     JobEnd(JobEnd<'a>),
     ProcedureLog(ProcedureLog<'a>),
+    KeepAlive(KeepAliveEntry),
     VciConnected(VciConnected<'a>),
     LinkOpened(LinkOpened<'a>),
     Identity(Identity),
@@ -1181,6 +1182,10 @@ struct ComParamInForce<'a> {
     /// The value set, absent when it keeps the library's default.
     #[serde(skip_serializing_if = "Option::is_none")]
     value: Option<u32>,
+    /// The value of a byte-field ComParam (the tester-present message and its two expected
+    /// responses), as hexadecimal text; `value` is then absent.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    value_hex: Option<String>,
     set_by: SetBy,
     /// For an indication the link turns on (`link::INDICATION_COMPARAMS`): whether the library
     /// accepted it. A refused one leaves the link without the indication.
@@ -1214,6 +1219,36 @@ struct TimingMargin {
 /// the library; the link sets the others it lists. `CP_P1Max` is left out: CAN has no
 /// inter-byte time.
 const LOGGED_TIMING_COMPARAMS: [&str; 1] = ["CP_TesterPresentHandling"];
+
+/// The agent switched the API's tester present on or off on a job's own link (`keep_alive`,
+/// design 8.11, ADR-420): an entry without an exchange, with the agent's time only, since the
+/// VCI gives the switch no time of its own. The first session control that starts the
+/// tester-present is the VM's own exchange; this entry follows it.
+#[derive(Serialize)]
+struct KeepAliveEntry {
+    origin: exchange::Origin,
+    target: exchange::Target,
+    link: u32,
+    /// `on` or `off`: what the agent switched the tester present to.
+    action: &'static str,
+    /// `start_comm`: the session control that started communication switched it on; `update_param`:
+    /// a `CoptUpdateparam` switched it.
+    means: &'static str,
+    /// `ok`, or `failed` with the failure in `detail`.
+    result: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    detail: Option<exchange::Detail>,
+    agent: KeepAliveTime,
+}
+
+/// The agent's clocks at a `keep_alive` entry: the agent epoch, the monotonic microseconds since
+/// the log began, and the wall clock.
+#[derive(Serialize)]
+struct KeepAliveTime {
+    epoch: u32,
+    us: u64,
+    wall_unix_ms: u64,
+}
 
 /// A message the procedure logged with `diag.log`, with its level (design 8.11, ADR-348 item
 /// 6). It may hold vehicle data, so it is kept here and never in the operational log.
@@ -1925,10 +1960,12 @@ impl CommLog {
     /// request identifier and no ended exchange on the link could still own it; the others are
     /// `unattached` events, written before the entry. The other conditions design 8.11 sets
     /// hold on the agent's link by construction: the job runs one primitive at a time on its one
-    /// link, so no other exchange on the physical channel is in flight, and the link starts no
-    /// communication (`PDU_COPT_STARTCOMM`), so the API sends no tester present of its own (ISO
-    /// 22900-2:2022 8.2.6.3.2 and 8.4.9.2.1: tester present runs only on a link whose
-    /// communication was started; `j2534-0404-service` arms it on `CoptStartcomm` alone).
+    /// link, so no other exchange on the physical channel is in flight, and the API's own tester
+    /// present, which a job's link runs once its first session control has started communication
+    /// (`PDU_COPT_STARTCOMM`, ADR-418), sends no request while a primitive of the link is
+    /// outstanding (ISO 22900-2:2022 8.1.3 Table 1, which `j2534-0404-service` keeps as ADR-419
+    /// decides) and has its transmit indications and loopback echo discarded by the worker
+    /// (ADR-099), so none reaches this attribution as an item of the exchange.
     ///
     /// A start-of-message indication among them is the first frame of the exchange's response
     /// when it carries the exchange's response identifier and no owed request on the link could
@@ -3350,6 +3387,7 @@ impl CommLog {
             .map(|(name, value)| ComParamInForce {
                 name,
                 value: Some(value),
+                value_hex: None,
                 set_by: if valued_by_document.contains(&name) {
                     SetBy::Document
                 } else {
@@ -3358,10 +3396,38 @@ impl CommLog {
                 accepted: None,
             })
             .collect();
+        // The keep-alive's tester-present ComParams, with whether the library accepted them
+        // (design 8.2.5, 8.11): a refused set leaves the link without the keep-alive.
+        comparams.extend(
+            crate::link::tester_present_comparams(config)
+                .into_iter()
+                .map(|(name, value)| {
+                    let (value, value_hex) = match value {
+                        // A library that refused a tester-present ComParam had the handling set
+                        // to 0 afterwards (best effort), the value attempted last.
+                        crate::link::ParamValue::U32(_)
+                            if name == crate::link::TESTER_PRESENT_HANDLING
+                                && !indications.tester_present =>
+                        {
+                            (Some(0), None)
+                        }
+                        crate::link::ParamValue::U32(value) => (Some(value), None),
+                        crate::link::ParamValue::Bytes(bytes) => (None, Some(to_hex(bytes))),
+                    };
+                    ComParamInForce {
+                        name,
+                        value,
+                        value_hex,
+                        set_by: SetBy::Link,
+                        accepted: Some(indications.tester_present),
+                    }
+                }),
+        );
         comparams.extend(crate::link::INDICATION_COMPARAMS.into_iter().map(|name| {
             ComParamInForce {
                 name,
                 value: Some(1),
+                value_hex: None,
                 set_by: SetBy::Link,
                 accepted: Some(indications.accepted(name)),
             }
@@ -3369,6 +3435,7 @@ impl CommLog {
         comparams.extend(config.params.iter().map(|(name, value)| ComParamInForce {
             name,
             value: Some(*value),
+            value_hex: None,
             set_by: SetBy::Document,
             accepted: None,
         }));
@@ -3380,6 +3447,7 @@ impl CommLog {
                 comparams.push(ComParamInForce {
                     name,
                     value: None,
+                    value_hex: None,
                     set_by: SetBy::LibraryDefault,
                     accepted: None,
                 });
@@ -3606,6 +3674,37 @@ impl CommLog {
     pub(crate) fn procedure_log(&self, level: u8, message: &str) -> Option<u64> {
         let mut inner = self.lock();
         let event = Event::ProcedureLog(ProcedureLog { level, message });
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
+    /// Writes a `keep_alive` event: the agent switched the API's tester present to `action` (`on`
+    /// or `off`) by `means` (`start_comm` or `update_param`) on link `link` (design 8.11,
+    /// ADR-420). `failure` is the switch's failure (`result` `failed`), or `None` when it
+    /// succeeded. The event's `seq`; `None` once the log has failed.
+    pub(crate) fn keep_alive(
+        &self,
+        target: exchange::Target,
+        link: u32,
+        action: &'static str,
+        means: &'static str,
+        failure: Option<exchange::Detail>,
+    ) -> Option<u64> {
+        let now = self.now();
+        let event = Event::KeepAlive(KeepAliveEntry {
+            origin: exchange::Origin::KeepAlive,
+            target,
+            link,
+            action,
+            means,
+            result: if failure.is_some() { "failed" } else { "ok" },
+            detail: failure,
+            agent: KeepAliveTime {
+                epoch: now.epoch,
+                us: now.monotonic_us,
+                wall_unix_ms: now.wall_unix_ms,
+            },
+        });
+        let mut inner = self.lock();
         inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
     }
 
@@ -5961,6 +6060,7 @@ mod tests {
                 crate::link::Indications {
                     transmit,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 None,
             )
@@ -5972,6 +6072,50 @@ mod tests {
                 .find(|line| line["event"] == "link_opened")
                 .unwrap();
             assert_eq!(opened["transmit_confirmation"], expected, "{transmit}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-420 item 2: `link_opened` lists the keep-alive's ComParams as attempted, and says
+    /// whether the library accepted them; when it did not, the handling in force is the 0 the
+    /// agent set afterwards, not the 1 it first tried.
+    #[test]
+    fn link_opened_shows_the_tester_present_comparams_the_library_refused() {
+        for (accepted, handling) in [(true, 1), (false, 0)] {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    tester_present: accepted,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            let opened = lines
+                .iter()
+                .find(|line| line["event"] == "link_opened")
+                .unwrap();
+            let param = |name: &str| {
+                opened["comparams"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|param| param["name"] == name)
+                    .unwrap_or_else(|| panic!("{name} in {opened}"))
+            };
+            let handling_param = param("CP_TesterPresentHandling");
+            assert_eq!(handling_param["value"], handling, "{accepted}");
+            assert_eq!(handling_param["accepted"], accepted);
+            assert_eq!(param("CP_TesterPresentMessage")["value_hex"], "3e00");
+            assert_eq!(param("CP_TesterPresentMessage")["accepted"], accepted);
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }
@@ -7479,6 +7623,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -7568,6 +7713,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -7661,6 +7807,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -7781,6 +7928,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -8096,6 +8244,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -8197,6 +8346,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -8359,6 +8509,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -8546,6 +8697,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -9458,6 +9610,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -9834,6 +9987,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -10259,6 +10413,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -10394,6 +10549,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -10531,6 +10687,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -10634,6 +10791,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -10846,6 +11004,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -10922,6 +11081,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -11036,6 +11196,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -11332,6 +11493,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -13598,6 +13760,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -13865,6 +14028,7 @@ mod tests {
                 crate::link::Indications {
                     transmit: true,
                     start_of_message: true,
+                    ..Default::default()
                 },
                 Some(true),
             )
@@ -13952,6 +14116,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )
@@ -14416,6 +14581,7 @@ mod tests {
             crate::link::Indications {
                 transmit: true,
                 start_of_message: true,
+                ..Default::default()
             },
             Some(true),
         )

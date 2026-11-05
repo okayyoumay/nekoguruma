@@ -19,6 +19,13 @@
 //! is kept as well. Returning to the default session switches the tester present off by
 //! `CoptUpdateparam`.
 //!
+//! An ECU that stops answering the worker's TesterPresent ends the run (ADR-418 item 6,
+//! ADR-420 item 8): `sim-vci` is told, through its control directory, to lose the response to
+//! the next TesterPresent, which the worker reports as its tester-present error at the end of
+//! its response window. The agent reads it at the next poll of the procedure's `Wait`, so the
+//! run ends in `SessionLost` before the routine is sent, and the log has the `keep_alive` entry
+//! of the error.
+//!
 //! This file holds a single test, so the process-wide environment it sets for the spawned service
 //! cannot race with another test.
 
@@ -27,7 +34,10 @@ use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::{CommLogSetup, CommLogStatus, Job, JobLimits, JobRun, LinkConfig, run_program};
+use agent::{
+    CommLogSetup, CommLogStatus, HostError, Job, JobError, JobLimits, JobRun, LinkConfig,
+    run_program,
+};
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
@@ -146,14 +156,16 @@ fn the_agent_keeps_a_session_alive_across_a_wait() {
     let ecu_path = tmp("ecu.json");
     let definition_dir = tmp("definitions");
     let comm_log_dir = tmp("commlog");
+    let control_dir = tmp("control");
     let _temps = [
+        Temp(control_dir.clone()),
         Temp(config_path.clone()),
         Temp(ecu_path.clone()),
         Temp(definition_dir.clone()),
         Temp(comm_log_dir.clone()),
     ];
     std::fs::write(&config_path, "").expect("test config file should be writable");
-    for dir in [&definition_dir, &comm_log_dir] {
+    for dir in [&definition_dir, &comm_log_dir, &control_dir] {
         std::fs::create_dir_all(dir).expect("test directory");
     }
     // The registration definition names the library, through the debug-only
@@ -174,6 +186,7 @@ fn the_agent_keeps_a_session_alive_across_a_wait() {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
         std::env::set_var("NGR_J2534_DEFINITION_DIR", &definition_dir);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
+        std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", &control_dir);
         std::env::set_var("NGR_SIM_ECU_CONFIG", &ecu_path);
         std::env::remove_var("NGR_SIM_ECU_STATE");
     }
@@ -187,7 +200,11 @@ fn the_agent_keeps_a_session_alive_across_a_wait() {
     // A wedged service must fail the test, not hang the CI job.
     runtime
         .block_on(async {
-            tokio::time::timeout(Duration::from_secs(120), run_the_jobs(&comm_log_dir)).await
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                run_the_jobs(&comm_log_dir, &control_dir),
+            )
+            .await
         })
         .expect("the flow should finish in time");
 }
@@ -195,10 +212,24 @@ fn the_agent_keeps_a_session_alive_across_a_wait() {
 /// What a job returned: its stack, and the lines of its communication log.
 struct Outcome {
     stack: Vec<Value>,
+    /// How the job ended, when it did not finish.
+    error: Option<JobError>,
     log: Vec<serde_json::Value>,
 }
 
-async fn run_the_jobs(comm_log_dir: &std::path::Path) {
+impl Outcome {
+    /// The outcome of a job that finished.
+    fn finished(self) -> Self {
+        assert!(
+            self.error.is_none(),
+            "the job should finish: {:?}",
+            self.error
+        );
+        self
+    }
+}
+
+async fn run_the_jobs(comm_log_dir: &std::path::Path, control_dir: &std::path::Path) {
     let worker = WorkerProcess::launch(
         std::path::Path::new(env!("CARGO_BIN_EXE_j2534-0404-service")),
         ServiceKind::J2534V0404,
@@ -249,12 +280,16 @@ async fn run_the_jobs(comm_log_dir: &std::path::Path) {
                 job_guards(),
             )
             .await;
-            let state = result.expect("the job should finish");
+            let (stack, error) = match result {
+                Ok(state) => (state.stack, None),
+                Err(error) => (Vec::new(), Some(error)),
+            };
             assert_eq!(comm_log, CommLogStatus::Complete);
             let text =
                 std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
             Outcome {
-                stack: state.stack,
+                stack,
+                error,
                 log: text
                     .lines()
                     .map(|line| serde_json::from_str(line).expect("a JSON line"))
@@ -265,7 +300,7 @@ async fn run_the_jobs(comm_log_dir: &std::path::Path) {
 
     // Kept alive: the session outlasts the wait, so the routine answers a request sequence error,
     // as it does in the programming session.
-    let kept = run(session_program(0x02), Some(PERIOD)).await;
+    let kept = run(session_program(0x02), Some(PERIOD)).await.finished();
     let [Value::Bytes(session), Value::Bytes(routine)] = kept.stack.as_slice() else {
         panic!("{:?}", kept.stack);
     };
@@ -299,7 +334,7 @@ async fn run_the_jobs(comm_log_dir: &std::path::Path) {
 
     // The same job with the keep-alive off: the session lapsed during the wait, so the routine is
     // out of range, as in the default session.
-    let lapsed = run(session_program(0x02), None).await;
+    let lapsed = run(session_program(0x02), None).await.finished();
     let [Value::Bytes(_), Value::Bytes(routine)] = lapsed.stack.as_slice() else {
         panic!("{:?}", lapsed.stack);
     };
@@ -319,7 +354,7 @@ async fn run_the_jobs(comm_log_dir: &std::path::Path) {
     // A session control whose positive response is suppressed: the ECU's silence is its result
     // (ADR-408), reported by the worker's receive timeout of the StartComm, and the session is
     // kept all the same.
-    let silent = run(session_program(0x82), Some(PERIOD)).await;
+    let silent = run(session_program(0x82), Some(PERIOD)).await.finished();
     let [Value::Bytes(session), Value::Bytes(routine)] = silent.stack.as_slice() else {
         panic!("{:?}", silent.stack);
     };
@@ -341,7 +376,7 @@ async fn run_the_jobs(comm_log_dir: &std::path::Path) {
     );
 
     // Back to the default session: the tester present is switched off by CoptUpdateparam.
-    let back = run(there_and_back_program(), Some(PERIOD)).await;
+    let back = run(there_and_back_program(), Some(PERIOD)).await.finished();
     let switches: Vec<(&str, &str, &str)> = back
         .log
         .iter()
@@ -359,5 +394,58 @@ async fn run_the_jobs(comm_log_dir: &std::path::Path) {
         [("on", "start_comm", "ok"), ("off", "update_param", "ok")],
         "{:?}",
         back.log
+    );
+
+    // An ECU that stops answering the tester present: `sim-vci` loses the response to the next
+    // TesterPresent that reaches the ECU, which is the worker's first, sent as the session
+    // starts. The worker reports its tester-present error at the end of the response window,
+    // while the procedure waits; the agent reads it at its next poll, and the run ends before
+    // the routine is sent.
+    let control = control_dir.join("001.json");
+    std::fs::write(
+        control_dir.join("001.tmp"),
+        r#"{"command": "inject_fault", "service": 62, "fault": "drop_response"}"#,
+    )
+    .expect("the control command should be writable");
+    std::fs::rename(control_dir.join("001.tmp"), &control).expect("the command is published");
+    let lost = run(session_program(0x02), Some(PERIOD)).await;
+    match &lost.error {
+        Some(JobError::Host {
+            source: HostError::SessionLost,
+            ..
+        }) => {}
+        other => panic!(
+            "the run should end in SessionLost: {other:?} {:?}",
+            lost.log
+        ),
+    }
+    assert!(lost.stack.is_empty());
+    // The control command was applied (a rejected one is renamed, an applied one deleted).
+    assert!(!control.exists(), "the fault was never armed");
+    let errors: Vec<&serde_json::Value> = lost
+        .log
+        .iter()
+        .filter(|line| line["event"] == "keep_alive" && line["action"] == "error")
+        .collect();
+    assert_eq!(errors.len(), 1, "{:?}", lost.log);
+    assert_eq!(errors[0]["origin"], "keep_alive");
+    assert_eq!(errors[0]["link_error"], "tester_present");
+    assert_eq!(errors[0]["session_lost"], true);
+    assert_eq!(
+        errors[0]["detail"]["error_event"],
+        "PDU_ERR_EVT_TESTER_PRESENT_ERROR"
+    );
+    // Only the session control was sent: the wait ended the run before the routine.
+    let exchanges: Vec<&serde_json::Value> = lost
+        .log
+        .iter()
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    assert_eq!(exchanges.len(), 1, "{:?}", lost.log);
+    assert_eq!(exchanges[0]["detail"]["cop_type"], "startcomm");
+    assert!(
+        errors[0]["seq"].as_u64() > exchanges[0]["seq"].as_u64(),
+        "{:?}",
+        lost.log
     );
 }

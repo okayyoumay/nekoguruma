@@ -1,7 +1,7 @@
 # ADR-420: The Agent's Keep-Alive Mechanics
 
 **Date:** 2026-11-05
-**Status:** Accepted (part 1 implemented; the drain, the observer and the latch of items 6 and 8 are the second part)
+**Status:** Accepted
 **Affects:** `agent` (`link.rs` `LinkConfig` and the link open, `keep_alive.rs`, `host.rs`
 `WorkerHost`, `client.rs` `WorkerApi`, the communication log's `keep_alive` event and
 `link_opened`), `diag-ir` (`link::SET_BY_LINK`), `ngr-hw-checks` (`GuardedClient`); design 8.2.5 and
@@ -124,10 +124,16 @@ worker kinds and does not branch on which it is.
    keeps sending a harmless tester-present. The request that triggered a failed switch-on returns
    its own result unchanged. In the first part, with no latch, the host keeps the failure and the
    next request of the host fails with `HostError::KeepAliveFailed` before anything is sent (not
-   sent, no in-run repeat; the entry has its own refusal cause, `keep_alive_failed`), through the
-   entry point the second part's latch uses (`send`; the presence request is on a link with no
-   keep-alive); the second
-   part merges the failure into the latch and reports it as `HostError::SessionLost`.
+   sent, no in-run repeat; the entry has its own refusal cause, `keep_alive_failed`). The failed
+   switch-on and the latch of item 8 share one report point: the check at the start of `send`,
+   `wait` and `runtime_input` (`WorkerHost::check_session`), which returns the lost session
+   first, else the failed switch-on, so a `Wait` or a runtime read ends in the failed switch-on
+   as a request is refused by it. They keep their own errors and refusal causes
+   (`HostError::KeepAliveFailed`, cause `keep_alive_failed`, classified `system`, since the
+   agent could not switch the handling; `HostError::SessionLost`, cause `session_lost`,
+   `undetermined`, since the vehicle may have dropped the session): both are `NotSent` and
+   `Other`, so `repeat_decision` ends the run for both, with no repeat and no reopen. The
+   presence request does not pass the check; its functional link has no keep-alive.
 
 7. **The log.** Each switch, on or off, writes a `keep_alive` event beside the exchange entries
    (design 8.11): `origin` `keep_alive`, `target`, `link`, `action` (`on` or `off`), `means`
@@ -136,16 +142,56 @@ worker kinds and does not branch on which it is.
    agent's time only, since the VCI gives a switch no time. The StartComm itself is the VM's own
    exchange and is logged as such. A failed switch is logged whichever way it was meant.
 
-8. **The second part: noticing a lost session.** The link's event stream is read only inside a
+8. **Noticing a lost session (implemented).** The link's event stream is read only inside a
    send-receive's wait and at the job's end, so a tester-present error event raised during a
    `Wait`, a server round trip or between steps waits for the next send-receive. The second part
    gives every reader of the stream one observer, drains the stream without blocking at the start
    of each request, `Wait` poll and runtime read, and latches a tester-present error event as the
    session lost only while the record holds a non-default session (decision a); with the record in
    the default session the event is logged and the run goes on. The latch is reported at the VM's
-   next host call (ADR-418 item 6), together with a failed switch-on (item 6 above); the other
-   items the drain reads keep their ADR-372 and ADR-386 placement. This ADR states the rule; the
-   backlog item of the second part implements it.
+   next host call (ADR-418 item 6), at the check it shares with a failed switch-on (item 6
+   above); the other items the drain reads keep their ADR-372 and ADR-386 placement.
+
+   The mechanism, as built:
+
+   - `KeepAlive::observe` is the one observer and the only writer of the latch. The send-receive
+     wait, the tag wait (`resolve_tag`), the job-end settlement (`settle_at_end`) and the drain
+     call it for every notification before they hand it on. A tester-present error is told by its
+     event code, not by whether it names a primitive, since the J2534 worker's first
+     tester-present of a switch-on runs inside the `CoptUpdateparam` primitive and its error may
+     carry that handle; it is never taken as the result of the primitive it names or of the
+     exchange that read it (an error naming an earlier primitive stays an unbound item of the
+     exchange). A lost VCI read makes the errors after it unlatched until the link opens again
+     (ADR-393), so the loss, not the lapsed session, is what the run reports.
+   - The drain (`WorkerHost::drain_link_items`) reads the stream without waiting at the start of
+     `send`, `wait` and `runtime_input` (one poll of the read per notification; a read that
+     would wait is dropped, which `tonic::Streaming::message` allows without loss). It does not
+     run while a stray primitive is unsettled: the stray's items belong to its settlement, and the
+     settling wait observes. Results and errors of no primitive or of an earlier one wait in
+     `pending_unbound` and go in front of the next exchange's own unbound items, so their
+     placement is the one the exchange would have given them; what no exchange takes goes to the
+     log at job end. A lost VCI of no primitive is kept, and the next request is refused as
+     `VciLost { refused_after_loss: true }` without being sent, as the worker would refuse it
+     (ADR-294); it enters the exchange entry as the lost VCI's error. A stream that ended or
+     failed is dropped, so the next request fails on it as it does without the drain. A
+     lost-events notice read outside an exchange changes no outcome and is written to the
+     operational log only.
+   - The latch is reported by `check_session` at the start of `send` (the request is refused
+     unsent, `NotSent`, `Other`, so `repeat_decision` ends the run and the request marker is
+     withdrawn as not sent), of `wait` (a `Wait` ends at its next poll) and of `runtime_input`.
+     A server round trip is not interrupted, and nothing checks after the VM's last call:
+     `settle_at_end` still writes the entry of an error it reads. An error read during a step's
+     exchange is latched all the same: the exchange's own result stands and the next call is
+     refused. `reopen` starts the record over, the latch included.
+   - The log: a `keep_alive` entry with `action` `error`, written for every tester-present
+     error the observer read, latched or not (`session_lost`), with the event's name and its extra
+     error information (ADR-351), `link_error` `tester_present`, the agent's time and no VCI time
+     of its own. Its `refers_to` names the entries that placed the item's VCI time: the exchange
+     entry that took it and the `unattached` or `late_item` lines the log wrote for it, so the
+     time is placed once. The entry is written once those exist, not when the error is read: after
+     the exchange entry, after the lines the drain's items get, or at job end. The refused
+     request's entry has the cause `session_lost`, `caused_by` the error entry, and the
+     classification `undetermined` (design 8.11).
 
 ## Consequences
 

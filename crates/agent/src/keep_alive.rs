@@ -6,7 +6,9 @@
 //! worker's tester-present handling is believed on, and whether a switch of it failed. The
 //! functions here decide; the host ([`crate::host`]) sends what they decide.
 
+use crate::comm_log::AgentNow;
 use crate::host::HostError;
+use vci_service_interface::{EventNotification, PduErrorEvent, event_item, event_notification};
 
 /// The sub-function of the default session.
 pub(crate) const DEFAULT_SESSION: u8 = 0x01;
@@ -53,6 +55,28 @@ pub(crate) struct KeepAlive {
     handling: bool,
     /// A switch-on failed: the next request of the host is refused (ADR-420 item 6).
     failed: bool,
+    /// The session is lost: the worker's tester-present reported an error while the session
+    /// record held a non-default session (ADR-420 item 8). Written by [`KeepAlive::observe`]
+    /// only; a link that opens again starts over.
+    lost: bool,
+    /// The VCI was lost and the link not yet opened again: a tester-present error read after
+    /// it is logged only, since the loss ends the run or reopens the link first (ADR-393).
+    vci_lost: bool,
+    /// The tester-present errors read whose `keep_alive` entry is not written yet.
+    seen: Vec<TesterPresentSeen>,
+}
+
+/// A tester-present error event ([`KeepAlive::observe`]) read from the link's event stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TesterPresentSeen {
+    /// The extra error information as the worker gave it (ADR-351): its code and its name.
+    pub(crate) extra_error_info: Option<u32>,
+    pub(crate) extra_error_info_name: Option<String>,
+    /// The agent's clocks when the host read it, with a log open.
+    pub(crate) read: Option<AgentNow>,
+    /// It made the session lost; an error read with the record in the default session, or
+    /// after a loss, did not.
+    pub(crate) latched: bool,
 }
 
 /// What [`KeepAlive::record`] saw, for [`KeepAlive::wanted`].
@@ -80,7 +104,56 @@ impl KeepAlive {
             link: LinkState::Online,
             handling: enabled,
             failed: false,
+            lost: false,
+            vci_lost: false,
+            seen: Vec::new(),
         }
+    }
+
+    /// The one observer of the link's event stream (ADR-420 item 8): every reader of the stream
+    /// passes each notification here before it hands it on. A tester-present error event, told
+    /// apart by its code and not by whether it names a primitive (the J2534 worker's first
+    /// tester-present of a switch-on runs inside the `CoptUpdateparam` primitive), is noted for
+    /// the log; it also makes the session lost when the session record holds a non-default
+    /// session and no loss is latched yet. A lost VCI is noted so that errors read after it
+    /// latch nothing. Returns whether the notification was a tester-present error.
+    pub(crate) fn observe(
+        &mut self,
+        notification: &EventNotification,
+        read: Option<AgentNow>,
+    ) -> bool {
+        let Some(event_notification::EventData::Item(item)) = &notification.event_data else {
+            return false;
+        };
+        let Some(event_item::Data::ErrorData(error)) = &item.data else {
+            return false;
+        };
+        if error.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32 {
+            self.vci_lost = true;
+            return false;
+        }
+        if error.error_event != PduErrorEvent::PduErrEvtTesterPresentError as i32 {
+            return false;
+        }
+        let latched = self.session != DEFAULT_SESSION && !self.lost && !self.vci_lost;
+        self.lost |= latched;
+        self.seen.push(TesterPresentSeen {
+            extra_error_info: error.extra_error_info,
+            extra_error_info_name: error.extra_error_info_name.clone(),
+            read,
+            latched,
+        });
+        true
+    }
+
+    /// Whether the session is lost (a tester-present error latched it).
+    pub(crate) fn session_lost(&self) -> bool {
+        self.lost
+    }
+
+    /// Takes the tester-present errors whose entries are not written yet, in read order.
+    pub(crate) fn take_seen(&mut self) -> Vec<TesterPresentSeen> {
+        std::mem::take(&mut self.seen)
     }
 
     pub(crate) fn enabled(&self) -> bool {
@@ -448,5 +521,99 @@ mod tests {
         assert!(keep.failed());
         // Opening the link again starts over.
         assert!(!KeepAlive::new(true).failed());
+    }
+
+    fn error_item(event: PduErrorEvent, handle: Option<u32>) -> EventNotification {
+        EventNotification {
+            event_data: Some(event_notification::EventData::Item(
+                vci_service_interface::EventItem {
+                    cop_handle: handle.map(|cop_handle| {
+                        vci_service_interface::ComPrimitiveHandle {
+                            module_handle: 1,
+                            cll_handle: 1,
+                            cop_handle,
+                        }
+                    }),
+                    data: Some(event_item::Data::ErrorData(
+                        vci_service_interface::ErrorData {
+                            error_event: event as i32,
+                            extra_error_info: Some(7),
+                            extra_error_info_name: Some("no_answer".to_owned()),
+                        },
+                    )),
+                    ..Default::default()
+                },
+            )),
+            ..Default::default()
+        }
+    }
+
+    const TESTER_PRESENT_ERROR: PduErrorEvent = PduErrorEvent::PduErrEvtTesterPresentError;
+
+    /// ADR-420 item 8: a tester-present error makes the session lost only while the record holds
+    /// a non-default session; with the record in the default session it is noted and nothing is
+    /// latched.
+    #[test]
+    fn a_tester_present_error_latches_the_loss_only_in_a_non_default_session() {
+        let mut keep = KeepAlive::new(true);
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(!keep.session_lost());
+        let seen = keep.take_seen();
+        assert_eq!(seen.len(), 1);
+        assert!(!seen[0].latched);
+        assert_eq!(seen[0].extra_error_info, Some(7));
+        assert_eq!(seen[0].extra_error_info_name.as_deref(), Some("no_answer"));
+        assert!(keep.take_seen().is_empty());
+
+        keep.record(&[0x10, 0x03], false, &positive(&[0x50, 0x03]));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(keep.session_lost());
+        // A second error is noted, not latched again.
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        let latched: Vec<bool> = keep.take_seen().iter().map(|seen| seen.latched).collect();
+        assert_eq!(latched, [true, false]);
+        // A link that opens again starts over.
+        let keep = KeepAlive::new(true);
+        assert!(!keep.session_lost());
+    }
+
+    /// The first tester-present of a switch-on runs inside the update primitive of the J2534
+    /// worker, so its error may carry that primitive's handle: it is told apart by its code.
+    #[test]
+    fn the_event_code_decides_not_the_primitive_handle() {
+        let mut keep = KeepAlive::new(true);
+        keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, Some(9)), None));
+        assert!(keep.session_lost());
+        // Other errors, with or without a handle, are not it.
+        let mut keep = KeepAlive::new(true);
+        keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
+        for handle in [None, Some(9)] {
+            assert!(!keep.observe(&error_item(PduErrorEvent::PduErrEvtRxError, handle), None));
+        }
+        let status = EventNotification {
+            event_data: Some(event_notification::EventData::Item(
+                vci_service_interface::EventItem::default(),
+            )),
+            ..Default::default()
+        };
+        assert!(!keep.observe(&status, None));
+        assert!(!keep.observe(&EventNotification::default(), None));
+        assert!(!keep.session_lost() && keep.take_seen().is_empty());
+    }
+
+    /// A tester-present error read after the VCI was lost is noted and latches nothing: the loss
+    /// ends the run or opens the link again first (ADR-393).
+    #[test]
+    fn an_error_read_after_a_lost_vci_latches_nothing() {
+        let mut keep = KeepAlive::new(true);
+        keep.record(&[0x10, 0x02], false, &positive(&[0x50, 0x02]));
+        assert!(!keep.observe(
+            &error_item(PduErrorEvent::PduErrEvtLostCommToVci, None),
+            None
+        ));
+        assert!(keep.observe(&error_item(TESTER_PRESENT_ERROR, None), None));
+        assert!(!keep.session_lost());
+        assert!(!keep.take_seen()[0].latched);
     }
 }

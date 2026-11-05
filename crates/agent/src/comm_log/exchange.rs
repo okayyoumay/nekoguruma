@@ -587,6 +587,10 @@ pub(crate) enum RefusalCause {
     /// Switching the worker's tester present on failed, or could not be done, so the job's
     /// session is no longer kept alive (design 8.2.5, ADR-420 item 6).
     KeepAliveFailed,
+    /// The worker's tester-present reported an error while the ECU was in a non-default
+    /// session, so the session may have ended and the job stops (design 8.2.5, ADR-420 item 8).
+    /// `caused_by` is the `keep_alive` entry of that error.
+    SessionLost,
 }
 
 impl RefusalCause {
@@ -615,6 +619,12 @@ impl RefusalCause {
             Self::SystemOwnReasons => "the system refused it for its own reasons (invalid parameters, a full queue or a request the protocol cannot carry)".to_owned(),
             Self::LinkHeld => "an earlier request the agent stopped waiting for still holds the link, and the system could not cancel it".to_owned(),
             Self::KeepAliveFailed => "the system could not keep the session alive, so the job's next request was not sent".to_owned(),
+            Self::SessionLost => match caused_by {
+                Some(entry) => format!(
+                    "the tester-present kept running on the link reported an error (entry {entry}) while the ECU was in a non-default session, so the session may have ended"
+                ),
+                None => "the tester-present kept running on the link reported an error while the ECU was in a non-default session, so the session may have ended".to_owned(),
+            },
         }
     }
 }
@@ -4117,8 +4127,9 @@ fn rows(
     let to_owned = |text: &str| text.to_owned();
 
     match &evidence.end {
-        // Refused by the agent because of an earlier response.
-        End::NotSent(cause @ RefusalCause::EarlierResponse) => (
+        // Refused by the agent because of an earlier response, or because the worker reported
+        // the session lost: the vehicle may have dropped it.
+        End::NotSent(cause @ (RefusalCause::EarlierResponse | RefusalCause::SessionLost)) => (
             Undetermined,
             format!("Not sent: {}.", cause.phrase(evidence.caused_by)),
         ),
@@ -6929,6 +6940,26 @@ mod tests {
         assert_eq!(json["caused_by"], 9);
     }
 
+    /// A refusal because the worker reported the session lost is undetermined (the vehicle may
+    /// have dropped the session), not the system's, and names the `keep_alive` entry of the
+    /// error in `caused_by` (design 8.11).
+    #[test]
+    fn a_refusal_for_a_lost_session_is_undetermined_and_names_the_error_entry() {
+        let mut evidence = evidence(&[0x36, 1], End::NotSent(RefusalCause::SessionLost));
+        evidence.caused_by = Some(7);
+        let entry = ExchangeEntry::build(8, evidence, LinkHistory::empty());
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert_eq!(entry.sent, Sent::NotSent);
+        assert_eq!(entry.sent_evidence, SentEvidence::Refused);
+        assert!(entry.reason.contains("entry 7"), "{}", entry.reason);
+        let json = serde_json::to_value(&entry).unwrap();
+        assert_eq!(
+            json["outcome"],
+            json!({ "result": "not_sent", "cause": "session_lost" })
+        );
+        assert_eq!(json["caused_by"], 7);
+    }
+
     #[test]
     fn a_lost_vci_keeps_the_send_the_evidence_gave_and_a_refusal_after_it_is_not_sent() {
         let pending_before = {
@@ -7720,6 +7751,7 @@ mod tests {
             End::NotSent(RefusalCause::SystemOwnReasons),
             End::NotSent(RefusalCause::KeepAliveFailed),
             End::NotSent(RefusalCause::EarlierResponse),
+            End::NotSent(RefusalCause::SessionLost),
             End::Unknown(UnknownCause::RpcFailure),
             End::Unknown(UnknownCause::WorkerNotAnswering),
             End::Unknown(UnknownCause::EventsEnded),

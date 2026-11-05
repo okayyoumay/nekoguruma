@@ -171,6 +171,12 @@ pub enum HostError {
     /// (ADR-420 item 6). Which call failed is in the `keep_alive` entry of the communication log.
     #[error("the keep-alive could not be switched on, so the session is no longer kept alive")]
     KeepAliveFailed,
+    /// The worker's tester-present reported an error while the session record held a
+    /// non-default session, so the ECU's session may have ended (ADR-420 item 8). Reported at
+    /// the VM's next host call, a request before it is sent; the `keep_alive` entry of the
+    /// error is in the communication log.
+    #[error("the ECU's session was lost: the worker's tester-present reported an error")]
+    SessionLost,
 }
 
 /// Whether a failed send-receive's request may have reached the ECU.
@@ -216,7 +222,8 @@ impl HostError {
             | HostError::Unsupported(_)
             | HostError::DeclaredLink(_)
             | HostError::InputNotEstablished(_)
-            | HostError::KeepAliveFailed => SendState::NotSent,
+            | HostError::KeepAliveFailed
+            | HostError::SessionLost => SendState::NotSent,
             // The worker refused the start after a lost VCI (ADR-294).
             HostError::VciLost {
                 refused_after_loss: true,
@@ -612,6 +619,17 @@ pub struct WorkerHost<C: WorkerApi> {
     /// The agent's record of the link's keep-alive: the session, the link's state, the
     /// tester-present handling and a failed switch (ADR-420). Starts over when a link opens.
     keep_alive: KeepAlive,
+    /// Results and errors of no primitive, or of an earlier one, that [`WorkerHost::drain_link_items`]
+    /// read between exchanges. They go in front of the next exchange's own unbound items, so
+    /// their placement is the one it would have had if the exchange had read them (ADR-372,
+    /// ADR-386); what no exchange takes goes to the log at job end.
+    pending_unbound: Vec<Unbound>,
+    /// A lost VCI of no primitive that the drain read: the next request is refused as the worker
+    /// would refuse it, after the loss (ADR-294), carrying this error for the loss record.
+    vci_lost_read: Option<ErrorSeen>,
+    /// The `seq` of the `keep_alive` entry of the error that made the session lost, once
+    /// written: the `caused_by` of the refusals that follow.
+    loss_entry: Option<u64>,
 }
 
 /// The link that is open on the worker: the client it was opened on and its handles.
@@ -727,6 +745,9 @@ impl<C: WorkerApi> WorkerHost<C> {
             relink: None,
             target: 0,
             keep_alive,
+            pending_unbound: Vec::new(),
+            vci_lost_read: None,
+            loss_entry: None,
         }
     }
 
@@ -743,6 +764,8 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// ids). The log gets the new connection: `vci_connected`, which settles the run's own
     /// loss, then `link_opened`, on the link number the log used before.
     pub(crate) fn reopen(&mut self, mut client: C, link: Link, config: &LinkConfig) {
+        // What the old link left unwritten is written before its record is dropped.
+        self.flush_pending(&[]);
         if let Some(log) = &self.comm_log {
             log_connected(
                 &self.handle,
@@ -756,6 +779,9 @@ impl<C: WorkerApi> WorkerHost<C> {
         }
         self.client = client;
         self.keep_alive = KeepAlive::new(link.indications.tester_present);
+        self.pending_unbound.clear();
+        self.vci_lost_read = None;
+        self.loss_entry = None;
         self.link = link;
         self.waits.clear();
         self.vbatt_id = crate::inputs::VbattId::Unknown;
@@ -955,6 +981,18 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// Every result and error item of the link read meanwhile, of the primitive, of none or of an
     /// earlier one, goes to the log with it, in read order (ADR-386).
     pub(crate) fn settle_at_end(&mut self) {
+        let owner = self
+            .stray
+            .as_ref()
+            .and_then(|stray| stray.seq.or(stray.exchange));
+        self.settle_stray();
+        // Whatever the drain read and no exchange took, and the tester-present errors read
+        // meanwhile, go to the log with it (ADR-420 item 8).
+        self.flush_pending(owner.as_slice());
+    }
+
+    /// [`WorkerHost::settle_at_end`]'s settlement of the stray primitive.
+    fn settle_stray(&mut self) {
         let Some(mut stray) = self.stray.take() else {
             return;
         };
@@ -962,14 +1000,20 @@ impl<C: WorkerApi> WorkerHost<C> {
         let until = stray.deadline.max(tokio::time::Instant::now()) + self.job_end_wait;
         let log = self.comm_log.as_ref().filter(|log| log.is_open());
         let mut events = self.link.events.as_mut();
+        let keep = &mut self.keep_alive;
         // A start the worker did not answer has no handle yet: the items that carry its tag give
         // it within the same bound, and a primitive that ended on its tagged item is settled
         // from that read (ADR-416). Without a handle there is nothing to cancel and its end is
         // unknown, so nothing is written for the exchange.
         let mut tagged_end = None;
         if stray.cop.is_none() {
-            let (wait, unattached) =
-                handle.block_on(resolve_tag(events.as_deref_mut(), &mut stray, log, until));
+            let (wait, unattached) = handle.block_on(resolve_tag(
+                events.as_deref_mut(),
+                &mut *keep,
+                &mut stray,
+                log,
+                until,
+            ));
             match wait {
                 TagWait::Resolved => {}
                 TagWait::Ended(result) => tagged_end = Some(result),
@@ -1005,6 +1049,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                         };
                         match events.message().await {
                             Ok(Some(notification)) => {
+                                keep.observe(&notification, log.map(|log| log.now()));
                                 // A lost-events notice ends the wait as it does an exchange's.
                                 let lost = matches!(
                                     notification.event_data,
@@ -1367,10 +1412,16 @@ impl<C: WorkerApi> WorkerHost<C> {
         progress: Progress,
         before: Option<AgentNow>,
     ) -> Result<Vec<u8>, HostError> {
-        // A failed switch of the keep-alive is reported at the next request (ADR-420 item 6).
-        if self.keep_alive.failed() {
-            let error = HostError::KeepAliveFailed;
-            self.log_refused(&request, before, &error, None);
+        // What the link read since the last call is taken in first (ADR-420 item 8).
+        self.drain_link_items();
+        // A lost session, and a failed switch of the keep-alive, are reported at the next call
+        // (ADR-420 items 6 and 8).
+        if let Err(error) = self.check_session() {
+            let caused_by = match error {
+                HostError::SessionLost => self.loss_entry,
+                _ => None,
+            };
+            self.log_refused(&request, before, &error, caused_by);
             return Err(error);
         }
         // The link is the primary's; a request for another target cannot be served (ADR-409).
@@ -1413,9 +1464,25 @@ impl<C: WorkerApi> WorkerHost<C> {
         } else {
             ComOperationType::CoptSendrecv
         };
-        let mut sent =
-            handle.block_on(self.send_recv_async(request, progress, logged.is_some(), cop_type));
+        let mut sent = match self.vci_lost_read.take() {
+            // The drain read the loss of the VCI: the request is refused, as the worker would
+            // refuse it on the link it took offline (ADR-294).
+            Some(lost) => {
+                let mut sent = Sent::not_started(Err(HostError::VciLost {
+                    refused_after_loss: true,
+                }));
+                sent.vci_lost = Some(lost);
+                sent
+            }
+            None => {
+                handle.block_on(self.send_recv_async(request, progress, logged.is_some(), cop_type))
+            }
+        };
+        // What the drain read in front of the request's own items (ADR-372, ADR-386).
+        sent.unbound
+            .splice(0..0, std::mem::take(&mut self.pending_unbound));
         sent.silence_is_result(silent, one_frame);
+        let mut entry = None;
         if let Some((request, expected, negative, sid)) = logged {
             // A request that collects every answer lists them; any other lists them when it got
             // more than one (the first included), which only a worker that passes more than one
@@ -1517,7 +1584,11 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }
                 stray.exchange = stray.exchange.or(seq);
             }
+            entry = seq;
         }
+        // The tester-present errors read during the exchange, or by the drain before it, were
+        // placed by its entry (ADR-420 item 8).
+        self.write_tester_present_errors(entry.as_slice());
         if let Some(request) = sent_request {
             self.after_exchange(&request, start_comm, &sent.result);
         }
@@ -1574,6 +1645,124 @@ impl<C: WorkerApi> WorkerHost<C> {
             return;
         };
         self.switch_handling(switch);
+    }
+
+    /// Whether the call about to run may go on: a lost session (ADR-420 item 8) and a failed
+    /// switch-on of the keep-alive (item 6) are reported at the VM's next host call, the lost
+    /// session first. The error of a lost session is written to the log first, with the items
+    /// the drain read, so the call's refusal can name its entry.
+    fn check_session(&mut self) -> Result<(), HostError> {
+        if self.keep_alive.session_lost() {
+            self.flush_pending(&[]);
+            return Err(HostError::SessionLost);
+        }
+        if self.keep_alive.failed() {
+            return Err(HostError::KeepAliveFailed);
+        }
+        Ok(())
+    }
+
+    /// Reads, without waiting, what the link's event stream holds (ADR-420 item 8): the events
+    /// that came during a `Wait`, a server round trip or between steps, which nothing else reads
+    /// before the next send-receive. Each goes through the keep-alive's observer; results and
+    /// errors of no primitive or of an earlier one wait in `pending_unbound` for the next
+    /// exchange to place, a lost VCI is kept for the next request, a stream that ended or failed
+    /// is dropped, so the next request fails on it as it does today. A stray primitive's items
+    /// belong to its settlement, so nothing is read while one is unsettled.
+    fn drain_link_items(&mut self) {
+        if self.stray.is_some() {
+            return;
+        }
+        let _enter = self.handle.enter();
+        let log = self.comm_log.as_ref().filter(|log| log.is_open());
+        let mut ended = false;
+        if let Some(events) = self.link.events.as_mut() {
+            let keep = &mut self.keep_alive;
+            let pending = &mut self.pending_unbound;
+            let lost_vci = &mut self.vci_lost_read;
+            ended = drain_ready(events, |notification| {
+                let read = log.map(|log| log.now());
+                keep.observe(&notification, read);
+                match notification.event_data {
+                    Some(event_notification::EventData::Item(item)) => {
+                        take_drained(item, read, pending, lost_vci, log.is_some());
+                    }
+                    // Dropped events outside an exchange change no outcome: nothing is
+                    // pending that they could have been the end of.
+                    Some(event_notification::EventData::Lost(_)) => {
+                        tracing::warn!("the worker dropped events of the link between requests");
+                    }
+                    None => {}
+                }
+            });
+        }
+        if ended {
+            self.link.events = None;
+        }
+    }
+
+    /// Hands the log what is waiting for it: the items the drain read that no exchange took,
+    /// and the `keep_alive` entries of the tester-present errors read meanwhile, which refer to
+    /// `placed`, the exchange entry that placed their items, and to the lines the log wrote for
+    /// them.
+    fn flush_pending(&mut self, placed: &[u64]) {
+        let pending = std::mem::take(&mut self.pending_unbound);
+        let reads: Vec<EndRead> = pending
+            .iter()
+            .filter_map(|unbound| {
+                Some(EndRead {
+                    read: unbound.read?,
+                    item: EndItem::Unattached(unattached_item(unbound)?),
+                })
+            })
+            .collect();
+        self.log_unattached(&reads, None);
+        self.write_tester_present_errors(placed);
+    }
+
+    /// Writes the `keep_alive` entry (`action` `error`) of each tester-present error the observer
+    /// saw since the last call, in read order; the one that made the session lost sets
+    /// `loss_entry` (design 8.11).
+    fn write_tester_present_errors(&mut self, placed: &[u64]) {
+        let seen = self.keep_alive.take_seen();
+        let (Some(log), Some((tx_id, rx_id))) = (&self.comm_log, self.link_ids) else {
+            return;
+        };
+        let lines = log.take_tester_present_lines();
+        for error in seen {
+            let target = Target::Endpoint {
+                link: LOG_LINK,
+                tx_id,
+                rx_id,
+            };
+            let detail = Detail {
+                error_event: Some(error_event_name(
+                    PduErrorEvent::PduErrEvtTesterPresentError as i32,
+                )),
+                extra_error_info: error.extra_error_info,
+                extra_error_info_name: error.extra_error_info_name,
+                ..Detail::default()
+            };
+            let refers_to: Vec<u64> = lines.iter().chain(placed).copied().collect();
+            let written = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                log.keep_alive_error(
+                    target,
+                    LOG_LINK,
+                    detail,
+                    error.latched,
+                    error.read,
+                    refers_to,
+                )
+            }));
+            match written {
+                Ok(seq) => {
+                    if error.latched {
+                        self.loss_entry = seq;
+                    }
+                }
+                Err(_) => tracing::warn!("writing a keep_alive entry panicked"),
+            }
+        }
     }
 
     /// Asks the worker for the link's status (`GetStatus` of the logical link): whether it is
@@ -1810,8 +1999,14 @@ impl<C: WorkerApi> WorkerHost<C> {
             if stray.cop.is_none() {
                 let until = tokio::time::Instant::now() + self.timings.unary;
                 let log = self.comm_log.as_ref().filter(|log| log.is_open());
-                let (wait, unattached) =
-                    resolve_tag(self.link.events.as_mut(), &mut stray, log, until).await;
+                let (wait, unattached) = resolve_tag(
+                    self.link.events.as_mut(),
+                    &mut self.keep_alive,
+                    &mut stray,
+                    log,
+                    until,
+                )
+                .await;
                 match wait {
                     TagWait::Resolved => {}
                     TagWait::Ended(result) => preset_end = Some(SettlingEnd::Ended(result)),
@@ -1956,6 +2151,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             .and_then(|settling| Some((settling.cop, settling.stray.seq?)));
 
         let mut events = self.link.events.as_mut();
+        let keep = &mut self.keep_alive;
         let log = self.comm_log.as_ref();
         let progress = &mut progress;
         let settling_ref = &mut settling;
@@ -1971,6 +2167,10 @@ impl<C: WorkerApi> WorkerHost<C> {
                         status: Box::new(status),
                     })?
                     .ok_or(HostError::EventStreamEnded)?;
+                keep.observe(
+                    &notification,
+                    log.filter(|log| log.is_open()).map(|log| log.now()),
+                );
                 // The cancelled primitive's own items go to its end; lost events and a lost
                 // VCI end this exchange too.
                 if let Some(settling) = settling_ref
@@ -2222,6 +2422,79 @@ impl<C: WorkerApi> WorkerHost<C> {
         self.log(request, before, end, detail, Vec::new(), |evidence| {
             evidence.caused_by = caused_by;
         });
+    }
+}
+
+/// Polls `future` once, with a waker that wakes nothing: its output if it is ready, `None` if it
+/// would wait.
+fn poll_now<F: Future>(future: F) -> Option<F::Output> {
+    let mut future = std::pin::pin!(future);
+    let mut context = std::task::Context::from_waker(std::task::Waker::noop());
+    match future.as_mut().poll(&mut context) {
+        std::task::Poll::Ready(output) => Some(output),
+        std::task::Poll::Pending => None,
+    }
+}
+
+/// A source of the link's event notifications, read one at a time.
+trait EventSource {
+    /// The next notification, `Ok(None)` once the stream has ended. Dropping the future before it
+    /// is ready must lose nothing: the next call still gives what it would have.
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<vci_service_interface::EventNotification>, tonic::Status>>;
+}
+
+impl EventSource for tonic::Streaming<vci_service_interface::EventNotification> {
+    fn next_message(
+        &mut self,
+    ) -> impl Future<Output = Result<Option<vci_service_interface::EventNotification>, tonic::Status>>
+    {
+        self.message()
+    }
+}
+
+/// Hands `take` every notification `source` gives without waiting, in order. Returns whether the
+/// stream ended or failed. The read that finds nothing ready is dropped unfinished.
+fn drain_ready<S: EventSource>(
+    source: &mut S,
+    mut take: impl FnMut(vci_service_interface::EventNotification),
+) -> bool {
+    loop {
+        match poll_now(source.next_message()) {
+            None => return false,
+            Some(Ok(Some(notification))) => take(notification),
+            Some(Ok(None) | Err(_)) => return true,
+        }
+    }
+}
+
+/// Files an item the drain read: a lost VCI of no primitive is kept for the next request, a
+/// result or error of no primitive or of an earlier one (all of them are, between exchanges)
+/// waits for the next exchange to place it when the host logs (`logged`), and a status is
+/// dropped.
+fn take_drained(
+    item: EventItem,
+    read: Option<AgentNow>,
+    pending: &mut Vec<Unbound>,
+    lost_vci: &mut Option<ErrorSeen>,
+    logged: bool,
+) {
+    match &item.data {
+        Some(event_item::Data::ErrorData(data))
+            if item.cop_handle.is_none()
+                && data.error_event == PduErrorEvent::PduErrEvtLostCommToVci as i32 =>
+        {
+            lost_vci.get_or_insert_with(|| ErrorSeen::of(data, vci_time(&item)));
+        }
+        Some(event_item::Data::ResultData(_) | event_item::Data::ErrorData(_)) if logged => {
+            pending.push(Unbound {
+                item,
+                read,
+                owner: None,
+            });
+        }
+        _ => {}
     }
 }
 
@@ -2539,6 +2812,7 @@ enum TagWait {
 /// since every later item of the primitive carries the tag (ADR-204).
 async fn resolve_tag(
     mut events: Option<&mut tonic::Streaming<vci_service_interface::EventNotification>>,
+    keep: &mut KeepAlive,
     stray: &mut Stray,
     log: Option<&crate::comm_log::CommLog>,
     until: tokio::time::Instant,
@@ -2555,6 +2829,7 @@ async fn resolve_tag(
                 Ok(None) | Err(_) => return TagWait::Dropped,
             };
             let read = log.filter(|log| log.is_open()).map(|log| log.now());
+            keep.observe(&notification, read);
             let item = match notification.event_data {
                 Some(event_notification::EventData::Item(item)) => item,
                 // Every later item of the primitive carries the tag, so the wait goes on; the
@@ -3240,6 +3515,7 @@ fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
         HostError::BlockTooLong { .. } => RefusalCause::BlockTooLong,
         HostError::NoBlockLength { .. } => RefusalCause::EarlierResponse,
         HostError::KeepAliveFailed => RefusalCause::KeepAliveFailed,
+        HostError::SessionLost => RefusalCause::SessionLost,
         _ => RefusalCause::PreparationError,
     }
 }
@@ -3278,6 +3554,7 @@ fn host_error_name(error: &HostError) -> &'static str {
         HostError::Setup(_) => "Setup",
         HostError::InputNotEstablished(_) => "InputNotEstablished",
         HostError::KeepAliveFailed => "KeepAliveFailed",
+        HostError::SessionLost => "SessionLost",
     }
 }
 
@@ -4135,7 +4412,11 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
         self.transfer.after_block(index, counter, outcome)
     }
 
+    // Each poll takes in what the link read meanwhile and ends the wait when the session is lost
+    // (ADR-420 item 8).
     fn wait(&mut self, inquiry: u64, millis: u32) -> Result<bool, HostError> {
+        self.drain_link_items();
+        self.check_session()?;
         wait_elapsed(&mut self.waits, inquiry, millis, Instant::now())
     }
 
@@ -4171,6 +4452,8 @@ impl<C: WorkerApi> DiagHost for WorkerHost<C> {
     // reach the worker a host error the job can be resumed after (ADR-338, ADR-288).
     fn runtime_input(&mut self, input: diag_ir::RuntimeInput) -> Result<i64, HostError> {
         use crate::inputs::RuntimeInputs;
+        self.drain_link_items();
+        self.check_session()?;
         integer_reading(input, self.read(input)?)
     }
 
@@ -4392,7 +4675,7 @@ mod tests {
 
     #[test]
     fn a_refusal_names_its_cause() {
-        let cases: [(&[u8], HostError, RefusalCause); 10] = [
+        let cases: [(&[u8], HostError, RefusalCause); 11] = [
             (
                 &[],
                 HostError::BadService(0x1FF),
@@ -4437,6 +4720,7 @@ mod tests {
                 HostError::KeepAliveFailed,
                 RefusalCause::KeepAliveFailed,
             ),
+            (&[0x22], HostError::SessionLost, RefusalCause::SessionLost),
             (
                 &[0x22],
                 HostError::BadNegativeShape("x"),
@@ -4446,6 +4730,198 @@ mod tests {
         for (request, error, cause) in cases {
             assert_eq!(refusal_cause(request, &error), cause, "{error:?}");
         }
+    }
+
+    /// ADR-420 item 8: a lost session is refused before anything is sent, and is neither sent
+    /// again nor does it make the host open the link again.
+    #[test]
+    fn a_lost_session_is_not_sent_and_not_a_lost_path() {
+        let error = HostError::SessionLost;
+        assert_eq!(error.send_state(), SendState::NotSent);
+        assert_eq!(error.resend_class(), ResendClass::Other);
+        assert_eq!(host_error_name(&error), "SessionLost");
+    }
+
+    // ---- the drain of the link's events between requests (ADR-420 item 8) ----
+
+    /// What a [`Scripted`] source gives next.
+    enum Feed {
+        Item(vci_service_interface::EventNotification),
+        /// Not ready yet: the read that meets it is pending once and is dropped.
+        Stall,
+        End,
+        Fail,
+    }
+
+    struct Scripted(std::collections::VecDeque<Feed>);
+
+    impl EventSource for Scripted {
+        fn next_message(
+            &mut self,
+        ) -> impl Future<Output = Result<Option<vci_service_interface::EventNotification>, tonic::Status>>
+        {
+            std::future::poll_fn(|_| match self.0.front() {
+                Some(Feed::Stall) => {
+                    self.0.pop_front();
+                    std::task::Poll::Pending
+                }
+                Some(Feed::End) | None => std::task::Poll::Ready(Ok(None)),
+                Some(Feed::Fail) => {
+                    self.0.pop_front();
+                    std::task::Poll::Ready(Err(tonic::Status::internal("failed")))
+                }
+                Some(Feed::Item(_)) => match self.0.pop_front() {
+                    Some(Feed::Item(item)) => std::task::Poll::Ready(Ok(Some(item))),
+                    _ => std::task::Poll::Pending,
+                },
+            })
+        }
+    }
+
+    fn error_notification(
+        event: PduErrorEvent,
+        handle: Option<u32>,
+        at: u32,
+    ) -> vci_service_interface::EventNotification {
+        vci_service_interface::EventNotification {
+            event_data: Some(event_notification::EventData::Item(EventItem {
+                cop_handle: handle.map(|cop_handle| ComPrimitiveHandle {
+                    module_handle: 1,
+                    cll_handle: 1,
+                    cop_handle,
+                }),
+                timestamp: at,
+                data: Some(event_item::Data::ErrorData(ErrorData {
+                    error_event: event as i32,
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    /// The drain takes what is ready and stops at the first read that would wait; the read it
+    /// drops loses nothing, and the next drain goes on from there. A stream that ended or failed
+    /// is reported.
+    #[test]
+    fn the_drain_stops_where_nothing_is_ready_and_loses_nothing() {
+        let rx_error = || error_notification(PduErrorEvent::PduErrEvtRxError, None, 1);
+        let mut source = Scripted(
+            [
+                Feed::Item(rx_error()),
+                Feed::Item(rx_error()),
+                Feed::Stall,
+                Feed::Item(rx_error()),
+            ]
+            .into(),
+        );
+        let mut taken = 0;
+        assert!(!drain_ready(&mut source, |_| taken += 1));
+        assert_eq!(taken, 2);
+        // The third item was behind the pending read; the script then runs out, which is an
+        // end.
+        assert!(drain_ready(&mut source, |_| taken += 1));
+        assert_eq!(taken, 3);
+        let mut ended = Scripted([Feed::Item(rx_error()), Feed::End].into());
+        assert!(drain_ready(&mut ended, |_| taken += 1));
+        assert_eq!(taken, 4);
+        let mut failed = Scripted([Feed::Fail].into());
+        assert!(drain_ready(&mut failed, |_| taken += 1));
+        assert_eq!(taken, 4);
+        // A future that is never ready is dropped, and `poll_now` says so.
+        assert_eq!(poll_now(std::future::pending::<u8>()), None);
+        assert_eq!(poll_now(std::future::ready(3)), Some(3));
+    }
+
+    /// What the drain does with an item: a lost VCI of no primitive is kept for the next
+    /// request; results and errors, of no primitive or of an earlier one, wait for the next
+    /// exchange (only when the host logs); a lost VCI that names a primitive is that primitive's
+    /// own and stays a plain item; a status is dropped.
+    #[test]
+    fn the_drain_files_each_item_by_what_it_is() {
+        let item = |notification: vci_service_interface::EventNotification| match notification
+            .event_data
+        {
+            Some(event_notification::EventData::Item(item)) => item,
+            _ => unreachable!(),
+        };
+        let mut pending = Vec::new();
+        let mut lost = None;
+        let lost_vci = PduErrorEvent::PduErrEvtLostCommToVci;
+        take_drained(
+            item(error_notification(lost_vci, None, 5)),
+            None,
+            &mut pending,
+            &mut lost,
+            true,
+        );
+        assert!(pending.is_empty());
+        assert_eq!(lost.as_ref().map(|seen| seen.event), Some(lost_vci as i32));
+        assert_eq!(
+            lost.as_ref().and_then(|seen| seen.at).map(|at| at.us),
+            Some(5)
+        );
+        // The first loss stays.
+        take_drained(
+            item(error_notification(lost_vci, None, 9)),
+            None,
+            &mut pending,
+            &mut lost,
+            true,
+        );
+        assert_eq!(
+            lost.as_ref().and_then(|seen| seen.at).map(|at| at.us),
+            Some(5)
+        );
+        // An earlier primitive's, a primitive-less error: pending, in read order.
+        for (handle, at) in [(Some(3), 6), (None, 7)] {
+            take_drained(
+                item(error_notification(
+                    PduErrorEvent::PduErrEvtTesterPresentError,
+                    handle,
+                    at,
+                )),
+                None,
+                &mut pending,
+                &mut lost,
+                true,
+            );
+        }
+        take_drained(
+            item(error_notification(lost_vci, Some(3), 8)),
+            None,
+            &mut pending,
+            &mut lost,
+            true,
+        );
+        let times: Vec<u32> = pending
+            .iter()
+            .map(|unbound| unbound.item.timestamp)
+            .collect();
+        assert_eq!(times, [6, 7, 8]);
+        // Without a log nothing is kept, and a status is never kept.
+        let mut none = Vec::new();
+        take_drained(
+            item(error_notification(PduErrorEvent::PduErrEvtRxError, None, 1)),
+            None,
+            &mut none,
+            &mut None,
+            false,
+        );
+        take_drained(
+            EventItem {
+                data: Some(event_item::Data::CopStatus(
+                    PduComPrimitiveStatus::PduCopstFinished as i32,
+                )),
+                ..Default::default()
+            },
+            None,
+            &mut none,
+            &mut None,
+            true,
+        );
+        assert!(none.is_empty());
     }
 
     /// An error event without extra error information.

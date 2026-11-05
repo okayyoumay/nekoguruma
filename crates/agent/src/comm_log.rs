@@ -1221,23 +1221,39 @@ struct TimingMargin {
 const LOGGED_TIMING_COMPARAMS: [&str; 1] = ["CP_TesterPresentHandling"];
 
 /// The agent switched the API's tester present on or off on a job's own link (`keep_alive`,
-/// design 8.11, ADR-420): an entry without an exchange, with the agent's time only, since the
-/// VCI gives the switch no time of its own. The first session control that starts the
-/// tester-present is the VM's own exchange; this entry follows it.
+/// design 8.11, ADR-420), or noted a tester-present error the worker reported (`action`
+/// `error`): an entry without an exchange, with the agent's time only, since the VCI gives
+/// neither a time of its own. The first session control that starts the tester-present is the
+/// VM's own exchange; this entry follows it.
 #[derive(Serialize)]
 struct KeepAliveEntry {
     origin: exchange::Origin,
     target: exchange::Target,
     link: u32,
-    /// `on` or `off`: what the agent switched the tester present to.
+    /// `on` or `off`: what the agent switched the tester present to; `error`: a tester-present
+    /// error event was read.
     action: &'static str,
     /// `start_comm`: the session control that started communication switched it on; `update_param`:
-    /// a `CoptUpdateparam` switched it.
-    means: &'static str,
-    /// `ok`, or `failed` with the failure in `detail`.
-    result: &'static str,
+    /// a `CoptUpdateparam` switched it. Absent for an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    means: Option<&'static str>,
+    /// `ok`, or `failed` with the failure in `detail`. Absent for an error.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    result: Option<&'static str>,
+    /// For an error: the event's name and its extra error information (ADR-351).
     #[serde(skip_serializing_if = "Option::is_none")]
     detail: Option<exchange::Detail>,
+    /// For an error: `tester_present`, the kind of link error it is.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    link_error: Option<exchange::LinkErrorKind>,
+    /// For an error: whether it made the session lost (the session record held a non-default
+    /// session) or was only logged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    session_lost: Option<bool>,
+    /// For an error: the entries that place the item's VCI time (its exchange's entry, or the
+    /// `unattached` or `late_item` entry written for it), so that time is placed once.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    refers_to: Option<Vec<u64>>,
     agent: KeepAliveTime,
 }
 
@@ -1626,6 +1642,10 @@ struct Inner {
     clocks: clocks::VciClocks,
     /// When the exchange whose times are being placed began, on the agent's clock.
     exchange_began_us: Option<u64>,
+    /// The `seq` of each `unattached` or `late_item` line written for a tester-present error
+    /// since the host last took them ([`CommLog::take_tester_present_lines`]): the entries that
+    /// placed its time, which a `keep_alive` error entry refers to.
+    tester_present_lines: Vec<u64>,
     /// The limits and the margin of each link `link_opened` recorded, by link, which an
     /// exchange's timing is judged against.
     limits: Vec<(u32, timing::Limits)>,
@@ -1769,6 +1789,7 @@ impl CommLog {
             links: Vec::new(),
             clocks: clocks::VciClocks::starting_at(scan.next_clock_epoch),
             exchange_began_us: None,
+            tester_present_lines: Vec::new(),
             limits: Vec::new(),
             link_reads: Vec::new(),
             loss: None,
@@ -2685,6 +2706,7 @@ impl CommLog {
             let unattached = inner.append_with(|seq, line| {
                 serde_json::to_writer(line, &Line { seq, event: &event })
             })?;
+            inner.note_tester_present_line(item, unattached);
             if let Some(LateOwner::Several(owners, in_flight)) = owner {
                 may_own_unattached |= in_flight;
                 if !owners.is_empty() {
@@ -2853,6 +2875,13 @@ impl CommLog {
             }
         }
         Some(())
+    }
+
+    /// Takes the `seq` of each `unattached` or `late_item` line written for a tester-present
+    /// error since the last call, in order: the entries that placed the error's VCI time
+    /// (design 8.11 `keep_alive`).
+    pub(crate) fn take_tester_present_lines(&self) -> Vec<u64> {
+        std::mem::take(&mut self.lock().tester_present_lines)
     }
 
     /// Drops what the log kept of the exchange logged as `seq`, which nothing will settle: its
@@ -3695,9 +3724,48 @@ impl CommLog {
             target,
             link,
             action,
-            means,
-            result: if failure.is_some() { "failed" } else { "ok" },
+            means: Some(means),
+            result: Some(if failure.is_some() { "failed" } else { "ok" }),
             detail: failure,
+            link_error: None,
+            session_lost: None,
+            refers_to: None,
+            agent: KeepAliveTime {
+                epoch: now.epoch,
+                us: now.monotonic_us,
+                wall_unix_ms: now.wall_unix_ms,
+            },
+        });
+        let mut inner = self.lock();
+        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+    }
+
+    /// Writes a `keep_alive` event of `action` `error`: the worker's tester-present reported an
+    /// error event (design 8.11, ADR-420 item 8), read at `read` (now, without it). `detail`
+    /// names the event and its extra error information; `session_lost` tells whether it made the
+    /// session lost. `refers_to` are the entries that place the item's VCI time, which this
+    /// entry has none of. The event's `seq`; `None` once the log has failed.
+    pub(crate) fn keep_alive_error(
+        &self,
+        target: exchange::Target,
+        link: u32,
+        detail: exchange::Detail,
+        session_lost: bool,
+        read: Option<AgentNow>,
+        refers_to: Vec<u64>,
+    ) -> Option<u64> {
+        let now = read.unwrap_or_else(|| self.now());
+        let event = Event::KeepAlive(KeepAliveEntry {
+            origin: exchange::Origin::KeepAlive,
+            target,
+            link,
+            action: "error",
+            means: None,
+            result: None,
+            detail: Some(detail),
+            link_error: Some(exchange::LinkErrorKind::TesterPresent),
+            session_lost: Some(session_lost),
+            refers_to: Some(refers_to),
             agent: KeepAliveTime {
                 epoch: now.epoch,
                 us: now.monotonic_us,
@@ -4468,9 +4536,10 @@ impl Inner {
             let since = (read.read.epoch, Some(read.read.monotonic_us));
             if !self.late_link_error(&item, placed.time, kind, since, before_answer)? {
                 let event = Event::Unattached(UnattachedEntry::of(&item, placed.time));
-                self.append_with(|seq, line| {
+                let written = self.append_with(|seq, line| {
                     serde_json::to_writer(line, &Line { seq, event: &event })
                 })?;
+                self.note_tester_present_line(&item, written);
             }
         }
         Some(())
@@ -4716,9 +4785,18 @@ impl Inner {
             text,
             classification,
         });
-        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        let written = self
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        self.note_tester_present_line(item, written);
         self.refresh_loss(&reclassified)?;
         Some(true)
+    }
+
+    /// Notes that line `seq` placed `item`, when it is a tester-present error.
+    fn note_tester_present_line(&mut self, item: &UnattachedItem, seq: u64) {
+        if item.link_error() == Some(exchange::LinkErrorKind::TesterPresent) {
+            self.tester_present_lines.push(seq);
+        }
     }
 
     fn late_item_unowned(

@@ -184,7 +184,7 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "disconnect_vci"}` | unplugs the VCI |
 | `{"command": "connect_vci"}` | plugs it back in |
 | `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
-| `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures` |
+| `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures`. With `"service": S` (a byte), only a call whose first message starts with service `S` after the CAN identifier fails and counts; other calls, such as a tester present the worker sends meanwhile, go through |
 | `{"command": "clear_write_failures"}` | ends `fail_writes` |
 | `{"command": "fail_closes", "times": N}` | the next `N` calls of `PassThruClose` of the open device (at least 1; healthy, lost or crashed) fail with `ERR_FAILED` and release nothing, so the application can close again; without `"times"`, every close fails until `clear_close_failures`. A close of an unknown device ID answers `ERR_INVALID_DEVICE_ID` and keeps the count |
 | `{"command": "clear_close_failures"}` | ends `fail_closes` |

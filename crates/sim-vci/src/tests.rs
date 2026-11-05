@@ -1876,6 +1876,47 @@ fn armed_write_failures_send_nothing() {
     assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
 }
 
+/// A write failure armed for one service fails and counts only writes that start with that
+/// service; other writes, such as a tester present beside it, go through and keep the count.
+#[test]
+fn a_write_failure_for_a_service_fails_only_that_service() {
+    let f = fixture();
+    let read_did = msg(ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x90]);
+    let failed = |m: &PassThruMsg| {
+        let mut n = 1;
+        let status = unsafe { PassThruWriteMsgs(f.channel, m, &mut n, 100) };
+        assert_eq!(n, 0, "no message taken");
+        status == ERR_FAILED
+    };
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "times": 1, "service": 34}"#),
+        STATUS_NOERROR
+    );
+    // Another service goes through and leaves the count.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+    // The named service fails once, and then goes through.
+    assert!(failed(&read_did));
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x22, 0xF1, 0x90]);
+    assert_eq!(read(f.channel, 1, 1000).1.len(), 1);
+    // `clear_write_failures` drops the service too: a later unfiltered failure hits any write.
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "service": 34}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        control(r#"{"command": "clear_write_failures"}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(
+        control(r#"{"command": "fail_writes", "times": 1}"#),
+        STATUS_NOERROR
+    );
+    assert!(failed(&msg(ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00])));
+}
+
 /// An armed close failure fails the close of the open device with `ERR_FAILED` and releases
 /// nothing; an unknown device ID keeps the count; a lost device is released only by the first
 /// close that is not armed to fail.

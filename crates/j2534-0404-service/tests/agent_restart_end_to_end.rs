@@ -1034,7 +1034,9 @@ fn a_write_failure_mid_transfer_is_restarted() {
         &spec,
         KILL_AFTER_BLOCK,
         WAIT_FOR_BLOCK,
-        r#"{"command": "fail_writes", "times": 1}"#,
+        // TransferData only: a tester present the job's keep-alive sends during the park must
+        // not take the failure (ADR-418, ADR-420).
+        r#"{"command": "fail_writes", "times": 1, "service": 54}"#,
     );
     assert!(
         env.commands_applied(),

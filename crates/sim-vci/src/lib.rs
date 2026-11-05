@@ -350,6 +350,9 @@ struct Bus {
     state_path: Option<PathBuf>,
     /// `PassThruWriteMsgs` calls to fail (`Command::FailWrites`).
     write_failures: WriteFailures,
+    /// The service a write must start with to fail and count against `write_failures`, if
+    /// `Command::FailWrites` named one; other writes go through untouched.
+    write_failure_service: Option<u8>,
     /// `PassThruClose` calls of the open device to fail (`Command::FailCloses`).
     close_failures: WriteFailures,
 }
@@ -401,6 +404,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 battery_mv: DEFAULT_BATTERY_MV,
                 state_path: std::env::var_os(ECU_STATE_ENV).map(PathBuf::from),
                 write_failures: WriteFailures::None,
+                write_failure_service: None,
                 close_failures: WriteFailures::None,
             }),
             Condvar::new(),
@@ -589,14 +593,16 @@ impl Bus {
                 self.battery_mv = millivolts;
                 Ok(())
             }
-            Command::FailWrites { times: Some(0) } => Err(ERR_FAILED),
-            Command::FailWrites { times } => {
+            Command::FailWrites { times: Some(0), .. } => Err(ERR_FAILED),
+            Command::FailWrites { times, service } => {
                 self.write_failures =
                     times.map_or(WriteFailures::UntilCleared, WriteFailures::Next);
+                self.write_failure_service = service;
                 Ok(())
             }
             Command::ClearWriteFailures {} => {
                 self.write_failures = WriteFailures::None;
+                self.write_failure_service = None;
                 Ok(())
             }
             Command::FailCloses { times: Some(0) } => Err(ERR_FAILED),
@@ -875,6 +881,7 @@ fn reset(config: EcuConfig) {
     bus.trace_path = None;
     bus.battery_mv = DEFAULT_BATTERY_MV;
     bus.write_failures = WriteFailures::None;
+    bus.write_failure_service = None;
     bus.close_failures = WriteFailures::None;
 }
 
@@ -932,10 +939,15 @@ enum Command {
     /// disconnect, until it is closed (J2534-1 6.10.1).
     RestartVci {},
     /// Makes `PassThruWriteMsgs` fail with `ERR_FAILED`, sending nothing: the next `times` calls
-    /// (at least one), or, without `times`, every call until `ClearWriteFailures`.
+    /// (at least one), or, without `times`, every call until `ClearWriteFailures`. With
+    /// `service`, only a call whose first message's data starts with that service after the CAN
+    /// identifier fails and counts; other calls go through (so a test can fail one request kind
+    /// while a tester present or another request is sent beside it).
     FailWrites {
         #[serde(default)]
         times: Option<u32>,
+        #[serde(default)]
+        service: Option<u8>,
     },
     /// Ends `FailWrites`.
     ClearWriteFailures {},
@@ -1271,8 +1283,22 @@ pub unsafe extern "system" fn PassThruWriteMsgs(
     let Some(protocol_id) = bus.channels.get(&channel_id).map(|c| c.protocol_id) else {
         return fail(ERR_INVALID_CHANNEL_ID);
     };
-    // A write failure the test armed: the device takes none of the messages.
-    if bus.write_failures.take() {
+    // A write failure the test armed: the device takes none of the messages. With a service
+    // named, only a call whose first message starts with that service after the CAN identifier
+    // fails and counts.
+    let armed = match bus.write_failure_service {
+        None => true,
+        // SAFETY: `msgs` is non-null (checked above) and the caller guarantees `wanted`
+        // readable messages; the first is read only when there is one.
+        Some(service) => {
+            wanted > 0 && {
+                let first = unsafe { &*msgs };
+                let size = (first.data_size as usize).min(MAX_MSG_DATA);
+                first.data[..size].get(CAN_ID_LEN) == Some(&service)
+            }
+        }
+    };
+    if armed && bus.write_failures.take() {
         return fail(ERR_FAILED);
     }
     let mut sent = 0;

@@ -1632,7 +1632,16 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
         ]
     );
 
-    // Another type of ComPrimitive waits behind one the ECU is still answering.
+    // Another type of ComPrimitive waits behind one the ECU is still answering. The mock keeps a
+    // started link's tester-present (ADR-423), which would use up the faults below: switch it off
+    // for this link before the StartComm.
+    set_tester_present(
+        &mut client,
+        cll_handle,
+        "CP_TesterPresentHandling",
+        param_item::ParamData::Unum32(0),
+    )
+    .await;
     sim_ecu_control(
         &backdoor,
         r#"{"inject_fault":{"fault":{"delay_response":{"ms":100}}}}"#,
@@ -1739,4 +1748,222 @@ async fn a_waiting_com_primitive_reaches_the_ecu_when_it_begins() {
     drop(client);
     drop(setup_client);
     server.shutdown().await;
+}
+
+/// Sets a tester-present ComParam of the link by its name (ISO 22900-2:2022 Annex B.5.1).
+async fn set_tester_present(
+    client: &mut VciServiceClient<Channel>,
+    cll_handle: ComLogicalLinkHandle,
+    name: &str,
+    data: param_item::ParamData,
+) {
+    client
+        .set_com_param(SetComParamRequest {
+            cll_handle: Some(cll_handle),
+            param_item: Some(ParamItem {
+                id: Some(param_item::Id::ParamName(name.to_owned())),
+                com_param_class: PduParamClass::PduPcTesterPresent as i32,
+                param_data: Some(data),
+            }),
+        })
+        .await
+        .unwrap_or_else(|error| panic!("set_com_param {name}: {error}"));
+}
+
+/// The next event item on `stream`, within 5 s.
+async fn next_item(stream: &mut tonic::Streaming<EventNotification>) -> EventItem {
+    let notification = timeout(Duration::from_secs(5), stream.message())
+        .await
+        .expect("timed out waiting for an event")
+        .expect("stream should remain open")
+        .expect("an event should be present");
+    let Some(vci_service_interface::event_notification::EventData::Item(item)) =
+        notification.event_data
+    else {
+        panic!("expected an event item");
+    };
+    item
+}
+
+/// The link's state, from `GetStatus` of the link (ISO 22900-2:2022 8.4.6).
+async fn link_status(
+    client: &mut VciServiceClient<Channel>,
+    cll_handle: ComLogicalLinkHandle,
+) -> Option<i32> {
+    let status = client
+        .get_status(GetStatusRequest {
+            handle: Some(get_status_request::Handle::CllHandle(cll_handle)),
+        })
+        .await
+        .expect("get_status should succeed")
+        .into_inner()
+        .status;
+    match status {
+        Some(vci_service_interface::status_response::Status::CllStatus(status)) => Some(status),
+        other => panic!("expected a link status, got {other:?}"),
+    }
+}
+
+const CLL_ONLINE: i32 = 0x8051;
+const CLL_COMM_STARTED: i32 = 0x8052;
+
+/// A link started with a request keeps the ECU's session alive through the mock's tester-present
+/// (ADR-423): a STARTCOMM with `10 02` is answered and puts the link in COMM_STARTED, the
+/// tester-present set up as the agent sets it (ADR-418) outlasts the ECU's session timeout, a
+/// missing answer (armed through `NGR_SIM_ECU_COMMANDS`) arrives on the event stream as the
+/// tester-present error of no ComPrimitive, and switching the handling off with an UPDATEPARAM
+/// lets the session lapse.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_started_link_keeps_the_session_alive_and_reports_a_missing_answer() {
+    // The mock reads the commands when the service constructs it; the library is loaded into
+    // this process, so the variable is set only around the start.
+    let commands = r#"[
+        {"attach":{"config":{"s3_server_ms":1500}}},
+        {"inject_fault":{"fault":"drop_response","service":62}}
+    ]"#;
+    unsafe { std::env::set_var("NGR_SIM_ECU_COMMANDS", commands) };
+    let server = TestServer::start().await;
+    unsafe { std::env::remove_var("NGR_SIM_ECU_COMMANDS") };
+    let lib_path = iso22900_mock::mock_library_path().expect("mock cdylib should be discoverable");
+    let backdoor = MockBackdoor::open(&lib_path);
+    let _attached = AttachedEcu(&backdoor);
+
+    let mut setup_client = server.client().await;
+    let cll_handle = create_default_cll(&mut setup_client).await;
+    let mut stream_client = server.client().await;
+    let mut stream = stream_client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(
+                vci_service_interface::subscribe_event_request::Handle::CllHandle(cll_handle),
+            ),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut client = server.client().await;
+
+    // The agent's keep-alive ComParams (ADR-418 item 2), every 500 ms.
+    use param_item::ParamData::{Bytefield, Unum32};
+    for (name, data) in [
+        ("CP_TesterPresentMessage", Bytefield(vec![0x3E, 0x00])),
+        ("CP_TesterPresentReqRsp", Unum32(1)),
+        ("CP_TesterPresentExpPosResp", Bytefield(vec![0x7E, 0x00])),
+        ("CP_TesterPresentExpNegResp", Bytefield(vec![0x7F, 0x3E])),
+        ("CP_TesterPresentAddrMode", Unum32(0)),
+        ("CP_TesterPresentSendType", Unum32(0)),
+        ("CP_TesterPresentTime", Unum32(500_000)),
+        ("CP_TesterPresentHandling", Unum32(1)),
+    ] {
+        set_tester_present(&mut client, cll_handle, name, data).await;
+    }
+    assert_eq!(link_status(&mut client, cll_handle).await, Some(CLL_ONLINE));
+
+    // The session control is a STARTCOMM with a request: answered, and the link is started.
+    let start = client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cll_handle: Some(cll_handle),
+            cop_type: vci_service_interface::ComOperationType::CoptStartcomm as i32,
+            cop_data: vec![0x10, 0x02],
+            // Sent once and answered once, as a send-receive is.
+            cop_ctrl_data: Some(vci_service_interface::ComPrimitiveCtrlData {
+                num_send_cycles: 1,
+                num_receive_cycles: 1,
+                ..Default::default()
+            }),
+            cop_tag: None,
+        })
+        .await
+        .expect("start_com_primitive should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("a ComPrimitive handle")
+        .cop_handle;
+    let events = events_until_finished(&mut stream, 1).await;
+    assert!(events.iter().all(|(cop, _)| *cop == start), "{events:?}");
+    assert!(
+        events.iter().any(
+            |(_, seen)| matches!(seen, Seen::Result(bytes) if bytes.starts_with(&[0x50, 0x02]))
+        ),
+        "{events:?}"
+    );
+    assert_eq!(
+        link_status(&mut client, cll_handle).await,
+        Some(CLL_COMM_STARTED)
+    );
+
+    // The first tester-present's answer was dropped: one error event, of no ComPrimitive.
+    let item = next_item(&mut stream).await;
+    assert_eq!(item.cop_handle, None, "{item:?}");
+    let Some(event_item::Data::ErrorData(error)) = item.data else {
+        panic!("expected the tester-present error, got {item:?}");
+    };
+    assert_eq!(
+        error.error_event,
+        vci_service_interface::PduErrorEvent::PduErrEvtTesterPresentError as i32
+    );
+    assert_eq!(
+        error.extra_error_info,
+        Some(iso22900_mock::MOCK_XTRA_ERR_TP_NO_RSP)
+    );
+
+    // The session outlasts the ECU's 1.5 s timeout, and nothing else is reported meanwhile
+    // (the later answers are the expected `7E 00`).
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    let read_session = [0x22, 0xF1, 0x86];
+    assert_eq!(
+        send_and_receive(&mut client, &mut stream, cll_handle, &read_session).await,
+        [
+            Seen::Status(EXECUTING),
+            Seen::Result(vec![0x62, 0xF1, 0x86, 0x02]),
+            Seen::Status(FINISHED)
+        ]
+    );
+
+    // Switched off by an UPDATEPARAM, the tester-present stops and the session lapses.
+    set_tester_present(
+        &mut client,
+        cll_handle,
+        "CP_TesterPresentHandling",
+        Unum32(0),
+    )
+    .await;
+    let update = client
+        .start_com_primitive(StartComPrimitiveRequest {
+            cll_handle: Some(cll_handle),
+            cop_type: vci_service_interface::ComOperationType::CoptUpdateparam as i32,
+            cop_data: vec![],
+            cop_ctrl_data: None,
+            cop_tag: None,
+        })
+        .await
+        .expect("start_com_primitive should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("a ComPrimitive handle")
+        .cop_handle;
+    loop {
+        let item = next_item(&mut stream).await;
+        if item.cop_handle.is_some_and(|cop| cop.cop_handle == update) {
+            break;
+        }
+    }
+    tokio::time::sleep(Duration::from_millis(2000)).await;
+    assert_eq!(
+        send_and_receive(&mut client, &mut stream, cll_handle, &read_session).await,
+        [
+            Seen::Status(EXECUTING),
+            Seen::Result(vec![0x62, 0xF1, 0x86, 0x01]),
+            Seen::Status(FINISHED)
+        ]
+    );
+
+    drop(stream);
+    drop(stream_client);
+    drop(client);
+    drop(setup_client);
+    timeout(Duration::from_secs(5), server.shutdown())
+        .await
+        .expect("the worker shuts down");
 }

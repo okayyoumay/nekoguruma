@@ -1077,6 +1077,12 @@ pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong 
         bus.device_id = bus.device_id.wrapping_add(1).max(1);
         return ERR_FAILED;
     }
+    if bus.vci_crashed && !bus.device_ok(device_id) {
+        // The library knows which device IDs it holds without asking the VCI: a close of one it
+        // does not hold, such as the device a close above already released, is refused as with
+        // the VCI answering (ADR-422: a later close then confirms the device closed).
+        return ERR_INVALID_DEVICE_ID;
+    }
     if bus.device_lost && bus.device_ok(device_id) {
         // Closing is how the application recovers from a lost device; the call still reports
         // the loss, and the next open gets a new device ID (J2534-1 6.10.1).

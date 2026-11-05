@@ -1917,7 +1917,8 @@ fn armed_close_failures_release_nothing() {
 }
 
 /// A crashed VCI fails every call but `PassThruGetLastError` with `ERR_FAILED`, a close included,
-/// which still releases the device. The open fails until the VCI restarts; the next one gets a
+/// which still releases the device; a close of an ID the library does not hold is refused with
+/// `ERR_INVALID_DEVICE_ID`. The open fails until the VCI restarts; the next one gets a
 /// new device ID, and the ECU kept its state (ADR-292).
 #[test]
 fn a_crashed_vci_fails_every_call_until_it_restarts() {
@@ -1948,6 +1949,8 @@ fn a_crashed_vci_fails_every_call_until_it_restarts() {
         STATUS_NOERROR
     );
     assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    // The released device is unknown to the library even while the VCI does not answer.
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_INVALID_DEVICE_ID);
     let mut device = 0;
     assert_eq!(
         unsafe { PassThruOpen(ptr::null(), &mut device) },

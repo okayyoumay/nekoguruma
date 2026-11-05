@@ -48,3 +48,9 @@ worker's reach for the rest of its life.
   links and their messages are still gone after a failed close, but the device itself stays
   reachable by the next close.
 - The close's retry is the agent's; the worker does not retry on its own.
+- A crashed `sim-vci` (ADR-292) still releases the device at the first close and reports
+  `ERR_FAILED`, so the worker keeps the slot; a close of a device ID the library no longer holds
+  now answers `ERR_INVALID_DEVICE_ID` while the VCI is crashed (the library knows its own IDs
+  without the VCI), so the agent's second close of a crashed path confirms the link closed as
+  ADR-393 item 2 expects. A real library that answers a released ID with another error leaves
+  such a close unconfirmed, and ADR-258's mark holds the guards until the worker is reaped.

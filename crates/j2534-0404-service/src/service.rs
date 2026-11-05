@@ -3459,6 +3459,42 @@ pub(super) struct ResidualTesterPresentDiscard {
     pub(super) window: DiscardWindow,
     pub(super) target_can_ids: Option<TesterPresentTargetCanIds>,
     pub(super) tx_can_id: Option<u32>,
+    /// ISO 22900-2:2022 8.1.3 Table 1 hold state (ADR-419): `Some` exactly
+    /// when the send expected a response (`CP_TesterPresentReqRsp == 1` at
+    /// send time), which makes this entry hold the shared channel until the
+    /// answer settles it ([`TpHold`]) or `window.until` passes and the
+    /// per-tick sweep removes it. `None` keeps the ADR-099 behaviour: a
+    /// TX-echo identity window that prunes at `until` and never holds.
+    pub(super) hold: Option<TpHold>,
+}
+
+impl ResidualTesterPresentDiscard {
+    /// Whether this entry holds the channel (ADR-419).
+    pub(super) fn holds_bus(&self) -> bool {
+        self.hold.is_some()
+    }
+}
+
+/// The part of a [`ResidualTesterPresentDiscard`] that exists only while its
+/// send expected an answer (ADR-419). Everything but `first_pending_at` and
+/// `got_response` is frozen at the send, like the window's own fields, so a
+/// later `CoptUpdateparam` never changes how an outstanding send settles.
+#[derive(Debug, Clone)]
+pub(super) struct TpHold {
+    /// Physical addressing (also the class of an unresolved addressing, as on
+    /// K-line and J1850). The answer of a physical send ends the hold; a
+    /// functional send's hold lasts until its window expires.
+    pub(super) physical: bool,
+    /// Frozen response-code handling (offset, 0x78 handling, `CP_P2Star`,
+    /// completion ceiling), with `request_sid` set to the tester-present
+    /// message's service identifier.
+    pub(super) rc_cfg: RcHandlingConfig,
+    /// When the first pending answer of this send was seen (anchors the
+    /// completion ceiling once, as ADR-102 does for a send-receive).
+    pub(super) first_pending_at: Option<tokio::time::Instant>,
+    /// A positive answer was seen (decides whether the expiry of a
+    /// functional send reports a missing answer).
+    pub(super) got_response: bool,
 }
 
 /// `LogicalLinkState::tester_present_state`: what (if anything) `CoptStartcomm`

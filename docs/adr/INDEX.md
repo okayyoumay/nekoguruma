@@ -89,16 +89,16 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-085](ADR-085-copstopcomm-transmits-non-empty-cop-data.md) | CoptStopcomm Non-Empty cop_data Transmits a Final Fire-and-Forget Message | Accepted | `j2534-0404-service` service, rpc_primitive, events |
 | [ADR-086](ADR-086-connection-generation-distinguishes-reconnect-from-continuous-connection.md) | `connect_generation` Distinguishes a Same-Channel Reconnect from a Continuous Connection | Accepted (amended by ADR-100) | `j2534-0404-service` service, rpc_link, rpc_primitive, events |
 | [ADR-087](ADR-087-copstopcomm-final-message-receive-phase.md) | CoptStopcomm's Final Message Gains a Bounded, Non-Cancellable Receive Phase | Accepted (amends ADR-085; amended by ADR-100) | `j2534-0404-service` service, rpc_primitive, events |
-| [ADR-088](ADR-088-tester-present-reqrsp-response-discard.md) | CP_TesterPresentReqRsp Discards the ECU's Tester-Present Response | Accepted (amended twice; mode-0 scoping superseded by ADR-093; extended by ADR-099; precedence rule superseded by ADR-100) | `j2534-0404-service` service, events |
+| [ADR-088](ADR-088-tester-present-reqrsp-response-discard.md) | CP_TesterPresentReqRsp Discards the ECU's Tester-Present Response | Accepted (amended twice; mode-0 scoping superseded by ADR-093; extended by ADR-099; precedence rule superseded by ADR-100; the end of the discard window of a send that expects an answer superseded by ADR-419) | `j2534-0404-service` service, events |
 | [ADR-089](ADR-089-sanitize-library-load-error-messages.md) | Sanitize Library-Construction/Registry Error Messages (No Raw Filesystem Path / OS Error Text) | Accepted | `iso22900-service` error.rs, `j2534-0404-service` error.rs |
-| [ADR-093](ADR-093-tester-present-unified-software-dispatch.md) | Tester-Present Unified Software Dispatch (Mode 0 Drops PassThruStartPeriodicMsg), and CP_TesterPresentReqRsp-Aware P3 Gap Classification | Accepted (extended by ADR-099) | `j2534-0404-service` service, rpc_primitive, events, rpc_link, rpc_misc |
+| [ADR-093](ADR-093-tester-present-unified-software-dispatch.md) | Tester-Present Unified Software Dispatch (Mode 0 Drops PassThruStartPeriodicMsg), and CP_TesterPresentReqRsp-Aware P3 Gap Classification | Accepted (extended by ADR-099; send stamp made correct by ADR-419) | `j2534-0404-service` service, rpc_primitive, events, rpc_link, rpc_misc |
 | [ADR-094](ADR-094-poll-loop-tick-duties-persistent-deadline.md) | Poll-Loop Tick Duties Run on a Persistent Deadline, Not a Per-Iteration Sleep Arm | Accepted (extended by ADR-095) | `j2534-0404-service` events |
 | [ADR-095](ADR-095-poll-task-holds-run-tick-duties.md) | Every Poll-Task Hold Runs Tick Duties, or Documents Why Not | Accepted (amended by ADR-100) | `j2534-0404-service` events |
 | [ADR-096](ADR-096-isotp-tester-present-exclusion-by-wire-target.md) | ISO-TP Tester-Present Suppression Keys on Wire Target, Not CLL Identity | Accepted | `j2534-0404-service` events |
 | [ADR-097](ADR-097-iso22900-2-rxflag-start-of-message.md) | ISO 22900-2 RxFlag START_OF_MESSAGE Forwarding | **Superseded by ADR-098** | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-098](ADR-098-rxflag-all-status-bits.md) | ISO 22900-2 RxFlag Forwards All 5 Low RxStatus Bits | Accepted (amended by ADR-100, ADR-151; content-frame gate extended by ADR-172) | `j2534-0404-service` service, events, rpc_primitive |
 | [ADR-099](ADR-099-tester-present-indication-frame-discard.md) | Tester-Present Discard Extends to Indication Frames (SOM / TX_DONE / Loopback), and Now Windows on Every Successful Send | Accepted (amends ADR-088, ADR-093; amended by ADR-100) | `j2534-0404-service` service, events |
-| [ADR-100](ADR-100-cop-registry-two-tier-binding.md) | Two-Tier ComPrimitive Response-Binding Registry (ISO 22900-2 §9.2.6.3.4) | Accepted (amended by ADR-101, ADR-151, ADR-352; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182) | `j2534-0404-service` service, events, rpc_primitive, rpc_link |
+| [ADR-100](ADR-100-cop-registry-two-tier-binding.md) | Two-Tier ComPrimitive Response-Binding Registry (ISO 22900-2 §9.2.6.3.4) | Accepted (amended by ADR-101, ADR-151, ADR-352; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182; step 3 gains a settlement writeback and the Stage 2 stamp item is closed by ADR-419) | `j2534-0404-service` service, events, rpc_primitive, rpc_link |
 | [ADR-101](ADR-101-cross-channel-registrant-writeback.md) | Cross-Channel Registrant Bookkeeping Uses Delta/Monotone Merge, Not Absolute Overwrite | Accepted (amends ADR-100) | `j2534-0404-service` events |
 | [ADR-102](ADR-102-p2star-reload-per-occurrence-rc78-ceiling-reinstated.md) | CP_P2Star Reloads Per 0x78; CP_RC78CompletionTimeout Reinstated as Total Ceiling | Accepted (amends ADR-056, ADR-057) | `j2534-0404-service` service, events, comparam_defaults, service_params |
 | [ADR-103](ADR-103-paramitem-name-based-addressing.md) | ParamItem Name-Based Addressing for Set-Family RPCs | Accepted | `vci-service-interface`, `iso22900-service`, `j2534-0404-service` |
@@ -132,7 +132,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-133](ADR-133-getcomparam-class-and-typed-empty-fallback.md) | `GetComParam` Reports Real `com_param_class` (BUSTYPE/TESTER_PRESENT Only) and a Typed Empty Shape for Unseeded Bytefield/Structfield Params | Accepted | `j2534-0404-service` rpc_link, comparam_support, comparam_defaults |
 | [ADR-134](ADR-134-notavail-gating-extended-to-getversion-connect-and-companion-channels.md) | `PDU_MODST_NOT_AVAIL` Gating Extended to `GetVersion`, `ConnectComLogicalLink`, and Every Companion-Channel Open (closes ADR-131's two recorded residuals) | Accepted (extends ADR-131) | `j2534-0404-service` rpc_module, rpc_link |
 | [ADR-135](ADR-135-get-cable-id-rejects-with-fct-failed.md) | `GET_CABLE_ID` Rejects With `PDU_ERR_FCT_FAILED` (Supersedes ADR-079 Item 15's Error-Code Choice) | **Superseded by ADR-187** | `j2534-0404-service` rpc_misc |
-| [ADR-137](ADR-137-cp-tester-present-handling-master-switch.md) | `CP_TesterPresentHandling` Gates Tester-Present Arm/Re-arm (and Disarms Live) | Accepted (amends ADR-084) | `j2534-0404-service` service, rpc_primitive, events |
+| [ADR-137](ADR-137-cp-tester-present-handling-master-switch.md) | `CP_TesterPresentHandling` Gates Tester-Present Arm/Re-arm (and Disarms Live) | Accepted (amends ADR-084; prune rule amended by ADR-419) | `j2534-0404-service` service, rpc_primitive, events |
 | [ADR-138](ADR-138-cp-tester-present-addr-mode-addressing-source.md) | `CP_TesterPresentAddrMode` Selects Tester-Present Addressing via an `AddrModeSource` Selector in `tx_header` | Accepted | `j2534-0404-service` tx_header, rpc_primitive, comparam_defaults |
 | [ADR-139](ADR-139-hard-error-and-module-disconnect-hold-shared-channels-across-cancel-link-cops.md) | `handle_channel_hard_error`/`rpc_module_disconnect` Hold `shared_channels` Across Their `cancel_link_cops` Loop | Accepted | `j2534-0404-service` events, rpc_module |
 | [ADR-140](ADR-140-cop-status-queue-insertion.md) | `send_cop_status` Queue Insertion — Resolve-Before-`primitives` Pattern | Accepted | `j2534-0404-service` service, events, rpc_primitive |
@@ -407,7 +407,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-415](ADR-415-hardware-profile-names-the-worker-abi.md) | The Hardware Profile Names the Worker ABI to Launch | Accepted | `agent` launch (`launch_worker`, `host_runs`), `ngr-hw-checks` (`profile`, `open`); ADR-240, ADR-275 |
 | [ADR-416](ADR-416-a-timed-out-start-leaves-a-tagged-stray.md) | A Timed-Out Start Leaves a Tagged Stray That the Host Finds Again by Its Tag | Accepted | `agent` host (`send_recv_async`, `settle_at_end`, `Stray`, `resolve_tag`), communication log (`primitive_ended`, `settle_primitive_ended`); design 8.11 "Settlement", `primitive_ended`; ADR-204, ADR-358, ADR-367, ADR-372, ADR-386, ADR-389, ADR-393, ADR-394, ADR-397 |
 | [ADR-417](ADR-417-a-job-keeps-its-own-targets-session-alive.md) | A Job Keeps the Session of Its Own Targets Alive | Accepted (items 1, 4, 5 and 8's last sentence superseded, item 6's trigger replaced and item 9 amended by ADR-418: the worker sends the tester-present and the agent decides when) | `agent` (`LinkConfig`, host, runner, restart), communication log `keep_alive`; design 8.2.4, 8.2.5, 8.10; ADR-264, ADR-325, ADR-389, ADR-392, ADR-393, ADR-416 |
-| [ADR-418](ADR-418-the-worker-keeps-a-jobs-session-alive.md) | The Worker Keeps a Job's Session Alive, the Agent Decides When | Accepted | `agent` (`LinkConfig`, link open, host), `j2534-0404-service` tester-present, `iso22900-service`, `ngr-hw-checks`, communication log `keep_alive`; design 8.2.5, 8.10, 8.11, 13.5; ADR-084, ADR-088, ADR-093, ADR-099, ADR-137, ADR-264, ADR-275, ADR-325, ADR-417 |
+| [ADR-418](ADR-418-the-worker-keeps-a-jobs-session-alive.md) | The Worker Keeps a Job's Session Alive, the Agent Decides When | Accepted (items 5 and 6 implemented by the J2534 worker as ADR-419 decides) | `agent` (`LinkConfig`, link open, host), `j2534-0404-service` tester-present, `iso22900-service`, `ngr-hw-checks`, communication log `keep_alive`; design 8.2.5, 8.10, 8.11, 13.5; ADR-084, ADR-088, ADR-093, ADR-099, ADR-137, ADR-264, ADR-275, ADR-325, ADR-417 |
+| [ADR-419](ADR-419-tester-present-is-serialized-with-client-primitives.md) | The J2534 Worker's Tester-Present Is Serialized With Client Primitives | Accepted | `j2534-0404-service` (`wait_for_bus_clear`, tester-present dispatch, `bind_frame` step 3, open-discard entries), `docs/j2534-0404-architecture.md`; ADR-060, ADR-083, ADR-088, ADR-093, ADR-095, ADR-099, ADR-100, ADR-102, ADR-137, ADR-418 |
 
 ## Status Legend
 
@@ -466,7 +467,7 @@ the predecessor repository these ADRs came from.
 - ADR-061 (superseded)
 - ADR-097 (superseded)
 - ADR-098 (residual closed by ADR-143; RxFlag byte-1 scheme extended by ADR-146; amended by ADR-151; ADR-061-inherited RxStatus-CAN-ID premise narrowed by ADR-222)
-- ADR-100 (amended by ADR-151 and ADR-352; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182)
+- ADR-100 (amended by ADR-151 and ADR-352; Decision §4's `-1`-only `CP_CyclicRespTimeout` scope and Stage 3 boundary for created-receive-only COPs narrowly superseded by ADR-182; step 3 gains a settlement writeback and the Stage 2 stamp item is closed by ADR-419)
 - ADR-101
 - ADR-148 (amended)
 - ADR-151
@@ -556,11 +557,11 @@ the predecessor repository these ADRs came from.
 - ADR-010 (superseded for tester-present by ADR-093; its shared-channel periodic-message-leak discipline reinstated for TP2.0 broadcast re-trigger by ADR-192)
 - ADR-083 (partially superseded by ADR-093)
 - ADR-084 (partially superseded by ADR-093; amended by ADR-137)
-- ADR-088 (amended; partially superseded by ADR-093; extended by ADR-099)
-- ADR-093 (its "ADR-010 fully superseded" claim narrowed to tester-present by ADR-192)
+- ADR-088 (amended; partially superseded by ADR-093; extended by ADR-099; the end of the discard window of a send that expects an answer superseded by ADR-419)
+- ADR-093 (its "ADR-010 fully superseded" claim narrowed to tester-present by ADR-192; send stamp made correct by ADR-419)
 - ADR-096
 - ADR-099
-- ADR-137
+- ADR-137 (prune rule amended by ADR-419)
 - ADR-138
 - ADR-215
 
@@ -861,7 +862,8 @@ the predecessor repository these ADRs came from.
 - ADR-394 (the settle step of item 3 also runs after a link fails to open and to close again, in both runners, by ADR-396)
 - ADR-416
 - ADR-417 (items 1, 4, 5 and 8's last sentence superseded, item 6's trigger replaced and item 9 amended by ADR-418)
-- ADR-418
+- ADR-418 (items 5 and 6 implemented by the J2534 worker as ADR-419 decides)
+- ADR-419
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1); `Op::FlashBlock` appended, a block of a declared flash segment read through `DiagHost::artifact_bytes`, by ADR-336 item 11; `Op::ReadInput` appended, a runtime input read through `DiagHost::runtime_input`, by ADR-338; `Op::HmiRequestFromStack` appended, a form whose run-time parameters come from the stack, and item 7's constant of `HmiRequest` and `RecordInput` read as an encoded `HmiTemplate`, by ADR-340; item 2's repeat policy realized by ADR-392)

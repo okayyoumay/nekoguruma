@@ -1,7 +1,7 @@
 # ADR-418: The Worker Keeps a Job's Session Alive, the Agent Decides When
 
 **Date:** 2026-11-04
-**Status:** Accepted
+**Status:** Accepted (items 5 and 6 implemented by the J2534 worker as ADR-419 decides)
 **Affects:** `agent` (`link.rs` `LinkConfig`, link open, `host.rs`, the communication log's
 `Origin::KeepAlive`), `j2534-0404-service` (tester-present dispatch, `handle_start_comm`),
 `iso22900-service` (passes through to the vendor library), `ngr-hw-checks`; design 8.2.5, 8.10,

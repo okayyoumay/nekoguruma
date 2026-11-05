@@ -986,6 +986,22 @@ or as an async `PduErrEvtTesterPresentError` from a `COPT_UPDATEPARAM` re-arm
 (the same dual sync/async pattern this function already uses for
 `CP_TesterPresentSendType`/`CP_TesterPresentTime` validation).
 
+**Tester-present answers and serialization (ADR-419).** A tester-present send
+made with `CP_TesterPresentReqRsp` 1 is outstanding until its final answer
+(the expected positive or negative response, a pending response reloading the
+window) or the end of its `CP_P2Max` window; a functional one stays outstanding
+to the window's end. While it is outstanding, a request that ISO 22900-2:2022
+8.1.3 Table 1 makes wait for it (a physical request of any kind, and a
+functional one that expects a response) waits before it writes: `COPT_SENDRECV`,
+`COPT_STARTCOMM`, `COPT_STOPCOMM` and the K-line init exchange, on any link of
+the same shared channel. A functional request without a response does not wait
+for a physical tester-present. In the other direction, a physical
+tester-present that falls due while a request waits for its response is sent
+after the request's final response. A send whose final answer is negative, or
+that ends without an answer, raises `PduErrEvtTesterPresentError` on its link
+(once per such send, sending continues) while the link's tester-present is
+armed; a positive answer raises none.
+
 **Fast-init client contract (ADR-075).** For a K-line (ISO9141/ISO14230)
 `COPT_STARTCOMM` whose bound `CP_InitializationSettings` selects fast-init
 (`= 2`, or the legacy multi-byte-`init_data` heuristic when the ComParam is

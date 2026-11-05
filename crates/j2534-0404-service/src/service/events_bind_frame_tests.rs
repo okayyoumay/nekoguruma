@@ -88,6 +88,7 @@ fn test_entry(
         registrants,
         registrant_baselines: Vec::new(),
         tester_present_discard,
+        tp_settlements: Vec::new(),
         queue_error_class: None,
         start_msg_ind_enable: false,
         transmit_ind_enable: false,
@@ -878,6 +879,7 @@ fn discard_matching(pos: Vec<u8>) -> TesterPresentDiscard {
         neg: Vec::new(),
         target_can_ids: None,
         tx_can_id: None,
+        hold: None,
     }
 }
 
@@ -2130,6 +2132,7 @@ fn discard_at(until_offset_ms: i64, pos: u8) -> ResidualTesterPresentDiscard {
         },
         target_can_ids: None,
         tx_can_id: None,
+        hold: None,
     }
 }
 
@@ -5940,5 +5943,512 @@ fn session_timing_still_pairs_when_absorbed_via_concat_open_new_buffer_arm() {
             p2_max_ms: 200,
             p2_star_10ms: 10,
         })
+    );
+}
+
+// ---------------------------------------------------------------------------
+// ADR-419: ISO 22900-2:2022 8.1.3 Table 1 serialization of the tester-present
+// ---------------------------------------------------------------------------
+
+fn outstanding(functional: bool, cyclic_before_first: bool) -> Outstanding {
+    Outstanding {
+        functional,
+        cyclic_before_first,
+    }
+}
+
+fn next_send(functional: bool, with_response: bool) -> NextSend {
+    NextSend {
+        functional,
+        with_response,
+    }
+}
+
+/// Every row of `bus_hold`: after a physical exchange a physical send and a
+/// functional send with an answer wait, a functional send without an answer
+/// goes (unless the physical exchange is an IS-CYCLIC primitive before its
+/// first response); after a functional exchange everything waits.
+#[test]
+fn bus_hold_follows_every_row_of_table_1() {
+    let phys = outstanding(false, false);
+    let phys_cyclic = outstanding(false, true);
+    let func = outstanding(true, false);
+    // Physical previous, with response.
+    assert!(
+        bus_hold(phys, next_send(false, true)),
+        "physical with answer"
+    );
+    assert!(
+        bus_hold(phys, next_send(false, false)),
+        "physical without answer"
+    );
+    assert!(
+        bus_hold(phys, next_send(true, true)),
+        "functional with answer"
+    );
+    assert!(
+        !bus_hold(phys, next_send(true, false)),
+        "functional without answer goes at once"
+    );
+    // The table's note: a physical cyclic exchange keeps even that back until
+    // its first response.
+    assert!(
+        bus_hold(phys_cyclic, next_send(true, false)),
+        "functional without answer waits for the first cyclic response"
+    );
+    assert!(bus_hold(phys_cyclic, next_send(false, false)));
+    // Functional previous, with response: everything waits.
+    for (functional, with_response) in [(false, true), (false, false), (true, true), (true, false)]
+    {
+        assert!(
+            bus_hold(func, next_send(functional, with_response)),
+            "after a functional exchange with an answer, functional={functional} \
+             with_response={with_response} must wait"
+        );
+    }
+}
+
+/// A rc-handling config as a physical tester-present's `7F 3E 78` handling
+/// needs it: offset 2, pending handled, request SID 0x3E.
+fn tp_rc_cfg(rc78_handling: bool, ceiling_ms: Option<u32>) -> RcHandlingConfig {
+    RcHandlingConfig {
+        rc_byte_offset: 2,
+        rc78_handling,
+        rc78_p2_star_ms: 5000,
+        rc78_total_ceiling_ms: ceiling_ms,
+        request_sid: Some(0x3E),
+        ..RcHandlingConfig::default()
+    }
+}
+
+fn hold_entry(
+    until_offset_ms: i64,
+    physical: bool,
+    rc_cfg: RcHandlingConfig,
+) -> ResidualTesterPresentDiscard {
+    let mut e = discard_at(until_offset_ms, 0x7E);
+    e.window.pos = vec![0x7E, 0x00];
+    e.window.neg = vec![0x7F, 0x3E];
+    e.hold = Some(TpHold {
+        physical,
+        rc_cfg,
+        first_pending_at: None,
+        got_response: false,
+    });
+    e
+}
+
+fn settlement(e: &ResidualTesterPresentDiscard, kind: TpSettleKind) -> TpSettlement {
+    TpSettlement {
+        pos: e.window.pos.clone(),
+        neg: e.window.neg.clone(),
+        target_can_ids: e.target_can_ids,
+        tx_can_id: e.tx_can_id,
+        at: tokio::time::Instant::now(),
+        kind,
+    }
+}
+
+/// The prune of `push_open_tp_discard` keeps an expired entry that holds the
+/// channel (only the sweep may end it, so the missing answer is reported)
+/// and still prunes an expired one that does not.
+#[test]
+fn push_open_tp_discard_keeps_an_expired_holding_entry_and_the_sweep_removes_it() {
+    let now = tokio::time::Instant::now();
+    let mut list = vec![
+        hold_entry(-10, true, tp_rc_cfg(true, None)),
+        discard_at(-10, 0x03),
+        discard_at(10_000, 0x04),
+    ];
+    push_open_tp_discard(&mut list, now, None);
+    assert_eq!(
+        list.len(),
+        2,
+        "expired non-holding entry pruned, holding one kept"
+    );
+    assert!(list[0].holds_bus());
+
+    // Armed: the sweep removes it and reports one missing answer.
+    let mut armed = list.clone();
+    assert_eq!(sweep_expired_holds(&mut armed, now, true, &|_| true), 1);
+    assert_eq!(armed.len(), 1);
+    assert!(!armed[0].holds_bus());
+
+    // Disarmed or stopped: removed all the same, silently.
+    let mut disarmed = list.clone();
+    assert_eq!(sweep_expired_holds(&mut disarmed, now, false, &|_| true), 0);
+    assert_eq!(disarmed.len(), 1);
+
+    // A functional send that had a positive answer ends without a report.
+    let mut functional = vec![hold_entry(-10, false, tp_rc_cfg(true, None))];
+    functional[0].hold.as_mut().unwrap().got_response = true;
+    assert_eq!(
+        sweep_expired_holds(&mut functional, now, true, &|_| true),
+        0
+    );
+    assert!(functional.is_empty());
+
+    // An unexpired holding entry stays.
+    let mut open = vec![hold_entry(10_000, true, tp_rc_cfg(true, None))];
+    assert_eq!(sweep_expired_holds(&mut open, now, true, &|_| true), 0);
+    assert_eq!(open.len(), 1);
+}
+
+/// A new send of a holding signature replaces the entry (fresh pending
+/// state); a non-holding entry with the same bytes is a different signature.
+#[test]
+fn push_open_tp_discard_holding_signature_replaces_and_stays_distinct_from_non_holding() {
+    let now = tokio::time::Instant::now();
+    let mut stale = hold_entry(10_000, true, tp_rc_cfg(true, None));
+    stale.hold.as_mut().unwrap().first_pending_at = Some(now);
+    let mut list = vec![stale];
+    push_open_tp_discard(
+        &mut list,
+        now,
+        Some(hold_entry(10_000, true, tp_rc_cfg(true, None))),
+    );
+    assert_eq!(list.len(), 1);
+    assert!(list[0].hold.as_ref().unwrap().first_pending_at.is_none());
+
+    let mut plain = hold_entry(10_000, true, tp_rc_cfg(true, None));
+    plain.hold = None;
+    push_open_tp_discard(&mut list, now, Some(plain));
+    assert_eq!(list.len(), 2, "holds_bus is part of the dedup signature");
+}
+
+/// The settlements: pending reloads (clamped by the ceiling anchored at the
+/// first pending answer), a physical final answer removes the entry (a
+/// negative one reports while armed), a functional entry only records.
+#[test]
+fn apply_tp_settlement_reloads_removes_and_reports() {
+    let e = hold_entry(1_000, true, tp_rc_cfg(true, Some(8_000)));
+    let mut list = vec![e.clone()];
+    let at = tokio::time::Instant::now();
+
+    // Pending: until becomes at + P2Star (5 s), below the 8 s ceiling.
+    let mut pending = settlement(&e, TpSettleKind::Pending);
+    pending.at = at;
+    assert!(!apply_tp_settlement(&mut list, &pending, true));
+    assert_eq!(list[0].window.until, at + Duration::from_millis(5_000));
+    assert_eq!(list[0].hold.as_ref().unwrap().first_pending_at, Some(at));
+
+    // A later pending answer is clamped by the ceiling from the first one.
+    let mut later = settlement(&e, TpSettleKind::Pending);
+    later.at = at + Duration::from_millis(6_000);
+    assert!(!apply_tp_settlement(&mut list, &later, true));
+    assert_eq!(
+        list[0].window.until,
+        at + Duration::from_millis(8_000),
+        "the ceiling (8 s from the first pending answer) limits the reload"
+    );
+
+    // Positive: removed, nothing reported. A repeated settlement is a no-op.
+    let positive = settlement(&e, TpSettleKind::Positive);
+    assert!(!apply_tp_settlement(&mut list, &positive, true));
+    assert!(list.is_empty());
+    assert!(!apply_tp_settlement(&mut list, &positive, true));
+
+    // Negative final: removed; reported only while armed.
+    let mut list = vec![e.clone()];
+    assert!(apply_tp_settlement(
+        &mut list,
+        &settlement(&e, TpSettleKind::Negative),
+        true
+    ));
+    assert!(list.is_empty());
+    let mut list = vec![e.clone()];
+    assert!(!apply_tp_settlement(
+        &mut list,
+        &settlement(&e, TpSettleKind::Negative),
+        false
+    ));
+    assert!(list.is_empty());
+
+    // Functional: a positive answer only records, a negative one changes
+    // nothing, and the entry stays until its window ends.
+    let f = hold_entry(1_000, false, tp_rc_cfg(true, None));
+    let mut list = vec![f.clone()];
+    assert!(!apply_tp_settlement(
+        &mut list,
+        &settlement(&f, TpSettleKind::Negative),
+        true
+    ));
+    assert!(!list[0].hold.as_ref().unwrap().got_response);
+    assert!(!apply_tp_settlement(
+        &mut list,
+        &settlement(&f, TpSettleKind::Positive),
+        true
+    ));
+    assert_eq!(list.len(), 1);
+    assert!(list[0].hold.as_ref().unwrap().got_response);
+}
+
+fn step3_frame(entry: &mut CllRxEntry, payload: &[u8], is_tx_side: bool) -> FrameBinding {
+    bind_frame(
+        entry,
+        FrameContext {
+            is_content_frame: !is_tx_side,
+            is_tx_side,
+            frame_can_id: None,
+            payload,
+            unique_resp_identifier: 0,
+        },
+        0,
+        ConcatFrameMeta {
+            timestamp: 0,
+            header_bytes: &[],
+            footer_bytes: &[],
+            rx_status_flags: 0,
+            source_id: None,
+            uudt_routed: false,
+            raw_prefix: 0,
+        },
+        &mut Vec::new(),
+        &mut false,
+    )
+}
+
+fn holding_discard(rc_cfg: RcHandlingConfig, physical: bool) -> TesterPresentDiscard {
+    TesterPresentDiscard {
+        pos: vec![0x7E, 0x00],
+        neg: vec![0x7F, 0x3E],
+        target_can_ids: None,
+        tx_can_id: None,
+        hold: Some(TpHold {
+            physical,
+            rc_cfg,
+            first_pending_at: None,
+            got_response: false,
+        }),
+    }
+}
+
+/// Step 3 records a settlement per frame in frame order: a `7F 3E 78` then
+/// a `7E 00` of one batch are both discarded (never delivered), recorded as
+/// Pending then Positive, and applying them leaves the entry removed and
+/// nothing to report.
+#[test]
+fn step_3_settles_pending_then_positive_in_frame_order() {
+    let mut entry = test_entry(
+        1,
+        vec![registrant(100, 1)],
+        vec![holding_discard(tp_rc_cfg(true, None), true)],
+    );
+    assert!(matches!(
+        step3_frame(&mut entry, &[0x7F, 0x3E, 0x78], false),
+        FrameBinding::TesterPresent
+    ));
+    assert!(matches!(
+        step3_frame(&mut entry, &[0x7E, 0x00], false),
+        FrameBinding::TesterPresent
+    ));
+    let kinds: Vec<_> = entry.tp_settlements.iter().map(|s| s.kind).collect();
+    assert_eq!(kinds, vec![TpSettleKind::Pending, TpSettleKind::Positive]);
+
+    let mut live = vec![hold_entry(1_000, true, tp_rc_cfg(true, None))];
+    let mut report = false;
+    for s in &entry.tp_settlements {
+        report |= apply_tp_settlement(&mut live, s, true);
+    }
+    assert!(live.is_empty(), "the final answer ended the hold");
+    assert!(!report, "no error event for a pending then positive answer");
+}
+
+/// A negative answer that is not a handled pending one is a final negative;
+/// without `CP_RC78Handling` even 0x78 is one; a TX echo never settles.
+#[test]
+fn step_3_classifies_negative_answers_and_ignores_the_tx_echo() {
+    let mut entry = test_entry(
+        1,
+        Vec::new(),
+        vec![holding_discard(tp_rc_cfg(true, None), true)],
+    );
+    step3_frame(&mut entry, &[0x7F, 0x3E, 0x7E], false);
+    assert_eq!(entry.tp_settlements.len(), 1);
+    assert_eq!(entry.tp_settlements[0].kind, TpSettleKind::Negative);
+
+    let mut entry = test_entry(
+        1,
+        Vec::new(),
+        vec![holding_discard(tp_rc_cfg(false, None), true)],
+    );
+    step3_frame(&mut entry, &[0x7F, 0x3E, 0x78], false);
+    assert_eq!(
+        entry.tp_settlements[0].kind,
+        TpSettleKind::Negative,
+        "0x78 without CP_RC78Handling is a final negative answer"
+    );
+
+    // A TX-side frame is no answer.
+    let mut entry = test_entry(
+        1,
+        Vec::new(),
+        vec![holding_discard(tp_rc_cfg(true, None), true)],
+    );
+    step3_frame(&mut entry, &[0x7F, 0x3E, 0x78], true);
+    assert!(
+        entry.tp_settlements.is_empty(),
+        "a TX-side frame is no answer and settles nothing"
+    );
+}
+
+/// The property the integration test of the same name in `queue_error_suspend`
+/// checked before ADR-419 (an outstanding tester-present now keeps such a
+/// registrant from existing when its reply arrives, so it is checked here): a
+/// tester-present NEGATIVE reply binds at step 3 and writes no suspension,
+/// even when an unrelated tier-1 registrant with no request SID (so no
+/// SID-echo gate) and RC handling at offset 2 sits on the CLL and sights the
+/// frame as an unhandled negative response (ADR-147 correction).
+#[test]
+fn tester_present_negative_reply_is_not_a_suspension_for_an_unrelated_registrant() {
+    let mut unrelated = registrant(100, 1);
+    unrelated.expected = vec![non_vacuous_expected(0x62, 9)];
+    unrelated.rc_cfg = Some(RcHandlingConfig {
+        rc_byte_offset: 2,
+        ..RcHandlingConfig::default()
+    });
+    let mut entry = test_entry(
+        1,
+        vec![unrelated],
+        vec![TesterPresentDiscard {
+            pos: Vec::new(),
+            neg: vec![0x7F, 0x3E],
+            target_can_ids: None,
+            tx_can_id: None,
+            hold: None,
+        }],
+    );
+    let mut wrote_suspend = false;
+    let binding = bind_frame(
+        &mut entry,
+        FrameContext {
+            is_content_frame: true,
+            is_tx_side: false,
+            frame_can_id: None,
+            payload: &[0x7F, 0x3E, 0x22],
+            unique_resp_identifier: 0,
+        },
+        0,
+        ConcatFrameMeta {
+            timestamp: 0,
+            header_bytes: &[],
+            footer_bytes: &[],
+            rx_status_flags: 0,
+            source_id: None,
+            uudt_routed: false,
+            raw_prefix: 0,
+        },
+        &mut Vec::new(),
+        &mut wrote_suspend,
+    );
+    assert!(matches!(binding, FrameBinding::TesterPresent));
+    assert!(!wrote_suspend);
+    assert!(entry.queue_error_class.is_none());
+}
+
+/// `tester_present_discard_entry`'s classification: a send that expects an
+/// answer holds, physical unless its addressing resolved as functional (an
+/// unresolved one, as on K-line and J1850 style protocols, counts physical);
+/// one that expects none never holds.
+#[test]
+fn tester_present_discard_entry_holds_only_for_a_send_that_expects_an_answer() {
+    let window = || DiscardWindow {
+        until: tokio::time::Instant::now() + Duration::from_secs(1),
+        pos: vec![0x7E],
+        neg: Vec::new(),
+    };
+    let cfg = RcHandlingConfig::default();
+    let entry = |functional, expects| {
+        tester_present_discard_entry(window(), None, None, functional, expects, &cfg)
+    };
+    assert!(!entry(Some(false), false).holds_bus());
+    assert!(!entry(None, false).holds_bus());
+    assert!(entry(Some(false), true).hold.unwrap().physical);
+    assert!(entry(None, true).hold.unwrap().physical);
+    assert!(!entry(Some(true), true).hold.unwrap().physical);
+}
+
+/// An expired holding entry is kept until a drained poll ran at or after its
+/// `until`, so an answer sent in time but read one poll late can still settle
+/// it (and the send is not reported as missing).
+#[test]
+fn sweep_waits_for_a_drained_poll_past_the_window() {
+    let now = tokio::time::Instant::now();
+    let mut list = vec![hold_entry(-10, true, tp_rc_cfg(true, None))];
+    assert_eq!(sweep_expired_holds(&mut list, now, true, &|_| false), 0);
+    assert_eq!(
+        list.len(),
+        1,
+        "no drained poll since `until`: the entry stays"
+    );
+    assert_eq!(sweep_expired_holds(&mut list, now, true, &|_| true), 1);
+    assert!(list.is_empty());
+}
+
+/// The read-side snapshot keeps a holding entry past `until` (and still drops
+/// an expired non-holding one), so `bind_frame` settles a late-read answer
+/// instead of leaving it unbound for a client `3E 00` COP to take.
+#[test]
+fn a_holding_entry_past_its_window_still_settles_a_late_read_answer() {
+    let now = tokio::time::Instant::now();
+    let list = vec![
+        hold_entry(-5, true, tp_rc_cfg(true, None)),
+        discard_at(-5, 0x03),
+    ];
+    let discards = tester_present_discards_at(&list, now);
+    assert_eq!(
+        discards.len(),
+        1,
+        "only the holding entry is kept past `until`"
+    );
+    let mut entry = test_entry(1, vec![registrant(100, 1)], discards);
+    assert!(matches!(
+        step3_frame(&mut entry, &[0x7E, 0x00], false),
+        FrameBinding::TesterPresent
+    ));
+    assert_eq!(entry.tp_settlements.len(), 1);
+    assert_eq!(entry.tp_settlements[0].kind, TpSettleKind::Positive);
+}
+
+/// A pending answer of a functional send never shortens a window that another
+/// ECU's answer had extended; a physical send follows ADR-102's reload.
+#[test]
+fn a_pending_answer_reloads_a_functional_window_only_upward() {
+    let at = tokio::time::Instant::now();
+    let mut f = hold_entry(0, false, tp_rc_cfg(true, None));
+    f.window.until = at + Duration::from_millis(9_000);
+    let mut list = vec![f.clone()];
+    let mut s = settlement(&f, TpSettleKind::Pending);
+    s.at = at;
+    apply_tp_settlement(&mut list, &s, true);
+    assert_eq!(list[0].window.until, at + Duration::from_millis(9_000));
+
+    let mut p = hold_entry(0, true, tp_rc_cfg(true, None));
+    p.window.until = at + Duration::from_millis(9_000);
+    let mut list = vec![p.clone()];
+    let mut s = settlement(&p, TpSettleKind::Pending);
+    s.at = at;
+    apply_tp_settlement(&mut list, &s, true);
+    assert_eq!(list[0].window.until, at + Duration::from_millis(5_000));
+}
+
+/// A COP created receive only (IS-MULTIPLE included) still runs an inline
+/// wait, so its dispatches defer (ADR-083), but it holds nothing; a request
+/// with a response holds with its own class, and an unresolved addressing
+/// (K-line, J1850) is physical.
+#[test]
+fn inline_wait_for_defers_always_and_holds_only_for_an_outstanding_request() {
+    assert_eq!(inline_wait_for(true, Some(false), -2).hold, None);
+    assert_eq!(
+        inline_wait_for(false, None, 1).hold,
+        Some(outstanding(false, false))
+    );
+    assert_eq!(
+        inline_wait_for(false, Some(true), -2).hold,
+        Some(outstanding(true, false))
+    );
+    assert_eq!(
+        inline_wait_for(false, Some(false), -1).hold,
+        Some(outstanding(false, true))
     );
 }

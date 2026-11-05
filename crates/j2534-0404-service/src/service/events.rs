@@ -48,10 +48,10 @@ use super::{
     SYSTEM_SUBSCRIPTION_KEY, SendRecvTx, SessionTimingConfig, SoftIsoTpTx, StatusEvent,
     SubscriptionKey, SubscriptionSender, TerminalCopsLedger, TesterPresentState,
     TesterPresentTargetCanIds, TimingAccumulator, TimingChangeConfig, Tp20BroadcastPeriodic,
-    Tp20Connection, Tp20ConnectionOutcome, Tp20ConnectionPhase, TrackedError, TrackedStatus,
-    TxGapState, TxItem, comparam_defaults, comparam_support, expand_tidle, expand_uart_config,
-    find_physical_lock_holder, isotp, recompute_lock_tx_suspensions, resources, rpc_primitive,
-    to_j2534_config_value, tx_header,
+    Tp20Connection, Tp20ConnectionOutcome, Tp20ConnectionPhase, TpHold, TrackedError,
+    TrackedStatus, TxGapState, TxItem, comparam_defaults, comparam_support, expand_tidle,
+    expand_uart_config, find_physical_lock_holder, isotp, recompute_lock_tx_suspensions, resources,
+    rpc_primitive, to_j2534_config_value, tx_header,
 };
 use isotp::Addressing;
 
@@ -1041,6 +1041,11 @@ struct CllRxEntry {
     /// the first: each entry is an independently elicited send, not a
     /// precedence chain.
     tester_present_discard: Vec<TesterPresentDiscard>,
+    /// What `bind_frame` observed this pass about outstanding tester-present
+    /// sends that hold the channel, in frame order (ADR-419). Applied to the
+    /// live `open_tp_discards` in the end-of-pass critical section, keyed by
+    /// the entry's signature.
+    tp_settlements: Vec<TpSettlement>,
     /// `CP_SuspendQueueOnError` (ADR-147) bind-time classification, folded
     /// across this whole poll pass by `bind_frame`/`bind_registrant` with
     /// last-frame-wins semantics -- `None` means no frame this pass produced
@@ -1183,6 +1188,10 @@ struct TesterPresentDiscard {
     /// `None` here therefore means arm (c) never fires at all -- see the `is_some_and`
     /// (not `is_none_or`) check at its use site.
     tx_can_id: Option<u32>,
+    /// The originating entry's hold state (ADR-419), `None` for an entry that
+    /// does not hold the channel. `bind_frame` classifies a content match
+    /// against it into a [`TpSettlement`].
+    hold: Option<TpHold>,
 }
 
 /// The `TesterPresentDiscard`/`ResidualTesterPresentDiscard` `tx_can_id`
@@ -1242,20 +1251,311 @@ fn push_open_tp_discard(
     now: tokio::time::Instant,
     entry: Option<ResidualTesterPresentDiscard>,
 ) {
-    open_tp_discards.retain(|r| now < r.window.until);
+    // ADR-419: an entry that holds the channel (`TpHold`) outlives its own
+    // `until`; only a settled answer or `sweep_expired_tp_holds` removes it,
+    // since the expiry of a hold must report a missing answer. Every other
+    // entry prunes at `until` as before.
+    open_tp_discards.retain(|r| r.holds_bus() || now < r.window.until);
     if let Some(entry) = entry {
         if let Some(existing) = open_tp_discards.iter_mut().find(|r| {
             r.window.pos == entry.window.pos
                 && r.window.neg == entry.window.neg
                 && r.target_can_ids == entry.target_can_ids
                 && r.tx_can_id == entry.tx_can_id
+                && r.holds_bus() == entry.holds_bus()
         }) {
-            existing.window.until = existing.window.until.max(entry.window.until);
+            if entry.holds_bus() {
+                // A new send of a holding signature starts a new exchange:
+                // its frozen settings and pending state replace the old
+                // entry's (the old one was not settled, which the hold makes
+                // possible only for a send that bypassed it).
+                *existing = entry;
+            } else {
+                existing.window.until = existing.window.until.max(entry.window.until);
+            }
         } else {
             open_tp_discards.push(entry);
         }
     }
 }
+
+/// Builds the entry a successful tester-present send pushes (ADR-419): the
+/// ADR-099 window plus, when the send expected an answer, its hold state.
+/// `can_functional` classifies the send (`None`, an unresolved addressing as
+/// on K-line and J1850, counts as physical).
+fn tester_present_discard_entry(
+    window: DiscardWindow,
+    target_can_ids: Option<TesterPresentTargetCanIds>,
+    tx_can_id: Option<u32>,
+    can_functional: Option<bool>,
+    expects_response: bool,
+    rc_cfg: &RcHandlingConfig,
+) -> ResidualTesterPresentDiscard {
+    ResidualTesterPresentDiscard {
+        window,
+        target_can_ids,
+        tx_can_id,
+        hold: expects_response.then(|| TpHold {
+            physical: can_functional != Some(true),
+            rc_cfg: rc_cfg.clone(),
+            first_pending_at: None,
+            got_response: false,
+        }),
+    }
+}
+
+/// What the ISO-TP send loops pass to `dispatch_due_tester_present` while a
+/// segmented send is on the wire (ADR-419): a physical exchange that expects
+/// an answer, so a physical tester-present waits and only a functional one
+/// without an answer is dispatched there (as ADR-095 already confines it).
+const IN_FLIGHT_SEND: Option<InlineWait> = Some(InlineWait {
+    hold: Some(Outstanding {
+        functional: false,
+        cyclic_before_first: false,
+    }),
+});
+
+/// The [`InlineWait`] of one receive phase: always an inline wait (so
+/// dispatches made from it defer), and holding the channel only when a request
+/// is outstanding (not for a COP created receive only, IS-MULTIPLE included).
+fn inline_wait_for(
+    created_receive_only: bool,
+    can_functional: Option<bool>,
+    num_receive_cycles: i32,
+) -> InlineWait {
+    InlineWait {
+        hold: (!created_receive_only).then_some(Outstanding {
+            functional: can_functional == Some(true),
+            cyclic_before_first: num_receive_cycles == -1,
+        }),
+    }
+}
+
+/// The poll task is inside its own inline wait (ADR-083), so a dispatch made
+/// from it must never poll RX itself or wait, whether or not the wait has an
+/// exchange outstanding. `hold` is that exchange for Table 1 (ADR-419); it is
+/// `None` for a wait with no request outstanding (a COP created receive only,
+/// IS-MULTIPLE included).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct InlineWait {
+    pub(super) hold: Option<Outstanding>,
+}
+
+/// An exchange outstanding on the shared channel, as ISO 22900-2:2022 8.1.3
+/// Table 1 sees it (ADR-419): either the poll task's own inline response
+/// wait (a client primitive with a receive phase) or a tester-present send
+/// that expects an answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct Outstanding {
+    /// Functionally addressed. Unresolved addressing counts as physical.
+    pub(super) functional: bool,
+    /// An IS-CYCLIC (`NumReceiveCycles == -1`) client primitive that has not
+    /// had its first response yet. Table 1's note keeps a physical one from
+    /// letting a functional send without response go ahead.
+    pub(super) cyclic_before_first: bool,
+}
+
+/// The send that asks whether the bus is clear (ADR-419).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct NextSend {
+    functional: bool,
+    with_response: bool,
+}
+
+/// The per-channel Table 1 rule (ADR-419): whether `next` must wait for the
+/// completion of `prev`, an outstanding exchange that expects an answer.
+///
+/// - After a functional exchange everything waits for it to end (its window).
+/// - After a physical exchange a physical send waits, and so does a
+///   functional send that expects an answer.
+/// - A functional send without an answer goes ahead of a physical exchange,
+///   except while the latter is an IS-CYCLIC client primitive that has had no
+///   response yet (the table's note).
+///
+/// An exchange that expects no answer never reaches this function: the
+/// P3Phys/P3Func timing of ADR-060 governs what follows it.
+fn bus_hold(prev: Outstanding, next: NextSend) -> bool {
+    if prev.functional {
+        return true;
+    }
+    if !next.functional || next.with_response {
+        return true;
+    }
+    prev.cyclic_before_first
+}
+
+/// One answer-side observation of an outstanding tester-present send that
+/// `bind_frame` made at step 3 (ADR-419), applied to the live entry in frame
+/// order at the end of the poll pass.
+#[derive(Debug, Clone)]
+struct TpSettlement {
+    /// The entry's signature (as `push_open_tp_discard` dedups on it).
+    pos: Vec<u8>,
+    neg: Vec<u8>,
+    target_can_ids: Option<TesterPresentTargetCanIds>,
+    tx_can_id: Option<u32>,
+    at: tokio::time::Instant,
+    kind: TpSettleKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TpSettleKind {
+    /// A pending response (NRC 0x78 with `CP_RC78Handling`): reloads the window.
+    Pending,
+    Positive,
+    /// A negative answer other than a handled pending one.
+    Negative,
+}
+
+/// Applies one [`TpSettlement`] to the live entry it names (ADR-419).
+/// Returns `true` when the settlement ends a physical send with a negative
+/// answer while the link's tester-present is still armed (`armed`), which the
+/// caller reports as `PduErrEvtTesterPresentError`. A settlement whose entry
+/// is already gone (settled earlier, swept, cleared) does nothing.
+fn apply_tp_settlement(
+    list: &mut Vec<ResidualTesterPresentDiscard>,
+    settlement: &TpSettlement,
+    armed: bool,
+) -> bool {
+    let Some(idx) = list.iter().position(|e| {
+        e.holds_bus()
+            && e.window.pos == settlement.pos
+            && e.window.neg == settlement.neg
+            && e.target_can_ids == settlement.target_can_ids
+            && e.tx_can_id == settlement.tx_can_id
+    }) else {
+        return false;
+    };
+    let entry = &mut list[idx];
+    let Some(hold) = entry.hold.as_mut() else {
+        return false;
+    };
+    match settlement.kind {
+        TpSettleKind::Pending => {
+            // ADR-102's reload: `CP_P2Star` from this response, clamped to the
+            // completion ceiling anchored at the first pending response.
+            let first = *hold.first_pending_at.get_or_insert(settlement.at);
+            let mut until =
+                settlement.at + Duration::from_millis(hold.rc_cfg.rc78_p2_star_ms as u64);
+            if let Some(ceiling_ms) = hold.rc_cfg.rc78_total_ceiling_ms {
+                until = until.min(first + Duration::from_millis(ceiling_ms as u64));
+            }
+            // A functional send is answered by several ECUs, so a pending
+            // answer from one never shortens a window another has extended;
+            // a physical send follows ADR-102 exactly (reload, ceiling).
+            entry.window.until = if hold.physical {
+                until
+            } else {
+                until.max(entry.window.until)
+            };
+            false
+        }
+        TpSettleKind::Positive => {
+            if hold.physical {
+                list.remove(idx);
+            } else {
+                hold.got_response = true;
+            }
+            false
+        }
+        TpSettleKind::Negative => {
+            if hold.physical {
+                list.remove(idx);
+                armed
+            } else {
+                false
+            }
+        }
+    }
+}
+
+/// Removes the holding entries whose window has ended and returns how many of
+/// them leave a send without its answer to report (ADR-419): only while the
+/// link's tester-present is still `armed`, and for a functional send only if
+/// no positive answer came. A disarm or CoptStopcomm after the send leaves
+/// its expiry silent. `drained_past(until)` says whether every channel that
+/// serves the entry's link (the primary and, with a UUDT companion, the
+/// companion too) completed an exhaustive RX drain at or after `until`.
+fn sweep_expired_holds(
+    list: &mut Vec<ResidualTesterPresentDiscard>,
+    now: tokio::time::Instant,
+    armed: bool,
+    drained_past: &dyn Fn(tokio::time::Instant) -> bool,
+) -> usize {
+    let mut missing = 0;
+    list.retain(|e| match &e.hold {
+        // An answer that arrived in time but is read one poll late must still
+        // settle the entry, so an expired entry goes only once a drained poll
+        // ran at or after its `until` (`drained_past`, the ADR-101 Decision §E
+        // watermark test).
+        Some(hold) if now >= e.window.until && drained_past(e.window.until) => {
+            if armed && !hold.got_response {
+                missing += 1;
+            }
+            false
+        }
+        _ => true,
+    });
+    missing
+}
+
+/// The per-tick sweep of [`sweep_expired_holds`] over this channel's links,
+/// raising `PduErrEvtTesterPresentError` for each send that ended without an
+/// answer (ADR-419).
+async fn sweep_expired_tp_holds(ctx: &ChannelPollCtx) {
+    let now = tokio::time::Instant::now();
+    let watermarks = ctx.drain_watermarks.lock().await.clone();
+    let mut missing: Vec<u32> = Vec::new();
+    {
+        let mut links = ctx.logical_links.lock().await;
+        for (&cll_handle, link) in links.iter_mut() {
+            if link.channel_id != Some(ctx.channel_id) || link.open_tp_discards.is_empty() {
+                continue;
+            }
+            let armed = matches!(link.tester_present_state, TesterPresentState::Armed { .. });
+            let primary = watermarks.get(&ctx.channel_id).copied();
+            let companion = link.uudt_channel_id;
+            let uudt = companion.and_then(|id| watermarks.get(&id).copied());
+            let drained_past = |until: tokio::time::Instant| {
+                primary.is_some_and(|wm| wm >= until)
+                    && (companion.is_none() || uudt.is_some_and(|wm| wm >= until))
+            };
+            let n = sweep_expired_holds(&mut link.open_tp_discards, now, armed, &drained_past);
+            missing.extend(std::iter::repeat_n(cll_handle, n));
+        }
+    }
+    for cll_handle in missing {
+        send_error_event(
+            &ctx.subscriptions,
+            &ctx.logical_links,
+            cll_handle,
+            PduErrorEvent::PduErrEvtTesterPresentError,
+            None,
+        )
+        .await;
+    }
+}
+
+/// Whether a tester-present send that expects an answer, outstanding on this
+/// channel, holds `next` back (ADR-419).
+async fn tp_hold_blocks(ctx: &ChannelPollCtx, next: NextSend) -> bool {
+    let links = ctx.logical_links.lock().await;
+    links
+        .values()
+        .filter(|l| l.channel_id == Some(ctx.channel_id))
+        .flat_map(|l| l.open_tp_discards.iter())
+        .filter_map(|e| e.hold.as_ref())
+        .any(|h| {
+            bus_hold(
+                Outstanding {
+                    functional: !h.physical,
+                    cyclic_before_first: false,
+                },
+                next,
+            )
+        })
+}
+
 #[path = "events_rx_routing.rs"]
 mod rx_routing;
 use rx_routing::*;
@@ -3628,8 +3928,13 @@ fn bind_frame(
     // sends) -- a match against ANY entry discards the frame; this is not a
     // first-match-wins scan, since every entry is an independently elicited
     // send.
-    if concat_meta.rx_status_flags & RX_BREAK as u8 == 0
-        && entry.tester_present_discard.iter().any(|discard| {
+    //
+    // ADR-419: the scan also settles the first holding entry that a content
+    // frame matches (a loop instead of `any`, so the whole list is visited).
+    let mut tp_matched = false;
+    if concat_meta.rx_status_flags & RX_BREAK as u8 == 0 {
+        let mut settled_hold = false;
+        for discard in &entry.tester_present_discard {
             let resp_can_id_ok = discard.target_can_ids.is_none_or(|ids| {
                 frame_ctx
                     .frame_can_id
@@ -3650,9 +3955,42 @@ fn bind_frame(
                 && discard
                     .tx_can_id
                     .is_some_and(|id| frame_ctx.frame_can_id == Some(id));
-            content_match || som_herald_match || tx_side_match
-        })
-    {
+            if content_match || som_herald_match || tx_side_match {
+                tp_matched = true;
+            }
+            if content_match
+                && !settled_hold
+                && let Some(hold) = &discard.hold
+            {
+                settled_hold = true;
+                let pos_match =
+                    !discard.pos.is_empty() && frame_ctx.payload.starts_with(&discard.pos);
+                let neg_match =
+                    !discard.neg.is_empty() && frame_ctx.payload.starts_with(&discard.neg);
+                let pending = neg_match
+                    && hold
+                        .rc_cfg
+                        .detect_pending_rc(frame_ctx.payload, concat_meta.raw_prefix)
+                        == Some(0x78);
+                let kind = if pending {
+                    TpSettleKind::Pending
+                } else if pos_match {
+                    TpSettleKind::Positive
+                } else {
+                    TpSettleKind::Negative
+                };
+                entry.tp_settlements.push(TpSettlement {
+                    pos: discard.pos.clone(),
+                    neg: discard.neg.clone(),
+                    target_can_ids: discard.target_can_ids,
+                    tx_can_id: discard.tx_can_id,
+                    at: tokio::time::Instant::now(),
+                    kind,
+                });
+            }
+        }
+    }
+    if tp_matched {
         return FrameBinding::TesterPresent;
     }
 
@@ -5754,12 +6092,28 @@ async fn poll_rx_inner(
     // see `terminate_tp20_broadcast_periodic_for_suspension`'s own doc
     // comment for why the callee needs them.
     let mut suspended_broadcast_periodics: Vec<SuspendedBroadcastPeriodic> = Vec::new();
+    // ADR-419: links whose outstanding tester-present send ended with a
+    // negative answer this pass, reported once the lock below is released.
+    let mut tp_negative_answers: Vec<u32> = Vec::new();
     {
         let mut links = ctx.logical_links.lock().await;
         for entry in &cll_entries {
             let Some(link) = links.get_mut(&entry.handle) else {
                 continue; // CLL torn down mid-pass; nothing to merge back.
             };
+            // ADR-419: apply what step 3 observed about outstanding
+            // tester-present sends, in frame order, under this same lock.
+            // A pending answer reloads the send's window, a final one ends
+            // the hold. The same-batch `7F 3E 78` then `7E 00` settles as
+            // Pending then Positive here, and neither frame was delivered.
+            let armed = matches!(link.tester_present_state, TesterPresentState::Armed { .. });
+            for settlement in &entry.tp_settlements {
+                if link.connect_generation == entry.connect_generation
+                    && apply_tp_settlement(&mut link.open_tp_discards, settlement, armed)
+                {
+                    tp_negative_answers.push(entry.handle);
+                }
+            }
             for snap in &entry.registrants {
                 let Some(live) = link
                     .registrants
@@ -5927,6 +6281,16 @@ async fn poll_rx_inner(
                 }
             }
         }
+    }
+    for cll_handle in tp_negative_answers {
+        send_error_event(
+            &ctx.subscriptions,
+            &ctx.logical_links,
+            cll_handle,
+            PduErrorEvent::PduErrEvtTesterPresentError,
+            None,
+        )
+        .await;
     }
     for (cll_handle, periodic, channel_id, connect_generation, channel_key) in
         suspended_broadcast_periodics
@@ -6945,7 +7309,7 @@ async fn isotp_send(
                 // `transmit_request_inner`, so a tester-present send
                 // triggered from inside this function can never itself
                 // re-enter `isotp_send` (this invariant is load-bearing).
-                // `defer_gap_wait = true` (ADR-083): `dispatch_due_tester_present`'s
+                // `defer = IN_FLIGHT_SEND` (ADR-083, ADR-419): `dispatch_due_tester_present`'s
                 // own `wait_for_p3_gap` call runs an unprobed `poll_rx` with
                 // no `FcCapture` active -- an FC frame arriving during that
                 // unprobed poll would be silently consumed as unattributed
@@ -6992,7 +7356,7 @@ async fn isotp_send(
                 // otherwise need to compute.
                 run_detached_registrant_maintenance(ctx).await;
                 Box::pin(dispatch_due_tester_present(
-                    true,
+                    IN_FLIGHT_SEND,
                     Some(cll_handle),
                     in_flight_target,
                     false,
@@ -7073,7 +7437,7 @@ async fn isotp_send(
             // (e.g. ~15 CFs at STmin=127ms is ~1.9s) -- fire any due
             // tester-present CLL on this channel before each CF here too,
             // same reasoning (boxing, recursion-depth-1 invariant,
-            // defer_gap_wait, exclude_cll, in_flight_target) as the FC-wait
+            // defer, exclude_cll, in_flight_target) as the FC-wait
             // loop above.
             //
             // ADR-095 amendment (2026-07-18): reap any detached (tier-2)
@@ -7090,7 +7454,7 @@ async fn isotp_send(
             // unconditionally.
             run_detached_registrant_maintenance(ctx).await;
             Box::pin(dispatch_due_tester_present(
-                true,
+                IN_FLIGHT_SEND,
                 Some(cll_handle),
                 in_flight_target,
                 false,
@@ -7424,6 +7788,86 @@ async fn wait_for_p3_gap(
     }
 }
 
+/// The single gate every send on the shared channel passes before it writes
+/// (ADR-419): first the ISO 22900-2:2022 8.1.3 Table 1 completion hold, then
+/// the `CP_P3Func`/`CP_P3Phys` gap of [`wait_for_p3_gap`] (ADR-060, unchanged).
+/// The arguments are those of [`wait_for_p3_gap`] except `defer`.
+///
+/// The hold has two sources, both per shared channel and not per link:
+///
+/// - the poll task's own inline response wait, passed in as `defer`
+///   (`Some(Outstanding)`) by the callers that run from inside it
+///   (`dispatch_due_tester_present` from `wait_for_expected_response_inner`
+///   and from the ISO-TP send loops), and
+/// - the holding entries of `open_tp_discards`, one per tester-present send
+///   that expects an answer and has none yet.
+///
+/// A caller that runs inside an inline wait (`defer.is_some()`) and a
+/// tester-present send itself (`cop_handle == NO_COP`) never wait here: a held
+/// send returns [`P3GapOutcome::Deferred`] and is left due for the next pass,
+/// so an unprobed `poll_rx` cannot take the answer an active wait is matching
+/// (ADR-083), and a held tester-present keeps its cadence from the first free
+/// pass on. Any other caller (a client primitive, `CoptStartcomm`,
+/// `CoptStopcomm`, a re-arm) polls RX in `POLL_INTERVAL_MS` steps until the
+/// outstanding tester-present is answered, expires or is cleared, honouring
+/// `cancellable` and a hard channel error like the gap wait does.
+async fn wait_for_bus_clear(
+    cop_handle: u32,
+    cll_handle: u32,
+    can_functional: Option<bool>,
+    num_receive_cycles: i32,
+    cancellable: bool,
+    defer: Option<InlineWait>,
+    ctx: &ChannelPollCtx,
+) -> P3GapOutcome {
+    let next = NextSend {
+        functional: can_functional == Some(true),
+        with_response: num_receive_cycles != 0,
+    };
+    let never_block = defer.is_some() || cop_handle == NO_COP;
+    let poll_interval = Duration::from_millis(POLL_INTERVAL_MS);
+    loop {
+        sweep_expired_tp_holds(ctx).await;
+        let held = defer
+            .and_then(|d| d.hold)
+            .is_some_and(|client| bus_hold(client, next))
+            || tp_hold_blocks(ctx, next).await;
+        if !held {
+            break;
+        }
+        if never_block {
+            return P3GapOutcome::Deferred;
+        }
+        tokio::time::sleep(poll_interval).await;
+        if !poll_rx(ctx).await.is_ok() {
+            return P3GapOutcome::HardError;
+        }
+        if !cancellable {
+            continue;
+        }
+        let was_cancelled = {
+            let mut links = ctx.logical_links.lock().await;
+            links
+                .get_mut(&cll_handle)
+                .map(|l| l.cancelled_cops.remove(&cop_handle))
+                .unwrap_or(false)
+        };
+        if was_cancelled {
+            return P3GapOutcome::Cancelled;
+        }
+    }
+    wait_for_p3_gap(
+        cop_handle,
+        cll_handle,
+        can_functional,
+        num_receive_cycles,
+        cancellable,
+        defer.is_some(),
+        ctx,
+    )
+    .await
+}
+
 /// Fires each due tester-present CLL (either `CP_TesterPresentSendType`
 /// value) on this shared channel (ADR-083; both native
 /// `PassThruStartPeriodicMsg` mode-0 dispatch and its native periodic-start
@@ -7464,15 +7908,20 @@ async fn wait_for_p3_gap(
 /// a Codex-review-caught regression, see ADR-083 Consequences). Instead, a
 /// successful send stamps this CLL's own `last_fired`, below.
 ///
-/// `defer_gap_wait` is threaded straight through to this send's
-/// `wait_for_p3_gap` call as `defer_if_blocked` (ADR-083): `true` only at
-/// the `wait_for_expected_response` call site, where this function's own
-/// unprobed `poll_rx` inside a `wait_for_p3_gap` wait could otherwise drain
-/// the very ECU response an active `CoptSendrecv` is waiting to match;
-/// `false` at the outer-select and `handle_delay` call sites, which have no
-/// COP-specific match state to protect and keep waiting out the gap as
-/// before. A deferred item is simply left `Armed` for the next call to
-/// re-evaluate.
+/// `defer` is `Some` exactly when this function runs from inside the poll
+/// task's own inline wait (ADR-083, ADR-419), whatever that wait is: the
+/// `wait_for_expected_response` call sites pass the client exchange being
+/// waited for (`InlineWait::hold`, `None` for a COP created receive only,
+/// which still defers), and the ISO-TP send loops pass the segmented send in
+/// flight (`IN_FLIGHT_SEND`). It is threaded to each due send's `wait_for_bus_clear`
+/// call, where it (a) applies ISO 22900-2:2022 8.1.3 Table 1 to the
+/// outstanding exchange (a physical tester-present never goes while a
+/// client exchange is outstanding) and (b) makes any wait a deferral
+/// instead, because this function's own unprobed `poll_rx` could otherwise
+/// drain the very ECU response the active exchange is waiting to match. The
+/// outer-select and `handle_delay` call sites pass `None`: no match state to
+/// protect, so the gap is waited out as before. A deferred item is simply
+/// left `Armed` and due, its `last_fired` unstamped, for the next call.
 ///
 /// `exclude_cll` (ADR-095 audit round) excludes one specific CLL from the
 /// due-snapshot filter entirely -- used only by `isotp_send`'s two in-flight
@@ -7731,7 +8180,7 @@ fn isotp_target_collision(
         && (tx_flags & j2534_0404::TX_EXTENDED_ID != 0) == target.can_29bit
 }
 
-/// Parameters, in order: `defer_gap_wait`, `exclude_cll`,
+/// Parameters, in order: `defer`, `exclude_cll`,
 /// `exclude_isotp_target`, `force`, `ctx`.
 ///
 /// `exclude_isotp_target` (PR #97 sixth Codex review round): see
@@ -7769,15 +8218,21 @@ struct StillDueSnapshot {
     expects_response: bool,
     exp_pos_resp: Vec<u8>,
     exp_neg_resp: Vec<u8>,
+    /// ADR-419: the response-code handling the answer settles under, read
+    /// live like `exp_pos_resp` (the request SID stays the armed one).
+    rc_cfg: RcHandlingConfig,
 }
 
 async fn dispatch_due_tester_present(
-    defer_gap_wait: bool,
+    defer: Option<InlineWait>,
     exclude_cll: Option<u32>,
     exclude_isotp_target: Option<InFlightIsoTpTarget>,
     force: bool,
     ctx: &ChannelPollCtx,
 ) {
+    // ADR-419: end the holds whose window has passed before judging what is
+    // due (reports a send that got no answer).
+    sweep_expired_tp_holds(ctx).await;
     let now = tokio::time::Instant::now();
     let last_activity = *ctx.last_bus_activity.lock().await;
 
@@ -7848,24 +8303,23 @@ async fn dispatch_due_tester_present(
         expects_response: snapshotted_expects_response,
     } in due
     {
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             NO_COP,
             cll_handle,
             can_functional,
             if snapshotted_expects_response { 1 } else { 0 },
             true,
-            defer_gap_wait,
+            defer,
             ctx,
         )
         .await
         {
             P3GapOutcome::Ready => {}
             P3GapOutcome::Cancelled | P3GapOutcome::HardError => continue,
-            // A deferred gap wait (ADR-083, defer_gap_wait = true only from
-            // wait_for_expected_response) leaves this CLL Armed; the next
-            // dispatch_due_tester_present pass -- imminent, since the
-            // gap deadline is already close -- re-evaluates it without ever
-            // draining RX via this call's unprobed poll_rx.
+            // A deferred wait (ADR-083 gap; ADR-419 Table 1 hold) leaves this
+            // CLL Armed and its `last_fired` unstamped, so it stays due and
+            // the next dispatch_due_tester_present pass re-evaluates it
+            // without ever draining RX via this call's unprobed poll_rx.
             P3GapOutcome::Deferred => continue,
         }
 
@@ -7970,6 +8424,13 @@ async fn dispatch_due_tester_present(
                             expects_response: l.active.tester_present_req_rsp() == 1,
                             exp_pos_resp: l.active.tester_present_exp_pos_resp().to_vec(),
                             exp_neg_resp: l.active.tester_present_exp_neg_resp().to_vec(),
+                            rc_cfg: RcHandlingConfig::from_params(
+                                &l.active,
+                                ChannelProtocol::from_raw(resources::base_protocol_id(
+                                    l.hw_protocol_id,
+                                )),
+                            )
+                            .with_request_sid(resolved.rc_cfg.request_sid),
                         })
                     }
                     TesterPresentState::None
@@ -7984,6 +8445,7 @@ async fn dispatch_due_tester_present(
             expects_response,
             exp_pos_resp,
             exp_neg_resp,
+            rc_cfg,
         }) = still_due
         else {
             continue;
@@ -8067,22 +8529,27 @@ async fn dispatch_due_tester_present(
                 // so content/SOM-herald discard stays correctly gated on
                 // `expects_response` while the window itself now
                 // unconditionally opens for TX-side discard (`tx_can_id`).
-                send_ok.then(|| ResidualTesterPresentDiscard {
-                    window: DiscardWindow {
-                        until: fired_at + Duration::from_millis(p2_max_ms as u64),
-                        pos: if expects_response {
-                            exp_pos_resp
-                        } else {
-                            Vec::new()
+                send_ok.then(|| {
+                    tester_present_discard_entry(
+                        DiscardWindow {
+                            until: fired_at + Duration::from_millis(p2_max_ms as u64),
+                            pos: if expects_response {
+                                exp_pos_resp
+                            } else {
+                                Vec::new()
+                            },
+                            neg: if expects_response {
+                                exp_neg_resp
+                            } else {
+                                Vec::new()
+                            },
                         },
-                        neg: if expects_response {
-                            exp_neg_resp
-                        } else {
-                            Vec::new()
-                        },
-                    },
-                    target_can_ids: resolved.target_can_ids,
-                    tx_can_id: tester_present_tx_can_id(resolved, framed_data),
+                        resolved.target_can_ids,
+                        tester_present_tx_can_id(resolved, framed_data),
+                        can_functional,
+                        expects_response,
+                        &rc_cfg,
+                    )
                 })
             } else {
                 None
@@ -8271,20 +8738,20 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
     if should_transmit {
         // CP_P3Func/P3Phys minimum inter-request gap (ADR-060, CAN-family
         // only): wait, if necessary, before actually writing.
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             can_functional,
             num_receive_cycles,
             true,
-            false,
+            None,
             ctx,
         )
         .await
         {
             P3GapOutcome::Cancelled => cancelled = true,
             P3GapOutcome::HardError => channel_lost = true,
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
             P3GapOutcome::Ready => {
                 // ADR-180 Decision 14 Part B (design-advisor consult, PR #72
                 // round 12): re-verify, at THIS cycle's actual transmit
@@ -8928,6 +9395,7 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                 created_receive_only: send_cycles_remaining == 0,
                 cyclic_resp_timeout_ms: params.cyclic_resp_timeout_ms(),
                 enable_concatenation: params.enable_concatenation(),
+                can_functional,
             },
             ctx,
         )
@@ -9250,7 +9718,7 @@ async fn handle_delay(
         // select loop -- fire any due tester-present CLL on this channel on
         // every tick here too, or a sibling CLL sharing this physical
         // channel could starve for the entire delay.
-        dispatch_due_tester_present(false, None, None, false, ctx).await;
+        dispatch_due_tester_present(None, None, None, false, ctx).await;
     }
     if delay_hard_error {
         // cancel_link_cops already emitted PDU_COPST_CANCELLED.
@@ -9385,7 +9853,7 @@ async fn run_due_tick_duties(
     // CP_TesterPresentSendType (either value, ADR-083/ADR-094): fire any CLL
     // on this channel whose due window has elapsed. After the ordinary RX
     // poll, same as every other periodic per-tick duty at this site.
-    dispatch_due_tester_present(false, None, None, false, ctx).await;
+    dispatch_due_tester_present(None, None, None, false, ctx).await;
     // ADR-179 Decision 3 ("later, spontaneous `_LOST`"): re-enter the
     // address-claim retry loop for any CLL on this channel a spontaneous
     // post-claim loss armed since the last tick.
@@ -11239,7 +11707,7 @@ async fn handle_start_comm(
         // every other call site in this file): this CLL has no
         // tester-present armed yet at this point regardless, since arming
         // happens later in this same function, well after this call
-        // returns. `defer_gap_wait = false`: this is a one-shot call outside
+        // returns. `defer = None`: this is a one-shot call outside
         // any match-sensitive receive-phase loop, so there is no
         // `wait_for_expected_response`-style reason to defer an unprobed
         // `poll_rx` inside `wait_for_p3_gap`. `exclude_isotp_target = None`
@@ -11247,7 +11715,21 @@ async fn handle_start_comm(
         // at this call site -- this is a one-shot top-up immediately before
         // `run_protocol_init`, not a mid-transfer wait -- so there is no wire
         // target to protect here.
-        dispatch_due_tester_present(false, Some(cll_handle), None, true, ctx).await;
+        dispatch_due_tester_present(None, Some(cll_handle), None, true, ctx).await;
+
+        // ADR-419: the wakeup/StartCommunication exchange is a request on the
+        // shared bus (K-line, so physical), and the top-up just above may have
+        // opened a hold with a sibling's tester-present that expects an
+        // answer. Wait for it as any other request does (ISO 22900-2:2022
+        // 8.1.3 Table 1). Past the point of no return like the arm below, so
+        // not cancellable; a hard channel error has already been reported.
+        match wait_for_bus_clear(cop_handle, cll_handle, None, 1, false, None, ctx).await {
+            P3GapOutcome::Ready => {}
+            P3GapOutcome::HardError => return,
+            P3GapOutcome::Cancelled | P3GapOutcome::Deferred => {
+                unreachable!("cancellable = false, defer = None and a client cop handle")
+            }
+        }
 
         match run_protocol_init(
             five_baud,
@@ -12973,13 +13455,13 @@ async fn handle_start_comm(
         // analogous final message (ADR-085/ADR-087, always `cancellable:
         // false`), nothing has committed/changed CLL state by this point --
         // this is fully cancellable (`cancellable: true` throughout).
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             tx.send.can_functional,
             tx.num_receive_cycles,
             true,
-            false,
+            None,
             ctx,
         )
         .await
@@ -13026,7 +13508,7 @@ async fn handle_start_comm(
                 // (mirrors handle_send_recv's `!channel_lost` gate).
                 return;
             }
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
             P3GapOutcome::Ready => {
                 let still_on_this_channel = {
                     let links = ctx.logical_links.lock().await;
@@ -13151,6 +13633,7 @@ async fn handle_start_comm(
                                     created_receive_only: false,
                                     cyclic_resp_timeout_ms: 0,
                                     enable_concatenation: tx.enable_concatenation,
+                                    can_functional: tx.send.can_functional,
                                 },
                                 ctx,
                             )
@@ -13480,7 +13963,7 @@ async fn handle_start_comm(
         // has already put a real ECU handshake on the wire, past the point of
         // no return -- the pre-existing (pre-ADR-083) invariant that nothing
         // after a successful init is cancellable applies here too.
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             tester_present.can_functional,
@@ -13490,7 +13973,7 @@ async fn handle_start_comm(
                 0
             },
             false,
-            false,
+            None,
             ctx,
         )
         .await
@@ -13513,7 +13996,7 @@ async fn handle_start_comm(
                 // event sequence (including PduCopstCancelled for this COP).
                 return;
             }
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
             P3GapOutcome::Ready => {}
         }
 
@@ -13637,10 +14120,15 @@ async fn handle_start_comm(
         // pushed into `LogicalLinkState.open_tp_discards` at the write-back
         // site instead, under the same lock as the `tester_present_state`
         // write.
-        let new_open_tp_discard = discard_window.map(|window| ResidualTesterPresentDiscard {
-            target_can_ids: tester_present.target_can_ids,
-            tx_can_id: tester_present_tx_can_id(&tester_present, &tester_present_data),
-            window,
+        let new_open_tp_discard = discard_window.map(|window| {
+            tester_present_discard_entry(
+                window,
+                tester_present.target_can_ids,
+                tester_present_tx_can_id(&tester_present, &tester_present_data),
+                tester_present.can_functional,
+                tester_present.expects_response,
+                &tester_present.rc_cfg,
+            )
         });
 
         (
@@ -13885,13 +14373,13 @@ async fn handle_stop_comm(
         // hardcoded `0`. `defer_if_blocked: false`: this is a one-shot
         // terminal send, not an idle-mode keepalive dispatch, so `Deferred`
         // never applies here.
-        match wait_for_p3_gap(
+        match wait_for_bus_clear(
             cop_handle,
             cll_handle,
             tx.send.can_functional,
             tx.num_receive_cycles,
             false,
-            false,
+            None,
             ctx,
         )
         .await
@@ -14150,6 +14638,7 @@ async fn handle_stop_comm(
                                         created_receive_only: false,
                                         cyclic_resp_timeout_ms: 0,
                                         enable_concatenation: tx.enable_concatenation,
+                                        can_functional: tx.send.can_functional,
                                     },
                                     ctx,
                                 )
@@ -14246,7 +14735,7 @@ async fn handle_stop_comm(
             P3GapOutcome::Cancelled => {
                 unreachable!("cancellable = false: wait_for_p3_gap never checks cancelled_cops")
             }
-            P3GapOutcome::Deferred => unreachable!("defer_if_blocked = false"),
+            P3GapOutcome::Deferred => unreachable!("defer = None and a client cop handle"),
         }
     }
 
@@ -15785,13 +16274,13 @@ async fn handle_update_param(
                             )
                             .await;
                             if !framed_data.is_empty() {
-                                match wait_for_p3_gap(
+                                match wait_for_bus_clear(
                                     cop_handle,
                                     cll_handle,
                                     resolved.can_functional,
                                     if resolved.expects_response { 1 } else { 0 },
                                     false,
-                                    false,
+                                    None,
                                     ctx,
                                 )
                                 .await
@@ -15907,14 +16396,17 @@ async fn handle_update_param(
                                             // itself.
                                             let new_open_tp_discard =
                                                 discard_window.map(|window| {
-                                                    ResidualTesterPresentDiscard {
-                                                        target_can_ids: resolved.target_can_ids,
-                                                        tx_can_id: tester_present_tx_can_id(
+                                                    tester_present_discard_entry(
+                                                        window,
+                                                        resolved.target_can_ids,
+                                                        tester_present_tx_can_id(
                                                             &resolved,
                                                             &framed_data,
                                                         ),
-                                                        window,
-                                                    }
+                                                        resolved.can_functional,
+                                                        expects_response,
+                                                        &resolved.rc_cfg,
+                                                    )
                                                 });
                                             let mut links = ctx.logical_links.lock().await;
                                             if let Some(l) = links.get_mut(&cll_handle)
@@ -15956,7 +16448,7 @@ async fn handle_update_param(
                                         debug_assert!(false, "cancellable = false");
                                     }
                                     P3GapOutcome::Deferred => {
-                                        unreachable!("defer_if_blocked = false")
+                                        unreachable!("defer = None and a client cop handle")
                                     }
                                 }
                             }
@@ -16478,6 +16970,12 @@ struct ExpectedResponseWait<'a> {
     /// `wait_for_expected_response` combines all three into the
     /// `CopRegistrant::concat_enabled` it actually stores.
     enable_concatenation: bool,
+    /// The request's addressing class (`ResolvedSendRecvTx::can_functional`:
+    /// `Some(true)` functional, `Some(false)` physical, `None` unresolved or
+    /// not CAN-family, which ISO 22900-2:2022 8.1.3 Table 1 handling treats as
+    /// physical). Gives the hold this wait imposes on tester-present sends
+    /// (ADR-419).
+    can_functional: Option<bool>,
 }
 
 /// Wraps [`wait_for_expected_response_inner`] (see its doc comment for the
@@ -16876,7 +17374,7 @@ async fn wait_for_expected_response_inner(
         // insertion -- this loop only ever needs the LIVE registrant's own
         // `cyclic_deadline` (read fresh each pass below), not these
         // call-time inputs.
-        created_receive_only: _,
+        created_receive_only,
         cyclic_resp_timeout_ms: _,
         // Same rationale as `created_receive_only`/`cyclic_resp_timeout_ms`
         // just above: `wait_for_expected_response`'s wrapper already
@@ -16886,7 +17384,15 @@ async fn wait_for_expected_response_inner(
         // fresh each pass, e.g. the deadline-expiry finalize check below),
         // never this call-time input.
         enable_concatenation: _,
+        can_functional,
     } = wait;
+
+    // ADR-419: while this inline wait runs, the exchange it waits for is
+    // outstanding on the shared channel (ISO 22900-2:2022 8.1.3 Table 1), which
+    // the tester-present dispatch below must respect. A COP created receive
+    // only has no request outstanding. Every exit of this function ends the
+    // hold, since the hold exists only while this loop does.
+    let outstanding = inline_wait_for(created_receive_only, can_functional, num_receive_cycles);
 
     let matches_needed: Option<u32> = match num_receive_cycles {
         -2 | -1 => None,     // IS-MULTIPLE / IS-CYCLIC: unbounded match count
@@ -17170,7 +17676,7 @@ async fn wait_for_expected_response_inner(
                                 // `wait_for_expected_response`), so there is
                                 // no async-fn recursion cycle to break here,
                                 // unlike Fix A's `isotp_send` call sites.
-                                // `defer_gap_wait = true`, matching the
+                                // `defer = outstanding`, matching the
                                 // enclosing receive phase's own top-level
                                 // call above: a tester-present send's
                                 // unprobed `poll_rx` inside `wait_for_p3_gap`
@@ -17196,7 +17702,14 @@ async fn wait_for_expected_response_inner(
                                 // cancellation reap above still runs every
                                 // chunk unconditionally.
                                 run_detached_registrant_maintenance(ctx).await;
-                                dispatch_due_tester_present(true, None, None, false, ctx).await;
+                                dispatch_due_tester_present(
+                                    Some(outstanding),
+                                    None,
+                                    None,
+                                    false,
+                                    ctx,
+                                )
+                                .await;
                             }
                         }
 
@@ -17488,7 +18001,7 @@ async fn wait_for_expected_response_inner(
         // poll_channel_events's outer select loop. Fire any due
         // tester-present CLL on this channel on every non-terminal iteration
         // here too, or a sibling CLL sharing this physical channel could
-        // starve for the whole wait. defer_gap_wait = true here (ADR-083):
+        // starve for the whole wait. defer = outstanding here (ADR-083, ADR-419):
         // unlike the outer-select and handle_delay call sites, this poll
         // loop is match-sensitive for the active COP's response -- a
         // tester-present send's own wait_for_p3_gap wait must not drain RX
@@ -17725,7 +18238,7 @@ async fn wait_for_expected_response_inner(
         // directly, so this call site no longer needs to compute any
         // exhaustiveness signal of its own.
         run_detached_registrant_maintenance(ctx).await;
-        dispatch_due_tester_present(true, None, None, false, ctx).await;
+        dispatch_due_tester_present(Some(outstanding), None, None, false, ctx).await;
 
         if no_deadline {
             // IS-CYCLIC: no response window; keep polling until cancelled.

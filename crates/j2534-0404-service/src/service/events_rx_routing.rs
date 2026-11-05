@@ -1268,18 +1268,8 @@ pub(super) async fn build_cll_rx_entries(
             // discards a frame matching ANY of them, not just the first --
             // each entry is an independently elicited send, not a
             // precedence chain.
-            let now = tokio::time::Instant::now();
-            let tester_present_discard: Vec<TesterPresentDiscard> = l
-                .open_tp_discards
-                .iter()
-                .filter(|r| now < r.window.until)
-                .map(|r| TesterPresentDiscard {
-                    pos: r.window.pos.clone(),
-                    neg: r.window.neg.clone(),
-                    target_can_ids: r.target_can_ids,
-                    tx_can_id: r.tx_can_id,
-                })
-                .collect();
+            let tester_present_discard =
+                tester_present_discards_at(&l.open_tp_discards, tokio::time::Instant::now());
             let registrant_baselines = l
                 .registrants
                 .iter()
@@ -1333,6 +1323,7 @@ pub(super) async fn build_cll_rx_entries(
                 // this function.
                 set_seq_at_read: set_seq_snapshot.get(&h).copied(),
                 tester_present_discard,
+                tp_settlements: Vec::new(),
                 registrants: l.registrants.clone(),
                 registrant_baselines,
                 queue_error_class: None,
@@ -1340,6 +1331,27 @@ pub(super) async fn build_cll_rx_entries(
                 transmit_ind_enable: l.active.transmit_ind_enable(),
                 cop_tags,
             })
+        })
+        .collect()
+}
+
+/// The `open_tp_discards` entries of one link as `bind_frame` sees them at
+/// read time `now`: an entry inside its window, and (ADR-419) every entry that
+/// holds the channel until the sweep removes it, so that an answer sent in
+/// time but read one poll late still settles the send instead of being
+/// unbound and then reported as missing.
+pub(super) fn tester_present_discards_at(
+    list: &[ResidualTesterPresentDiscard],
+    now: tokio::time::Instant,
+) -> Vec<TesterPresentDiscard> {
+    list.iter()
+        .filter(|r| r.holds_bus() || now < r.window.until)
+        .map(|r| TesterPresentDiscard {
+            pos: r.window.pos.clone(),
+            neg: r.window.neg.clone(),
+            target_can_ids: r.target_can_ids,
+            tx_can_id: r.tx_can_id,
+            hold: r.hold.clone(),
         })
         .collect()
 }

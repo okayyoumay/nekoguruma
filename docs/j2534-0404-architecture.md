@@ -383,7 +383,17 @@ Key internals:
      first — closing the field bug ADR-088 originally left open (a vacuous
      `CoptSendrecv` capturing a tester-present reply meant for nobody). See
      "Tester-Present Dispatch" (§5) for the discard-window/identity-signature
-     matching mechanics, and ADR-100/ADR-137 for the precedence history.
+     matching mechanics, and ADR-100/ADR-137 for the precedence history. A
+     content frame that matches an entry of a send that expects an answer
+     also *settles* that entry (ADR-419): `bind_frame` records the pending,
+     positive or negative answer per entry in frame order, and the end of the
+     poll pass applies the records to the live entries under the
+     `logical_links` lock (a pending answer reloads the window, a final one
+     ends the entry), so a `7F 3E 78` and a `7E 00` in one batch are a
+     reload and a final answer, neither delivered. While a physical
+     tester-present is outstanding no client primitive with a receive phase
+     is registered (the serialization below), so step 2 has no competing
+     claim for its answer.
   4. **Tier-1, vacuous claims** (empty mask/pattern descriptor), in COP
      registration order. For a `concat_enabled` registrant, this is also the
      step where a continuation matching an open buffer whose own
@@ -1153,6 +1163,10 @@ struct ResidualTesterPresentDiscard {
     window: DiscardWindow,
     target_can_ids: Option<TesterPresentTargetCanIds>,
     tx_can_id: Option<u32>,
+    hold: Option<TpHold>,   // ADR-419: Some iff the send expected an answer; the entry
+                            // then holds the shared channel (physical, frozen RcHandlingConfig,
+                            // first_pending_at, got_response) until the answer settles it or
+                            // the per-tick sweep removes it after window.until
 }
 
 // Attribution registrant (ADR-100 Decision §1/§2) -- one per outstanding COP
@@ -1239,7 +1253,8 @@ Both `CP_TesterPresentSendType` modes are dispatched by this service's own
 software poll loop (ADR-093) through the single `Armed` variant above,
 discriminated by `resolved.send_type`. Mode 0 ("periodic") fires strictly
 every `interval` since its own last fire/arm, never deferred by other bus
-traffic. Mode 1 ("idle-triggered") fires once the shared channel has been
+traffic (only by the Table 1 hold below, which defers it to the first free
+pass). Mode 1 ("idle-triggered") fires once the shared channel has been
 idle for `interval`, measured from `max(last_bus_activity,
 last_fired.unwrap_or(armed_at))` (see `last_bus_activity` below) — a CLL's
 own arming never resets the shared clock, so it cannot push out a sibling
@@ -1266,7 +1281,9 @@ all, immediately sends and re-arms the same way — for either mode. A
 **Discard-window identity-signature matching (ADR-088/093/099/137).** Every
 successful tester-present send opens an entry in
 `LogicalLinkState.open_tp_discards` (`ResidualTesterPresentDiscard`, above),
-scoped to a `CP_P2Max` deadline; `bind_frame`'s tier-3 (see "Response
+scoped to a `CP_P2Max` deadline (for a send that expects an answer, the
+window ends as "Serialization with client primitives" below says, ADR-419);
+`bind_frame`'s tier-3 (see "Response
 attribution" under "CAN Channel Operating Modes" above) matches an incoming
 frame against ANY still-open entry, not first-match-wins, since each entry
 is an independently elicited send. Three ways a frame matches: (a)
@@ -1281,6 +1298,43 @@ to the CLL's own tester-present target's physical response CAN ID(s)
 does not restrict them); case (c) is restricted to tester-present's own
 frozen outgoing TX CAN ID (`tx_can_id`). A match is discarded outright.
 
+**Serialization with client primitives (ADR-419, ISO 22900-2:2022 8.1.3
+Table 1).** Every diagnostic request written on the shared channel (client
+primitives, the `CoptStartcomm` request and arm, the K-line init exchange after
+its top-up, the `CoptStopcomm` message, re-arms and tester-present dispatches;
+not the J1939 address-claim frames or the TP2.0 transport frames) goes through
+`wait_for_bus_clear`, which applies the pure per-channel rule
+`bus_hold(prev, next)` and then the `CP_P3Func`/`CP_P3Phys` gap wait. An
+exchange that expects an answer is outstanding until it completes: after a
+functional one everything waits; after a physical one a physical send and a
+functional send with an answer wait, and a functional send without an
+answer goes at once, except while the physical exchange is an IS-CYCLIC
+client primitive that has had no response yet. An exchange without an
+answer does not hold (the P3 rows apply). An unresolved addressing (K-line,
+J1850 style protocols) counts as physical; the hold applies on every
+protocol, the P3 rows stay CAN-only. The hold's two sources are the poll
+task's own inline response wait (passed into `dispatch_due_tester_present`
+as `Option<Outstanding>`; the ISO-TP send loops pass a segmented send in
+flight) and the entries of `open_tp_discards` that carry a `TpHold`. A
+client primitive, `CoptStartcomm`/`CoptStopcomm` and a re-arm wait in the
+gate (polling RX, cancellable where they were), so a request issued while a
+tester-present is outstanding goes after its answer; a tester-present
+dispatch, and any dispatch from inside an inline wait, is deferred instead
+and stays due with `last_fired` unstamped, so a tester-present due during a
+client request's response wait is sent after the final response. A physical
+send's entry ends at its final answer (the expected positive answer, or the
+expected negative answer with a code other than 0x78); 0x78 reloads the
+window to `CP_P2Star` limited by the `CP_RC78CompletionTimeout` ceiling
+anchored at the first pending answer. A functional send's entry lasts to its
+window end, and any ECU's 0x78 reloads it (upward only). An expired entry is
+swept only after an exhaustive RX drain at or after its end, and until then
+the read-side snapshot still lets it settle a late-read answer. The entry outlives `until` until
+the per-tick sweep, which removes it and raises `PduErrEvtTesterPresentError`
+for a send that ended with a negative final answer or without an answer
+(functional: without a positive answer) while the link's tester-present is
+still armed; after a disarm or `CoptStopcomm` the hold persists but its end
+is silent. Disconnect and Destroy clear the entries.
+
 **Addressing source (ADR-138).** Tester-present's addressing is resolved
 independently, via `CP_TesterPresentAddrMode` — not `CP_RequestAddrMode`,
 which every other TX construction site uses — see "TX Message
@@ -1289,7 +1343,9 @@ Construction" (§6) for the header-construction table this feeds.
 **Bus-gap participation (ADR-058/060/083/093).** Every tester-present send
 (both modes) participates in the same `CP_P3Func`/`CP_P3Phys` inter-request
 gap enforcement as `CoptSendrecv`, classified by `CP_TesterPresentReqRsp`
-rather than `NumReceiveCycles`; mode 1 additionally drives a separate
+rather than `NumReceiveCycles` (a send that expects an answer is not paced by
+this gap because the Table 1 hold above waits for the answer instead); mode 1
+additionally drives a separate
 per-shared-channel `last_bus_activity` clock (stamped on TX and RX) for its
 own idle-triggered dispatch — mode 0 never reads it. See "Service-Level
 Parameters" (§7) for the full gap-state model.
@@ -1307,7 +1363,8 @@ agent relies on from this service is that a tester-present is serialized with
 client primitives as ISO 22900-2:2022 8.1.3 Table 1 requires, that its
 discard window ends at the final response, not at a fixed `CP_P2Max`, and
 that a missing or negative answer raises `PduErrEvtTesterPresentError` while
-sending continues.
+sending continues; all three are implemented here (ADR-419). A vendor
+D-PDU library's behaviour is not covered by this service.
 
 ### ComParamSet — parameter storage
 

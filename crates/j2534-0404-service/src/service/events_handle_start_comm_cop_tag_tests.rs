@@ -139,6 +139,7 @@ fn tester_present_disabled() -> rpc_primitive::ResolvedTesterPresent {
         exp_pos_resp: Vec::new(),
         exp_neg_resp: Vec::new(),
         handling_enabled: false,
+        rc_cfg: RcHandlingConfig::default(),
     }
 }
 

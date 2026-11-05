@@ -4,12 +4,12 @@
 //! path): `worker-host` launches the real `j2534-0404-service` binary against the `sim-vci`
 //! cdylib, a job runs a program that waits between two requests, and this test unplugs the
 //! simulated VCI during the wait. The second request fails and the VCI does not return in time;
-//! the job's close gets the library's failure from the first close of the lost device, the
-//! second finds the link gone and the module's disconnect succeeds, so the returned guards are
-//! unmarked. Another job takes them at once and reads the VIN from a fresh worker. Both jobs
+//! the library answers the first close of the lost device as the device being gone, which the
+//! worker counts as closed (ADR-422), so the module's disconnect succeeds and the returned guards
+//! are unmarked. Another job takes them at once and reads the VIN from a fresh worker. Both jobs
 //! write one communication log: the first records the loss, and the second settles it after its
-//! VCI connected (design 8.11 `vci_loss_settled`, ADR-373). The unit tests of `agent`'s runner
-//! cover a close that stays unconfirmed.
+//! VCI connected (design 8.11 `vci_loss_settled`, ADR-373). `agent_marked_guards.rs` covers a close
+//! that stays unconfirmed.
 //!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
@@ -303,8 +303,9 @@ async fn flow(control_dir: &Path, ecu_state: &Path, setup: GuardSetup, comm_log:
         ),
         "{result:?}"
     );
-    // The path was lost: the first close gets the library's failure, the second finds the link
-    // gone, and the module's disconnect succeeds, so the close is confirmed (ADR-393).
+    // The path was lost: the library answers the close as the device being gone, which the worker
+    // counts as closed, so the module's disconnect succeeds and the close is confirmed (ADR-393,
+    // ADR-422).
     assert!(
         !guards.link_unconfirmed(),
         "the close of a lost device is confirmed"

@@ -1,7 +1,7 @@
 # ADR-292: A Crashed Simulated VCI Fails Every Call with `ERR_FAILED`
 
 **Date:** 2026-10-14
-**Status:** Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`)
+**Status:** Accepted (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`; the crash model amended by ADR-422: a crashed VCI answers a close of a device ID it does not hold with `ERR_INVALID_DEVICE_ID`)
 **Affects:** `crates/sim-vci` (`crash_vci`, `restart_vci`), `crates/j2534-0404-service/tests/agent_restart_end_to_end.rs`;
 ADR-238
 
@@ -30,6 +30,8 @@ considered:
 2. **`PassThruClose` on the open device still releases it** and reports `ERR_FAILED`: the
    application gives the device up, and the next open, once the VCI answers again, gets a new
    device ID, as after a loss.
+   (ADR-422 amends this: a close of a device ID the crashed VCI does not hold, as when the
+   application retries a close, is answered `ERR_INVALID_DEVICE_ID`.)
 3. **`restart_vci` ends the crash.** A device the application still holds open across the
    restart is lost: the restarted VCI has forgotten it, so every call returns
    `ERR_DEVICE_NOT_CONNECTED` until the device is closed, as for a disconnect (J2534-1 6.10.1).

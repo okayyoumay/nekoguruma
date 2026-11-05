@@ -350,6 +350,8 @@ struct Bus {
     state_path: Option<PathBuf>,
     /// `PassThruWriteMsgs` calls to fail (`Command::FailWrites`).
     write_failures: WriteFailures,
+    /// `PassThruClose` calls of the open device to fail (`Command::FailCloses`).
+    close_failures: WriteFailures,
 }
 
 /// Which `PassThruWriteMsgs` calls fail with `ERR_FAILED`, sending nothing.
@@ -399,6 +401,7 @@ fn bus() -> &'static (Mutex<Bus>, Condvar) {
                 battery_mv: DEFAULT_BATTERY_MV,
                 state_path: std::env::var_os(ECU_STATE_ENV).map(PathBuf::from),
                 write_failures: WriteFailures::None,
+                close_failures: WriteFailures::None,
             }),
             Condvar::new(),
         )
@@ -594,6 +597,16 @@ impl Bus {
             }
             Command::ClearWriteFailures {} => {
                 self.write_failures = WriteFailures::None;
+                Ok(())
+            }
+            Command::FailCloses { times: Some(0) } => Err(ERR_FAILED),
+            Command::FailCloses { times } => {
+                self.close_failures =
+                    times.map_or(WriteFailures::UntilCleared, WriteFailures::Next);
+                Ok(())
+            }
+            Command::ClearCloseFailures {} => {
+                self.close_failures = WriteFailures::None;
                 Ok(())
             }
         }
@@ -862,6 +875,7 @@ fn reset(config: EcuConfig) {
     bus.trace_path = None;
     bus.battery_mv = DEFAULT_BATTERY_MV;
     bus.write_failures = WriteFailures::None;
+    bus.close_failures = WriteFailures::None;
 }
 
 // ---------------------------------------------------------------- Control
@@ -885,7 +899,8 @@ const CONTROL_POLL_INTERVAL: Duration = Duration::from_millis(20);
 /// A control command, as JSON: `{"command": "inject_fault", "fault": "power_loss"}`,
 /// `{"command": "reconnect_ecu"}`, `{"command": "disconnect_vci"}`, `{"command": "connect_vci"}`,
 /// `{"command": "set_battery_voltage", "millivolts": 11500}`, `{"command": "fail_writes",
-/// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "crash_vci"}`,
+/// "times": 1}`, `{"command": "clear_write_failures"}`, `{"command": "fail_closes", "times": 1}`,
+/// `{"command": "clear_close_failures"}`, `{"command": "crash_vci"}`,
 /// `{"command": "restart_vci"}`, `{"command": "hold_session"}`.
 #[derive(Debug, Deserialize)]
 #[serde(tag = "command", rename_all = "snake_case", deny_unknown_fields)]
@@ -924,6 +939,16 @@ enum Command {
     },
     /// Ends `FailWrites`.
     ClearWriteFailures {},
+    /// Makes `PassThruClose` of the open device (healthy, lost or crashed) fail with
+    /// `ERR_FAILED`, releasing nothing: the next `times` calls (at least one), or, without
+    /// `times`, every call until `ClearCloseFailures`. A close of an unknown device ID still
+    /// answers `ERR_INVALID_DEVICE_ID` and keeps the count.
+    FailCloses {
+        #[serde(default)]
+        times: Option<u32>,
+    },
+    /// Ends `FailCloses`.
+    ClearCloseFailures {},
     /// `SimEcu::hold_session`: a non-default session does not time out until the next request
     /// reaches the ECU.
     HoldSession {},
@@ -1039,6 +1064,11 @@ pub unsafe extern "system" fn PassThruOpen(
 #[unsafe(no_mangle)]
 pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong {
     let mut bus = lock();
+    if bus.device_open && bus.device_ok(device_id) && bus.close_failures.take() {
+        // `Command::FailCloses`: the close fails and the device stays as it was, so the
+        // application can close it again.
+        return ERR_FAILED;
+    }
     if bus.vci_crashed && bus.device_open && bus.device_ok(device_id) {
         // The VCI does not answer, but the application gives the device up: it is released as
         // after a loss, and the call reports the failure (ADR-292).
@@ -1046,6 +1076,12 @@ pub extern "system" fn PassThruClose(device_id: PassThruUlong) -> PassThruUlong 
         bus.device_lost = false;
         bus.device_id = bus.device_id.wrapping_add(1).max(1);
         return ERR_FAILED;
+    }
+    if bus.vci_crashed && !bus.device_ok(device_id) {
+        // The library knows which device IDs it holds without asking the VCI: a close of one it
+        // does not hold, such as the device a close above already released, is refused as with
+        // the VCI answering (ADR-422: a later close then confirms the device closed).
+        return ERR_INVALID_DEVICE_ID;
     }
     if bus.device_lost && bus.device_ok(device_id) {
         // Closing is how the application recovers from a lost device; the call still reports

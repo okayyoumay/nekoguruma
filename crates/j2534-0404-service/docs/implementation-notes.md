@@ -6385,12 +6385,14 @@ above did not account for those two native calls themselves failing — a round-
 found that a genuine double failure of both left a committed periodic transmitting device-side with
 no tracking anywhere and no way to ever retry stopping it, since neither call's result was checked
 before this function proceeded. A `design-advisor` consult confirmed leak-tracking the failure was
-a dead end specifically here, not a general objection: by the time such a failure could be observed,
-`slot.take()` has already unconditionally cleared `self.device_id` (ADR-107 addendum (h)), and the
-opportunistic leaked-stop retry mechanisms (`retry_leaked_periodic_message_stops`/
-`retry_leaked_repeat_message_stops`, `rpc_misc.rs`) only ever probe a live `SharedChannel` on an
-open device, so nothing could ever reach the old device again to retry against regardless of what
-got tracked. The validated fix instead adds an explicit best-effort native stop of its own: while
+a dead end specifically here, not a general objection: the opportunistic leaked-stop retry
+mechanisms (`retry_leaked_periodic_message_stops`/`retry_leaked_repeat_message_stops`,
+`rpc_misc.rs`) only ever probe a live `SharedChannel` on an open device, and this function has
+already drained `shared_channels` by then. Since ADR-422 the slot is cleared only when the close
+succeeds or is answered `ERR_INVALID_DEVICE_ID`/`ERR_DEVICE_NOT_CONNECTED`; a failed close keeps
+the slot and a later disconnect closes the device again, but the drained map still holds nothing
+to retry against, and the invariant slot `None` implies `shared_channels` empty still holds. The
+validated fix instead adds an explicit best-effort native stop of its own: while
 iterating `links.values_mut()` in the same loop the round-17 fix already added, each link now also
 resolves its owning `SharedChannel` via `link.channel_key.and_then(|k| chans.get(&k))` (the
 already-held `chans` guard) and skips collecting anything for that link if the resolved channel is

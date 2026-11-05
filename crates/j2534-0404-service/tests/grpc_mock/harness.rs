@@ -1300,6 +1300,19 @@ impl MockBackdoor {
         }
     }
 
+    /// Makes the next `times` `PassThruClose` calls fail with `code`
+    /// (ADR-422); `times == 0` clears the override.
+    pub(crate) fn fail_closes(&self, code: c_long, times: u32) {
+        unsafe {
+            let f: Symbol<unsafe extern "system" fn(c_long, u32) -> c_long> = self
+                .lib
+                .get(b"__mock_fail_closes\0")
+                .expect("__mock_fail_closes should be exported");
+            let rc = f(code, times);
+            assert_eq!(rc, NC, "__mock_fail_closes should succeed");
+        }
+    }
+
     /// Forces every subsequent `PassThruWriteMsgs` call, on every channel, to
     /// fail with `code` instead of its normal success behavior -- lets tests
     /// exercise the RC21/RC23 (NRC 0x21/0x23) auto-re-request path's own

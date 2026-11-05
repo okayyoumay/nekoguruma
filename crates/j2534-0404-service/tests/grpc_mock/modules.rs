@@ -1037,3 +1037,265 @@ async fn hard_channel_error_populates_error_event_data_on_a_later_unrelated_rpc(
     drop(events);
     server.shutdown().await;
 }
+
+/// Drains the system event buffer (`GetEventItem(SystemHandle)`) and returns
+/// how many `PDU_INFO_MODULE_LIST_CHG` items it held.
+async fn drain_module_list_changes(
+    client: &mut VciServiceClient<tonic::transport::Channel>,
+) -> usize {
+    let mut changes = 0;
+    while let Some(item) = client
+        .get_event_item(vci_service_interface::GetEventItemRequest {
+            handle: Some(
+                vci_service_interface::get_event_item_request::Handle::SystemHandle(
+                    vci_service_interface::SystemHandle {},
+                ),
+            ),
+        })
+        .await
+        .expect("get_event_item(SystemHandle) should succeed")
+        .into_inner()
+        .event_item
+    {
+        if item.data
+            == Some(event_item::Data::InfoData(
+                vci_service_interface::PduInfo::ModuleListChg as i32,
+            ))
+        {
+            changes += 1;
+        }
+    }
+    changes
+}
+
+/// The module's row status in `GetModuleIds` (ADR-132: derived from the slot).
+async fn module_row_status(
+    client: &mut VciServiceClient<tonic::transport::Channel>,
+    module_handle: u32,
+) -> PduModuleStatus {
+    let rows = client
+        .get_module_ids(GetModuleIdsRequest {})
+        .await
+        .expect("get_module_ids should succeed")
+        .into_inner()
+        .module_id_list
+        .expect("module_id_list should be present")
+        .module_data;
+    let row = rows
+        .iter()
+        .find(|r| r.module_handle == Some(ModuleHandle { module_handle }))
+        .expect("row for the module");
+    PduModuleStatus::try_from(row.module_status).expect("known module status")
+}
+
+/// ADR-422: a `PassThruClose` that fails with an ordinary error keeps the
+/// worker's device slot. `ModuleDisconnect` returns the error, the module's
+/// row stays open, no `ModuleListChg` is sent, a `ModuleConnect` reuses the
+/// kept device (no second `PassThruOpen`), and a second `ModuleDisconnect`
+/// closes again and clears the slot.
+#[tokio::test]
+#[serial]
+async fn a_failed_close_keeps_the_slot_until_a_later_disconnect_closes() {
+    let server =
+        TestServer::start_with_modules(&[("Bench 1", "USB:1"), ("Bench 2", "USB:2")]).await;
+    let mut client = server.client().await;
+    let handle = || Some(ModuleHandle { module_handle: 1 });
+
+    client
+        .module_connect(ModuleConnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("module_connect(1) should succeed");
+    assert_eq!(server.backdoor.open_count(), 1);
+    let _ = drain_module_list_changes(&mut client).await;
+
+    server
+        .backdoor
+        .fail_closes(j2534_0404::ERR_FAILED as std::os::raw::c_long, 1);
+    client
+        .module_disconnect(ModuleDisconnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect_err("a failed PassThruClose must fail ModuleDisconnect");
+    assert_eq!(server.backdoor.close_count(), 0);
+    assert_ne!(
+        module_row_status(&mut client, 1).await,
+        PduModuleStatus::PduModstAvail,
+        "the slot is kept, so the module still counts as open"
+    );
+    assert_eq!(
+        drain_module_list_changes(&mut client).await,
+        0,
+        "no ModuleListChg while the slot stays"
+    );
+
+    // A connect while the slot is kept reuses the device.
+    client
+        .module_connect(ModuleConnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("module_connect(1) should reuse the kept device");
+    assert_eq!(server.backdoor.open_count(), 1, "no second PassThruOpen");
+
+    client
+        .module_disconnect(ModuleDisconnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("the second ModuleDisconnect should close the device");
+    assert_eq!(server.backdoor.close_count(), 1);
+    assert_eq!(
+        module_row_status(&mut client, 1).await,
+        PduModuleStatus::PduModstAvail
+    );
+    assert_eq!(drain_module_list_changes(&mut client).await, 1);
+
+    server.shutdown().await;
+}
+
+async fn a_close_answered_as_already_gone_counts_as_closed(code: u32) {
+    let server =
+        TestServer::start_with_modules(&[("Bench 1", "USB:1"), ("Bench 2", "USB:2")]).await;
+    let mut client = server.client().await;
+    let handle = || Some(ModuleHandle { module_handle: 1 });
+
+    client
+        .module_connect(ModuleConnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("module_connect(1) should succeed");
+    let _ = drain_module_list_changes(&mut client).await;
+
+    server.backdoor.fail_closes(code as std::os::raw::c_long, 1);
+    client
+        .module_disconnect(ModuleDisconnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("the first close answered as already gone counts as closed");
+    assert_eq!(
+        module_row_status(&mut client, 1).await,
+        PduModuleStatus::PduModstAvail
+    );
+    assert_eq!(drain_module_list_changes(&mut client).await, 1);
+
+    // The slot is clear: the next connect opens again.
+    client
+        .module_connect(ModuleConnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("module_connect(1) should open again");
+    assert_eq!(server.backdoor.open_count(), 2);
+
+    server.shutdown().await;
+}
+
+/// ADR-422: `ERR_DEVICE_NOT_CONNECTED` on the first close counts as closed.
+#[tokio::test]
+#[serial]
+async fn a_close_answered_device_not_connected_clears_the_slot() {
+    a_close_answered_as_already_gone_counts_as_closed(j2534_0404::ERR_DEVICE_NOT_CONNECTED).await;
+}
+
+/// ADR-422: `ERR_INVALID_DEVICE_ID` on the first close counts as closed.
+#[tokio::test]
+#[serial]
+async fn a_close_answered_invalid_device_id_clears_the_slot() {
+    a_close_answered_as_already_gone_counts_as_closed(j2534_0404::ERR_INVALID_DEVICE_ID).await;
+}
+
+/// ADR-422, ADR-131: a module a hard channel error marked not available whose
+/// close fails keeps the worker's slot. `ModuleConnect` is still refused, and
+/// a later successful `ModuleDisconnect` followed by `ModuleConnect` opens the
+/// device afresh and the module is ready.
+#[tokio::test]
+#[serial]
+async fn a_not_available_module_whose_close_fails_keeps_its_slot() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let handle = || Some(ModuleHandle { module_handle: 1 });
+
+    let cll_handle = create_and_connect_cll(
+        &mut client,
+        j2534_0404::CAN,
+        &[(j2534_0404::DATA_RATE, 500_000)],
+    )
+    .await;
+    assert_eq!(server.backdoor.open_count(), 1);
+
+    let mut events = client
+        .subscribe_event(vci_service_interface::SubscribeEventRequest {
+            handle: Some(subscribe_event_request::Handle::CllHandle(cll_handle)),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+    server.backdoor.set_read_msgs_error(Some(
+        j2534_0404::ERR_DEVICE_NOT_CONNECTED as std::os::raw::c_long,
+    ));
+    assert!(
+        wait_for_event(&mut events, 2000, |item| matches!(
+            item.data,
+            Some(event_item::Data::CllStatus(status))
+                if status == vci_service_interface::PduComLogicalLinkStatus::PduCllstOffline as i32
+        ))
+        .await,
+        "the hard channel error should take the link offline"
+    );
+    drop(events);
+    server.backdoor.set_read_msgs_error(None);
+    assert_eq!(
+        module_row_status(&mut client, 1).await,
+        PduModuleStatus::PduModstNotAvail
+    );
+
+    server
+        .backdoor
+        .fail_closes(j2534_0404::ERR_FAILED as std::os::raw::c_long, 1);
+    client
+        .module_disconnect(ModuleDisconnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect_err("a failed PassThruClose must fail ModuleDisconnect");
+    assert_eq!(server.backdoor.close_count(), 0);
+
+    let refused = client
+        .module_connect(ModuleConnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect_err("ModuleConnect on a kept not-available slot is still refused");
+    assert_eq!(refused.code(), Code::FailedPrecondition);
+    assert_eq!(
+        module_row_status(&mut client, 1).await,
+        PduModuleStatus::PduModstNotAvail,
+        "the kept slot stays not available"
+    );
+
+    client
+        .module_disconnect(ModuleDisconnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("the second ModuleDisconnect should close the device");
+    assert_eq!(server.backdoor.close_count(), 1);
+    client
+        .module_connect(ModuleConnectRequest {
+            module_handle: handle(),
+        })
+        .await
+        .expect("ModuleConnect after the disconnect should open afresh");
+    assert_eq!(server.backdoor.open_count(), 2, "a fresh PassThruOpen");
+    assert_eq!(
+        module_row_status(&mut client, 1).await,
+        PduModuleStatus::PduModstReady
+    );
+
+    server.shutdown().await;
+}

@@ -2556,6 +2556,7 @@ impl J2534Service {
                 tester_present_state: TesterPresentState::None,
                 tester_present_base_tx_flags: 0,
                 open_tp_discards: Vec::new(),
+                open_func_tx: None,
                 working_unique_resp_id_table: Vec::new(),
                 active_unique_resp_id_table: Vec::new(),
                 unique_resp_filter_ids: Vec::new(),
@@ -7254,6 +7255,7 @@ impl J2534Service {
             // way but must leave `open_tp_discards` untouched -- see that
             // function's own note.
             link.open_tp_discards.clear();
+            link.open_func_tx = None; // ADR-421
             let channel_id = link.channel_id;
             link.channel_id = None;
             link.connected = false;
@@ -9105,6 +9107,7 @@ mod tests {
             tester_present_state: TesterPresentState::None,
             tester_present_base_tx_flags: 0,
             open_tp_discards: Vec::new(),
+            open_func_tx: None,
             working_unique_resp_id_table: Vec::new(),
             active_unique_resp_id_table: Vec::new(),
             unique_resp_filter_ids: Vec::new(),

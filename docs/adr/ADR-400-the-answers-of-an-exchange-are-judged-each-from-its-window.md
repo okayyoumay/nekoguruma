@@ -94,8 +94,9 @@ response and its times on every answer, while the entry took the first answer's 
   (`VciTimes.finished`, not written to the log).
 - A stray primitive's answers after the agent's deadline are not carried into its
   `primitive_ended` entry.
-- On the J2534 worker the functional presence primitive gives the log no transmit time, and an
-  identification job `ngr-agent identify` starts is given no timing margin (a caller of
-  `run_identification` may pass one), so its answers are placed on their clock and
-  `undetermined`, with no response time (`no_transmit_time`, `no_margin`); the rows judge them
-  once either is supplied.
+- On the J2534 worker the functional presence primitive gave the log no transmit time, so the
+  answers of an identification job were placed on their clock and `undetermined`, with no
+  response time (`no_transmit_time`). ADR-421 routes that primitive's TxDone to the sending
+  link, so with a timing margin the answers have a response time and the rows judge them; a
+  caller that passes none (`ngr-agent identify` outside hardware) still gets `no_margin`. The
+  entry stays `undetermined` either way.

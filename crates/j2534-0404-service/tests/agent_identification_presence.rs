@@ -232,7 +232,12 @@ async fn run_once(
             api: Api::J2534,
             long_size: long_size(),
         }),
-        agent::VciMargins::default(),
+        // The simulated VCI's timing margin, as a profile would give it (the CLI has none
+        // outside hardware), so the log judges the answers' windows (ADR-377).
+        agent::VciMargins {
+            timing_margin_us: Some(2_000),
+            ..agent::VciMargins::default()
+        },
         Arc::new(AtomicBool::new(false)),
     )
     .await;
@@ -240,13 +245,20 @@ async fn run_once(
     Found { run, log }
 }
 
-/// An answer item of a presence entry that is placed in time: on the device clock, with its
-/// epoch. It has no response time: the J2534 worker gives the functional presence primitive no
-/// transmit time to measure it from, so its window is not judged either (`no_transmit_time`).
+/// An answer item of a presence entry that is placed in time and judged: on the device clock,
+/// with its epoch, and with the response time measured from the functional request's own
+/// transmit indication (ADR-421). The entry itself stays `undetermined`: its window ends on the
+/// worker's clock (ADR-400).
 fn assert_timed(item: &serde_json::Value) {
-    assert!(item["response_ms"].is_null(), "{item}");
+    assert!(item["response_ms"].is_number(), "{item}");
     assert_eq!(item["clock"], "device", "{item}");
     assert!(item["epoch"].is_number(), "{item}");
+}
+
+/// `assert_timed`, and the answer is judged within its window (ADR-400).
+fn assert_timed_within_window(item: &serde_json::Value) {
+    assert_timed(item);
+    assert_eq!(item["classification"], "none", "{item}");
 }
 
 impl Found {
@@ -432,12 +444,32 @@ async fn flow(root: &Path, control_dir: &Path) {
     assert_eq!(exchange["outcome"]["result"], "positive");
     // The link forwards pendings, so the rows may rely on that (ADR-376).
     assert_eq!(exchange["pending_visibility"], "forwarded", "{exchange}");
-    // No transmit time reaches the log on this link, and an identification job is given no timing
-    // margin (ADR-377): nothing is judged against a limit, so the answer is placed on its clock
-    // and `undetermined`, and so is the entry (ADR-400).
-    assert_timed(&exchange["answers"][0]);
-    assert_eq!(exchange["answers"][0]["classification"], "undetermined");
+    // The functional request's transmit indication reaches the log (ADR-421), so the answer's
+    // response time is measured from it and judged against the margin the run is given: the
+    // answer is within its window. The entry stays `undetermined`, as its window ends on the
+    // worker's clock (ADR-400).
+    assert_timed_within_window(&exchange["answers"][0]);
+    // The transmit indication is the evidence the request was sent, and its device-clock time
+    // is the start of each answer's response time.
+    assert_eq!(exchange["sent"], "confirmed", "{exchange}");
+    assert_eq!(exchange["sent_evidence"], "tx_indication", "{exchange}");
+    assert!(
+        exchange["times"]["vci"]["tx_done"]["us"].is_number(),
+        "{exchange}"
+    );
+    assert_eq!(exchange["timing"]["window"], "not_judged", "{exchange}");
+    assert_eq!(exchange["timing"]["not_judged_reason"], "other_clock");
     assert_eq!(exchange["classification"], "undetermined", "{exchange}");
+    let opened_transmit = found
+        .log
+        .iter()
+        .find(|line| line["event"] == "link_opened")
+        .unwrap();
+    assert_eq!(
+        opened_transmit["transmit_confirmation"],
+        serde_json::json!(["transmit_indication"])
+    );
+    assert_eq!(opened_transmit["response_times_judged"], true);
     let opened = found
         .log
         .iter()
@@ -500,8 +532,9 @@ async fn flow(root: &Path, control_dir: &Path) {
     assert_eq!(found.exchange("negative")["outcome"]["result"], "negative");
     let negative_answer = &found.exchange("negative")["answers"][0];
     assert_timed(negative_answer);
+    // An ECU-state refusal is the vehicle's, and is judged on the response time all the same.
+    assert_eq!(negative_answer["classification"], "vehicle");
     assert_eq!(negative_answer["outcome"]["result"], "negative");
-    assert_eq!(negative_answer["classification"], "undetermined");
 
     // The run's guards hold the VCI's lock until they are dropped.
     drop(found);
@@ -525,11 +558,7 @@ async fn flow(root: &Path, control_dir: &Path) {
         Some(1)
     );
     let pending_exchange = found.exchange("pending");
-    assert_timed(&pending_exchange["answers"][0]);
-    assert_eq!(
-        pending_exchange["answers"][0]["classification"], "undetermined",
-        "{pending_exchange}"
-    );
+    assert_timed_within_window(&pending_exchange["answers"][0]);
     assert_eq!(
         pending_exchange["classification"], "undetermined",
         "{pending_exchange}"
@@ -559,8 +588,7 @@ async fn flow(root: &Path, control_dir: &Path) {
     assert_eq!(answers.len(), 2, "{exchange}");
     assert_eq!(answers[0]["rx_id"], answers[1]["rx_id"], "{exchange}");
     for item in answers {
-        assert_timed(item);
-        assert_eq!(item["classification"], "undetermined", "{exchange}");
+        assert_timed_within_window(item);
     }
     assert!(
         answers[1]["vci_us"].as_u64() > answers[0]["vci_us"].as_u64(),

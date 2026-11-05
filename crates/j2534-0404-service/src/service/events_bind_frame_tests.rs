@@ -93,6 +93,7 @@ fn test_entry(
         start_msg_ind_enable: false,
         transmit_ind_enable: false,
         cop_tags: HashMap::new(),
+        func_tx_can_id: None,
     }
 }
 
@@ -245,6 +246,71 @@ mod route_frame_with_role_tests {
             route_frame_with_role(&entry, Some(0x5E8), None, true, false, true, false),
             Some((1, false)),
             "USDT tier wins precedence over UUDT on the same key either way"
+        );
+    }
+}
+
+/// ADR-421: the marker routes a functional request's own transmit indication
+/// to the sending link although the table names no row for the functional ID.
+mod func_tx_marker_routing_tests {
+    use super::*;
+
+    fn table_entry(marker: Option<u32>) -> CllRxEntry {
+        CllRxEntry {
+            unique_resp_ids: vec![can_key(1, Some(0x7E8), None)],
+            func_tx_can_id: marker,
+            ..test_entry(1, Vec::new(), Vec::new())
+        }
+    }
+
+    /// A TX-side frame on the marked ID routes with URID 0 (not a UUDT role).
+    #[test]
+    fn tx_side_frame_on_the_marked_id_routes_to_urid_zero() {
+        let entry = table_entry(Some(0x7DF));
+        assert_eq!(
+            route_frame_with_role(&entry, Some(0x7DF), None, true, true, true, false),
+            Some((0, false))
+        );
+    }
+
+    /// A sibling link with the same table but no marker (the unmarked sender
+    /// of a different request) does not get the frame.
+    #[test]
+    fn unmarked_sibling_with_the_same_functional_id_is_not_routed() {
+        let entry = table_entry(None);
+        assert_eq!(
+            route_frame_with_role(&entry, Some(0x7DF), None, true, true, true, false),
+            None
+        );
+    }
+
+    /// The marker covers TX-side frames only, and only its own ID: a received
+    /// frame on the same ID and a TX-side frame on another ID are not routed.
+    #[test]
+    fn marker_does_not_route_rx_frames_or_other_ids() {
+        let entry = table_entry(Some(0x7DF));
+        assert_eq!(
+            route_frame_with_role(&entry, Some(0x7DF), None, true, false, true, false),
+            None
+        );
+        assert_eq!(
+            route_frame_with_role(&entry, Some(0x7E0), None, true, true, true, false),
+            None
+        );
+    }
+
+    /// A table row that matches wins over the marker (the scan runs first).
+    #[test]
+    fn a_table_match_keeps_its_own_urid() {
+        let mut entry = table_entry(Some(0x7DF));
+        entry.unique_resp_ids = vec![can_key(5, Some(0x7DF), None)];
+        let routed = route_frame_with_role(&entry, Some(0x7DF), None, true, true, true, false);
+        assert_ne!(routed, None);
+        entry.func_tx_can_id = None;
+        assert_eq!(
+            route_frame_with_role(&entry, Some(0x7DF), None, true, true, true, false),
+            routed,
+            "the marker adds routing only where the scan finds no row"
         );
     }
 }

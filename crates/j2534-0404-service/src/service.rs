@@ -4020,6 +4020,14 @@ struct LogicalLinkState {
     /// presents will be sent" governs future sends, not replies already
     /// elicited by sends that already went out.
     open_tp_discards: Vec<ResidualTesterPresentDiscard>,
+    /// The CAN ID of the functional request this link sent and whose receive
+    /// phase is still running (ADR-421), read from the first four bytes of the
+    /// sent `SendRecvTx.data` as ADR-099's `tx_can_id` is. Written by
+    /// `handle_send_recv` after the request's write succeeds and cleared when
+    /// that cycle's `wait_for_expected_response` returns, and on
+    /// `DisconnectComLogicalLink` (`DestroyComLogicalLink` drops the whole
+    /// state). `build_cll_rx_entries` snapshots it for `route_frame_with_role`.
+    open_func_tx: Option<u32>,
     /// Working UniqueRespIdTable — written by `SetUniqueRespIdTable`, read by
     /// `GetUniqueRespIdTable`. Promoted to `active_unique_resp_id_table` at
     /// this CLL's own `ConnectComLogicalLink` and at `CoptUpdateparam`
@@ -4686,6 +4694,7 @@ mod clear_error_suspension_tests {
             tester_present_state: TesterPresentState::None,
             tester_present_base_tx_flags: 0,
             open_tp_discards: Vec::new(),
+            open_func_tx: None,
             working_unique_resp_id_table: Vec::new(),
             active_unique_resp_id_table: Vec::new(),
             unique_resp_filter_ids: Vec::new(),

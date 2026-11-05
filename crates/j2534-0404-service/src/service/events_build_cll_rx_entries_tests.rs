@@ -45,6 +45,7 @@ fn minimal_link() -> LogicalLinkState {
         tester_present_state: TesterPresentState::None,
         tester_present_base_tx_flags: 0,
         open_tp_discards: Vec::new(),
+        open_func_tx: None,
         working_unique_resp_id_table: Vec::new(),
         active_unique_resp_id_table: Vec::new(),
         unique_resp_filter_ids: Vec::new(),
@@ -119,6 +120,31 @@ async fn absent_cll_is_stamped_none() {
         entries[0].set_seq_at_read, None,
         "a CLL absent from the pre-read snapshot must stamp None, never a live fallback"
     );
+}
+
+/// ADR-421: `open_func_tx` is snapshotted into `func_tx_can_id`, and an
+/// unmarked link snapshots `None`.
+#[tokio::test]
+async fn open_func_tx_is_snapshotted_into_func_tx_can_id() {
+    let marked = LogicalLinkState {
+        open_func_tx: Some(0x7DF),
+        ..minimal_link()
+    };
+    let logical_links = Arc::new(Mutex::new(HashMap::from([
+        (PRESENT_CLL, marked),
+        (ABSENT_CLL, minimal_link()),
+    ])));
+    let mut entries = build_cll_rx_entries(
+        CHANNEL,
+        &logical_links,
+        &no_cop_tags(),
+        &HashMap::new(),
+        CanChannelMode::SingleChannel,
+    )
+    .await;
+    entries.sort_by_key(|e| e.handle);
+    assert_eq!(entries[0].func_tx_can_id, Some(0x7DF));
+    assert_eq!(entries[1].func_tx_can_id, None);
 }
 
 /// ADR-217 Codex-review fix, PR #132 round 2: a qualified (pin-selected)

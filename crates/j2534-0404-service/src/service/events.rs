@@ -1096,6 +1096,12 @@ struct CllRxEntry {
     /// least as correct as a later one, and strictly more resilient against
     /// this exact removal race.
     cop_tags: HashMap<u32, Vec<u8>>,
+    /// Snapshot of `LogicalLinkState::open_func_tx` (ADR-421): the CAN ID of
+    /// the functional request whose receive phase this link is in, so that
+    /// `route_frame_with_role` routes that request's transmit indication
+    /// (a TX-side frame on this ID) to this link although the table names no
+    /// row for the functional ID. `None` outside such a phase.
+    func_tx_can_id: Option<u32>,
 }
 
 impl CllRxEntry {
@@ -8586,6 +8592,30 @@ struct SendRecvCycle {
     connect_generation: u64,
 }
 
+/// The CAN ID a CAN-family request will go out on: the 4-byte prefix of its
+/// header-prefixed `SendRecvTx.data`, the same bytes `tester_present_tx_can_id`
+/// reads (ADR-099). `None` for data too short to carry it.
+fn func_tx_can_id(data: &[u8]) -> Option<u32> {
+    data.get(0..4)
+        .map(|b| u32::from_be_bytes(b.try_into().unwrap()))
+}
+
+/// Writes `LogicalLinkState::open_func_tx` (ADR-421) for the link's current
+/// connection only: a link that was reconnected or removed since `generation`
+/// keeps whatever its newer state holds.
+async fn set_open_func_tx(
+    logical_links: &Mutex<HashMap<u32, LogicalLinkState>>,
+    cll_handle: u32,
+    generation: u64,
+    can_id: Option<u32>,
+) {
+    if let Some(link) = logical_links.lock().await.get_mut(&cll_handle)
+        && link.connect_generation == generation
+    {
+        link.open_func_tx = can_id;
+    }
+}
+
 /// Processes one send cycle of a `TxItem::SendRecv` in the poll task
 /// (`CoptSendrecv`): writes the already-resolved `tx` via
 /// `PassThruWriteMsgs` (or the software ISO-TP driver, ADR-046), optionally
@@ -9173,6 +9203,18 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                         no_response_required: num_receive_cycles == 0,
                     });
                 }
+                // ADR-421: a functional request with a receive phase marks
+                // this link, so its transmit indication (read inside that
+                // phase) is routed here. Set before the wait's first read.
+                if can_functional == Some(true) && num_receive_cycles != 0 {
+                    set_open_func_tx(
+                        &ctx.logical_links,
+                        cll_handle,
+                        connect_generation,
+                        func_tx_can_id(&data),
+                    )
+                    .await;
+                }
                 true
             }
             Some(Err(TxFailure::Event(error_event, error_name))) => {
@@ -9314,6 +9356,7 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
         })
     };
     if !still_on_this_channel {
+        set_open_func_tx(&ctx.logical_links, cll_handle, connect_generation, None).await;
         emit_terminal_if_live(
             &ctx.primitives,
             &ctx.logical_links,
@@ -9365,7 +9408,7 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
             cfg.with_request(access_timing_request.as_deref().unwrap_or(&[]), tx_prefix)
         });
         let response_timeout_ms = params.p2_max_timeout_ms();
-        match wait_for_expected_response(
+        let wait_outcome = wait_for_expected_response(
             ExpectedResponseWait {
                 cll_handle,
                 cop_handle,
@@ -9399,8 +9442,11 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
             },
             ctx,
         )
-        .await
-        {
+        .await;
+        // ADR-421: every exit of the wait (match quota, timeout, cancel,
+        // staleness, tier-2 detach, re-request failure) ends the marker.
+        set_open_func_tx(&ctx.logical_links, cll_handle, connect_generation, None).await;
+        match wait_outcome {
             ReceivePhaseOutcome::Terminal => return None,
             ReceivePhaseOutcome::CycleComplete => {}
             ReceivePhaseOutcome::ReRequestTxFailed => {

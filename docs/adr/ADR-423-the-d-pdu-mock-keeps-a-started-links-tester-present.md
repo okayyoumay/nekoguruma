@@ -36,10 +36,15 @@ to the standard here.
    reads as the number 0, because `PDUDestroyItem` frees a ComParam's data as a number. The
    copies are cleared by `PDUDestroyComLogicalLink`, `PDUConstruct` and `__mock_reset`.
 3. **Link state.** The mock keeps ONLINE or COMM_STARTED. A `CoptStartcomm` makes the link
-   COMM_STARTED when it finishes, whatever the ECU answered (8.2.6.3.2: the agent asks the link
-   after a refused session control, ADR-420 item 3); `CoptStopcomm`, `PDUDisconnect`,
-   `PDUDestroyComLogicalLink` and a reset make it ONLINE. `PDUGetStatus` of a link (no
-   ComPrimitive, 8.4.6) reports the state; module status and ComPrimitive status are as before.
+   COMM_STARTED when it finishes, whatever the ECU answered. That is the mock's choice, as the
+   J2534 worker's is: ISO 22900-2:2022 8.2.6.3.2 e) and 8.4.17.2.1 tie the state to a successful
+   StartComm, but libraries differ here, which is why the agent asks the link after a refused
+   session control (ADR-420 item 3) instead of assuming. `CoptStopcomm`, `PDUDisconnect`,
+   `PDUDestroyComLogicalLink` and a reset make it ONLINE, and drop the state change of every
+   ComPrimitive still waiting or running, so a `CoptStartcomm` that finishes after the link
+   went away does not start it again. `PDUGetStatus` of a link (no ComPrimitive, 8.4.6) reports
+   the state; module status and ComPrimitive status are as before (the marker of item 6 is not a
+   ComPrimitive and never makes either read executing).
 4. **A `CoptStartcomm` with a request is sent as a send-receive** (ADR-418 item 3, 8.2.6.3.2):
    its events and their control data (cycles) are those of ADR-299 items 2 and 3, and a request
    the ECU does not answer ends in the receive timeout and a finished status, with the link
@@ -56,13 +61,17 @@ to the standard here.
    destroy and a reset stop it.
 6. **Serialization (8.1.3 Table 1, as ADR-419 for the J2534 worker).** A tester-present goes only
    when no ComPrimitive runs or waits; a ComPrimitive that waits goes first and the
-   tester-present stays due. A send that expects a response (`ReqRsp` 1) puts a marker into the
+   tester-present stays due. This holds every tester-present behind the ComPrimitives, which is
+   stricter than 8.1.3 Table 1 (a functional tester-present with no response may go at once
+   behind a physical request): a simplification of the mock. A send that expects a response (`ReqRsp` 1) puts a marker into the
    schedule of the running ComPrimitive, due when the ECU's final answer is (response-pending
    messages included), and the next ComPrimitive begins only after it. A send that expects none
    holds nothing. The ECU's answer to a tester-present is never delivered as a result item.
 7. **Judging and the error item.** With `ReqRsp` 0 an answer is never an error. With 1 the answer is
-   positive when it starts with the non-empty `ExpPosResp`; a missing answer, the expected
-   negative response and any other answer are an error. The marker, when due, queues one
+   positive when it starts with `ExpPosResp`; with that field empty it is not enabled (B.5.1
+   compares only the bytes the field holds), so any answer is positive unless it starts with a
+   non-empty `ExpNegResp`. A missing answer and the expected negative response are an error, as
+   is any other answer when `ExpPosResp` is set. The marker, when due, queues one
    `PDU_IT_ERROR` item `PDU_ERR_EVT_TESTER_PRESENT_ERROR` for the link (hCop
    `PDU_HANDLE_UNDEF`) per unanswered or unexpectedly answered send, and sending goes on. It
    queues nothing when the answer was positive or the tester-present was switched off or
@@ -75,7 +84,8 @@ to the standard here.
    `NGR_SIM_ECU_CONFIG` is attached, when no ECU is attached yet. A worker process under test
    cannot call the back door, so this arms a fault such as the loss of the first tester-present
    answer (`{"inject_fault":{"fault":"drop_response","service":62}}`). A command that does not
-   parse or cannot apply fails `PDUConstruct`.
+   parse or cannot apply fails `PDUConstruct` and leaves no ECU attached, so a retried construct
+   does not succeed without the faults. A variable that is set but blank names no commands.
 
 ## Consequences
 

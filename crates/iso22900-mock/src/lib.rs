@@ -384,10 +384,23 @@ struct MockState {
 impl MockState {
     /// Forgets the link: ONLINE, no tester-present, the ComParams at their defaults.
     fn reset_link(&mut self) {
-        self.link_state = LinkState::Online;
+        self.go_online();
         self.tp_working = TesterPresent::default();
         self.tp_active = TesterPresent::default();
+    }
+
+    /// The link is ONLINE with no tester-present. A ComPrimitive still waiting or running keeps
+    /// its events, but its state change is dropped, so a STARTCOMM that finishes after the link
+    /// went away does not start it again.
+    fn go_online(&mut self) {
+        self.link_state = LinkState::Online;
         self.tp_due = None;
+        for cop in &mut self.waiting {
+            cop.hook = None;
+        }
+        for (_, event) in &mut self.scheduled {
+            event.on_finish = None;
+        }
     }
 
     fn next_primitive_handle(&mut self) -> UNUM32 {
@@ -891,8 +904,9 @@ fn apply_hook(state: &mut MockState, hook: Hook, now: Instant) {
 /// raised. A send that expects a response puts a marker in `scheduled` at the time of the final
 /// answer, which holds the link's ComPrimitives back until then (ISO 22900-2 (2022) 8.1.3
 /// Table 1) and reports a missing or unexpected answer. Judged against the active ComParams:
-/// the answer is positive when it starts with the expected positive response. Send type 1 is
-/// sent as type 0, every period.
+/// the answer is positive when it starts with the expected positive response; with that field
+/// empty, when it does not start with the expected negative one. Send type 1 is sent as type 0,
+/// every period.
 fn send_tester_present(state: &mut MockState, now: Instant) {
     if !tester_present_on(state) {
         state.tp_due = None;
@@ -921,9 +935,16 @@ fn send_tester_present(state: &mut MockState, now: Instant) {
     let last_pending = exchange.pending.last().map_or(0, |(delay_ms, _)| *delay_ms);
     let (delay_ms, error) = match answer {
         None => (last_pending, Some(MOCK_XTRA_ERR_TP_NO_RSP)),
-        Some(bytes) if !tp.exp_pos.is_empty() && bytes.starts_with(&tp.exp_pos) => {
-            (exchange.delay_ms, None)
+        // An empty expected-positive field is not enabled (B.5.1): any answer is positive unless
+        // it is the expected negative one.
+        Some(bytes) if tp.exp_pos.is_empty() => {
+            let negative = !tp.exp_neg.is_empty() && bytes.starts_with(&tp.exp_neg);
+            (
+                exchange.delay_ms,
+                negative.then_some(MOCK_XTRA_ERR_TP_NEG_RSP),
+            )
         }
+        Some(bytes) if bytes.starts_with(&tp.exp_pos) => (exchange.delay_ms, None),
         Some(_) => (exchange.delay_ms, Some(MOCK_XTRA_ERR_TP_NEG_RSP)),
     };
     state.scheduled.push_back((
@@ -1043,8 +1064,48 @@ fn ecu_config_from(path: Option<std::ffi::OsString>) -> Result<Option<EcuConfig>
 fn ecu_commands_from(text: Option<std::ffi::OsString>) -> Result<Vec<SimEcuCommand>, ()> {
     match text {
         None => Ok(Vec::new()),
-        Some(text) => serde_json::from_str(text.to_str().ok_or(())?).map_err(|_| ()),
+        Some(text) => {
+            let text = text.to_str().ok_or(())?;
+            // A variable that is set but blank names no commands.
+            if text.trim().is_empty() {
+                return Ok(Vec::new());
+            }
+            serde_json::from_str(text).map_err(|_| ())
+        }
     }
+}
+
+/// Applies the commands `text` holds (`NGR_SIM_ECU_COMMANDS`) in order; stops at the first that
+/// fails, leaving what the earlier ones did (the caller undoes it).
+fn apply_ecu_commands(state: &mut MockState, text: Option<std::ffi::OsString>) -> Result<(), ()> {
+    for command in ecu_commands_from(text)? {
+        apply_sim_ecu_command(state, command)?;
+    }
+    Ok(())
+}
+
+/// What `PDUConstruct` does about the ECU when none is attached: attaches the one the
+/// configuration file `config` names, then applies the commands `commands` holds (ADR-423), so a
+/// fault can be armed from the start. All or nothing: when a step fails the ECU is detached
+/// again, and a retried construct does not succeed without the faults.
+fn attach_from_environment(
+    state: &mut MockState,
+    config: Option<std::ffi::OsString>,
+    commands: Option<std::ffi::OsString>,
+) -> Result<(), ()> {
+    if state.ecu.is_some() {
+        return Ok(());
+    }
+    let result = ecu_config_from(config).and_then(|config| {
+        if let Some(config) = config {
+            state.ecu = Some(SimEcu::new(config));
+        }
+        apply_ecu_commands(state, commands)
+    });
+    if result.is_err() {
+        state.ecu = None;
+    }
+    result
 }
 
 /// The configuration an ECU attached without one gets, as `sim-vci`'s default.
@@ -1151,23 +1212,14 @@ macro_rules! exported_fn {
 
 exported_fn!(PDUConstruct(_option_str: *mut CHAR8, p_api_tag: *mut c_void) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
-    if guard.ecu.is_none() {
-        match ecu_config_from(std::env::var_os(ECU_CONFIG_ENV)) {
-            Ok(Some(config)) => guard.ecu = Some(SimEcu::new(config)),
-            Ok(None) => {}
-            Err(()) => return E_PDU_ERROR::PDU_ERR_FCT_FAILED,
-        }
-        // The commands follow the attach, so a fault can be armed from the start (ADR-423).
-        match ecu_commands_from(std::env::var_os(ECU_COMMANDS_ENV)) {
-            Ok(commands) => {
-                for command in commands {
-                    if apply_sim_ecu_command(&mut guard, command).is_err() {
-                        return E_PDU_ERROR::PDU_ERR_FCT_FAILED;
-                    }
-                }
-            }
-            Err(()) => return E_PDU_ERROR::PDU_ERR_FCT_FAILED,
-        }
+    if attach_from_environment(
+        &mut guard,
+        std::env::var_os(ECU_CONFIG_ENV),
+        std::env::var_os(ECU_COMMANDS_ENV),
+    )
+    .is_err()
+    {
+        return E_PDU_ERROR::PDU_ERR_FCT_FAILED;
     }
     // A delivery thread that a `PDUDestruct` from its own callback left to end keeps the stop
     // flag set until here.
@@ -1290,14 +1342,17 @@ exported_fn!(PDUGetStatus(_h_mod: UNUM32, h_cll: UNUM32, h_cop: UNUM32, p_status
         // The status of a link, asked with no ComPrimitive (8.4.6), is its state (ADR-423); a
         // ComPrimitive waiting for its turn is idle, one with events to come is executing
         // (ADR-299).
+        // The marker of a tester-present in `scheduled` has no ComPrimitive handle; it is not one
+        // a caller can ask about.
+        let is_cop_handle = h_cop != 0 && h_cop != PDU_HANDLE_UNDEF;
         if h_cop == PDU_HANDLE_UNDEF && h_cll != PDU_HANDLE_UNDEF {
             match guard.link_state {
                 LinkState::Online => E_PDU_STATUS::PDU_CLLST_ONLINE,
                 LinkState::CommStarted => E_PDU_STATUS::PDU_CLLST_COMM_STARTED,
             }
-        } else if h_cop != 0 && guard.waiting.iter().any(|cop| cop.event.h_cop == h_cop) {
+        } else if is_cop_handle && guard.waiting.iter().any(|cop| cop.event.h_cop == h_cop) {
             E_PDU_STATUS::PDU_COPST_IDLE
-        } else if h_cop != 0 && guard.scheduled.iter().any(|(_, event)| event.h_cop == h_cop) {
+        } else if is_cop_handle && guard.scheduled.iter().any(|(_, event)| event.h_cop == h_cop) {
             E_PDU_STATUS::PDU_COPST_EXECUTING
         } else {
             E_PDU_STATUS::PDU_COPST_FINISHED
@@ -1382,8 +1437,7 @@ exported_fn!(PDUConnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
 exported_fn!(PDUDisconnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.disconnect += 1;
-    guard.link_state = LinkState::Online;
-    guard.tp_due = None;
+    guard.go_online();
     drop(guard);
     no_error()
 });
@@ -2693,13 +2747,17 @@ mod tester_present_tests {
         }
 
         fn link_status(&self) -> E_PDU_STATUS {
+            self.status_of(MOCK_LOGICAL_LINK_HANDLE, PDU_HANDLE_UNDEF)
+        }
+
+        fn status_of(&self, h_cll: UNUM32, h_cop: UNUM32) -> E_PDU_STATUS {
             let (mut status, mut timestamp, mut extra) = (E_PDU_STATUS(0), 0, 0);
             unsafe {
                 assert_eq!(
                     PDUGetStatus(
                         MOCK_MODULE_HANDLE,
-                        MOCK_LOGICAL_LINK_HANDLE,
-                        PDU_HANDLE_UNDEF,
+                        h_cll,
+                        h_cop,
                         &mut status,
                         &mut timestamp,
                         &mut extra,
@@ -2764,6 +2822,29 @@ mod tester_present_tests {
         assert_eq!(ecu_commands_from(Some(text.into())).unwrap().len(), 2);
         assert!(ecu_commands_from(Some(r#"{"detach":{}}"#.into())).is_err());
         assert!(ecu_commands_from(Some("[{\"reboot\":{}}]".into())).is_err());
+        // Set but blank: no commands.
+        assert!(ecu_commands_from(Some("".into())).unwrap().is_empty());
+        assert!(ecu_commands_from(Some(" \n\t ".into())).unwrap().is_empty());
+    }
+
+    /// A construct whose commands fail leaves no ECU behind, so a retry does not succeed without
+    /// the faults.
+    #[test]
+    fn a_failed_command_detaches_the_ecu_again() {
+        let _serial = GLOBAL_STATE.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state = MockState::default();
+        // The second command names both a service and a request, which is refused.
+        let bad = r#"[{"attach":{}},{"inject_fault":{"fault":"drop_response","service":62,"request":[62]}}]"#;
+        assert!(attach_from_environment(&mut state, None, Some(bad.into())).is_err());
+        assert!(state.ecu.is_none());
+        // The first command alone, with the second arming a fault, succeeds.
+        let good = r#"[{"attach":{}},{"inject_fault":{"fault":"drop_response","service":62}}]"#;
+        assert!(attach_from_environment(&mut state, None, Some(good.into())).is_ok());
+        assert!(state.ecu.is_some());
+        // Blank commands attach nothing and are no error.
+        let mut state = MockState::default();
+        assert!(attach_from_environment(&mut state, None, Some("  ".into())).is_ok());
+        assert!(state.ecu.is_none());
     }
 
     /// Row 1: a ComParam set with no primitive changes the working buffer and nothing else.
@@ -2949,15 +3030,17 @@ mod tester_present_tests {
     fn a_tester_present_and_a_com_primitive_take_turns() {
         let rig = Rig::new();
         rig.keep_alive(100);
-        // The first tester-present is answered after 400 ms.
-        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":400}},"service":62}}"#);
+        // The first tester-present is answered after 2 s, far longer than the checks below take.
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":2000}},"service":62}}"#);
         let start = rig.start(start_comm(), &[0x10, 0x02]);
         rig.finished(start);
         rig.wait_for("the marker", Rig::marker_pending);
         // The read waits for the answer; its tester-present falls due meanwhile.
         rig.arm_probe();
         let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
-        std::thread::sleep(Duration::from_millis(150));
+        rig.wait_for("the next tester-present to fall due", |state| {
+            state.tp_due.is_some_and(|due| due <= Instant::now())
+        });
         {
             let guard = state().lock().unwrap();
             assert_eq!(guard.waiting.len(), 1, "the read began before the answer");
@@ -3119,6 +3202,180 @@ mod tester_present_tests {
         let guard = state().lock().unwrap();
         assert!(guard.scheduled.is_empty());
         assert!(guard.waiting.is_empty());
+    }
+
+    /// A STARTCOMM still running when the link is disconnected does not start it again.
+    #[test]
+    fn a_startcomm_that_finishes_after_a_disconnect_does_not_start_the_link() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":16}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        assert!(!state().lock().unwrap().scheduled.is_empty());
+        unsafe {
+            assert_eq!(
+                PDUDisconnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        // The link is used again before the old STARTCOMM ends.
+        unsafe {
+            assert_eq!(
+                PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        rig.finished(cop);
+        rig.arm_probe();
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        let guard = state().lock().unwrap();
+        assert_eq!(guard.tp_due, None);
+        assert!(!Rig::probe_used(&guard), "a tester-present was sent");
+    }
+
+    /// The same for a STARTCOMM that still waits for its turn when the link is destroyed.
+    #[test]
+    fn a_waiting_startcomm_does_not_start_a_destroyed_link() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":34}}"#);
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        assert_eq!(state().lock().unwrap().waiting.len(), 1);
+        unsafe {
+            assert_eq!(
+                PDUDestroyComLogicalLink(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE),
+                no_error()
+            );
+        }
+        rig.wait_for("both to end", |state| {
+            state.waiting.is_empty() && state.scheduled.is_empty()
+        });
+        let events = rig.events();
+        for handle in [read, cop] {
+            assert!(events.contains(&(handle, FINISHED)), "{events:?}");
+        }
+        rig.arm_probe();
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(rig.link_status(), E_PDU_STATUS::PDU_CLLST_ONLINE);
+        let guard = state().lock().unwrap();
+        assert_eq!(guard.tp_due, None);
+        assert!(!Rig::probe_used(&guard), "a tester-present was sent");
+    }
+
+    /// The outstanding tester-present is not a ComPrimitive: the module's status stays as it
+    /// was.
+    #[test]
+    fn a_tester_present_marker_does_not_make_the_module_executing() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":2000}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the marker", Rig::marker_pending);
+        assert_eq!(
+            rig.status_of(PDU_HANDLE_UNDEF, PDU_HANDLE_UNDEF),
+            E_PDU_STATUS::PDU_COPST_FINISHED
+        );
+        assert_eq!(
+            rig.status_of(MOCK_LOGICAL_LINK_HANDLE, cop),
+            E_PDU_STATUS::PDU_COPST_FINISHED
+        );
+    }
+
+    /// An empty expected-positive field is not enabled: any answer is positive unless it is the
+    /// expected negative one; no answer is still an error.
+    #[test]
+    fn an_empty_expected_positive_response_accepts_any_answer_but_the_negative_one() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.set_bytes("CP_TesterPresentExpPosResp", &[]);
+        // A negative answer that is not the expected one counts as positive.
+        rig.ecu(r#"{"inject_fault":{"fault":{"negative_response":{"nrc":"request_out_of_range"}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the tester-present", Rig::probe_used);
+        rig.wait_for("the answer", |state| !Rig::marker_pending(state));
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rig.events().is_empty());
+        // The expected negative answer is an error.
+        rig.set_bytes("CP_TesterPresentExpNegResp", &[0x7F, 0x3E, 0x22]);
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        rig.ecu(r#"{"inject_fault":{"fault":{"negative_response":{"nrc":"conditions_not_correct"}},"service":62}}"#);
+        let error = (
+            PDU_HANDLE_UNDEF,
+            Seen::Error(TP_ERROR, MOCK_XTRA_ERR_TP_NEG_RSP),
+        );
+        let mut events = Vec::new();
+        let started = Instant::now();
+        while !events.contains(&error) {
+            assert!(started.elapsed() < Duration::from_secs(5), "{events:?}");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(rig.events());
+        }
+        // No answer at all is an error, too.
+        rig.ecu(r#"{"inject_fault":{"fault":"drop_response","service":62}}"#);
+        let no_answer = (
+            PDU_HANDLE_UNDEF,
+            Seen::Error(TP_ERROR, MOCK_XTRA_ERR_TP_NO_RSP),
+        );
+        let started = Instant::now();
+        while !events.contains(&no_answer) {
+            assert!(started.elapsed() < Duration::from_secs(5), "{events:?}");
+            std::thread::sleep(Duration::from_millis(5));
+            events.extend(rig.events());
+        }
+    }
+
+    /// An UPDATEPARAM that changes a tester-present value while the tester-present is on sends at
+    /// once; one that changes nothing leaves the schedule alone.
+    #[test]
+    fn an_updateparam_that_changes_a_value_sends_the_tester_present_at_once() {
+        let rig = Rig::new();
+        rig.keep_alive(10_000);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the first tester-present", |state| {
+            state
+                .tp_due
+                .is_some_and(|due| due > Instant::now() + Duration::from_secs(5))
+        });
+        let due = state().lock().unwrap().tp_due;
+        // Nothing changed: the next one stays due a period after the last.
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        assert_eq!(state().lock().unwrap().tp_due, due);
+        // A changed period: sent now, the next one a (new) period later.
+        rig.set_number("CP_TesterPresentTime", 20_000_000);
+        rig.arm_probe();
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        rig.wait_for("the tester-present", Rig::probe_used);
+        assert_ne!(state().lock().unwrap().tp_due, due);
+    }
+
+    /// An answer that comes after a response pending message is judged when the final answer is
+    /// due, and expected it reports nothing.
+    #[test]
+    fn a_tester_present_answered_after_response_pending_reports_nothing() {
+        let rig = Rig::new();
+        rig.keep_alive(50);
+        rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":1500}},"service":62}}"#);
+        let cop = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(cop);
+        rig.wait_for("the marker", Rig::marker_pending);
+        // The marker waits for the final answer: a read started now waits for it.
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        assert_eq!(state().lock().unwrap().waiting.len(), 1);
+        let events = rig.finished(read);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
     }
 
     impl Rig {

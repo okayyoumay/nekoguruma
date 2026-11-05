@@ -1632,7 +1632,16 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
         ]
     );
 
-    // Another type of ComPrimitive waits behind one the ECU is still answering.
+    // Another type of ComPrimitive waits behind one the ECU is still answering. The mock keeps a
+    // started link's tester-present (ADR-423), which would use up the faults below: switch it off
+    // for this link before the StartComm.
+    set_tester_present(
+        &mut client,
+        cll_handle,
+        "CP_TesterPresentHandling",
+        param_item::ParamData::Unum32(0),
+    )
+    .await;
     sim_ecu_control(
         &backdoor,
         r#"{"inject_fault":{"fault":{"delay_response":{"ms":100}}}}"#,

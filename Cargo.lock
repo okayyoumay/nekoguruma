@@ -1262,6 +1262,7 @@ dependencies = [
  "postcard",
  "serde_json",
  "serial_test",
+ "shared-proto",
  "tempfile",
  "tokio",
  "tokio-stream",

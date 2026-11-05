@@ -565,7 +565,7 @@ fn check_runnable(program: &Program) -> Result<(), JobError> {
 /// [`check_program`] for a job, which also checks the declarations its program names
 /// (`diag_ir::check_declarations`): the response fields it decodes (`Op::DecodeField`,
 /// ADR-316, ADR-318), the services it send-receives (ADR-321) and the flash segments whose blocks
-/// it reads (`Op::FlashBlock`, ADR-336), and the flash session of each recovery plan (ADR-245). A job without a document to
+/// it reads (`Op::FlashBlock`, ADR-336), and the flash session of each recovery plan with every segment of it (ADR-245), whether or not the job has an artifact. A job without a document to
 /// decode with, or one whose document does not declare what the program names, is refused here
 /// rather than failing at the instruction, which could be after a write.
 ///

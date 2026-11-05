@@ -4279,6 +4279,47 @@ mod flash_block {
         );
     }
 
+    /// Every segment of a plan's session is checked, at the plan's entry, in a job with no
+    /// artifact as with one: a zero block size (session 4), an end past the offset range
+    /// (session 6) and a block longer than a byte string may be (session 7).
+    #[test]
+    fn check_declarations_checks_every_segment_of_a_plans_session() {
+        let bytes = document();
+        let document = load_ecu_document(&bytes).expect("the document loads");
+        let variant = document.variant().expect("a variant");
+        let with_plan = |session| {
+            let mut program = prog(vec![Op::Pop], vec![]);
+            program.flash = vec![super::plan(session, 0, 6)];
+            program
+        };
+        assert_eq!(
+            check_declarations(&with_plan(4), &variant),
+            Err((
+                6,
+                VmError::ZeroBlockSize {
+                    session: 4,
+                    segment: 1
+                }
+            ))
+        );
+        assert_eq!(
+            check_declarations(&with_plan(6), &variant),
+            Err((6, VmError::Overflow))
+        );
+        assert_eq!(
+            check_declarations(&with_plan(7), &variant),
+            Err((6, VmError::BytesTooLong(MAX_BYTES_LEN as u64 + 1)))
+        );
+        // The same errors as the job's artifact check reads.
+        assert_eq!(
+            flash_session_extents(&variant, 4),
+            Err(VmError::ZeroBlockSize {
+                session: 4,
+                segment: 1
+            })
+        );
+    }
+
     #[test]
     fn check_declarations_checks_a_recovery_plans_flash_session() {
         let bytes = document();
@@ -4289,9 +4330,9 @@ mod flash_block {
             program.flash = vec![super::plan(session, 0, 6)];
             program
         };
-        // Declared session: accepted.
+        // Declared session with well-formed segments: accepted.
         assert_eq!(
-            check_declarations(&with_plan(vec![Op::Pop], 4), &variant),
+            check_declarations(&with_plan(vec![Op::Pop], 5), &variant),
             Ok(())
         );
         // Undeclared session: reported at the plan's entry.

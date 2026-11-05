@@ -1389,8 +1389,10 @@ fn store(slots: &mut Vec<Option<Value>>, slot: u16, value: Value) {
 ///   whose longest block is longer than [`MAX_BYTES_LEN`] (ADR-336).
 ///
 /// After the instructions, each flash recovery plan of `program.flash`, in plan order, must name
-/// a flash session the variant declares (`FlashSession.id`); otherwise the error is
-/// [`VmError::UnknownFlashSession`], reported at the plan's `boundaries.entry_pc` (ADR-245).
+/// a flash session the variant declares (`FlashSession.id`), else [`VmError::UnknownFlashSession`]
+/// (ADR-245), and every segment of that session must pass the segment checks above, as
+/// [`flash_session_extents`] reads them for the job's artifact check; the error is reported at
+/// the plan's `boundaries.entry_pc`. Whether a job has an artifact does not change the result.
 /// An instruction's error takes precedence over a plan's.
 ///
 /// The declarations checked are those of one target: a caller of a program with several targets
@@ -1421,8 +1423,10 @@ pub fn check_declarations(
         };
         checked.map_err(|error| (u32::try_from(pc).unwrap_or(u32::MAX), error))?;
     }
+    // Every segment of a plan's session, as the job's artifact check reads them: whether the
+    // segments are well formed depends only on the declarations, not on the artifact.
     for plan in &program.flash {
-        declared_session(variant, plan.flash_session)
+        flash_session_extents(variant, plan.flash_session)
             .map_err(|error| (plan.boundaries.entry_pc, error))?;
     }
     Ok(())

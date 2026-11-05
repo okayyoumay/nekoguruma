@@ -1,7 +1,7 @@
 # ADR-299: iso22900-mock Answers ComPrimitives from sim-ecu
 
 **Date:** 2026-10-15
-**Status:** Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request)
+**Status:** Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; Decision item 4 and the receive timeout of item 5 hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it: see the mock's testing guide, "Response pending handling")
 **Affects:** `crates/iso22900-mock` (`PDUStartComPrimitive`, event items, `__mock_sim_ecu_control`,
 `NGR_SIM_ECU_CONFIG`), `crates/iso22900-service/tests/grpc_mock.rs`
 

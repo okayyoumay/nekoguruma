@@ -226,6 +226,97 @@ impl Default for TesterPresent {
     }
 }
 
+/// The ComParams of the response pending handling (Annex B.5.1), by the values the mock keeps
+/// (ADR-299, extended): `CP_RC78Handling`, `CP_P2Star`, `CP_RC78CompletionTimeout` and
+/// `CP_RCByteOffset`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Rc78 {
+    /// 0 passes each response pending message on as a result item; 1 absorbs them until the
+    /// completion timeout; 2 absorbs them with no limit.
+    handling: u32,
+    /// The receive timeout after a response pending message, in microseconds.
+    p2_star_us: u32,
+    /// How long a chain of response pending messages is accepted, in microseconds.
+    completion_us: u32,
+    /// The index of the response code in a negative response, counted from 0 (the agent sets 2
+    /// for `7F SID code`); 0xFFFF_FFFF is the last byte.
+    byte_offset: u32,
+}
+
+/// The mock's start: handling off, so a response pending message is passed on as before (the
+/// B.5.1 default of UDS on CAN is on, which a library has and the mock does not unless a ComParam
+/// turns it on), and the B.5.1 timings of the UDS protocols.
+impl Default for Rc78 {
+    fn default() -> Self {
+        Self {
+            handling: 0,
+            p2_star_us: 5_000_000,
+            completion_us: 25_000_000,
+            byte_offset: 0xFFFF_FFFF,
+        }
+    }
+}
+
+/// A ComParam of [`Rc78`].
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Rc78Param {
+    Handling,
+    P2Star,
+    Completion,
+    ByteOffset,
+}
+
+/// The [`Rc78`] ComParam with object id `id`.
+fn rc78_param(id: UNUM32) -> Option<Rc78Param> {
+    let (name, _) = STANDARD_COMPARAMS.iter().find(|(_, known)| *known == id)?;
+    Some(match *name {
+        "CP_RC78Handling" => Rc78Param::Handling,
+        "CP_P2Star" => Rc78Param::P2Star,
+        "CP_RC78CompletionTimeout" => Rc78Param::Completion,
+        "CP_RCByteOffset" => Rc78Param::ByteOffset,
+        _ => return None,
+    })
+}
+
+impl Rc78 {
+    fn number(&self, param: Rc78Param) -> u32 {
+        match param {
+            Rc78Param::Handling => self.handling,
+            Rc78Param::P2Star => self.p2_star_us,
+            Rc78Param::Completion => self.completion_us,
+            Rc78Param::ByteOffset => self.byte_offset,
+        }
+    }
+
+    /// Stores `value`; false for one outside the range of B.5.1 (handling 0 to 2, offset not 0).
+    fn set_number(&mut self, param: Rc78Param, value: u32) -> bool {
+        match param {
+            Rc78Param::Handling if value <= 2 => self.handling = value,
+            Rc78Param::ByteOffset if value != 0 => self.byte_offset = value,
+            Rc78Param::P2Star => self.p2_star_us = value,
+            Rc78Param::Completion => self.completion_us = value,
+            _ => return false,
+        }
+        true
+    }
+
+    /// Whether `message` is a response pending message: a negative response with 0x78 at the
+    /// response code offset.
+    fn is_pending(&self, message: &[u8]) -> bool {
+        let index = if self.byte_offset == 0xFFFF_FFFF {
+            message.len().checked_sub(1)
+        } else {
+            Some(self.byte_offset as usize)
+        };
+        message.first() == Some(&0x7F) && index.and_then(|i| message.get(i)) == Some(&0x78)
+    }
+}
+
+/// Microseconds as whole milliseconds, rounded up (the mock's schedule counts milliseconds).
+fn us_to_ms(us: u32) -> u32 {
+    us.div_ceil(1_000)
+}
+
 /// The longest a tester-present byte field may be (`ParamMaxLen` of B.5.1).
 const TESTER_PRESENT_MAX_LEN: usize = 12;
 
@@ -376,6 +467,11 @@ struct MockState {
     /// The tester-present ComParams in force: the working buffer as a STARTCOMM or an
     /// UPDATEPARAM last copied it.
     tp_active: TesterPresent,
+    /// The response pending ComParams `PDUSetComParam` wrote: the working buffer (8.4.15.6).
+    rc78_working: Rc78,
+    /// The response pending ComParams in force: the working buffer as `PDUConnect` or an
+    /// UPDATEPARAM last copied it. A ComPrimitive takes its values from here when it is started.
+    rc78_active: Rc78,
     /// When the next tester-present is due; `None` while the tester-present is off, that is,
     /// unless the link is COMM_STARTED with the active handling on.
     tp_due: Option<Instant>,
@@ -387,6 +483,8 @@ impl MockState {
         self.go_online();
         self.tp_working = TesterPresent::default();
         self.tp_active = TesterPresent::default();
+        self.rc78_working = Rc78::default();
+        self.rc78_active = Rc78::default();
     }
 
     /// The link is ONLINE with no tester-present. A ComPrimitive still waiting or running keeps
@@ -693,6 +791,8 @@ struct WaitingCop {
     event: PendingEvent,
     /// The request and cycles of a send-and-receive ComPrimitive with request bytes, for the ECU.
     request: Option<(Vec<u8>, Cycles)>,
+    /// The response pending ComParams in force when it was started.
+    rc78: Rc78,
     /// The state change its last item makes when delivered.
     hook: Option<Hook>,
 }
@@ -709,7 +809,7 @@ fn begin_next(state: &mut MockState, now: Instant) {
     let mut events = match (state.ecu.as_mut(), cop.request) {
         (Some(ecu), Some((request, cycles))) => {
             let sent = clock_at(now);
-            let mut events = ecu_events(ecu, &request, cycles, &cop.event);
+            let mut events = ecu_events(ecu, &request, cycles, cop.rc78, &cop.event);
             // The request is sent now; each response item carries that as its transmit done.
             for (_, event) in &mut events {
                 if matches!(event.kind, EventKind::Result(_)) {
@@ -985,14 +1085,93 @@ fn cycles(control: Option<&PDU_COP_CTRL_DATA>) -> Cycles {
     }
 }
 
+/// What a send-and-receive ComPrimitive receives of the ECU's messages: `pending` (response
+/// pending messages with their delays), then `response` at `response_delay_ms`, or nothing; and
+/// the delay at which it ends.
+///
+/// With the handling off, each pending message is a result item, and a missing response is a
+/// receive timeout right after the last message (the mock keeps no P2Max). With the handling on
+/// (ISO 22900-2 (2022) B.5.1, Table 9, Figure I.4), the pending messages are absorbed: each
+/// reloads the receive timer with P2*, so the next message is due within P2* of it and, with
+/// handling 1, within the completion timeout of the first. Only the response is a result item;
+/// when a message comes too late, or the ECU sends no response, the receive timeout is the item,
+/// at the instant the timer ran out, and the response (if any) is not delivered.
+fn receive_events(
+    rc78: Rc78,
+    pending: Vec<(u32, Vec<u8>)>,
+    response: Option<Vec<u8>>,
+    response_delay_ms: u32,
+) -> (Vec<(u32, EventKind)>, u32) {
+    let timeout = |at| {
+        (
+            at,
+            EventKind::Error(
+                E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
+            ),
+        )
+    };
+    let absorbed = rc78.handling != 0
+        && !pending.is_empty()
+        && pending.iter().all(|(_, bytes)| rc78.is_pending(bytes));
+    if !absorbed {
+        let mut events: Vec<(u32, EventKind)> = pending
+            .into_iter()
+            .map(|(delay_ms, bytes)| (delay_ms, EventKind::Result(bytes)))
+            .collect();
+        let last = match response {
+            Some(bytes) => {
+                events.push((response_delay_ms, EventKind::Result(bytes)));
+                response_delay_ms
+            }
+            None => {
+                let at = events.last().map_or(0, |(delay_ms, _)| *delay_ms);
+                events.push(timeout(at));
+                at
+            }
+        };
+        return (events, last);
+    }
+    let p2_star_ms = us_to_ms(rc78.p2_star_us);
+    let first = pending[0].0;
+    let completion =
+        (rc78.handling == 1).then(|| first.saturating_add(us_to_ms(rc78.completion_us)));
+    // The instant the receive timer runs out: P2* after the last pending message, or the end of
+    // the completion timeout, whichever is first.
+    let limit = |last_pending: u32| {
+        let reload = last_pending.saturating_add(p2_star_ms);
+        completion.map_or(reload, |end| reload.min(end))
+    };
+    let mut last_pending = first;
+    for (at, _) in &pending[1..] {
+        if *at > limit(last_pending) {
+            let at = limit(last_pending);
+            return (vec![timeout(at)], at);
+        }
+        last_pending = *at;
+    }
+    match response {
+        Some(bytes) if response_delay_ms <= limit(last_pending) => (
+            vec![(response_delay_ms, EventKind::Result(bytes))],
+            response_delay_ms,
+        ),
+        _ => {
+            let at = limit(last_pending);
+            (vec![timeout(at)], at)
+        }
+    }
+}
+
 /// The events a `PDU_COPT_SENDRECV` ComPrimitive gets from the attached ECU, each with its delay
 /// from the request in milliseconds (ADR-299): the `PDU_COPST_EXECUTING` status item; when it
 /// receives, a result item for each response pending message and for the response, or a receive
-/// timeout error item when the ECU sends no response; then the `PDU_COPST_FINISHED` status item.
+/// timeout error item when the ECU sends no response ([`receive_events`] decides, by `rc78`, whether
+/// the pending messages are items or absorbed); then the `PDU_COPST_FINISHED` status item.
 fn ecu_events(
     ecu: &mut SimEcu,
     request: &[u8],
     cycles: Cycles,
+    rc78: Rc78,
     event: &PendingEvent,
 ) -> Vec<(u32, PendingEvent)> {
     let with = |kind| PendingEvent {
@@ -1013,31 +1192,17 @@ fn ecu_events(
         events.push((0, with(EventKind::Status(E_PDU_STATUS::PDU_COPST_FINISHED))));
         return events;
     }
-    events.extend(
-        exchange
-            .pending
-            .into_iter()
-            .map(|(delay_ms, bytes)| (delay_ms, with(EventKind::Result(bytes)))),
+    let (received, last) = receive_events(
+        rc78,
+        exchange.pending,
+        exchange.response.to_bytes(),
+        exchange.delay_ms,
     );
-    let last = match exchange.response.to_bytes() {
-        Some(bytes) => {
-            events.push((exchange.delay_ms, with(EventKind::Result(bytes))));
-            exchange.delay_ms
-        }
-        None => {
-            // The mock keeps no timing ComParams, so there is no P2 to wait for: the timeout
-            // is reported right after the last message the ECU sent.
-            let at = events.last().map_or(0, |(delay_ms, _)| *delay_ms);
-            events.push((
-                at,
-                with(EventKind::Error(
-                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
-                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
-                )),
-            ));
-            at
-        }
-    };
+    events.extend(
+        received
+            .into_iter()
+            .map(|(delay_ms, kind)| (delay_ms, with(kind))),
+    );
     events.push((
         last,
         with(EventKind::Status(E_PDU_STATUS::PDU_COPST_FINISHED)),
@@ -1430,6 +1595,7 @@ exported_fn!(PDUDestroyComLogicalLink(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_E
 exported_fn!(PDUConnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.counters.connect += 1;
+    guard.rc78_active = guard.rc78_working;
     drop(guard);
     no_error()
 });
@@ -1458,11 +1624,16 @@ exported_fn!(PDUUnlockResource(_h_mod: UNUM32, _h_cll: UNUM32, _lock_mask: UNUM3
     no_error()
 });
 
-// The tester-present ComParams are read back as the working value (8.4.16) when numeric; a byte
+// The tester-present and the response pending ComParams are read back as the working value (8.4.16) when numeric; a byte
 // field, like every other ComParam, reads as the number 0, as `PDUDestroyItem` frees a ComParam
 // item's data as one.
 exported_fn!(PDUGetComParam(_h_mod: UNUM32, _h_cll: UNUM32, param_id: UNUM32, p_param_item: *mut *mut PDU_PARAM_ITEM) -> T_PDU_ERROR {
     let (value, class) = match tester_present_param(param_id) {
+        None if rc78_param(param_id).is_some() => {
+            let guard = state().lock().expect("mock state poisoned");
+            let param = rc78_param(param_id).expect("checked");
+            (guard.rc78_working.number(param), E_PDU_PC::PDU_PC_COM)
+        }
         Some(param) => {
             let guard = state().lock().expect("mock state poisoned");
             (
@@ -1476,12 +1647,26 @@ exported_fn!(PDUGetComParam(_h_mod: UNUM32, _h_cll: UNUM32, param_id: UNUM32, p_
 });
 
 // Stores the tester-present ComParams in the working buffer (ADR-423); they take effect with a
-// STARTCOMM or an UPDATEPARAM. Any other ComParam is accepted and forgotten. A tester-present
+// STARTCOMM or an UPDATEPARAM. The response pending ComParams are stored in another working buffer
+// that PDUConnect and an UPDATEPARAM copy to the active one (ADR-299, extended); a wrong data type or a value
+// out of range is refused. Any other ComParam is accepted and forgotten. A tester-present
 // ComParam of the wrong data type, or a byte field longer than 12 bytes, is refused.
 exported_fn!(PDUSetComParam(_h_mod: UNUM32, _h_cll: UNUM32, p_param_item: *mut PDU_PARAM_ITEM) -> T_PDU_ERROR {
     let Some(item) = (unsafe { p_param_item.as_ref() }) else {
         return no_error();
     };
+    if let Some(param) = rc78_param(item.ComParamId) {
+        if item.pComParamData.is_null() || item.ComParamDataType != E_PDU_PT::PDU_PT_UNUM32 {
+            return invalid_parameters();
+        }
+        let value = unsafe { *item.pComParamData.cast::<UNUM32>() };
+        let mut guard = state().lock().expect("mock state poisoned");
+        return if guard.rc78_working.set_number(param, value) {
+            no_error()
+        } else {
+            invalid_parameters()
+        };
+    }
     let Some(param) = tester_present_param(item.ComParamId) else {
         return no_error();
     };
@@ -1556,9 +1741,17 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
                 || cop_type == E_PDU_COPT::PDU_COPT_STARTCOMM;
             let request = (sends && !request.is_empty())
                 .then(|| (request.to_vec(), cycles(control)));
+            // An UPDATEPARAM copies the working buffer before it is queued (8.4.15.6 step 12); a
+            // ComPrimitive is tied to the active buffer as it is then. The TempParamUpdate flag
+            // (working buffer for one ComPrimitive) is not supported.
+            if cop_type == E_PDU_COPT::PDU_COPT_UPDATEPARAM {
+                guard.rc78_active = guard.rc78_working;
+            }
+            let rc78 = guard.rc78_active;
             guard.waiting.push_back(WaitingCop {
                 event,
                 request,
+                rc78,
                 hook,
             });
             // On an idle link it begins at once, as it would without the delivery thread.
@@ -2592,6 +2785,161 @@ mod delivery_tests {
     }
 }
 
+/// What a send-and-receive ComPrimitive receives when the library absorbs response pending
+/// messages (`CP_RC78Handling`) and when it does not.
+#[cfg(test)]
+mod response_pending_tests {
+    use super::*;
+
+    fn pending(delays: &[u32]) -> Vec<(u32, Vec<u8>)> {
+        delays
+            .iter()
+            .map(|d| (*d, vec![0x7F, 0x22, 0x78]))
+            .collect()
+    }
+
+    fn rc78(handling: u32, p2_star_ms: u32, completion_ms: u32) -> Rc78 {
+        Rc78 {
+            handling,
+            p2_star_us: p2_star_ms * 1_000,
+            completion_us: completion_ms * 1_000,
+            byte_offset: 2,
+        }
+    }
+
+    fn timeout_at(at: u32) -> (u32, EventKind) {
+        (
+            at,
+            EventKind::Error(
+                E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP,
+            ),
+        )
+    }
+
+    /// Compares the kinds, which have no `PartialEq`, by their debug-free shape.
+    fn shape(events: &[(u32, EventKind)]) -> Vec<(u32, String)> {
+        events
+            .iter()
+            .map(|(at, kind)| {
+                let text = match kind {
+                    EventKind::Result(bytes) => format!("result {bytes:02X?}"),
+                    EventKind::Error(code, extra) => format!("error {} {extra:#x}", code.0),
+                    _ => "other".to_owned(),
+                };
+                (*at, text)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn with_the_handling_off_each_pending_message_is_a_result_item() {
+        let answer = Some(vec![0x62, 0xF1, 0x90]);
+        let (events, last) = receive_events(Rc78::default(), pending(&[0, 20]), answer.clone(), 40);
+        assert_eq!(last, 40);
+        assert_eq!(
+            shape(&events),
+            [
+                (0, "result [7F, 22, 78]".to_owned()),
+                (20, "result [7F, 22, 78]".to_owned()),
+                (40, "result [62, F1, 90]".to_owned()),
+            ]
+        );
+        // Silence after the pending messages: the timeout comes right after the last of them.
+        let (events, last) = receive_events(Rc78::default(), pending(&[0, 20]), None, 0);
+        assert_eq!(last, 20);
+        assert_eq!(shape(&events)[2], shape(&[timeout_at(20)])[0]);
+        assert_eq!(events.len(), 3);
+    }
+
+    #[test]
+    fn with_the_handling_on_the_pending_messages_are_absorbed_and_the_answer_delivered() {
+        let answer = Some(vec![0x62, 0xF1, 0x90]);
+        for handling in [1, 2] {
+            let (events, last) = receive_events(
+                rc78(handling, 100, 1_000),
+                pending(&[0, 20]),
+                answer.clone(),
+                40,
+            );
+            assert_eq!(last, 40);
+            assert_eq!(shape(&events), [(40, "result [62, F1, 90]".to_owned())]);
+        }
+    }
+
+    #[test]
+    fn with_the_handling_on_silence_after_a_pending_message_is_only_the_timeout() {
+        // P2* after the last pending message (20 ms + 100 ms).
+        let (events, last) = receive_events(rc78(1, 100, 1_000), pending(&[0, 20]), None, 0);
+        assert_eq!(last, 120);
+        assert_eq!(shape(&events), shape(&[timeout_at(120)]));
+        // A message later than P2* after the one before it comes too late.
+        let (events, last) = receive_events(
+            rc78(2, 100, 1_000),
+            pending(&[0, 150]),
+            Some(vec![0x62]),
+            160,
+        );
+        assert_eq!(last, 100);
+        assert_eq!(shape(&events), shape(&[timeout_at(100)]));
+        // The answer itself may be too late too.
+        let (events, last) =
+            receive_events(rc78(1, 100, 1_000), pending(&[0]), Some(vec![0x62]), 101);
+        assert_eq!(last, 100);
+        assert_eq!(shape(&events), shape(&[timeout_at(100)]));
+    }
+
+    #[test]
+    fn the_completion_timeout_ends_a_chain_of_pending_messages_unless_the_handling_is_unlimited() {
+        // A message every 40 ms, within P2* of 100 ms, past the 100 ms completion timeout of
+        // handling 1, which counts from the first.
+        let chain = pending(&[0, 40, 80, 120, 160]);
+        let (events, last) =
+            receive_events(rc78(1, 100, 100), chain.clone(), Some(vec![0x62]), 200);
+        assert_eq!(last, 100);
+        assert_eq!(shape(&events), shape(&[timeout_at(100)]));
+        let (events, last) = receive_events(rc78(2, 100, 100), chain, Some(vec![0x62]), 200);
+        assert_eq!(last, 200);
+        assert_eq!(shape(&events), [(200, "result [62]".to_owned())]);
+    }
+
+    #[test]
+    fn the_response_code_offset_decides_what_is_a_pending_message() {
+        let found = Rc78 {
+            byte_offset: 2,
+            ..Rc78::default()
+        };
+        assert!(found.is_pending(&[0x7F, 0x22, 0x78]));
+        assert!(!found.is_pending(&[0x7F, 0x22, 0x31]));
+        assert!(!found.is_pending(&[0x62, 0x22, 0x78]));
+        let last = Rc78::default();
+        assert!(last.is_pending(&[0x7F, 0x22, 0x78]));
+        // With the offset elsewhere the messages are not pending ones: passed on.
+        let elsewhere = Rc78 {
+            handling: 1,
+            byte_offset: 1,
+            ..Rc78::default()
+        };
+        let (events, _) = receive_events(elsewhere, pending(&[0]), Some(vec![0x62]), 5);
+        assert_eq!(events.len(), 2);
+    }
+
+    #[test]
+    fn the_comparams_are_range_checked() {
+        let mut rc78 = Rc78::default();
+        assert!(rc78.set_number(Rc78Param::Handling, 2));
+        assert!(!rc78.set_number(Rc78Param::Handling, 3));
+        assert!(!rc78.set_number(Rc78Param::ByteOffset, 0));
+        assert!(rc78.set_number(Rc78Param::ByteOffset, 2));
+        assert_eq!((rc78.handling, rc78.byte_offset), (2, 2));
+        assert_eq!(
+            rc78_param(standard_comparam_id("CP_P2Star").unwrap()).map(|p| p == Rc78Param::P2Star),
+            Some(true)
+        );
+        assert!(rc78_param(standard_comparam_id("CP_P2Max").unwrap()).is_none());
+    }
+}
+
 /// The link's tester-present (ADR-423), driven through the exported functions of the mock.
 #[cfg(test)]
 mod tester_present_tests {
@@ -3374,6 +3722,115 @@ mod tester_present_tests {
             events
                 .iter()
                 .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
+    }
+
+    /// The mock's response pending ComParams, set the way the agent does, absorb a pending
+    /// message of the ECU: a suppressed request gets only the receive timeout (the silence),
+    /// and with the handling off (the start) the pending message is a result item.
+    #[test]
+    fn a_pending_message_is_absorbed_once_the_handling_is_set() {
+        let rig = Rig::new();
+        let pending = Seen::Result(vec![0x7F, 0x10, 0x78]);
+        let silent = r#"[{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,131]}},
+            {"inject_fault":{"fault":"drop_response","request":[16,131]}}]"#;
+        let arm = |rig: &Rig| {
+            for command in serde_json::from_str::<Vec<serde_json::Value>>(silent).unwrap() {
+                rig.ecu(&command.to_string());
+            }
+        };
+        arm(&rig);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let events = rig.finished(cop);
+        let kinds: Vec<&Seen> = events.iter().map(|(_, seen)| seen).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EXECUTING,
+                &pending,
+                &Seen::Error(
+                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP
+                ),
+                &FINISHED
+            ]
+        );
+
+        rig.set_number("CP_RC78Handling", 1);
+        rig.set_number("CP_P2Star", 50_000);
+        rig.set_number("CP_RCByteOffset", 2);
+        // Set after PDUConnect, the values are in the working buffer only: the pending message
+        // is still passed on until an UPDATEPARAM copies them.
+        arm(&rig);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let events = rig.finished(cop);
+        assert!(
+            events.iter().any(|(_, seen)| *seen == pending),
+            "{events:?}"
+        );
+        let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+        rig.finished_or_result(update);
+        arm(&rig);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x83]);
+        let started = Instant::now();
+        let events = rig.finished(cop);
+        let kinds: Vec<&Seen> = events.iter().map(|(_, seen)| seen).collect();
+        assert_eq!(
+            kinds,
+            [
+                &EXECUTING,
+                &Seen::Error(
+                    E_PDU_ERR_EVT::PDU_ERR_EVT_RX_TIMEOUT,
+                    MOCK_XTRA_ERR_RX_TIMEOUT_NO_RSP
+                ),
+                &FINISHED
+            ]
+        );
+        // The pending message came at 0 ms, so the timeout waited P2* (50 ms) after it.
+        assert!(
+            started.elapsed() >= Duration::from_millis(45),
+            "{:?}",
+            started.elapsed()
+        );
+
+        // A value out of range is refused, and a wrong data type too.
+        let mut value = 3u32;
+        let mut item = PDU_PARAM_ITEM {
+            ItemType: E_PDU_IT::PDU_IT_PARAM,
+            ComParamId: standard_comparam_id("CP_RC78Handling").unwrap(),
+            ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+            ComParamClass: E_PDU_PC::PDU_PC_COM,
+            pComParamData: (&mut value as *mut u32).cast(),
+        };
+        let status =
+            unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) };
+        assert_eq!(status, invalid_parameters());
+    }
+
+    /// `PDUConnect` copies the working response pending ComParams to the active ones.
+    #[test]
+    fn pdu_connect_activates_the_response_pending_comparams() {
+        let rig = Rig::new();
+        rig.set_number("CP_RC78Handling", 2);
+        rig.set_number("CP_P2Star", 50_000);
+        rig.set_number("CP_RCByteOffset", 2);
+        assert_eq!(state().lock().unwrap().rc78_active.handling, 0);
+        unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+        assert_eq!(state().lock().unwrap().rc78_active.handling, 2);
+        rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,3]}}"#);
+        let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x10, 0x03]);
+        let events = rig.finished(cop);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| *seen != Seen::Result(vec![0x7F, 0x10, 0x78])),
+            "{events:?}"
+        );
+        assert!(
+            events
+                .iter()
+                .any(|(_, seen)| matches!(seen, Seen::Result(bytes) if bytes[0] == 0x50)),
             "{events:?}"
         );
     }

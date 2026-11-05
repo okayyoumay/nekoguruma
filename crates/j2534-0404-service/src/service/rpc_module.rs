@@ -162,7 +162,7 @@ impl J2534Service {
         // (`j1850_bus_flavor`, `resolved_can_channel_mode`) are epoch-tagged
         // and self-validate on read against `device_epoch`, so this function
         // no longer needs to touch either of them at all -- see the epoch
-        // bump right after `slot.take()` below and ADR-107 addendum (h).
+        // bump before the close attempt below and ADR-107 addendum (h).
         let mut slot = self.lock_device_for(requested_handle).await?;
 
         // ISO 22900-2 §9.3.3: ModuleDisconnect must force-cleanup all resources.
@@ -189,8 +189,9 @@ impl J2534Service {
         // reacquired below to drain the map -- two separate acquisitions,
         // not one held across the whole function, so this never overlaps
         // the later `module_state` read inside the `if let Some(...) =
-        // slot.take()` block (`device_id -> module_state -> shared_channels`
-        // order, ADR-107 addendum).
+        // slot` block, which holds the device until its close
+        // (`device_id -> module_state -> shared_channels` order, ADR-107
+        // addendum).
         //
         // ADR-193 amendment (round 17, Codex review, P1, PR #101): tracks
         // whether the loop below takes a `None`-sentinel in-flight-start
@@ -239,8 +240,8 @@ impl J2534Service {
                 // native stop attempt first, not silent reliance on a
                 // broader teardown call alone. Round 17 reasoned that the
                 // imminent native teardown (`api.disconnect`/`api.close`,
-                // further down this function, gated on `slot.take()`
-                // returning `Some`) would clear a committed periodic
+                // further down this function, gated on a device
+                // being held in the slot) would clear a committed periodic
                 // device-side regardless, citing SAE J2534-1 §7.2.4
                 // (`PassThruDisconnect`) and §7.2.2 (`PassThruClose`) --
                 // also restated together in §7.2.7

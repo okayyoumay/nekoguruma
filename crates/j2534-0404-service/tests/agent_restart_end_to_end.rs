@@ -962,8 +962,8 @@ fn an_ecu_power_loss_mid_transfer_is_restarted_once_power_returns() {
 
 /// The VCI is unplugged while the agent waits after block 4 (design 5.6, 8.2.5; ADR-229 item 1,
 /// ADR-238): the next block's transfer fails on the lost device and the run ends there, keeping
-/// its guards and its journal; the link's first close fails on the lost device, and the second
-/// finds it gone and confirms it (ADR-393).
+/// its guards and its journal; the link's first close is answered `ERR_DEVICE_NOT_CONNECTED`,
+/// which confirms it (ADR-393, ADR-422).
 /// The ECU, untouched, stays in its programming session with the transfer running. The agent's
 /// next run, on a new worker with the VCI plugged back in, takes the same restart order as after
 /// an agent kill and completes, with the restart's ECUReset the only power cycle.
@@ -981,7 +981,7 @@ fn a_vci_disconnect_mid_transfer_is_restarted_once_the_vci_is_back() {
     assert!(env.commands_applied(), "the disconnect should be applied");
     assert!(
         !run.link_unconfirmed,
-        "the lost path's second close finds the link gone and the module's disconnect succeeds"
+        "the lost path's first close is answered ERR_DEVICE_NOT_CONNECTED and confirms the link"
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the lost device and took the link offline, so the
@@ -1078,7 +1078,9 @@ fn a_write_failure_mid_transfer_is_restarted() {
 
 /// The VCI crashes while the agent waits after block 4 (design 5.6, 13.4; ADR-229 item 1,
 /// ADR-292): it stays plugged in, but every J2534 call fails, so the next block's transfer fails
-/// and the run ends there, keeping its guards and its journal. The ECU, untouched, stays in its
+/// and the run ends there, keeping its guards and its journal; the link's first close releases
+/// the device but reports `ERR_FAILED`, so the worker keeps its slot, and the second close is
+/// answered `ERR_INVALID_DEVICE_ID` and confirms it (ADR-292, ADR-422). The ECU, untouched, stays in its
 /// programming session with the transfer running. The agent's next run, on a new worker whose
 /// VCI answers again, takes the same restart order as after an agent kill and completes, with
 /// the restart's ECUReset the only power cycle.
@@ -1096,7 +1098,8 @@ fn a_vci_crash_mid_transfer_is_restarted_once_the_vci_answers_again() {
     assert!(env.commands_applied(), "the crash should be applied");
     assert!(
         !run.link_unconfirmed,
-        "the lost path's second close finds the link gone and the module's disconnect succeeds"
+        "the first close releases the device but reports ERR_FAILED, so the worker keeps its slot; \
+         the second is answered ERR_INVALID_DEVICE_ID and confirms the link"
     );
     let first_attempt = assert_interrupted_at_the_next_block(&env, &spec, &run, |cause| {
         // The worker's receive poll met the failing VCI and took the link offline, as for a lost

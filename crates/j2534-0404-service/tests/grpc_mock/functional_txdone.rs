@@ -66,7 +66,15 @@ async fn subscribe(
 async fn start_functional_sendrecv(
     client: &mut VciServiceClient<tonic::transport::Channel>,
     cll: vci_service_interface::ComLogicalLinkHandle,
-) {
+) -> vci_service_interface::ComPrimitiveHandle {
+    start_functional_sendrecv_cycles(client, cll, 1).await
+}
+
+async fn start_functional_sendrecv_cycles(
+    client: &mut VciServiceClient<tonic::transport::Channel>,
+    cll: vci_service_interface::ComLogicalLinkHandle,
+    num_receive_cycles: i32,
+) -> vci_service_interface::ComPrimitiveHandle {
     client
         .start_com_primitive(StartComPrimitiveRequest {
             cop_tag: None,
@@ -76,7 +84,7 @@ async fn start_functional_sendrecv(
             cop_ctrl_data: Some(ComPrimitiveCtrlData {
                 time: 0,
                 num_send_cycles: 1,
-                num_receive_cycles: 1,
+                num_receive_cycles,
                 temp_param_update: 0,
                 expected_response_array: vec![ExpectedResponseData {
                     response_type: 0,
@@ -89,7 +97,10 @@ async fn start_functional_sendrecv(
             }),
         })
         .await
-        .expect("start_com_primitive(CoptSendrecv) should succeed");
+        .expect("start_com_primitive(CoptSendrecv) should succeed")
+        .into_inner()
+        .cop_handle
+        .expect("cop_handle should be present")
 }
 
 fn is_result_data(item: &vci_service_interface::EventItem) -> bool {
@@ -161,7 +172,10 @@ async fn functional_send_receive_delivers_its_tx_done_to_the_sender_only() {
 }
 
 /// A functional tester-present is not marked (ADR-099 handles its
-/// indication): on a link with a table its TxDone is not delivered.
+/// indication): on a link with a table its TxDone is not delivered. The table
+/// alone already keeps it out, so this guards a refactor of the marker's
+/// writers (a tester-present send must never set it), not today's behaviour
+/// against a different cause.
 #[tokio::test]
 #[serial]
 async fn functional_tester_present_tx_done_is_still_not_delivered() {
@@ -199,6 +213,105 @@ async fn functional_tester_present_tx_done_is_still_not_delivered() {
         "a tester-present TxDone is not a functional request's and stays undelivered"
     );
 
+    drop(events);
+    server.shutdown().await;
+}
+
+fn is_cop_status(item: &vci_service_interface::EventItem, status: i32) -> bool {
+    matches!(item.data, Some(event_item::Data::CopStatus(s)) if s == status)
+}
+
+/// A receive phase that ends by its `CP_P2Max` timeout clears the marker.
+#[tokio::test]
+#[serial]
+async fn the_marker_ends_with_a_receive_timeout() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let cll = table_link_with_functional_requests(&mut client, 0x7E8, 0x7E0).await;
+    set_com_param_unum32(&mut client, cll, j2534_0404::P2_MAX, 100_000).await;
+    promote_via_update_param(&mut client, cll).await;
+    let mut events = subscribe(&mut client, cll).await;
+
+    let cop = start_functional_sendrecv(&mut client, cll).await;
+    let finished = vci_service_interface::PduComPrimitiveStatus::PduCopstFinished as i32;
+    assert!(
+        wait_for_event(&mut events, 3000, |i| {
+            i.cop_handle == Some(cop) && is_cop_status(i, finished)
+        })
+        .await
+    );
+
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(FUNC_ID, &[]),
+        j2534_0404::ISO15765,
+        TX_DONE,
+    );
+    assert!(
+        !wait_for_event(&mut events, 300, is_result_data).await,
+        "the timeout ended the receive phase, so the marker is gone"
+    );
+    drop(events);
+    server.shutdown().await;
+}
+
+/// A cancelled send-receive clears the marker.
+#[tokio::test]
+#[serial]
+async fn the_marker_ends_with_a_cancel() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let cll = table_link_with_functional_requests(&mut client, 0x7E8, 0x7E0).await;
+    let mut events = subscribe(&mut client, cll).await;
+
+    let cop = start_functional_sendrecv(&mut client, cll).await;
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+    client
+        .cancel_com_primitive(vci_service_interface::CancelComPrimitiveRequest {
+            cop_handle: Some(cop),
+        })
+        .await
+        .expect("cancel_com_primitive should succeed");
+    let cancelled = vci_service_interface::PduComPrimitiveStatus::PduCopstCancelled as i32;
+    assert!(wait_for_event(&mut events, 3000, |i| is_cop_status(i, cancelled)).await);
+    tokio::time::sleep(tokio::time::Duration::from_millis(200)).await;
+
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(FUNC_ID, &[]),
+        j2534_0404::ISO15765,
+        TX_DONE,
+    );
+    assert!(
+        !wait_for_event(&mut events, 300, is_result_data).await,
+        "the cancel ended the receive phase, so the marker is gone"
+    );
+    drop(events);
+    server.shutdown().await;
+}
+
+/// A functional send with no receive phase (ADR-352 item 3 stands) sets no
+/// marker: its TxDone is not delivered to a link with a table.
+#[tokio::test]
+#[serial]
+async fn a_functional_send_with_no_receive_phase_is_unmarked() {
+    let server = TestServer::start().await;
+    let mut client = server.client().await;
+    let cll = table_link_with_functional_requests(&mut client, 0x7E8, 0x7E0).await;
+    let mut events = subscribe(&mut client, cll).await;
+
+    start_functional_sendrecv_cycles(&mut client, cll, 0).await;
+    wait_for_written_count(&server, MOCK_CHANNEL_ID, 1).await;
+    server.backdoor.inject_rx_with_status(
+        MOCK_CHANNEL_ID,
+        &can_frame(FUNC_ID, &[]),
+        j2534_0404::ISO15765,
+        TX_DONE,
+    );
+    assert!(
+        !wait_for_event(&mut events, 300, is_result_data).await,
+        "no receive phase, no marker"
+    );
     drop(events);
     server.shutdown().await;
 }

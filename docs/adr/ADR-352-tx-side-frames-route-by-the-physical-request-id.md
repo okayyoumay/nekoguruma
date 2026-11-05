@@ -1,7 +1,7 @@
 # ADR-352: TX-Side Frames Route by the Unique Response Entry's Physical Request ID
 
 **Date:** 2026-10-24
-**Status:** Accepted (Decision item 3 superseded by ADR-421)
+**Status:** Accepted (Decision item 3 superseded in part by ADR-421)
 **Affects:** `j2534-0404-service` (`events_rx_routing.rs`: `UniqueRespIdKey`, `route_frame`,
 `build_cll_rx_entries`), `sim-vci` (TxDone indications), `docs/j2534-0404-architecture.md`,
 `docs/rpc-api-guide.md`; design 8.11 "Link settings for the log", ADR-098, ADR-100, ADR-151,

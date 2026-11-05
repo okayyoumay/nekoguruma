@@ -666,3 +666,29 @@ async fn cop_tags_snapshot_survives_a_primitives_removal_racing_the_later_resolu
          landing after the snapshot but before this frame's own resolution"
     );
 }
+
+/// ADR-421: a marker is set only for the link's own generation and while it is
+/// still on the sending channel; a clear needs no channel.
+#[tokio::test]
+async fn set_open_func_tx_needs_the_generation_and_the_channel() {
+    let detached = LogicalLinkState {
+        channel_id: None,
+        ..minimal_link()
+    };
+    let links = Mutex::new(HashMap::from([
+        (PRESENT_CLL, detached),
+        (ABSENT_CLL, minimal_link()),
+    ]));
+    // minimal_link's generation is 7.
+    set_open_func_tx(&links, PRESENT_CLL, 7, CHANNEL, Some(0x7DF)).await;
+    set_open_func_tx(&links, ABSENT_CLL, 6, CHANNEL, Some(0x7DF)).await;
+    {
+        let guard = links.lock().await;
+        assert_eq!(guard[&PRESENT_CLL].open_func_tx, None, "no channel");
+        assert_eq!(guard[&ABSENT_CLL].open_func_tx, None, "other generation");
+    }
+    set_open_func_tx(&links, ABSENT_CLL, 7, CHANNEL, Some(0x7DF)).await;
+    assert_eq!(links.lock().await[&ABSENT_CLL].open_func_tx, Some(0x7DF));
+    set_open_func_tx(&links, ABSENT_CLL, 7, CHANNEL, None).await;
+    assert_eq!(links.lock().await[&ABSENT_CLL].open_func_tx, None);
+}

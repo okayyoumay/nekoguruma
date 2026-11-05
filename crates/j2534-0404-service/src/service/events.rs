@@ -8602,15 +8602,19 @@ fn func_tx_can_id(data: &[u8]) -> Option<u32> {
 
 /// Writes `LogicalLinkState::open_func_tx` (ADR-421) for the link's current
 /// connection only: a link that was reconnected or removed since `generation`
-/// keeps whatever its newer state holds.
+/// keeps whatever its newer state holds. Setting a marker also requires the
+/// link to still be on `channel_id`, so a set that lost the race with a
+/// disconnect leaves nothing behind for a later reconnect to inherit.
 async fn set_open_func_tx(
     logical_links: &Mutex<HashMap<u32, LogicalLinkState>>,
     cll_handle: u32,
     generation: u64,
+    channel_id: ChannelId,
     can_id: Option<u32>,
 ) {
     if let Some(link) = logical_links.lock().await.get_mut(&cll_handle)
         && link.connect_generation == generation
+        && (can_id.is_none() || link.channel_id == Some(channel_id))
     {
         link.open_func_tx = can_id;
     }
@@ -9211,6 +9215,7 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
                         &ctx.logical_links,
                         cll_handle,
                         connect_generation,
+                        ctx.channel_id,
                         func_tx_can_id(&data),
                     )
                     .await;
@@ -9356,7 +9361,14 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
         })
     };
     if !still_on_this_channel {
-        set_open_func_tx(&ctx.logical_links, cll_handle, connect_generation, None).await;
+        set_open_func_tx(
+            &ctx.logical_links,
+            cll_handle,
+            connect_generation,
+            ctx.channel_id,
+            None,
+        )
+        .await;
         emit_terminal_if_live(
             &ctx.primitives,
             &ctx.logical_links,
@@ -9445,7 +9457,14 @@ async fn handle_send_recv(cycle: SendRecvCycle, ctx: &ChannelPollCtx) -> Option<
         .await;
         // ADR-421: every exit of the wait (match quota, timeout, cancel,
         // staleness, tier-2 detach, re-request failure) ends the marker.
-        set_open_func_tx(&ctx.logical_links, cll_handle, connect_generation, None).await;
+        set_open_func_tx(
+            &ctx.logical_links,
+            cll_handle,
+            connect_generation,
+            ctx.channel_id,
+            None,
+        )
+        .await;
         match wait_outcome {
             ReceivePhaseOutcome::Terminal => return None,
             ReceivePhaseOutcome::CycleComplete => {}

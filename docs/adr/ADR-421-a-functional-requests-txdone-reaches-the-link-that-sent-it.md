@@ -57,13 +57,18 @@ exchange's target is the functional ID. Only the worker's routing was missing.
   worker's clock (ADR-400 item 2).
 - A TxDone read after the entry was written goes to the entry's late item, which restates the
   sent evidence; the answers keep their timing.
+- A loopback echo (`CP_Loopback`) of the request is a TX-side frame on the same ID, so it is
+  routed to the link the same way, and the agent attributes it as it does the TxDone.
 - A TxDone that is lost leaves nothing to attribute: the marker ends with the wait, and the
   entry has no transmit time, as before.
-- Residuals. While the link has an open tester-present window on the same functional ID (arm c
-  of ADR-099), that discard takes the client's TxDone; the agent's tester-present is physical
-  and its presence link arms none. A sibling's tester-present TxDone on the functional ID that
-  is enqueued after the P3Func gap but read inside the marker is taken for the request's, so
-  the transmit time can be early by up to that gap.
+- Residuals. The marker takes any TX-side frame on its ID that is read inside the wait, not
+  only this request's. A tester-present TxDone of a sibling enqueued after the P3Func gap, or the
+  TxDone of an earlier functional send with `NumReceiveCycles` 0 when `CP_P3Func` is 0 and the
+  gap wait returns without reading, can be taken for the request's, so the transmit time can be
+  early by up to the gap. The agent reaches neither. And while the link has an open tester-present
+  window on the same functional ID (arm c of ADR-099), that discard takes the client's TxDone;
+  the agent's tester-present is physical and its presence link arms none.
 - Another link with a table and the same functional ID that sends later does not overlap: ADR-419
   serializes the sends, and the marker of the later send takes the later TxDone.
-- ADR-352 item 3 is superseded for a functional send with a receive phase.
+- ADR-352 item 3 is superseded for a functional send with a receive phase and stands for one
+  without.

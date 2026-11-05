@@ -3886,6 +3886,8 @@ impl J2534Service {
             // default` already starts this field `None`), the actual fix
             // only for a reconnect.
             link.tp20_connection = None;
+            // ADR-421: a fresh generation never inherits a send's marker.
+            link.open_func_tx = None;
             // ADR-180 Decision 18: same reconnect-only reasoning as
             // Decision 17 just above -- a fresh `connect_generation` must
             // not inherit a prior generation's negotiation posture either,

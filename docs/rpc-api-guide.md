@@ -46,7 +46,7 @@ SystemHandle          (implicit — no ID)
 |-----|---------|----------|-------------|
 | `GetModuleIds` | `GetModuleIdsRequest` | `ModuleIdsResponse` | List all available VCI modules with their handles and status |
 | `ModuleConnect` | `ModuleConnectRequest` | `Response` | Activate a module (required before any link operations) |
-| `ModuleDisconnect` | `ModuleDisconnectRequest` | `Response` | Deactivate a module; optionally force-clean all its CLLs |
+| `ModuleDisconnect` | `ModuleDisconnectRequest` | `Response` | Deactivate a module; optionally force-clean all its CLLs. The J2534 worker keeps its device open when the library's close fails (other than by reporting the device gone), returns the error and sends no `ModuleListChg`; calling `ModuleDisconnect` again closes it (ADR-422) |
 
 **Typical sequence:**
 

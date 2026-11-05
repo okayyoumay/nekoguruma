@@ -2125,6 +2125,11 @@ struct MockState {
     /// the backlog entry
     /// citing ADR-087 for that path's lack of test coverage.
     write_msgs_error: Option<c_long>,
+    /// `(code, remaining)` set via `__mock_fail_closes`: the next `remaining`
+    /// `PassThruClose` calls return the raw J2534 error code `code` instead
+    /// of succeeding. The close counter is not advanced by a failed call.
+    /// `None` (the default after `__mock_reset`) means no override.
+    close_failures: Option<(c_long, u32)>,
     /// The `pName` argument of the most recent `PassThruOpen` call: `None` if
     /// it was called with a NULL `pName` (or has never been called since
     /// `__mock_reset`), `Some(bytes)` (NUL terminator excluded) if it was
@@ -2604,6 +2609,14 @@ exported_fn!(PassThruOpen(p_name: *mut c_void, p_device_id: *mut u32) -> c_long 
 
 exported_fn!(PassThruClose(_device_id: u32) -> c_long {
     let mut guard = state().lock().expect("mock state poisoned");
+    if let Some((code, remaining)) = guard.close_failures {
+        guard.close_failures = if remaining > 1 {
+            Some((code, remaining - 1))
+        } else {
+            None
+        };
+        return code;
+    }
     guard.counters.close += 1;
     no_error()
 });
@@ -5404,6 +5417,23 @@ exported_fn!(
     __mock_set_flow_control_filter_checks(max_filters: usize) -> c_long {
     let mut guard = state().lock().expect("mock state poisoned");
     guard.flow_control_filter_checks = (max_filters > 0).then_some(max_filters);
+    no_error()
+});
+
+exported_fn!(
+    /// Makes the next `times` `PassThruClose` calls fail with the given raw
+    /// J2534 error code instead of closing (the close counter is not
+    /// advanced by a failed call) -- lets tests exercise
+    /// `j2534-0404-service`'s `ModuleDisconnect` handling of a failed device
+    /// close (ADR-422). `times == 0` or `code == STATUS_NOERROR` (`0`)
+    /// clears the override (the default after `__mock_reset`).
+    __mock_fail_closes(code: c_long, times: u32) -> c_long {
+    let mut guard = state().lock().expect("mock state poisoned");
+    guard.close_failures = if times == 0 || code == STATUS_NOERROR as c_long {
+        None
+    } else {
+        Some((code, times))
+    };
     no_error()
 });
 

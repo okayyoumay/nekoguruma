@@ -1181,6 +1181,8 @@ fn the_control_export_rejects_what_it_cannot_parse() {
         r#"{"command": "fail_writes", "times": 0}"#,
         r#"{"command": "fail_writes", "times": -1}"#,
         r#"{"command": "clear_write_failures", "times": 1}"#,
+        r#"{"command": "fail_closes", "times": 0}"#,
+        r#"{"command": "clear_close_failures", "times": 1}"#,
     ] {
         assert_eq!(control(command), ERR_FAILED, "{command}");
     }
@@ -1872,6 +1874,46 @@ fn armed_write_failures_send_nothing() {
     );
     write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
     assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+}
+
+/// An armed close failure fails the close of the open device with `ERR_FAILED` and releases
+/// nothing; an unknown device ID keeps the count; a lost device is released only by the first
+/// close that is not armed to fail.
+#[test]
+fn armed_close_failures_release_nothing() {
+    let f = fixture();
+    assert_eq!(
+        control(r#"{"command": "fail_closes", "times": 2}"#),
+        STATUS_NOERROR
+    );
+    // An unknown ID is refused without using a count.
+    assert_eq!(PassThruClose(DEVICE_ID + 1), ERR_INVALID_DEVICE_ID);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    // The device is still open: the channel works.
+    write(f.channel, ECU_PHYSICAL_REQUEST_ID, &[0x3E, 0x00]);
+    assert_eq!(read(f.channel, 1, 1000).1, vec![response(&[0x7E, 0x00])]);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_FAILED);
+    assert_eq!(PassThruClose(DEVICE_ID), STATUS_NOERROR);
+    assert_eq!(PassThruClose(DEVICE_ID), ERR_INVALID_DEVICE_ID);
+
+    // Lost device: the armed close fails and leaves it lost; the next one releases it.
+    reset(default_ecu_config());
+    let mut device = 0;
+    assert_eq!(
+        unsafe { PassThruOpen(ptr::null(), &mut device) },
+        STATUS_NOERROR
+    );
+    assert_eq!(control(r#"{"command": "disconnect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "connect_vci"}"#), STATUS_NOERROR);
+    assert_eq!(control(r#"{"command": "fail_closes"}"#), STATUS_NOERROR);
+    assert_eq!(PassThruClose(device), ERR_FAILED);
+    assert_eq!(PassThruClose(device), ERR_FAILED);
+    assert_eq!(
+        control(r#"{"command": "clear_close_failures"}"#),
+        STATUS_NOERROR
+    );
+    assert_eq!(PassThruClose(device), ERR_DEVICE_NOT_CONNECTED);
+    assert_eq!(PassThruClose(device), ERR_INVALID_DEVICE_ID);
 }
 
 /// A crashed VCI fails every call but `PassThruGetLastError` with `ERR_FAILED`, a close included,

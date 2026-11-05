@@ -186,6 +186,8 @@ A control command is a JSON object tagged by `command`:
 | `{"command": "set_battery_voltage", "millivolts": N}` | sets the battery voltage `READ_VBATT` reports (default 12000) |
 | `{"command": "fail_writes", "times": N}` | the next `N` calls of `PassThruWriteMsgs` (at least 1) fail with `ERR_FAILED`, sending nothing; without `"times"`, every call fails until `clear_write_failures` |
 | `{"command": "clear_write_failures"}` | ends `fail_writes` |
+| `{"command": "fail_closes", "times": N}` | the next `N` calls of `PassThruClose` of the open device (at least 1; healthy, lost or crashed) fail with `ERR_FAILED` and release nothing, so the application can close again; without `"times"`, every close fails until `clear_close_failures`. A close of an unknown device ID answers `ERR_INVALID_DEVICE_ID` and keeps the count |
+| `{"command": "clear_close_failures"}` | ends `fail_closes` |
 | `{"command": "crash_vci"}` | crashes the VCI: it stays plugged in, but every J2534 call except `PassThruGetLastError` fails with `ERR_FAILED` (ADR-292) |
 | `{"command": "restart_vci"}` | restarts a crashed VCI |
 | `{"command": "hold_session"}` | holds a non-default session that has not timed out (`SimEcu::hold_session`): tS3_Server stops until the next request reaches the ECU. A test harness sends it from a process between two runs, so that the next run's start-up does not count against the session |

@@ -282,10 +282,10 @@ impl J2534Service {
                 // unlike `DisconnectComLogicalLink`/`DestroyComLogicalLink`:
                 // design-advisor confirmed there is nowhere left to
                 // leak-track this into that any retry mechanism could ever
-                // reach. `slot.take()` further down this function
-                // unconditionally clears `self.device_id` regardless of
-                // whether the native close that follows succeeds (ADR-107
-                // addendum (h)), and the opportunistic
+                // reach. This function's teardown drains
+                // `shared_channels` whether or not the native close that
+                // follows succeeds (a failed close keeps `self.device_id`,
+                // ADR-422, but not the channels), and the opportunistic
                 // `retry_leaked_periodic_message_stops`/
                 // `retry_leaked_repeat_message_stops` mechanisms
                 // (`rpc_misc.rs`) only ever probe a LIVE `SharedChannel` on
@@ -427,10 +427,11 @@ impl J2534Service {
         // Drop all shared channels: this stops the poll tasks and disconnects
         // the physical channels.  Then close the device.
         let channels: HashMap<_, _> = std::mem::take(&mut *self.shared_channels.lock().await);
-        let close_result = if let Some((_, id)) = slot.take() {
+        let close_result = if let Some(&(_, id)) = slot.as_ref() {
             // Every device CLOSE bumps the epoch, attempted or successful
             // (ADR-107 addendum (h)) -- bumped here, before the close is
-            // even attempted, so a failed `PassThruClose` below still
+            // even attempted, so a failed `PassThruClose` below, whose slot
+            // stays (ADR-422), still
             // invalidates `j1850_bus_flavor`/`resolved_can_channel_mode`
             // (both epoch-tagged and self-validating on read; this function
             // no longer clears them directly).
@@ -474,8 +475,37 @@ impl J2534Service {
                 let _ = api.disconnect(sc.channel_id);
             }
             let last_error = self.module_state.lock().await.last_error.clone();
-            api.close(id)
-                .map_err(|err| map_native_error_for_link("PassThruClose", &err, Some(last_error)))
+            // ADR-422: the slot is cleared only when the close ended the
+            // device's open state. Success does; so do the two codes that say
+            // the library no longer has the device (SAE J2534-1 6.10.1 and
+            // 7.2.2; ISO 22900-2:2022 9.4.30), also on a first close. Any
+            // other error keeps the slot, so a later ModuleDisconnect closes
+            // again and the open paths reuse the id.
+            match api.close(id) {
+                Ok(()) => {
+                    *slot = None;
+                    Ok(())
+                }
+                Err(j2534_0404::Error::ApiStatus { code, .. })
+                    if matches!(
+                        code.as_u32(),
+                        j2534_0404::ERR_INVALID_DEVICE_ID | j2534_0404::ERR_DEVICE_NOT_CONNECTED
+                    ) =>
+                {
+                    warn!(
+                        code = code.as_u32(),
+                        "ModuleDisconnect: PassThruClose says the device is already gone; \
+                         counted as closed"
+                    );
+                    *slot = None;
+                    Ok(())
+                }
+                Err(err) => Err(map_native_error_for_link(
+                    "PassThruClose",
+                    &err,
+                    Some(last_error),
+                )),
+            }
         } else {
             // Pins the invariant the no-leak-track decision above rests on:
             // `slot == None` here implies `channels` (already `mem::take`n
@@ -496,28 +526,26 @@ impl J2534Service {
             );
             Ok(())
         };
+        let slot_cleared = slot.is_none();
         drop(slot);
 
-        // Notify system subscribers that the module list has changed --
-        // unconditionally, before propagating any `PassThruClose` failure
-        // below (Codex review on PR #145). `slot.take()` above already
-        // cleared `self.device_id` regardless of whether the native close
-        // that follows succeeds; since ADR-132, `GetModuleIds` derives that
-        // row's status from `device_id`, so the moment the slot clears, the
-        // row has already changed (to `PDU_MODST_AVAIL`) whether or not
-        // `close_result` ends up `Err`. Emitting this before `close_result?`
-        // (rather than after, as previously) ensures a failed
-        // `PassThruClose` still notifies subscribers of that real change
-        // instead of silently leaving them on a stale module list -- this
-        // still fires (as before) even when nothing was open at all
-        // (`close_result` is trivially `Ok(())` in that case), unchanged
-        // from the pre-existing no-op-disconnect behavior.
-        events::send_system_info(
-            &self.subscriptions,
-            &self.system_event_buf,
-            vci_service_interface::PduInfo::ModuleListChg,
-        )
-        .await;
+        // Notify system subscribers that the module list has changed, before
+        // propagating any `PassThruClose` failure below, and only when the
+        // slot is `None` after the attempt (ADR-422). Since ADR-132,
+        // `GetModuleIds` derives the row's status from `device_id`, so the
+        // row changed (to `PDU_MODST_AVAIL`) exactly when the slot cleared:
+        // on a close that succeeded or was answered as already gone, and
+        // when nothing was open at all (unchanged from the no-op disconnect).
+        // A close that failed keeps the slot and the row, so subscribers have
+        // no change to learn of.
+        if slot_cleared {
+            events::send_system_info(
+                &self.subscriptions,
+                &self.system_event_buf,
+                vci_service_interface::PduInfo::ModuleListChg,
+            )
+            .await;
+        }
         close_result?;
 
         self.terminate_all_subscriptions(&queues).await;
@@ -1288,8 +1316,8 @@ mod tests {
     /// `SharedChannel::leaked_periodic_message_ids` -- design-advisor
     /// confirmed (see the collection site's own doc comment) there is
     /// nowhere left to leak-track this into that any retry mechanism could
-    /// ever reach, once this same call's own `slot.take()` unconditionally
-    /// clears `self.device_id` (ADR-107 addendum (h)).
+    /// ever reach, once this same call's own teardown has drained
+    /// `shared_channels` (ADR-107 addendum (h), ADR-422).
     #[tokio::test]
     #[serial(tp20_stop_periodic_call_counter)]
     async fn module_disconnect_issues_a_best_effort_periodic_stop_for_a_committed_broadcast_before_teardown()

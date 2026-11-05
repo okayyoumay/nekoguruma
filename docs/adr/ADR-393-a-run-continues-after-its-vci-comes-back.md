@@ -1,7 +1,9 @@
 # ADR-393: A Run Continues After Its VCI Comes Back
 
 **Date:** 2026-10-30
-**Status:** Accepted (item 2's "a worker that crashed is not restarted" superseded by ADR-394)
+**Status:** Accepted (item 2's "a worker that crashed is not restarted" superseded by ADR-394; item 2's second close finds a device the first close released: the
+worker keeps its slot after a failed close and counts the two answers that say the device is
+gone as closed, ADR-422)
 **Affects:** `agent` host (`HostError::resend_class`, `WorkerHost::reopen`), runner (`run_vm`,
 `JobLimits::vci_return_wait`, `reopen_poll`, `max_link_reopens`), restart (`repeat_decision`),
 communication log (`settle_loss`, `vci_connected`, `link_opened`); design 8.2.5, 8.11;

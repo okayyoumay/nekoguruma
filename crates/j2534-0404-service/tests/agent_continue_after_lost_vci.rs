@@ -7,7 +7,7 @@
 //! lost, as J2534-1 6.10.1 has it, until the library closes it, so the second read fails with
 //! the loss although the VCI is present again. With the reads `Safe` the run closes the
 //! lost link (the J2534 library releases the device on the first close yet reports the loss
-//! from it, so the close is made once more and the second finds the link gone), opens a new
+//! from it, which the worker counts as closed, ADR-422), opens a new
 //! one and finishes with the read's value; the log shows the loss, the reconnect, the
 //! settlement and the new link in that order. With the reads `Unsafe` the second read is
 //! delayed by the ECU and the VCI is lost while it is pending, so the request may have reached

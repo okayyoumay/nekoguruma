@@ -584,6 +584,9 @@ pub(crate) enum RefusalCause {
     /// An earlier primitive the agent stopped waiting for still holds the link, and the worker
     /// did not cancel it (design 8.11 "Settlement").
     LinkHeld,
+    /// Switching the worker's tester present on failed, or could not be done, so the job's
+    /// session is no longer kept alive (design 8.2.5, ADR-420 item 6).
+    KeepAliveFailed,
 }
 
 impl RefusalCause {
@@ -611,6 +614,7 @@ impl RefusalCause {
             }
             Self::SystemOwnReasons => "the system refused it for its own reasons (invalid parameters, a full queue or a request the protocol cannot carry)".to_owned(),
             Self::LinkHeld => "an earlier request the agent stopped waiting for still holds the link, and the system could not cancel it".to_owned(),
+            Self::KeepAliveFailed => "the system could not keep the session alive, so the job's next request was not sent".to_owned(),
         }
     }
 }
@@ -6902,6 +6906,7 @@ mod tests {
             RefusalCause::UndeclaredService,
             RefusalCause::SystemOwnReasons,
             RefusalCause::LinkHeld,
+            RefusalCause::KeepAliveFailed,
         ] {
             let evidence = evidence(&[0x36, 1], End::NotSent(cause));
             let entry = ExchangeEntry::build(4, evidence, LinkHistory::empty());
@@ -7713,6 +7718,7 @@ mod tests {
             End::NotSent(RefusalCause::EmptyRequest),
             End::NotSent(RefusalCause::UndeclaredService),
             End::NotSent(RefusalCause::SystemOwnReasons),
+            End::NotSent(RefusalCause::KeepAliveFailed),
             End::NotSent(RefusalCause::EarlierResponse),
             End::Unknown(UnknownCause::RpcFailure),
             End::Unknown(UnknownCause::WorkerNotAnswering),

@@ -2939,7 +2939,14 @@ impl GuardedHandle {
         }
         // The staged timings are in effect once the update has finished successfully; until
         // then (and when it fails, which is returned) the longer of the two is waited for.
-        if updates && let (Some(cll), Some(cop)) = (cll, response.cop_handle) {
+        // A handle that does not read the link's events (a job's: `!subscribes`) does not wait
+        // for the update: subscribing here would make the worker cancel the job's own
+        // subscription, and the job reads the update's end itself. The longer timings stay in
+        // force, as for an update that failed.
+        if updates
+            && self.shared.subscribes
+            && let (Some(cll), Some(cop)) = (cll, response.cop_handle)
+        {
             // An update that fails, is cancelled or times out is the call's error, and the
             // timings stay as they were.
             self.shared

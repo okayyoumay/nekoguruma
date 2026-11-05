@@ -64,6 +64,13 @@ pub(crate) struct Recorded {
     started_now: bool,
 }
 
+impl Recorded {
+    /// The link became COMM_STARTED by this exchange, by its StartComm or by the link's status.
+    pub(crate) fn started_now(self) -> bool {
+        self.started_now
+    }
+}
+
 impl KeepAlive {
     /// A link that has just opened, with the keep-alive `enabled`.
     pub(crate) fn new(enabled: bool) -> Self {
@@ -108,7 +115,8 @@ impl KeepAlive {
     /// The session `request` leaves the ECU in when it ended as `result`, or `None` when the
     /// record does not change (ADR-417 item 3, ADR-408): a positive answer to a session control
     /// (or the silence of one whose positive response is suppressed) enters the session its
-    /// sub-function names, an accepted ECUReset returns to the default session, and anything
+    /// sub-function names, an accepted ECUReset that resets the ECU (sub-function 01 to 03) returns to the default
+    /// session, and anything
     /// else, a negative answer or a failure, leaves it as it was.
     pub(crate) fn session_after(request: &[u8], result: &Result<Vec<u8>, HostError>) -> Option<u8> {
         let accepted = match result {
@@ -121,7 +129,12 @@ impl KeepAlive {
         }
         match request {
             [SID_SESSION_CONTROL, sub, ..] => Some(sub & !SUPPRESS_POSITIVE_RESPONSE),
-            [SID_ECU_RESET, ..] => Some(DEFAULT_SESSION),
+            // Only the sub-functions that reset the ECU (hard, key off/on, soft: 01 to 03) end
+            // its session; the two rapid-power-shutdown ones (04, 05) do not (ISO 14229-1:2026
+            // 9.3), and a tester-present kept running in the default session is harmless.
+            [SID_ECU_RESET, sub, ..] if (1..=3).contains(&(sub & !SUPPRESS_POSITIVE_RESPONSE)) => {
+                Some(DEFAULT_SESSION)
+            }
             _ => None,
         }
     }
@@ -204,6 +217,13 @@ impl KeepAlive {
         self.handling = switch == Switch::On;
     }
 
+    /// The ECU is in a non-default session on a link that is ONLINE, so no tester-present can
+    /// run: the status came late and said the link never started (ADR-420 item 5). The session is
+    /// not kept, which is the failure of a switch-on.
+    pub(crate) fn unkept(&self) -> bool {
+        self.enabled && self.link == LinkState::Online && self.session != DEFAULT_SESSION
+    }
+
     /// A switch-on failed: the next request is refused.
     pub(crate) fn fail(&mut self) {
         self.failed = true;
@@ -261,7 +281,7 @@ mod tests {
     fn the_session_record_follows_the_answers_that_change_the_session() {
         let refused = Err(HostError::NoResponse);
         type Row<'a> = (&'a [u8], Result<Vec<u8>, HostError>, Option<u8>);
-        let rows: [Row; 16] = [
+        let rows: [Row; 21] = [
             (
                 &[0x10, 0x02],
                 positive(&[0x50, 0x02, 0, 0x32, 1, 0xF4]),
@@ -278,6 +298,12 @@ mod tests {
             (&[0x11, 0x01], positive(&[0x51, 0x01]), Some(0x01)),
             (&[0x11, 0x81], positive(&[]), Some(0x01)),
             (&[0x11, 0x01], positive(&[0x7F, 0x11, 0x33]), None),
+            // Rapid power shutdown does not reset the ECU (ISO 14229-1:2026 9.3).
+            (&[0x11, 0x04], positive(&[0x51, 0x04, 0x10]), None),
+            (&[0x11, 0x05], positive(&[0x51, 0x05]), None),
+            (&[0x11, 0x84], positive(&[]), None),
+            (&[0x11, 0x03], positive(&[0x51, 0x03]), Some(0x01)),
+            (&[0x11, 0x02], positive(&[0x51, 0x02]), Some(0x01)),
             (&[0x11, 0x01], Err(HostError::NoResponse), None),
             // Another service's positive answer changes nothing.
             (&[0x22, 0xF1, 0x90], positive(&[0x62, 0xF1, 0x90, 1]), None),
@@ -383,6 +409,35 @@ mod tests {
         // Keep-alive off: no state to act on.
         let keep = KeepAlive::new(false);
         assert!(!keep.enabled() && !keep.handling());
+    }
+
+    /// ADR-420 item 5: a status that comes late and says ONLINE, with the ECU already in a
+    /// non-default session, leaves a session no tester-present runs for.
+    #[test]
+    fn a_late_online_status_with_a_non_default_session_leaves_the_session_unkept() {
+        let mut keep = KeepAlive::new(true);
+        // The start got no answer and its status could not be read; the next session control
+        // went as a send-receive and was answered.
+        let _ = keep.record(&[0x10, 0x02], true, &Err(HostError::NoResponse));
+        let mut recorded = keep.record(&[0x10, 0x03], false, &positive(&[0x50, 0x03]));
+        assert!(!keep.unkept());
+        keep.resolved(false, &mut recorded);
+        assert!(keep.unkept());
+        assert_eq!(keep.wanted(recorded), None);
+        // Started instead: the tester-present the start left on keeps it, and the exchange that
+        // resolved it says so.
+        let mut keep = KeepAlive::new(true);
+        let _ = keep.record(&[0x10, 0x02], true, &Err(HostError::NoResponse));
+        let mut recorded = keep.record(&[0x10, 0x03], false, &positive(&[0x50, 0x03]));
+        keep.resolved(true, &mut recorded);
+        assert!(!keep.unkept() && recorded.started_now());
+        assert_eq!(keep.wanted(recorded), None);
+        // Default session, or the keep-alive off: nothing is unkept.
+        let mut keep = KeepAlive::new(true);
+        let mut recorded = keep.record(&[0x10, 0x02], true, &Err(HostError::NoResponse));
+        keep.resolved(false, &mut recorded);
+        assert!(!keep.unkept());
+        assert!(!KeepAlive::new(false).unkept());
     }
 
     #[test]

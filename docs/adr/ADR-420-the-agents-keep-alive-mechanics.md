@@ -58,7 +58,7 @@ worker kinds and does not branch on which it is.
    `CP_RCByteOffset` stay among the link's own ComParams, where ADR-419 depends on them. A library
    that does not know one of these ComParams or refuses it is treated as for an indication
    ComParam: the link opens without the keep-alive (the handling is set to 0 on a best-effort
-   basis), `link_opened` says the ComParams were not accepted (`accepted: false`), and the host
+   basis), `link_opened` lists them as attempted with `accepted: false` (the handling with the 0 set afterwards, the value in force), and the host
    behaves as if the keep-alive were off for that link. The names are in `diag_ir::link::SET_BY_LINK`,
    so a document cannot override them (ADR-324 item 3); ADR-406 item 7's test keeps the two lists
    equal. `link_opened` names the byte fields by a hexadecimal `value_hex` in place of `value`;
@@ -80,15 +80,18 @@ worker kinds and does not branch on which it is.
    makes it COMM_STARTED; any other end that reached the worker makes it unknown (decision b), and
    the host asks `GetStatus` of the logical link: COMM_STARTED makes it started, ONLINE makes it
    ONLINE again (the next such request is a StartComm again), and an answer that fails or names
-   another state leaves it unknown, asked again after the next exchange. A refusal before the
+   another state leaves it unknown, asked again after the next exchange. It is not asked while a primitive the host stopped waiting for is unsettled (a StartComm the agent's deadline ended is a stray the next request cancels): the status of a link that primitive may still change says nothing, so the question waits for the exchange that settles it. A refusal before the
    start (`SendState::NotSent`) leaves the state as it was.
 
 4. **The session record.** `after_exchange(request, result)`, at the end of `exchange`, is the
-   only writer. Every request passes through it (send-receive, generic send-receive, flash
-   transfer, the presence request, the runner's and the restart's own reads). A DiagnosticSessionControl
+   only writer. Every request passes through `exchange`, and so through it (send-receive,
+   generic send-receive, flash transfer, the runner's and the restart's own reads; the presence
+   request does too, but its functional link has the keep-alive off, so nothing changes). A DiagnosticSessionControl
    answered positively, or by the silence of a suppressed positive response, records the
-   sub-function (suppress bit masked; 1 is the default); an ECUReset answered the same way records
-   the default session; a negative answer, a failure or a positive answer of another service
+   sub-function (suppress bit masked; 1 is the default); an ECUReset of a sub-function that resets the ECU (01 to 03, ISO 14229-1:2026 9.3) answered
+   the same way records the default session; the rapid-power-shutdown sub-functions (04, 05) do
+   not reset it and change nothing, a tester-present left running in the default session being
+   harmless; a negative answer, a failure or a positive answer of another service
    changes nothing (ADR-417 item 3, ADR-408). A restart's teardown on a fresh link therefore
    leaves the record in the default session and switches nothing.
 
@@ -101,14 +104,29 @@ worker kinds and does not branch on which it is.
    switches off; and when the link has just become started (by the StartComm or its status) with the
    record in the default session, it switches off, since the StartComm left the handling on
    (ADR-418 item 3). A StartComm answered positively into a non-default session switches nothing,
-   the handling being on from the open. The handling changes only when a switch succeeded.
+   the handling being on from the open. The handling changes only when a switch succeeded, or when a switch-off failed in a way
+   that leaves it unknown whether the update reached the worker (its start timed out or failed
+   without a refusal): the handling is then believed off, since a later switch-on is harmless if
+   it was on, and a handling believed on would never be switched on again. A refusal that names
+   its reason proves the update did not start, and the handling stays believed on.
+
+   The status can also come late: when it says ONLINE for a link whose record already holds a
+   non-default session (the start got no answer, its status could not be read, and a session
+   control went as a send-receive meanwhile), no tester-present runs for the session and no switch
+   can start one. The agent treats that as the failure of a switch-on (item 6): the next request
+   is refused and a failed `keep_alive` entry is written. Sending the next session control as a
+   StartComm instead would depend on the job sending one. When it says COMM_STARTED with the
+   handling still on, the tester-present the start left on keeps the session, and the log shows
+   the `on` entry with `means` `start_comm`.
 
 6. **A failed switch.** A failed switch-on leaves the session unkept, which is the loss ADR-418
    item 6 reports; a failed switch-off is only logged, as the handling stays on and the worker
    keeps sending a harmless tester-present. The request that triggered a failed switch-on returns
    its own result unchanged. In the first part, with no latch, the host keeps the failure and the
    next request of the host fails with `HostError::KeepAliveFailed` before anything is sent (not
-   sent, no in-run repeat), through the entry point the second part's latch uses; the second
+   sent, no in-run repeat; the entry has its own refusal cause, `keep_alive_failed`), through the
+   entry point the second part's latch uses (`send`; the presence request is on a link with no
+   keep-alive); the second
    part merges the failure into the latch and reports it as `HostError::SessionLost`.
 
 7. **The log.** Each switch, on or off, writes a `keep_alive` event beside the exchange entries

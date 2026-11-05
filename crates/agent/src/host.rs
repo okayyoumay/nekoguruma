@@ -1536,16 +1536,35 @@ impl<C: WorkerApi> WorkerHost<C> {
     ) {
         let mut recorded = self.keep_alive.record(request, start_comm, result);
         // A start that was not answered positively, or one whose status could not be read
-        // earlier: ask the link whether it reached COMM_STARTED (ADR-420 item 3).
+        // earlier: ask the link whether it reached COMM_STARTED (ADR-420 item 3). Not while a
+        // primitive the host stopped waiting for is unsettled: it may be that start, and the
+        // status of a link it may still change says nothing; the question waits for the next
+        // exchange, which settles it first.
         if self.keep_alive.needs_status()
+            && self.stray.is_none()
             && let Some(started) = self.link_started()
         {
             self.keep_alive.resolved(started, &mut recorded);
         }
+        if self.keep_alive.unkept() {
+            // The link never started although the ECU is in a non-default session: nothing
+            // keeps it, which is the failure of a switch-on (ADR-420 item 5).
+            self.log_keep_alive(
+                "on",
+                "start_comm",
+                Some(Detail {
+                    host_error: Some(host_error_name(&HostError::KeepAliveFailed)),
+                    ..Detail::default()
+                }),
+            );
+            self.keep_alive.fail();
+            return;
+        }
         let Some(switch) = self.keep_alive.wanted(recorded) else {
-            // A started link that is in a non-default session by the StartComm itself has its
-            // tester-present on since: the log shows it (ADR-420 item 7).
-            if start_comm
+            // A started link that is in a non-default session with the tester-present on since
+            // its start (the StartComm's, or the one the status showed) has it on: the log shows
+            // it (ADR-420 item 7).
+            if recorded.started_now()
                 && self.keep_alive.link() == LinkState::Started
                 && self.keep_alive.handling()
                 && self.keep_alive.session() != crate::keep_alive::DEFAULT_SESSION
@@ -1596,7 +1615,8 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// finished status is not waited for (the link runs its primitives in order, ISO 22900-2:2022
     /// 8.4.17, so the next one starts after it). Never `CoptStopcomm`. A success is recorded
     /// as the handling's new state; a failed switch-on is held for the next request
-    /// ([`HostError::KeepAliveFailed`]), a failed switch-off only logged (ADR-420 item 6).
+    /// ([`HostError::KeepAliveFailed`]), a failed switch-off only logged, and believed done when
+    /// its update may have reached the worker (ADR-420 item 6).
     fn switch_handling(&mut self, switch: Switch) {
         let on = switch == Switch::On;
         let handle = self.handle.clone();
@@ -1607,7 +1627,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 self.keep_alive.switched(switch);
                 self.log_keep_alive(action, "update_param", None);
             }
-            Err(error) => {
+            Err((error, may_have_applied)) => {
                 tracing::warn!(
                     error = %error.log_text(),
                     action,
@@ -1623,13 +1643,19 @@ impl<C: WorkerApi> WorkerHost<C> {
                 self.log_keep_alive(action, "update_param", Some(detail));
                 if on {
                     self.keep_alive.fail();
+                } else if may_have_applied {
+                    // The update may have reached the worker, which then has the tester-present
+                    // off: believe it off, since a later switch-on is harmless if it was on
+                    // (ADR-420 item 6).
+                    self.keep_alive.switched(Switch::Off);
                 }
             }
         }
     }
 
-    /// The two calls of [`WorkerHost::switch_handling`].
-    async fn send_handling(&mut self, on: bool) -> Result<(), HostError> {
+    /// The calls of [`WorkerHost::switch_handling`]. A failure comes with whether the update
+    /// primitive may have reached the worker (its start failed without a refusal).
+    async fn send_handling(&mut self, on: bool) -> Result<(), (HostError, bool)> {
         let name = crate::link::TESTER_PRESENT_HANDLING;
         let id = unary(
             self.timings.unary,
@@ -1640,7 +1666,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                     shortname: name.to_owned(),
                 }),
         )
-        .await?
+        .await
+        .map_err(|error| (error, false))?
         .pdu_object_id;
         unary(
             self.timings.unary,
@@ -1654,7 +1681,8 @@ impl<C: WorkerApi> WorkerHost<C> {
                 }),
             }),
         )
-        .await?;
+        .await
+        .map_err(|error| (error, false))?;
         // No data and no control data: the primitive only applies the ComParams set on the link.
         let tag = self.next_tag.to_be_bytes().to_vec();
         self.next_tag = self.next_tag.wrapping_add(1);
@@ -1669,7 +1697,11 @@ impl<C: WorkerApi> WorkerHost<C> {
                 cop_ctrl_data: None,
             }),
         )
-        .await?;
+        .await
+        .map_err(|error| {
+            let may_have_applied = error.send_state() == SendState::MayHaveReached;
+            (error, may_have_applied)
+        })?;
         Ok(())
     }
 
@@ -3207,6 +3239,7 @@ fn refusal_cause(request: &[u8], error: &HostError) -> RefusalCause {
         HostError::NoTransferActive => RefusalCause::NoTransferActive,
         HostError::BlockTooLong { .. } => RefusalCause::BlockTooLong,
         HostError::NoBlockLength { .. } => RefusalCause::EarlierResponse,
+        HostError::KeepAliveFailed => RefusalCause::KeepAliveFailed,
         _ => RefusalCause::PreparationError,
     }
 }
@@ -4359,7 +4392,7 @@ mod tests {
 
     #[test]
     fn a_refusal_names_its_cause() {
-        let cases: [(&[u8], HostError, RefusalCause); 9] = [
+        let cases: [(&[u8], HostError, RefusalCause); 10] = [
             (
                 &[],
                 HostError::BadService(0x1FF),
@@ -4398,6 +4431,11 @@ mod tests {
                     response: vec![0x74],
                 },
                 RefusalCause::EarlierResponse,
+            ),
+            (
+                &[0x22],
+                HostError::KeepAliveFailed,
+                RefusalCause::KeepAliveFailed,
             ),
             (
                 &[0x22],

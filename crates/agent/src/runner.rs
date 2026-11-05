@@ -15348,6 +15348,8 @@ def main():
         /// The logical link status `GetStatus` gives (`PduComLogicalLinkStatus` as a number);
         /// none: the fake does not implement the call.
         status: Arc<Mutex<Option<i32>>>,
+        /// What the first `GetStatus` calls give instead, one per call (`None`: the call fails).
+        status_script: Arc<Mutex<std::collections::VecDeque<Option<i32>>>>,
         /// What the first StartComPrimitive calls of type UpdateParam answer (`None`: success,
         /// `Some`: fail with the status), one per call; later ones succeed.
         updates: Arc<Mutex<UpdateScript>>,
@@ -15355,6 +15357,13 @@ def main():
 
     impl KeepRecord {
         /// The types of the primitives started, in order.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(
+                dead_code,
+                reason = "only the session tests, which need the simulator permission of a debug build, use it"
+            )
+        )]
         fn types(&self) -> Vec<vci_service_interface::ComOperationType> {
             self.starts
                 .lock()
@@ -15393,6 +15402,13 @@ def main():
         /// A pending (`7F 22 78`) bound to the primitive.
         Pending(u32),
         /// A received result bound to the primitive, with these bytes.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(
+                dead_code,
+                reason = "only the session tests, which need the simulator permission of a debug build, use it"
+            )
+        )]
         Bytes(u32, &'static [u8]),
         /// A receive timeout bound to the primitive.
         TimeOut(u32),
@@ -16055,7 +16071,8 @@ def main():
             _: tonic::Request<vci_service_interface::GetStatusRequest>,
         ) -> Result<tonic::Response<vci_service_interface::StatusResponse>, tonic::Status> {
             self.note("GetStatus");
-            let status = *self.tagging.keep.status.lock().unwrap();
+            let scripted = self.tagging.keep.status_script.lock().unwrap().pop_front();
+            let status = scripted.unwrap_or(*self.tagging.keep.status.lock().unwrap());
             let Some(status) = status else {
                 return unimplemented();
             };
@@ -16323,6 +16340,13 @@ def main():
         /// The keep-alive's traffic and how the fake answers it.
         keep: KeepRecord,
         /// Each SetComParam: the ComParam's name, its value and its class.
+        #[cfg_attr(
+            not(debug_assertions),
+            expect(
+                dead_code,
+                reason = "only the session tests, which need the simulator permission of a debug build, use it"
+            )
+        )]
         set: SetComParams,
     }
 
@@ -22984,6 +23008,14 @@ def main():
     // ---------------------------------------------- the keep-alive on a job's link (ADR-420)
 
     /// The steps a fake worker gives a request of the keep-alive tests.
+    #[cfg_attr(
+        not(debug_assertions),
+        expect(
+            dead_code,
+            unused_imports,
+            reason = "only the session tests, which need the simulator permission of a debug build, use these"
+        )
+    )]
     mod keep_alive_host {
         use super::*;
         use diag_ir::DiagHost;
@@ -23059,7 +23091,11 @@ def main():
         struct Setup {
             keep_alive_off: bool,
             status: Option<LinkStatus>,
+            /// What the first `GetStatus` calls answer instead, one per call.
+            status_script: Vec<Option<LinkStatus>>,
             updates: Vec<Option<tonic::Status>>,
+            /// The agent's deadline for a request; zero for the default.
+            deadline: Duration,
         }
 
         async fn keep_run(
@@ -23076,6 +23112,11 @@ def main():
                 fake_worker_answering(CancelAnswer::Done, None, false, false, script, Vec::new())
                     .await;
             *fake.keep.status.lock().unwrap() = setup.status.map(|status| status as i32);
+            fake.keep
+                .status_script
+                .lock()
+                .unwrap()
+                .extend(setup.status_script.iter().map(|s| s.map(|s| s as i32)));
             fake.keep.updates.lock().unwrap().extend(setup.updates);
             let config = LinkConfig {
                 keep_alive: (!setup.keep_alive_off).then_some(Duration::from_secs(2)),
@@ -23094,7 +23135,11 @@ def main():
             let handle = tokio::runtime::Handle::current();
             let timings = Timings {
                 unary: Duration::from_secs(5),
-                send_recv: Duration::from_secs(5),
+                send_recv: if setup.deadline.is_zero() {
+                    Duration::from_secs(5)
+                } else {
+                    setup.deadline
+                },
             };
             let requests = requests.to_vec();
             let results = tokio::task::spawn_blocking(move || {
@@ -23434,13 +23479,36 @@ def main():
         #[tokio::test(flavor = "multi_thread")]
         async fn a_failed_switch_off_is_logged_and_a_failed_switch_on_fails_the_next_request() {
             let refusal = || tonic::Status::internal("PDU_ERR_FCT_FAILED");
-            // Off fails: the handling stays on, so entering a session switches nothing.
+            // A refusal that proves the update was not started (the worker names its reason).
+            let refused = || {
+                vci_service_interface::status_with_error_detail(
+                    tonic::Code::InvalidArgument,
+                    "refused",
+                    vci_service_interface::ErrorDetail {
+                        refusal: Some(
+                            vci_service_interface::RefusalReason::InvalidParameters as i32,
+                        ),
+                        ..Default::default()
+                    },
+                )
+            };
+            // An update that may have reached the worker before it failed: the handling is
+            // believed off, so entering a session switches it on again.
+            let setup = Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                updates: vec![Some(refusal())],
+                ..Setup::default()
+            };
+            let run = keep_run(setup, &[NEGATIVE_10, POSITIVE_02], &[DSC_02, DSC_02], None).await;
+            assert_eq!(run.types(), [Startcomm, Updateparam, Sendrecv, Updateparam]);
+            // Off fails with a proof that it was not started: the handling stays on, so
+            // entering a session switches nothing.
             let dir = journal_dir("keep-alive-off-fails");
             let log =
                 crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
             let setup = Setup {
                 status: Some(LinkStatus::PduCllstCommStarted),
-                updates: vec![Some(refusal())],
+                updates: vec![Some(refused())],
                 ..Setup::default()
             };
             let run = keep_run(
@@ -23508,8 +23576,108 @@ def main():
                 .rfind(|line| line["event"] == "exchange")
                 .expect("the refused request has an entry");
             assert_eq!(refused["outcome"]["result"], "not_sent");
+            assert_eq!(refused["outcome"]["cause"], "keep_alive_failed");
             assert_eq!(refused["detail"]["host_error"], "KeepAliveFailed");
             std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A status that comes late: the start got no answer, its status could not be read, and
+        /// the next session control was answered before the status said anything. ONLINE then
+        /// means no tester-present runs for a session that is entered: the same failure as a
+        /// failed switch-on (the next request is refused, the log says so). COMM_STARTED means
+        /// the start's tester-present keeps it, and the log shows it on.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn a_late_status_decides_whether_the_entered_session_is_kept() {
+            let dir = journal_dir("keep-alive-late-online");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status_script: vec![None, Some(LinkStatus::PduCllstOnline)],
+                ..Setup::default()
+            };
+            let run = keep_run(
+                setup,
+                &[NO_ANSWER, POSITIVE_03, READ_ANSWERED],
+                &[DSC_02, DSC_03, READ],
+                Some(log),
+            )
+            .await;
+            assert!(matches!(run.results[2], Err(HostError::KeepAliveFailed)));
+            assert_eq!(run.types(), [Startcomm, Sendrecv]);
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<_> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .collect();
+            assert_eq!(alive.len(), 1, "{lines:?}");
+            assert_eq!(alive[0]["action"], "on");
+            assert_eq!(alive[0]["result"], "failed");
+            assert_eq!(alive[0]["detail"]["host_error"], "KeepAliveFailed");
+            std::fs::remove_dir_all(&dir).unwrap();
+
+            let dir = journal_dir("keep-alive-late-started");
+            let log =
+                crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+            let setup = Setup {
+                status_script: vec![None, Some(LinkStatus::PduCllstCommStarted)],
+                ..Setup::default()
+            };
+            let run = keep_run(
+                setup,
+                &[NO_ANSWER, POSITIVE_03, READ_ANSWERED],
+                &[DSC_02, DSC_03, READ],
+                Some(log),
+            )
+            .await;
+            assert!(run.results[2].is_ok(), "{:?}", run.results);
+            assert_eq!(run.types(), [Startcomm, Sendrecv, Sendrecv]);
+            let lines = comm_log_lines(&dir);
+            let alive: Vec<(&str, &str, &str)> = lines
+                .iter()
+                .filter(|line| line["event"] == "keep_alive")
+                .map(|line| {
+                    (
+                        line["action"].as_str().unwrap(),
+                        line["means"].as_str().unwrap(),
+                        line["result"].as_str().unwrap(),
+                    )
+                })
+                .collect();
+            assert_eq!(alive, [("on", "start_comm", "ok")]);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+
+        /// A StartComm the agent's deadline ended is a stray the next request cancels: the
+        /// link's status is not asked while it may still change the link, and is asked after the
+        /// next exchange has settled it.
+        #[cfg(debug_assertions)]
+        #[tokio::test(flavor = "multi_thread")]
+        async fn the_status_is_not_asked_while_the_start_is_unsettled() {
+            let setup = || Setup {
+                status: Some(LinkStatus::PduCllstCommStarted),
+                deadline: Duration::from_secs(1),
+                ..Setup::default()
+            };
+            let hung: &[Step] = &[];
+            let run = keep_run(setup(), &[hung], &[DSC_02], None).await;
+            assert!(matches!(run.results[0], Err(HostError::NoResponse)));
+            assert_eq!(run.called("GetStatus"), 0);
+            assert_eq!(run.called("CancelComPrimitive"), 0);
+
+            let run = keep_run(setup(), &[hung, READ_ANSWERED], &[DSC_02, READ], None).await;
+            assert!(run.results[1].is_ok(), "{:?}", run.results);
+            assert_eq!(run.called("GetStatus"), 1);
+            let calls = run.fake.calls.lock().unwrap().clone();
+            let cancel = calls
+                .iter()
+                .position(|c| *c == "CancelComPrimitive")
+                .unwrap();
+            let status = calls.iter().position(|c| *c == "GetStatus").unwrap();
+            assert!(cancel < status, "{calls:?}");
+            // The link started and the record is the default session: the tester-present the
+            // start left on is switched off.
+            assert_eq!(run.types(), [Startcomm, Sendrecv, Updateparam]);
         }
 
         /// ADR-393: a link opened again starts the record over: ONLINE, the default session and

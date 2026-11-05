@@ -3403,6 +3403,14 @@ impl CommLog {
                 .into_iter()
                 .map(|(name, value)| {
                     let (value, value_hex) = match value {
+                        // A library that refused a tester-present ComParam had the handling set
+                        // to 0 afterwards (best effort), the value attempted last.
+                        crate::link::ParamValue::U32(_)
+                            if name == crate::link::TESTER_PRESENT_HANDLING
+                                && !indications.tester_present =>
+                        {
+                            (Some(0), None)
+                        }
                         crate::link::ParamValue::U32(value) => (Some(value), None),
                         crate::link::ParamValue::Bytes(bytes) => (None, Some(to_hex(bytes))),
                     };
@@ -6064,6 +6072,50 @@ mod tests {
                 .find(|line| line["event"] == "link_opened")
                 .unwrap();
             assert_eq!(opened["transmit_confirmation"], expected, "{transmit}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-420 item 2: `link_opened` lists the keep-alive's ComParams as attempted, and says
+    /// whether the library accepted them; when it did not, the handling in force is the 0 the
+    /// agent set afterwards, not the 1 it first tried.
+    #[test]
+    fn link_opened_shows_the_tester_present_comparams_the_library_refused() {
+        for (accepted, handling) in [(true, 1), (false, 0)] {
+            let dir = dir();
+            let setup = setup(&dir);
+            let log = CommLog::open(&setup).unwrap();
+            log.begin(&facts(), RunKind::First);
+            log.link_opened(
+                1,
+                &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+                &[],
+                crate::link::Indications {
+                    tester_present: accepted,
+                    ..Default::default()
+                },
+                None,
+            )
+            .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            let opened = lines
+                .iter()
+                .find(|line| line["event"] == "link_opened")
+                .unwrap();
+            let param = |name: &str| {
+                opened["comparams"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|param| param["name"] == name)
+                    .unwrap_or_else(|| panic!("{name} in {opened}"))
+            };
+            let handling_param = param("CP_TesterPresentHandling");
+            assert_eq!(handling_param["value"], handling, "{accepted}");
+            assert_eq!(handling_param["accepted"], accepted);
+            assert_eq!(param("CP_TesterPresentMessage")["value_hex"], "3e00");
+            assert_eq!(param("CP_TesterPresentMessage")["accepted"], accepted);
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }

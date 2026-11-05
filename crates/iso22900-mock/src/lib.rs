@@ -2792,7 +2792,9 @@ mod tester_present_tests {
                 ),
                 no_error()
             );
-            assert_eq!(*(*item).pComParamData.cast::<u32>(), 50_000);
+            let param = item.as_ref().expect("PDUGetComParam sets the item");
+            let value = param.pComParamData.cast::<u32>().as_ref();
+            assert_eq!(value.copied(), Some(50_000));
             assert_eq!(PDUDestroyItem(item.cast()), no_error());
         }
         assert_eq!(

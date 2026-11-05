@@ -37,8 +37,9 @@ const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
 /// Held by a case while it uses the process environment and its worker.
 static CASE: Mutex<()> = Mutex::new(());
 
-/// P2* the document declares, in microseconds: the silence after a pending lasts this long.
-const P2_STAR_US: i64 = 300_000;
+/// P2* the document declares, in microseconds: the silence after a pending lasts this long. It is
+/// larger than the agent's default P2 (1000 ms), so a silence that ends at P2 shows.
+const P2_STAR_US: i64 = 1_500_000;
 
 /// Sends `10 83` of the declared service 1, then a VIN read, which shows the run goes on.
 fn program() -> Program {
@@ -117,7 +118,7 @@ const PENDING: &str = r#"{"inject_fault":{"fault":{"response_pending":{"count":1
 #[test]
 fn a_suppressed_send_receive_silence_on_a_d_pdu_link_is_undetermined_h4() {
     // The ECU drops its answer to `10 83`, so it stays silent.
-    run_case(&format!("[{DROP}]"));
+    run_case(&format!("[{DROP}]"), Duration::ZERO);
 }
 
 /// The ECU sends a response pending message to `10 83` and then nothing. The mock absorbs the
@@ -125,10 +126,14 @@ fn a_suppressed_send_receive_silence_on_a_d_pdu_link_is_undetermined_h4() {
 /// on a library that handles the pending itself.
 #[test]
 fn a_suppressed_send_receive_silence_after_an_absorbed_pending_is_undetermined_h4() {
-    run_case(&format!("[{PENDING},{DROP}]"));
+    // The pending comes 20 ms in and the receive timer reloads to P2*: the silence lasts that long.
+    run_case(
+        &format!("[{PENDING},{DROP}]"),
+        Duration::from_micros(P2_STAR_US as u64),
+    );
 }
 
-fn run_case(ecu_commands: &str) {
+fn run_case(ecu_commands: &str, silence_at_least: Duration) {
     let _case = CASE.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
@@ -161,11 +166,17 @@ fn run_case(ecu_commands: &str) {
         .expect("runtime");
     // A wedged service must fail the test, not hang the CI job.
     runtime
-        .block_on(async { tokio::time::timeout(Duration::from_secs(120), run_the_job(root)).await })
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                run_the_job(root, silence_at_least),
+            )
+            .await
+        })
         .expect("the flow should finish in time");
 }
 
-async fn run_the_job(root: &Path) {
+async fn run_the_job(root: &Path, silence_at_least: Duration) {
     let worker = WorkerProcess::launch(
         Path::new(env!("CARGO_BIN_EXE_iso22900-service")),
         ServiceKind::Iso22900,
@@ -233,6 +244,18 @@ async fn run_the_job(root: &Path) {
     assert_eq!(silent["classification"], "undetermined", "{silent}");
     let reason = silent["reason"].as_str().expect("a reason");
     assert!(reason.contains("(H4)"), "{reason}");
+    // The exchange, by the agent's clock, lasted at least as long as the silence: P2* after the
+    // absorbed pending, not only P2.
+    let agent_us = |key: &str| {
+        silent["times"]["agent"][key]
+            .as_u64()
+            .expect("an agent time")
+    };
+    let lasted = Duration::from_micros(agent_us("end_us") - agent_us("before_us"));
+    assert!(
+        lasted >= silence_at_least,
+        "the exchange took {lasted:?}, less than {silence_at_least:?}: {silent}"
+    );
     // The VCI absorbed any pending, so none is listed.
     assert!(
         silent

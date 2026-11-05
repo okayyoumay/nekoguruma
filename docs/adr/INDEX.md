@@ -288,7 +288,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
 | [ADR-298](ADR-298-csv-definition-errors-are-reported-in-two-stages.md) | CSV Definition Errors Are Reported in Two Stages | Accepted | `diag-frontend` CSV table reader error reporting |
-| [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request) | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
+| [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it) | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
 | [ADR-300](ADR-300-statically-resolved-function-features-in-starlark.md) | Statically Resolved Lambdas, Nested Functions and Keyword Arguments in Starlark | Accepted (the Consequences' rule for sections in a nested `def` superseded by ADR-301) | `diag-frontend` Starlark subset spec, design 8.4 |
 | [ADR-301](ADR-301-starlark-sections-are-whole-functions.md) | Starlark Sections Are Whole Functions | Accepted (item 3's one `Section` per copy split around each diagnostic primitive by ADR-332; the Consequences' open question on a plan answered by ADR-336: a plan function is expanded in place) | `diag-frontend` Starlark subset spec and checker, design 8.4 |
 | [ADR-302](ADR-302-decoded-shape-of-nested-layouts.md) | Decoded Shape of Nested Layouts | Accepted | `diag-ir` decoder, design 8.2.2 |
@@ -413,6 +413,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-421](ADR-421-a-functional-requests-txdone-reaches-the-link-that-sent-it.md) | A Functional Request's TxDone Reaches the Link That Sent It | Accepted | `j2534-0404-service` (`open_func_tx`, `handle_send_recv`, `route_frame_with_role`), `docs/j2534-0404-architecture.md`; design 8.11; ADR-099, ADR-100, ADR-352 item 3, ADR-400, ADR-419 |
 | [ADR-422](ADR-422-a-failed-device-close-keeps-the-workers-slot.md) | A Failed Device Close Keeps the Worker's Slot | Accepted | `j2534-0404-service` (`rpc_module_disconnect`), `j2534-0404-mock`, `sim-vci` (`fail_closes`), `docs/j2534-0404-architecture.md`; ADR-107 addendum (h), ADR-132, ADR-258, ADR-393 item 2 |
 | [ADR-423](ADR-423-the-d-pdu-mock-keeps-a-started-links-tester-present.md) | The D-PDU Mock Keeps a Started Link's Tester-Present | Accepted | `iso22900-mock` (tester-present ComParams, link state, `PDUGetStatus`, delivery thread, `NGR_SIM_ECU_COMMANDS`), `iso22900-service` `grpc_mock` test; ADR-299, ADR-418, ADR-419, ADR-420 |
+| [ADR-424](ADR-424-the-d-pdu-mock-absorbs-response-pendings.md) | The D-PDU Mock Absorbs Response Pendings | Accepted | `iso22900-mock` (response pending ComParams, `receive_events`, `PDUConnect`, UPDATEPARAM), mock testing guide, `iso22900-service` `agent_suppressed_send_receive` test; ADR-102, ADR-299, ADR-423 |
 
 ## Status Legend
 
@@ -766,7 +767,7 @@ the predecessor repository these ADRs came from.
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 - ADR-283
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`; the crash model amended by ADR-422: a crashed VCI answers a close of a device ID it does not hold with `ERR_INVALID_DEVICE_ID`)
-- ADR-299 (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request)
+- ADR-299 (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it)
 - ADR-312 (Decision item 4 amended: comparison done, Codex kept; Decision item 1's switch on a stalled review amended by ADR-360)
 - ADR-333 (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342)
 - ADR-334
@@ -784,6 +785,7 @@ the predecessor repository these ADRs came from.
 - ADR-407 (item 4 amended by ADR-413: `status` proposes `close`, which starts with the sweep)
 - ADR-413
 - ADR-423
+- ADR-424
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

@@ -13,7 +13,7 @@
 //! for each, classified by what the host saw. A sixth sends a request longer than ISO 15765 can
 //! carry, which the worker refuses with its reason (ADR-350), and its log shows the request not
 //! sent, refused by the worker. A seventh set of jobs sends requests whose positive response is
-//! suppressed (ADR-408): the ECU's silence is the result, a negative response is returned, and a
+//! suppressed (ADR-408), also through the generic send-receive: the ECU's silence is the result, a negative response is returned, and a
 //! response pending obliges a final response. Every job comes from a document and opens the link
 //! its variant
 //! declares (ADR-324).
@@ -29,7 +29,7 @@ use agent::guards::{GuardSetup, JobGuards};
 use agent::{CommLogSetup, CommLogStatus, Job, JobDocument, JobLimits, JobRun, run_program};
 use diag_ir::declaration::{
     DataKind, EcuDocumentT, EcuVariantT, FieldT, NegativeShapeT, Placement, PositiveResponseT,
-    ProtocolT, ServiceT, encode_ecu_document,
+    ProtocolT, RequestT, ServiceT, encode_ecu_document,
 };
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
@@ -147,6 +147,17 @@ fn vin_document(procedure: &Program) -> Vec<u8> {
     service.id = 1;
     service.short_name = Some("readVin".into());
     service.positive = Some(Box::new(positive));
+    // Service 2: DiagnosticSessionControl, for the generic send-receive (ADR-321), whose positive
+    // response starts with 0x50.
+    let mut session_positive = PositiveResponseT::default();
+    session_positive.sid = 0x50;
+    let mut session = ServiceT::default();
+    session.id = 2;
+    session.short_name = Some("sessionControl".into());
+    let mut request = RequestT::default();
+    request.sid = 0x10;
+    session.request = Some(Box::new(request));
+    session.positive = Some(Box::new(session_positive));
     let mut shape = NegativeShapeT::default();
     shape.marker = 0x7F;
     shape.echoes_sid = true;
@@ -163,7 +174,7 @@ fn vin_document(procedure: &Program) -> Vec<u8> {
     variant.id = 1;
     variant.short_name = Some("sim".into());
     variant.protocols = Some(vec![protocol]);
-    variant.services = Some(vec![service]);
+    variant.services = Some(vec![service, session]);
     let mut document = EcuDocumentT::default();
     document.schema_version = IR_SCHEMA_VERSION;
     document.source_format = Some("csv-starlark".into());
@@ -796,6 +807,39 @@ async fn suppressed_requests(
         "{}",
         entries[3]
     );
+
+    // The same through the generic send-receive (ADR-321, ADR-408): `10 83` of the declared
+    // service 2 is answered by silence, which is the empty result, and the run goes on to a VIN
+    // read. The entry is the one the service request gives.
+    let (state, entries) = logged_run(
+        worker,
+        comm_log_dir,
+        "3f1c2b4d5e85",
+        &Program {
+            code: vec![
+                Op::PushBytes(0),
+                Op::SendReceive { service: 2 },
+                Op::PushBytes(1),
+                Op::ServiceRequest { service: 0x22 },
+            ],
+            constants: vec![vec![0x10, 0x83], vec![0xF1, 0x90]],
+            ..program()
+        },
+    )
+    .await;
+    let state = state.expect("a suppressed send-receive's silence is not a failure");
+    assert_eq!(
+        state.stack,
+        [Value::Bytes(Vec::new()), Value::Bytes(vin.clone())],
+        "{state:?}"
+    );
+    let silent = &entries[0];
+    assert_eq!(silent["request"]["bytes"]["clear"], "1083", "{silent}");
+    assert_eq!(silent["request"]["suppressed"], true, "{silent}");
+    assert_eq!(silent["outcome"]["result"], "no_response", "{silent}");
+    assert!(silent["detail"].get("host_error").is_none(), "{silent}");
+    assert_eq!(silent["sent"], "confirmed", "{silent}");
+    assert_eq!(silent["classification"], "undetermined", "{silent}");
 
     // A sub-function the ECU refuses, with the bit set: the negative response is sent anyway.
     let (state, entries) = logged_run(

@@ -1,0 +1,216 @@
+// Relies on the debug-only runtime VCI_CONFIG_PATH and NGR_PDU_API_ROOT_FILE overrides; see
+// ADR-073 and ADR-282.
+#![cfg(debug_assertions)]
+//! A suppressed request through the generic send-receive (`Op::SendReceive`, ADR-321) end to end
+//! on a D-PDU API link (ADR-408): the agent runs a procedure against a real `iso22900-service`
+//! worker and `iso22900-mock`, whose simulated ECU drops its answer to `10 83` (the
+//! suppress-positive-response bit set), so it stays silent (`NGR_SIM_ECU_COMMANDS`, ADR-423).
+//!
+//! The request's result is the empty answer and the run goes on. The link is one whose VCI
+//! absorbs pendings, so the communication log classifies the silence `undetermined` (H4, design
+//! 8.11): a pending the VCI absorbed may have obliged an answer. The mock does not absorb
+//! pendings itself: it passes each one on as a result item, so a pending followed by silence
+//! cannot be produced here, and the host then sees the pending and fails the request.
+//! The J2534 counterpart is `crates/j2534-0404-service/tests/agent_end_to_end.rs`.
+//!
+//! This file holds a single test, so the process-wide environment it sets for the spawned
+//! service cannot race with another test.
+
+use std::path::Path;
+use std::sync::atomic::AtomicBool;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use agent::guards::{GuardSetup, JobGuards};
+use agent::{CommLogSetup, CommLogStatus, Job, JobDocument, JobLimits, JobRun, run_program};
+use diag_ir::declaration::{
+    EcuDocumentT, EcuVariantT, NegativeShapeT, PositiveResponseT, ProtocolT, RequestT, ServiceT,
+    encode_ecu_document,
+};
+use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
+use worker_host::client::ConnectOptions;
+use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
+
+const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
+
+/// Sends `10 83` of the declared service 1, then a VIN read, which shows the run goes on.
+fn program() -> Program {
+    Program {
+        schema_version: IR_SCHEMA_VERSION,
+        code: vec![
+            Op::PushBytes(0),
+            Op::SendReceive { service: 1 },
+            Op::PushBytes(1),
+            Op::ServiceRequest { service: 0x22 },
+        ],
+        constants: vec![vec![0x10, 0x83], vec![0xF1, 0x90]],
+        sections: Vec::new(),
+        source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
+        targets: Vec::new(),
+    }
+}
+
+/// A document with UDS over ISO 15765 on the simulated ECU's identifiers and one service, 1:
+/// DiagnosticSessionControl, whose positive response starts with 0x50.
+fn document(procedure: &Program) -> Vec<u8> {
+    let mut positive = PositiveResponseT::default();
+    positive.sid = 0x50;
+    let mut service = ServiceT::default();
+    service.id = 1;
+    service.short_name = Some("sessionControl".into());
+    let mut request = RequestT::default();
+    request.sid = 0x10;
+    service.request = Some(Box::new(request));
+    service.positive = Some(Box::new(positive));
+    let mut shape = NegativeShapeT::default();
+    shape.marker = 0x7F;
+    shape.echoes_sid = true;
+    shape.code_at = 2;
+    shape.pending = Some(vec![0x78]);
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    protocol.negative_shape = Some(Box::new(shape));
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("sim".into());
+    variant.protocols = Some(vec![protocol]);
+    variant.services = Some(vec![service]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure = Some(postcard::to_allocvec(procedure).expect("program should serialize"));
+    encode_ecu_document(&document)
+}
+
+fn job_guards(dir: &Path) -> JobGuards {
+    let setup = GuardSetup {
+        dir: dir.to_owned(),
+        vci: "agent-suppressed-dpdu-vci".to_owned(),
+    };
+    let never = AtomicBool::new(false);
+    JobGuards::take(&setup, Duration::from_millis(10), &never).expect("guards should be free")
+}
+
+#[test]
+fn a_suppressed_send_receive_silence_on_a_d_pdu_link_is_undetermined_h4() {
+    let temp = tempfile::tempdir().expect("temporary directory");
+    let root = temp.path();
+    let config_path = root.join("config.toml");
+    std::fs::write(&config_path, "").expect("test config file should be writable");
+    // The mock attaches its simulated ECU only when it is given a configuration.
+    let ecu_path = root.join("ecu.json");
+    std::fs::write(
+        &ecu_path,
+        r#"{"vin": "NGRSIMECU00000005", "part_number": "NGR-SIM-ECU", "sw_version": "1.0.0",
+            "response_delay_ms": 0, "drop_at_block": null, "require_security_access": false,
+            "require_gateway_auth": false, "fail_checksum": false, "s3_server_ms": 5000}"#,
+    )
+    .expect("ECU config file should be writable");
+    let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
+    let root_file = iso22900_mock::write_root_file(root, LIBRARY_NAME, &library)
+        .expect("root description file should be writable");
+    // SAFETY: this test binary runs only this test, and the runtime, the only other source of
+    // threads here, is built below, so nothing reads the environment concurrently.
+    unsafe {
+        std::env::set_var("VCI_CONFIG_PATH", &config_path);
+        std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
+        std::env::set_var(iso22900_mock::ECU_CONFIG_ENV, &ecu_path);
+        // The ECU drops its answer to `10 83`, so it stays silent.
+        std::env::set_var(
+            iso22900_mock::ECU_COMMANDS_ENV,
+            r#"[{"inject_fault":{"fault":"drop_response","request":[16,131]}}]"#,
+        );
+        std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
+    }
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("runtime");
+    // A wedged service must fail the test, not hang the CI job.
+    runtime
+        .block_on(async { tokio::time::timeout(Duration::from_secs(120), run_the_job(root)).await })
+        .expect("the flow should finish in time");
+}
+
+async fn run_the_job(root: &Path) {
+    let worker = WorkerProcess::launch(
+        Path::new(env!("CARGO_BIN_EXE_iso22900-service")),
+        ServiceKind::Iso22900,
+        LIBRARY_NAME,
+        OperatingMode::User,
+        // Generous timeouts for a debug binary on a busy CI runner.
+        &LaunchOptions {
+            startup_timeout: Duration::from_secs(20),
+            request_timeout: Duration::from_secs(5),
+            ..LaunchOptions::default()
+        },
+    )
+    .await
+    .expect("worker should launch");
+    // The worker has copied its environment; the other tests of a process must not see it.
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock should be after unix epoch")
+        .as_nanos();
+    let setup = CommLogSetup {
+        dir: root.join("commlog"),
+        key: agent::journal::JobKey {
+            job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5f90".to_owned()),
+            generation: 1,
+        },
+    };
+    std::fs::create_dir_all(&setup.dir).expect("log directory");
+    let job = Job::from_document(JobDocument::new(document(&program())).expect("document loads"))
+        .expect("the document carries its procedure")
+        .with_comm_log(setup.clone());
+    let JobRun {
+        result,
+        guards: _guards,
+        comm_log,
+    } = run_program(
+        worker
+            .connect(&ConnectOptions::default())
+            .await
+            .expect("client should connect"),
+        &job.declared_link().expect("the document declares its link"),
+        job,
+        JobLimits::default(),
+        job_guards(&root.join(format!("locks-{nanos}"))),
+    )
+    .await;
+    let state = result.expect("a suppressed request's silence is not a failure");
+    assert_eq!(comm_log, CommLogStatus::Complete);
+    let [Value::Bytes(silence), Value::Bytes(read)] = state.stack.as_slice() else {
+        panic!("{state:?}");
+    };
+    assert!(silence.is_empty(), "{state:?}");
+    assert!(read.starts_with(&[0x62, 0xF1, 0x90]), "{state:?}");
+
+    let text = std::fs::read_to_string(setup.path().expect("the log's path")).expect("the log");
+    let entries: Vec<serde_json::Value> = text
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    let silent = &entries[0];
+    assert_eq!(silent["request"]["bytes"]["clear"], "1083", "{silent}");
+    assert_eq!(silent["request"]["suppressed"], true, "{silent}");
+    assert_eq!(silent["outcome"]["result"], "no_response", "{silent}");
+    assert!(silent["detail"].get("host_error").is_none(), "{silent}");
+    assert_eq!(silent["classification"], "undetermined", "{silent}");
+    let reason = silent["reason"].as_str().expect("a reason");
+    assert!(reason.contains("(H4)"), "{reason}");
+
+    worker
+        .stop(Duration::from_secs(5))
+        .await
+        .expect("the worker stops");
+}

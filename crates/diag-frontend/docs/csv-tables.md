@@ -228,6 +228,19 @@ rule set in `diag_ir::link` that both call (ADR-406, design 8.2.4): this section
 (a ComParam name it does not know, two names it resolves to one id, a value it refuses) or
 several documents (ADR-395) is left to the agent.
 
+The conversion does not check a ComParam name against the names a worker knows, and this is
+deliberate (ADR-406 item 6). Which names exist, and the id each resolves to, is not something the
+conversion can know:
+- A D-PDU API worker asks the vendor's library for each id (`PDUGetObjectId`), so the answer
+  depends on the library and its module description file, which differ between VCIs.
+- A J2534 worker resolves names with its own mapping.
+- The conversion does not know which worker or VCI will run the job, so a list one worker
+  exported would refuse names another accepts.
+- A table of the standard's ComParam names would copy a copyrighted annex.
+
+The agent therefore refuses an unknown name, or two names that resolve to one id, when it sets up
+the job's link, before anything is sent.
+
 `comparams.csv`, one `ComParam` per row, appended to the named protocol's `params` in row order.
 The agent sets them on the job's link as written (ADR-324), in the ComParam's own unit
 (microseconds for a time); there is no `unit` column. It reads `CP_P2Max`, `CP_P2Star` and

@@ -4367,10 +4367,11 @@ mod tester_present_tests {
                     PDUGetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, id, &mut item),
                     no_error()
                 );
-                assert_eq!(*(*item).pComParamData.cast::<u32>(), 0);
-                assert_eq!((*item).ComParamClass, E_PDU_PC::PDU_PC_COM);
-                drop(Box::from_raw((*item).pComParamData.cast::<u32>()));
-                drop(Box::from_raw(item));
+                let param = item.as_ref().expect("PDUGetComParam sets the item");
+                let value = param.pComParamData.cast::<u32>().as_ref();
+                assert_eq!(value.copied(), Some(0));
+                assert_eq!(param.ComParamClass, E_PDU_PC::PDU_PC_COM);
+                assert_eq!(PDUDestroyItem(item.cast()), no_error());
             }
         }
 
@@ -4420,9 +4421,14 @@ mod tester_present_tests {
                         PDUGetEventItem(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item),
                         no_error()
                     );
-                    assert_eq!((*item).ItemType, E_PDU_IT::PDU_IT_RESULT);
-                    assert_eq!((*item).hCop, cop);
-                    let data = &*(*item).pData.cast::<PDU_RESULT_DATA>();
+                    let event = item.as_ref().expect("PDUGetEventItem sets the item");
+                    assert_eq!(event.ItemType, E_PDU_IT::PDU_IT_RESULT);
+                    assert_eq!(event.hCop, cop);
+                    let data = event
+                        .pData
+                        .cast::<PDU_RESULT_DATA>()
+                        .as_ref()
+                        .expect("a result item has its data");
                     assert_eq!(data.NumDataBytes, 0);
                     assert!(data.pDataBytes.is_null());
                     assert_eq!(data.TimestampFlags.NumFlagBytes, 0);

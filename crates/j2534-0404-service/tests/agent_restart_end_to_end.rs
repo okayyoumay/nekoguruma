@@ -1235,8 +1235,9 @@ fn kill_while_unanswered(
         parked(state) && sent && applied
     });
     let sent_at = std::time::Instant::now();
-    // The trace line is written as the request is sent, just before the ECU handles it; the
-    // kill waits until the ECU has, well within the response-pending sequence.
+    // `sim-vci` writes the trace line only once the ECU has handled the request and saved its
+    // state, so the kill cannot overtake that save, however long the worker is descheduled. The
+    // kill comes well within the response-pending sequence.
     std::thread::sleep(KILL_DELAY);
     let status = agent.kill();
     assert!(
@@ -1772,7 +1773,8 @@ fn a_converted_starlark_procedure_killed_mid_transfer_is_restarted() {
             && env.commands_applied()
     });
     let sent_at = std::time::Instant::now();
-    // The kill waits until the ECU has the request, well within the response-pending sequence.
+    // `sim-vci` traces the block only once the ECU has handled it and saved its state, so the
+    // kill cannot overtake that save; it comes well within the response-pending sequence.
     std::thread::sleep(KILL_DELAY);
     let status = agent.kill();
     assert!(

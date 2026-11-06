@@ -738,7 +738,6 @@ impl Bus {
             self.tx_done_unanswered(channel_id, id, payload.len());
             return Ok(());
         }
-        self.trace_request(payload);
         let ecu = self.ecu.as_mut().expect("checked above");
         let before = ecu.power_cycles();
         let exchange = ecu.exchange(addressing, payload);
@@ -748,6 +747,10 @@ impl Bus {
         // A request the next process must know about fails if it cannot be recorded; its
         // response is then not sent either.
         self.save_ecu()?;
+        // Traced once the ECU's state after it is saved, all under the bus lock: a test that sees
+        // the line and then kills the worker finds the request's effect in the state file, however
+        // late the kill comes. Its response is queued after the line.
+        self.trace_request(payload);
         if reached {
             self.tx_done(channel_id, id);
         } else {
@@ -894,8 +897,8 @@ pub const CONTROL_DIR_ENV: &str = "NGR_SIM_VCI_CONTROL_DIR";
 
 /// Environment variable naming a file `sim-vci` appends a request trace to, for a test that
 /// checks the order of the requests a worker sent: one line per UDS request sent towards the
-/// simulated ECU (a send attempt, traced before the ECU sees it, so a request lost on the bus or
-/// ignored is listed too; see `trace_line`), and a `vbatt` line per `READ_VBATT`. Read once, on the first
+/// simulated ECU (a send attempt, traced once the ECU has handled it and its state is saved, before its
+/// response is queued, so a request lost on the bus or ignored is listed too; see `trace_line`), and a `vbatt` line per `READ_VBATT`. Read once, on the first
 /// call into the library, and only in debug builds. The file is created if missing and never
 /// truncated by the library.
 pub const TRACE_ENV: &str = "NGR_SIM_VCI_TRACE";

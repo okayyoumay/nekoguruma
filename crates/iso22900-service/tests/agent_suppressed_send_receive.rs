@@ -8,29 +8,38 @@
 //!
 //! The request's result is the empty answer and the run goes on. The link is one whose VCI
 //! absorbs pendings, so the communication log classifies the silence `undetermined` (H4, design
-//! 8.11): a pending the VCI absorbed may have obliged an answer. The mock does not absorb
-//! pendings itself: it passes each one on as a result item, so a pending followed by silence
-//! cannot be produced here, and the host then sees the pending and fails the request.
+//! 8.11): a pending the VCI absorbed may have obliged an answer. The second case lets the ECU
+//! send a pending first: the agent turns the mock's `CP_RC78Handling` on, so the mock absorbs the
+//! pending as a library does and the silence that follows is the receive timeout, with no
+//! pending listed in the entry.
 //! The J2534 counterpart is `crates/j2534-0404-service/tests/agent_end_to_end.rs`.
 //!
-//! This file holds a single test, so the process-wide environment it sets for the spawned
-//! service cannot race with another test.
+//! Each case sets process-wide environment for the spawned service, so the cases take turns
+//! (`CASE`).
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
 use agent::{CommLogSetup, CommLogStatus, Job, JobDocument, JobLimits, JobRun, run_program};
 use diag_ir::declaration::{
-    EcuDocumentT, EcuVariantT, NegativeShapeT, PositiveResponseT, ProtocolT, RequestT, ServiceT,
-    encode_ecu_document,
+    ComParamT, EcuDocumentT, EcuVariantT, NegativeShapeT, PositiveResponseT, ProtocolT, RequestT,
+    ServiceT, encode_ecu_document,
 };
 use diag_ir::{IR_SCHEMA_VERSION, Op, Program, Value};
 use worker_host::client::ConnectOptions;
 use worker_host::service::{LaunchOptions, OperatingMode, ServiceKind, WorkerProcess};
 
 const LIBRARY_NAME: &str = "NGR Mock D-PDU API";
+
+/// Held by a case while it uses the process environment and its worker.
+static CASE: Mutex<()> = Mutex::new(());
+
+/// P2* the document declares, in microseconds: the silence after a pending lasts this long. It is
+/// larger than the agent's default P2 (1000 ms), so a silence that ends at P2 shows.
+const P2_STAR_US: i64 = 1_500_000;
 
 /// Sends `10 83` of the declared service 1, then a VIN read, which shows the run goes on.
 fn program() -> Program {
@@ -69,7 +78,11 @@ fn document(procedure: &Program) -> Vec<u8> {
     shape.echoes_sid = true;
     shape.code_at = 2;
     shape.pending = Some(vec![0x78]);
+    let mut p2_star = ComParamT::default();
+    p2_star.short_name = Some("CP_P2Star".into());
+    p2_star.value = P2_STAR_US;
     let mut protocol = ProtocolT::default();
+    protocol.params = Some(vec![p2_star]);
     protocol.short_name = Some("ISO15765".into());
     protocol.application_layer = Some("UDS".into());
     protocol.baud_rate = 500_000;
@@ -99,8 +112,29 @@ fn job_guards(dir: &Path) -> JobGuards {
     JobGuards::take(&setup, Duration::from_millis(10), &never).expect("guards should be free")
 }
 
+const DROP: &str = r#"{"inject_fault":{"fault":"drop_response","request":[16,131]}}"#;
+const PENDING: &str = r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":20}},"request":[16,131]}}"#;
+
 #[test]
 fn a_suppressed_send_receive_silence_on_a_d_pdu_link_is_undetermined_h4() {
+    // The ECU drops its answer to `10 83`, so it stays silent.
+    run_case(&format!("[{DROP}]"), Duration::ZERO);
+}
+
+/// The ECU sends a response pending message to `10 83` and then nothing. The mock absorbs the
+/// pending (`CP_RC78Handling` is on), so the request ends in the receive timeout, as it would
+/// on a library that handles the pending itself.
+#[test]
+fn a_suppressed_send_receive_silence_after_an_absorbed_pending_is_undetermined_h4() {
+    // The pending comes 20 ms in and the receive timer reloads to P2*: the silence lasts that long.
+    run_case(
+        &format!("[{PENDING},{DROP}]"),
+        Duration::from_micros(P2_STAR_US as u64),
+    );
+}
+
+fn run_case(ecu_commands: &str, silence_at_least: Duration) {
+    let _case = CASE.lock().unwrap_or_else(|e| e.into_inner());
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
     let config_path = root.join("config.toml");
@@ -123,11 +157,7 @@ fn a_suppressed_send_receive_silence_on_a_d_pdu_link_is_undetermined_h4() {
         std::env::set_var("VCI_CONFIG_PATH", &config_path);
         std::env::set_var("NGR_PDU_API_ROOT_FILE", &root_file);
         std::env::set_var(iso22900_mock::ECU_CONFIG_ENV, &ecu_path);
-        // The ECU drops its answer to `10 83`, so it stays silent.
-        std::env::set_var(
-            iso22900_mock::ECU_COMMANDS_ENV,
-            r#"[{"inject_fault":{"fault":"drop_response","request":[16,131]}}]"#,
-        );
+        std::env::set_var(iso22900_mock::ECU_COMMANDS_ENV, ecu_commands);
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
     }
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -136,11 +166,17 @@ fn a_suppressed_send_receive_silence_on_a_d_pdu_link_is_undetermined_h4() {
         .expect("runtime");
     // A wedged service must fail the test, not hang the CI job.
     runtime
-        .block_on(async { tokio::time::timeout(Duration::from_secs(120), run_the_job(root)).await })
+        .block_on(async {
+            tokio::time::timeout(
+                Duration::from_secs(120),
+                run_the_job(root, silence_at_least),
+            )
+            .await
+        })
         .expect("the flow should finish in time");
 }
 
-async fn run_the_job(root: &Path) {
+async fn run_the_job(root: &Path, silence_at_least: Duration) {
     let worker = WorkerProcess::launch(
         Path::new(env!("CARGO_BIN_EXE_iso22900-service")),
         ServiceKind::Iso22900,
@@ -208,6 +244,25 @@ async fn run_the_job(root: &Path) {
     assert_eq!(silent["classification"], "undetermined", "{silent}");
     let reason = silent["reason"].as_str().expect("a reason");
     assert!(reason.contains("(H4)"), "{reason}");
+    // The exchange, by the agent's clock, lasted at least as long as the silence: P2* after the
+    // absorbed pending, not only P2.
+    let agent_us = |key: &str| {
+        silent["times"]["agent"][key]
+            .as_u64()
+            .expect("an agent time")
+    };
+    let lasted = Duration::from_micros(agent_us("end_us") - agent_us("before_us"));
+    assert!(
+        lasted >= silence_at_least,
+        "the exchange took {lasted:?}, less than {silence_at_least:?}: {silent}"
+    );
+    // The VCI absorbed any pending, so none is listed.
+    assert!(
+        silent
+            .get("pending")
+            .is_none_or(|pending| pending.as_array().is_some_and(Vec::is_empty)),
+        "{silent}"
+    );
 
     worker
         .stop(Duration::from_secs(5))

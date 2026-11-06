@@ -49,7 +49,10 @@ no longer exists (ADR-258).
 6. **A run that ends reaps a dead worker too.** A run that ends after its path was lost, on
    site or in the host error, asks for the worker's exit before it closes its link. A worker
    that exited is reaped there: the log gets its exit, the final close through it is not made,
-   and the guards are not marked. The process stays in a slot the caller shares with the
+   and the guards are not marked. A worker still reported alive is asked about again for up
+   to the exit grace (the wait of item 3), since the run ended because its path was lost, and
+   a killed process may read alive for a moment; a reopen's first look at the process does not
+   wait, so a live worker costs the reopen nothing. The process stays in a slot the caller shares with the
    source; `ngr-agent run` stops whatever process is in it at the end.
 7. **The log tells it in two events.** `worker_exit` names the process ID, how it ended (an
    exit code, a signal, or ended by the agent) and the exchanges that were in flight, and

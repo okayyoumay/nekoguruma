@@ -22387,6 +22387,94 @@ def main():
         }
     }
 
+    /// ADR-394: a killed worker may still read alive when the run ends on the lost path; the
+    /// run's end asks again within the exit grace, so the exit that shows a moment later is
+    /// logged and the worker is taken in, with no close through it.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_run_end_waits_for_a_killed_worker_that_still_reads_alive() {
+        let internal = || Some(tonic::Status::internal("library"));
+        let dir = journal_dir("end-late-exit");
+        let (first, first_calls) = fake_worker_losing(
+            vec![unavailable()],
+            vec![internal(), internal()],
+            vec![internal(), internal()],
+        )
+        .await;
+        let (source, asked_of) = scripted(
+            first,
+            Vec::new(),
+            vec![
+                WorkerStatus::Alive,
+                WorkerStatus::Alive,
+                exited(ExitHow::Signal(9)),
+            ],
+            Vec::new(),
+        );
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Unsafe)]),
+            Some(&dir),
+            after_loss_limits(),
+            "end-late-exit",
+        )
+        .await;
+        assert!(
+            matches!(run.result, Err(JobError::OnSiteInterventionRequired(_))),
+            "{:?}",
+            run.result
+        );
+        assert!(!run.guards.link_unconfirmed());
+        assert_eq!(closes(&first_calls), Vec::<&str>::new());
+        assert_eq!(asked(&asked_of, "status"), 3);
+        assert_eq!(asked(&asked_of, "end"), 0);
+        assert_eq!(
+            worker_events(&dir),
+            ["vci_connected", "link_opened", "worker_exit"]
+        );
+        let exit = &of_event(&comm_log_lines(&dir), "worker_exit")[0];
+        assert_eq!(exit["exit"], serde_json::json!({"signal": 9}));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-394: the run end's wait for a worker's exit is bounded by the exit grace: a worker
+    /// that stays alive is not taken in, and the final close goes through it as before.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_run_end_gives_up_on_a_worker_that_stays_alive_after_the_grace() {
+        let internal = || Some(tonic::Status::internal("library"));
+        let dir = journal_dir("end-stays-alive");
+        let (first, _first_calls) = fake_worker_losing(
+            vec![unavailable()],
+            vec![internal(), internal()],
+            vec![internal(), internal()],
+        )
+        .await;
+        let (source, asked_of) = scripted(first, Vec::new(), Vec::new(), Vec::new());
+        let started = std::time::Instant::now();
+        let run = run_on_source(
+            source,
+            plain_steps(&[(0x22, Unsafe)]),
+            Some(&dir),
+            after_loss_limits(),
+            "end-stays-alive",
+        )
+        .await;
+        let took = started.elapsed();
+        assert!(
+            matches!(run.result, Err(JobError::OnSiteInterventionRequired(_))),
+            "{:?}",
+            run.result
+        );
+        // Polled for about the grace (1 s every 50 ms), and no longer.
+        let polls = asked(&asked_of, "status");
+        assert!((5..=40).contains(&polls), "{polls} questions");
+        assert!(took < Duration::from_secs(15), "{took:?}");
+        assert_eq!(asked(&asked_of, "end"), 0);
+        assert!(!worker_events(&dir).contains(&"worker_exit".to_owned()));
+        let mut guards = run.guards;
+        guards.worker_gone();
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// A client whose link disconnect never answers, as a hung worker's does, or, with `true`,
     /// whose link destroy never answers.
     #[derive(Clone)]
@@ -22687,8 +22775,10 @@ def main():
         assert!(guards.link_unconfirmed());
         guards.worker_gone();
         assert!(closes(&first_calls).contains(&"ModuleDisconnect"));
-        // Asked before the close and after it failed; never ended or started again.
-        assert_eq!(asked(&asked_of, "status"), 3, "{:?}", asked_of);
+        // Asked before the close and after it failed, and at the run's end for the exit grace
+        // (every 50 ms); never ended or started again.
+        let status = asked(&asked_of, "status");
+        assert!((4..=30).contains(&status), "{:?}", asked_of);
         assert_eq!(asked(&asked_of, "end"), 0);
         assert_eq!(asked(&asked_of, "launch"), 0);
     }
@@ -22844,13 +22934,11 @@ def main():
             assert_eq!(guards.link_unconfirmed(), marked, "{tag}");
             guards.worker_gone();
             assert_eq!(asked(&asked_of, "launch"), 1, "{tag}");
-            // Every attempt asks the process once, and the run's end asks once: the process of
-            // the worker that took the link is alive, so the polls start no other.
-            assert_eq!(
-                asked(&asked_of, "status"),
-                asked(&asked_of, "client"),
-                "{tag}"
-            );
+            // Every attempt asks the process once, and the run's end asks it every 50 ms for the
+            // exit grace: the process of the worker that took the link is alive, so the polls
+            // start no other.
+            let (status, client) = (asked(&asked_of, "status"), asked(&asked_of, "client"));
+            assert!((client..=client + 25).contains(&status), "{tag}: {status}");
             if !marked {
                 assert!(asked(&asked_of, "client") >= 3, "{tag}: {asked_of:?}");
             }

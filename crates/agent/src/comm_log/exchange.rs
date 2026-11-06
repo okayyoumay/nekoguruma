@@ -1460,12 +1460,9 @@ pub(crate) struct Kept {
     /// (`usize::MAX` for one not read at a known place), by place in the evidence's list: a
     /// settling entry restates the windows of the answers with what it reads after them
     /// (ADR-425).
-    #[expect(dead_code, reason = "the settling entries read it in the next change")]
     pub pending_order: Vec<usize>,
     /// The same for the entry's answers, and where each answer ended.
-    #[expect(dead_code, reason = "the settling entries read it in the next change")]
     pub answer_order: Vec<usize>,
-    #[expect(dead_code, reason = "the settling entries read it in the next change")]
     pub answer_ends: Vec<super::timing::At>,
     /// The link's limits, when `link_opened` recorded them.
     pub limits: Option<super::timing::Limits>,

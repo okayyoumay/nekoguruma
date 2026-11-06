@@ -3071,7 +3071,9 @@ impl CommLog {
         let mut unattached: Vec<(&UnattachedItem, Option<clocks::Placed>)> = Vec::new();
         for (index, (read, placed)) in ended.reads.iter().zip(&placed).enumerate() {
             match &read.item {
-                EndItem::Pending(pending) => own_pendings.push((read.read, pending, placed.time)),
+                EndItem::Pending(pending) => {
+                    own_pendings.push((index, read.read, pending, placed.time));
+                }
                 EndItem::Response {
                     end,
                     tx_done,
@@ -3176,7 +3178,23 @@ impl CommLog {
             .iter()
             .map(|at| at.map(|(_, placed)| placed))
             .collect();
-        for (read, pending, placed) in own_pendings {
+        // Where the items stand in the order the host read them: the entry's, then the ones read
+        // for the end, after them (ADR-425). The lists are the evidence's own in length.
+        let order_base = kept
+            .pending_order
+            .iter()
+            .chain(&kept.answer_order)
+            .filter(|order| **order != usize::MAX)
+            .max()
+            .map_or(0, |last| last + 1);
+        let mut pending_order = kept.pending_order.clone();
+        pending_order.resize(kept.evidence.pending.len(), usize::MAX);
+        let mut answer_order = kept.answer_order.clone();
+        answer_order.resize(kept.evidence.answers.len(), usize::MAX);
+        let mut answer_ends = kept.answer_ends.clone();
+        answer_ends.resize(kept.evidence.answers.len(), None);
+        for (index, read, pending, placed) in own_pendings {
+            pending_order.push(order_base + index);
             let mut pending = pending.clone();
             // The pending's agent time is when the host read it.
             pending.agent_us = read.monotonic_us;
@@ -3282,29 +3300,31 @@ impl CommLog {
         // the exchange had attached, as for an exchange (`VciTime::prefer`).
         let transmit = vci.tx_done.and_then(|time| time.placed()).or(kept.transmit);
         exchange::pending_intervals(&mut evidence.pending, &placed_all, transmit);
+        // A start with the response's identifier that another exchange could own still means
+        // this response may have begun, as for an exchange.
+        let response_may_have_begun = evidence.response_started
+            || kept.limits.is_some_and(|limits| !limits.start_indications)
+            || kept.start_unattached
+            || unattached
+                .iter()
+                .any(|(item, _)| item.is_start_indication_for(rx_id));
+        // The window of a collecting entry ends on the primitive's finished status or the
+        // receive timeout, from where its last answer ended (ADR-425).
+        judge_windows(
+            &mut evidence,
+            &WindowItems {
+                pendings: &pendings,
+                pending_order: &pending_order,
+                answer_order: &answer_order,
+                answer_ends: &answer_ends,
+            },
+            kept.limits,
+            &vci,
+            transmit,
+            response_may_have_begun,
+            kept.evidence.collecting,
+        );
         if let Some(limits) = kept.limits {
-            // A start with the response's identifier that another exchange could own still
-            // means this response may have begun, as for an exchange.
-            let response_may_have_begun = evidence.response_started
-                || !limits.start_indications
-                || kept.start_unattached
-                || unattached
-                    .iter()
-                    .any(|(item, _)| item.is_start_indication_for(rx_id));
-            evidence.timing = timing::judge(
-                limits,
-                evidence.absorbing(),
-                timing::Times {
-                    transmit,
-                    window_from: None,
-                    pendings: &pendings,
-                    start: vci.rx_start.and_then(|time| time.placed()),
-                    end: vci.rx_end.and_then(|time| time.placed()),
-                    end_len: evidence.end.response().map(<[u8]>::len),
-                    timeout: vci.rx_timeout.and_then(|time| time.placed()),
-                    response_may_have_begun,
-                },
-            );
             // A pending read at job end from at or before the reading, or one whose order with
             // it is unknown, may extend the limit past it: the kept `system` stands only while
             // the VCI's limits are still past by the reading with every such pending.
@@ -4287,23 +4307,31 @@ impl Inner {
                 .collect();
             exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
         }
+        let response_may_have_begun = evidence.response_started
+            || kept.limits.is_some_and(|limits| !limits.start_indications)
+            || kept.start_unattached;
+        // A late pending is read after the entry's items and takes no place among them.
+        let mut pending_order = kept.pending_order.clone();
+        pending_order.resize(evidence.pending.len(), usize::MAX);
+        let mut answer_order = kept.answer_order.clone();
+        answer_order.resize(evidence.answers.len(), usize::MAX);
+        let mut answer_ends = kept.answer_ends.clone();
+        answer_ends.resize(evidence.answers.len(), None);
+        judge_windows(
+            &mut evidence,
+            &WindowItems {
+                pendings: &pendings,
+                pending_order: &pending_order,
+                answer_order: &answer_order,
+                answer_ends: &answer_ends,
+            },
+            kept.limits,
+            &vci,
+            transmit,
+            response_may_have_begun,
+            kept.evidence.collecting,
+        );
         if let Some(limits) = kept.limits {
-            let response_may_have_begun =
-                evidence.response_started || !limits.start_indications || kept.start_unattached;
-            evidence.timing = timing::judge(
-                limits,
-                evidence.absorbing(),
-                timing::Times {
-                    transmit,
-                    window_from: None,
-                    pendings: &pendings,
-                    start: vci.rx_start.and_then(|time| time.placed()),
-                    end: vci.rx_end.and_then(|time| time.placed()),
-                    end_len: evidence.end.response().map(<[u8]>::len),
-                    timeout: vci.rx_timeout.and_then(|time| time.placed()),
-                    response_may_have_begun,
-                },
-            );
             // A start is judged like a late response by its time, against the limit in force:
             // before the limit less the margin, or after the limit plus the margin (design 8.11
             // "Settlement"). The latest start is judged: one that replaces an earlier start
@@ -8313,6 +8341,171 @@ mod tests {
         let worker = collecting_entry(finished(1_020_000, exchange::Clock::Worker));
         assert_eq!(worker["timing"]["window"], "not_judged", "{worker}");
         assert_eq!(worker["classification"], "undetermined", "{worker}");
+    }
+
+    /// Opens a log with the link `collecting_entry` logs on: P2 1 s, P2* 5 s, a 2 ms margin.
+    fn collecting_log() -> (PathBuf, CommLogSetup, CommLog) {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+                ..Default::default()
+            },
+            Some(true),
+        )
+        .unwrap();
+        (dir, setup, log)
+    }
+
+    /// A collecting presence exchange transmitted at `BASE_US`, ended by the agent's deadline
+    /// 5 s later (`build` gives it the answers it had read), as the host logs it.
+    fn collecting_waited(build: impl FnOnce(&mut exchange::Evidence)) -> exchange::Evidence {
+        let mut evidence = evidence(endpoint(0x7DF), &[0x3E, 0x00], exchange::End::VciDidNotEnd);
+        evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+        evidence.collecting = true;
+        evidence.times.agent.before_us = BASE_US - 100_000;
+        evidence.times.agent.end_us = BASE_US + 5_000_000;
+        evidence.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device_time(BASE_US)),
+            ..exchange::VciTimes::default()
+        });
+        build(&mut evidence);
+        evidence
+    }
+
+    /// The items a primitive's end read, the first just after the agent's deadline, a microsecond
+    /// apart.
+    fn read_after_deadline(items: Vec<EndItem>) -> Vec<EndRead> {
+        items
+            .into_iter()
+            .zip(0..)
+            .map(|(item, k)| EndRead {
+                read: AgentNow {
+                    epoch: 0,
+                    monotonic_us: BASE_US + 5_000_001 + k,
+                    wall_unix_ms: 0,
+                },
+                item,
+            })
+            .collect()
+    }
+
+    /// Logs the collecting exchange `build` makes, then the `primitive_ended` entry for `end`
+    /// with the `items` read for it, and returns that entry.
+    fn collecting_settled(
+        build: impl FnOnce(&mut exchange::Evidence),
+        end: exchange::End,
+        vci_ended: bool,
+        items: Vec<EndItem>,
+    ) -> serde_json::Value {
+        let (dir, setup, log) = collecting_log();
+        let seq = log.exchange(collecting_waited(build)).unwrap();
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(end),
+                detail: exchange::Detail::default(),
+                vci_ended,
+                reads: read_after_deadline(items),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        assert_consecutive(&lines);
+        std::fs::remove_dir_all(&dir).unwrap();
+        of_event(&lines, "primitive_ended").remove(0)
+    }
+
+    /// ADR-425: the end of a collecting primitive that had answers is judged from where its last
+    /// answer ended, as the exchange's own would be (ADR-400): the receive timeout read after
+    /// the agent's deadline is at the limit 1 s after the answer, 1.02 s after the transmit.
+    #[test]
+    fn a_receive_timeout_after_the_deadline_is_judged_from_the_last_answer() {
+        let entry = collecting_settled(
+            |evidence| evidence.answers = vec![positive_on(0x7E8, 20_000)],
+            exchange::End::Positive(vec![0x7E, 0x00]),
+            true,
+            vec![EndItem::RxTimeout(device_time(BASE_US + 1_020_000))],
+        );
+        assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert!(entry["timing"]["response_ms"].is_null(), "{entry}");
+        assert_eq!(entry["answers"].as_array().unwrap().len(), 1, "{entry}");
+        assert_eq!(entry["classification"], "system", "{entry}");
+        // Without an answer the window runs from the transmit: 1.02 s is past the limit.
+        let silent = collecting_settled(
+            |_| {},
+            exchange::End::NoResponse,
+            true,
+            vec![EndItem::RxTimeout(device_time(BASE_US + 1_020_000))],
+        );
+        assert_eq!(silent["timing"]["window"], "timeout_late", "{silent}");
+        let at_limit = collecting_settled(
+            |_| {},
+            exchange::End::NoResponse,
+            true,
+            vec![EndItem::RxTimeout(device_time(BASE_US + 1_000_000))],
+        );
+        assert_eq!(
+            at_limit["timing"]["window"], "timeout_at_limit",
+            "{at_limit}"
+        );
+        assert_eq!(at_limit["classification"], "system", "{at_limit}");
+        let early = collecting_settled(
+            |_| {},
+            exchange::End::NoResponse,
+            true,
+            vec![EndItem::RxTimeout(device_time(BASE_US + 100_000))],
+        );
+        assert_eq!(early["timing"]["window"], "timeout_early", "{early}");
+        assert_eq!(early["classification"], "system", "{early}");
+    }
+
+    /// ADR-425: a `late_item` of a collecting exchange with answers restates the exchange with
+    /// its window judged by the shared function; the entry shows only the classification that
+    /// gives (the window itself is in no `late_item` field).
+    #[test]
+    fn a_late_item_of_a_collecting_exchange_with_answers_restates_it() {
+        let (dir, setup, log) = collecting_log();
+        let seq = log
+            .exchange(collecting_waited(|evidence| {
+                // Owed, as the exchange the agent's deadline ended is, with the finished status
+                // already shown.
+                evidence.answers = vec![positive_on(0x7E8, 20_000)];
+                evidence.vci_ended = true;
+                evidence.times.vci.as_mut().unwrap().finished =
+                    Some(device_time(BASE_US + 1_020_000));
+            }))
+            .unwrap();
+        let start = UnattachedItem {
+            vci_us: 7,
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+                identifier: Some(0x7E8),
+                bytes: Vec::new(),
+            },
+            ..tx_done(0x7E8)
+        };
+        log.lock()
+            .late_item(0, seq, LateIndication::Start, &start, None)
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_item").remove(0);
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+        assert_eq!(late["exchanges"][0]["seq"], seq, "{late}");
+        assert_eq!(
+            late["exchanges"][0]["classification"], "undetermined",
+            "{late}"
+        );
     }
 
     /// A collecting request takes its transmit done from the first answer that carries one.

@@ -903,6 +903,15 @@ pub(crate) fn standing_answers<T, K: PartialEq>(
         .collect()
 }
 
+/// The end of a collecting request that was not ended by an error or the agent's deadline: its
+/// first answer's, or no response when nothing answered (ADR-396 item 4). The one rule the host
+/// ends an exchange by and the log restates a settled end by (ADR-425).
+pub(crate) fn collecting_end(answers: &[Answer]) -> End {
+    answers
+        .first()
+        .map_or(End::NoResponse, |answer| answer.end.clone())
+}
+
 /// An [`Answer`] as the entry gives it, with its own outcome and classification.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AnswerItem {

@@ -1609,12 +1609,14 @@ fn answer_windows(
         .collect();
     let mut open_pendings: Vec<usize> = (0..evidence.pending.len())
         .filter(|&index| {
-            open.iter().any(|&id| {
-                let after = order_of(final_before(evidence.answers.len(), &|answer| {
-                    answer.rx_id == id
-                }));
-                came_on(index, id) && after.is_none_or(|after| pending_order[index] > after)
-            })
+            // A pending not read at a known place is in no window.
+            pending_order[index] != usize::MAX
+                && open.iter().any(|&id| {
+                    let after = order_of(final_before(evidence.answers.len(), &|answer| {
+                        answer.rx_id == id
+                    }));
+                    came_on(index, id) && after.is_none_or(|after| pending_order[index] > after)
+                })
         })
         .collect();
     open_pendings.sort_by_key(|&index| pending_order[index]);
@@ -1630,6 +1632,38 @@ fn answer_windows(
         }
     };
     (windows, entry)
+}
+
+/// The time of the final response for [`exchange::Kept::answer_time`]: a collecting entry has no
+/// response time, so an answer is an answering item with no placed time, as `exchange_with`
+/// takes it; any other entry's is its response's end.
+fn settled_final_time(
+    collecting: bool,
+    final_response: bool,
+    rx_end: Option<exchange::VciTime>,
+) -> Option<timing::At> {
+    if collecting {
+        final_response.then_some(None)
+    } else {
+        rx_end.map(|time| time.placed())
+    }
+}
+
+/// The transmit done of a collecting request, which the first of its `answers` that carries one
+/// gives, on that answer's clock, with where that answer ended (`placed` is where each was
+/// placed): the transmit done is placed before that end (ADR-400 decision 6).
+fn answer_carrier(
+    answers: &[exchange::Answer],
+    placed: &[Option<clocks::Placed>],
+) -> Option<(exchange::VciTime, timing::At)> {
+    let (answer, placed) = answers
+        .iter()
+        .zip(placed)
+        .find(|(answer, _)| answer.tx_done_us.is_some())?;
+    Some((
+        exchange::VciTime::new(answer.tx_done_us?, answer.clock),
+        answer.clock.zip(*placed),
+    ))
 }
 
 /// The elements of `items` whose place `standing` marks.
@@ -2328,29 +2362,19 @@ impl CommLog {
         // done gives it, and ends where that transmit done is placed from.
         let carrier = evidence
             .collecting
-            .then(|| {
-                evidence
-                    .answers
-                    .iter()
-                    .zip(&answer_placed)
-                    .find(|(answer, _)| answer.tx_done_us.is_some())
-            })
+            .then(|| answer_carrier(&evidence.answers, &answer_placed))
             .flatten();
-        if let Some((answer, _)) = carrier {
+        if let Some((time, _)) = carrier {
             vci.tx_done = vci
                 .tx_done
                 .into_iter()
-                .chain(
-                    answer
-                        .tx_done_us
-                        .map(|us| exchange::VciTime::new(us, answer.clock)),
-                )
+                .chain([time])
                 .reduce(exchange::VciTime::prefer);
         }
-        let anchor = vci.rx_end.and_then(|end| end.placed()).or_else(|| {
-            let (answer, placed) = carrier?;
-            answer.clock.zip(*placed)
-        });
+        let anchor = vci
+            .rx_end
+            .and_then(|end| end.placed())
+            .or_else(|| carrier?.1);
         let end_read = read_at(end_us);
         for time in [&mut vci.tx_done, &mut vci.rx_start].into_iter().flatten() {
             let placed = match anchor {
@@ -3120,11 +3144,24 @@ impl CommLog {
         }
         // The item that answers a collecting primitive is its first answer read for the end
         // (ADR-425); any other primitive's is its final response.
-        let first_new_answer = kept
-            .evidence
-            .collecting
-            .then(|| new_answers.first().map(|(index, read, ..)| (*index, *read)))
-            .flatten();
+        // As the host orders an error it read against a window's answer: a window that ended
+        // on an answer, whose first final answer came after the entry's, with no final answer
+        // in the entry.
+        let expected = &kept.evidence.expected;
+        let first_new_answer = (kept.evidence.collecting
+            && evidence.end.response().is_some()
+            && kept
+                .evidence
+                .answers
+                .iter()
+                .all(|answer| answer.is_pending(expected)))
+        .then(|| {
+            new_answers
+                .iter()
+                .find(|(_, _, answer, _)| !answer.is_pending(expected))
+                .map(|(index, read, ..)| (*index, *read))
+        })
+        .flatten();
         let answer_read = response
             .map(|(index, read, ..)| (index, read))
             .or(first_new_answer);
@@ -3241,16 +3278,38 @@ impl CommLog {
         // entry's, in the order the host read them, each placed once (ADR-425). A pending of
         // the entry's that came last on its identifier and now has a final answer after it is
         // that answer's pending, not an answer of its own (ADR-396).
-        let mut new_answer_at = None;
+        let mut carried_tx_done = None;
         if collecting {
             evidence.pending_ids = pending_ids;
             let mut answers = std::mem::take(&mut evidence.answers);
+            let (fresh, fresh_placed): (Vec<_>, Vec<_>) = new_answers
+                .iter()
+                .map(|(_, _, answer, placed)| ((*answer).clone(), *placed))
+                .unzip();
+            // The transmit done an answer read after the deadline carries, when the entry had
+            // none (as `exchange_with` takes it from the first answer that has one).
+            if kept
+                .evidence
+                .times
+                .vci
+                .and_then(|vci| vci.tx_done)
+                .is_none()
+            {
+                carried_tx_done =
+                    answer_carrier(&fresh, &fresh_placed).map(|(time, anchor)| {
+                        match (time.clock, anchor) {
+                            (Some(clock), Some((own, end))) if clock == own => {
+                                time.at(Some(clocks::before(end, time.us)))
+                            }
+                            _ => time.at(None),
+                        }
+                    });
+            }
             for (index, read, answer, placed) in new_answers {
                 let mut answer = answer.clone();
                 // The answer's agent time is when the host read it.
                 answer.agent_us = read.monotonic_us;
                 answer.epoch = placed.map(|placed| placed.epoch);
-                new_answer_at = Some(answer.clock.zip(placed));
                 answer_order.push(order_base + index);
                 answer_ends.push(answer.clock.zip(placed));
                 answers.push(answer);
@@ -3263,6 +3322,17 @@ impl CommLog {
             evidence.answers = keep_standing(answers, &standing);
             answer_order = keep_standing(answer_order, &standing);
             answer_ends = keep_standing(answer_ends, &standing);
+            // The end is the first answer left standing, as an exchange that ended on its own
+            // has it (ADR-396 item 4); an error or a lost VCI keeps its own.
+            if matches!(
+                evidence.end,
+                exchange::End::Positive(_)
+                    | exchange::End::Negative(_)
+                    | exchange::End::PositiveUnusable(_)
+                    | exchange::End::NoResponse
+            ) {
+                evidence.end = exchange::collecting_end(&evidence.answers);
+            }
         }
         // The entry's VCI times are the ones its exchange had, with the end's over them; the
         // times read before the deadline keep their entry's placement (ADR-386).
@@ -3296,14 +3366,16 @@ impl CommLog {
                 Some(exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed));
             evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
         }
-        let given_tx_done = response.and_then(|(_, _, _, tx_done, _)| tx_done);
+        let given_tx_done = response
+            .and_then(|(_, _, _, tx_done, _)| tx_done)
+            .or(carried_tx_done);
         vci.tx_done = indication
             .into_iter()
             .chain(given_tx_done)
             .reduce(exchange::VciTime::prefer);
         // A transmit done the response's own item carries confirms the send when no indication
         // did, as for an exchange (design 8.11 `sent_evidence` `tx_done_time`).
-        if response_tx_done && evidence.transmit_evidence.is_none() {
+        if (response_tx_done || carried_tx_done.is_some()) && evidence.transmit_evidence.is_none() {
             evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxDoneTime);
         }
         // The reading at the deadline, which the kept `system` rests on.
@@ -3466,10 +3538,11 @@ impl CommLog {
         // after its entry may have come after it (ADR-384), by the time of the item that
         // answers it: the response's end, else the latest pending, then a start.
         let answer_time = kept.answer_time(
-            times
-                .and_then(|times| times.rx_end)
-                .map(|time| time.placed())
-                .or(new_answer_at),
+            settled_final_time(
+                collecting,
+                final_response,
+                times.and_then(|times| times.rx_end),
+            ),
             &pendings[kept_pendings..],
             times
                 .and_then(|times| times.rx_start)
@@ -5920,7 +5993,7 @@ impl JobLog {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// What a job end read for a primitive in the form tests were written in: the pendings, the
@@ -8508,6 +8581,29 @@ mod tests {
         lines
     }
 
+    /// For the host's tests: logs the collecting presence exchange the agent's deadline ended,
+    /// with one positive answer from 0x7E8 at 20 ms when `kept`, then hands `settle` the log and
+    /// the exchange's `seq` to write its `primitive_ended` entry (what the host read for the end
+    /// is read from `BASE_US + 5 s` on the agent's clock). Returns the lines of the log.
+    pub(crate) fn settle_collecting(
+        kept: bool,
+        settle: impl FnOnce(&CommLog, u64),
+    ) -> Vec<serde_json::Value> {
+        let (dir, setup, log) = collecting_log();
+        let seq = log
+            .exchange(collecting_waited(|evidence| {
+                if kept {
+                    evidence.answers = vec![positive_on(0x7E8, 20_000)];
+                }
+            }))
+            .unwrap();
+        settle(&log, seq);
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
     /// [`collecting_lines`]'s `primitive_ended` entry.
     fn collecting_settled(
         build: impl FnOnce(&mut exchange::Evidence),
@@ -8780,19 +8876,21 @@ mod tests {
         assert_eq!(classes(&unknown), ["none", "none"], "{unknown}");
     }
 
-    /// ADR-425, rows 11 and 12 (ADR-386, design 8.11 "Link error"): a link error read before the
-    /// first answer read for the end comes before it, and the answer counts since the error; one
-    /// read after it ends the answer's count. Either way the answers are listed, each with the
-    /// history the link gave it as an exchange of its own (ADR-400).
+    /// ADR-425, rows 11 and 12 (ADR-386, design 8.11 "Link error"): a window that failed in a
+    /// bound error lists its answers, each with the history the link gave it as an exchange of its
+    /// own (ADR-400), and no answer comes before that error. A link error the entry had read
+    /// after its final answer stays after it when another answer is read for the end.
     #[test]
-    fn a_link_error_read_for_a_collecting_end_is_ordered_by_the_first_new_answer() {
-        let run = |items: Vec<EndItem>| {
+    fn a_link_error_read_for_a_collecting_end_is_ordered_by_its_first_final_answer() {
+        let run = |build: Box<dyn FnOnce(&mut exchange::Evidence)>,
+                   end: exchange::End,
+                   items: Vec<EndItem>| {
             let (dir, setup, log) = collecting_log();
-            let seq = log.exchange(collecting_waited(|_| {})).unwrap();
+            let seq = log.exchange(collecting_waited(build)).unwrap();
             log.primitive_ended(
                 seq,
                 PrimitiveEnded {
-                    end: Some(exchange::End::Positive(FIRST.to_vec())),
+                    end: Some(end),
                     detail: exchange::Detail::default(),
                     vci_ended: true,
                     reads: read_after_deadline(items),
@@ -8806,21 +8904,164 @@ mod tests {
             (evidence, of_event(&lines, "primitive_ended").remove(0))
         };
         let frame = Some(exchange::LinkErrorKind::Frame);
-        let (before, _) = run(vec![
-            end_error(frame, 90_000),
-            answer_read(0x7E8, 100_000),
-            EndItem::Finished(device_time(BASE_US + 1_100_000)),
-        ]);
-        let (after, entry) = run(vec![
-            answer_read(0x7E8, 100_000),
-            end_error(frame, 200_000),
-            EndItem::Finished(device_time(BASE_US + 1_100_000)),
-        ]);
-        assert_eq!(before.link_errors, [exchange::LinkErrorKind::Frame]);
-        assert!(before.link_errors_before_answer);
-        assert!(!after.link_errors_before_answer);
+        // The window failed after an answer: no answer is before the error.
+        let (failed, entry) = run(
+            Box::new(|_| {}),
+            exchange::End::LinkError(exchange::LinkErrorKind::Frame),
+            vec![
+                answer_read(0x7E8, 100_000),
+                end_error(None, 200_000),
+                EndItem::Finished(device_time(BASE_US + 1_100_000)),
+            ],
+        );
+        assert!(!failed.link_errors_before_answer);
         assert_eq!(entry["answers"].as_array().unwrap().len(), 1, "{entry}");
-        assert!(after.answers[0].history.is_some());
+        assert!(failed.answers[0].history.is_some());
+        // The entry had a final answer and an own-link error after it: another answer read for
+        // the end does not put the error before an answer.
+        let (kept_error, _) = run(
+            Box::new(|evidence| {
+                evidence.answers = vec![positive_on(0x7E8, 20_000)];
+                evidence.link_errors = vec![exchange::LinkErrorKind::Frame];
+            }),
+            exchange::End::Positive(FIRST.to_vec()),
+            vec![
+                answer_read(0x7E9, 300_000),
+                EndItem::Finished(device_time(BASE_US + 1_300_000)),
+            ],
+        );
+        assert!(!kept_error.link_errors_before_answer);
+        // Without a final answer in the entry the first one read for the end is the key: an
+        // error read before it comes first, one read after it does not.
+        let (before, _) = run(
+            Box::new(|_| {}),
+            exchange::End::Positive(FIRST.to_vec()),
+            vec![
+                end_error(frame, 90_000),
+                answer_read(0x7E8, 100_000),
+                EndItem::Finished(device_time(BASE_US + 1_100_000)),
+            ],
+        );
+        assert!(before.link_errors_before_answer);
+        let (after, _) = run(
+            Box::new(|_| {}),
+            exchange::End::Positive(FIRST.to_vec()),
+            vec![
+                answer_read(0x7E8, 100_000),
+                end_error(frame, 200_000),
+                EndItem::Finished(device_time(BASE_US + 1_100_000)),
+            ],
+        );
+        assert!(!after.link_errors_before_answer);
+    }
+
+    /// ADR-425: the answer a collecting entry counts for the later exchanges has no placed time,
+    /// as the exchange's entry gives it, whatever the answers' times.
+    #[test]
+    fn a_collecting_entrys_answer_time_is_not_placed() {
+        let end = Some(device_time(BASE_US));
+        assert_eq!(settled_final_time(true, true, end), Some(None));
+        assert_eq!(settled_final_time(true, false, end), None);
+        assert_eq!(settled_final_time(false, false, None), None);
+        assert_eq!(
+            settled_final_time(false, true, end.map(|time| time.at(None))),
+            Some(None)
+        );
+    }
+
+    /// ADR-425: the transmit done an answer read after the deadline carries gives the entry its
+    /// transmit when the entry had none, and confirms the send, as the first answer that has one
+    /// does for the exchange's own entry (ADR-400 decision 6).
+    #[test]
+    fn a_transmit_done_on_an_answer_read_after_the_deadline_places_the_window() {
+        let mut carrier = positive_on(0x7E8, 20_000);
+        carrier.tx_done_us = Some(BASE_US);
+        let entry = collecting_settled(
+            |evidence| evidence.times.vci = None,
+            exchange::End::Positive(FIRST.to_vec()),
+            true,
+            vec![
+                EndItem::Answer(carrier),
+                EndItem::Finished(device_time(BASE_US + 1_020_000)),
+            ],
+        );
+        assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert_eq!(entry["answers"][0]["response_ms"], 20.0, "{entry}");
+        assert_eq!(entry["sent_evidence"], "tx_done_time", "{entry}");
+    }
+
+    /// ADR-396 item 4, ADR-425: the end is the first answer left standing, as an exchange that
+    /// ended on its own has it: a lone pending read after the deadline is a negative end, and a
+    /// kept lone pending on another identifier stays the first answer when a final one is read.
+    #[test]
+    fn the_end_of_a_settled_window_is_its_first_standing_answer() {
+        let mut items = pending_reads(0x7E8, 200_000);
+        items.push(EndItem::Finished(device_time(BASE_US + 1_200_000)));
+        let lone = collecting_settled(|_| {}, exchange::End::NoResponse, false, items);
+        assert_eq!(lone["outcome"]["result"], "negative", "{lone}");
+        let kept_lone = collecting_settled(
+            |evidence| {
+                evidence.answers = vec![answer_on(
+                    0x7E9,
+                    exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+                    200_000,
+                )];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E9)];
+            },
+            exchange::End::Positive(FIRST.to_vec()),
+            true,
+            vec![
+                answer_read(0x7E8, 400_000),
+                EndItem::Finished(device_time(BASE_US + 1_400_000)),
+            ],
+        );
+        assert_eq!(kept_lone["outcome"]["result"], "negative", "{kept_lone}");
+        assert_eq!(
+            kept_lone["answers"].as_array().unwrap().len(),
+            2,
+            "{kept_lone}"
+        );
+    }
+
+    /// ADR-425 decision 4: a new pending on the identifier of the entry's lone pending replaces
+    /// it as the lone answer.
+    #[test]
+    fn a_newer_pending_on_the_same_identifier_folds_the_entrys_lone_pending() {
+        let mut items = pending_reads(0x7E8, 600_000);
+        items.push(EndItem::Finished(device_time(BASE_US + 1_600_000)));
+        let entry = collecting_settled(
+            |evidence| {
+                evidence.answers = vec![answer_on(
+                    0x7E8,
+                    exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+                    200_000,
+                )];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            },
+            exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+            true,
+            items,
+        );
+        let answers = entry["answers"].as_array().unwrap();
+        assert_eq!(answers.len(), 1, "{entry}");
+        assert_eq!(answers[0]["vci_us"], BASE_US + 600_000, "{entry}");
+    }
+
+    /// A pending read at no known place is in no window, so the entry's open window leaves it
+    /// out and a later judgement never indexes past the placed ones.
+    #[test]
+    fn a_pending_with_no_place_is_in_no_open_window() {
+        let lone = answer_on(0x7E9, exchange::End::Negative(vec![0x7F, 0x3E, 0x78]), 20);
+        let (_, entry) = windows_of(
+            vec![lone],
+            vec![pending_on(20)],
+            vec![Some(0x7E9)],
+            &[usize::MAX],
+            &[1],
+        );
+        assert!(entry.pendings.is_empty());
     }
 
     /// ADR-425, row 13: the cancel of the agent settles nothing and lists no answers.

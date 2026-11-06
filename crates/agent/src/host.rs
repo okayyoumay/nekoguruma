@@ -1306,39 +1306,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             self.log_unattached(&reads, None);
             return;
         };
-        let primitive = match ended {
-            StrayEnd::Ended(result) => {
-                let (end, mut detail) =
-                    sent_end(&stray.request, result, &progress.negative, progress.sid);
-                // The event named and its extra error information, as for an exchange, from
-                // every error the primitive reported: the one that ended it may have been read
-                // before the deadline.
-                named_events(
-                    result,
-                    &progress.errors,
-                    progress.vci_lost.as_ref(),
-                    progress.rx_timeout.as_ref(),
-                    &mut detail,
-                );
-                crate::comm_log::PrimitiveEnded {
-                    end: Some(end),
-                    detail,
-                    // As an exchange's: a collecting window that got answers ended on the
-                    // primitive's finished status (ISO 22900-2:2022 8.2.6.2.2).
-                    vci_ended: progress.rx_timeout.is_some()
-                        || (progress.collecting
-                            && result.is_ok()
-                            && progress.response_times.finished.is_some()),
-                    reads: progress.take_reads(epoch, Some(result)),
-                }
-            }
-            StrayEnd::Cancelled => crate::comm_log::PrimitiveEnded {
-                end: None,
-                detail: Detail::default(),
-                vci_ended: false,
-                reads: progress.take_reads(epoch, None),
-            },
-        };
+        let primitive = primitive_ended_of(stray, progress, ended, epoch);
         let reads = primitive.reads.clone();
         let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             log.primitive_ended(seq, primitive)
@@ -1552,15 +1520,11 @@ impl<C: WorkerApi> WorkerHost<C> {
             };
             // A collecting request that ended on its own has the end of its first answer, or no
             // response (ADR-396); any other end is judged as for any request.
-            let (end, mut detail) = match (&sent.result, answers.first()) {
-                (Ok(_) | Err(HostError::NoResponse), first)
-                    if collecting && !sent.agent_deadline =>
-                {
-                    (
-                        first.map_or(End::NoResponse, |answer| answer.end.clone()),
-                        Detail::default(),
-                    )
-                }
+            let (end, mut detail) = match &sent.result {
+                Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => (
+                    crate::comm_log::exchange::collecting_end(&answers),
+                    Detail::default(),
+                ),
                 _ => sent_end(&request, &sent.result, &negative, sid),
             };
             detail.cop_type = start_comm.then_some("startcomm");
@@ -3124,6 +3088,49 @@ enum StrayEnd<'a> {
     Cancelled,
 }
 
+/// The `primitive_ended` input the stray's wait gives for its `ended`: the end as its exchange
+/// would have had it, and every item read for it (ADR-386), `epoch` being the agent's.
+fn primitive_ended_of(
+    stray: &Stray,
+    progress: &mut Progress,
+    ended: StrayEnd<'_>,
+    epoch: u32,
+) -> crate::comm_log::PrimitiveEnded {
+    match ended {
+        StrayEnd::Ended(result) => {
+            let (end, mut detail) =
+                sent_end(&stray.request, result, &progress.negative, progress.sid);
+            // The event named and its extra error information, as for an exchange, from
+            // every error the primitive reported: the one that ended it may have been read
+            // before the deadline.
+            named_events(
+                result,
+                &progress.errors,
+                progress.vci_lost.as_ref(),
+                progress.rx_timeout.as_ref(),
+                &mut detail,
+            );
+            crate::comm_log::PrimitiveEnded {
+                end: Some(end),
+                detail,
+                vci_ended: vci_ended(
+                    progress.rx_timeout.is_some(),
+                    progress.collecting,
+                    result.is_ok(),
+                    progress.response_times.finished.is_some(),
+                ),
+                reads: progress.take_reads(epoch, Some(result)),
+            }
+        }
+        StrayEnd::Cancelled => crate::comm_log::PrimitiveEnded {
+            end: None,
+            detail: Detail::default(),
+            vci_ended: false,
+            reads: progress.take_reads(epoch, None),
+        },
+    }
+}
+
 /// Whether `item` shows that the primitive `cop` has ended: its own finished or cancelled
 /// status, or a lost VCI, whose primitives the worker cancels (ADR-289).
 fn ends_primitive(item: &EventItem, cop: ComPrimitiveHandle) -> bool {
@@ -3261,8 +3268,12 @@ impl Sent {
     /// agent's own deadline.
     fn vci_ended(&self, collecting: bool) -> bool {
         // A response's times count only for an exchange that ended with that response.
-        self.rx_timeout.is_some()
-            || (collecting && self.result.is_ok() && self.response_times.finished.is_some())
+        vci_ended(
+            self.rx_timeout.is_some(),
+            collecting,
+            self.result.is_ok(),
+            self.response_times.finished.is_some(),
+        )
     }
 
     /// A request whose positive response is suppressed (`suppressed`) is answered by silence
@@ -3960,6 +3971,13 @@ pub(crate) fn positive_prefix(request: &[u8]) -> Vec<u8> {
         [sid, ..] => vec![sid.wrapping_add(0x40)],
         [] => Vec::new(),
     }
+}
+
+/// Whether the VCI ended an exchange: by its receive timeout, or for a collecting window that
+/// got answers (`result_ok`) by the primitive's finished status (ISO 22900-2:2022 8.2.6.2.2).
+/// The one rule the exchange's entry and its `primitive_ended` entry share.
+fn vci_ended(rx_timeout: bool, collecting: bool, result_ok: bool, finished: bool) -> bool {
+    rx_timeout || (collecting && result_ok && finished)
 }
 
 /// What the events of one send-receive have shown so far.
@@ -7849,6 +7867,69 @@ mod tests {
             ),
             [false, true, true]
         );
+    }
+
+    /// ADR-425, host to log: a collecting stray driven by the events it reads after the deadline
+    /// (an answer on another identifier, then the finished status) gives the
+    /// `PrimitiveEnded` the host writes, whose `vci_ended` follows the exchange's rule, and the
+    /// log lists both answers and judges the window from the last on the finished item.
+    #[test]
+    fn a_collecting_stray_read_after_the_deadline_is_settled_through_the_log() {
+        let lines = crate::comm_log::tests::settle_collecting(true, |log, seq| {
+            let progress = Progress::for_request(&[0x3E, 0x00]).unwrap();
+            let mut stray = Stray {
+                cop: Some(COP),
+                tag: vec![0; 8],
+                deadline: tokio::time::Instant::now(),
+                cancel_failed: false,
+                request: vec![0x3E, 0x00],
+                expectation: crate::send_receive::Expectation {
+                    sid: progress.sid,
+                    positive: progress.positive_prefix.clone(),
+                    negative: progress.negative.clone(),
+                },
+                seq: Some(seq),
+                exchange: Some(seq),
+                // The entry's answer was the primitive's response.
+                response: Some(vec![0x7E, 0x00]),
+                response_times: VciTimes::default(),
+                error: None,
+                errors: Vec::new(),
+                collecting: true,
+                receive_table: TABLE.to_vec(),
+                progress: None,
+            };
+            let mut progress = stray.take_progress();
+            let mut answer = answer_on(Some(0x7E9), 2, &[0x7E, 0x00]);
+            answer.timestamp = 1_300_000;
+            answer.timestamp_clock = TimestampClock::Device as i32;
+            let mut finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+            finished.timestamp = 2_300_000;
+            finished.timestamp_clock = TimestampClock::Device as i32;
+            let mut done = None;
+            for (at, item) in [answer, finished].into_iter().enumerate() {
+                done = progress.on_read(
+                    Some(event_notification::EventData::Item(item)),
+                    COP,
+                    Some(AgentNow {
+                        epoch: 0,
+                        monotonic_us: 6_000_000 + at as u64,
+                        wall_unix_ms: 0,
+                    }),
+                );
+            }
+            let done = done.expect("the finished status ends the wait");
+            let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
+            assert!(ended.vci_ended);
+            assert!(log.primitive_ended(seq, ended).is_some());
+        });
+        let entry = lines
+            .iter()
+            .find(|line| line["event"] == "primitive_ended")
+            .unwrap();
+        assert_eq!(entry["answers"].as_array().unwrap().len(), 2, "{entry}");
+        assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        assert_eq!(entry["outcome"]["result"], "positive", "{entry}");
     }
 
     /// Case 22: an ordinary primitive that got two bound answers keeps the first as its response

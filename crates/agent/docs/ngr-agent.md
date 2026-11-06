@@ -555,6 +555,12 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   then goes through `late_item`: one of no primitive at or after the exchange's earliest placed
   start, or not set against its starts, is that exchange's own; the rest are placed by their
   time. A settling entry that changes an exchange a `vci_loss` record lists rewrites the record.
+  The stray of a collecting primitive (the presence request) goes on collecting, so what it
+  reads after the deadline reaches the entry (ADR-425): each result as an answer (`EndItem::Answer`,
+  a pending with the identifier it came on) and the finished status (`EndItem::Finished`). The
+  entry lists them after the exchange's own answers, folds a lone pending whose identifier then
+  got its final answer, and judges all of them, and its own window from the last answer, with the
+  one function the exchange's entry uses (`judge_windows`, ADR-400).
   The `primitive_ended` entry gives the end as an
   exchange entry does, classified by the exchange rows as if the agent had waited, except that a
   final response or a receive timeout at the limit is `system`; a cancel by the agent, written

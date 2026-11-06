@@ -884,6 +884,25 @@ impl Answer {
     }
 }
 
+/// Which of `items`, the results of a collecting primitive in the order they were read, stand as
+/// answers: every result that is not a pending, and a pending only when no result on its
+/// identifier (`key`) came after it, so a pending followed by its final answer is one answer
+/// (ADR-396). The one rule both the host's list of a window's answers and the log's restatement
+/// of them at a settlement follow (ADR-425).
+pub(crate) fn standing_answers<T, K: PartialEq>(
+    items: &[T],
+    key: impl Fn(&T) -> K,
+    pending: impl Fn(&T) -> bool,
+) -> Vec<bool> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            !pending(item) || !items[at + 1..].iter().any(|later| key(later) == key(item))
+        })
+        .collect()
+}
+
 /// An [`Answer`] as the entry gives it, with its own outcome and classification.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AnswerItem {
@@ -2528,6 +2547,16 @@ impl LinkState {
             .find(|logged| logged.seq == seq)
             .map(|logged| logged.classification)
             .or_else(|| self.kept(seq).map(|kept| kept.classification))
+    }
+
+    /// The evidence the window holds for the exchange logged as `seq`, as the last entry about it
+    /// left it.
+    #[cfg(test)]
+    pub(crate) fn logged_evidence(&self, seq: u64) -> Option<&Evidence> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .map(|logged| &logged.evidence)
     }
 
     /// The window's newest exchange.

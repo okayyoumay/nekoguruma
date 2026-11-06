@@ -45,8 +45,6 @@ serial_test = "3"
 shared-proto = { workspace = true }
 tempfile = "3"
 worker-host = { workspace = true }
-# DIAG: investigation only; tests/agent_worker_crash.rs prints the agent's warnings.
-tracing-subscriber = { workspace = true }
 # Built for tests/sim_vci_end_to_end.rs and tests/sim_vci_control.rs, which load the cdylib;
 # not linked.
 sim-vci = { path = "../sim-vci" }

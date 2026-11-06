@@ -142,22 +142,6 @@ jobs:
       - if: github.event_name == 'pull_request'
         shell: bash
         run: cargo nextest run -p j2534-0404-service --locked --profile ci-windows --test agent_restart_end_to_end
-      # DIAG (investigation only): repeat agent_worker_crash with its diagnostics shown.
-      - if: github.event_name == 'pull_request'
-        shell: bash
-        run: |
-          failed=0
-          for i in 1 2 3 4 5; do
-            echo "DIAG: iteration $i"
-            if cargo nextest run -p j2534-0404-service --locked --profile ci-windows --test agent_worker_crash --no-fail-fast --no-capture; then
-              echo "DIAG: iteration $i exit status 0"
-            else
-              status=$?
-              echo "DIAG: iteration $i exit status $status"
-              failed=1
-            fi
-          done
-          exit $failed
       # sim-vci is a cdylib only, which cargo runs no doc tests for.
       - shell: bash
         run: cargo test --workspace --locked --exclude sim-vci $EXCLUDE --doc

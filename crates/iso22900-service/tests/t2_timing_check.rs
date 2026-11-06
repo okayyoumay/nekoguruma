@@ -14,6 +14,11 @@
 //! `crates/j2534-0404-service/tests/t2_timing_check.rs` runs the same body on `sim-vci` behind
 //! the J2534 worker, which measures to the response's end.
 //!
+//! The guard turns both indications on and the mock's transmit indication carries the same time as
+//! the response's `TxMsgDoneTimestamp`, so this test does not show that the handle reads the
+//! transmit done from the response item itself; the handle's unit tests cover that, and
+//! `t2_indication_times.rs` covers the times from the indication items.
+//!
 //! This file holds a single test, so the process-wide variables it sets for the spawned service
 //! cannot race with another test.
 

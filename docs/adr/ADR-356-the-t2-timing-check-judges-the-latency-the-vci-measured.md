@@ -94,8 +94,12 @@ The maintainer decided three things:
 - On J2534, the transmit indication and the response are both on the device clock, so their
   difference is measured. `sim-vci` gives no start of message for a single frame, so CI
   measures to the response's end.
-- The D-PDU mock gives no timestamp flags, so on `iso22900-service` the shape of the D-PDU
-  items is covered by the handle's unit tests, not end to end.
+- The D-PDU mock gave no timestamp flags when this was decided, so on `iso22900-service` the
+  shape of the D-PDU items was covered by the handle's unit tests only. Amended later: the mock
+  now gives the response's timestamp flags and, with the two indication ComParams on, bound
+  transmit and start-of-message indication items, and `iso22900-service`'s
+  `t2_indication_times` test shows the handle taking its times from the indications end to end;
+  the handle's unbound path is still covered by its unit tests only.
 - Every guarded link on T1 to T3 now has the indications on. The handle's other readers ignore
   them: an indication is never a response, and the raw frame reader serves only T0.
 - The API's own tester present can send on the request identifier during an exchange, when a

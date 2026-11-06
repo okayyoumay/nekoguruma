@@ -703,6 +703,7 @@ pub(crate) fn settle_worker<S: crate::client::WorkerSource + ?Sized>(
     in_flight: &[u64],
 ) -> bool {
     let mut status = source.status();
+    let first_status = format!("{status:?}");
     if matches!(status, WorkerStatus::Alive) && evidence.unanswered {
         let until = Instant::now() + exit_grace;
         while matches!(status, WorkerStatus::Alive) && Instant::now() < until {
@@ -723,8 +724,25 @@ pub(crate) fn settle_worker<S: crate::client::WorkerSource + ?Sized>(
                 return false;
             }
         },
-        _ => return false,
+        _ => {
+            tracing::warn!(
+                unanswered = evidence.unanswered,
+                hung = evidence.hung,
+                first_status,
+                final_status = ?status,
+                logged_worker_exit = false,
+                "DIAG settle_worker"
+            );
+            return false;
+        }
     };
+    tracing::warn!(
+        unanswered = evidence.unanswered,
+        hung = evidence.hung,
+        first_status,
+        logged_worker_exit = log.is_some(),
+        "DIAG settle_worker"
+    );
     if let Some(log) = log {
         log.worker_exit(exit, in_flight);
     }

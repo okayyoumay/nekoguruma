@@ -915,7 +915,8 @@ again only after a client of a new worker was given):
 
 At the run's end, when the run's path was lost (`path_lost`, whatever ending followed),
 `run_job` asks `WorkerHost::reap_exited_worker` before it settles the stray primitive and closes
-the link: a worker that exited is taken in as above, so the final close through it is not made
+the link: a worker still reported alive is asked about again every 50 ms for up to the exit
+grace (a reopen's own first look does not wait), and one that exited is taken in as above, so the final close through it is not made
 and does not mark the guards. The process stays in the slot, and `main.rs`'s stop finds it gone
 (`Stopped::Exited`). A bare client says `Unknown`, so a run on one behaves as it did before.
 

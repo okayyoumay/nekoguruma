@@ -815,7 +815,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             .store(true, std::sync::atomic::Ordering::Relaxed);
         // A worker that exited holds no link and answers nothing: it is not asked to close it
         // (ADR-394).
-        if !self.worker_exited(relink) && relink.old_open {
+        if !self.worker_exited(relink, false) && relink.old_open {
             // A primitive the loss left is settled first, then the lost link is closed: the
             // worker takes the module again only after it was disconnected. The event stream
             // goes before the link is closed.
@@ -925,12 +925,20 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// takes the end in ([`WorkerHost::worker_gone`]). A source that does not own the process
     /// never says so, and neither does one whose worker's end was taken in already, until a
     /// client of a new worker is given (ADR-394).
-    fn worker_exited(&mut self, relink: &mut Relink<C>) -> bool {
+    ///
+    /// `lost` says the worker's loss is evident (the run ended on a lost path): a killed process
+    /// may still read alive for a moment, so the exit is waited for up to `Relink::exit_grace`.
+    /// A reopen's first look (`lost` false) must not hold up the reopen of a live worker.
+    fn worker_exited(&mut self, relink: &mut Relink<C>, lost: bool) -> bool {
         if relink.worker_ended {
             return false;
         }
         let in_flight = self.stray.as_ref().and_then(|stray| stray.exchange);
-        self.worker_gone(relink, CloseEvidence::default(), in_flight)
+        let evidence = CloseEvidence {
+            unanswered: lost,
+            hung: false,
+        };
+        self.worker_gone(relink, evidence, in_flight)
     }
 
     /// Settles the worker after a step of closing or opening a link got no answer
@@ -966,12 +974,14 @@ impl<C: WorkerApi> WorkerHost<C> {
 
     /// At the end of a run that ended on a lost path: whether the worker's process has exited,
     /// which is then taken in ([`WorkerHost::worker_gone`]) so that the final close, which would
-    /// go through a dead worker, is not made and does not mark the guards (ADR-394).
+    /// go through a dead worker, is not made and does not mark the guards (ADR-394). A worker
+    /// still reported alive is asked again for up to the exit grace, since a killed process
+    /// closes its sockets before it can be reaped.
     pub(crate) fn reap_exited_worker(&mut self) -> bool {
         let Some(mut relink) = self.relink.take() else {
             return false;
         };
-        let exited = self.worker_exited(&mut relink);
+        let exited = self.worker_exited(&mut relink, true);
         self.relink = Some(relink);
         exited
     }

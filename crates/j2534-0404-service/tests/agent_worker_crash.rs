@@ -486,17 +486,26 @@ async fn an_unsafe_request_outstanding_at_the_crash_ends_on_site(
         "{}",
         text()
     );
-    let exit = event(&lines, "worker_exit");
-    assert_eq!(exit["pid"], killed, "{exit}");
+    // The host logs a `worker_exit` only when it sees the process gone within its exit grace
+    // (`host.rs`, the close's exit check); on a slower system (the Windows runner) the killed
+    // worker can still read as alive then, so the entry may be missing, but when it is there
+    // it names the killed worker.
+    if let Some(exit) = lines.iter().find(|line| line["event"] == "worker_exit") {
+        assert_eq!(exit["pid"], killed, "{exit}");
+    }
     drop(run.guards);
-    // The slot's process is the killed one, reaped and so without an ID: no new worker was
-    // started.
+    // The slot still holds the killed worker, reaped (no ID) or not yet (its own ID): no new
+    // worker was started.
     let process = slot
         .lock()
         .unwrap()
         .take()
         .expect("the slot holds a worker");
-    assert_eq!(process.id(), None);
+    assert!(
+        process.id().is_none_or(|id| id == killed),
+        "the slot holds another worker: {:?}",
+        process.id()
+    );
     drop(process);
 }
 

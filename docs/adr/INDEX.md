@@ -389,7 +389,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-397](ADR-397-a-parity-gap-is-fixed-by-sharing-the-existing-code.md) | A Parity Gap Is Fixed by Sharing the Existing Code | Accepted | `.claude/README.md` (gates, the parity check), `.claude/agents/edge-case-hunter.md` |
 | [ADR-398](ADR-398-a-refused-connect-time-filter-fails-the-j2534-connect.md) | A Refused Connect-Time Filter Fails the J2534 Connect; the Log Header Names the Job Kind; `ngr-agent identify` | Accepted | `j2534-0404-service` rpc_link; `agent` comm_log, runner, identification, `main.rs`; design 8.8.2, 8.11; ADR-039, ADR-068, ADR-396, ADR-397 |
 | [ADR-399](ADR-399-the-identification-job-reads-the-vin.md) | The Identification Job Reads the VIN, Establishes It on Agreement and Takes the Vehicle's Lock | Accepted (item 4's report with no lock now ends the run in `LinkUnconfirmed` when an ECU read remains, by ADR-401; item 6's "nothing is dropped" superseded for a plan of candidates by ADR-402: a candidate none of whose VIN rules for a component matched is dropped) | `agent` `identification`, `inputs`, `runner` (`promote_to_vehicle`); design 8.8.2; ADR-261, ADR-262, ADR-327 item 5, ADR-345, ADR-392, ADR-393, ADR-395, ADR-396, ADR-397 |
-| [ADR-400](ADR-400-the-answers-of-an-exchange-are-judged-each-from-its-window.md) | The Answers of an Exchange Are Judged Each From Its Own Window | Accepted | `agent` host, communication log and timing, `sim-ecu` (`Fault::RepeatResponse`), `sim-vci`; design 8.11 `answers`, `timing`; ADR-327 item 2, ADR-361, ADR-376, ADR-396 item 4 |
+| [ADR-400](ADR-400-the-answers-of-an-exchange-are-judged-each-from-its-window.md) | The Answers of an Exchange Are Judged Each From Its Own Window | Accepted (Consequences on settling entries superseded by ADR-425) | `agent` host, communication log and timing, `sim-ecu` (`Fault::RepeatResponse`), `sim-vci`; design 8.11 `answers`, `timing`; ADR-327 item 2, ADR-361, ADR-376, ADR-396 item 4 |
 | [ADR-401](ADR-401-the-identification-job-reads-the-ecu-definitions.md) | The Identification Job Reads the ECU Definitions and Reports the Entry States | Accepted (item 1's plan order, item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim: ADR-402 orders the reads by ADR-327 item 4, skips definitions no remaining candidate names and drops contradicted candidates in a plan of candidates; item 4's conclusiveness judged over the pattern declarations, and item 8's pattern-less definition read when a field rule names it, by ADR-403) | `agent` `identification` and `inputs`, `diag-ir` `identify`; design 8.8.2; ADR-315 item 3, ADR-324, ADR-326 item 3, ADR-327, ADR-395, ADR-396, ADR-397, ADR-399 |
 | [ADR-402](ADR-402-the-identification-job-narrows-its-candidates.md) | The Identification Job Narrows Its Candidates and Chooses the Next ECU | Accepted (item 5's rule-field alternatives and its open mixed outcome settled by ADR-403: a rule field plugs in per key and a mixed outcome does not count) | `agent` `identification`; design 8.8.2; ADR-326 items 2 and 3, ADR-327 items 3, 4, 5, 6 and 8, ADR-397, ADR-399 item 6, ADR-401 |
 | [ADR-403](ADR-403-the-identification-job-evaluates-the-matching-rules-fields.md) | The Identification Job Evaluates the Matching Rules' Fields | Accepted | `agent` `identification`, `diag-ir` `decode` / `identify` / `plan`; design 8.8.2; ADR-306, ADR-326 item 2, ADR-327 items 3, 4 and 6, ADR-395 item 3, ADR-397, ADR-399, ADR-401, ADR-402 |
@@ -414,6 +414,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-422](ADR-422-a-failed-device-close-keeps-the-workers-slot.md) | A Failed Device Close Keeps the Worker's Slot | Accepted | `j2534-0404-service` (`rpc_module_disconnect`), `j2534-0404-mock`, `sim-vci` (`fail_closes`), `docs/j2534-0404-architecture.md`; ADR-107 addendum (h), ADR-132, ADR-258, ADR-393 item 2 |
 | [ADR-423](ADR-423-the-d-pdu-mock-keeps-a-started-links-tester-present.md) | The D-PDU Mock Keeps a Started Link's Tester-Present | Accepted | `iso22900-mock` (tester-present ComParams, link state, `PDUGetStatus`, delivery thread, `NGR_SIM_ECU_COMMANDS`), `iso22900-service` `grpc_mock` test; ADR-299, ADR-418, ADR-419, ADR-420 |
 | [ADR-424](ADR-424-the-d-pdu-mock-absorbs-response-pendings.md) | The D-PDU Mock Absorbs Response Pendings | Accepted | `iso22900-mock` (response pending ComParams, `receive_events`, `PDUConnect`, UPDATEPARAM), mock testing guide, `iso22900-service` `agent_suppressed_send_receive` test; ADR-102, ADR-299, ADR-423 |
+| [ADR-425](ADR-425-a-stray-collecting-primitives-answers-reach-its-primitive-ended.md) | A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry | Accepted | `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`, `judge_windows`); design 8.11 `primitive_ended`; ADR-386, ADR-396, ADR-400, ADR-416 |
 
 ## Status Legend
 
@@ -816,6 +817,7 @@ the predecessor repository these ADRs came from.
 - ADR-384 (item 2's stored answered-only flag, and the Consequences' recount by position, revised by ADR-385)
 - ADR-385
 - ADR-386
+- ADR-425
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)
@@ -874,6 +876,7 @@ the predecessor repository these ADRs came from.
 - ADR-419
 - ADR-420
 - ADR-422
+- ADR-425
 
 ### Diagnostic IR
 - ADR-233 (item 3's `VmState` fields removed by ADR-245; `Op::Fail` and `StepOutcome::Failed` appended by ADR-280; `Op::SelectTarget` appended, `VmState` given the current target and the host told of target changes by ADR-325 item 3; `Op::ShlChecked` appended, a left shift that fails on overflow instead of dropping bits (item 5; Starlark subset 4.4); `Op::WaitFromStack` appended, a wait whose duration is a run-time operand, with `VmError::WaitOutOfRange` for a duration outside 0 to `u32::MAX` (item 3; Starlark subset 3.1); `Op::LogFromStack` appended, a log whose message is a run-time operand (item 3; Starlark subset 3.1); `Op::FlashBlock` appended, a block of a declared flash segment read through `DiagHost::artifact_bytes`, by ADR-336 item 11; `Op::ReadInput` appended, a runtime input read through `DiagHost::runtime_input`, by ADR-338; `Op::HmiRequestFromStack` appended, a form whose run-time parameters come from the stack, and item 7's constant of `HmiRequest` and `RecordInput` read as an encoded `HmiTemplate`, by ADR-340; item 2's repeat policy realized by ADR-392)
@@ -928,7 +931,7 @@ the predecessor repository these ADRs came from.
 - ADR-396 (item 8 realized by ADR-398; item 7's per-VCI lock only and presence-only sends widened by ADR-399: the run then reads the VIN and may hold the vehicle's lock; item 4's placeholder `answers` items classified and timed by ADR-400)
 - ADR-398
 - ADR-399 (item 4's report with no lock now ends the run in `LinkUnconfirmed` when an ECU read remains, by ADR-401; item 6's "nothing is dropped" superseded for a plan of candidates by ADR-402: a candidate none of whose VIN rules for a component matched is dropped)
-- ADR-400
+- ADR-400 (Consequences on settling entries superseded by ADR-425)
 - ADR-401 (item 1's plan order, item 11's "nothing is dropped" and the Consequences' "none is skipped" were interim: ADR-402 orders the reads by ADR-327 item 4, skips definitions no remaining candidate names and drops contradicted candidates in a plan of candidates; item 4's conclusiveness judged over the pattern declarations, and item 8's pattern-less definition read when a field rule names it, by ADR-403)
 - ADR-402 (item 5's rule-field alternatives and its open mixed outcome settled by ADR-403: a rule field plugs in per key and a mixed outcome does not count)
 - ADR-403
@@ -939,6 +942,7 @@ the predecessor repository these ADRs came from.
 - ADR-410 (the refusals listed as not done in the Consequences given their form by ADR-412, and the dry run's per-target declarations by ADR-411)
 - ADR-411
 - ADR-412
+- ADR-425
 
 ### Acquired Data & Monitoring
 - ADR-236

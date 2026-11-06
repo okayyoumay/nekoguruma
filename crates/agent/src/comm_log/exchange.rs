@@ -884,6 +884,34 @@ impl Answer {
     }
 }
 
+/// Which of `items`, the results of a collecting primitive in the order they were read, stand as
+/// answers: every result that is not a pending, and a pending only when no result on its
+/// identifier (`key`) came after it, so a pending followed by its final answer is one answer
+/// (ADR-396). The one rule both the host's list of a window's answers and the log's restatement
+/// of them at a settlement follow (ADR-425).
+pub(crate) fn standing_answers<T, K: PartialEq>(
+    items: &[T],
+    key: impl Fn(&T) -> K,
+    pending: impl Fn(&T) -> bool,
+) -> Vec<bool> {
+    items
+        .iter()
+        .enumerate()
+        .map(|(at, item)| {
+            !pending(item) || !items[at + 1..].iter().any(|later| key(later) == key(item))
+        })
+        .collect()
+}
+
+/// The end of a collecting request that was not ended by an error or the agent's deadline: its
+/// first answer's, or no response when nothing answered (ADR-396 item 4). The one rule the host
+/// ends an exchange by and the log restates a settled end by (ADR-425).
+pub(crate) fn collecting_end(answers: &[Answer]) -> End {
+    answers
+        .first()
+        .map_or(End::NoResponse, |answer| answer.end.clone())
+}
+
 /// An [`Answer`] as the entry gives it, with its own outcome and classification.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub(crate) struct AnswerItem {
@@ -1456,6 +1484,14 @@ pub(crate) struct Kept {
     pub sent: Sent,
     pub transmit: super::timing::At,
     pub pendings: Vec<super::timing::At>,
+    /// Where the entry's pendings stand in the order the host read the entry's items
+    /// (`usize::MAX` for one not read at a known place), by place in the evidence's list: a
+    /// settling entry restates the windows of the answers with what it reads after them
+    /// (ADR-425).
+    pub pending_order: Vec<usize>,
+    /// The same for the entry's answers, and where each answer ended.
+    pub answer_order: Vec<usize>,
+    pub answer_ends: Vec<super::timing::At>,
     /// The link's limits, when `link_opened` recorded them.
     pub limits: Option<super::timing::Limits>,
     /// A start-of-message with the response's identifier was read during the exchange and not
@@ -2520,6 +2556,16 @@ impl LinkState {
             .find(|logged| logged.seq == seq)
             .map(|logged| logged.classification)
             .or_else(|| self.kept(seq).map(|kept| kept.classification))
+    }
+
+    /// The evidence the window holds for the exchange logged as `seq`, as the last entry about it
+    /// left it.
+    #[cfg(test)]
+    pub(crate) fn logged_evidence(&self, seq: u64) -> Option<&Evidence> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .map(|logged| &logged.evidence)
     }
 
     /// The window's newest exchange.
@@ -4575,6 +4621,9 @@ mod tests {
             sent: entry.sent,
             transmit: None,
             pendings: Vec::new(),
+            pending_order: Vec::new(),
+            answer_order: Vec::new(),
+            answer_ends: Vec::new(),
             limits: None,
             start_unattached: false,
             late_start: None,
@@ -7072,6 +7121,9 @@ mod tests {
             sent: Sent::Confirmed,
             transmit: None,
             pendings: Vec::new(),
+            pending_order: Vec::new(),
+            answer_order: Vec::new(),
+            answer_ends: Vec::new(),
             limits: None,
             start_unattached: false,
             late_start: None,
@@ -7180,6 +7232,9 @@ mod tests {
                 sent: entry.sent,
                 transmit: None,
                 pendings: Vec::new(),
+                pending_order: Vec::new(),
+                answer_order: Vec::new(),
+                answer_ends: Vec::new(),
                 limits: None,
                 start_unattached: false,
                 late_start: None,

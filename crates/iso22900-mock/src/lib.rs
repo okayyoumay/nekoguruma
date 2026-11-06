@@ -4446,15 +4446,19 @@ mod tester_present_tests {
                     .clone();
                 let item = unsafe { make_event_item(event) };
                 unsafe {
-                    (*item.cast::<PDU_EVENT_ITEM>())
-                        .pData
-                        .cast::<PDU_RESULT_DATA>()
-                        .read()
+                    let data = &*(*item).pData.cast::<PDU_RESULT_DATA>();
+                    let read = (
+                        data.TimestampFlags.NumFlagBytes,
+                        data.TxMsgDoneTimestamp,
+                        data.StartMsgTimestamp,
+                    );
+                    assert_eq!(PDUDestroyItem(item.cast()), no_error());
+                    read
                 }
             };
             let on = result_flags(&rig.run(VIN_READ, None));
-            assert_eq!(on.TimestampFlags.NumFlagBytes, 4);
-            assert_ne!(on.TxMsgDoneTimestamp, 0);
+            assert_eq!(on.0, 4);
+            assert_ne!(on.1, 0);
             rig.ecu(r#"{"response_timestamps":{"enabled":false}}"#);
             let events = rig.run(VIN_READ, None);
             // The indications still come, and still before the response.
@@ -4469,8 +4473,78 @@ mod tester_present_tests {
                 ]
             );
             let off = result_flags(&events);
-            assert_eq!(off.TimestampFlags.NumFlagBytes, 0);
-            assert_eq!((off.TxMsgDoneTimestamp, off.StartMsgTimestamp), (0, 0));
+            assert_eq!(off, (0, 0, 0));
+        }
+
+        /// Sets a ComParam through the FFI, whatever the value.
+        fn try_set(name: &str, mut value: u32) -> T_PDU_ERROR {
+            let mut item = PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: standard_comparam_id(name).unwrap(),
+                ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+                ComParamClass: E_PDU_PC::PDU_PC_COM,
+                pComParamData: (&mut value as *mut u32).cast(),
+            };
+            unsafe { PDUSetComParam(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut item) }
+        }
+
+        #[test]
+        fn a_value_of_2_through_the_ffi_is_refused_and_leaves_the_buffer() {
+            let _rig = Rig::new();
+            for name in ["CP_TransmitIndEnable", "CP_StartMsgIndEnable"] {
+                assert_eq!(try_set(name, 2), invalid_parameters(), "{name}");
+            }
+            assert_eq!(state().lock().unwrap().ind_working, Indications::default());
+        }
+
+        #[test]
+        fn pdu_connect_copies_the_working_buffer_to_the_active_one() {
+            let rig = Rig::new();
+            set(&rig, 1, 1);
+            assert_eq!(state().lock().unwrap().ind_active, Indications::default());
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            let both = Indications {
+                transmit: true,
+                start: true,
+            };
+            assert_eq!(state().lock().unwrap().ind_active, both);
+            // A later write waits in the working buffer.
+            set(&rig, 0, 0);
+            assert_eq!(state().lock().unwrap().ind_active, both);
+        }
+
+        #[test]
+        fn a_queued_primitive_keeps_the_copy_it_took_when_an_updateparam_follows() {
+            let rig = Rig::new();
+            set(&rig, 1, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            // A slow response keeps the first primitive running while the others queue.
+            rig.ecu(r#"{"inject_fault":{"fault":{"delay_response":{"ms":300}},"service":34}}"#);
+            let first = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, VIN_READ);
+            // Queued behind it with the transmit indication on, then the setting is turned off
+            // and activated by an UPDATEPARAM started after it.
+            let second = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, SESSION);
+            set(&rig, 0, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            assert_eq!(state().lock().unwrap().ind_active, Indications::default());
+            let mut seen = Vec::new();
+            let started = Instant::now();
+            while !seen.iter().any(|e: &PendingEvent| {
+                e.h_cop == update && matches!(&e.kind, EventKind::Result(_) | EventKind::Status(_))
+            }) {
+                seen.extend(std::mem::take(&mut state().lock().unwrap().pending_events));
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let transmits = |cop| {
+                seen.iter()
+                    .filter(|e| e.h_cop == cop)
+                    .filter(|e| matches!(e.kind, EventKind::Indication(Indication::Transmit)))
+                    .count()
+            };
+            assert_eq!(transmits(first), 1);
+            assert_eq!(transmits(second), 1);
         }
     }
 }

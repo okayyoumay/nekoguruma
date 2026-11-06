@@ -47,13 +47,21 @@ the primitive the agent stopped waiting for:
    exchange's entry does (ADR-400 decision 4), and counts for the later exchanges as the entry's
    answers do.
 5. **A window with answers ends on the finished item, else on the receive timeout**, which wins
-   when both were read. The entry's end stays the first answer's, so a collecting end that
-   delivers an answer is `system` as every end that does (design 8.11 `primitive_ended`), and a
-   window that ended in an error lists its answers and is not judged at its limit. The entry's
-   `vci_ended` follows the exchange's rule: a receive timeout, or a finished status that came with
+   when both were read. The entry's end is the first answer left standing after the fold, by the
+   rule an exchange that ended on its own follows (ADR-396 item 4; one function,
+   `collecting_end`, serves the host and the log), so a lone pending read after the deadline is a
+   negative end; an error or a lost VCI keeps its own. A collecting end that delivers an answer
+   is `system` as every end that does (design 8.11 `primitive_ended`), and a window that ended in
+   an error lists its answers and is not judged at its limit. The entry's `vci_ended` follows the
+   exchange's rule (one function): a receive timeout, or a finished status that came with
    answers and no failure.
-6. **A link error read for a collecting end is before the answer** when it was read before the
-   first answer read for that end (a primitive that is not collecting: before its final response).
+6. **The settling entry takes what an exchange's entry takes from the answers.** The first
+   answer read for the end that carries a transmit done gives the entry its transmit when it had
+   none (placed before that answer's end, and the send is `tx_done_time`), by the function the
+   exchange's entry uses. A link error read for a collecting end is before the answer only as
+   the host orders it: the window ended on an answer, the entry had no final answer, and the
+   error was read before the first final answer read for the end. The answer counts for later
+   exchanges with no placed time, as the exchange's entry gives it.
 
 ## Consequences
 

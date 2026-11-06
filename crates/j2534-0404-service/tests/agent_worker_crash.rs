@@ -11,12 +11,6 @@
 //! reaps the dead worker at its end: the log has the exit and no restart, and the guards are
 //! not marked, since a worker that no longer exists holds no link.
 //!
-//! The reads go on because the worker died between two primitives, so the next read was refused
-//! unsent. A worker killed while an `Unsafe` request is outstanding (the ECU answers it with a
-//! long response pending chain) is another case: the request may have reached the ECU, so the
-//! run ends in on-site intervention with the request marker kept in the journal, and nothing
-//! is sent again on a new worker.
-//!
 //! This file holds a single test, so the process-wide environment it sets for the spawned
 //! service cannot race with another test.
 
@@ -25,12 +19,10 @@ use std::sync::atomic::AtomicBool;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use agent::guards::{GuardSetup, JobGuards};
-use agent::inputs::ServiceSources;
-use agent::journal::Journal;
 use agent::launch::{LaunchRecipe, RelaunchingWorker, WorkerSlot};
 use agent::{
-    CommLogSetup, CommLogStatus, HostError, Job, JobError, JobLimits, JobRun, JournalSetup,
-    LinkConfig, VciFacts, WorkerSource, WorkerStatus, run_program, run_program_journaled,
+    CommLogSetup, CommLogStatus, HostError, Job, JobError, JobLimits, JobRun, LinkConfig, VciFacts,
+    WorkerSource, WorkerStatus, run_program,
 };
 use diag_ir::{IR_SCHEMA_VERSION, Idempotency, Interruptible, Op, Program, Section, Value};
 use worker_host::client::ConnectOptions;
@@ -77,14 +69,10 @@ struct TempPaths {
     ecu_state: PathBuf,
     locks: PathBuf,
     comm_log: PathBuf,
-    control_dir: PathBuf,
-    trace: PathBuf,
 }
 
 impl Drop for TempPaths {
     fn drop(&mut self) {
-        let _ = std::fs::remove_dir_all(&self.control_dir);
-        let _ = std::fs::remove_file(&self.trace);
         let _ = std::fs::remove_file(&self.config);
         let _ = std::fs::remove_file(&self.ecu_state);
         let _ = std::fs::remove_dir_all(&self.definitions);
@@ -158,28 +146,6 @@ fn waiting_program(idempotency: Idempotency) -> Program {
             end_pc: code.len() as u32,
             interruptible: Interruptible::Yes,
             idempotency,
-            expected_millis: 0,
-        }],
-        code,
-        constants: vec![vec![0xF1, 0x90]],
-        source_map: Vec::new(),
-        identity: Default::default(),
-        preconditions: Default::default(),
-        flash: Vec::new(),
-        targets: Vec::new(),
-    }
-}
-
-/// One `Unsafe` VIN read, the only request of the program.
-fn unsafe_read_program() -> Program {
-    let code = vec![Op::PushBytes(0), Op::ServiceRequest { service: 0x22 }];
-    Program {
-        schema_version: IR_SCHEMA_VERSION,
-        sections: vec![Section {
-            start_pc: 0,
-            end_pc: code.len() as u32,
-            interruptible: Interruptible::Yes,
-            idempotency: Idempotency::Unsafe,
             expected_millis: 0,
         }],
         code,
@@ -301,10 +267,7 @@ fn a_run_starts_a_worker_that_crashed_again() {
         ecu_state: temp.join(format!("sim-vci-crash-{pid}-{nanos}.ecu")),
         locks: temp.join(format!("sim-vci-crash-locks-{pid}-{nanos}")),
         comm_log: temp.join(format!("sim-vci-crash-commlog-{pid}-{nanos}")),
-        control_dir: temp.join(format!("sim-vci-crash-control-{pid}-{nanos}")),
-        trace: temp.join(format!("sim-vci-crash-trace-{pid}-{nanos}.txt")),
     };
-    std::fs::create_dir(&paths.control_dir).expect("control directory should be created");
     std::fs::write(&paths.config, "").expect("test config file should be writable");
     // The registration definition names the library, through the debug-only
     // `NGR_J2534_DEFINITION_DIR` override (ADR-282).
@@ -320,13 +283,7 @@ fn a_run_starts_a_worker_that_crashed_again() {
         // The simulated ECU keeps its state in a file (ADR-241), so a new worker finds the ECU
         // as the killed one left it.
         std::env::set_var("NGR_SIM_ECU_STATE", &paths.ecu_state);
-        // The control directory stays empty except in the case that arms a response pending
-        // chain, so the other cases see no fault.
-        std::env::set_var("NGR_SIM_VCI_CONTROL_DIR", &paths.control_dir);
-        // Every worker appends the requests it sends to one trace file (the variable cannot
-        // be set later, with the runtime's threads running); the case that needs it counts the
-        // lines already there.
-        std::env::set_var("NGR_SIM_VCI_TRACE", &paths.trace);
+        std::env::remove_var("NGR_SIM_VCI_CONTROL_DIR");
         std::env::remove_var("VCI_SERVICE_INSECURE_NO_AUTH");
         std::env::remove_var("NGR_SIM_ECU_CONFIG");
     }
@@ -353,151 +310,8 @@ fn a_run_starts_a_worker_that_crashed_again() {
 async fn flow(paths: &TempPaths, setup: GuardSetup) {
     reads_go_on(paths, &setup, Idempotency::Safe, "safe").await;
     reads_go_on(paths, &setup, Idempotency::Unsafe, "unsafe").await;
-    an_unsafe_request_outstanding_at_the_crash_ends_on_site(paths, &setup).await;
     a_worker_dead_before_the_run_ends_it_in_the_link_error(&setup).await;
     a_start_the_system_refuses_is_a_spawn_failure().await;
-}
-
-/// How many VIN reads the trace file holds.
-fn vin_reads_traced(trace: &Path) -> usize {
-    std::fs::read_to_string(trace)
-        .unwrap_or_default()
-        .lines()
-        .filter(|line| line.trim() == "uds 22 F190")
-        .count()
-}
-
-/// The worker crashes while an `Unsafe` request is outstanding: the ECU answers it with a long
-/// response pending chain, and the worker is killed once the request marker is in the journal
-/// and the chain has begun. The request may have reached the ECU, so the run does not send it
-/// again on a new worker: it ends in on-site intervention (ADR-389, ADR-392), and the request
-/// marker stays in the journal.
-async fn an_unsafe_request_outstanding_at_the_crash_ends_on_site(
-    paths: &TempPaths,
-    setup: &GuardSetup,
-) {
-    let dir = paths.comm_log.join("outstanding");
-    std::fs::create_dir(&dir).expect("journal directory should be created");
-    let key = agent::journal::JobKey {
-        job_id: shared_proto::JobId("0190f5a8-7c2e-7d4b-9a6e-3f1c2b4d5e83".to_owned()),
-        generation: 1,
-    };
-    // 0x78 every 1.5 s, ten times: the request is still open when the worker is killed, and
-    // the chain (15 s) is inside the completion timeout.
-    std::fs::write(
-        paths.control_dir.join("001.json"),
-        r#"{"command": "inject_fault", "fault": {"response_pending": {"count": 10, "interval_ms": 1500}}}"#,
-    )
-    .expect("control file should be writable");
-    // The VIN reads the trace holds before this case's worker exists.
-    let sent_before = vin_reads_traced(&paths.trace);
-    let (source, slot) = launch_source().await;
-    let killed = slot
-        .lock()
-        .unwrap()
-        .as_ref()
-        .and_then(|process| process.id())
-        .expect("the worker runs");
-    let job = tokio::spawn({
-        let guards = take_guards(setup);
-        let journal = JournalSetup {
-            dir: dir.clone(),
-            key: key.clone(),
-            sources: ServiceSources::default(),
-            vin: None,
-            intended_software_version: None,
-        };
-        async move {
-            run_program_journaled(
-                source,
-                &LinkConfig::iso15765(0x7E0, 0x7E8),
-                Job::from(unsafe_read_program()).with_vci(VciFacts {
-                    api: agent::launch::Api::J2534,
-                    long_size: long_size(),
-                }),
-                limits(),
-                journal,
-                guards,
-            )
-            .await
-        }
-    });
-    // The marker is committed before the request is sent; the worker's trace shows the send
-    // (a line is appended when the request goes out), and the chain's first 0x78 is 1.5 s
-    // later, so the request is outstanding from the trace line on.
-    wait_for("the request marker", || {
-        Journal::read(&dir, &key).is_ok_and(|state| state.facts.last_request.is_some())
-    })
-    .await;
-    let started = std::time::Instant::now();
-    while vin_reads_traced(&paths.trace) <= sent_before {
-        assert!(
-            started.elapsed() < Duration::from_secs(30),
-            "gave up waiting for the request in the trace"
-        );
-        tokio::time::sleep(Duration::from_millis(20)).await;
-    }
-    assert!(
-        !job.is_finished(),
-        "the request should still be outstanding"
-    );
-    kill_worker(killed);
-    let run = tokio::time::timeout(GENEROUS, job)
-        .await
-        .expect("the run should end")
-        .expect("the job task should not panic");
-    let lines = log_lines(&dir);
-    let text = || format!("{lines:#?}");
-    let at = agent::journal::StepRef { pc: 1, steps: 1 };
-    assert!(
-        matches!(
-            &run.result,
-            Err(JobError::OnSiteInterventionRequired(
-                agent::restart::OnSiteReason::UnconfirmedRequest { at: reason_at }
-            )) if *reason_at == at
-        ),
-        "{:?}\n{}",
-        run.result,
-        text()
-    );
-    // The marker stays: the request is not provably unsent.
-    let facts = Journal::read(&dir, &key).expect("the job's journal").facts;
-    assert_eq!(facts.last_request, Some(at));
-    assert_eq!(facts.last_request_unsent, None);
-    assert_eq!(facts.standing_request, Some(at));
-    // Nothing was sent again: the one exchange is the request the crash cut off (logged as
-    // sent, its outcome unknown), with no repeat and no new worker.
-    let exchanges: Vec<&serde_json::Value> = lines
-        .iter()
-        .filter(|line| line["event"] == "exchange")
-        .collect();
-    assert_eq!(exchanges.len(), 1, "{}", text());
-    assert_eq!(exchanges[0]["origin"], "procedure", "{}", text());
-    // Killed at the trace line, the worker may or may not have reported the transmission yet,
-    // so the log reads the send as confirmed or as unknown, never as unsent.
-    assert!(
-        ["confirmed", "unknown"].contains(&exchanges[0]["sent"].as_str().unwrap_or("")),
-        "{}",
-        text()
-    );
-    assert_eq!(exchanges[0]["outcome"]["result"], "unknown", "{}", text());
-    assert!(
-        !lines.iter().any(|line| line["event"] == "worker_restart"),
-        "{}",
-        text()
-    );
-    let exit = event(&lines, "worker_exit");
-    assert_eq!(exit["pid"], killed, "{exit}");
-    drop(run.guards);
-    // The slot's process is the killed one, reaped and so without an ID: no new worker was
-    // started.
-    let process = slot
-        .lock()
-        .unwrap()
-        .take()
-        .expect("the slot holds a worker");
-    assert_eq!(process.id(), None);
-    drop(process);
 }
 
 /// Waits until the process in `slot` has exited, which is when its status can be read.

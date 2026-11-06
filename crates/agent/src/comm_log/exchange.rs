@@ -1456,6 +1456,17 @@ pub(crate) struct Kept {
     pub sent: Sent,
     pub transmit: super::timing::At,
     pub pendings: Vec<super::timing::At>,
+    /// Where the entry's pendings stand in the order the host read the entry's items
+    /// (`usize::MAX` for one not read at a known place), by place in the evidence's list: a
+    /// settling entry restates the windows of the answers with what it reads after them
+    /// (ADR-425).
+    #[expect(dead_code, reason = "the settling entries read it in the next change")]
+    pub pending_order: Vec<usize>,
+    /// The same for the entry's answers, and where each answer ended.
+    #[expect(dead_code, reason = "the settling entries read it in the next change")]
+    pub answer_order: Vec<usize>,
+    #[expect(dead_code, reason = "the settling entries read it in the next change")]
+    pub answer_ends: Vec<super::timing::At>,
     /// The link's limits, when `link_opened` recorded them.
     pub limits: Option<super::timing::Limits>,
     /// A start-of-message with the response's identifier was read during the exchange and not
@@ -4575,6 +4586,9 @@ mod tests {
             sent: entry.sent,
             transmit: None,
             pendings: Vec::new(),
+            pending_order: Vec::new(),
+            answer_order: Vec::new(),
+            answer_ends: Vec::new(),
             limits: None,
             start_unattached: false,
             late_start: None,
@@ -7072,6 +7086,9 @@ mod tests {
             sent: Sent::Confirmed,
             transmit: None,
             pendings: Vec::new(),
+            pending_order: Vec::new(),
+            answer_order: Vec::new(),
+            answer_ends: Vec::new(),
             limits: None,
             start_unattached: false,
             late_start: None,
@@ -7180,6 +7197,9 @@ mod tests {
                 sent: entry.sent,
                 transmit: None,
                 pendings: Vec::new(),
+                pending_order: Vec::new(),
+                answer_order: Vec::new(),
+                answer_ends: Vec::new(),
                 limits: None,
                 start_unattached: false,
                 late_start: None,

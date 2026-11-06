@@ -1627,6 +1627,134 @@ fn answer_windows(
     (windows, entry)
 }
 
+/// The placed items of an exchange that [`judge_windows`] reads, each list in the place of the
+/// evidence's own (`pendings` and `pending_order` as `evidence.pending`, `answer_order` and
+/// `answer_ends` as `evidence.answers`).
+struct WindowItems<'a> {
+    /// Where each pending was placed; empty when the link's limits are not known.
+    pendings: &'a [timing::At],
+    pending_order: &'a [usize],
+    answer_order: &'a [usize],
+    answer_ends: &'a [timing::At],
+}
+
+/// Judges the windows of `evidence` (ADR-400): the pendings each answer's window holds, the
+/// entry's own timing, and with `judge_answers` each answer's timing. The one place that does
+/// it, for the exchange's entry and for the settling entries of its primitive's end, so that an
+/// answer is judged the same wherever it is listed (ADR-425). `vci` is the entry's VCI times and
+/// `transmit` the placed transmit done; the timings are judged only on a link whose `limits` the
+/// log knows.
+fn judge_windows(
+    evidence: &mut exchange::Evidence,
+    items: &WindowItems<'_>,
+    limits: Option<timing::Limits>,
+    vci: &exchange::VciTimes,
+    transmit: timing::At,
+    response_may_have_begun: bool,
+    judge_answers: bool,
+) {
+    let (answer_windows, entry_window) = answer_windows(
+        evidence,
+        items.pending_order,
+        items.answer_order,
+        items.answer_ends,
+    );
+    if judge_answers {
+        for (answer, window) in evidence.answers.iter_mut().zip(&answer_windows) {
+            answer.pending = window
+                .pendings
+                .iter()
+                .map(|&index| evidence.pending[index].clone())
+                .collect();
+        }
+    }
+    let Some(limits) = limits else {
+        return;
+    };
+    let pendings = items.pendings;
+    let in_window = |window: &AnswerWindow| -> Vec<timing::At> {
+        window
+            .pendings
+            .iter()
+            .map(|&index| pendings[index])
+            .collect()
+    };
+    // A collecting entry's own timing judges where the window ended, from where its last
+    // answer ended; it has no response time (ADR-400).
+    let collecting = evidence.collecting;
+    let entry_pendings = if collecting {
+        in_window(&entry_window)
+    } else {
+        pendings.to_vec()
+    };
+    evidence.timing = timing::judge(
+        limits,
+        evidence.absorbing(),
+        timing::Times {
+            transmit,
+            window_from: collecting.then_some(entry_window.from).flatten(),
+            pendings: &entry_pendings,
+            start: vci
+                .rx_start
+                .and_then(|time| time.placed())
+                .filter(|_| !collecting),
+            end: vci
+                .rx_end
+                .and_then(|time| time.placed())
+                .filter(|_| !collecting),
+            end_len: evidence.end.response().map(<[u8]>::len),
+            // A collecting window ends with a receive timeout when nothing answered, and with
+            // the primitive's finished status when something did.
+            timeout: vci
+                .rx_timeout
+                .or(vci.finished.filter(|_| collecting))
+                .and_then(|time| time.placed()),
+            response_may_have_begun,
+        },
+    );
+    if !judge_answers {
+        return;
+    }
+    // Each answer from the end of the one before it, with the response time from the transmit.
+    let answer_timings: Vec<_> = evidence
+        .answers
+        .iter()
+        .zip(items.answer_ends)
+        .zip(&answer_windows)
+        .map(|((answer, end), window)| {
+            // A lone pending is the last pending of its own request and ends nothing.
+            let (kind, own_pendings) = answer.as_exchange(&evidence.expected);
+            let lone = own_pendings.len() > window.pendings.len();
+            let mut pendings = in_window(window);
+            if lone {
+                pendings.push(*end);
+            }
+            let start = answer
+                .start_us
+                .zip(*end)
+                .filter(|_| !lone)
+                .map(|(us, (clock, placed))| (clock, clocks::before(placed, us)));
+            timing::judge(
+                limits,
+                evidence.absorbing(),
+                timing::Times {
+                    transmit,
+                    window_from: window.from,
+                    pendings: &pendings,
+                    start,
+                    end: end.filter(|_| !lone),
+                    end_len: kind.response().map(<[u8]>::len),
+                    timeout: None,
+                    response_may_have_begun,
+                },
+            )
+        })
+        .collect();
+    for (answer, timing) in evidence.answers.iter_mut().zip(answer_timings) {
+        answer.timing = timing;
+    }
+}
+
 struct Inner {
     sink: Box<dyn LineSink>,
     next_seq: u64,
@@ -2565,110 +2693,41 @@ impl CommLog {
             .zip(&answer_placed)
             .map(|(answer, placed)| answer.clock.zip(*placed))
             .collect();
-        let (answer_windows, entry_window) =
-            answer_windows(&evidence, &pending_order, &answer_order, &answer_ends);
-        for (answer, window) in evidence.answers.iter_mut().zip(&answer_windows) {
-            answer.pending = window
-                .pendings
-                .iter()
-                .map(|&index| evidence.pending[index].clone())
-                .collect();
-        }
         // The times judged against the limits of the link `link_opened` recorded (design 8.11
         // "Timing judged"); evidence on a link the log did not open keeps the timing it gives.
+        let limits = inner
+            .limits
+            .iter()
+            .find(|(of, _)| *of == evidence.link)
+            .map(|(_, limits)| *limits);
+        let pendings: Vec<timing::At> = evidence
+            .pending
+            .iter()
+            .zip(&pending_placed)
+            .map(|(pending, placed)| pending.clock.zip(*placed))
+            .collect();
+        let rx_id = evidence.rx_id;
+        let response_may_have_begun = evidence.response_started
+            || limits.is_some_and(|limits| !limits.start_indications)
+            || unbound
+                .iter()
+                .any(|item| item.is_start_indication_for(rx_id));
+        judge_windows(
+            &mut evidence,
+            &WindowItems {
+                pendings: &pendings,
+                pending_order: &pending_order,
+                answer_order: &answer_order,
+                answer_ends: &answer_ends,
+            },
+            limits,
+            &vci,
+            transmit,
+            response_may_have_begun,
+            true,
+        );
         let mut judged_from: Option<(Vec<timing::At>, timing::Limits)> = None;
-        if let Some((_, limits)) = inner.limits.iter().find(|(of, _)| *of == evidence.link) {
-            let pendings: Vec<_> = evidence
-                .pending
-                .iter()
-                .zip(&pending_placed)
-                .map(|(pending, placed)| pending.clock.zip(*placed))
-                .collect();
-            let rx_id = evidence.rx_id;
-            let response_may_have_begun = evidence.response_started
-                || !limits.start_indications
-                || unbound
-                    .iter()
-                    .any(|item| item.is_start_indication_for(rx_id));
-            let in_window = |window: &AnswerWindow| -> Vec<timing::At> {
-                window
-                    .pendings
-                    .iter()
-                    .map(|&index| pendings[index])
-                    .collect()
-            };
-            // A collecting entry's own timing judges where the window ended, from where its last
-            // answer ended; it has no response time (ADR-400).
-            let collecting = evidence.collecting;
-            let entry_pendings = if collecting {
-                in_window(&entry_window)
-            } else {
-                pendings.clone()
-            };
-            evidence.timing = timing::judge(
-                *limits,
-                evidence.absorbing(),
-                timing::Times {
-                    transmit,
-                    window_from: collecting.then_some(entry_window.from).flatten(),
-                    pendings: &entry_pendings,
-                    start: vci
-                        .rx_start
-                        .and_then(|time| time.placed())
-                        .filter(|_| !collecting),
-                    end: vci
-                        .rx_end
-                        .and_then(|time| time.placed())
-                        .filter(|_| !collecting),
-                    end_len: evidence.end.response().map(<[u8]>::len),
-                    // A collecting window ends with a receive timeout when nothing answered, and with
-                    // the primitive's finished status when something did.
-                    timeout: vci
-                        .rx_timeout
-                        .or(vci.finished.filter(|_| collecting))
-                        .and_then(|time| time.placed()),
-                    response_may_have_begun,
-                },
-            );
-            // Each answer from the end of the one before it, with the response time from the
-            // transmit.
-            let answer_timings: Vec<_> = evidence
-                .answers
-                .iter()
-                .zip(&answer_ends)
-                .zip(&answer_windows)
-                .map(|((answer, end), window)| {
-                    // A lone pending is the last pending of its own request and ends nothing.
-                    let (kind, own_pendings) = answer.as_exchange(&evidence.expected);
-                    let lone = own_pendings.len() > window.pendings.len();
-                    let mut pendings = in_window(window);
-                    if lone {
-                        pendings.push(*end);
-                    }
-                    let start = answer
-                        .start_us
-                        .zip(*end)
-                        .filter(|_| !lone)
-                        .map(|(us, (clock, placed))| (clock, clocks::before(placed, us)));
-                    timing::judge(
-                        *limits,
-                        evidence.absorbing(),
-                        timing::Times {
-                            transmit,
-                            window_from: window.from,
-                            pendings: &pendings,
-                            start,
-                            end: end.filter(|_| !lone),
-                            end_len: kind.response().map(<[u8]>::len),
-                            timeout: None,
-                            response_may_have_begun,
-                        },
-                    )
-                })
-                .collect();
-            for (answer, timing) in evidence.answers.iter_mut().zip(answer_timings) {
-                answer.timing = timing;
-            }
+        if let Some(limits) = &limits {
             // The VCI's own limits past by the reading at the agent's deadline, on a link
             // whose start-of-message indications are on and showed no response under way: none
             // bound to the primitive, none unbound that names no identifier or this exchange's,
@@ -2738,6 +2797,9 @@ impl CommLog {
                 .as_ref()
                 .map(|(pendings, _)| pendings.clone())
                 .unwrap_or_default(),
+            pending_order,
+            answer_order,
+            answer_ends,
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             late_start: None,

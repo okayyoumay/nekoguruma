@@ -4430,28 +4430,41 @@ impl Inner {
         let answered = kept.answered(bytes);
         let history = state.history_for(&answered);
         let time = item.clock.zip(placed);
-        let rx_id = match &item.data {
+        // The identifiers it could have come on: the one it names, else those a pending is open
+        // on, else the link's own (ADR-429). It is judged against each one's window.
+        let ids: Vec<u32> = match &item.data {
             UnattachedData::Result {
                 identifier: Some(identifier),
                 ..
-            } => *identifier,
-            _ => match kept.evidence.open_pending_ids()[..] {
-                [only] => only,
-                _ => kept.evidence.rx_id,
+            } => vec![*identifier],
+            _ => match kept.evidence.open_pending_ids() {
+                open if open.is_empty() => vec![kept.evidence.rx_id],
+                open => open,
             },
         };
-        let (window_from, in_window) = late_window(&kept, rx_id);
-        let window = kept.limits.map_or(timing::LateWindow::Open, |limits| {
-            timing::judge_late(
-                limits,
-                kept.evidence.absorbing(),
-                kept.transmit,
-                window_from,
-                &in_window,
-                time,
-                bytes.len(),
-            )
-        });
+        let judge = |rx_id| {
+            let (window_from, in_window) = late_window(&kept, rx_id);
+            kept.limits.map_or(timing::LateWindow::Open, |limits| {
+                timing::judge_late(
+                    limits,
+                    kept.evidence.absorbing(),
+                    kept.transmit,
+                    window_from,
+                    &in_window,
+                    time,
+                    bytes.len(),
+                )
+            })
+        };
+        // Verdicts that differ leave the window open.
+        let mut verdicts = ids.iter().map(|&id| judge(id));
+        let first = verdicts.next().unwrap_or(timing::LateWindow::Open);
+        let window =
+            if verdicts.all(|v| std::mem::discriminant(&v) == std::mem::discriminant(&first)) {
+                first
+            } else {
+                timing::LateWindow::Open
+            };
         let (classification, reason) =
             exchange::settle_late_response(&kept, &answered, window, &history);
         // The answer it adds counts for the later exchanges on the link.
@@ -9937,6 +9950,49 @@ pub(crate) mod tests {
                 .contains("within the limit in force less the margin"),
             "{late}"
         );
+    }
+
+    /// ADR-429: a late response that names no identifier, of an exchange open on two, is judged
+    /// against each identifier's window: both in time is `system`, and verdicts that differ leave
+    /// it `undetermined`.
+    #[test]
+    fn a_late_response_naming_no_identifier_is_judged_against_every_open_identifier() {
+        let classified = |second_pending_at_us: u64, second_id: Option<u32>| {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![
+                    lone_pending_on(0x7E8),
+                    answer_on(
+                        0x7E9,
+                        exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+                        second_pending_at_us,
+                    ),
+                ];
+                evidence.pending = vec![pending_on(200_000), pending_on(second_pending_at_us)];
+                evidence.pending_ids = vec![Some(0x7E8), second_id];
+            });
+            let mut item = late_final_item();
+            item.data = UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: None,
+                bytes: vec![0x7E, 0x00],
+            };
+            log.lock()
+                .late_response(0, seq, &item, placed_after(3_000_000))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            of_event(&lines, "late_response").remove(0)["exchanges"][0].clone()
+        };
+        // Pendings at 200 ms on both: 2.8 s later is within P2* (5 s) on each.
+        let both = classified(200_000, Some(0x7E9));
+        assert_eq!(both["classification"], "system", "{both}");
+        // Both pendings came on 0x7E8, so 0x7E9's window has no pending
+        // and P2 (1 s) applies there while 0x7E8's is within P2*: the verdicts differ.
+        let differ = classified(200_000, Some(0x7E8));
+        assert_eq!(differ["classification"], "undetermined", "{differ}");
     }
 
     /// ADR-429: a later exchange of the link that was not sent awaits no answer, so a late final

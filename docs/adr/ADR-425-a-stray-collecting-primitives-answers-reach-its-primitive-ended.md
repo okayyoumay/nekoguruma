@@ -72,7 +72,10 @@ the primitive the agent stopped waiting for:
 - The classification of such an entry is `system` whenever its end is an answer, whatever the
   answers' own timing, which stays in the answers' items; the entry's window is `timeout_at_limit`
   when the finished item is 1 s after the last answer, on the clock the answers are on.
-- Not decided here: whether the collecting deadline should extend with each answer, so that a
-  window which is still receiving is not given up on; `late_item`'s own judgement of a late
-  pending or start of a collecting exchange still measures from the transmit; the answers read
-  before a cancel took effect are not listed in the cancel's entry. They are open items.
+- Not decided here: `late_item`'s own judgement of a late pending or start of a collecting
+  exchange still measures from the transmit; the answers read before a cancel took effect are not
+  listed in the cancel's entry. They are open items.
+- Decided later by the maintainer (2026-11-07): the collecting deadline does not extend with each
+  answer. It stays one bound from the request. A window still receiving when it passes is given
+  up on, and the answers read afterwards reach the `primitive_ended` entry by decision 2, so
+  nothing the VCI reports is lost. The entry is then `system` whenever its end is an answer.

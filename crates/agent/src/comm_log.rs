@@ -1803,6 +1803,88 @@ fn judge_windows(
     }
 }
 
+/// The window a late item of `kept`, read after its entry, closes, as `judge_late` and
+/// `judge_late_start` take it: where the window started (`None` is the transmit, as for
+/// [`timing::judge`]) and the pendings that came in it (ADR-426).
+///
+/// A collecting exchange's late item is judged as a final answer on the link's own response
+/// identifier would be at that place in the order the host read the items, by the one rule that
+/// judges its answers ([`answer_windows`], ADR-425): the identifier's pendings since its previous
+/// final answer, the window starting at the latest final answer of any identifier before the
+/// first of them, or at the last final answer when there are none, else at the transmit. The
+/// late pendings in time or open come after the entry's items, in the order they were read; a
+/// late one is passed over, as for [`exchange::Kept::limit_pendings`]. Any other exchange is
+/// judged from the transmit with its limit pendings (ADR-371). A window that cannot be placed is
+/// `Some(None)`, which leaves the judgement open.
+fn late_window(kept: &exchange::Kept) -> (Option<timing::At>, Vec<timing::At>) {
+    let evidence = &kept.evidence;
+    if !evidence.collecting {
+        return (None, kept.limit_pendings());
+    }
+    let all = kept.all_pendings();
+    if all.len() != evidence.pending.len() {
+        // The entry's pendings are not all kept: the window cannot be placed.
+        return (Some(None), Vec::new());
+    }
+    let late = kept.late_pendings.len();
+    let mut pendings = kept.pendings.clone();
+    let mut pending_order = kept.pending_order.clone();
+    pending_order.resize(pendings.len(), usize::MAX);
+    let mut answer_order = kept.answer_order.clone();
+    answer_order.resize(evidence.answers.len(), usize::MAX);
+    let mut answer_ends = kept.answer_ends.clone();
+    answer_ends.resize(evidence.answers.len(), None);
+    let base = pending_order
+        .iter()
+        .chain(&answer_order)
+        .filter(|&&order| order != usize::MAX)
+        .max()
+        .map_or(0, |last| last + 1);
+    for (place, (at, window)) in kept.late_pendings.iter().enumerate() {
+        match window {
+            exchange::LatePending::InTime => {
+                pendings.push(*at);
+                pending_order.push(base + place);
+            }
+            exchange::LatePending::Open => {
+                pendings.push(None);
+                pending_order.push(base + place);
+            }
+            exchange::LatePending::Late => {
+                pendings.push(*at);
+                pending_order.push(usize::MAX);
+            }
+        }
+    }
+    // The item itself stands for a final answer on the link's identifier, read last.
+    let mut probe = evidence.clone();
+    probe.answers.push(exchange::Answer {
+        rx_id: evidence.rx_id,
+        end: exchange::End::Positive(Vec::new()),
+        vci_us: None,
+        clock: None,
+        epoch: None,
+        start_us: None,
+        tx_done_us: None,
+        agent_us: 0,
+        pending: Vec::new(),
+        timing: exchange::Timing::not_judged(),
+        history: None,
+    });
+    answer_order.push(base + late);
+    answer_ends.push(None);
+    let (mut windows, _) = answer_windows(&probe, &pending_order, &answer_order, &answer_ends);
+    let Some(window) = windows.pop() else {
+        return (Some(None), Vec::new());
+    };
+    let in_window = window
+        .pendings
+        .iter()
+        .map(|&index| pendings[index])
+        .collect();
+    (window.from, in_window)
+}
+
 struct Inner {
     sink: Box<dyn LineSink>,
     next_seq: u64,
@@ -4225,12 +4307,14 @@ impl Inner {
         let answered = kept.answered(bytes);
         let history = state.history_for(&answered);
         let time = item.clock.zip(placed);
+        let (window_from, in_window) = late_window(&kept);
         let window = kept.limits.map_or(timing::LateWindow::Open, |limits| {
             timing::judge_late(
                 limits,
                 kept.evidence.absorbing(),
                 kept.transmit,
-                &kept.limit_pendings(),
+                window_from,
+                &in_window,
                 time,
                 bytes.len(),
             )
@@ -4389,10 +4473,13 @@ impl Inner {
                     }
                     _ => false,
                 };
-                let spans_frames = evidence
-                    .end
-                    .response()
-                    .is_none_or(|response| response.len() > SINGLE_FRAME_MAX);
+                // A collecting exchange's end is its first answer, which says nothing of the
+                // response this start begins.
+                let spans_frames = evidence.collecting
+                    || evidence
+                        .end
+                        .response()
+                        .is_none_or(|response| response.len() > SINGLE_FRAME_MAX);
                 // The latest start is the response's: the ECU aborted and began again, so it
                 // replaces a start the exchange had, unless it comes before that one on its
                 // clock and epoch.
@@ -4417,6 +4504,9 @@ impl Inner {
                     .read
                     .filter(|read| read.epoch == evidence.times.agent.epoch)
                     .map_or(evidence.times.agent.end_us, |read| read.monotonic_us);
+                // It came on the link's own response identifier (ADR-426).
+                evidence.pending_ids.resize(evidence.pending.len(), None);
+                evidence.pending_ids.push(Some(evidence.rx_id));
                 evidence.pending.push(exchange::Pending {
                     vci_us: Some(u64::from(item.vci_us)),
                     clock: item.clock,
@@ -4431,8 +4521,9 @@ impl Inner {
         // after the VCI ended the exchange is judged on its own, below, and the late-pending row
         // does not apply to it (ADR-371).
         let pendings = kept.pendings.clone();
-        // The limit in force for what came after the exchange ended.
-        let limit_pendings = kept.limit_pendings();
+        // The limit in force for what came after the exchange ended, and the window it runs
+        // from (ADR-426).
+        let (window_from, limit_pendings) = late_window(&kept);
         // The timing judged again with what the item adds, as the exchange's entry would have
         // judged it: a timeout judged on no response having begun is refuted by a start, and a
         // transmit done places the response's times (design 8.11 "Settlement").
@@ -4480,14 +4571,24 @@ impl Inner {
             // before the limit less the margin, or after the limit plus the margin (design 8.11
             // "Settlement"). The latest start is judged: one that replaces an earlier start
             // ends that one's judgement.
+            // A collecting exchange with answers is judged when the link's own identifier has no
+            // final answer standing (ADR-426); any other when its response did not complete.
+            let judge_start = if evidence.collecting {
+                !evidence.answers.iter().any(|answer| {
+                    answer.rx_id == evidence.rx_id && !answer.is_pending(&evidence.expected)
+                })
+            } else {
+                matches!(evidence.end, exchange::End::ResponseIncomplete)
+            };
             if kind == LateIndication::Start
-                && matches!(evidence.end, exchange::End::ResponseIncomplete)
+                && judge_start
                 && let Some(start) = vci.rx_start
             {
                 late_start = match timing::judge_late_start(
                     limits,
                     evidence.absorbing(),
                     transmit,
+                    window_from,
                     &limit_pendings,
                     start.placed(),
                 ) {
@@ -4518,6 +4619,7 @@ impl Inner {
                     limits,
                     false,
                     transmit,
+                    window_from,
                     &limit_pendings,
                     item.clock.zip(placed),
                     bytes.len(),
@@ -9199,6 +9301,366 @@ pub(crate) mod tests {
         assert_eq!(
             late["exchanges"][0]["classification"], "undetermined",
             "{late}"
+        );
+    }
+
+    /// Logs the collecting presence exchange `build` makes on the link of `collecting_log`; the
+    /// late items of ADR-426 are then read with [`late_pending_judged`] and [`late_start_judged`].
+    fn late_collecting(
+        build: impl FnOnce(&mut exchange::Evidence),
+    ) -> (PathBuf, CommLogSetup, CommLog, u64) {
+        let (dir, setup, log) = collecting_log();
+        let seq = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.vci_ended = true;
+                build(evidence);
+            }))
+            .unwrap();
+        (dir, setup, log, seq)
+    }
+
+    /// Where a time `after_us` after the transmit is placed.
+    fn placed_after(after_us: i64) -> Option<clocks::Placed> {
+        Some(clocks::Placed {
+            epoch: 0,
+            unwrapped: BASE_US as i64 + after_us,
+        })
+    }
+
+    /// The pending of 0x7E8 that a worker delivered late.
+    fn late_pending_item() -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x7F, 0x3E, 0x78],
+            },
+            ..tx_done(0x7E8)
+        }
+    }
+
+    /// The kept exchange `seq`.
+    fn kept_of(log: &CommLog, seq: u64) -> exchange::Kept {
+        log.lock().links[0].1.kept(seq).cloned().unwrap()
+    }
+
+    /// Reads a late pending of the exchange `seq`, `after_us` after its transmit, and returns how
+    /// the log judged it.
+    fn late_pending_judged(log: &CommLog, seq: u64, after_us: i64) -> exchange::LatePending {
+        log.lock()
+            .late_item(
+                0,
+                seq,
+                LateIndication::Pending,
+                &late_pending_item(),
+                placed_after(after_us),
+            )
+            .unwrap();
+        kept_of(log, seq).late_pendings.last().unwrap().1
+    }
+
+    /// Reads a late start of the exchange `seq`, `after_us` after its transmit, and returns how
+    /// the log judged it.
+    fn late_start_judged(log: &CommLog, seq: u64, after_us: i64) -> Option<exchange::LateStart> {
+        let start = UnattachedItem {
+            vci_us: 7,
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+                identifier: Some(0x7E8),
+                bytes: Vec::new(),
+            },
+            ..tx_done(0x7E8)
+        };
+        log.lock()
+            .late_item(
+                0,
+                seq,
+                LateIndication::Start,
+                &start,
+                placed_after(after_us),
+            )
+            .unwrap();
+        kept_of(log, seq).late_start
+    }
+
+    /// ADR-426, case table rows 2 to 4 and 17: a collecting exchange with no answer judges a
+    /// late pending from the transmit, with the limit its own identifier's pendings put in
+    /// force; another identifier's pending sets none, and a late pending in time carries it on.
+    #[test]
+    fn a_late_pending_of_a_collecting_exchange_with_no_answer_is_judged_from_its_own_pendings() {
+        use exchange::LatePending::{InTime, Late};
+        let judged = |build: fn(&mut exchange::Evidence), after_us| {
+            let (dir, _, log, seq) = late_collecting(build);
+            assert_eq!(
+                kept_of(&log, seq).transmit.map(|(_, placed)| placed),
+                placed_after(0)
+            );
+            let judged = late_pending_judged(&log, seq, after_us);
+            std::fs::remove_dir_all(&dir).unwrap();
+            judged
+        };
+        // Row 2: P2 (1 s) from the transmit.
+        assert_eq!(judged(|_| {}, 500_000), InTime);
+        assert_eq!(judged(|_| {}, 1_500_000), Late);
+        // Row 3: the entry's pending on its own identifier puts P2* in force.
+        let own = |evidence: &mut exchange::Evidence| {
+            evidence.pending = vec![pending_on(30_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        };
+        assert_eq!(judged(own, 3_000_000), InTime);
+        // Row 4: the same pending on another identifier does not; one the host did not name
+        // counts for this one.
+        let other = |evidence: &mut exchange::Evidence| {
+            evidence.pending = vec![pending_on(30_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+        };
+        assert_eq!(judged(other, 3_000_000), Late);
+        let unnamed = |evidence: &mut exchange::Evidence| {
+            evidence.pending = vec![pending_on(30_000)];
+        };
+        assert_eq!(judged(unnamed, 3_000_000), InTime);
+        // Row 17: a late pending in time carries the limit on to the next one; a late one does
+        // not.
+        let (dir, _, log, seq) = late_collecting(|_| {});
+        assert_eq!(late_pending_judged(&log, seq, 500_000), InTime);
+        assert_eq!(late_pending_judged(&log, seq, 4_000_000), InTime);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (dir, _, log, seq) = late_collecting(|_| {});
+        assert_eq!(late_pending_judged(&log, seq, 1_500_000), Late);
+        assert_eq!(late_pending_judged(&log, seq, 1_600_000), Late);
+        // The pending is kept with the identifier it came on.
+        assert_eq!(
+            kept_of(&log, seq).evidence.pending_ids,
+            [Some(0x7E8), Some(0x7E8)]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-426, case table rows 5 to 8: after answers, a late pending of a collecting exchange is
+    /// judged as the final answer of its identifier would be at that place: from the end of the
+    /// latest final answer before the identifier's chain of pendings.
+    #[test]
+    fn a_late_pending_of_a_collecting_exchange_after_answers_is_judged_from_the_window_s_start() {
+        use exchange::LatePending::{InTime, Late};
+        let judged = |build: fn(&mut exchange::Evidence), after_us| {
+            let (dir, _, log, seq) = late_collecting(build);
+            let judged = late_pending_judged(&log, seq, after_us);
+            std::fs::remove_dir_all(&dir).unwrap();
+            judged
+        };
+        // Row 5: another identifier's answer at 0.6 s; 1.5 s is 0.9 s after it, in time from it
+        // and late from the transmit.
+        let other = |evidence: &mut exchange::Evidence| {
+            evidence.answers = vec![positive_on(0x7E9, 600_000)];
+        };
+        assert_eq!(judged(other, 1_500_000), InTime);
+        assert_eq!(judged(other, 1_700_000), Late);
+        // Row 8: the answer on its own identifier restarts the window the same way.
+        let own = |evidence: &mut exchange::Evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 600_000)];
+        };
+        assert_eq!(judged(own, 1_500_000), InTime);
+        // Row 6: a pending of Y at 30 ms is no pending of this identifier; the answer of Z at
+        // 40 ms starts the window, so 3 s is late, though Y's P2* would have run to 5 s.
+        let reverse = |evidence: &mut exchange::Evidence| {
+            evidence.pending = vec![pending_on(30_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+            evidence.answers = vec![positive_on(0x7EA, 40_000)];
+        };
+        assert_eq!(judged(reverse, 3_000_000), Late);
+        // Row 7: this identifier is open with a pending at 0.1 s after the answer of another at
+        // 20 ms; the pending of a third identifier at 0.2 s is not in the chain. P2* from 0.1 s
+        // runs to 5.1 s.
+        let open = |evidence: &mut exchange::Evidence| {
+            evidence.pending = vec![pending_on(100_000), pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8), Some(0x7EA)];
+            evidence.answers = vec![positive_on(0x7E9, 20_000)];
+        };
+        assert_eq!(judged(open, 4_000_000), InTime);
+        assert_eq!(judged(open, 5_150_000), Late);
+    }
+
+    /// ADR-426, case table rows 12 to 15: a window that cannot be placed on the transmit's clock,
+    /// an item before the window's start, a transmit with no time, and a link that absorbs
+    /// pendings leave the judgement of a late pending open.
+    #[test]
+    fn a_late_pending_of_a_collecting_exchange_whose_window_cannot_be_placed_stays_open() {
+        use exchange::LatePending::{InTime, Open};
+        let judged = |build: fn(&mut exchange::Evidence), after_us| {
+            let (dir, _, log, seq) = late_collecting(build);
+            let judged = late_pending_judged(&log, seq, after_us);
+            std::fs::remove_dir_all(&dir).unwrap();
+            judged
+        };
+        // The same answer placed, as the control.
+        let placed = |evidence: &mut exchange::Evidence| {
+            evidence.answers = vec![positive_on(0x7E9, 600_000)];
+        };
+        assert_eq!(judged(placed, 1_500_000), InTime);
+        // Row 12: the window starts at an answer with no clock, or on the worker's.
+        let no_clock = |evidence: &mut exchange::Evidence| {
+            let mut answer = positive_on(0x7E9, 600_000);
+            answer.clock = None;
+            evidence.answers = vec![answer];
+        };
+        assert_eq!(judged(no_clock, 1_500_000), Open);
+        let worker = |evidence: &mut exchange::Evidence| {
+            let mut answer = positive_on(0x7E9, 600_000);
+            answer.clock = Some(exchange::Clock::Worker);
+            evidence.answers = vec![answer];
+        };
+        assert_eq!(judged(worker, 1_500_000), Open);
+        // Row 14: the item is placed before the window's start.
+        assert_eq!(judged(placed, 300_000), Open);
+        // Row 13: no transmit time.
+        let (dir, _, log, seq) = late_collecting(|evidence| {
+            evidence.times.vci = None;
+        });
+        assert_eq!(kept_of(&log, seq).transmit, None);
+        assert_eq!(late_pending_judged(&log, seq, 500_000), Open);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Row 15: a link whose VCI absorbs pendings forwards none to judge.
+        assert_eq!(
+            judged(
+                |evidence| {
+                    evidence.pending_visibility = exchange::PendingVisibility::AbsorbedByVci;
+                },
+                500_000
+            ),
+            Open
+        );
+    }
+
+    /// ADR-426, case table rows 16 and 17 for `late_window`: an entry pending read at no known
+    /// place is in no window of a collecting exchange (it counts for any other exchange), a late
+    /// pending open leaves the limit after it unknown, and a late one is passed over.
+    #[test]
+    fn the_window_of_a_late_item_leaves_out_unplaced_pendings_and_passes_over_late_ones() {
+        let (dir, _, log, seq) = late_collecting(|evidence| {
+            evidence.pending = vec![pending_on(30_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        let kept = kept_of(&log, seq);
+        let (from, in_window) = late_window(&kept);
+        assert_eq!((from, in_window.len()), (None, 1));
+        let mut unplaced = kept.clone();
+        unplaced.pending_order = vec![usize::MAX];
+        let (from, in_window) = late_window(&unplaced);
+        assert_eq!((from, in_window.len()), (None, 0));
+        // Not collecting: it counts, and the window is the transmit's.
+        unplaced.evidence.collecting = false;
+        let (from, in_window) = late_window(&unplaced);
+        assert_eq!((from, in_window.len()), (None, 1));
+        // A late pending in time is in the window, an open one is an unplaced time, and a late one
+        // is passed over.
+        std::fs::remove_dir_all(&dir).unwrap();
+        for (after_us, window) in [
+            (Some(500_000), exchange::LatePending::InTime),
+            (None, exchange::LatePending::Open),
+            (Some(6_000_000), exchange::LatePending::Late),
+        ] {
+            let (dir, _, log, seq) = late_collecting(|evidence| {
+                evidence.pending = vec![pending_on(30_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            });
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Pending,
+                    &late_pending_item(),
+                    after_us.and_then(placed_after),
+                )
+                .unwrap();
+            let kept = kept_of(&log, seq);
+            assert_eq!(kept.late_pendings[0].1, window);
+            let at = kept.late_pendings[0].0;
+            let expected = match window {
+                exchange::LatePending::InTime => vec![kept.pendings[0], at],
+                exchange::LatePending::Open => vec![kept.pendings[0], None],
+                exchange::LatePending::Late => vec![kept.pendings[0]],
+            };
+            assert_eq!(late_window(&kept), (None, expected), "{window:?}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-426, case table rows 9 to 11: a late start of a collecting exchange is judged from the
+    /// window's start when its identifier has no final answer; with one it only restates.
+    #[test]
+    fn a_late_start_of_a_collecting_exchange_is_judged_when_its_identifier_has_no_final_answer() {
+        let judged = |build: fn(&mut exchange::Evidence), after_us| {
+            let (dir, _, log, seq) = late_collecting(build);
+            let judged = late_start_judged(&log, seq, after_us);
+            std::fs::remove_dir_all(&dir).unwrap();
+            judged
+        };
+        // Row 9: no answer, as for any exchange whose response did not complete.
+        let silent = |evidence: &mut exchange::Evidence| {
+            evidence.end = exchange::End::NoResponse;
+        };
+        assert!(matches!(
+            judged(silent, 500_000),
+            Some(exchange::LateStart::InTime { at_us: 500_000 })
+        ));
+        assert!(matches!(
+            judged(silent, 1_500_000),
+            Some(exchange::LateStart::Late { .. })
+        ));
+        // Row 10: another identifier's answer at 0.6 s restarts the window: a start at 1.5 s is
+        // in time from it, and would be late from the transmit.
+        let other = |evidence: &mut exchange::Evidence| {
+            evidence.answers = vec![positive_on(0x7E9, 600_000)];
+        };
+        assert!(matches!(
+            judged(other, 1_500_000),
+            Some(exchange::LateStart::InTime { at_us: 1_500_000 })
+        ));
+        assert!(matches!(
+            judged(other, 1_700_000),
+            Some(exchange::LateStart::Late { .. })
+        ));
+        // Row 11: its own identifier's final answer stands, and the start is not judged.
+        let own = |evidence: &mut exchange::Evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 600_000)];
+        };
+        assert_eq!(judged(own, 1_500_000), None);
+    }
+
+    /// ADR-426 (design 8.11 `late_response`): a late response of a collecting exchange is judged
+    /// from the same window as a late pending, so one in time from another identifier's answer is
+    /// `system`.
+    #[test]
+    fn a_late_response_of_a_collecting_exchange_is_judged_from_the_window_s_start() {
+        let classified = |after_us: i64| {
+            let (dir, setup, log, seq) = late_collecting(|evidence| {
+                evidence.answers = vec![positive_on(0x7E9, 600_000)];
+            });
+            let response = UnattachedItem {
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, 0],
+                    identifier: Some(0x7E8),
+                    bytes: vec![0x7E, 0x00],
+                },
+                ..tx_done(0x7E8)
+            };
+            log.lock()
+                .late_response(0, seq, &response, placed_after(after_us))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response").remove(0);
+            late["exchanges"][0]["reason"].as_str().unwrap().to_owned()
+        };
+        // 1.5 s is 0.9 s after the answer at 0.6 s.
+        assert!(
+            classified(1_500_000).contains("within the limit in force less the margin"),
+            "in time from the answer"
+        );
+        assert!(
+            !classified(1_700_000).contains("within the limit in force less the margin"),
+            "late from the answer"
         );
     }
 

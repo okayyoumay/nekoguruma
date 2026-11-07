@@ -824,7 +824,7 @@ pub(super) fn cll_create_flag_to_iso(
 /// the identifier the answer came on (ADR-428).
 const ENABLE_EXTRA_INFO: u8 = 0x20;
 
-/// Default TxFlag length in bytes (ISO 22900-2 D.2).
+/// Default TxFlag length in bytes (ISO 22900-2:2022 D.2).
 const TX_FLAG_DEFAULT_LEN: usize = 4;
 
 /// Sets ENABLE_EXTRA_INFO in a ComPrimitive TxFlag (ADR-428). Pads to the

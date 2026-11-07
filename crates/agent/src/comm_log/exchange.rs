@@ -3858,8 +3858,11 @@ impl Kept {
     }
 
     /// The exchange's evidence with `response` as its end, judged by the rows that do not turn
-    /// on timing: its window is taken as within the limit.
-    pub(crate) fn answered(&self, response: &[u8]) -> Evidence {
+    /// on timing: its window is taken as within the limit. For a collecting exchange the
+    /// response is restated as an answer of its list, as the log restates a final answer read
+    /// after the entry (ADR-425 decision 4, ADR-429): it folds the last pending of the
+    /// identifier it came on into it, and the end is the first standing final answer.
+    pub(crate) fn answered(&self, response: &[u8], late: &LateAnswer) -> Evidence {
         let negative = &self.evidence.expected.negative_pattern;
         let end = if !negative.is_empty() && response.starts_with(negative) {
             End::Negative(response.to_vec())
@@ -3871,20 +3874,100 @@ impl Kept {
         timing.window_by_ms = None;
         timing.not_judged_reason = None;
         timing.late_pending = None;
-        self.evidence.ended_as(end, timing)
+        if !self.evidence.collecting {
+            return self.evidence.ended_as(end, timing);
+        }
+        let expected = &self.evidence.expected;
+        // The identifier the response is keyed on, as the host keys an answer that names none:
+        // 0 on a link with a receive table, else the link's own.
+        let own_id = late
+            .rx_id
+            .unwrap_or(if self.evidence.receive_ids.is_empty() {
+                self.evidence.rx_id
+            } else {
+                0
+            });
+        let mut answers = self.evidence.answers.clone();
+        answers.push(Answer {
+            rx_id: own_id,
+            end: end.clone(),
+            vci_us: late.vci_us,
+            clock: late.clock,
+            epoch: late.epoch,
+            start_us: None,
+            tx_done_us: None,
+            agent_us: late.agent_us,
+            pending: Vec::new(),
+            timing: timing.clone(),
+            history: None,
+        });
+        // The one generic fold (ADR-425 decision 4): the pending of the same identifier leaves
+        // the list and is the final answer's pending chain.
+        let standing = standing_answers(&answers, |a| a.rx_id, |a| a.is_pending(expected));
+        let mut chain: Option<Vec<Pending>> = None;
+        let mut folded = Vec::with_capacity(answers.len());
+        for (answer, standing) in answers.into_iter().zip(standing) {
+            if standing {
+                folded.push(answer);
+            } else {
+                chain.get_or_insert_with(|| answer.as_exchange(expected).1);
+            }
+        }
+        // A response that names no identifier is also taken on the one identifier the exchange
+        // is owed on; with several open it folds nothing more.
+        if chain.is_none()
+            && late.rx_id.is_none()
+            && let [only] = self.evidence.owed_ids()[..]
+            && let Some(at) = folded
+                .iter()
+                .rposition(|answer| answer.rx_id == only && answer.is_pending(expected))
+        {
+            chain = Some(folded.remove(at).as_exchange(expected).1);
+        }
+        if let Some(last) = folded.last_mut() {
+            last.pending = chain.unwrap_or_default();
+        }
+        let end = collecting_end(&folded, expected);
+        // The window's end stays judged by the entry's timing (`Evidence::collecting`), which a
+        // late answer does not change; only the answer it adds is taken as within the limit. A
+        // late start judged at the limit showed that end was the VCI's at the limit.
+        let mut window = self.evidence.timing.clone();
+        if matches!(
+            self.late_start_for(late.rx_id),
+            Some(LateStart::Late { at_limit: true, .. })
+        ) {
+            window.window = Window::TimeoutAtLimit;
+            window.not_judged_reason = None;
+        }
+        let mut evidence = self.evidence.ended_as(end, window);
+        evidence.answers = folded;
+        evidence
     }
+}
+
+/// The item of a late response that [`Kept::answered`] restates as an answer of a collecting
+/// exchange: the identifier it names (`None` when it names none) and its times, as the host
+/// gives an answer's.
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LateAnswer {
+    pub rx_id: Option<u32>,
+    pub vci_us: Option<u64>,
+    pub clock: Option<Clock>,
+    pub epoch: Option<u32>,
+    pub agent_us: u64,
 }
 
 /// The classification and reason a `late_response` gives the exchange it settles (design 8.11
 /// "Settlement", ADR-365): the response, which came after the VCI ended that exchange, judged
 /// by `window` against its limit in force. `answered` is [`Kept::answered`], and `history` the
-/// link's history for it as of the settling entry.
+/// link's history for it as of the settling entry, and `response` the late response's bytes.
 pub(crate) fn settle_late_response(
     kept: &Kept,
     answered: &Evidence,
     window: super::timing::LateWindow,
     history: &LinkHistory,
     response_id: Option<u32>,
+    response: &[u8],
 ) -> (Classification, String) {
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
@@ -3895,10 +3978,9 @@ pub(crate) fn settle_late_response(
     // spans frames, since one that fits one frame came after a transfer the ECU aborted; one
     // after the limit plus the margin means the ECU started late, which any response completing
     // after it is judged as (design 8.11 "Settlement").
-    let spans_frames = answered
-        .end
-        .response()
-        .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
+    // It is the late response's own bytes: a collecting exchange's end may be another
+    // identifier's final answer.
+    let spans_frames = response.len() > super::SINGLE_FRAME_MAX;
     let window = match (window, late_start) {
         (LateWindow::Late { .. } | LateWindow::Open, Some(LateStart::InTime { at_us }))
             if spans_frames =>
@@ -4970,7 +5052,7 @@ mod tests {
 
     /// The answer a settling entry adds when exchange `seq`, kept as `kept`, gets `response`.
     fn final_answer(state: &LinkState, seq: u64, kept: &Kept, response: &[u8]) -> SettledAnswer {
-        let answered = kept.answered(response);
+        let answered = kept.answered(response, &LateAnswer::default());
         let history = state.history_settling(&answered, seq);
         ExchangeEntry::build(seq, answered, history).settled_answer(kept, true)
     }
@@ -4985,7 +5067,7 @@ mod tests {
         response: &[u8],
     ) -> (ExchangeEntry, Vec<Reclassified>, Option<u64>) {
         state.settle_owed(seq);
-        let answered = kept.answered(response);
+        let answered = kept.answered(response, &LateAnswer::default());
         let history = state.history_settling(&answered, seq);
         let entry = ExchangeEntry::build(seq, answered.clone(), history);
         state.settled(seq, entry.classification, &entry.reason, answered, true);
@@ -5873,7 +5955,7 @@ mod tests {
             assert!(!state.kept(2).unwrap().matched, "{late_us}");
             // Exchange 2's final response, settled through the real path.
             let kept = state.kept(2).unwrap().clone();
-            let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
+            let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41], &LateAnswer::default());
             let history = state.history_settling(&response, 2);
             let entry = ExchangeEntry::build(2, response.clone(), history);
             let mut answer = entry.settled_answer(&kept, true);
@@ -5918,7 +6000,7 @@ mod tests {
             state.keep(2, kept);
             // The final response first: it counts as nothing new, but its time is stored.
             let kept = state.kept(2).unwrap().clone();
-            let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
+            let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41], &LateAnswer::default());
             let history = state.history_settling(&response, 2);
             let entry = ExchangeEntry::build(2, response, history);
             let mut answer = entry.settled_answer(&kept, true);
@@ -6360,7 +6442,7 @@ mod tests {
         let settle = |state: &mut LinkState, seq: u64, at: i64| {
             let kept = state.kept(seq).unwrap().clone();
             state.settle_owed(seq);
-            let answered = kept.answered(response);
+            let answered = kept.answered(response, &LateAnswer::default());
             let history = state.history_settling(&answered, seq);
             let entry = ExchangeEntry::build(seq, answered.clone(), history);
             state.settled(seq, entry.classification, &entry.reason, answered, true);
@@ -6391,7 +6473,7 @@ mod tests {
         state.error_after(Some(1), 3, LinkErrorKind::Receive, Some(first));
         // The first exchange's answer at 2 500 is before the error: answered only.
         let kept = state.kept(1).unwrap().clone();
-        let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
+        let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41], &LateAnswer::default());
         let history = state.history_settling(&answered, 1);
         let entry = ExchangeEntry::build(1, answered.clone(), history);
         let mut settled = entry.settled_answer(&kept, true);
@@ -6479,7 +6561,7 @@ mod tests {
         state.error_after(Some(2), 4, LinkErrorKind::Receive, Some(at));
         let kept = state.kept(1).unwrap().clone();
         state.settle_owed(1);
-        let late = kept.answered(&response);
+        let late = kept.answered(&response, &LateAnswer::default());
         let history = state.history_settling(&late, 1);
         let entry = ExchangeEntry::build(1, late.clone(), history);
         let mut settled = entry.settled_answer(&kept, true);
@@ -7438,8 +7520,15 @@ mod tests {
             matched: false,
         };
         let settle = |kept: &Kept, response: &[u8], window| {
-            let answered = kept.answered(response);
-            settle_late_response(kept, &answered, window, &LinkHistory::empty(), None)
+            let answered = kept.answered(response, &LateAnswer::default());
+            settle_late_response(
+                kept,
+                &answered,
+                window,
+                &LinkHistory::empty(),
+                None,
+                response,
+            )
         };
         let positive = [0x62, 0xF1, 0x86, 0x01];
         let vehicle = kept(Classification::Vehicle);
@@ -9498,14 +9587,253 @@ mod tests {
 
     #[test]
     fn a_late_response_settling_a_silent_collecting_exchange_takes_the_ordinary_rows() {
-        // Case 29: `Kept::answered` on a collecting exchange with no answers.
+        // Case 29: `Kept::answered` on a collecting exchange with no answers restates the response
+        // as its one answer, judged by the collecting row.
         let mut state = LinkState::default();
         let (_, kept) = log_kept(&mut state, 1, collecting(Vec::new()));
-        let answered = kept.answered(&POSITIVE);
-        assert!(answered.collecting && answered.answers.is_empty());
+        let answered = kept.answered(&POSITIVE, &LateAnswer::default());
+        assert!(answered.collecting && answered.answers.len() == 1);
         let (class, reason) = verdict_of(&answered);
         assert!(!reason.contains("No answer came"), "{reason}");
         assert_eq!(class, Classification::None, "{reason}");
+    }
+
+    const RX2: u32 = 0x7E9;
+
+    /// A pending on `rx_id` the window did not follow with a final answer.
+    fn lone(rx_id: u32) -> Answer {
+        answer(
+            rx_id,
+            End::Negative(vec![0x7F, 0x3E, 0x78]),
+            Window::WithinP2,
+            5.0,
+        )
+    }
+
+    /// The kept collecting exchange with `answers` (its end the first final answer's); on a
+    /// functional link (`functional`) its own identifier is 0 and it receives on 0x7E8, 0x7E9.
+    fn kept_collecting(answers: Vec<Answer>, functional: bool) -> Kept {
+        kept_on(answers, if functional { &[RX, RX2] } else { &[] })
+    }
+
+    /// [`kept_collecting`] on a link that receives on `table` (empty: a physical link).
+    fn kept_on(answers: Vec<Answer>, table: &[u32]) -> Kept {
+        let mut evidence = collecting(answers);
+        evidence.end = collecting_end(&evidence.answers, &evidence.expected);
+        if !table.is_empty() {
+            evidence.rx_id = 0;
+            evidence.receive_ids = table.to_vec();
+        }
+        log_kept(&mut LinkState::default(), 1, evidence).1
+    }
+
+    fn late_on(rx_id: Option<u32>) -> LateAnswer {
+        LateAnswer {
+            rx_id,
+            vci_us: Some(7_000),
+            clock: Some(Clock::Device),
+            epoch: Some(0),
+            agent_us: 9_000,
+        }
+    }
+
+    /// The identifier and end of each answer.
+    fn shape(evidence: &Evidence) -> Vec<(u32, Option<Vec<u8>>)> {
+        evidence
+            .answers
+            .iter()
+            .map(|answer| (answer.rx_id, answer.end.response().map(<[u8]>::to_vec)))
+            .collect()
+    }
+
+    /// Row A (ADR-425 decision 4, ADR-429): a final answer to a lone pending folds it, so no
+    /// identifier is left open; the folded list is what the host's rule gives.
+    #[test]
+    fn a_late_final_answer_folds_the_lone_pending_of_its_identifier() {
+        let kept = kept_collecting(vec![lone(RX)], false);
+        assert_eq!(kept.evidence.open_pending_ids(), [RX]);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert!(answered.open_pending_ids().is_empty());
+        assert_eq!(answered.answers.len(), 1);
+        let last = answered.answers.last().unwrap();
+        assert_eq!(last.pending.len(), 1);
+        assert_eq!((last.rx_id, last.agent_us), (RX, 9_000));
+        assert_eq!(last.timing.window, Window::WithinP2);
+        assert_eq!(answered.end.response(), Some(&POSITIVE[..]));
+        assert!(answered.settles_owed());
+        // The host's rule over the answers and the final gives the same list.
+        let mut items = kept.evidence.answers.clone();
+        items.push(answered.answers[0].clone());
+        let expected = &kept.evidence.expected;
+        let standing = standing_answers(&items, |a| a.rx_id, |a| a.is_pending(expected));
+        let rule = super::super::keep_standing(items, &standing);
+        assert_eq!(
+            rule.iter()
+                .map(|a| (a.rx_id, a.end.response().map(<[u8]>::to_vec)))
+                .collect::<Vec<_>>(),
+            shape(&answered)
+        );
+    }
+
+    /// Rows A, B and C: how the settlement judges the folded exchange by the response's window.
+    #[test]
+    fn a_folded_lone_pending_no_longer_hides_where_the_vci_ended_its_wait() {
+        use super::super::timing::LateWindow;
+        let kept = kept_collecting(vec![lone(RX)], false);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        let settle = |window| {
+            settle_late_response(
+                &kept,
+                &answered,
+                window,
+                &LinkHistory::empty(),
+                Some(RX),
+                &POSITIVE,
+            )
+        };
+        // A.
+        let (class, _) = settle(LateWindow::InTime { at_us: 1_000 });
+        assert_eq!(class, Classification::System);
+        // B: the VCI ended its wait at the limit; the pending no longer makes it undetermined.
+        let (class, reason) = settle(LateWindow::Late { by_us: 2_000 });
+        assert_eq!(class, Classification::Vehicle, "{reason}");
+        assert!(reason.contains("VCI had ended its wait"), "{reason}");
+        // C: the reason names the final answer, not a pending.
+        let (class, reason) = settle(LateWindow::Open);
+        assert_eq!(class, Classification::Undetermined, "{reason}");
+        assert!(!reason.contains("pending"), "{reason}");
+    }
+
+    /// Row D: the other identifier's lone pending stays open, and the exchange is still settled
+    /// whole.
+    #[test]
+    fn a_late_final_answer_leaves_another_identifiers_lone_pending() {
+        let kept = kept_collecting(vec![lone(RX), lone(RX2)], true);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert_eq!(answered.open_pending_ids(), [RX2]);
+        assert_eq!(answered.answers.len(), 2);
+        assert_eq!(answered.answers[1].pending.len(), 1);
+        assert_eq!(answered.end.response(), Some(&POSITIVE[..]));
+        assert!(!answered.settles_owed());
+        let (class, _) = verdict_of(&answered);
+        assert_eq!(class, Classification::Undetermined);
+    }
+
+    /// Row E: the end is the first standing final answer, which another identifier's earlier one
+    /// is; whether the late response spans frames is read from its own bytes.
+    #[test]
+    fn a_late_final_answer_keeps_an_earlier_identifiers_final_as_the_end() {
+        use super::super::timing::LateWindow;
+        let mut kept = kept_collecting(vec![positive(RX2, Window::WithinP2), lone(RX)], true);
+        let long = vec![0x7E; 20];
+        let answered = kept.answered(&long, &late_on(Some(RX)));
+        assert_eq!(answered.end.response(), Some(&POSITIVE[..]));
+        assert_eq!(answered.answers.len(), 2);
+        assert!(answered.open_pending_ids().is_empty());
+        kept.late_start = Some(LateStart::InTime { at_us: 1_000 });
+        kept.late_start_id = Some(RX);
+        let (class, reason) = settle_late_response(
+            &kept,
+            &answered,
+            LateWindow::Late { by_us: 1 },
+            &LinkHistory::empty(),
+            Some(RX),
+            &long,
+        );
+        assert_eq!(class, Classification::System, "{reason}");
+        assert!(reason.contains("started"), "{reason}");
+    }
+
+    /// Row F: an unnamed final answer folds the pending of the one identifier the exchange is
+    /// owed on; it carries identifier 0, which may be any identifier of the table.
+    #[test]
+    fn an_unnamed_late_final_answer_folds_the_one_owed_identifier() {
+        let kept = kept_collecting(vec![lone(RX)], true);
+        assert_eq!(kept.evidence.owed_ids(), [RX]);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert!(answered.open_pending_ids().is_empty());
+        assert_eq!(answered.answers.len(), 1);
+        assert_eq!(answered.answers[0].rx_id, 0);
+        assert_eq!(answered.answers[0].pending.len(), 1);
+        assert_eq!(answered.owed_ids(), [RX, RX2]);
+        assert!(answered.settles_owed());
+    }
+
+    /// Row G: an unnamed final answer with several identifiers open folds nothing.
+    #[test]
+    fn an_unnamed_late_final_answer_folds_nothing_with_several_open() {
+        let kept = kept_collecting(vec![lone(RX), lone(RX2)], true);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(answered.answers.len(), 3);
+        assert_eq!(answered.open_pending_ids(), [RX, RX2]);
+        assert!(
+            answered
+                .answers
+                .iter()
+                .all(|a| a.rx_id != 0 || a.pending.is_empty())
+        );
+        assert!(!answered.settles_owed());
+        assert_eq!(answered.end.response(), Some(&POSITIVE[..]));
+    }
+
+    /// An unnamed final answer folds an unnamed lone pending, as the host's fold keys both 0;
+    /// on a physical link an unnamed answer is keyed on the link's own identifier.
+    #[test]
+    fn an_unnamed_late_final_answer_folds_an_unnamed_lone_pending() {
+        for table in [&[RX, RX2][..], &[RX][..]] {
+            let kept = kept_on(vec![lone(0)], table);
+            let answered = kept.answered(&POSITIVE, &late_on(None));
+            assert!(answered.open_pending_ids().is_empty(), "{table:?}");
+            assert_eq!(answered.answers.len(), 1);
+            assert_eq!(answered.answers[0].pending.len(), 1);
+            assert!(answered.settles_owed(), "{table:?}");
+        }
+        let kept = kept_on(vec![lone(RX)], &[]);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(shape(&answered), [(RX, Some(POSITIVE.to_vec()))]);
+        assert!(answered.open_pending_ids().is_empty());
+    }
+
+    /// A late start judged at the limit shows the window ended at the limit, though the kept
+    /// timing, judged again with the start, no longer says so: the response that completes it is
+    /// the vehicle's, with or without a lone pending.
+    #[test]
+    fn a_late_start_at_the_limit_keeps_a_collecting_exchange_the_vehicles() {
+        use super::super::timing::LateWindow;
+        for table in [&[][..], &[RX, RX2][..]] {
+            for answers in [Vec::new(), vec![lone(RX)]] {
+                let mut kept = kept_on(answers, table);
+                kept.evidence.timing.window = Window::NotJudged;
+                kept.evidence.timing.not_judged_reason = Some(NotJudgedReason::ResponseBegun);
+                kept.late_start = Some(LateStart::Late {
+                    by_us: 2_000,
+                    at_limit: true,
+                });
+                kept.late_start_id = Some(RX);
+                let late = late_on(Some(RX));
+                let answered = kept.answered(&POSITIVE, &late);
+                let (class, reason) = settle_late_response(
+                    &kept,
+                    &answered,
+                    LateWindow::Late { by_us: 2_000 },
+                    &LinkHistory::empty(),
+                    Some(RX),
+                    &POSITIVE,
+                );
+                assert_eq!(class, Classification::Vehicle, "{table:?} {reason}");
+            }
+        }
+    }
+
+    /// Row H: an unnamed lone pending (identifier 0) is no pending of a named identifier, so a
+    /// named final answer folds nothing; the pending stays open for the other identifier.
+    #[test]
+    fn a_named_late_final_answer_folds_no_unnamed_pending() {
+        let kept = kept_collecting(vec![lone(0)], true);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert_eq!(answered.answers.len(), 2);
+        assert_eq!(answered.open_pending_ids(), [0]);
+        assert_eq!(answered.owed_ids(), [RX2]);
     }
 
     /// A request meant for one ECU that got `count` answers, with one earlier request on the

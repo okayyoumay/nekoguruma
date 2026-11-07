@@ -1,7 +1,7 @@
 # ADR-423: The D-PDU Mock Keeps a Started Link's Tester-Present
 
 **Date:** 2026-11-05
-**Status:** Accepted (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication)
+**Status:** Accepted (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication; by ADR-430: with no header, in every binding mode)
 **Affects:** `crates/iso22900-mock` (`PDUSetComParam`, `PDUGetComParam`, `PDUGetStatus`,
 `PDUStartComPrimitive`, `PDUConstruct`, the delivery thread, `NGR_SIM_ECU_COMMANDS`),
 `crates/iso22900-mock/docs/`, `crates/iso22900-service/tests/grpc_mock.rs`; ADR-299, ADR-418,
@@ -60,7 +60,8 @@ to the standard here.
    resumes when one is attached. Switching the handling off, a `CoptStopcomm`, a disconnect, a
    destroy and a reset stop it.
    Amended by ADR-427: with the indication binding unbound, the active transmit indication on
-   and address mode 0, a send also raises an unbound transmit indication.
+   and address mode 0, a send also raises an unbound transmit indication; ADR-430: with no
+   header, in every binding mode.
 6. **Serialization (8.1.3 Table 1, as ADR-419 for the J2534 worker).** A tester-present goes only
    when no ComPrimitive runs or waits; a ComPrimitive that waits goes first and the
    tester-present stays due. This holds every tester-present behind the ComPrimitives, which is

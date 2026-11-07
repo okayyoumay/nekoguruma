@@ -582,7 +582,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   a time on the job's one link, and the API's own tester present, which runs once the link's
   first session control has started communication ("Keeping a session alive" below), sends no
   request while a primitive is outstanding (ISO 22900-2:2022 8.1.3 Table 1, ADR-419) and has its
-  own transmit indications discarded by the worker (ADR-099). A start-of-message indication that carries the exchange's
+  own transmit indications discarded by the J2534 worker (ADR-099). On D-PDU the
+  condition holds by the standard's structure: an item of no ComPrimitive has no extra info
+  header (ISO 22900-2:2022 10.1.4.11, 10.1.4.11.4, D.2.1), so the API's tester-present
+  indication gives the agent no identifier to match, and the worker logs one that has a header as
+  a sign of a non-conforming library (ADR-430). A start-of-message indication that carries the exchange's
   response identifier is the first frame of its response, which counts as an answer of the ECU
   (design 8.11 "Link settings for the log", "Answer of the ECU"), unless an owed request on the
   link expecting a response on that identifier could own it (one that stays owed after a reopened

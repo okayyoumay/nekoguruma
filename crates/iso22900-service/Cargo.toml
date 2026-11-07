@@ -39,6 +39,7 @@ diag-frontend = { path = "../diag-frontend" }
 postcard = { workspace = true }
 iso22900-mock = { workspace = true }
 worker-host = { workspace = true }
+tracing-subscriber = { workspace = true }
 serial_test = "3"
 tempfile = "3"
 serde_json = "1"

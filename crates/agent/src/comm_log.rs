@@ -4445,7 +4445,11 @@ impl Inner {
             vci_us: Some(u64::from(item.vci_us)),
             clock: item.clock,
             epoch: placed.map(|placed| placed.epoch),
-            agent_us: item.read.map_or(0, |read| read.monotonic_us),
+            // When the host read it, in the exchange's agent epoch, else the entry's end.
+            agent_us: item
+                .read
+                .filter(|read| read.epoch == kept.evidence.times.agent.epoch)
+                .map_or(kept.evidence.times.agent.end_us, |read| read.monotonic_us),
         };
         let answered = kept.answered(bytes, &late);
         let history = state.history_for(&answered);
@@ -9558,6 +9562,18 @@ pub(crate) mod tests {
         }
     }
 
+    /// The final answer to the presence request, delivered late with no identifier.
+    fn late_final_unnamed() -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: None,
+                bytes: vec![0x7E, 0x00],
+            },
+            ..tx_done(0x7E8)
+        }
+    }
+
     fn late_final_item() -> UnattachedItem {
         late_final_on(0x7E8)
     }
@@ -9618,7 +9634,7 @@ pub(crate) mod tests {
     /// ended its wait at the limit, which the settled lone pending no longer hides (row B).
     #[test]
     fn a_final_answer_after_the_window_of_a_lone_pending_is_the_vehicles() {
-        for functional in [false, true] {
+        for (functional, unnamed) in [(false, false), (true, false), (false, true), (true, true)] {
             let (dir, setup, log, seq) = late_collecting_on(functional, |evidence| {
                 evidence.end = exchange::End::NoResponse;
                 evidence.vci_ended = true;
@@ -9629,8 +9645,13 @@ pub(crate) mod tests {
                 evidence.pending = vec![pending_on(200_000)];
                 evidence.pending_ids = vec![Some(0x7E8)];
             });
+            let item = if unnamed {
+                late_final_unnamed()
+            } else {
+                late_final_item()
+            };
             log.lock()
-                .late_response(0, seq, &late_final_item(), placed_after(9_000_000))
+                .late_response(0, seq, &item, placed_after(9_000_000))
                 .unwrap();
             log.end("ok");
             let lines = lines(&setup);
@@ -9638,12 +9659,34 @@ pub(crate) mod tests {
             let late = of_event(&lines, "late_response").remove(0);
             assert_eq!(
                 late["exchanges"][0]["classification"], "vehicle",
-                "{functional} {late}"
+                "{functional} {unnamed} {late}"
             );
             let reason = late["exchanges"][0]["reason"].as_str().unwrap();
             assert!(reason.contains("VCI had ended its wait"), "{reason}");
             assert!(!reason.contains("pending"), "{reason}");
         }
+    }
+
+    /// Row F through the log: a final answer that names no identifier settles a lone pending
+    /// of a functional exchange, folded on the one identifier it is owed on.
+    #[test]
+    fn an_unnamed_final_answer_settles_a_functional_lone_pending() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        log.lock()
+            .late_response(0, seq, &late_final_unnamed(), placed_after(3_000_000))
+            .unwrap();
+        assert_eq!(owed_on_7e8(&log, seq), (Vec::new(), false));
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response").remove(0);
+        assert_eq!(late["exchanges"][0]["classification"], "system", "{late}");
     }
 
     /// The late response decision for `item` on link 0, as the log takes it.

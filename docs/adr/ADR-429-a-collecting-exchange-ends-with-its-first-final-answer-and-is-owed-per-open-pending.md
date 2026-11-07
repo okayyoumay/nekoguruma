@@ -65,5 +65,10 @@ even an exchange that stayed owed could never own it.
 - Deferred, kept as backlog items: settling per identifier; a pending whose identifier is
   unnamed (identifier 0) and an exchange with no answer, which stay owed on identifier 0 only,
   so a later final answer on a named identifier is not attached; `Kept::answered` restating the
-  answers of a settled exchange (closed: it folds the pending of the identifier the late final
-  answer came on into it, as decision 4 of ADR-425).
+  answers of a settled exchange (closed: `Kept::answered` of a collecting exchange restates the late
+  final answer through the same generic fold as decision 4 of ADR-425, keyed as the host keys an
+  answer, so an unnamed final answer folds an unnamed pending; it extends that fold in one
+  case, a final answer that names no identifier also folds the pending of the one identifier
+  the exchange is owed on, and none when several are open. The window's end stays judged by
+  the kept exchange's own timing, or as at the limit when a late start was judged so (design
+  8.11 `late_item`); only the appended answer is taken as within the limit).

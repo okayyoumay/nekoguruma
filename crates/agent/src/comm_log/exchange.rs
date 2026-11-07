@@ -3878,23 +3878,18 @@ impl Kept {
             return self.evidence.ended_as(end, timing);
         }
         let expected = &self.evidence.expected;
-        // The identifier the response is taken on: the one it names, else the one identifier
-        // the exchange is owed on; with several open it folds nothing.
-        let taken_on = late.rx_id.or_else(|| match self.evidence.owed_ids()[..] {
-            [only] => Some(only),
-            _ => None,
-        });
+        // The identifier the response is keyed on, as the host keys an answer that names none:
+        // 0 on a link with a receive table, else the link's own.
+        let own_id = late
+            .rx_id
+            .unwrap_or(if self.evidence.receive_ids.is_empty() {
+                self.evidence.rx_id
+            } else {
+                0
+            });
         let mut answers = self.evidence.answers.clone();
-        let pending = taken_on
-            .and_then(|id| {
-                answers
-                    .iter()
-                    .rposition(|answer| answer.rx_id == id && answer.is_pending(expected))
-            })
-            .map(|at| answers.remove(at).as_exchange(expected).1)
-            .unwrap_or_default();
         answers.push(Answer {
-            rx_id: late.rx_id.unwrap_or(0),
+            rx_id: own_id,
             end: end.clone(),
             vci_us: late.vci_us,
             clock: late.clock,
@@ -3902,15 +3897,50 @@ impl Kept {
             start_us: None,
             tx_done_us: None,
             agent_us: late.agent_us,
-            pending,
+            pending: Vec::new(),
             timing: timing.clone(),
             history: None,
         });
-        let end = collecting_end(&answers, expected);
-        // The entry's timing judges the window's end (`Evidence::collecting`), which a late
-        // answer does not change; only the answer it adds is taken as within the limit.
-        let mut evidence = self.evidence.ended_as(end, self.evidence.timing.clone());
-        evidence.answers = answers;
+        // The one generic fold (ADR-425 decision 4): the pending of the same identifier leaves
+        // the list and is the final answer's pending chain.
+        let standing = standing_answers(&answers, |a| a.rx_id, |a| a.is_pending(expected));
+        let mut chain: Option<Vec<Pending>> = None;
+        let mut folded = Vec::with_capacity(answers.len());
+        for (answer, standing) in answers.into_iter().zip(standing) {
+            if standing {
+                folded.push(answer);
+            } else {
+                chain.get_or_insert_with(|| answer.as_exchange(expected).1);
+            }
+        }
+        // A response that names no identifier is also taken on the one identifier the exchange
+        // is owed on; with several open it folds nothing more.
+        if chain.is_none()
+            && late.rx_id.is_none()
+            && let [only] = self.evidence.owed_ids()[..]
+            && let Some(at) = folded
+                .iter()
+                .rposition(|answer| answer.rx_id == only && answer.is_pending(expected))
+        {
+            chain = Some(folded.remove(at).as_exchange(expected).1);
+        }
+        if let Some(last) = folded.last_mut() {
+            last.pending = chain.unwrap_or_default();
+        }
+        let end = collecting_end(&folded, expected);
+        // The window's end stays judged by the entry's timing (`Evidence::collecting`), which a
+        // late answer does not change; only the answer it adds is taken as within the limit. A
+        // late start judged at the limit showed that end was the VCI's at the limit.
+        let mut window = self.evidence.timing.clone();
+        if matches!(
+            self.late_start_for(late.rx_id),
+            Some(LateStart::Late { at_limit: true, .. })
+        ) {
+            window.window = Window::TimeoutAtLimit;
+            window.not_judged_reason = None;
+        }
+        let mut evidence = self.evidence.ended_as(end, window);
+        evidence.answers = folded;
         evidence
     }
 }
@@ -9583,11 +9613,16 @@ mod tests {
     /// The kept collecting exchange with `answers` (its end the first final answer's); on a
     /// functional link (`functional`) its own identifier is 0 and it receives on 0x7E8, 0x7E9.
     fn kept_collecting(answers: Vec<Answer>, functional: bool) -> Kept {
+        kept_on(answers, if functional { &[RX, RX2] } else { &[] })
+    }
+
+    /// [`kept_collecting`] on a link that receives on `table` (empty: a physical link).
+    fn kept_on(answers: Vec<Answer>, table: &[u32]) -> Kept {
         let mut evidence = collecting(answers);
         evidence.end = collecting_end(&evidence.answers, &evidence.expected);
-        if functional {
+        if !table.is_empty() {
             evidence.rx_id = 0;
-            evidence.receive_ids = vec![RX, RX2];
+            evidence.receive_ids = table.to_vec();
         }
         log_kept(&mut LinkState::default(), 1, evidence).1
     }
@@ -9739,6 +9774,55 @@ mod tests {
         );
         assert!(!answered.settles_owed());
         assert_eq!(answered.end.response(), Some(&POSITIVE[..]));
+    }
+
+    /// An unnamed final answer folds an unnamed lone pending, as the host's fold keys both 0;
+    /// on a physical link an unnamed answer is keyed on the link's own identifier.
+    #[test]
+    fn an_unnamed_late_final_answer_folds_an_unnamed_lone_pending() {
+        for table in [&[RX, RX2][..], &[RX][..]] {
+            let kept = kept_on(vec![lone(0)], table);
+            let answered = kept.answered(&POSITIVE, &late_on(None));
+            assert!(answered.open_pending_ids().is_empty(), "{table:?}");
+            assert_eq!(answered.answers.len(), 1);
+            assert_eq!(answered.answers[0].pending.len(), 1);
+            assert!(answered.settles_owed(), "{table:?}");
+        }
+        let kept = kept_on(vec![lone(RX)], &[]);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(shape(&answered), [(RX, Some(POSITIVE.to_vec()))]);
+        assert!(answered.open_pending_ids().is_empty());
+    }
+
+    /// A late start judged at the limit shows the window ended at the limit, though the kept
+    /// timing, judged again with the start, no longer says so: the response that completes it is
+    /// the vehicle's, with or without a lone pending.
+    #[test]
+    fn a_late_start_at_the_limit_keeps_a_collecting_exchange_the_vehicles() {
+        use super::super::timing::LateWindow;
+        for table in [&[][..], &[RX, RX2][..]] {
+            for answers in [Vec::new(), vec![lone(RX)]] {
+                let mut kept = kept_on(answers, table);
+                kept.evidence.timing.window = Window::NotJudged;
+                kept.evidence.timing.not_judged_reason = Some(NotJudgedReason::ResponseBegun);
+                kept.late_start = Some(LateStart::Late {
+                    by_us: 2_000,
+                    at_limit: true,
+                });
+                kept.late_start_id = Some(RX);
+                let late = late_on(Some(RX));
+                let answered = kept.answered(&POSITIVE, &late);
+                let (class, reason) = settle_late_response(
+                    &kept,
+                    &answered,
+                    LateWindow::Late { by_us: 2_000 },
+                    &LinkHistory::empty(),
+                    Some(RX),
+                    &POSITIVE,
+                );
+                assert_eq!(class, Classification::Vehicle, "{table:?} {reason}");
+            }
+        }
     }
 
     /// Row H: an unnamed lone pending (identifier 0) is no pending of a named identifier, so a

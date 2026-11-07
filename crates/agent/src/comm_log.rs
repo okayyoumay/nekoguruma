@@ -8988,12 +8988,14 @@ pub(crate) mod tests {
         assert_ne!(unplaced["classification"], "system", "{unplaced}");
     }
 
-    /// A pending read for the end before the reading, whose ECU's final answer was read after it,
-    /// is still open at the reading and puts P2* in force: the kept `system` is refuted.
+    /// A pending read for the end just before the reading (another ECU's, within the clock's
+    /// tolerance of it), whose final answer was read after it, is still open at the reading and
+    /// puts P2* in force: the kept `system` is refuted. A pending much earlier than the reading,
+    /// read after it, is on a new epoch and refutes the check whatever the window.
     #[test]
     fn a_pending_whose_final_answer_came_after_the_reading_still_limits_the_reading() {
         let (entry, ended) = collecting_read_then_ended(
-            |evidence| evidence.answers = vec![positive_on(0x7E8, 200_000)],
+            |evidence| evidence.answers = vec![positive_on(0x7E8, 3_000_000)],
             None,
             exchange::End::VciLost {
                 refused_after_loss: false,
@@ -9002,14 +9004,15 @@ pub(crate) mod tests {
                 EndItem::Answer(answer_on(
                     0x7E9,
                     exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
-                    800_000,
+                    4_999_000,
                 )),
-                EndItem::Pending(pending_on(800_000), Some(0x7E9)),
+                EndItem::Pending(pending_on(4_999_000), Some(0x7E9)),
                 answer_read(0x7E9, 5_200_000),
             ],
         );
         assert_eq!(entry["classification"], "system", "{entry}");
         assert_ne!(ended["classification"], "system", "{ended}");
+        assert_eq!(ended["pending"][0]["epoch"], 0, "{ended}");
     }
 
     /// A late pending read before the end is in no window, but one not shown after the reading

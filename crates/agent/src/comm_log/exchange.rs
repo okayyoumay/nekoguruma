@@ -1160,6 +1160,10 @@ pub(crate) struct Evidence {
     /// pending is kept per identifier (ADR-400). Shorter than `pending`, or `None`, for one
     /// whose identifier is not known; it then counts for every identifier. Not written.
     pub pending_ids: Vec<Option<u32>>,
+    /// The response identifiers the link receives on, from the host's receive table (a
+    /// functional link lists the identifiers of the ECUs it addresses, its own `rx_id` is 0).
+    /// Empty counts as `[rx_id]`. Not written.
+    pub receive_ids: Vec<u32>,
     pub timing: Timing,
     pub times: Times,
     /// A transmit confirmation the link gave. No link gives one yet.
@@ -1238,6 +1242,7 @@ impl Evidence {
             caused_by: None,
             pending: Vec::new(),
             pending_ids: Vec::new(),
+            receive_ids: Vec::new(),
             timing: Timing::not_judged(),
             times: Times {
                 agent: AgentTimes {
@@ -1285,6 +1290,96 @@ impl Evidence {
         for answer in &self.answers {
             if answer.is_pending(&self.expected) && !ids.contains(&answer.rx_id) {
                 ids.push(answer.rx_id);
+            }
+        }
+        ids
+    }
+
+    /// Whether a final answer on the named identifier `id` stands in the exchange.
+    fn final_standing(&self, id: u32) -> bool {
+        self.answers
+            .iter()
+            .any(|answer| answer.rx_id == id && !answer.is_pending(&self.expected))
+    }
+
+    /// The response identifiers the exchange is owed on (design 8.11 "Owed request", ADR-432),
+    /// each once. With no receive table (a physical link) it is owed as before: on the
+    /// identifiers a pending is open on, else on its link's `rx_id`. With a table, a request
+    /// that is not collecting is owed on its `rx_id` once a final response ended it, else on
+    /// every receive identifier; a collecting request with no answer on every receive
+    /// identifier. With answers, an identifier with a final answer standing is never owed; only
+    /// the identifiers a pending is open on are, an unnamed pending (identifier 0) standing for
+    /// every receive identifier with no final answer, and for none when every one has it (the
+    /// pending is covered by those answers, ADR-400 decision 1). A collecting request that
+    /// ended with a final response and is left with none owes the identifiers whose final
+    /// answers' own histories show an owner, else (with no pending open) the first final
+    /// answer's, so the request it could be a late answer of finds it.
+    pub(crate) fn owed_ids(&self) -> Vec<u32> {
+        // A link with no receive table (a physical one) is owed as before ADR-432: on the
+        // identifiers a pending is open on, else on its own.
+        if self.receive_ids.is_empty() {
+            let open = self.open_pending_ids();
+            return if self.collecting && !open.is_empty() {
+                open
+            } else {
+                vec![self.rx_id]
+            };
+        }
+        let table = self.receive_ids.clone();
+        let mut ids: Vec<u32> = Vec::new();
+        fn add(ids: &mut Vec<u32>, id: u32) {
+            if !ids.contains(&id) {
+                ids.push(id);
+            }
+        }
+        if !self.collecting {
+            if self.final_response().is_some() {
+                add(&mut ids, self.rx_id);
+            } else {
+                table.iter().for_each(|&id| add(&mut ids, id));
+            }
+            return ids;
+        }
+        if self.answers.is_empty() {
+            table.iter().for_each(|&id| add(&mut ids, id));
+            return ids;
+        }
+        for id in self.open_pending_ids() {
+            if id == 0 {
+                for &receive in &table {
+                    if !self.final_standing(receive) {
+                        add(&mut ids, receive);
+                    }
+                }
+            } else if !self.final_standing(id) {
+                add(&mut ids, id);
+            }
+        }
+        if ids.is_empty() && self.final_response().is_some() {
+            let finals = || {
+                self.answers
+                    .iter()
+                    .filter(|answer| !answer.is_pending(&self.expected))
+            };
+            // An unnamed answer (0) may have come on any identifier of the table.
+            let add_answer = |ids: &mut Vec<u32>, rx_id: u32| {
+                if rx_id == 0 {
+                    table.iter().for_each(|&id| add(ids, id));
+                } else {
+                    add(ids, rx_id);
+                }
+            };
+            for answer in finals().filter(|answer| {
+                answer
+                    .history
+                    .as_ref()
+                    .is_some_and(|history| !history.owners.is_empty())
+            }) {
+                add_answer(&mut ids, answer.rx_id);
+            }
+            if ids.is_empty() && self.open_pending_ids().is_empty() {
+                let first = finals().next().map_or(self.rx_id, |answer| answer.rx_id);
+                add_answer(&mut ids, first);
             }
         }
         ids
@@ -1463,7 +1558,6 @@ struct LinkEffect {
     key: MatchKey,
     sid: Option<u8>,
     expected: Expected,
-    rx_id: u32,
     sent: Sent,
     this_exchange: bool,
     /// The answer is a final response or a pending, not a response start alone
@@ -1475,6 +1569,8 @@ struct LinkEffect {
     /// The response identifiers whose last standing answer is a pending
     /// ([`Evidence::open_pending_ids`]): the exchange is owed on each.
     open_pending_ids: Vec<u32>,
+    /// The identifiers the exchange is owed on ([`Evidence::owed_ids`]).
+    owed_ids: Vec<u32>,
     positive: bool,
     /// The final response is one the agent cannot use.
     unusable: bool,
@@ -1604,7 +1700,7 @@ impl Kept {
         };
         let applies = match response_id {
             Some(id) => id == own,
-            None => self.evidence.open_pending_ids() == [own],
+            None => self.evidence.owed_ids() == [own],
         };
         applies.then_some(start)
     }
@@ -1807,16 +1903,22 @@ impl LinkState {
     /// request the exchange's answer could belong to is counted.
     pub(crate) fn history_for(&self, evidence: &Evidence) -> LinkHistory {
         let head = evidence.answer_head();
-        let owners: Vec<u64> = head
-            .as_deref()
-            .map(|answer| {
-                self.owed
-                    .iter()
-                    .filter(|owed| owed.rx_id == evidence.rx_id && owed.expected.matches(answer))
-                    .map(|owed| owed.seq)
-                    .collect()
-            })
-            .unwrap_or_default();
+        // A collecting exchange's answers are each looked up on their own (ADR-432): the
+        // identifier and the bytes of one answer, never one answer's identifier with another's
+        // bytes.
+        let owners: Vec<u64> = if evidence.collecting && !evidence.answers.is_empty() {
+            let mut owners: Vec<u64> = Vec::new();
+            for answer in &evidence.answers {
+                for owner in self.owners_of(&evidence.as_answer(answer)) {
+                    if !owners.contains(&owner) {
+                        owners.push(owner);
+                    }
+                }
+            }
+            owners
+        } else {
+            self.owners_of(evidence)
+        };
         LinkHistory {
             answered: self.answered,
             answered_since_error: self.answered_since_error,
@@ -1831,6 +1933,29 @@ impl LinkState {
             this_exchange: head.is_some() || evidence.response_started,
             owners,
         }
+    }
+
+    /// The owed requests the answer head of `evidence` could belong to, by `seq`: those owed on
+    /// the identifier it came on and expecting its bytes. An exchange with no identifier of its
+    /// own (0) on a link with a receive table, such as an unnamed answer, may have come on any
+    /// identifier of the table (ADR-432).
+    fn owners_of(&self, evidence: &Evidence) -> Vec<u64> {
+        let Some(head) = evidence.answer_head() else {
+            return Vec::new();
+        };
+        let unnamed = evidence.rx_id == 0 && !evidence.receive_ids.is_empty();
+        let mut owners: Vec<u64> = Vec::new();
+        for owed in &self.owed {
+            let on_id = if unnamed {
+                evidence.receive_ids.contains(&owed.rx_id)
+            } else {
+                owed.rx_id == evidence.rx_id
+            };
+            if on_id && owed.expected.matches(&head) && !owners.contains(&owed.seq) {
+                owners.push(owed.seq);
+            }
+        }
+        owners
     }
 
     /// The history of each answer of `evidence` as an exchange of its own (ADR-400): the one
@@ -2185,34 +2310,20 @@ impl LinkState {
         let placed_alone = entry.placed_alone();
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
         if let (true, false, Some(sid)) = (may_have_arrived, placed_alone, effect.sid) {
-            self.set_owed_rows(
-                entry.seq,
-                sid,
-                &effect.expected,
-                effect.rx_id,
-                &effect.open_pending_ids,
-            );
+            self.set_owed_rows(entry.seq, sid, &effect.expected, &effect.owed_ids);
         }
     }
 
-    /// Sets the rows exchange `seq` is owed on, replacing any it had: one for each response
-    /// identifier a pending is open on (ADR-429), else one on its link's identifier `rx_id`,
-    /// which a functional link does not name (it is 0).
-    fn set_owed_rows(
-        &mut self,
-        seq: u64,
-        sid: u8,
-        expected: &Expected,
-        rx_id: u32,
-        open_pending_ids: &[u32],
-    ) {
+    /// Sets the rows exchange `seq` is owed on, replacing any it had: one for each identifier in
+    /// `owed_ids` ([`Evidence::owed_ids`], ADR-429, ADR-432), once each.
+    fn set_owed_rows(&mut self, seq: u64, sid: u8, expected: &Expected, owed_ids: &[u32]) {
         self.owed.retain(|owed| owed.seq != seq);
-        let ids = if open_pending_ids.is_empty() {
-            vec![rx_id]
-        } else {
-            open_pending_ids.to_vec()
-        };
-        for rx_id in ids {
+        let mut done: Vec<u32> = Vec::new();
+        for &rx_id in owed_ids {
+            if done.contains(&rx_id) {
+                continue;
+            }
+            done.push(rx_id);
             self.owed.push(Owed {
                 seq,
                 rx_id,
@@ -2246,13 +2357,7 @@ impl LinkState {
         else {
             return;
         };
-        self.set_owed_rows(
-            seq,
-            sid,
-            &evidence.expected,
-            evidence.rx_id,
-            &evidence.open_pending_ids(),
-        );
+        self.set_owed_rows(seq, sid, &evidence.expected, &evidence.owed_ids());
         if let Some(kept) = self.kept.get_mut(&seq) {
             // A collecting exchange's placed pendings include the late ones already, in the
             // evidence's order (`Kept::all_pendings`); an ordinary exchange's are its entry's
@@ -3431,13 +3536,13 @@ impl ExchangeEntry {
             key: MatchKey::of(&evidence),
             sid,
             expected: evidence.expected.clone(),
-            rx_id: evidence.rx_id,
             sent,
             this_exchange: history.this_exchange,
             bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
             final_response: evidence.final_response().is_some() && !evidence.end_rejected,
             open_pending_ids: evidence.open_pending_ids(),
+            owed_ids: evidence.owed_ids(),
             positive: matches!(evidence.end, End::Positive(_)),
             unusable: matches!(evidence.end, End::PositiveUnusable(_)),
             suppressed: evidence.suppressed,

@@ -1,7 +1,7 @@
 # ADR-425: A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry
 
 **Date:** 2026-11-06
-**Status:** Accepted (Consequences' `late_item` gap closed by ADR-426; decision 5's lone-pending end amended by ADR-429)
+**Status:** Accepted (Consequences' `late_item` gap closed by ADR-426; decision 4's fold also restates a collecting exchange's `late_response`, ADR-429; decision 5's lone-pending end amended by ADR-429)
 **Affects:** `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`,
 `judge_windows`, `exchange` `Kept`, `standing_answers`); design 8.11 `primitive_ended`; ADR-386,
 ADR-396, ADR-400

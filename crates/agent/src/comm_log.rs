@@ -4434,13 +4434,22 @@ impl Inner {
         let Some(kept) = state.settle_owed(owner) else {
             return Some(());
         };
-        let answered = kept.answered(bytes);
-        let history = state.history_for(&answered);
-        let time = item.clock.zip(placed);
         let named = match &item.data {
             UnattachedData::Result { identifier, .. } => *identifier,
             _ => None,
         };
+        // The answer a collecting exchange restates it as, timed as the host times an answer
+        // it reads (ADR-425).
+        let late = exchange::LateAnswer {
+            rx_id: named,
+            vci_us: Some(u64::from(item.vci_us)),
+            clock: item.clock,
+            epoch: placed.map(|placed| placed.epoch),
+            agent_us: item.read.map_or(0, |read| read.monotonic_us),
+        };
+        let answered = kept.answered(bytes, &late);
+        let history = state.history_for(&answered);
+        let time = item.clock.zip(placed);
         // The identifiers it could have come on: the one it names, else those the exchange is
         // owed on (ADR-429, ADR-432). It is judged against each one's window.
         let ids: Vec<u32> = match &item.data {
@@ -4474,7 +4483,7 @@ impl Inner {
                 timing::LateWindow::Open
             };
         let (classification, reason) =
-            exchange::settle_late_response(&kept, &answered, window, &history, named);
+            exchange::settle_late_response(&kept, &answered, window, &history, named, bytes);
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
@@ -9602,6 +9611,38 @@ pub(crate) mod tests {
                     .contains("within the limit in force less the margin"),
                 "{functional} {late}"
             );
+        }
+    }
+
+    /// The same exchange with its final answer after the P2* the pending put in force: the VCI
+    /// ended its wait at the limit, which the settled lone pending no longer hides (row B).
+    #[test]
+    fn a_final_answer_after_the_window_of_a_lone_pending_is_the_vehicles() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                // The VCI ended its wait at the P2* the pending put in force.
+                evidence.times.vci.as_mut().unwrap().rx_timeout =
+                    Some(device_time(BASE_US + 5_200_000));
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            });
+            log.lock()
+                .late_response(0, seq, &late_final_item(), placed_after(9_000_000))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response").remove(0);
+            assert_eq!(
+                late["exchanges"][0]["classification"], "vehicle",
+                "{functional} {late}"
+            );
+            let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+            assert!(reason.contains("VCI had ended its wait"), "{reason}");
+            assert!(!reason.contains("pending"), "{reason}");
         }
     }
 

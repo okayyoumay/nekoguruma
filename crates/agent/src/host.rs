@@ -1220,8 +1220,8 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// deadline, else the agent's cancel when the worker carried it out. A primitive that had
     /// ended (its handle invalid) or that a lost VCI ended, with no end read, keeps its
     /// exchange's classification. What the log kept for the exchange is then released, since
-    /// nothing else settles it, unless it stays owed per an identifier a pending is open on
-    /// (ADR-429). Returns the results and errors read for it that no entry
+    /// nothing else settles it, unless it stays owed per an identifier a pending is open on, or
+    /// its end shows the VCI ended its wait (ADR-429, ADR-431). Returns the results and errors read for it that no entry
     /// carries (its end was not read), which go to the exchange in flight's unbound items of an
     /// earlier primitive: a link error among them goes to the stray's exchange once tagged with
     /// its `seq` (ADR-372).
@@ -1269,8 +1269,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                 items
             }
         };
-        // Not the kept record of a collecting exchange left owed per an open identifier: its
-        // ECU's final answer can still settle it (ADR-429).
+        // Not the kept record of an exchange left owed per an open identifier, or one whose end
+        // shows the VCI ended its wait: its ECU's final answer can still settle it (ADR-429,
+        // ADR-431).
         if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
             log.release_kept_ended(seq);
         }

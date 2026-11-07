@@ -1,7 +1,7 @@
 # ADR-429: A Collecting Exchange Ends With Its First Final Answer and Is Owed Once per Identifier With an Open Pending
 
 **Date:** 2026-11-07
-**Status:** Accepted
+**Status:** Accepted (item 3's renewal at `primitive_ended` and the release exception generalised to every exchange left owed by ADR-431)
 **Affects:** `agent` (`comm_log/exchange.rs` `collecting_end`, `Evidence::open_pending_ids`,
 `LinkEffect`, `LinkState::record`, the owner lookups; `comm_log.rs` `primitive_ended`,
 `late_item`; `host.rs`); design 8.11 "Owed request", `answers`; ADR-396 item 4, ADR-400,

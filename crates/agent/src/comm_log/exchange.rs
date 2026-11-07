@@ -2059,14 +2059,15 @@ impl LinkState {
     }
 
     /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
-    /// still owed per an identifier a pending is open on: its ECU's final answer can still settle
-    /// it (ADR-429).
+    /// still owed and either has an identifier a pending is open on or shows, in the evidence
+    /// its `primitive_ended` renewed, that the VCI ended its wait: its ECU's final answer can
+    /// still settle it (ADR-429, ADR-431). A cancel, a link error, a lost VCI or an unknown end
+    /// leaves `vci_ended` false, so those are released.
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
-            && self
-                .kept
-                .get(&seq)
-                .is_some_and(|kept| !kept.evidence.open_pending_ids().is_empty());
+            && self.kept.get(&seq).is_some_and(|kept| {
+                !kept.evidence.open_pending_ids().is_empty() || kept.evidence.vci_ended
+            });
         if !open {
             self.kept.remove(&seq);
         }
@@ -2214,10 +2215,11 @@ impl LinkState {
         }
     }
 
-    /// Exchange `seq`, a collecting exchange still owed after its primitive ended, has `evidence`
-    /// and the placed items of it now: it is owed on the identifiers a pending is open on in
-    /// them, and a late item is judged against them (ADR-429). Nothing for an exchange that is
-    /// not owed.
+    /// Exchange `seq`, still owed after its primitive ended (collecting or not, ADR-431), has
+    /// `evidence` and the placed items of it now: it is owed on the identifiers a pending is
+    /// open on in them, and a late item is judged against them (ADR-429). Its late pendings are
+    /// in the placed pendings already only for a collecting exchange. Nothing for an exchange
+    /// that is not owed.
     pub(crate) fn renew_owed(
         &mut self,
         seq: u64,
@@ -2245,8 +2247,11 @@ impl LinkState {
             &evidence.open_pending_ids(),
         );
         if let Some(kept) = self.kept.get_mut(&seq) {
-            // The late pendings are in `placed` already (`Kept::all_pendings`).
-            kept.late_pendings.clear();
+            // A collecting exchange's late pendings are in `placed` already
+            // (`Kept::all_pendings`).
+            if evidence.collecting {
+                kept.late_pendings.clear();
+            }
             kept.evidence = evidence.clone();
             (
                 kept.pendings,

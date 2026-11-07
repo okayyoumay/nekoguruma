@@ -3133,7 +3133,8 @@ impl CommLog {
     }
 
     /// [`CommLog::release_kept`] for the exchange whose `primitive_ended` was just written,
-    /// except one left owed per an open identifier (ADR-429).
+    /// except one left owed per an open identifier, or whose renewed evidence shows the VCI
+    /// ended its wait (ADR-429, ADR-431).
     pub(crate) fn release_kept_ended(&self, seq: u64) {
         let mut inner = self.lock();
         for (_, state) in &mut inner.links {
@@ -3693,10 +3694,11 @@ impl CommLog {
         let times = evidence.times.vci;
         let settled_evidence = evidence.clone();
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
-        if collecting && !final_response {
-            // Still owed: on the identifiers a pending is open on after what was read, and a
-            // late item is judged against the answers read after the deadline, with the send
-            // and the transmit they show (ADR-429).
+        if !final_response {
+            // Still owed, collecting or not: on the identifiers a pending is open on after what
+            // was read, and a late item is judged against the answers read after the deadline,
+            // with the send and the transmit they show, and whether the VCI ended (ADR-429,
+            // ADR-431).
             let state = &mut inner.links[at].1;
             state.renew_owed(
                 seq,
@@ -9877,6 +9879,240 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(&other).unwrap();
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A log whose one ordinary exchange, a read of F190 the agent's deadline ended
+    /// (`vci_did_not_end`, `vci_ended` false at its entry), is owed on the link's response
+    /// identifier (0 on a functional link, ADR-396); its transmit is at 10.5 ms on the device
+    /// clock. Returns the directory, setup, log and the exchange's `seq`.
+    fn ordinary_stray_on(functional: bool) -> (PathBuf, CommLogSetup, CommLog, u64) {
+        let (dir, setup, log) = collecting_log_on(functional);
+        let mut waited = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::VciDidNotEnd,
+        );
+        if functional {
+            waited.rx_id = 0;
+        }
+        waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.times.agent.before_us = 10_000;
+        // The agent gave up before the P2 ran out: its entry observed no fault of the system.
+        waited.times.agent.end_us = 600_000;
+        waited.times.vci = None;
+        let transmit = UnattachedItem {
+            vci_us: 10_500,
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 10_600,
+                wall_unix_ms: 0,
+            }),
+            ..tx_done(0x7E0)
+        };
+        let seq = log.exchange_with(waited, vec![transmit]).unwrap();
+        (dir, setup, log, seq)
+    }
+
+    /// The response of F190 that the VCI delivered `vci_us` on its clock, read at job end.
+    fn late_f190_response(functional: bool, vci_us: u32) -> UnattachedItem {
+        UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            owner: None,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: Some(read_at(u64::from(vci_us) + 100)),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(if functional { 0 } else { 0x7E8 }),
+                bytes: vec![0x62, 0xF1, 0x90, 0x41],
+            },
+        }
+    }
+
+    /// `primitive_ended` of the exchange `seq` of [`ordinary_stray_on`], as the host writes it
+    /// for the end `end`; the VCI's receive timeout is read when `end` is no response.
+    fn end_ordinary(log: &CommLog, seq: u64, end: Option<exchange::End>) {
+        let timed_out = matches!(end, Some(exchange::End::NoResponse));
+        let reads = if timed_out {
+            vec![end_read(500_000, EndItem::RxTimeout(dev(1_010_500)))]
+        } else {
+            Vec::new()
+        };
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end,
+                detail: exchange::Detail::default(),
+                vci_ended: timed_out,
+                reads,
+            },
+        )
+        .unwrap();
+    }
+
+    /// ADR-431, case table rows 1 and 2: an ordinary exchange whose entry had `vci_ended` false
+    /// and whose primitive the VCI's receive timeout ended is kept with renewed evidence
+    /// (`vci_ended` true) after the release that follows, so the response read at job end is its
+    /// `late_response`, not `unattached`. On a functional link too.
+    #[test]
+    fn an_ordinary_exchange_ended_by_the_vci_s_receive_timeout_owns_its_late_response() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = ordinary_stray_on(functional);
+            assert!(!kept_of(&log, seq).evidence.vci_ended, "{functional}");
+            end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+            assert!(kept_of(&log, seq).evidence.vci_ended, "{functional}");
+            log.release_kept_ended(seq);
+            assert!(log.lock().links[0].1.kept(seq).is_some(), "{functional}");
+            log.late_link_errors(vec![late_f190_response(functional, 600_000)])
+                .unwrap();
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// ADR-431, case table row 3: when the next exchange awaits the same response, the late
+    /// response is `unattached` with an unowned `late_response` naming the kept exchange.
+    #[test]
+    fn a_kept_ordinary_exchange_and_the_next_one_awaiting_the_same_response_share_it() {
+        let (dir, setup, log, seq) = ordinary_stray_on(false);
+        end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+        log.release_kept_ended(seq);
+        let mut next = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        next.vci_ended = true;
+        next.pending_visibility = exchange::PendingVisibility::Forwarded;
+        next.times.agent.before_us = JOB_END_US + 2_000_000;
+        next.times.agent.end_us = JOB_END_US + 3_000_000;
+        let transmit = UnattachedItem {
+            vci_us: u32::try_from(JOB_END_US).unwrap() + 2_000_000,
+            read: Some(read_at(2_000_100)),
+            ..tx_done(0x7E0)
+        };
+        log.exchange_with(
+            next,
+            vec![
+                transmit,
+                late_f190_response(false, u32::try_from(JOB_END_US).unwrap() + 2_500_000),
+            ],
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        let late = line_of(&lines, "late_response");
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+        assert_eq!(
+            late["unattached"],
+            line_of(&lines, "unattached")["seq"],
+            "{late}"
+        );
+    }
+
+    /// ADR-431, case table row 2: a next exchange that does not await the response leaves the
+    /// kept exchange its owner.
+    #[test]
+    fn a_next_exchange_that_does_not_await_the_response_leaves_the_kept_exchange_its_owner() {
+        let (dir, setup, log, seq) = ordinary_stray_on(false);
+        end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+        log.release_kept_ended(seq);
+        let mut next = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x91],
+            exchange::End::NoResponse,
+        );
+        next.vci_ended = true;
+        next.pending_visibility = exchange::PendingVisibility::Forwarded;
+        next.times.agent.before_us = JOB_END_US + 2_000_000;
+        next.times.agent.end_us = JOB_END_US + 3_000_000;
+        let transmit = UnattachedItem {
+            vci_us: u32::try_from(JOB_END_US).unwrap() + 2_000_000,
+            read: Some(read_at(2_000_100)),
+            ..tx_done(0x7E0)
+        };
+        log.exchange_with(next, vec![transmit, late_f190_response(false, 600_000)])
+            .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        let late = line_of(&lines, "late_response");
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-431, case table rows 6 to 8 (ADR-366 item 1): a primitive that ended by a link error
+    /// or the agent's cancel leaves `vci_ended` false, so its exchange is released and a later
+    /// response stays `unattached`.
+    #[test]
+    fn an_ordinary_exchange_ended_by_a_link_error_or_a_cancel_is_released() {
+        for functional in [false, true] {
+            for end in [
+                Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+                None,
+            ] {
+                let (dir, setup, log, seq) = ordinary_stray_on(functional);
+                end_ordinary(&log, seq, end.clone());
+                if end.is_some() {
+                    assert!(!kept_of(&log, seq).evidence.vci_ended, "{end:?}");
+                }
+                log.release_kept_ended(seq);
+                assert!(
+                    log.lock().links[0].1.kept(seq).is_none(),
+                    "{functional} {end:?}"
+                );
+                log.late_link_errors(vec![late_f190_response(functional, 600_000)])
+                    .unwrap();
+                let lines = finished(&log, &setup, &dir);
+                assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+                assert!(of_event(&lines, "late_response").is_empty(), "{lines:#?}");
+            }
+        }
+    }
+
+    /// ADR-431: the renewed evidence shows the timeout at the limit, so a response past the
+    /// limit is judged as one the VCI's wait ended before ("The VCI had ended its wait at the
+    /// limit"). The `system` the `primitive_ended` entry gave stands (design 8.11 "Settlement").
+    #[test]
+    fn a_late_response_of_a_renewed_ordinary_exchange_past_the_limit_is_judged_on_the_timeout() {
+        let (dir, setup, log, seq) = ordinary_stray_on(false);
+        end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+        log.release_kept_ended(seq);
+        log.late_link_errors(vec![late_f190_response(false, 2_000_000)])
+            .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        let late = line_of(&lines, "late_response");
+        assert_eq!(late["classification"], "system", "{late}");
+        let text = late["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            text.contains("The VCI had ended its wait at the limit."),
+            "{late}"
+        );
+    }
+
+    /// ADR-431: renewing a non-collecting exchange does not count a late pending twice.
+    #[test]
+    fn a_renewed_ordinary_exchange_counts_its_late_pendings_once() {
+        let (dir, _setup, log, seq) = ordinary_stray_on(false);
+        late_pending_judged(&log, seq, 300_000);
+        assert_eq!(kept_of(&log, seq).late_pendings.len(), 1);
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: vec![
+                    end_read(400_000, EndItem::Pending(pending_on(200_000), None)),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                ],
+            },
+        )
+        .unwrap();
+        let kept = kept_of(&log, seq);
+        assert_eq!(kept.all_pendings().len(), kept.evidence.pending.len());
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// ADR-429: an exchange with no transmit done that a pending read after the deadline

@@ -1268,6 +1268,13 @@ the same override reason as their named-bit counterparts above, and
 `SUPPRESS_POS_RESP`/`ENABLE_EXTRA_INFO` (D.2.1 byte 0) have no J2534
 `TxFlags` equivalent (ADR-116).
 
+`iso22900-service` always sets `ENABLE_EXTRA_INFO` on a `StartComPrimitive`,
+whichever representation (or none) the client sends, keeps every other bit,
+and passes at least four flag bytes (zero-padded; a longer raw flag keeps its
+length). A client therefore need not request it; the library then gives each
+result item `extra_info` bytes, which the agent reads as the identifier the
+answer came on (ADR-428).
+
 ---
 
 ### Status and Events

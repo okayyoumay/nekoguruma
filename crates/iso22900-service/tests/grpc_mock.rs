@@ -1693,6 +1693,90 @@ async fn com_primitives_are_answered_by_the_simulated_ecu() {
         .expect("the worker shuts down while a response is due");
 }
 
+/// The worker sets ENABLE_EXTRA_INFO on every ComPrimitive (ADR-428), so a result item of the
+/// simulated ECU carries the response identifier of the unique response table as a four-byte
+/// header, with no footer, and its data bytes hold the response alone. The request below sets no
+/// TxFlag at all.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[serial]
+async fn a_result_item_carries_the_table_response_id_as_its_header() {
+    let server = TestServer::start().await;
+    let lib_path = iso22900_mock::mock_library_path().expect("mock cdylib should be discoverable");
+    let backdoor = MockBackdoor::open(&lib_path);
+    sim_ecu_control(&backdoor, r#"{"attach":{}}"#);
+    let _attached = AttachedEcu(&backdoor);
+
+    let mut setup_client = server.client().await;
+    let cll_handle = create_default_cll(&mut setup_client).await;
+    setup_client
+        .set_unique_resp_id_table(SetUniqueRespIdTableRequest {
+            cll_handle: Some(cll_handle),
+            unique_resp_id_table: Some(vci_service_interface::UniqueRespIdTableItem {
+                unique_data: vec![vci_service_interface::EcuUniqueRespData {
+                    unique_resp_identifier: 1,
+                    params: vec![ParamItem {
+                        id: Some(param_item::Id::ParamId(3217)),
+                        com_param_class: PduParamClass::PduPcUniqueId as i32,
+                        param_data: Some(param_item::ParamData::Unum32(0x7E8)),
+                    }],
+                }],
+            }),
+        })
+        .await
+        .expect("set_unique_resp_id_table should succeed");
+    // The table is a working buffer; the connect makes it active (8.4.28.1, 8.4.15.6).
+    setup_client
+        .connect_com_logical_link(ConnectComLogicalLinkRequest {
+            cll_handle: Some(cll_handle),
+        })
+        .await
+        .expect("connect_com_logical_link should succeed");
+    let mut stream_client = server.client().await;
+    let mut stream = stream_client
+        .subscribe_event(SubscribeEventRequest {
+            handle: Some(
+                vci_service_interface::subscribe_event_request::Handle::CllHandle(cll_handle),
+            ),
+        })
+        .await
+        .expect("subscribe_event should succeed")
+        .into_inner();
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    let mut client = server.client().await;
+
+    start_send_and_receive(&mut client, cll_handle, &[0x22, 0xF1, 0x90], 1).await;
+    let mut result = None;
+    loop {
+        let notification = timeout(Duration::from_secs(5), stream.message())
+            .await
+            .expect("timed out waiting for an event")
+            .expect("stream should remain open")
+            .expect("an event should be present");
+        let Some(vci_service_interface::event_notification::EventData::Item(item)) =
+            notification.event_data
+        else {
+            panic!("expected an event item");
+        };
+        match item.data.expect("event data") {
+            event_item::Data::ResultData(data) => result = Some(data),
+            event_item::Data::CopStatus(status) if status == FINISHED => break,
+            _ => {}
+        }
+    }
+    let result = result.expect("the ECU's response arrives as a result item");
+    let extra = result.extra_info.expect("the result item has extra info");
+    assert_eq!(extra.header_bytes, [0x00, 0x00, 0x07, 0xE8]);
+    assert!(extra.footer_bytes.is_empty());
+    // The header is not part of the data.
+    assert_eq!(&result.data_bytes[..3], [0x62, 0xF1, 0x90]);
+
+    drop(stream);
+    drop(stream_client);
+    drop(client);
+    drop(setup_client);
+    server.shutdown().await;
+}
+
 /// A ComPrimitive that waits behind another reaches the ECU only when it begins, so the ECU's
 /// timers run from then (ADR-299). The session request below waits 1 s behind the VIN read;
 /// had it reached the ECU at once, its 600 ms session timeout would have run out before its own

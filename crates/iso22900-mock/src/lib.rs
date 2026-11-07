@@ -90,6 +90,12 @@ fn clock_at(instant: Instant) -> UNUM32 {
     instant.saturating_duration_since(epoch).as_micros() as UNUM32
 }
 
+/// ComParam id of `CP_CanRespUSDTId` (the table above).
+const CP_CAN_RESP_USDT_ID: UNUM32 = 3217;
+
+/// ENABLE_EXTRA_INFO in a ComPrimitive TxFlag: byte 0, bit 5 (ISO 22900-2 (2022) D.2.1 Table D.4).
+const TX_FLAG_ENABLE_EXTRA_INFO: UNUM8 = 0x20;
+
 /// `TimestampFlags` bits of a result item: the transmit-done time and the start-of-message time
 /// are valid (ISO 22900-2 (2022) D.2.4: byte 0, bits 7 and 6; the default flag width is 4 bytes).
 const TIMESTAMP_FLAG_TX_DONE: UNUM8 = 0x80;
@@ -142,8 +148,11 @@ struct PendingEvent {
     /// transmit done and the start of message. Set on a response of the attached ECU, unless
     /// [`SimEcuCommand::ResponseTimestamps`] switched it off.
     times_valid: bool,
-    /// For an indication item the mock queues unbound ([`SimEcuCommand::IndicationBinding`]): the
-    /// CAN identifier its `pExtraInfo` header carries. Such an item has `hCop` undefined.
+    /// The CAN identifier the item's `pExtraInfo` header carries, big-endian. Two sources
+    /// (ADR-428): an indication item the mock queues unbound ([`SimEcuCommand::IndicationBinding`]),
+    /// which has `hCop` undefined, takes it from that control; a result item of the attached ECU
+    /// takes the response identifier of the unique response table, when its ComPrimitive set
+    /// ENABLE_EXTRA_INFO and the table gave one ([`MockState::table_active`], as it was when the ComPrimitive started).
     identifier: Option<u32>,
     kind: EventKind,
     /// The link state change that takes effect when this item is delivered, set on the last
@@ -596,6 +605,15 @@ struct MockState {
     /// Set by [`SimEcuCommand::IndicationBinding`]: the indication items are unbound, with these
     /// request and response identifiers. `None`: bound to the ComPrimitive.
     unbound_indications: Option<UnboundIds>,
+    /// The `CP_CanRespUSDTId` value of the entry with `UniqueRespIdentifier` 1 in the table
+    /// `PDUSetUniqueRespIdTable` last set (the mock's ECU always answers as unique 1): the
+    /// response identifier the result items of a ComPrimitive that set ENABLE_EXTRA_INFO carry
+    /// in their header (ADR-428). `None` until a table gave one. Reset with the link.
+    table_active: Option<u32>,
+    /// The id the last `PDUSetUniqueRespIdTable` gave: the working buffer, which `PDUConnect` and
+    /// the start of an UPDATEPARAM copy to `table_active` like the other ComParams (ISO 22900-2
+    /// (2022) 8.4.28.1, 8.4.15.6). A ComPrimitive keeps the active id from when it was started.
+    table_working: Option<u32>,
     /// When the next tester-present is due; `None` while the tester-present is off, that is,
     /// unless the link is COMM_STARTED with the active handling on.
     tp_due: Option<Instant>,
@@ -611,6 +629,8 @@ impl MockState {
         self.rc78_active = Rc78::default();
         self.ind_working = Indications::default();
         self.ind_active = Indications::default();
+        self.table_working = None;
+        self.table_active = None;
     }
 
     /// The link is ONLINE with no tester-present. A ComPrimitive still waiting or running keeps
@@ -798,6 +818,38 @@ unsafe fn make_param_item(param_id: UNUM32, value: u32, class: E_PDU_PC) -> *mut
     }))
 }
 
+/// The `CP_CanRespUSDTId` (ComParam 3217) `PDU_PT_UNUM32` value of the entry with
+/// `UniqueRespIdentifier` 1 in `table`, if there is one.
+///
+/// # Safety
+/// `table` is null or a table whose entries and ComParam items are valid, as the caller of
+/// `PDUSetUniqueRespIdTable` guarantees.
+unsafe fn table_response_id(table: *const PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> Option<u32> {
+    let table = unsafe { table.as_ref()? };
+    if table.pUniqueData.is_null() {
+        return None;
+    }
+    let entries =
+        unsafe { std::slice::from_raw_parts(table.pUniqueData, table.NumEntries as usize) };
+    let entry = entries
+        .iter()
+        .find(|entry| entry.UniqueRespIdentifier == 1)?;
+    if entry.pParams.is_null() {
+        return None;
+    }
+    let params = unsafe { std::slice::from_raw_parts(entry.pParams, entry.NumParamItems as usize) };
+    params
+        .iter()
+        .find(|param| {
+            param.ComParamId == CP_CAN_RESP_USDT_ID
+                && param.ComParamDataType == E_PDU_PT::PDU_PT_UNUM32
+                && !param.pComParamData.is_null()
+        })
+        .map(|param| unsafe { param.pComParamData.cast::<UNUM32>().read_unaligned() })
+        // All ones is the value for "not used".
+        .filter(|&id| id != u32::MAX)
+}
+
 /// A flag field with no bytes.
 fn no_flags() -> PDU_FLAG_DATA {
     PDU_FLAG_DATA {
@@ -855,7 +907,7 @@ unsafe fn make_event_item(event: PendingEvent) -> *mut PDU_EVENT_ITEM {
                 } else {
                     0
                 },
-                pExtraInfo: ptr::null_mut(),
+                pExtraInfo: event.identifier.map_or(ptr::null_mut(), extra_info),
                 NumDataBytes: num_data_bytes,
                 pDataBytes: data_bytes,
             });
@@ -962,6 +1014,11 @@ struct WaitingCop {
     indications: Indications,
     /// The indication binding in force when it was started.
     unbound: Option<UnboundIds>,
+    /// Whether its control set ENABLE_EXTRA_INFO in the TxFlag (ISO 22900-2 (2022) D.2.1): its
+    /// result items then carry the table's response identifier as a header (ADR-428).
+    extra_info: bool,
+    /// The table's response identifier in force when it was started (`table_active`).
+    table_id: Option<u32>,
     /// The state change its last item makes when delivered.
     hook: Option<Hook>,
 }
@@ -977,6 +1034,7 @@ fn begin_next(state: &mut MockState, now: Instant) {
     let hook = cop.hook;
     let no_response_times = state.no_response_times;
     let unbound = cop.unbound;
+    let header_id = if cop.extra_info { cop.table_id } else { None };
     let mut events = match (state.ecu.as_mut(), cop.request) {
         (Some(ecu), Some((request, cycles))) => {
             let sent = clock_at(now);
@@ -996,6 +1054,7 @@ fn begin_next(state: &mut MockState, now: Instant) {
                     EventKind::Result(_) => {
                         event.tx_done = Some(sent);
                         event.times_valid = !no_response_times;
+                        event.identifier = header_id;
                     }
                     EventKind::Indication(Indication::Start) => event.tx_done = Some(sent),
                     _ => {}
@@ -1284,6 +1343,18 @@ enum Cycles {
     SendReceive,
 }
 
+/// Whether the control's TxFlag sets ENABLE_EXTRA_INFO: byte 0, bit 5 (D.2.1 Table D.4). Reads
+/// the flag only when it has a byte to read.
+fn requests_extra_info(control: Option<&PDU_COP_CTRL_DATA>) -> bool {
+    let Some(control) = control else {
+        return false;
+    };
+    let flag = control.TxFlag;
+    flag.NumFlagBytes >= 1
+        && !flag.pFlagData.is_null()
+        && unsafe { *flag.pFlagData } & TX_FLAG_ENABLE_EXTRA_INFO != 0
+}
+
 /// `PDU_COP_CTRL_DATA`'s send and receive cycles (ISO 22900-2 (2022) 8.2.6.2). Without control
 /// data the mock sends once and receives once.
 fn cycles(control: Option<&PDU_COP_CTRL_DATA>) -> Cycles {
@@ -1569,8 +1640,8 @@ pub enum SimEcuCommand {
     /// bytes are the big-endian CAN identifier, `request_id` for a transmit indication and
     /// `response_id` for a start-of-message one. A D-PDU library attaches extra info only to the
     /// items of a ComPrimitive that set ENABLE_EXTRA_INFO (ISO 22900-2 (2022) 10.1.4.11.4, D.2.1),
-    /// so this header comes from the control, not from a library. The mock knows no identifiers
-    /// (ADR-299), so both are required with `bound` false (the command fails without them) and
+    /// so this header comes from the control, not from a library (the result items of a bound
+    /// ECU response take theirs from the unique response table instead, ADR-428). Both are required with `bound` false (the command fails without them) and
     /// ignored with `bound` true. The ECU's own tester-present then raises an unbound transmit
     /// indication with `request_id` when `CP_TransmitIndEnable` is active and
     /// `CP_TesterPresentAddrMode` is 0. A ComPrimitive takes the binding when it is started, like
@@ -1898,6 +1969,7 @@ exported_fn!(PDUConnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     guard.counters.connect += 1;
     guard.rc78_active = guard.rc78_working;
     guard.ind_active = guard.ind_working;
+    guard.table_active = guard.table_working;
     drop(guard);
     no_error()
 });
@@ -2061,6 +2133,7 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         if cop_type == E_PDU_COPT::PDU_COPT_UPDATEPARAM {
             guard.rc78_active = guard.rc78_working;
             guard.ind_active = guard.ind_working;
+            guard.table_active = guard.table_working;
         }
         let busy = !guard.waiting.is_empty() || !guard.scheduled.is_empty();
         let immediate = if guard.ecu.is_some() || busy {
@@ -2072,12 +2145,16 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             let rc78 = guard.rc78_active;
             let indications = guard.ind_active;
             let unbound = guard.unbound_indications;
+            let extra_info = requests_extra_info(control);
+            let table_id = guard.table_active;
             guard.waiting.push_back(WaitingCop {
                 event,
                 request,
                 rc78,
                 indications,
                 unbound,
+                extra_info,
+                table_id,
                 hook,
             });
             // On an idle link it begins at once, as it would without the delivery thread.
@@ -2385,7 +2462,15 @@ exported_fn!(PDUGetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, p_unique_re
     unsafe { set_out_ptr(p_unique_resp_id_table, make_unique_resp_table_item()) }
 });
 
-exported_fn!(PDUSetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, _p_unique_resp_id_table: *mut PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> T_PDU_ERROR {
+exported_fn!(PDUSetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, p_unique_resp_id_table: *mut PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> T_PDU_ERROR {
+    // The mock keeps only the response identifier of the entry its ECU answers as (ADR-428).
+    if p_unique_resp_id_table.is_null() {
+        // 8.4.28.2: no table is a parameter error. The wrapper always passes a table struct,
+        // with a null entry array when it is empty, which this accepts.
+        return invalid_parameters();
+    }
+    let id = unsafe { table_response_id(p_unique_resp_id_table) };
+    state().lock().expect("mock state poisoned").table_working = id;
     no_error()
 });
 
@@ -4279,6 +4364,485 @@ mod tester_present_tests {
                 assert!(started.elapsed() < Duration::from_secs(5), "no completion");
                 std::thread::sleep(Duration::from_millis(2));
             }
+        }
+    }
+
+    /// The extra info of a result item: the unique response table's response identifier as a
+    /// header when the ComPrimitive set ENABLE_EXTRA_INFO (ADR-428; ISO 22900-2 (2022)
+    /// 10.1.4.11.4, D.2.1).
+    mod extra_info {
+        use super::*;
+
+        const SESSION: &[u8] = &[0x10, 0x03];
+        /// A response of several frames, which raises a start-of-message indication.
+        const VIN_READ: &[u8] = &[0x22, 0xF1, 0x90];
+        const UNBOUND: &str =
+            r#"{"indication_binding":{"bound":false,"request_id":2016,"response_id":2024}}"#;
+
+        /// Sets a table with the entry for unique 1 (answering on `id`, when given) and another
+        /// entry for unique 2 (answering on 0x123).
+        fn set_table(id: Option<u32>) {
+            let mut one = id.unwrap_or(0);
+            let mut two = 0x123u32;
+            let param = |value: &mut u32| PDU_PARAM_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_PARAM,
+                ComParamId: CP_CAN_RESP_USDT_ID,
+                ComParamDataType: E_PDU_PT::PDU_PT_UNUM32,
+                ComParamClass: E_PDU_PC::PDU_PC_COM,
+                pComParamData: (value as *mut u32).cast(),
+            };
+            let mut params_one = vec![param(&mut one)];
+            let mut params_two = vec![param(&mut two)];
+            let mut entries = vec![
+                PDU_ECU_UNIQUE_RESP_DATA {
+                    UniqueRespIdentifier: 2,
+                    NumParamItems: 1,
+                    pParams: params_two.as_mut_ptr(),
+                },
+                PDU_ECU_UNIQUE_RESP_DATA {
+                    UniqueRespIdentifier: 1,
+                    NumParamItems: if id.is_some() { 1 } else { 0 },
+                    pParams: params_one.as_mut_ptr(),
+                },
+            ];
+            let mut table = PDU_UNIQUE_RESP_ID_TABLE_ITEM {
+                ItemType: E_PDU_IT::PDU_IT_UNIQUE_RESP_ID_TABLE,
+                NumEntries: entries.len() as UNUM32,
+                pUniqueData: entries.as_mut_ptr(),
+            };
+            let status = unsafe {
+                PDUSetUniqueRespIdTable(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE, &mut table)
+            };
+            assert_eq!(status, no_error());
+        }
+
+        /// Runs `request` as a send-receive with the TxFlag `flag` (none: an empty flag field),
+        /// after activating the ComParams, and returns the events up to the end.
+        fn run(rig: &Rig, request: &[u8], flag: Option<&[u8]>) -> Vec<PendingEvent> {
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            let mut bytes = flag.unwrap_or(&[]).to_vec();
+            let mut control = PDU_COP_CTRL_DATA {
+                Time: 0,
+                NumSendCycles: 1,
+                NumReceiveCycles: 1,
+                TempParamUpdate: 0,
+                TxFlag: PDU_FLAG_DATA {
+                    NumFlagBytes: bytes.len() as UNUM32,
+                    pFlagData: if bytes.is_empty() {
+                        ptr::null_mut()
+                    } else {
+                        bytes.as_mut_ptr()
+                    },
+                },
+                NumPossibleExpectedResponses: 0,
+                pExpectedResponseArray: ptr::null_mut(),
+            };
+            let mut data = request.to_vec();
+            let mut handle = 0;
+            unsafe {
+                PDUStartComPrimitive(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    E_PDU_COPT::PDU_COPT_SENDRECV,
+                    data.len() as UNUM32,
+                    data.as_mut_ptr(),
+                    &mut control,
+                    ptr::null_mut(),
+                    &mut handle,
+                );
+            }
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+                taken.extend(
+                    queued
+                        .into_iter()
+                        .filter(|event| event.h_cop == handle || event.identifier.is_some()),
+                );
+                if taken.iter().any(|event| {
+                    matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                }) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// The header, whether there is a footer, and the data bytes of an event as the item
+        /// the library hands out; frees the item (the data, flags, header once each).
+        fn item_of(event: &PendingEvent) -> (Option<Vec<u8>>, bool, Vec<u8>) {
+            let item = unsafe { make_event_item(event.clone()) };
+            unsafe {
+                let data = &*(*item).pData.cast::<PDU_RESULT_DATA>();
+                let extra = data.pExtraInfo.as_ref().map(|extra| {
+                    assert_eq!(extra.NumHeaderBytes, 4);
+                    std::slice::from_raw_parts(extra.pHeaderBytes, 4).to_vec()
+                });
+                let footer = data.pExtraInfo.as_ref().is_some_and(|extra| {
+                    extra.NumFooterBytes != 0 || !extra.pFooterBytes.is_null()
+                });
+                let bytes = if data.pDataBytes.is_null() {
+                    Vec::new()
+                } else {
+                    std::slice::from_raw_parts(data.pDataBytes, data.NumDataBytes as usize).to_vec()
+                };
+                assert_eq!(PDUDestroyItem(item.cast()), no_error());
+                (extra, footer, bytes)
+            }
+        }
+
+        /// Starts `request` as a send-receive with `control` (null: none) and returns its handle.
+        fn start_with(request: &[u8], control: *mut PDU_COP_CTRL_DATA) -> UNUM32 {
+            let mut data = request.to_vec();
+            let mut handle = 0;
+            unsafe {
+                PDUStartComPrimitive(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    E_PDU_COPT::PDU_COPT_SENDRECV,
+                    data.len() as UNUM32,
+                    data.as_mut_ptr(),
+                    control,
+                    ptr::null_mut(),
+                    &mut handle,
+                );
+            }
+            handle
+        }
+
+        /// A control for one send and one receive with the TxFlag `flag` of `count` bytes.
+        fn control_with(flag: &mut [u8], count: UNUM32) -> PDU_COP_CTRL_DATA {
+            PDU_COP_CTRL_DATA {
+                Time: 0,
+                NumSendCycles: 1,
+                NumReceiveCycles: 1,
+                TempParamUpdate: 0,
+                TxFlag: PDU_FLAG_DATA {
+                    NumFlagBytes: count,
+                    pFlagData: flag.as_mut_ptr(),
+                },
+                NumPossibleExpectedResponses: 0,
+                pExpectedResponseArray: ptr::null_mut(),
+            }
+        }
+
+        /// The events of `handle` up to its end (a FINISHED status).
+        fn until_finished(handle: UNUM32) -> Vec<PendingEvent> {
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+                taken.extend(queued.into_iter().filter(|event| event.h_cop == handle));
+                if taken.iter().any(|event| {
+                    matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                }) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Every event queued, until `done` holds for what has been taken so far.
+        fn collect(done: impl Fn(&[PendingEvent]) -> bool) -> Vec<PendingEvent> {
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                taken.extend(std::mem::take(&mut state().lock().unwrap().pending_events));
+                if done(&taken) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "not done");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn finished(events: &[PendingEvent], handle: UNUM32) -> bool {
+            events.iter().any(|event| {
+                event.h_cop == handle
+                    && matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+            })
+        }
+
+        fn update_param(rig: &Rig) {
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+        }
+
+        fn results(events: &[PendingEvent]) -> Vec<&PendingEvent> {
+            events
+                .iter()
+                .filter(|event| matches!(event.kind, EventKind::Result(_)))
+                .collect()
+        }
+
+        const FLAG_SET: &[u8] = &[0x20, 0, 0, 0];
+
+        #[test]
+        fn the_table_response_id_is_a_working_buffer_active_at_connect_and_cleared_with_the_link() {
+            let rig = Rig::new();
+            assert_eq!(state().lock().unwrap().table_active, None);
+            set_table(Some(0x7E8));
+            assert_eq!(state().lock().unwrap().table_working, Some(0x7E8));
+            assert_eq!(state().lock().unwrap().table_active, None);
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E8));
+            // A later table is active at the next UPDATEPARAM.
+            set_table(None);
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E8));
+            update_param(&rig);
+            assert_eq!(state().lock().unwrap().table_active, None);
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            unsafe { PDUDestroyComLogicalLink(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            assert_eq!(state().lock().unwrap().table_active, None);
+            assert_eq!(state().lock().unwrap().table_working, None);
+        }
+
+        #[test]
+        fn a_table_set_after_connect_without_an_updateparam_keeps_the_connect_time_id() {
+            let rig = Rig::new();
+            // Nothing active at connect: no header, though the working buffer has an id.
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            set_table(Some(0x7E8));
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(item_of(results(&until_finished(handle))[0]).0, None);
+            // An id active at connect stays until the next UPDATEPARAM.
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            set_table(Some(0x7E9));
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(
+                item_of(results(&until_finished(handle))[0]).0,
+                Some(vec![0, 0, 0x07, 0xE8])
+            );
+            drop(rig);
+        }
+
+        #[test]
+        fn a_primitive_keeps_the_id_active_when_it_started() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":200}},"request":[16,3]}}"#);
+            let first = start_with(SESSION, &mut control);
+            let second = start_with(&[0x22, 0xF1, 0x90], &mut control);
+            // Both are started: a table change that is active from now on leaves them alone.
+            set_table(Some(0x7E9));
+            let _update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E9));
+            let events = collect(|e| finished(e, first) && finished(e, second));
+            let of = |handle: UNUM32| -> Vec<PendingEvent> {
+                events
+                    .iter()
+                    .filter(|e| e.h_cop == handle)
+                    .cloned()
+                    .collect()
+            };
+            for handle in [first, second] {
+                for event in results(&of(handle)) {
+                    assert_eq!(item_of(event).0, Some(vec![0, 0, 0x07, 0xE8]));
+                }
+            }
+            // A primitive started now takes the new id.
+            let third = start_with(SESSION, &mut control);
+            let events = collect(|e| finished(e, third));
+            let third_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.h_cop == third)
+                .cloned()
+                .collect();
+            assert_eq!(
+                item_of(results(&third_events)[0]).0,
+                Some(vec![0, 0, 0x07, 0xE9])
+            );
+        }
+
+        #[test]
+        fn a_table_id_of_all_ones_means_not_used_and_no_table_is_refused() {
+            let rig = Rig::new();
+            set_table(Some(u32::MAX));
+            assert_eq!(state().lock().unwrap().table_working, None);
+            let status = unsafe {
+                PDUSetUniqueRespIdTable(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, invalid_parameters());
+            drop(rig);
+        }
+
+        #[test]
+        fn the_flag_and_the_table_give_the_result_a_four_byte_header_and_no_footer() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            let results = results(&events);
+            assert_eq!(results.len(), 1);
+            let (header, footer, data) = item_of(results[0]);
+            assert_eq!(header, Some(vec![0, 0, 0x07, 0xE8]));
+            assert!(!footer);
+            // The data is the response, with no header in it.
+            assert_eq!(data[0], 0x50);
+            assert_eq!(data.len(), 6);
+        }
+
+        #[test]
+        fn the_flag_bit_alone_in_a_longer_or_other_flag_is_enough() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            let events = run(&rig, SESSION, Some(&[0x60, 0xFF, 0, 0, 0, 0]));
+            let (header, ..) = item_of(results(&events)[0]);
+            assert_eq!(header, Some(vec![0, 0, 0x07, 0xE8]));
+        }
+
+        #[test]
+        fn a_response_pending_item_carries_the_header_too() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":10}},"request":[16,3]}}"#);
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            let results = results(&events);
+            assert_eq!(results.len(), 2);
+            for result in results {
+                assert_eq!(item_of(result).0, Some(vec![0, 0, 0x07, 0xE8]));
+            }
+        }
+
+        #[test]
+        fn without_the_flag_or_a_readable_flag_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            for flag in [
+                None,
+                Some(&[0u8, 0, 0, 0][..]),
+                Some(&[0x40, 0, 0, 0][..]),
+                Some(&[0xDF, 0xFF, 0xFF, 0xFF][..]),
+            ] {
+                let events = run(&rig, SESSION, flag);
+                assert_eq!(item_of(results(&events)[0]).0, None, "{flag:?}");
+            }
+        }
+
+        #[test]
+        fn a_null_control_gives_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let handle = start_with(SESSION, ptr::null_mut());
+            let events = until_finished(handle);
+            assert_eq!(item_of(results(&events)[0]).0, None);
+            assert!(!requests_extra_info(None));
+        }
+
+        #[test]
+        fn a_flag_with_no_bytes_but_a_pointer_gives_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 0);
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(item_of(results(&until_finished(handle))[0]).0, None);
+        }
+
+        #[test]
+        fn the_flag_without_a_table_response_id_gives_no_header() {
+            let rig = Rig::new();
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            assert_eq!(item_of(results(&events)[0]).0, None);
+            // A table whose entry for unique 1 has no CP_CanRespUSDTId likewise.
+            set_table(None);
+            let events = run(&rig, SESSION, Some(FLAG_SET));
+            assert_eq!(item_of(results(&events)[0]).0, None);
+        }
+
+        #[test]
+        fn the_synthetic_completion_has_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            let completion_of = |events: &[PendingEvent], handle: UNUM32| -> Option<PendingEvent> {
+                events
+                    .iter()
+                    .find(|e| e.h_cop == handle && matches!(e.kind, EventKind::Result(_)))
+                    .cloned()
+            };
+            // No ECU at the start: the completion is queued at once.
+            rig.ecu(r#"{"detach":{}}"#);
+            let handle = start_with(&[], &mut control);
+            let events = collect(|e| completion_of(e, handle).is_some());
+            assert_eq!(item_of(&completion_of(&events, handle).unwrap()).0, None);
+
+            // Queued behind a running primitive while attached, the ECU gone when it begins:
+            // the completion comes from `begin_next`'s fallback.
+            rig.ecu(r#"{"attach":{}}"#);
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":300}},"request":[16,3]}}"#);
+            let first = start_with(SESSION, &mut control);
+            let second = start_with(&[0x22, 0xF1, 0x90], &mut control);
+            rig.ecu(r#"{"detach":{}}"#);
+            let events = collect(|e| finished(e, first) && completion_of(e, second).is_some());
+            let completion = completion_of(&events, second).unwrap();
+            assert_eq!(item_of(&completion).0, None);
+        }
+
+        #[test]
+        fn bound_indications_have_no_header_but_the_response_has() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.set_number("CP_StartMsgIndEnable", 1);
+            let events = run(&rig, VIN_READ, Some(FLAG_SET));
+            let mut indications = 0;
+            for event in &events {
+                match event.kind {
+                    EventKind::Indication(_) => {
+                        indications += 1;
+                        assert_eq!(item_of(event).0, None);
+                    }
+                    EventKind::Result(_) => {
+                        assert_eq!(item_of(event).0, Some(vec![0, 0, 0x07, 0xE8]));
+                    }
+                    _ => {}
+                }
+            }
+            assert_eq!(indications, 2);
+        }
+
+        #[test]
+        fn unbound_indications_keep_the_control_and_the_response_takes_the_table() {
+            let rig = Rig::new();
+            // A table identifier unlike the control's, to tell the sources apart.
+            set_table(Some(0x7E9));
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.set_number("CP_StartMsgIndEnable", 1);
+            rig.ecu(UNBOUND);
+            let events = run(&rig, VIN_READ, Some(FLAG_SET));
+            let headers: Vec<_> = events
+                .iter()
+                .filter(|event| {
+                    matches!(event.kind, EventKind::Indication(_) | EventKind::Result(_))
+                })
+                .map(|event| item_of(event).0)
+                .collect();
+            assert_eq!(
+                headers,
+                [
+                    Some(vec![0, 0, 0x07, 0xE0]),
+                    Some(vec![0, 0, 0x07, 0xE8]),
+                    Some(vec![0, 0, 0x07, 0xE9]),
+                ]
+            );
         }
     }
 

@@ -1,7 +1,7 @@
 # ADR-427: The D-PDU Mock Can Queue Its Indications Unbound
 
 **Date:** 2026-11-07
-**Status:** Accepted
+**Status:** Accepted (Consequences on the agent's D-PDU link settled by ADR-428)
 **Affects:** `crates/iso22900-mock` (`SimEcuCommand::IndicationBinding`, `ecu_events`,
 `send_tester_present`, `make_event_item`, `PDUDestroyItem`), `crates/iso22900-mock/docs/testing-guide.md`,
 `crates/iso22900-service/tests/t2_indication_unbound.rs`, `crates/ngr-hw-checks` guarded handle
@@ -77,4 +77,4 @@ the handle's identifier check does not match.
   takes an unbound transmit done only when the API sends no tester present on that identifier,
   and the agent's tests through the mock use the default, bound mode.
 - The agent's D-PDU link sends no TxFlag, so on a real library its response items carry no
-  header; that is a separate item.
+  header; settled by ADR-428: the D-PDU worker sets ENABLE_EXTRA_INFO on every ComPrimitive.

@@ -43,9 +43,14 @@ not itself owed, while its answers' histories left it `undetermined` (ADR-400 ro
    against (differing verdicts leave the window open, as ADR-429 had it). `Kept::late_start_for`
    reads it too, for an unnamed response. The exchange in flight that is not collecting awaits a
    response on those identifiers too.
-3. **`history_for` of a collecting exchange looks the owners up by its answers' identifiers,**
-   deduplicated by exchange, not by its own `rx_id`. A presence resend whose final answer an
-   earlier owed exchange could own is then owed itself and `undetermined`, as ADR-429 intended.
+3. **`history_for` finds owners per answer.** A collecting exchange's owners are the union of
+   those of each of its answers, each looked up by that answer's own identifier and its own
+   bytes (never one answer's identifier with another's bytes), deduplicated by exchange, not by
+   the exchange's own `rx_id`. An answer with no identifier (0) on a link with a receive table
+   may have come on any of its identifiers, so it is looked up on all of them, and an owed
+   request that answer finds is owed on every identifier of the table. A presence resend whose
+   final answer an earlier owed exchange could own is then owed itself and `undetermined`, as
+   ADR-429 intended.
 4. **Not changed:** the owner lookups for a late response, start and pending (they match owed
    rows by identifier as before; the rows are what changed), the start-indication checks that
    read the link's own `rx_id`, and the host's presence marking.

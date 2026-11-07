@@ -1361,17 +1361,25 @@ impl Evidence {
                     .iter()
                     .filter(|answer| !answer.is_pending(&self.expected))
             };
-            finals()
-                .filter(|answer| {
-                    answer
-                        .history
-                        .as_ref()
-                        .is_some_and(|history| !history.owners.is_empty())
-                })
-                .for_each(|answer| add(&mut ids, answer.rx_id));
+            // An unnamed answer (0) may have come on any identifier of the table.
+            let add_answer = |ids: &mut Vec<u32>, rx_id: u32| {
+                if rx_id == 0 {
+                    table.iter().for_each(|&id| add(ids, id));
+                } else {
+                    add(ids, rx_id);
+                }
+            };
+            for answer in finals().filter(|answer| {
+                answer
+                    .history
+                    .as_ref()
+                    .is_some_and(|history| !history.owners.is_empty())
+            }) {
+                add_answer(&mut ids, answer.rx_id);
+            }
             if ids.is_empty() && self.open_pending_ids().is_empty() {
                 let first = finals().next().map_or(self.rx_id, |answer| answer.rx_id);
-                add(&mut ids, first);
+                add_answer(&mut ids, first);
             }
         }
         ids
@@ -1895,28 +1903,22 @@ impl LinkState {
     /// request the exchange's answer could belong to is counted.
     pub(crate) fn history_for(&self, evidence: &Evidence) -> LinkHistory {
         let head = evidence.answer_head();
-        // A collecting exchange's answers name the identifiers they came on; its own `rx_id`
-        // is 0 on a functional link (ADR-432).
-        let ids: Vec<u32> = if evidence.collecting && !evidence.answers.is_empty() {
-            evidence.answers.iter().map(|answer| answer.rx_id).collect()
-        } else {
-            vec![evidence.rx_id]
-        };
-        let owners: Vec<u64> = head
-            .as_deref()
-            .map(|answer| {
-                let mut owners: Vec<u64> = Vec::new();
-                for owed in &self.owed {
-                    if ids.contains(&owed.rx_id)
-                        && owed.expected.matches(answer)
-                        && !owners.contains(&owed.seq)
-                    {
-                        owners.push(owed.seq);
+        // A collecting exchange's answers are each looked up on their own (ADR-432): the
+        // identifier and the bytes of one answer, never one answer's identifier with another's
+        // bytes.
+        let owners: Vec<u64> = if evidence.collecting && !evidence.answers.is_empty() {
+            let mut owners: Vec<u64> = Vec::new();
+            for answer in &evidence.answers {
+                for owner in self.owners_of(&evidence.as_answer(answer)) {
+                    if !owners.contains(&owner) {
+                        owners.push(owner);
                     }
                 }
-                owners
-            })
-            .unwrap_or_default();
+            }
+            owners
+        } else {
+            self.owners_of(evidence)
+        };
         LinkHistory {
             answered: self.answered,
             answered_since_error: self.answered_since_error,
@@ -1931,6 +1933,29 @@ impl LinkState {
             this_exchange: head.is_some() || evidence.response_started,
             owners,
         }
+    }
+
+    /// The owed requests the answer head of `evidence` could belong to, by `seq`: those owed on
+    /// the identifier it came on and expecting its bytes. An exchange with no identifier of its
+    /// own (0) on a link with a receive table, such as an unnamed answer, may have come on any
+    /// identifier of the table (ADR-432).
+    fn owners_of(&self, evidence: &Evidence) -> Vec<u64> {
+        let Some(head) = evidence.answer_head() else {
+            return Vec::new();
+        };
+        let unnamed = evidence.rx_id == 0 && !evidence.receive_ids.is_empty();
+        let mut owners: Vec<u64> = Vec::new();
+        for owed in &self.owed {
+            let on_id = if unnamed {
+                evidence.receive_ids.contains(&owed.rx_id)
+            } else {
+                owed.rx_id == evidence.rx_id
+            };
+            if on_id && owed.expected.matches(&head) && !owners.contains(&owed.seq) {
+                owners.push(owed.seq);
+            }
+        }
+        owners
     }
 
     /// The history of each answer of `evidence` as an exchange of its own (ADR-400): the one

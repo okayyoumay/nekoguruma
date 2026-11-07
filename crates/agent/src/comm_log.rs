@@ -9906,6 +9906,64 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir2).unwrap();
     }
 
+    /// ADR-432 (review): an unnamed final answer (identifier 0) of a presence resend may have
+    /// come on any receive identifier, so an earlier exchange with no answer is a possible owner:
+    /// the resend is not placed alone and its answer does not confirm its send.
+    #[test]
+    fn an_unnamed_answer_of_a_resend_finds_an_exchange_owed_on_the_table() {
+        let (dir, setup, log, first) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+        });
+        let resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0, 100_000)];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        let history = log.lock().links[0].1.history_for(&resend);
+        assert_eq!(history.owners, vec![first]);
+        let second = log.exchange(resend).unwrap();
+        assert_eq!(owed_on_7e8(&log, first).0, vec![first, second]);
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entries = of_event(&lines, "exchange");
+        assert_eq!(entries[1]["classification"], "undetermined", "{entries:#?}");
+    }
+
+    /// ADR-432 (review): an owner is found per answer, by that answer's identifier and its own
+    /// bytes. A valid answer on 0x7E8 and a wrong-echo result on 0x7E9 do not make an exchange
+    /// owed only on 0x7E9 their owner.
+    #[test]
+    fn an_answers_identifier_is_not_combined_with_another_answers_bytes() {
+        let (dir, _setup, log, first) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E9)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+        });
+        let resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![
+                positive_on(0x7E8, 100_000),
+                answer_on(0x7E9, exchange::End::Positive(vec![0x7E, 0x01]), 200_000),
+            ];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        let history = log.lock().links[0].1.history_for(&resend);
+        assert!(history.owners.is_empty(), "{history:?}");
+        // Placed alone: it is owed on nothing.
+        log.exchange(resend).unwrap();
+        assert_eq!(owed_on(&log, 0x7E9, first).0, vec![first]);
+        assert!(owed_on_7e8(&log, first).0.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// ADR-429, case 9: a lone pending read after the deadline, with the window finished, is no
     /// response and the exchange stays owed and kept, on the identifier the pending came on; the
     /// identifier's final answer is then its `late_response`.

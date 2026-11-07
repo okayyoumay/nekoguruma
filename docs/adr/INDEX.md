@@ -416,6 +416,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-424](ADR-424-the-d-pdu-mock-absorbs-response-pendings.md) | The D-PDU Mock Absorbs Response Pendings | Accepted | `iso22900-mock` (response pending ComParams, `receive_events`, `PDUConnect`, UPDATEPARAM), mock testing guide, `iso22900-service` `agent_suppressed_send_receive` test; ADR-102, ADR-299, ADR-423 |
 | [ADR-425](ADR-425-a-stray-collecting-primitives-answers-reach-its-primitive-ended.md) | A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry | Accepted (Consequences' `late_item` gap closed by ADR-426) | `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`, `judge_windows`); design 8.11 `primitive_ended`; ADR-386, ADR-396, ADR-400, ADR-416 |
 | [ADR-426](ADR-426-a-collecting-exchanges-late-items-are-judged-from-their-windows-start.md) | A Collecting Exchange's Late Items Are Judged From Their Window's Start | Accepted | `agent` (`comm_log` `late_item`, `late_response`, `timing::judge_late`); design 8.11 `late_item`, `late_response`; ADR-371, ADR-400, ADR-425 |
+| [ADR-427](ADR-427-the-d-pdu-mock-can-queue-unbound-indications.md) | The D-PDU Mock Can Queue Its Indications Unbound | Accepted | `iso22900-mock` (`SimEcuCommand::IndicationBinding`, indication items, tester-present indication), mock testing guide, `iso22900-service` `t2_indication_unbound` test, `ngr-hw-checks` handle unit tests; ADR-299, ADR-356, ADR-423 |
 
 ## Status Legend
 
@@ -775,7 +776,7 @@ the predecessor repository these ADRs came from.
 - ADR-334
 - ADR-343
 - ADR-349 (Decision items 1 and 4 amended by ADR-381: the pause applies to code pull requests too)
-- ADR-356
+- ADR-356 (Consequences extended by ADR-427: the mock queues unbound indications, and the handle needs no rule for the API's tester present)
 - ADR-360 (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer)
 - ADR-380
 - ADR-381 (item 1 extended by ADR-387: one row per path that writes the value the rule decides)
@@ -788,6 +789,7 @@ the predecessor repository these ADRs came from.
 - ADR-413
 - ADR-423
 - ADR-424
+- ADR-427
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

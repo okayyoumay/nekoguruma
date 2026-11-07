@@ -99,14 +99,17 @@ The maintainer decided three things:
   now gives the response's timestamp flags and, with the two indication ComParams on, bound
   transmit and start-of-message indication items, and `iso22900-service`'s
   `t2_indication_times` test shows the handle taking its times from the indications end to end;
-  the handle's unbound path is still covered by its unit tests only.
+  the handle's unbound path was covered by its unit tests only. Amended by ADR-427: the mock can
+  queue the indications unbound, and `t2_indication_unbound` shows that path end to end.
 - Every guarded link on T1 to T3 now has the indications on. The handle's other readers ignore
   them: an indication is never a response, and the raw frame reader serves only T0.
 - The API's own tester present can send on the request identifier during an exchange, when a
   profile pins `CP_TesterPresentHandling` on. Its unbound transmit indication would then
   replace the request's, which can only shorten a latency, never make an on-time response
   late. It comes only after the link has been idle for the tester-present time, which is far
-  longer than the check's exchanges, so the check does not guard against it.
+  longer than the check's exchanges, so the check does not guard against it. ADR-427 shows why
+  the handle needs no further rule: 8.1.3 Table 1 keeps a conforming library from sending it
+  between the request and its response.
 - On a D-PDU link the worker does not say it passes on every pending. There a response past P2
   is not judged, only a response within it.
 - The key is the one the agent will read. Its timing margin, still `source` `none` in

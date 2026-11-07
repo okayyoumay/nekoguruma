@@ -451,8 +451,9 @@ async fn an_unsafe_request_outstanding_at_the_crash_ends_on_site(
         }
     });
     // The marker is committed before the request is sent; the worker's trace shows the send
-    // (a line is appended when the request goes out), and the chain's first 0x78 is 1.5 s
-    // later, so the request is outstanding from the trace line on.
+    // (a line is appended once the ECU has handled the request, before its response is queued),
+    // and the chain's first 0x78 is 1.5 s later, so the request is outstanding from the trace
+    // line on.
     wait_for("the request marker", || {
         Journal::read(&dir, &key).is_ok_and(|state| state.facts.last_request.is_some())
     })

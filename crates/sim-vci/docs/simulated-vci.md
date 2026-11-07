@@ -238,9 +238,12 @@ it, and the ECU keeps its state throughout.
 `NGR_SIM_VCI_TRACE` names a file, read once when the library is first called and only in debug
 builds, so a test can check the order of the requests a worker process sent. `sim-vci` appends
 one line per UDS request the worker sends towards the simulated ECU, and one `vbatt` line per
-`READ_VBATT`. A request is traced when it is sent, before the ECU sees it, so a line records a send
-attempt, not receipt: a request lost on the bus (`Fault::BusError`) or ignored by an ECU that is
-silent or still starting after a reset is listed too.
+`READ_VBATT`. A request is traced once the ECU has handled it and its state after the request is
+saved (`NGR_SIM_ECU_STATE`), before its response is queued. A test that sees the line can
+therefore kill the worker at any point after it and still find the request's effect in the state
+file. A line records a send attempt, not receipt: a request lost on the bus (`Fault::BusError`), or
+ignored by an ECU that is silent or still starting after a reset, is listed too. A request whose
+state cannot be saved fails, gets no response and is not listed.
 A request line is `uds`, the service ID, and what identifies the request, all in hex: the DIDs of
 a 0x22 read (`uds 22 F190 F187`), the DID of a 0x2E write, the sub-function of 0x10, 0x11 and
 0x3E (`uds 11 01`), sub-function and routine ID of 0x31 (`uds 31 01 FF00`), and the block counter

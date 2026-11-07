@@ -1221,9 +1221,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// ended (its handle invalid) or that a lost VCI ended, with no end read, keeps its
     /// exchange's classification. What the log kept for the exchange is then released, since
     /// nothing else settles it, unless it stays owed per an identifier a pending is open on, or
-    /// its end shows the VCI ended its wait (ADR-429, ADR-431). Returns the results and errors read for it that no entry
-    /// carries (its end was not read), which go to the exchange in flight's unbound items of an
-    /// earlier primitive: a link error among them goes to the stray's exchange once tagged with
+    /// its end shows the VCI ended its wait (ADR-429, ADR-431). Returns the results and errors
+    /// read for it that no entry carries (its end was not read), which go to the exchange in
+    /// flight's unbound items of an earlier primitive: a link error among them goes to the stray's exchange once tagged with
     /// its `seq` (ADR-372).
     fn settle_cancelled(&self, settling: Settling, stream_failed: bool) -> Vec<Unbound> {
         let Settling {

@@ -25,17 +25,22 @@ since no pending was open.
 1. **Every exchange a `primitive_ended` leaves owed is renewed** (no final response by
    `settles_owed`), collecting or not: `renew_owed` sets its owed rows from the evidence the
    end restated, and `update_kept` replaces its kept evidence, send and transmit. `renew_owed`
-   clears the kept late pendings only for a collecting exchange, whose placed pendings already
-   include them (`Kept::all_pendings`); an ordinary exchange keeps its late pendings.
+   clears the kept late pendings, which its placed pendings already include
+   (`Kept::all_pendings`).
 2. **The release after the entry keeps the record of an exchange that is still owed and either
    has an identifier a pending is open on (ADR-429) or whose renewed kept evidence shows
    `vci_ended`.** That is the case when the primitive ended by the VCI's receive timeout. Its
    response is then its `late_response` (design 8.11), judged by its time against the limit the
    renewed evidence shows, and a next exchange that awaits the same response makes it
    `unattached` with an unowned `late_response` naming the kept exchange, as for two owners.
-3. **A cancel, a link error, a lost VCI and an unknown end are unchanged:** the end leaves
-   `vci_ended` false, so the record is released and a later response is `unattached`
-   (ADR-366 item 1).
+3. **An end that read no receive timeout is released as before:** a cancel, or a link error, a
+   lost VCI or an unknown end with no receive timeout read, leaves `vci_ended` false, so the
+   record is released and a later response is `unattached`. `PrimitiveEnded.vci_ended` is true
+   when a receive timeout was read, whatever else the end read after it, so such an end that
+   did read one is kept, as an entry with `vci_ended` is.
+4. **The late pendings of a renewed exchange are placed in the evidence's order.** Its placed
+   pendings are the entry's, the late ones, then the end's own, as `evidence.pending` lists
+   them, so the limit a later item is judged against runs from the latest in time.
 
 ## Consequences
 

@@ -2061,8 +2061,10 @@ impl LinkState {
     /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
     /// still owed and either has an identifier a pending is open on or shows, in the evidence
     /// its `primitive_ended` renewed, that the VCI ended its wait: its ECU's final answer can
-    /// still settle it (ADR-429, ADR-431). A cancel, a link error, a lost VCI or an unknown end
-    /// leaves `vci_ended` false, so those are released.
+    /// still settle it (ADR-429, ADR-431). `vci_ended` is true when the end read a receive
+    /// timeout, whatever else it read after (as an entry's is), so an end that read none (a
+    /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
+    /// released.
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
             && self.kept.get(&seq).is_some_and(|kept| {
@@ -2218,8 +2220,8 @@ impl LinkState {
     /// Exchange `seq`, still owed after its primitive ended (collecting or not, ADR-431), has
     /// `evidence` and the placed items of it now: it is owed on the identifiers a pending is
     /// open on in them, and a late item is judged against them (ADR-429). Its late pendings are
-    /// in the placed pendings already only for a collecting exchange. Nothing for an exchange
-    /// that is not owed.
+    /// in the placed pendings already, in the evidence's order. Nothing for an exchange that is
+    /// not owed.
     pub(crate) fn renew_owed(
         &mut self,
         seq: u64,
@@ -2247,11 +2249,9 @@ impl LinkState {
             &evidence.open_pending_ids(),
         );
         if let Some(kept) = self.kept.get_mut(&seq) {
-            // A collecting exchange's late pendings are in `placed` already
+            // The late pendings are in `placed` already, in the evidence's order
             // (`Kept::all_pendings`).
-            if evidence.collecting {
-                kept.late_pendings.clear();
-            }
+            kept.late_pendings.clear();
             kept.evidence = evidence.clone();
             (
                 kept.pendings,

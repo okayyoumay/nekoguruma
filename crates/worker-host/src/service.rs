@@ -93,9 +93,14 @@ impl WorkerLayout {
 
 #[derive(Debug, Clone)]
 pub struct LaunchOptions {
-    /// Upper bound for `set_auth_key` + `get_status` polling until the gRPC server runs.
+    /// Upper bound for the whole start: the worker answers its first control request
+    /// (`set_auth_key`) only once it has resolved, checked and loaded its library and bound its
+    /// gRPC listener, so that request waits under this bound alone; then `get_status` polling
+    /// until the gRPC server runs.
     pub startup_timeout: Duration,
-    /// Timeout for each control request.
+    /// Timeout for each control request once the worker answers, the `get_status` polls of the
+    /// start included; not for the first request of the start, which waits for the worker's
+    /// startup under [`LaunchOptions::startup_timeout`].
     pub request_timeout: Duration,
     pub poll_interval: Duration,
     /// Width of J2534 `unsigned long` in bytes (4 or 8): the registration definition's
@@ -204,8 +209,16 @@ impl WorkerProcess {
 
         let startup = async {
             let key = base64::engine::general_purpose::STANDARD.encode(worker.auth_key);
+            // The worker reads its control channel only after its own startup (library
+            // resolution, the pre-load checks, loading, binding the listener), so the first
+            // request's answer waits for all of it: the start's bound covers it, not a single
+            // request's.
             worker
-                .request("set_auth_key", Some(json!({ "key": key })))
+                .request_within(
+                    "set_auth_key",
+                    Some(json!({ "key": key })),
+                    options.startup_timeout,
+                )
                 .await?;
             loop {
                 let status = worker.request("get_status", None).await?;
@@ -264,6 +277,17 @@ impl WorkerProcess {
         method: &str,
         params: Option<Value>,
     ) -> Result<Value, ServiceError> {
+        self.request_within(method, params, self.request_timeout)
+            .await
+    }
+
+    /// [`WorkerProcess::request`] with its own bound on the answer.
+    async fn request_within(
+        &mut self,
+        method: &str,
+        params: Option<Value>,
+        timeout: Duration,
+    ) -> Result<Value, ServiceError> {
         let id = self.next_id;
         self.next_id += 1;
         let mut msg = json!({ "jsonrpc": "2.0", "id": id, "method": method });
@@ -288,7 +312,7 @@ impl WorkerProcess {
                 return parse_response(response);
             }
         };
-        tokio::time::timeout(self.request_timeout, exchange)
+        tokio::time::timeout(timeout, exchange)
             .await
             .map_err(|_| ServiceError::Timeout("control response"))?
     }

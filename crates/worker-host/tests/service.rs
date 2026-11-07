@@ -133,6 +133,51 @@ async fn times_out_when_never_running() {
     assert!(matches!(result, Err(ServiceError::Timeout(_))));
 }
 
+/// A worker answers its first control request only after its own startup (loading its
+/// library), which can take longer than one request's bound: the start's bound covers it.
+#[tokio::test]
+async fn a_startup_longer_than_one_request_is_waited_for_under_the_startup_bound() {
+    let options = LaunchOptions {
+        startup_timeout: Duration::from_secs(10),
+        request_timeout: Duration::from_millis(200),
+        ..LaunchOptions::default()
+    };
+    let worker = WorkerProcess::launch(
+        fake(),
+        ServiceKind::J2534V0404,
+        "slow-start-800",
+        OperatingMode::User,
+        &options,
+    )
+    .await
+    .expect("a slow start within the startup bound should launch");
+    assert_eq!(worker.endpoints(), ["127.0.0.1:50051", "[::1]:50051"]);
+    worker.stop(Duration::from_secs(5)).await.expect("stop");
+}
+
+/// A startup longer than the start's own bound still fails.
+#[tokio::test]
+async fn a_startup_longer_than_the_startup_bound_times_out() {
+    let options = LaunchOptions {
+        startup_timeout: Duration::from_millis(300),
+        request_timeout: Duration::from_secs(5),
+        ..LaunchOptions::default()
+    };
+    let result = WorkerProcess::launch(
+        fake(),
+        ServiceKind::J2534V0404,
+        "slow-start-3000",
+        OperatingMode::User,
+        &options,
+    )
+    .await;
+    assert!(
+        matches!(result, Err(ServiceError::Timeout(_))),
+        "{:?}",
+        result.err()
+    );
+}
+
 #[tokio::test]
 async fn rejects_query_in_library_name() {
     for library in ["a?port=1", "a#b"] {

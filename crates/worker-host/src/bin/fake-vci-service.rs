@@ -1,6 +1,8 @@
 //! Test double for the stdio control channel of the worker service binaries.
 //! Not shipped. The library name selects the behavior: `startup-error`, `never-running`,
-//! `ignore-stop` (a stop request is never answered and the process never exits), anything else starts normally.
+//! `ignore-stop` (a stop request is never answered and the process never exits), `slow-start-<ms>`
+//! (reads its control channel only after `<ms>` milliseconds, as a worker does once it has loaded
+//! its library), anything else starts normally.
 //! The query after the library name is not parsed; `echo_startup_argument` returns the whole argument.
 
 use std::io::{BufRead, Write};
@@ -22,6 +24,12 @@ fn main() {
     let mut out = stdout.lock();
     writeln!(out, "not json: startup noise").unwrap();
     out.flush().unwrap();
+    if let Some(ms) = mode
+        .strip_prefix("slow-start-")
+        .and_then(|ms| ms.parse::<u64>().ok())
+    {
+        std::thread::sleep(std::time::Duration::from_millis(ms));
+    }
 
     for line in std::io::stdin().lock().lines() {
         let Ok(line) = line else { break };

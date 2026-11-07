@@ -818,6 +818,42 @@ pub(super) fn cll_create_flag_to_iso(
     }
 }
 
+/// ENABLE_EXTRA_INFO in the ComPrimitive TxFlag: byte 0, bit 5 (ISO 22900-2:2022
+/// D.2.1 Table D.4; same position in the 2009 edition). With it set a library
+/// gives each result item header bytes (10.1.4.11.4), which the agent reads as
+/// the identifier the answer came on (ADR-428).
+const ENABLE_EXTRA_INFO: u8 = 0x20;
+
+/// Default TxFlag length in bytes (ISO 22900-2 D.2).
+const TX_FLAG_DEFAULT_LEN: usize = 4;
+
+/// Sets ENABLE_EXTRA_INFO in a ComPrimitive TxFlag (ADR-428). Pads to the
+/// default length; every other bit and any longer raw length are kept.
+pub(super) fn with_extra_info(mut flags: IsoFlagData) -> IsoFlagData {
+    if flags.bytes.len() < TX_FLAG_DEFAULT_LEN {
+        flags.bytes.resize(TX_FLAG_DEFAULT_LEN, 0);
+    }
+    flags.bytes[0] |= ENABLE_EXTRA_INFO;
+    flags
+}
+
+/// The control data for a StartComPrimitive: the caller's, or an all-default
+/// one, with ENABLE_EXTRA_INFO set in either case (ADR-428).
+pub(super) fn control_for_start(control: Option<ComPrimitiveCtrlData>) -> ComPrimitiveControl {
+    let mut control = control
+        .map(to_iso_control)
+        .unwrap_or_else(|| ComPrimitiveControl {
+            time: 0,
+            send_cycles: 0,
+            receive_cycles: 0,
+            temp_param_update: 0,
+            tx_flags: IsoFlagData::default(),
+            expected_responses: Vec::new(),
+        });
+    control.tx_flags = with_extra_info(control.tx_flags);
+    control
+}
+
 pub(super) fn to_iso_control(control: ComPrimitiveCtrlData) -> ComPrimitiveControl {
     ComPrimitiveControl {
         time: control.time,
@@ -921,6 +957,57 @@ mod tests {
     fn flag_bits_skips_zero_and_negative() {
         let out = flag_proto_bits_to_bytes(&[0, -1, 1]);
         assert_eq!(out, vec![0x01]);
+    }
+
+    fn bits_flag(bit: i32) -> com_primitive_ctrl_data::TxFlag {
+        com_primitive_ctrl_data::TxFlag::TxFlagBits(vci_service_interface::TxFlag {
+            bits: vec![bit],
+        })
+    }
+
+    fn start_flags(flag: Option<com_primitive_ctrl_data::TxFlag>) -> Vec<u8> {
+        let ctrl = ComPrimitiveCtrlData {
+            tx_flag: flag,
+            ..Default::default()
+        };
+        control_for_start(Some(ctrl)).tx_flags.bytes
+    }
+
+    #[test]
+    fn extra_info_set_when_tx_flag_none() {
+        assert_eq!(start_flags(None), vec![0x20, 0, 0, 0]);
+    }
+
+    #[test]
+    fn extra_info_set_when_bit_already_requested() {
+        let bits = bits_flag(6);
+        assert_eq!(start_flags(Some(bits)), vec![0x20, 0, 0, 0]);
+    }
+
+    #[test]
+    fn extra_info_keeps_suppress_pos_resp() {
+        // TX_FLAG_SUPPRESS_POS_RESP = 7 -> byte 0 bit 6.
+        let bits = bits_flag(7);
+        assert_eq!(start_flags(Some(bits)), vec![0x60, 0, 0, 0]);
+    }
+
+    #[test]
+    fn extra_info_pads_empty_raw() {
+        let raw = com_primitive_ctrl_data::TxFlag::TxFlagRaw(vec![]);
+        assert_eq!(start_flags(Some(raw)), vec![0x20, 0, 0, 0]);
+    }
+
+    #[test]
+    fn extra_info_keeps_long_raw_length() {
+        let raw = com_primitive_ctrl_data::TxFlag::TxFlagRaw(vec![0x00, 1, 2, 3, 4, 5]);
+        assert_eq!(start_flags(Some(raw)), vec![0x20, 1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn extra_info_set_when_cop_ctrl_data_none() {
+        let control = control_for_start(None);
+        assert_eq!(control.tx_flags.bytes, vec![0x20, 0, 0, 0]);
+        assert_eq!(control.time, 0);
     }
 
     #[test]

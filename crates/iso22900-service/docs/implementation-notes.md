@@ -20,6 +20,7 @@ Hosts gRPC API operations and manages lifecycle through stdio JSON-RPC and local
 - Update lifecycle behavior and docs together when changing shutdown/startup flows.
 - Maintain deterministic subscription termination behavior under local stop and process-exit paths.
 - `get_status`'s `error` field and any construction/resolve-error `Status` returned from `error.rs` must stay sanitized: never format a raw `libloading::Error`/`io::Error`/underlying resolver error (Display or Debug) into client- or launcher-facing text, since these can contain local filesystem paths. Log the full error server-side via `tracing::error!` instead (ADR-089).
+- `StartComPrimitive` ORs ENABLE_EXTRA_INFO (ISO 22900-2:2022 D.2.1, byte 0 bit 5) into the TxFlag after converting the caller's control data, once, in `rpc_start_com_primitive` (`service/convert.rs` `with_extra_info`, `control_for_start`; ADR-428). Every other caller bit and any raw length above four bytes are kept; shorter flags are zero-padded to four (D.2). It applies to every path: named bits, raw bytes, no `tx_flag`, no `cop_ctrl_data`.
 
 ## Change Checklist
 

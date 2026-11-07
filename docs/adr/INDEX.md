@@ -288,7 +288,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-296](ADR-296-the-ir-declaration-part-is-loaded-through-a-checking-loader.md) | The IR Declaration Part Is Loaded Through a Checking Loader | Accepted | `diag-ir` declaration loader and generated bindings; design 8.2.6 |
 | [ADR-297](ADR-297-a-flat-positive-response-is-decoded-as-odx-extracts-a-parameter.md) | A Flat Positive Response Is Decoded as ODX Extracts a Parameter | Accepted | `diag-ir` response decoder; design 8.2.2 |
 | [ADR-298](ADR-298-csv-definition-errors-are-reported-in-two-stages.md) | CSV Definition Errors Are Reported in Two Stages | Accepted | `diag-frontend` CSV table reader error reporting |
-| [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it) | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
+| [ADR-299](ADR-299-iso22900-mock-answers-from-sim-ecu.md) | iso22900-mock Answers ComPrimitives from sim-ecu | Accepted (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it; extended by ADR-428: result items carry the unique response table's response identifier as a header when the ComPrimitive's TxFlag sets ENABLE_EXTRA_INFO) | `iso22900-mock` ComPrimitive events, `__mock_sim_ecu_control`, `NGR_SIM_ECU_CONFIG` |
 | [ADR-300](ADR-300-statically-resolved-function-features-in-starlark.md) | Statically Resolved Lambdas, Nested Functions and Keyword Arguments in Starlark | Accepted (the Consequences' rule for sections in a nested `def` superseded by ADR-301) | `diag-frontend` Starlark subset spec, design 8.4 |
 | [ADR-301](ADR-301-starlark-sections-are-whole-functions.md) | Starlark Sections Are Whole Functions | Accepted (item 3's one `Section` per copy split around each diagnostic primitive by ADR-332; the Consequences' open question on a plan answered by ADR-336: a plan function is expanded in place) | `diag-frontend` Starlark subset spec and checker, design 8.4 |
 | [ADR-302](ADR-302-decoded-shape-of-nested-layouts.md) | Decoded Shape of Nested Layouts | Accepted | `diag-ir` decoder, design 8.2.2 |
@@ -416,7 +416,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-424](ADR-424-the-d-pdu-mock-absorbs-response-pendings.md) | The D-PDU Mock Absorbs Response Pendings | Accepted | `iso22900-mock` (response pending ComParams, `receive_events`, `PDUConnect`, UPDATEPARAM), mock testing guide, `iso22900-service` `agent_suppressed_send_receive` test; ADR-102, ADR-299, ADR-423 |
 | [ADR-425](ADR-425-a-stray-collecting-primitives-answers-reach-its-primitive-ended.md) | A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry | Accepted (Consequences' `late_item` gap closed by ADR-426) | `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`, `judge_windows`); design 8.11 `primitive_ended`; ADR-386, ADR-396, ADR-400, ADR-416 |
 | [ADR-426](ADR-426-a-collecting-exchanges-late-items-are-judged-from-their-windows-start.md) | A Collecting Exchange's Late Items Are Judged From Their Window's Start | Accepted (Consequences' `past_vci_limits` gap closed) | `agent` (`comm_log` `late_item`, `late_response`, `timing::judge_late`); design 8.11 `late_item`, `late_response`; ADR-371, ADR-400, ADR-425 |
-| [ADR-427](ADR-427-the-d-pdu-mock-can-queue-unbound-indications.md) | The D-PDU Mock Can Queue Its Indications Unbound | Accepted | `iso22900-mock` (`SimEcuCommand::IndicationBinding`, indication items, tester-present indication), mock testing guide, `iso22900-service` `t2_indication_unbound` test, `ngr-hw-checks` handle unit tests; ADR-299, ADR-356, ADR-423 |
+| [ADR-427](ADR-427-the-d-pdu-mock-can-queue-unbound-indications.md) | The D-PDU Mock Can Queue Its Indications Unbound | Accepted (Consequences on the agent's D-PDU link settled by ADR-428) | `iso22900-mock` (`SimEcuCommand::IndicationBinding`, indication items, tester-present indication), mock testing guide, `iso22900-service` `t2_indication_unbound` test, `ngr-hw-checks` handle unit tests; ADR-299, ADR-356, ADR-423 |
+| [ADR-428](ADR-428-the-d-pdu-worker-requests-extra-info-on-every-comprimitive.md) | The D-PDU Worker Requests Extra Info on Every ComPrimitive, and the Mock Attaches the Table's Response Identifier | Accepted | `iso22900-service` (`with_extra_info`, `rpc_start_com_primitive`), `iso22900-mock` (`PDUSetUniqueRespIdTable`, result item extra info), mock testing guide, `grpc_mock` test, design 8.11; ADR-051, ADR-116, ADR-299, ADR-427 |
 
 ## Status Legend
 
@@ -770,7 +771,7 @@ the predecessor repository these ADRs came from.
 - ADR-279 (Decision item 4's allowlist check replaced by the check against the Windows runner's system directory, ADR-283)
 - ADR-283
 - ADR-292 (the consequence that a crash shows as `HostError::Rpc` superseded by ADR-294: the agent reports `HostError::VciLost`; the crash model amended by ADR-422: a crashed VCI answers a close of a device ID it does not hold with `ERR_INVALID_DEVICE_ID`)
-- ADR-299 (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it)
+- ADR-299 (extended by ADR-423: the tester-present ComParams, the link state and a `CoptStartcomm` with a request; extended by ADR-424: the response pending ComParams, which limit Decision items 2, 4 and 5 as they apply, so they hold only while `CP_RC78Handling` is off, which it is until a ComParam is set and `PDUConnect` or an UPDATEPARAM activates it; extended by ADR-428: result items carry the unique response table's response identifier as a header when the ComPrimitive's TxFlag sets ENABLE_EXTRA_INFO)
 - ADR-312 (Decision item 4 amended: comparison done, Codex kept; Decision item 1's switch on a stalled review amended by ADR-360)
 - ADR-333 (the agent's read-only list it names renamed `policy::UDS_READ_ONLY_SERVICES` by ADR-342)
 - ADR-334
@@ -789,7 +790,8 @@ the predecessor repository these ADRs came from.
 - ADR-413
 - ADR-423 (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication)
 - ADR-424
-- ADR-427
+- ADR-427 (Consequences on the agent's D-PDU link settled by ADR-428)
+- ADR-428
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

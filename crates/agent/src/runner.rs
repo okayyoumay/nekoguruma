@@ -15411,6 +15411,9 @@ def main():
             )
         )]
         Bytes(u32, &'static [u8]),
+        /// A received result with the binding that names the response identifier it came on in
+        /// its header, as the J2534 worker gives it, with these bytes.
+        From(Bound, u32, u32, &'static [u8]),
         /// A tester-present error with the binding: the worker's own tester-present reporting a
         /// missing or negative answer (ADR-418 item 6).
         #[cfg_attr(
@@ -15867,6 +15870,18 @@ def main():
                                     Bound::Own,
                                     at,
                                     Data::ResultData(vci_service_interface::ResultData {
+                                        data_bytes: bytes.to_vec(),
+                                        ..Default::default()
+                                    }),
+                                ),
+                                Step::From(bound, at, id, bytes) => (
+                                    bound,
+                                    at,
+                                    Data::ResultData(vci_service_interface::ResultData {
+                                        extra_info: Some(vci_service_interface::ExtraInfo {
+                                            header_bytes: id.to_be_bytes().to_vec(),
+                                            footer_bytes: Vec::new(),
+                                        }),
                                         data_bytes: bytes.to_vec(),
                                         ..Default::default()
                                     }),
@@ -16977,6 +16992,147 @@ def main():
         let lines = comm_log_lines(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
         lines
+    }
+
+    /// Runs a functional presence request past the agent's deadline, then sends it again; the
+    /// first primitive's items (`first`) come once the test releases them, which the resend's
+    /// wait reads, and the second primitive gives `second`, ending its window at the VCI. The
+    /// items `second` gives after its `Step::Release` (an ECU's final answer to the first request
+    /// among them) are read when no exchange awaits an answer: the test releases them after the
+    /// resend, and the job end reads them. Returns the log's lines.
+    async fn presence_resend_run(
+        first: &'static [Step],
+        second: &'static [Step],
+    ) -> Vec<serde_json::Value> {
+        let dir = journal_dir("presence-resend");
+        let script = vec![
+            (When::After(Duration::ZERO), StartEvent::Script(first)),
+            (When::After(Duration::ZERO), StartEvent::Script(second)),
+        ];
+        let (mut client, fake) =
+            fake_worker_scripted(CancelAnswer::Done, None, false, false, script).await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let table = vec![(0x7E0, 0x7E8), (0x7E1, 0x7E9)];
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8).functional(0x7DF, table.clone());
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: PAST_DEADLINE,
+        };
+        let released = Arc::clone(&fake.released);
+        let read_dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(config.tx_id, config.rx_id);
+            host.set_receive_table(table);
+            host.own_reads(Some(OwnRead::Identification));
+            let request = [0x3E, 0x00];
+            // The agent's deadline ends the first window, which the VCI has not ended.
+            let first = host.presence(&request);
+            assert!(
+                matches!(first.end, Err(HostError::NoResponse)),
+                "{:?}",
+                first.end
+            );
+            // The first primitive's items come now; the resend's wait reads them.
+            released.add_permits(1);
+            let second = host.presence(&request);
+            assert!(second.end.is_ok(), "{:?}", second.end);
+            // The late final answer to the first request comes now. It crosses the loopback
+            // after the release, so the job end's reads run until the log shows it.
+            released.add_permits(1);
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                host.settle_at_end();
+                let lines = comm_log_lines(&read_dir);
+                let placed = lines
+                    .iter()
+                    .any(|line| line["event"] == "late_response" || line["event"] == "unattached");
+                assert!(
+                    placed || std::time::Instant::now() < until,
+                    "the final answer was not read: {lines:#?}"
+                );
+                if placed {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// Asserts that `lines` hold two presence exchanges and that the ECU's final answer is the
+    /// first one's `late_response`, not `unattached`.
+    fn assert_final_answer_is_the_first_exchange_s(lines: &[serde_json::Value]) {
+        let exchanges = of_event(lines, "exchange");
+        assert_eq!(exchanges.len(), 2, "{lines:#?}");
+        assert_eq!(exchanges[0]["outcome"]["result"], "vci_did_not_end");
+        let first = &exchanges[0]["seq"];
+        // The resend's wait read the first primitive's end.
+        let ended = of_event(lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(
+            ended[0]["refers_to"],
+            serde_json::json!([first]),
+            "{lines:#?}"
+        );
+        let late = of_event(lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        // The first exchange owns it. The resend's answer, which the late one shows the ECU gave
+        // on the other identifier too, may be reclassified beside it.
+        assert_eq!(late[0]["refers_to"][0], *first, "{lines:#?}");
+        assert_eq!(late[0]["exchanges"][0]["seq"], *first, "{lines:#?}");
+        assert!(of_event(lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-367 item 3 as annotated by ADR-429, ADR-432: a functional presence exchange the
+    /// agent's deadline ended, whose pending (on 7E8), receive timeout and finished status the
+    /// resend's wait reads, is kept by the release after its `primitive_ended` since the pending
+    /// is still open on 7E8; the ECU's final answer there, read once no exchange awaits one, is
+    /// its `late_response`, although the resend was answered on 7E9.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_presence_pending_read_in_the_resend_s_wait_owns_the_final_answer_that_follows() {
+        const FIRST: &[Step] = &[
+            Step::Release,
+            Step::From(Bound::Own, 5_000, 0x7E8, &[0x7F, 0x3E, 0x78]),
+            Step::TimeOut(5_500),
+            Step::Finish,
+        ];
+        const SECOND: &[Step] = &[
+            Step::From(Bound::Own, 6_000, 0x7E9, &[0x7E, 0x00]),
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 2_000_000, 0x7E8, &[0x7E, 0x00]),
+        ];
+        let lines = presence_resend_run(FIRST, SECOND).await;
+        assert_final_answer_is_the_first_exchange_s(&lines);
+    }
+
+    /// ADR-432: the logged evidence of a functional presence exchange carries the link's receive
+    /// identifiers (the log does not write them; the owner of a late answer shows them). The
+    /// first window got no answer and the VCI's receive timeout ended its primitive, so it is
+    /// owed on every identifier of the table, and the final answer of the ECU on 7E9 (the resend
+    /// was answered on 7E8) is its `late_response`. With a physical link's lone `rx_id` (0 here)
+    /// it would have no owner.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_silent_presence_exchange_is_owed_on_every_receive_identifier() {
+        const FIRST: &[Step] = &[Step::Release, Step::TimeOut(5_000), Step::Finish];
+        const SECOND: &[Step] = &[
+            Step::From(Bound::Own, 6_000, 0x7E8, &[0x7E, 0x00]),
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 2_000_000, 0x7E9, &[0x7E, 0x00]),
+        ];
+        let lines = presence_resend_run(FIRST, SECOND).await;
+        assert_final_answer_is_the_first_exchange_s(&lines);
     }
 
     /// ADR-386: a link error of no primitive read at job end, while the host waits for the

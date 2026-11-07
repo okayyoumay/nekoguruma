@@ -564,6 +564,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   got its final answer (a lone pending that stays one leaves the exchange owed, ADR-429), and
   judges all of them, and its own window from the last answer, with the
   one function the exchange's entry uses (`judge_windows`, ADR-400).
+  After the entry the log renews an exchange it leaves owed and keeps its record when a pending
+  is open on an identifier or the end read the VCI's receive timeout (whatever it read after),
+  so the exchange's response is its `late_response`; an end that read none is released
+  (ADR-429, ADR-431).
   The `primitive_ended` entry gives the end as an
   exchange entry does, classified by the exchange rows as if the agent had waited, except that a
   final response or a receive timeout at the limit is `system`; a cancel by the agent, written

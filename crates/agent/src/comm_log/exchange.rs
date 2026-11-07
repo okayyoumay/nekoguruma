@@ -1555,6 +1555,10 @@ pub(crate) struct Kept {
     /// force before it (a `late_item`, ADR-371). They come after [`Kept::pendings`], which are
     /// the ones its entry saw and judge its timing; only one in time carries the limit on.
     pub late_pendings: Vec<(super::timing::At, LatePending)>,
+    /// For each of [`Kept::late_pendings`], how many of [`Kept::pendings`] came before it in the
+    /// evidence's list (`Evidence::pending`), which lists them in the order they were read: the
+    /// end's own pendings of a renewed exchange come after the late ones read before it.
+    pub late_places: Vec<usize>,
     /// The least classification an ambiguous item read during or after it gave it, with the
     /// reason its reason then ends with: kept with the owed exchange too, so it stands after the
     /// exchange leaves the window (ADR-370).
@@ -2013,6 +2017,7 @@ impl LinkState {
         window: LatePending,
     ) {
         if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.late_places.push(kept.pendings.len());
             kept.late_pendings.push((at, window));
         }
     }
@@ -2059,14 +2064,17 @@ impl LinkState {
     }
 
     /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
-    /// still owed per an identifier a pending is open on: its ECU's final answer can still settle
-    /// it (ADR-429).
+    /// still owed and either has an identifier a pending is open on or shows, in the evidence
+    /// its `primitive_ended` renewed, that the VCI ended its wait: its ECU's final answer can
+    /// still settle it (ADR-429, ADR-431). `vci_ended` is true when the end read a receive
+    /// timeout, whatever else it read after (as an entry's is), so an end that read none (a
+    /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
+    /// released.
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
-            && self
-                .kept
-                .get(&seq)
-                .is_some_and(|kept| !kept.evidence.open_pending_ids().is_empty());
+            && self.kept.get(&seq).is_some_and(|kept| {
+                !kept.evidence.open_pending_ids().is_empty() || kept.evidence.vci_ended
+            });
         if !open {
             self.kept.remove(&seq);
         }
@@ -2214,10 +2222,11 @@ impl LinkState {
         }
     }
 
-    /// Exchange `seq`, a collecting exchange still owed after its primitive ended, has `evidence`
-    /// and the placed items of it now: it is owed on the identifiers a pending is open on in
-    /// them, and a late item is judged against them (ADR-429). Nothing for an exchange that is
-    /// not owed.
+    /// Exchange `seq`, still owed after its primitive ended (collecting or not, ADR-431), has
+    /// `evidence` and the placed items of it now: it is owed on the identifiers a pending is
+    /// open on in them, and a late item is judged against them (ADR-429). Its late pendings are
+    /// in the placed pendings already for a collecting exchange only; an ordinary exchange keeps
+    /// them, with their verdicts (ADR-431). Nothing for an exchange that is not owed.
     pub(crate) fn renew_owed(
         &mut self,
         seq: u64,
@@ -2245,8 +2254,13 @@ impl LinkState {
             &evidence.open_pending_ids(),
         );
         if let Some(kept) = self.kept.get_mut(&seq) {
-            // The late pendings are in `placed` already (`Kept::all_pendings`).
-            kept.late_pendings.clear();
+            // A collecting exchange's placed pendings include the late ones already, in the
+            // evidence's order (`Kept::all_pendings`); an ordinary exchange's are its entry's
+            // and the end's own, and its late pendings keep their verdicts (ADR-431).
+            if evidence.collecting {
+                kept.late_pendings.clear();
+                kept.late_places.clear();
+            }
             kept.evidence = evidence.clone();
             (
                 kept.pendings,
@@ -3701,28 +3715,41 @@ pub(crate) enum LatePending {
 }
 
 impl Kept {
-    /// The pendings the limit in force for a later late item or response runs from: its
-    /// entry's, then each in-time late pending; an open one leaves the limit after it unknown,
-    /// and a late one is passed over.
+    /// The pendings the limit in force for a later late item or response runs from, in the
+    /// evidence's order: its entry's and the end's own, and each in-time late pending; an open
+    /// one leaves the limit after it unknown, and a late one is passed over.
     pub(crate) fn limit_pendings(&self) -> Vec<super::timing::At> {
-        let mut pendings = self.pendings.clone();
-        for (at, window) in &self.late_pendings {
-            match window {
-                LatePending::InTime => pendings.push(*at),
-                LatePending::Open => pendings.push(None),
-                LatePending::Late => {}
-            }
-        }
-        pendings
+        self.merged_pendings(|window, at| match window {
+            LatePending::InTime => Some(at),
+            LatePending::Open => Some(None),
+            LatePending::Late => None,
+        })
     }
 
-    /// Every pending the exchange has, its entry's and the late ones, in order, placed.
+    /// Every pending the exchange has, its entry's, the end's own and the late ones, placed in
+    /// the order of `Evidence::pending`.
     pub(crate) fn all_pendings(&self) -> Vec<super::timing::At> {
-        self.pendings
-            .iter()
-            .copied()
-            .chain(self.late_pendings.iter().map(|(at, _)| *at))
-            .collect()
+        self.merged_pendings(|_, at| Some(at))
+    }
+
+    /// [`Kept::pendings`] with the late ones `keep` gives, each after the pendings its place
+    /// says came before it.
+    fn merged_pendings(
+        &self,
+        keep: impl Fn(LatePending, super::timing::At) -> Option<super::timing::At>,
+    ) -> Vec<super::timing::At> {
+        let mut merged = Vec::with_capacity(self.pendings.len() + self.late_pendings.len());
+        let mut late = self.late_pendings.iter().zip(&self.late_places).peekable();
+        for (index, pending) in self.pendings.iter().enumerate() {
+            while let Some(((at, window), _)) = late.next_if(|(_, place)| **place <= index) {
+                merged.extend(keep(*window, *at));
+            }
+            merged.push(*pending);
+        }
+        for ((at, window), _) in late {
+            merged.extend(keep(*window, *at));
+        }
+        merged
     }
 
     /// The exchange's evidence with `response` as its end, judged by the rows that do not turn
@@ -4798,6 +4825,7 @@ mod tests {
             late_start_id: None,
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
+            late_places: Vec::new(),
             floor: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
@@ -7299,6 +7327,7 @@ mod tests {
             late_start_id: None,
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
+            late_places: Vec::new(),
             floor: None,
             clears: Clears::default(),
             matched: false,
@@ -7378,6 +7407,7 @@ mod tests {
             late_start_id: Some(0x7E8),
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
+            late_places: Vec::new(),
             floor: None,
             clears: Clears::default(),
             matched: false,
@@ -7457,6 +7487,7 @@ mod tests {
                 late_start_id: None,
                 answer_at: AnswerTime::None,
                 late_pendings: Vec::new(),
+                late_places: Vec::new(),
                 floor: None,
                 clears: Clears::default(),
                 matched: false,

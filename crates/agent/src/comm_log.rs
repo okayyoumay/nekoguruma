@@ -2966,6 +2966,7 @@ impl CommLog {
             late_start_id: None,
             answer_at: exchange::AnswerTime::None,
             late_pendings: Vec::new(),
+            late_places: Vec::new(),
             floor: None,
             clears,
             matched: false,
@@ -3133,7 +3134,8 @@ impl CommLog {
     }
 
     /// [`CommLog::release_kept`] for the exchange whose `primitive_ended` was just written,
-    /// except one left owed per an open identifier (ADR-429).
+    /// except one left owed per an open identifier, or whose renewed evidence shows the VCI
+    /// ended its wait (ADR-429, ADR-431).
     pub(crate) fn release_kept_ended(&self, seq: u64) {
         let mut inner = self.lock();
         for (_, state) in &mut inner.links {
@@ -3371,7 +3373,9 @@ impl CommLog {
         }
         // The pendings, read after the entry, come after the kept ones.
         // A collecting exchange's evidence lists its late pendings too, so its placed pendings
-        // do (the window rule reads them by their place in the list, ADR-426).
+        // do (the window rule reads them by their place in the list, ADR-426). An ordinary
+        // exchange's are its entry's and the end's own, its late pendings keep their verdicts
+        // (ADR-431).
         let mut pendings = if kept.evidence.collecting {
             kept.all_pendings()
         } else {
@@ -3693,10 +3697,11 @@ impl CommLog {
         let times = evidence.times.vci;
         let settled_evidence = evidence.clone();
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
-        if collecting && !final_response {
-            // Still owed: on the identifiers a pending is open on after what was read, and a
-            // late item is judged against the answers read after the deadline, with the send
-            // and the transmit they show (ADR-429).
+        if !final_response {
+            // Still owed, collecting or not: on the identifiers a pending is open on after what
+            // was read, and a late item is judged against the answers read after the deadline,
+            // with the send and the transmit they show, and whether the VCI ended (ADR-429,
+            // ADR-431).
             let state = &mut inner.links[at].1;
             state.renew_owed(
                 seq,
@@ -9877,6 +9882,389 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(&other).unwrap();
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// A log whose one ordinary exchange, a read of F190 the agent's deadline ended
+    /// (`vci_did_not_end`, `vci_ended` false at its entry), is owed on the link's response
+    /// identifier (0 on a functional link, ADR-396); its transmit is at 10.5 ms on the device
+    /// clock. Returns the directory, setup, log and the exchange's `seq`.
+    fn ordinary_stray_on(functional: bool) -> (PathBuf, CommLogSetup, CommLog, u64) {
+        let (dir, setup, log) = collecting_log_on(functional);
+        let mut waited = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::VciDidNotEnd,
+        );
+        if functional {
+            waited.rx_id = 0;
+        }
+        waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.times.agent.before_us = 10_000;
+        // The agent gave up before the P2 ran out: its entry observed no fault of the system.
+        waited.times.agent.end_us = 600_000;
+        waited.times.vci = None;
+        let transmit = UnattachedItem {
+            vci_us: 10_500,
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 10_600,
+                wall_unix_ms: 0,
+            }),
+            ..tx_done(0x7E0)
+        };
+        let seq = log.exchange_with(waited, vec![transmit]).unwrap();
+        (dir, setup, log, seq)
+    }
+
+    /// The response of F190 that the VCI delivered `vci_us` on its clock, read at job end.
+    fn late_f190_response(functional: bool, vci_us: u32) -> UnattachedItem {
+        UnattachedItem {
+            link: 1,
+            earlier_primitive: true,
+            owner: None,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: Some(read_at(u64::from(vci_us) + 100)),
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(if functional { 0 } else { 0x7E8 }),
+                bytes: vec![0x62, 0xF1, 0x90, 0x41],
+            },
+        }
+    }
+
+    /// `primitive_ended` of the exchange `seq` of [`ordinary_stray_on`], as the host writes it
+    /// for the end `end`; the VCI's receive timeout is read when `end` is no response.
+    fn end_ordinary(log: &CommLog, seq: u64, end: Option<exchange::End>) {
+        let timed_out = matches!(end, Some(exchange::End::NoResponse));
+        end_ordinary_with(log, seq, end, timed_out, Vec::new());
+    }
+
+    /// [`end_ordinary`] whose end read the receive timeout when `timed_out` (`vci_ended`, as the
+    /// host sets it), then the `after` items.
+    fn end_ordinary_with(
+        log: &CommLog,
+        seq: u64,
+        end: Option<exchange::End>,
+        timed_out: bool,
+        after: Vec<EndRead>,
+    ) {
+        let mut reads = Vec::new();
+        if timed_out {
+            reads.push(end_read(500_000, EndItem::RxTimeout(dev(1_010_500))));
+        }
+        reads.extend(after);
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end,
+                detail: exchange::Detail::default(),
+                vci_ended: timed_out,
+                reads,
+            },
+        )
+        .unwrap();
+    }
+
+    /// ADR-431 decision 3 (case table rows 6 and 7): an end that read the VCI's receive timeout
+    /// keeps its exchange whatever it read after (a link error, a lost VCI, lost events), as an
+    /// entry with `vci_ended` would, and its response is the `late_response`; an end that read
+    /// none is released, and the response is `unattached`.
+    #[test]
+    fn a_receive_timeout_read_keeps_the_exchange_whatever_the_end_read_after_it() {
+        let ends = || {
+            [
+                exchange::End::LinkError(exchange::LinkErrorKind::Receive),
+                exchange::End::VciLost {
+                    refused_after_loss: false,
+                },
+                exchange::End::Unknown(exchange::UnknownCause::EventsLost),
+            ]
+        };
+        for functional in [false, true] {
+            for end in ends() {
+                for timed_out in [true, false] {
+                    let (dir, setup, log, seq) = ordinary_stray_on(functional);
+                    let after = if timed_out {
+                        vec![bound_error(600_000, None, 1_010_600, false)]
+                    } else {
+                        Vec::new()
+                    };
+                    end_ordinary_with(&log, seq, Some(end.clone()), timed_out, after);
+                    assert_eq!(kept_of(&log, seq).evidence.vci_ended, timed_out, "{end:?}");
+                    log.release_kept_ended(seq);
+                    assert_eq!(
+                        log.lock().links[0].1.kept(seq).is_some(),
+                        timed_out,
+                        "{functional} {end:?} {timed_out}"
+                    );
+                    log.late_link_errors(vec![late_f190_response(functional, 2_000_000)])
+                        .unwrap();
+                    let lines = finished(&log, &setup, &dir);
+                    let late = of_event(&lines, "late_response");
+                    let unattached = of_event(&lines, "unattached");
+                    if timed_out {
+                        assert_eq!(late.len(), 1, "{end:?}: {lines:#?}");
+                        assert_eq!(late[0]["refers_to"], serde_json::json!([seq]));
+                        assert!(unattached.is_empty(), "{end:?}: {lines:#?}");
+                    } else {
+                        assert!(late.is_empty(), "{end:?}: {lines:#?}");
+                        assert_eq!(unattached.len(), 1, "{end:?}: {lines:#?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// ADR-431, case table rows 1 and 2: an ordinary exchange whose entry had `vci_ended` false
+    /// and whose primitive the VCI's receive timeout ended is kept with renewed evidence
+    /// (`vci_ended` true) after the release that follows, so the response read at job end is its
+    /// `late_response`, not `unattached`. On a functional link too.
+    #[test]
+    fn an_ordinary_exchange_ended_by_the_vci_s_receive_timeout_owns_its_late_response() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = ordinary_stray_on(functional);
+            assert!(!kept_of(&log, seq).evidence.vci_ended, "{functional}");
+            end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+            assert!(kept_of(&log, seq).evidence.vci_ended, "{functional}");
+            log.release_kept_ended(seq);
+            assert!(log.lock().links[0].1.kept(seq).is_some(), "{functional}");
+            log.late_link_errors(vec![late_f190_response(functional, 600_000)])
+                .unwrap();
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// The exchange that follows the kept one of [`ordinary_stray_on`] in the tests below: a
+    /// read of F190 or F191 (`did`) that the VCI ended, with the response `late` read in it.
+    fn next_exchange(log: &CommLog, functional: bool, did: u8, late: UnattachedItem) {
+        let mut next = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, did],
+            exchange::End::NoResponse,
+        );
+        if functional {
+            next.rx_id = 0;
+        }
+        next.vci_ended = true;
+        next.pending_visibility = exchange::PendingVisibility::Forwarded;
+        next.times.agent.before_us = JOB_END_US + 2_000_000;
+        next.times.agent.end_us = JOB_END_US + 3_000_000;
+        let transmit = UnattachedItem {
+            vci_us: u32::try_from(JOB_END_US).unwrap() + 2_000_000,
+            read: Some(read_at(2_000_100)),
+            ..tx_done(0x7E0)
+        };
+        log.exchange_with(next, vec![transmit, late]).unwrap();
+    }
+
+    /// ADR-431, case table row 3: when the next exchange awaits the same response, the late
+    /// response is `unattached` with an unowned `late_response` naming the kept exchange. On a
+    /// functional link too.
+    #[test]
+    fn a_kept_ordinary_exchange_and_the_next_one_awaiting_the_same_response_share_it() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = ordinary_stray_on(functional);
+            end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+            log.release_kept_ended(seq);
+            let late =
+                late_f190_response(functional, u32::try_from(JOB_END_US).unwrap() + 2_500_000);
+            next_exchange(&log, functional, 0x90, late);
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+            assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+            assert_eq!(
+                late["unattached"],
+                line_of(&lines, "unattached")["seq"],
+                "{late}"
+            );
+        }
+    }
+
+    /// ADR-431, case table row 2: a next exchange that does not await the response leaves the
+    /// kept exchange its owner. On a functional link too.
+    #[test]
+    fn a_next_exchange_that_does_not_await_the_response_leaves_the_kept_exchange_its_owner() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = ordinary_stray_on(functional);
+            end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+            log.release_kept_ended(seq);
+            next_exchange(
+                &log,
+                functional,
+                0x91,
+                late_f190_response(functional, 600_000),
+            );
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// ADR-431, case table rows 6 to 8 (ADR-366 item 1): a primitive that ended by a link error
+    /// or the agent's cancel leaves `vci_ended` false, so its exchange is released and a later
+    /// response stays `unattached`.
+    #[test]
+    fn an_ordinary_exchange_ended_by_a_link_error_or_a_cancel_is_released() {
+        for functional in [false, true] {
+            for end in [
+                Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+                None,
+            ] {
+                let (dir, setup, log, seq) = ordinary_stray_on(functional);
+                end_ordinary(&log, seq, end.clone());
+                if end.is_some() {
+                    assert!(!kept_of(&log, seq).evidence.vci_ended, "{end:?}");
+                }
+                log.release_kept_ended(seq);
+                assert!(
+                    log.lock().links[0].1.kept(seq).is_none(),
+                    "{functional} {end:?}"
+                );
+                log.late_link_errors(vec![late_f190_response(functional, 600_000)])
+                    .unwrap();
+                let lines = finished(&log, &setup, &dir);
+                assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+                assert!(of_event(&lines, "late_response").is_empty(), "{lines:#?}");
+            }
+        }
+    }
+
+    /// ADR-431: the renewed evidence shows the timeout at the limit, so a response past the
+    /// limit is judged as one the VCI's wait ended before ("The VCI had ended its wait at the
+    /// limit"). The `system` the `primitive_ended` entry gave stands (design 8.11 "Settlement").
+    #[test]
+    fn a_late_response_of_a_renewed_ordinary_exchange_past_the_limit_is_judged_on_the_timeout() {
+        let (dir, setup, log, seq) = ordinary_stray_on(false);
+        end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+        log.release_kept_ended(seq);
+        log.late_link_errors(vec![late_f190_response(false, 2_000_000)])
+            .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        let late = line_of(&lines, "late_response");
+        assert_eq!(late["classification"], "system", "{late}");
+        let text = late["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            text.contains("The VCI had ended its wait at the limit."),
+            "{late}"
+        );
+    }
+
+    /// ADR-431 decision 4: renewing an ordinary exchange keeps its late pendings with their
+    /// verdicts and lists its placed pendings in the evidence's order (the entry's, the late
+    /// ones, the end's own), counting none twice; the limit runs from the latest in time.
+    #[test]
+    fn a_renewed_ordinary_exchange_places_its_pendings_in_the_evidence_s_order() {
+        let (dir, _setup, log, seq) = ordinary_stray_on(false);
+        late_pending_judged(&log, seq, 300_000);
+        assert_eq!(kept_of(&log, seq).late_pendings.len(), 1);
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: vec![
+                    end_read(400_000, EndItem::Pending(pending_on(400_000), None)),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                ],
+            },
+        )
+        .unwrap();
+        let kept = kept_of(&log, seq);
+        assert_eq!(kept.all_pendings().len(), kept.evidence.pending.len());
+        assert_eq!(kept.pendings.len(), 1, "the end's own only");
+        assert_eq!(kept.late_pendings.len(), 1, "its verdict kept");
+        let placed: Vec<i64> = kept
+            .all_pendings()
+            .iter()
+            .map(|at| at.unwrap().1.unwrapped)
+            .collect();
+        // The late pending (300 ms after the transmit) comes before the end's own (400 ms).
+        assert_eq!(placed.len(), 2, "{placed:?}");
+        assert_eq!(placed[0], BASE_US as i64 + 300_000, "{placed:?}");
+        assert!(placed[1] > placed[0], "{placed:?}");
+        let limit = kept.limit_pendings();
+        assert_eq!(
+            limit.last().unwrap().unwrap().1.unwrapped,
+            *placed.iter().max().unwrap()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-431 decision 4, ADR-371 item 4: after a renewal an ordinary exchange's late pending
+    /// still stands by its verdict. P2 is 1 s and P2* 5 s: a pending at 1.5 s was late, so a
+    /// final answer at 3.5 s is judged without it (it would be in time after the pending), one
+    /// in time still carries the limit on, and an open one leaves it unknown.
+    #[test]
+    fn a_renewed_ordinary_exchange_judges_by_its_late_pendings_verdicts() {
+        use exchange::LatePending::{InTime, Late, Open};
+        // The transmit of `ordinary_stray_on` is at 10.5 ms.
+        let after_transmit = |after_us: i64| {
+            Some(clocks::Placed {
+                epoch: 0,
+                unwrapped: 10_500 + after_us,
+            })
+        };
+        for (after_us, verdict) in [(1_500_000, Late), (300_000, InTime)] {
+            let (dir, setup, log, seq) = ordinary_stray_on(false);
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Pending,
+                    &late_pending_item(),
+                    after_transmit(after_us),
+                )
+                .unwrap();
+            assert_eq!(kept_of(&log, seq).late_pendings[0].1, verdict);
+            end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+            log.release_kept_ended(seq);
+            let kept = kept_of(&log, seq);
+            assert_eq!(kept.late_pendings.len(), 1, "{verdict:?}");
+            let counted = kept
+                .limit_pendings()
+                .iter()
+                .filter(|at| at.is_some_and(|(_, p)| p.unwrapped == 10_500 + after_us))
+                .count();
+            assert_eq!(counted, usize::from(verdict == InTime), "{verdict:?}");
+            log.lock()
+                .late_response(
+                    0,
+                    seq,
+                    &late_f190_response(false, 0),
+                    after_transmit(3_500_000),
+                )
+                .unwrap();
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+            // Past the limit of a late pending (1.5 s + P2* is 6.5 s) the answer at 3.5 s
+            // would be in time; judged from the transmit alone it is late.
+            assert_eq!(
+                reason.contains("at least"),
+                verdict == Late,
+                "{verdict:?}: {late}"
+            );
+        }
+        // An open one leaves the limit after it unknown.
+        let (dir, _setup, log, seq) = ordinary_stray_on(false);
+        end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+        let at = Some((
+            exchange::Clock::Device,
+            clocks::Placed {
+                epoch: 0,
+                unwrapped: 10_500 + 700_000,
+            },
+        ));
+        log.lock().links[0].1.add_kept_late_pending(seq, at, Open);
+        assert_eq!(kept_of(&log, seq).limit_pendings().last(), Some(&None));
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// ADR-429: an exchange with no transmit done that a pending read after the deadline

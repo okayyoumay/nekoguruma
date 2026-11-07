@@ -1,7 +1,7 @@
 # ADR-356: The T2 Timing Check Judges the Latency the VCI Measured
 
 **Date:** 2026-10-26
-**Status:** Accepted (Consequences on the D-PDU mock amended by ADR-427)
+**Status:** Accepted (Consequences on the D-PDU mock amended by ADR-427; its tester-present Consequence by ADR-430)
 **Affects:** `ngr-hw-checks` (`guard/handle.rs` `GuardedHandle::send_receive_timed`, the link's
 indications, `profile.rs` `Vci::timing_margin_us`, `checks/t2_timing.rs`),
 `crates/j2534-0404-service/tests/t2_timing_check.rs`,
@@ -108,7 +108,7 @@ The maintainer decided three things:
   replace the request's, which can only shorten a latency, never make an on-time response
   late. It is sent at once when the link starts and then every `CP_TesterPresentTime`, each
   held behind a physical request in flight (8.1.3 Table 1), so it lands before a request or
-  after its response, never between. ADR-427 shows why the handle needs no further rule.
+  after its response (ADR-430: also between, while a response is pending; and a D-PDU library gives the tester present's indication no header, so the handle does not match it). ADR-427 shows why the handle needs no further rule.
 - On a D-PDU link the worker does not say it passes on every pending. There a response past P2
   is not judged, only a response within it.
 - The key is the one the agent will read. Its timing margin, still `source` `none` in

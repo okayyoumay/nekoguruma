@@ -1272,13 +1272,11 @@ fn send_tester_present(state: &mut MockState, now: Instant) {
     };
     let exchange = ecu.exchange(addressing, &tp.message);
     // The API's own physical request completed on the bus: with the transmit indication enabled
-    // and the identifiers supplied (unbound), it raises one, like the request of a ComPrimitive
-    // (B.5.1, `CP_TransmitIndEnable`). A functional one goes out on another identifier, which the
-    // control does not supply, so it raises none.
-    if let Some(ids) = state.unbound_indications
-        && state.ind_active.transmit
-        && tp.addr_mode == 0
-    {
+    // it raises one (B.5.1, `CP_TransmitIndEnable`). The item belongs to no ComPrimitive, so it is
+    // unbound and, in every mode, carries no extra info header (ISO 22900-2 (2022) 10.1.4.11,
+    // 10.1.4.11.4, D.2.1; ADR-430). A functional one goes out on another identifier, which the
+    // mock does not model, so it raises none.
+    if state.ind_active.transmit && tp.addr_mode == 0 {
         let mut event = PendingEvent {
             h_mod: MOCK_MODULE_HANDLE,
             h_cll: MOCK_LOGICAL_LINK_HANDLE,
@@ -1287,7 +1285,7 @@ fn send_tester_present(state: &mut MockState, now: Instant) {
             timestamp: 0,
             tx_done: None,
             times_valid: false,
-            identifier: Some(ids.request),
+            identifier: None,
             kind: EventKind::Indication(Indication::Transmit),
             on_finish: None,
         };
@@ -1642,9 +1640,9 @@ pub enum SimEcuCommand {
     /// items of a ComPrimitive that set ENABLE_EXTRA_INFO (ISO 22900-2 (2022) 10.1.4.11.4, D.2.1),
     /// so this header comes from the control, not from a library (the result items of a bound
     /// ECU response take theirs from the unique response table instead, ADR-428). Both are required with `bound` false (the command fails without them) and
-    /// ignored with `bound` true. The ECU's own tester-present then raises an unbound transmit
-    /// indication with `request_id` when `CP_TransmitIndEnable` is active and
-    /// `CP_TesterPresentAddrMode` is 0. A ComPrimitive takes the binding when it is started, like
+    /// ignored with `bound` true. The ECU's own tester-present raises an unbound transmit
+    /// indication with no header, whatever the binding, when `CP_TransmitIndEnable` is active
+    /// and `CP_TesterPresentAddrMode` is 0 (ADR-430). A ComPrimitive takes the binding when it is started, like
     /// the indication ComParams. Reset by `__mock_reset`, not by `Detach`.
     IndicationBinding {
         bound: bool,
@@ -5325,7 +5323,7 @@ mod tester_present_tests {
         }
 
         /// The unbound transmit indications the ECU's own tester-present raises in 200 ms (the
-        /// period is 20 ms), under the given conditions.
+        /// period is 20 ms), under the given conditions, each with no header (ADR-430).
         fn tester_present_indications(unbound: bool, transmit: u32, addr_mode: u32) -> usize {
             let rig = Rig::new();
             rig.keep_alive(20);
@@ -5346,26 +5344,27 @@ mod tester_present_tests {
                     .all(|event| !matches!(event.kind, EventKind::Error(..))),
                 "a tester-present error"
             );
-            queued
+            let indications = queued
                 .iter()
                 .filter(|event| {
                     matches!(event.kind, EventKind::Indication(Indication::Transmit))
                         && event.h_cop == PDU_HANDLE_UNDEF
-                        && event.identifier == Some(2016)
                 })
-                .count()
+                .collect::<Vec<_>>();
+            assert!(indications.iter().all(|event| event.identifier.is_none()));
+            indications.len()
         }
 
         #[test]
-        fn the_tester_present_raises_an_unbound_transmit_indication_each_time_it_is_sent() {
+        fn the_tester_present_raises_a_headerless_unbound_transmit_indication_each_time_in_every_mode()
+         {
             // About ten sends fit in 200 ms; at least a few must show.
             assert!(tester_present_indications(true, 1, 0) >= 3);
+            assert!(tester_present_indications(false, 1, 0) >= 3);
         }
 
         #[test]
-        fn the_tester_present_raises_no_indication_unless_unbound_enabled_and_physical() {
-            // Bound: the mock has no identifier to give the item.
-            assert_eq!(tester_present_indications(false, 1, 0), 0);
+        fn the_tester_present_raises_no_indication_unless_enabled_and_physical() {
             // `CP_TransmitIndEnable` off.
             assert_eq!(tester_present_indications(true, 0, 0), 0);
             // Functional addressing goes out on another identifier.

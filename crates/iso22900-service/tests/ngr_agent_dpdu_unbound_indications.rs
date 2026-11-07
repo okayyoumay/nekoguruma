@@ -92,9 +92,32 @@ fn reads() -> Program {
     }
 }
 
+/// The mock's control with its default binding: indication items bound to their ComPrimitive.
+const BOUND_COMMANDS: &str = r#"[{"attach":{}},{"response_timestamps":{"enabled":false}}]"#;
+
+/// The session control, which starts the agent's tester present (the mock's own, ADR-423), then
+/// the VIN read.
+fn session_then_read() -> Program {
+    Program {
+        constants: vec![vec![0x03], vec![0xF1, 0x90]],
+        code: vec![
+            Op::PushBytes(0),
+            Op::ServiceRequest { service: 0x10 },
+            Op::PushBytes(1),
+            Op::ServiceRequest { service: 0x22 },
+        ],
+        ..reads()
+    }
+}
+
 /// Runs `ngr-agent` on `procedure` with the mock's `COMMANDS`, and returns the exchange entries
 /// of its communication log.
 fn run(procedure: &Program) -> Vec<serde_json::Value> {
+    run_with(procedure, COMMANDS)
+}
+
+/// Like [`run`], with the mock's control `commands`.
+fn run_with(procedure: &Program, commands: &str) -> Vec<serde_json::Value> {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
     let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
@@ -128,7 +151,7 @@ fn run(procedure: &Program) -> Vec<serde_json::Value> {
         .arg(&comm_log)
         .env("VCI_CONFIG_PATH", &config)
         .env("NGR_PDU_API_ROOT_FILE", &root_file)
-        .env(iso22900_mock::ECU_COMMANDS_ENV, COMMANDS)
+        .env(iso22900_mock::ECU_COMMANDS_ENV, commands)
         .env_remove(iso22900_mock::ECU_CONFIG_ENV)
         .env_remove("NGR_SIM_ECU_STATE")
         .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
@@ -210,4 +233,40 @@ fn the_agent_takes_an_exchange_s_times_from_unbound_indications() {
         assert!(tx_done > previous_end, "{entry}");
         previous_end = rx_end;
     }
+}
+
+/// The exchanges of `session_then_read` under the mock's control `commands`: the session control
+/// starts the mock's tester present, which raises an unbound transmit indication of its own
+/// (without a header, ADR-430), and the VIN read follows. The VIN read's transmit done is its
+/// own, taken from its own indication: later than the session control's end, and before the
+/// response's end by the ECU's response time, not by the time since the tester present.
+fn check_read_after_tester_present(commands: &str) {
+    let exchanges = run_with(&session_then_read(), commands);
+    assert_eq!(exchanges.len(), 2, "{exchanges:?}");
+    let (session, read) = (&exchanges[0], &exchanges[1]);
+    assert_eq!(session["outcome"]["result"], "positive", "{session}");
+    assert_eq!(read["outcome"]["result"], "positive", "{read}");
+    assert_eq!(read["sent"], "confirmed", "{read}");
+    assert_eq!(read["sent_evidence"], "tx_indication", "{read}");
+    let session_end = vci_us(session, "rx_end");
+    let (tx_done, rx_end) = (vci_us(read, "tx_done"), vci_us(read, "rx_end"));
+    assert!(tx_done > session_end, "{read}");
+    assert!(tx_done <= rx_end, "{read}");
+    // The mock answers the VIN read at once. The tester present's indication went out when the
+    // session control ended, some 45 ms before the read on a quiet machine, so taking it would
+    // leave a gap of that size; the read's own is within a few milliseconds of the response.
+    assert!(rx_end - tx_done < 30_000, "{read}");
+}
+
+/// Unbound items: the agent's tester present starts after the session control and its headerless
+/// unbound transmit indication is not taken for the VIN read's.
+#[test]
+fn the_tester_presents_headerless_indication_is_not_the_reads_transmit_done_unbound() {
+    check_read_after_tester_present(COMMANDS);
+}
+
+/// Bound items (the default binding): the VIN read's transmit done is its own bound indication.
+#[test]
+fn the_tester_presents_indication_is_not_the_reads_transmit_done_bound() {
+    check_read_after_tester_present(BOUND_COMMANDS);
 }

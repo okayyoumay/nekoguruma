@@ -60,7 +60,8 @@ to the standard here.
    resumes when one is attached. Switching the handling off, a `CoptStopcomm`, a disconnect, a
    destroy and a reset stop it.
    Amended by ADR-427: with the indication binding unbound, the active transmit indication on
-   and address mode 0, a send also raises an unbound transmit indication.
+   and address mode 0, a send also raises an unbound transmit indication; ADR-430: with no
+   header, in every binding mode.
 6. **Serialization (8.1.3 Table 1, as ADR-419 for the J2534 worker).** A tester-present goes only
    when no ComPrimitive runs or waits; a ComPrimitive that waits goes first and the
    tester-present stays due. This holds every tester-present behind the ComPrimitives, which is

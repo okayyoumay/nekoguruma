@@ -1518,8 +1518,8 @@ impl<C: WorkerApi> WorkerHost<C> {
             } else {
                 Vec::new()
             };
-            // A collecting request that ended on its own has the end of its first answer, or no
-            // response (ADR-396); any other end is judged as for any request.
+            // A collecting request that ended on its own has the end of its first standing answer
+            // that is not a pending, or no response (ADR-396, ADR-429); any other end is judged as for any request.
             let (end, mut detail) = match &sent.result {
                 Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => (
                     crate::comm_log::exchange::collecting_end(&answers, &expected),

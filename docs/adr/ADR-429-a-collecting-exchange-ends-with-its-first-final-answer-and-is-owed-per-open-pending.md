@@ -33,13 +33,20 @@ even an exchange that stayed owed could never own it.
 3. **The first late final answer on any of those identifiers settles the exchange**, removing all
    its rows. Settling per identifier (the exchange staying owed on the others) is not decided
    here. The owner lookups count distinct exchanges, since two rows can share one kept exchange.
-   At `primitive_ended` the exchange is settled only when no identifier is left open.
+   At `primitive_ended` the exchange is settled only when no identifier is left open; when it
+   stays owed, its rows are set again from the answers read after the deadline and its kept
+   evidence is replaced with them, so a later late item is judged against them. One predicate
+   (a final response and no open identifier) decides this for `record`, `primitive_ended` and
+   the answers a settling entry frees.
 4. **Amendments.** ADR-396 item 4's outcome for a lone pending is `no_response`, not the
    pending's negative result. ADR-425 decision 5's "a lone pending read after the deadline is a
    negative end" becomes no response. ADR-426's open bullets (a lone pending counted as a final
    response, so no late item had an owner) are closed. A late start or pending is judged on the
    identifier it carries, not on the link's, so a functional link's judgement no longer reads
-   identifier 0.
+   identifier 0. The window a late response, start or pending is judged from (`late_window`)
+   takes the identifier of the item. An exchange in flight that collects awaits answers on any
+   identifier, so an unbound answer read during a presence resend could be the resend's own and
+   settles no earlier exchange.
 
 ## Consequences
 

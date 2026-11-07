@@ -1290,6 +1290,12 @@ impl Evidence {
         ids
     }
 
+    /// The exchange has a final response and no identifier is left open on a pending
+    /// ([`LinkEffect::settles`]), so a final response settles its owed request.
+    pub(crate) fn settles_owed(&self) -> bool {
+        self.final_response().is_some() && !self.end_rejected && self.open_pending_ids().is_empty()
+    }
+
     /// The final response's bytes, when the exchange ended with one.
     fn final_response(&self) -> Option<&[u8]> {
         match &self.end {
@@ -1472,6 +1478,13 @@ struct LinkEffect {
 }
 
 impl LinkEffect {
+    /// The exchange has a final response and no identifier is left open on a pending: its
+    /// response is placed with it alone and it is owed nothing (ADR-429). The one predicate
+    /// `record`, the settling entries and the freed answers read.
+    fn settles(&self) -> bool {
+        self.final_response && self.open_pending_ids.is_empty()
+    }
+
     /// A session change or ECUReset that may have been carried out, though nothing shows it:
     /// one whose answer the agent cannot use, or one sent, with its positive response
     /// suppressed and no final response, whose silence is not classified `none` (no judged
@@ -1930,8 +1943,6 @@ impl LinkState {
             .iter()
             .filter(|owed| owed.rx_id == rx_id)
             .map(|owed| owed.seq)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect();
         let kept: Vec<u64> = owed
             .iter()
@@ -1952,8 +1963,6 @@ impl LinkState {
             .iter()
             .filter(|owed| owed.rx_id == rx_id && owed.expected.pending(pending))
             .map(|owed| owed.seq)
-            .collect::<std::collections::BTreeSet<_>>()
-            .into_iter()
             .collect();
         let kept: Vec<u64> = owed
             .iter()
@@ -2123,21 +2132,81 @@ impl LinkState {
         let placed_alone = entry.placed_alone();
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
         if let (true, false, Some(sid)) = (may_have_arrived, placed_alone, effect.sid) {
-            // One row per response identifier a pending is open on (ADR-429); a functional
-            // link's own identifier is 0, which no late item carries.
-            let ids = if effect.open_pending_ids.is_empty() {
-                vec![effect.rx_id]
-            } else {
-                effect.open_pending_ids.clone()
-            };
-            for rx_id in ids {
-                self.owed.push(Owed {
-                    seq: entry.seq,
-                    rx_id,
-                    sid,
-                    expected: effect.expected.clone(),
-                });
-            }
+            self.set_owed_rows(
+                entry.seq,
+                sid,
+                &effect.expected,
+                effect.rx_id,
+                &effect.open_pending_ids,
+            );
+        }
+    }
+
+    /// Sets the rows exchange `seq` is owed on, replacing any it had: one for each response
+    /// identifier a pending is open on (ADR-429), else one on its link's identifier `rx_id`,
+    /// which a functional link does not name (it is 0).
+    fn set_owed_rows(
+        &mut self,
+        seq: u64,
+        sid: u8,
+        expected: &Expected,
+        rx_id: u32,
+        open_pending_ids: &[u32],
+    ) {
+        self.owed.retain(|owed| owed.seq != seq);
+        let ids = if open_pending_ids.is_empty() {
+            vec![rx_id]
+        } else {
+            open_pending_ids.to_vec()
+        };
+        for rx_id in ids {
+            self.owed.push(Owed {
+                seq,
+                rx_id,
+                sid,
+                expected: expected.clone(),
+            });
+        }
+    }
+
+    /// Exchange `seq`, a collecting exchange still owed after its primitive ended, has `evidence`
+    /// and the placed items of it now: it is owed on the identifiers a pending is open on in
+    /// them, and a late item is judged against them (ADR-429). Nothing for an exchange that is
+    /// not owed.
+    pub(crate) fn renew_owed(
+        &mut self,
+        seq: u64,
+        evidence: &Evidence,
+        placed: (
+            Vec<super::timing::At>,
+            Vec<usize>,
+            Vec<usize>,
+            Vec<super::timing::At>,
+        ),
+    ) {
+        let Some(sid) = self
+            .owed
+            .iter()
+            .find(|owed| owed.seq == seq)
+            .map(|owed| owed.sid)
+        else {
+            return;
+        };
+        self.set_owed_rows(
+            seq,
+            sid,
+            &evidence.expected,
+            evidence.rx_id,
+            &evidence.open_pending_ids(),
+        );
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.evidence = evidence.clone();
+            (
+                kept.pendings,
+                kept.pending_order,
+                kept.answer_order,
+                kept.answer_ends,
+            ) = placed;
         }
     }
 
@@ -3225,7 +3294,7 @@ impl ExchangeEntry {
                 && before.answer_head().is_none()
                 && !before.response_started,
             newly_matched: self.matched_answer() && !kept.matched,
-            final_response: effect.final_response,
+            final_response: effect.settles(),
             clears: kept.clears,
             since_error: true,
         }
@@ -3273,9 +3342,7 @@ impl ExchangeEntry {
     /// Whether its answer is placed with it alone, so it is owed nothing, as
     /// [`LinkState::record`] reads it.
     fn placed_alone(&self) -> bool {
-        self.effect.owners.is_empty()
-            && (self.accepting()
-                || (self.effect.final_response && self.effect.open_pending_ids.is_empty()))
+        self.effect.owners.is_empty() && (self.accepting() || self.effect.settles())
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from

@@ -1548,6 +1548,9 @@ pub(crate) struct Kept {
     /// beginning, judged against the limit in force (a `late_item`, ADR-370, design 8.11
     /// "Settlement"): it decides a late response that completes that response.
     pub late_start: Option<LateStart>,
+    /// The response identifier [`Kept::late_start`] was judged on, for a collecting exchange: a
+    /// start on one identifier says nothing of another's response (ADR-429).
+    pub late_start_id: Option<u32>,
     /// The forwarded pendings read after its entry, each with how it stood against the limit in
     /// force before it (a `late_item`, ADR-371). They come after [`Kept::pendings`], which are
     /// the ones its entry saw and judge its timing; only one in time carries the limit on.
@@ -1586,6 +1589,22 @@ impl From<Option<(Clock, super::clocks::Placed)>> for AnswerTime {
 }
 
 impl Kept {
+    /// The late start that bears on a response with identifier `response_id` (`None` when it
+    /// names none): a collecting exchange's start counts for a response on the identifier it was
+    /// judged on, or an unnamed one when that is the only identifier open; any other exchange's
+    /// start counts for its response.
+    pub(crate) fn late_start_for(&self, response_id: Option<u32>) -> Option<LateStart> {
+        let start = self.late_start?;
+        let (true, Some(own)) = (self.evidence.collecting, self.late_start_id) else {
+            return Some(start);
+        };
+        let applies = match response_id {
+            Some(id) => id == own,
+            None => self.evidence.open_pending_ids() == [own],
+        };
+        applies.then_some(start)
+    }
+
     /// The time of the item that answers this exchange (design 8.11 `late_item`, ADR-384,
     /// ADR-385): the final response (`final_response`), else the latest pending, the settling
     /// entry's own (`new_pendings`); a start (`start`) only when the exchange has no answer yet,
@@ -3062,6 +3081,14 @@ impl LinkState {
     pub(crate) fn forget_late_start(&mut self, seq: u64) {
         if let Some(kept) = self.kept.get_mut(&seq) {
             kept.late_start = None;
+            kept.late_start_id = None;
+        }
+    }
+
+    /// Records the identifier the latest late start of owed exchange `seq` was judged on.
+    pub(crate) fn set_late_start_id(&mut self, seq: u64, rx_id: Option<u32>) {
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.late_start_id = rx_id;
         }
     }
 
@@ -3725,10 +3752,12 @@ pub(crate) fn settle_late_response(
     answered: &Evidence,
     window: super::timing::LateWindow,
     history: &LinkHistory,
+    response_id: Option<u32>,
 ) -> (Classification, String) {
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
     let base = classify(answered, history);
+    let late_start = kept.late_start_for(response_id);
     // A start of the response read late (ADR-370): one before the limit less the margin means
     // the response started in time, so the system missed it, but only for a response that
     // spans frames, since one that fits one frame came after a transfer the ECU aborted; one
@@ -3738,7 +3767,7 @@ pub(crate) fn settle_late_response(
         .end
         .response()
         .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
-    let window = match (window, kept.late_start) {
+    let window = match (window, late_start) {
         (LateWindow::Late { .. } | LateWindow::Open, Some(LateStart::InTime { at_us }))
             if spans_frames =>
         {
@@ -3748,10 +3777,7 @@ pub(crate) fn settle_late_response(
         (window, _) => window,
     };
     let at_limit = kept.evidence.timing.window == Window::TimeoutAtLimit
-        || matches!(
-            kept.late_start,
-            Some(LateStart::Late { at_limit: true, .. })
-        );
+        || matches!(late_start, Some(LateStart::Late { at_limit: true, .. }));
     let (classification, mut reason) = match window {
         LateWindow::InTime { at_us } => (
             System,
@@ -3820,6 +3846,7 @@ pub(crate) fn settle_late_pending(
     window: super::timing::LateWindow,
     base: Classification,
     base_reason: &str,
+    pending_id: Option<u32>,
 ) -> (Classification, String) {
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
@@ -3838,7 +3865,7 @@ pub(crate) fn settle_late_pending(
             );
             let at_limit = kept.evidence.timing.window == Window::TimeoutAtLimit
                 || matches!(
-                    kept.late_start,
+                    kept.late_start_for(pending_id),
                     Some(LateStart::Late { at_limit: true, .. })
                 );
             if base >= Undetermined {
@@ -4768,6 +4795,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            late_start_id: None,
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
             floor: None,
@@ -7268,6 +7296,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            late_start_id: None,
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
             floor: None,
@@ -7276,7 +7305,7 @@ mod tests {
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response);
-            settle_late_response(kept, &answered, window, &LinkHistory::empty())
+            settle_late_response(kept, &answered, window, &LinkHistory::empty(), None)
         };
         let positive = [0x62, 0xF1, 0x86, 0x01];
         let vehicle = kept(Classification::Vehicle);
@@ -7319,6 +7348,52 @@ mod tests {
         );
         assert_eq!(class, Classification::System);
         assert!(reason.contains("stands"), "{reason}");
+    }
+
+    /// ADR-429: a late start bears on a late pending of the identifier it was judged on only.
+    #[test]
+    fn a_late_start_bears_on_a_late_pending_of_its_identifier_only() {
+        use super::super::timing::LateWindow;
+        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        silent.vci_ended = true;
+        silent.collecting = true;
+        silent.timing.window = Window::NotJudged;
+        let kept = Kept {
+            evidence: silent.clone(),
+            origin: silent.origin,
+            request: Request::of(&silent),
+            classification: Classification::None,
+            sent: Sent::Confirmed,
+            transmit: None,
+            pendings: Vec::new(),
+            pending_order: Vec::new(),
+            answer_order: Vec::new(),
+            answer_ends: Vec::new(),
+            limits: None,
+            start_unattached: false,
+            late_start: Some(LateStart::Late {
+                by_us: 1,
+                at_limit: true,
+            }),
+            late_start_id: Some(0x7E8),
+            answer_at: AnswerTime::None,
+            late_pendings: Vec::new(),
+            floor: None,
+            clears: Clears::default(),
+            matched: false,
+        };
+        let judged = |id| {
+            settle_late_pending(
+                &kept,
+                LateWindow::Late { by_us: 1 },
+                Classification::None,
+                "",
+                id,
+            )
+            .0
+        };
+        assert_eq!(judged(Some(0x7E8)), Classification::Vehicle);
+        assert_eq!(judged(Some(0x7E9)), Classification::Undetermined);
     }
 
     #[test]
@@ -7379,6 +7454,7 @@ mod tests {
                 limits: None,
                 start_unattached: false,
                 late_start: None,
+                late_start_id: None,
                 answer_at: AnswerTime::None,
                 late_pendings: Vec::new(),
                 floor: None,

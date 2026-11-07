@@ -2963,6 +2963,7 @@ impl CommLog {
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             late_start: None,
+            late_start_id: None,
             answer_at: exchange::AnswerTime::None,
             late_pendings: Vec::new(),
             floor: None,
@@ -4430,6 +4431,10 @@ impl Inner {
         let answered = kept.answered(bytes);
         let history = state.history_for(&answered);
         let time = item.clock.zip(placed);
+        let named = match &item.data {
+            UnattachedData::Result { identifier, .. } => *identifier,
+            _ => None,
+        };
         // The identifiers it could have come on: the one it names, else those a pending is open
         // on, else the link's own (ADR-429). It is judged against each one's window.
         let ids: Vec<u32> = match &item.data {
@@ -4466,7 +4471,7 @@ impl Inner {
                 timing::LateWindow::Open
             };
         let (classification, reason) =
-            exchange::settle_late_response(&kept, &answered, window, &history);
+            exchange::settle_late_response(&kept, &answered, window, &history, named);
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
@@ -4810,8 +4815,13 @@ impl Inner {
         // (`settle_late_response`): it stands as a floor, since a later item cannot refute a time
         // the VCI observed.
         let pending_floor = pending_window.map(|window| {
-            let (verdict, text) =
-                exchange::settle_late_pending(&kept, window, classification, &reason);
+            let (verdict, text) = exchange::settle_late_pending(
+                &kept,
+                window,
+                classification,
+                &reason,
+                Some(item_rx_id),
+            );
             classification = verdict;
             reason = text;
             let late_pending = match window {
@@ -4827,7 +4837,12 @@ impl Inner {
         };
         // While the response does not complete, `undetermined` stands (design 8.11
         // "Settlement").
-        match late_start.unwrap_or(kept.late_start) {
+        // A start bears on the item only for the identifier it was judged on (ADR-429).
+        let item_id = match kind {
+            LateIndication::Pending => Some(item_rx_id),
+            LateIndication::Transmit(_) | LateIndication::Start => None,
+        };
+        match late_start.unwrap_or_else(|| kept.late_start_for(item_id)) {
             Some(exchange::LateStart::InTime { at_us }) => {
                 classification = classification.max(exchange::Classification::Undetermined);
                 reason.push_str(&format!(
@@ -4855,7 +4870,12 @@ impl Inner {
             reason.push_str(&suffix);
         }
         state.settled_from_evidence(owner, classification, &reason, evidence.clone());
+        let collecting = evidence.collecting;
         state.update_kept(owner, evidence, entry.sent, transmit, late_start);
+        if kind == LateIndication::Start && late_start.is_some() {
+            // The start was judged on the identifier it came on (ADR-429).
+            state.set_late_start_id(owner, collecting.then_some(item_rx_id));
+        }
         if let Some((late_pending, verdict)) = pending_floor {
             state.add_kept_late_pending(owner, item.clock.zip(placed), late_pending);
             if verdict > entry.classification
@@ -9993,6 +10013,121 @@ pub(crate) mod tests {
         // and P2 (1 s) applies there while 0x7E8's is within P2*: the verdicts differ.
         let differ = classified(200_000, Some(0x7E8));
         assert_eq!(differ["classification"], "undetermined", "{differ}");
+    }
+
+    /// ADR-429: a late start is judged on the identifier it came on, and bears on a response of
+    /// that identifier only (an unnamed one when it is the only identifier open).
+    #[test]
+    fn a_late_start_bears_on_a_response_of_its_own_identifier_only() {
+        // `Some(id)`: the final answer names `id`; `None`: it names none. Multi-frame, at 6 s.
+        let classified = |response_id: Option<u32>| {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![lone_pending_on(0x7E8), lone_pending_on(0x7E9)];
+                evidence.pending = vec![pending_on(200_000), pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8), Some(0x7E9)];
+            });
+            // A start on 0x7E8 at 3 s: within the limit its pending put in force.
+            let start = UnattachedItem {
+                vci_us: 7,
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+                    identifier: Some(0x7E8),
+                    bytes: Vec::new(),
+                },
+                ..tx_done(0x7E8)
+            };
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Start,
+                    &start,
+                    placed_after(3_000_000),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    kept_of(&log, seq).late_start,
+                    Some(exchange::LateStart::InTime { .. })
+                ),
+                "the start is judged"
+            );
+            let mut bytes = vec![0x7E, 0x00];
+            bytes.resize(20, 0);
+            let response = UnattachedItem {
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, 0],
+                    identifier: response_id,
+                    bytes,
+                },
+                ..tx_done(0x7E8)
+            };
+            log.lock()
+                .late_response(0, seq, &response, placed_after(6_000_000))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            of_event(&lines, "late_response").remove(0)["exchanges"][0].clone()
+        };
+        // Its own identifier: the response started in time, so the system missed it.
+        let own = classified(Some(0x7E8));
+        assert_eq!(own["classification"], "system", "{own}");
+        // Another identifier's response, and one naming none with two identifiers open: the
+        // start says nothing of them, and the response itself came after the limit.
+        for other in [Some(0x7E9), None] {
+            let entry = classified(other);
+            assert_ne!(entry["classification"], "system", "{other:?} {entry}");
+        }
+    }
+
+    /// ADR-429: a late start on one identifier does not colour the settlement of a late pending
+    /// of another.
+    #[test]
+    fn a_late_start_does_not_colour_a_late_pending_of_another_identifier() {
+        let reason_of = |pending_id: u32| {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![lone_pending_on(0x7E8), lone_pending_on(0x7E9)];
+                evidence.pending = vec![pending_on(200_000), pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8), Some(0x7E9)];
+            });
+            late_start_judged(&log, seq, 3_000_000);
+            let mut pending = late_pending_item();
+            pending.data = UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(pending_id),
+                bytes: vec![0x7F, 0x3E, 0x78],
+            };
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Pending,
+                    &pending,
+                    placed_after(3_500_000),
+                )
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let items = of_event(&lines, "late_item");
+            items.last().unwrap()["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            reason_of(0x7E8).contains("The response started"),
+            "its own identifier"
+        );
+        assert!(
+            !reason_of(0x7E9).contains("The response started"),
+            "another identifier"
+        );
     }
 
     /// ADR-429: a later exchange of the link that was not sent awaits no answer, so a late final

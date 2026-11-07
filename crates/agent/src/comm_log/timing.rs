@@ -373,17 +373,22 @@ fn judge_late_at(
 }
 
 /// How far the VCI's device clock, read at the agent's deadline, was past the VCI's own limits
-/// (design 8.11 `vci_did_not_end`): the reading less its round trip, from the transmit, past
-/// the latest limit in force plus the margin plus the longest transfer of a single-frame
-/// response, which would have given no start-of-message indication. `None` when it is not past,
-/// or cannot be shown: no profile gives the link's margin (ADR-377), the reading or the transmit is not on the device clock (on a J2534 link
-/// the reading is the worker's, ADR-120), they are on different epochs, a pending is not on
-/// their clock and epoch or came before the transmit, nothing bounds the limit, or the link's
-/// protocol has no single-frame bound.
+/// (design 8.11 `vci_did_not_end`): the reading less its round trip, from the window's start,
+/// past the latest limit in force plus the margin plus the longest transfer of a single-frame
+/// response, which would have given no start-of-message indication. The window starts at the
+/// transmit, or where `window_from` is: the end of a collecting request's last final answer,
+/// or, with pendings still open, of the latest final answer before them (the transmit when none;
+/// ADR-400, ADR-426). `pendings` are those of that window. `None` when it is not past,
+/// or cannot be shown: no profile gives the link's margin (ADR-377), the reading or the transmit
+/// is not on the device clock (on a J2534 link the reading is the worker's, ADR-120), they are
+/// on different epochs, the window's start or a pending is not on their clock and epoch or came
+/// before the window's start, nothing bounds the limit, or the link's protocol has no
+/// single-frame bound.
 pub(crate) fn past_vci_limits(
     limits: Limits,
     absorbing: bool,
     transmit: At,
+    window_from: Option<At>,
     pendings: &[At],
     reading: At,
     round_trip_us: u64,
@@ -397,17 +402,23 @@ pub(crate) fn past_vci_limits(
     if reading.epoch != transmit.epoch {
         return None;
     }
-    let pendings = pendings
-        .iter()
-        .map(|at| {
-            let (own, at) = (*at)?;
-            (own == Clock::Device && at.epoch == transmit.epoch)
-                .then_some(at.unwrapped - transmit.unwrapped)
-        })
-        .collect::<Option<Vec<i64>>>()?;
-    if pendings.iter().any(|&us| us < 0) {
+    // A time on the transmit's clock and epoch, in microseconds from the transmit.
+    let since = |time: At| {
+        let (own, time) = time?;
+        (own == Clock::Device && time.epoch == transmit.epoch)
+            .then_some(time.unwrapped - transmit.unwrapped)
+    };
+    let from = match window_from {
+        None => 0,
+        Some(start) => since(start)?,
+    };
+    if from < 0 {
         return None;
     }
+    let pendings = pendings
+        .iter()
+        .map(|at| since(*at).filter(|&us| us >= from).map(|us| us - from))
+        .collect::<Option<Vec<i64>>>()?;
     let transfer = to_i64(limits.single_frame?.transfer_us);
     let latest = limit_in_force(
         to_i64(limits.p2_us),
@@ -417,7 +428,7 @@ pub(crate) fn past_vci_limits(
         absorbing,
     )
     .latest?;
-    let elapsed = reading.unwrapped - to_i64(round_trip_us) - transmit.unwrapped;
+    let elapsed = reading.unwrapped - to_i64(round_trip_us) - transmit.unwrapped - from;
     let by = elapsed - (latest + to_i64(limits.margin_us?) + transfer);
     (by > 0).then_some(by)
 }
@@ -559,10 +570,10 @@ mod tests {
             LateWindow::Open
         );
         assert_eq!(
-            past_vci_limits(limits, false, transmit(), &[], at(900_000), 0),
+            past_vci_limits(limits, false, transmit(), None, &[], at(900_000), 0),
             None
         );
-        assert!(past_vci_limits(LIMITS, false, transmit(), &[], at(900_000), 0).is_some());
+        assert!(past_vci_limits(LIMITS, false, transmit(), None, &[], at(900_000), 0).is_some());
         // A reason the times' placement gives stands: no margin would let them be judged.
         let no_transmit = Times {
             start: at(10_000),
@@ -1015,6 +1026,7 @@ mod tests {
                 limits,
                 absorbing,
                 transmit(),
+                None,
                 pendings,
                 reading,
                 round_trip_us,
@@ -1056,6 +1068,41 @@ mod tests {
             ..LIMITS
         };
         assert_eq!(past(no_frame, false, &[], at(9_000_000), 0), None);
+    }
+
+    #[test]
+    fn the_vci_s_own_limits_run_from_the_window_s_start() {
+        let from = |start: At, pendings: &[At], reading: At| {
+            past_vci_limits(LIMITS, false, transmit(), Some(start), pendings, reading, 0)
+        };
+        // P2 50 ms, the margin 2 ms and one frame's 320 µs: 52_320 µs from the window's start,
+        // here an answer that ended at 4.8 s.
+        let start = at(4_800_000);
+        assert_eq!(from(start, &[], at(4_800_000 + 52_320)), None);
+        assert_eq!(from(start, &[], at(4_800_000 + 52_321)), Some(1));
+        // Past the limits from the transmit, but not from the window's start.
+        assert!(past_vci_limits(LIMITS, false, transmit(), None, &[], at(4_810_000), 0).is_some());
+        assert_eq!(from(start, &[], at(4_810_000)), None);
+        // A pending in the window puts P2* (5 s) in force from the pending.
+        assert_eq!(from(start, &[at(4_820_000)], at(9_820_000 + 2_320)), None);
+        assert_eq!(
+            from(start, &[at(4_820_000)], at(9_820_000 + 2_321)),
+            Some(1)
+        );
+        // A start not placed, on another epoch or clock, or a pending before it, shows nothing.
+        assert_eq!(from(None, &[], at(9_000_000)), None);
+        assert_eq!(from(on(1, 5), &[], at(9_000_000)), None);
+        let worker = Some((
+            Clock::Worker,
+            Placed {
+                epoch: 0,
+                unwrapped: 1_000_000,
+            },
+        ));
+        assert_eq!(from(worker, &[], at(9_000_000)), None);
+        assert_eq!(from(start, &[at(4_700_000)], at(19_000_000)), None);
+        // A start before the transmit shows nothing either.
+        assert_eq!(from(at(-1), &[], at(9_000_000)), None);
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # ADR-425: A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry
 
 **Date:** 2026-11-06
-**Status:** Accepted
+**Status:** Accepted (Consequences' `late_item` gap closed by ADR-426)
 **Affects:** `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`,
 `judge_windows`, `exchange` `Kept`, `standing_answers`); design 8.11 `primitive_ended`; ADR-386,
 ADR-396, ADR-400
@@ -73,7 +73,7 @@ the primitive the agent stopped waiting for:
   answers' own timing, which stays in the answers' items; the entry's window is `timeout_at_limit`
   when the finished item is 1 s after the last answer, on the clock the answers are on.
 - Not decided here: `late_item`'s own judgement of a late pending or start of a collecting
-  exchange still measures from the transmit; the answers read before a cancel took effect are not
+  exchange still measures from the transmit (decided by ADR-426); the answers read before a cancel took effect are not
   listed in the cancel's entry. They are open items.
 - Decided later by the maintainer (2026-11-07): the collecting deadline does not extend with each
   answer. It stays one bound from the request. A window still receiving when it passes is given

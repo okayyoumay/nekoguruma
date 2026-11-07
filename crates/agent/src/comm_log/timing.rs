@@ -251,10 +251,13 @@ pub(crate) enum LateWindow {
 
 /// Judges a late response's time `at`, which is its end, of `len` bytes, against the limit in
 /// force of the exchange whose transmit was `transmit` and whose pendings were `pendings`.
+/// `window_from` is where the window the response closes started, as for [`judge`]: `None` is the
+/// transmit, and `pendings` are the ones that came in that window.
 pub(crate) fn judge_late(
     limits: Limits,
     absorbing: bool,
     transmit: At,
+    window_from: Option<At>,
     pendings: &[At],
     at: At,
     len: usize,
@@ -265,7 +268,15 @@ pub(crate) fn judge_late(
         .single_frame
         .filter(|frame| len <= frame.max_bytes)
         .map(|frame| to_i64(frame.transfer_us));
-    judge_late_at(limits, absorbing, transmit, pendings, at, transfer)
+    judge_late_at(
+        limits,
+        absorbing,
+        transmit,
+        window_from,
+        pendings,
+        at,
+        transfer,
+    )
 }
 
 /// Judges the time `at` a late start-of-message indication shows its response beginning,
@@ -275,10 +286,19 @@ pub(crate) fn judge_late_start(
     limits: Limits,
     absorbing: bool,
     transmit: At,
+    window_from: Option<At>,
     pendings: &[At],
     at: At,
 ) -> LateWindow {
-    judge_late_at(limits, absorbing, transmit, pendings, at, Some(0))
+    judge_late_at(
+        limits,
+        absorbing,
+        transmit,
+        window_from,
+        pendings,
+        at,
+        Some(0),
+    )
 }
 
 /// [`judge_late`] for a time `at` that began its response `transfer` before it, when that is
@@ -287,6 +307,7 @@ fn judge_late_at(
     limits: Limits,
     absorbing: bool,
     transmit: At,
+    window_from: Option<At>,
     pendings: &[At],
     at: At,
     transfer: Option<i64>,
@@ -297,39 +318,56 @@ fn judge_late_at(
     if own != clock || at.epoch != transmit.epoch {
         return LateWindow::Open;
     }
+    // A time on the transmit's clock and epoch, in microseconds from the transmit.
+    let since = |time: At| {
+        let (own, time) = time?;
+        (own == clock && time.epoch == transmit.epoch)
+            .then_some(time.unwrapped - transmit.unwrapped)
+    };
+    // The window starts at the transmit, or where `window_from` is; a start that is not placed
+    // on the transmit's clock and epoch leaves the judgement open.
+    let from = match window_from {
+        None => Some(0),
+        Some(start) => since(start),
+    };
+    let Some(from) = from else {
+        return LateWindow::Open;
+    };
     let Some(pendings) = pendings
         .iter()
-        .map(|pending| {
-            let (own, pending) = (*pending)?;
-            (own == clock && pending.epoch == transmit.epoch)
-                .then_some(pending.unwrapped - transmit.unwrapped)
-        })
+        .map(|pending| since(*pending))
         .collect::<Option<Vec<i64>>>()
     else {
         return LateWindow::Open;
     };
     let at = at.unwrapped - transmit.unwrapped;
-    // A final response comes after the transmit and after every pending of its exchange.
-    if at < 0 || pendings.iter().any(|&us| us < 0 || us > at) {
+    // A final response comes after its window's start and after every pending of that window,
+    // which come after the start.
+    if from < 0 || at < from || pendings.iter().any(|&us| us < from || us > at) {
         return LateWindow::Open;
     }
     let Some(margin) = limits.margin_us.map(to_i64) else {
         return LateWindow::Open;
     };
+    let in_window: Vec<i64> = pendings.iter().map(|us| us - from).collect();
     let in_force = limit_in_force(
         to_i64(limits.p2_us),
         to_i64(limits.p2_star_us),
         limits.completion_us.map(to_i64),
-        &pendings,
+        &in_window,
         absorbing,
     );
-    if at <= in_force.earliest - margin {
+    // The time is from the transmit, as a response time is; the limits run from the window's
+    // start.
+    if at - from <= in_force.earliest - margin {
         return LateWindow::InTime { at_us: at };
     }
     match (transfer, in_force.latest) {
-        (Some(transfer), Some(latest)) if at - transfer > latest + margin => LateWindow::Late {
-            by_us: at - transfer - latest,
-        },
+        (Some(transfer), Some(latest)) if at - from - transfer > latest + margin => {
+            LateWindow::Late {
+                by_us: at - from - transfer - latest,
+            }
+        }
         _ => LateWindow::Open,
     }
 }
@@ -513,11 +551,11 @@ mod tests {
         );
         // A late response and a reading at the deadline are not judged either.
         assert_eq!(
-            judge_late(limits, false, transmit(), &[], at(900_000), 4),
+            judge_late(limits, false, transmit(), None, &[], at(900_000), 4),
             LateWindow::Open
         );
         assert_ne!(
-            judge_late(LIMITS, false, transmit(), &[], at(900_000), 4),
+            judge_late(LIMITS, false, transmit(), None, &[], at(900_000), 4),
             LateWindow::Open
         );
         assert_eq!(
@@ -843,7 +881,15 @@ mod tests {
     #[test]
     fn a_late_response_is_in_time_late_or_open() {
         let late = |limits, absorbing, pendings: &[At], at_us, len| {
-            judge_late(limits, absorbing, transmit(), pendings, at(at_us), len)
+            judge_late(
+                limits,
+                absorbing,
+                transmit(),
+                None,
+                pendings,
+                at(at_us),
+                len,
+            )
         };
         // P2 50 ms, the margin 2 ms, one frame 320 µs.
         assert_eq!(
@@ -876,7 +922,7 @@ mod tests {
         );
         // Not on one clock and epoch with the transmit, or before it.
         assert_eq!(
-            judge_late(LIMITS, false, transmit(), &[], on(1, 5), 3),
+            judge_late(LIMITS, false, transmit(), None, &[], on(1, 5), 3),
             LateWindow::Open
         );
         assert_eq!(
@@ -886,7 +932,8 @@ mod tests {
         assert_eq!(late(LIMITS, false, &[], -1, 3), LateWindow::Open);
         // A start is its response's beginning: late as soon as it is past the limit plus the
         // margin, with no frame's transfer off it, and on a link with no single-frame bound too.
-        let start = |limits, at_us| judge_late_start(limits, false, transmit(), &[], at(at_us));
+        let start =
+            |limits, at_us| judge_late_start(limits, false, transmit(), None, &[], at(at_us));
         assert_eq!(start(LIMITS, 52_000), LateWindow::Open);
         assert_eq!(start(LIMITS, 52_001), LateWindow::Late { by_us: 2_001 });
         let unbounded = Limits {
@@ -899,6 +946,65 @@ mod tests {
         assert_eq!(
             late(LIMITS, false, &[at(30_000)], 20_000, 3),
             LateWindow::Open
+        );
+    }
+
+    /// A late response of a window that restarted at an answer runs against the limit in force
+    /// from that answer's end (ADR-400 decision 1, ADR-426): the time stays from the transmit.
+    #[test]
+    fn a_late_response_of_a_restarted_window_is_judged_from_the_window_s_start() {
+        let late = |from: Option<At>, pendings: &[At], at_us, len| {
+            judge_late(LIMITS, false, transmit(), from, pendings, at(at_us), len)
+        };
+        // P2 50 ms, the margin 2 ms, one frame 320 us. A window that started at 3 s: 3.04 s is
+        // in time from the start, and late from the transmit.
+        assert_eq!(
+            late(Some(at(3_000_000)), &[], 3_040_000, 3),
+            LateWindow::InTime { at_us: 3_040_000 }
+        );
+        assert_eq!(
+            late(None, &[], 3_040_000, 3),
+            LateWindow::Late { by_us: 2_989_680 }
+        );
+        assert_eq!(
+            late(Some(at(3_000_000)), &[], 3_052_321, 3),
+            LateWindow::Late { by_us: 2_001 }
+        );
+        // The reverse: in time from the transmit, late from a start that came before it.
+        assert_eq!(
+            late(Some(at(30_000)), &[], 100_000, 3),
+            LateWindow::Late { by_us: 19_680 }
+        );
+        // A pending in the window sets the limit from its own time.
+        assert_eq!(
+            late(Some(at(3_000_000)), &[at(3_010_000)], 7_000_000, 3),
+            LateWindow::InTime { at_us: 7_000_000 }
+        );
+        // A start not placed, or on another clock or epoch, leaves it open.
+        assert_eq!(late(Some(None), &[], 3_040_000, 3), LateWindow::Open);
+        assert_eq!(late(Some(on(1, 5)), &[], 3_040_000, 3), LateWindow::Open);
+        // An item before the start, or before a pending, or a pending before the start.
+        assert_eq!(
+            late(Some(at(3_000_000)), &[], 2_000_000, 3),
+            LateWindow::Open
+        );
+        assert_eq!(
+            late(Some(at(3_000_000)), &[at(3_030_000)], 3_020_000, 3),
+            LateWindow::Open
+        );
+        assert_eq!(
+            late(Some(at(3_000_000)), &[at(2_900_000)], 3_040_000, 3),
+            LateWindow::Open
+        );
+        // A late start is judged the same way, with no transfer off it.
+        let start = |from, at_us| judge_late_start(LIMITS, false, transmit(), from, &[], at(at_us));
+        assert_eq!(
+            start(Some(at(3_000_000)), 3_040_000),
+            LateWindow::InTime { at_us: 3_040_000 }
+        );
+        assert_eq!(
+            start(Some(at(3_000_000)), 3_052_001),
+            LateWindow::Late { by_us: 2_001 }
         );
     }
 

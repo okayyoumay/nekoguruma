@@ -2435,6 +2435,9 @@ impl<C: WorkerApi> WorkerHost<C> {
         };
         let mut evidence = Evidence::new(origin, target, LOG_LINK, rx_id, request.to_vec(), end);
         evidence.at = self.at.clone();
+        // The identifiers the link receives on, which a collecting or silent exchange is owed
+        // on (ADR-432).
+        evidence.receive_ids = receive_ids_of(&self.receive_table);
         // Design 8.11 `pending`, ADR-355: forwarded only when the worker says the link passes
         // on every pending. The link has the API handle 0x78 alone (`send_receive`'s supported
         // pending codes), so no profile's 0x21 or 0x23 makes it absorb a busy answer the log
@@ -2622,6 +2625,18 @@ fn pending_visibility(forwards_pendings: Option<bool>) -> PendingVisibility {
     } else {
         PendingVisibility::AbsorbedByVci
     }
+}
+
+/// The response identifiers of the host's receive table, each once, in the table's order
+/// (ADR-432).
+fn receive_ids_of(table: &[(u32, u32)]) -> Vec<u32> {
+    let mut ids = Vec::new();
+    for &(_, receive) in table {
+        if !ids.contains(&receive) {
+            ids.push(receive);
+        }
+    }
+    ids
 }
 
 /// The communication log's form of the rejected results: each read with a log, its response
@@ -7746,6 +7761,10 @@ mod tests {
         });
         progress.pendings[0].read = read;
         assert_eq!(pending_ids_of(&progress.pendings, &TABLE), [Some(0x7E9)]);
+        // ADR-432: a functional exchange's evidence carries the table's identifiers once each.
+        assert_eq!(receive_ids_of(&TABLE), [0x7E8, 0x7E9, 0x7EA]);
+        assert_eq!(receive_ids_of(&[(0x7DF, 0x7E8), (0x7E0, 0x7E8)]), [0x7E8]);
+        assert!(receive_ids_of(&[]).is_empty());
         // With no identifier in the header, the unique-response number names the table entry.
         let mut by_number = Progress::collecting(&[0x3E, 0x00]).unwrap();
         let _ = by_number.on_event(answer_on(None, 3, &[0x7F, 0x3E, 0x78]), COP);

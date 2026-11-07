@@ -903,12 +903,15 @@ pub(crate) fn standing_answers<T, K: PartialEq>(
         .collect()
 }
 
-/// The end of a collecting request that was not ended by an error or the agent's deadline: its
-/// first answer's, or no response when nothing answered (ADR-396 item 4). The one rule the host
-/// ends an exchange by and the log restates a settled end by (ADR-425).
-pub(crate) fn collecting_end(answers: &[Answer]) -> End {
+/// The end of a collecting request that was not ended by an error or the agent's deadline: the
+/// end of its first standing answer that is not a pending, or no response when nothing answered
+/// or only pendings did (ADR-396 item 4, ADR-429). A pending is no final response, so a lone
+/// one leaves the request owed. The one rule the host ends an exchange by and the log restates
+/// a settled end by (ADR-425).
+pub(crate) fn collecting_end(answers: &[Answer], expected: &Expected) -> End {
     answers
-        .first()
+        .iter()
+        .find(|answer| !answer.is_pending(expected))
         .map_or(End::NoResponse, |answer| answer.end.clone())
 }
 
@@ -1271,6 +1274,40 @@ impl Evidence {
         self.request.first().copied()
     }
 
+    /// The response identifiers whose last standing answer is a pending, in the order they first
+    /// answered: a collecting request is owed once on each of them (design 8.11 "Owed request",
+    /// ADR-429). Empty for any other request.
+    pub(crate) fn open_pending_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if !self.collecting {
+            return ids;
+        }
+        for answer in &self.answers {
+            if answer.is_pending(&self.expected) && !ids.contains(&answer.rx_id) {
+                ids.push(answer.rx_id);
+            }
+        }
+        ids
+    }
+
+    /// The request may have reached the ECU, so the exchange awaits an answer: it was neither
+    /// not sent nor refused after a VCI loss.
+    pub(crate) fn awaits_response(&self) -> bool {
+        !matches!(
+            self.end,
+            End::NotSent(_)
+                | End::VciLost {
+                    refused_after_loss: true
+                }
+        )
+    }
+
+    /// The exchange has a final response and no identifier is left open on a pending
+    /// ([`LinkEffect::settles`]), so a final response settles its owed request.
+    pub(crate) fn settles_owed(&self) -> bool {
+        self.final_response().is_some() && !self.end_rejected && self.open_pending_ids().is_empty()
+    }
+
     /// The final response's bytes, when the exchange ended with one.
     fn final_response(&self) -> Option<&[u8]> {
         match &self.end {
@@ -1435,6 +1472,9 @@ struct LinkEffect {
     /// The owed requests the answer could belong to.
     owners: Vec<u64>,
     final_response: bool,
+    /// The response identifiers whose last standing answer is a pending
+    /// ([`Evidence::open_pending_ids`]): the exchange is owed on each.
+    open_pending_ids: Vec<u32>,
     positive: bool,
     /// The final response is one the agent cannot use.
     unusable: bool,
@@ -1450,6 +1490,13 @@ struct LinkEffect {
 }
 
 impl LinkEffect {
+    /// The exchange has a final response and no identifier is left open on a pending (ADR-429).
+    /// `placed_alone` adds to it that no owed request could own the answer, and `record` reads
+    /// that; a settling entry adds the answer's own end ([`ExchangeEntry::settled_answer`]).
+    fn settles(&self) -> bool {
+        self.final_response && self.open_pending_ids.is_empty()
+    }
+
     /// A session change or ECUReset that may have been carried out, though nothing shows it:
     /// one whose answer the agent cannot use, or one sent, with its positive response
     /// suppressed and no final response, whose silence is not classified `none` (no judged
@@ -1501,6 +1548,9 @@ pub(crate) struct Kept {
     /// beginning, judged against the limit in force (a `late_item`, ADR-370, design 8.11
     /// "Settlement"): it decides a late response that completes that response.
     pub late_start: Option<LateStart>,
+    /// The response identifier [`Kept::late_start`] was judged on, for a collecting exchange: a
+    /// start on one identifier says nothing of another's response (ADR-429).
+    pub late_start_id: Option<u32>,
     /// The forwarded pendings read after its entry, each with how it stood against the limit in
     /// force before it (a `late_item`, ADR-371). They come after [`Kept::pendings`], which are
     /// the ones its entry saw and judge its timing; only one in time carries the limit on.
@@ -1539,6 +1589,22 @@ impl From<Option<(Clock, super::clocks::Placed)>> for AnswerTime {
 }
 
 impl Kept {
+    /// The late start that bears on a response with identifier `response_id` (`None` when it
+    /// names none): a collecting exchange's start counts for a response on the identifier it was
+    /// judged on, or an unnamed one when that is the only identifier open; any other exchange's
+    /// start counts for its response.
+    pub(crate) fn late_start_for(&self, response_id: Option<u32>) -> Option<LateStart> {
+        let start = self.late_start?;
+        let (true, Some(own)) = (self.evidence.collecting, self.late_start_id) else {
+            return Some(start);
+        };
+        let applies = match response_id {
+            Some(id) => id == own,
+            None => self.evidence.open_pending_ids() == [own],
+        };
+        applies.then_some(start)
+    }
+
     /// The time of the item that answers this exchange (design 8.11 `late_item`, ADR-384,
     /// ADR-385): the final response (`final_response`), else the latest pending, the settling
     /// entry's own (`new_pendings`); a start (`start`) only when the exchange has no answer yet,
@@ -1847,6 +1913,8 @@ impl LinkState {
                 rx_id.is_none_or(|id| id == owed.rx_id) && owed.expected.matches(response)
             })
             .map(|owed| owed.seq)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
@@ -1990,6 +2058,20 @@ impl LinkState {
         self.kept.remove(&seq);
     }
 
+    /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
+    /// still owed per an identifier a pending is open on: its ECU's final answer can still settle
+    /// it (ADR-429).
+    pub(crate) fn release_kept_ended(&mut self, seq: u64) {
+        let open = self.owed.iter().any(|owed| owed.seq == seq)
+            && self
+                .kept
+                .get(&seq)
+                .is_some_and(|kept| !kept.evidence.open_pending_ids().is_empty());
+        if !open {
+            self.kept.remove(&seq);
+        }
+    }
+
     /// The history of `evidence`, an exchange's evidence that a settling entry for exchange
     /// `seq` gives: the exchange is not an owed request its own answer could belong to.
     /// (Answer histories: [`LinkState::answer_histories`].)
@@ -2092,15 +2174,86 @@ impl LinkState {
         if effect.sent == Sent::Unknown {
             self.unknown_sends += 1;
         }
-        let placed_alone = effect.owners.is_empty() && (effect.final_response || accepting);
+        let placed_alone = entry.placed_alone();
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
         if let (true, false, Some(sid)) = (may_have_arrived, placed_alone, effect.sid) {
-            self.owed.push(Owed {
-                seq: entry.seq,
-                rx_id: effect.rx_id,
+            self.set_owed_rows(
+                entry.seq,
                 sid,
-                expected: effect.expected.clone(),
+                &effect.expected,
+                effect.rx_id,
+                &effect.open_pending_ids,
+            );
+        }
+    }
+
+    /// Sets the rows exchange `seq` is owed on, replacing any it had: one for each response
+    /// identifier a pending is open on (ADR-429), else one on its link's identifier `rx_id`,
+    /// which a functional link does not name (it is 0).
+    fn set_owed_rows(
+        &mut self,
+        seq: u64,
+        sid: u8,
+        expected: &Expected,
+        rx_id: u32,
+        open_pending_ids: &[u32],
+    ) {
+        self.owed.retain(|owed| owed.seq != seq);
+        let ids = if open_pending_ids.is_empty() {
+            vec![rx_id]
+        } else {
+            open_pending_ids.to_vec()
+        };
+        for rx_id in ids {
+            self.owed.push(Owed {
+                seq,
+                rx_id,
+                sid,
+                expected: expected.clone(),
             });
+        }
+    }
+
+    /// Exchange `seq`, a collecting exchange still owed after its primitive ended, has `evidence`
+    /// and the placed items of it now: it is owed on the identifiers a pending is open on in
+    /// them, and a late item is judged against them (ADR-429). Nothing for an exchange that is
+    /// not owed.
+    pub(crate) fn renew_owed(
+        &mut self,
+        seq: u64,
+        evidence: &Evidence,
+        placed: (
+            Vec<super::timing::At>,
+            Vec<usize>,
+            Vec<usize>,
+            Vec<super::timing::At>,
+        ),
+    ) {
+        let Some(sid) = self
+            .owed
+            .iter()
+            .find(|owed| owed.seq == seq)
+            .map(|owed| owed.sid)
+        else {
+            return;
+        };
+        self.set_owed_rows(
+            seq,
+            sid,
+            &evidence.expected,
+            evidence.rx_id,
+            &evidence.open_pending_ids(),
+        );
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            // The late pendings are in `placed` already (`Kept::all_pendings`).
+            kept.late_pendings.clear();
+            kept.evidence = evidence.clone();
+            (
+                kept.pendings,
+                kept.pending_order,
+                kept.answer_order,
+                kept.answer_ends,
+            ) = placed;
         }
     }
 
@@ -2928,6 +3081,14 @@ impl LinkState {
     pub(crate) fn forget_late_start(&mut self, seq: u64) {
         if let Some(kept) = self.kept.get_mut(&seq) {
             kept.late_start = None;
+            kept.late_start_id = None;
+        }
+    }
+
+    /// Records the identifier the latest late start of owed exchange `seq` was judged on.
+    pub(crate) fn set_late_start_id(&mut self, seq: u64, rx_id: Option<u32>) {
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.late_start_id = rx_id;
         }
     }
 
@@ -3175,10 +3336,16 @@ impl ExchangeEntry {
         self.effect.link_error
     }
 
+    /// Whether the exchange has a final response and no identifier open on a pending
+    /// ([`LinkEffect::settles`]).
+    pub(crate) fn settles(&self) -> bool {
+        self.effect.settles()
+    }
+
     /// The answer this entry, a settling entry's view of the earlier exchange `kept` with its new
     /// evidence, adds for the later exchanges on its link ([`LinkState::reclassify_after`]),
     /// counted as [`LinkState::record`] counts an exchange's answer.
-    pub(crate) fn settled_answer(&self, kept: &Kept) -> SettledAnswer {
+    pub(crate) fn settled_answer(&self, kept: &Kept, settles: bool) -> SettledAnswer {
         let effect = &self.effect;
         let before = &kept.evidence;
         SettledAnswer {
@@ -3188,7 +3355,7 @@ impl ExchangeEntry {
                 && before.answer_head().is_none()
                 && !before.response_started,
             newly_matched: self.matched_answer() && !kept.matched,
-            final_response: effect.final_response,
+            final_response: settles,
             clears: kept.clears,
             since_error: true,
         }
@@ -3236,7 +3403,7 @@ impl ExchangeEntry {
     /// Whether its answer is placed with it alone, so it is owed nothing, as
     /// [`LinkState::record`] reads it.
     fn placed_alone(&self) -> bool {
-        self.effect.owners.is_empty() && (self.effect.final_response || self.accepting())
+        self.effect.owners.is_empty() && (self.accepting() || self.effect.settles())
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -3256,6 +3423,7 @@ impl ExchangeEntry {
             bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
             final_response: evidence.final_response().is_some() && !evidence.end_rejected,
+            open_pending_ids: evidence.open_pending_ids(),
             positive: matches!(evidence.end, End::Positive(_)),
             unusable: matches!(evidence.end, End::PositiveUnusable(_)),
             suppressed: evidence.suppressed,
@@ -3584,10 +3752,12 @@ pub(crate) fn settle_late_response(
     answered: &Evidence,
     window: super::timing::LateWindow,
     history: &LinkHistory,
+    response_id: Option<u32>,
 ) -> (Classification, String) {
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
     let base = classify(answered, history);
+    let late_start = kept.late_start_for(response_id);
     // A start of the response read late (ADR-370): one before the limit less the margin means
     // the response started in time, so the system missed it, but only for a response that
     // spans frames, since one that fits one frame came after a transfer the ECU aborted; one
@@ -3597,7 +3767,7 @@ pub(crate) fn settle_late_response(
         .end
         .response()
         .is_none_or(|response| response.len() > super::SINGLE_FRAME_MAX);
-    let window = match (window, kept.late_start) {
+    let window = match (window, late_start) {
         (LateWindow::Late { .. } | LateWindow::Open, Some(LateStart::InTime { at_us }))
             if spans_frames =>
         {
@@ -3607,10 +3777,7 @@ pub(crate) fn settle_late_response(
         (window, _) => window,
     };
     let at_limit = kept.evidence.timing.window == Window::TimeoutAtLimit
-        || matches!(
-            kept.late_start,
-            Some(LateStart::Late { at_limit: true, .. })
-        );
+        || matches!(late_start, Some(LateStart::Late { at_limit: true, .. }));
     let (classification, mut reason) = match window {
         LateWindow::InTime { at_us } => (
             System,
@@ -3679,6 +3846,7 @@ pub(crate) fn settle_late_pending(
     window: super::timing::LateWindow,
     base: Classification,
     base_reason: &str,
+    pending_id: Option<u32>,
 ) -> (Classification, String) {
     use super::timing::LateWindow;
     use Classification::{System, Undetermined, Vehicle};
@@ -3697,7 +3865,7 @@ pub(crate) fn settle_late_pending(
             );
             let at_limit = kept.evidence.timing.window == Window::TimeoutAtLimit
                 || matches!(
-                    kept.late_start,
+                    kept.late_start_for(pending_id),
                     Some(LateStart::Late { at_limit: true, .. })
                 );
             if base >= Undetermined {
@@ -4627,6 +4795,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            late_start_id: None,
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
             floor: None,
@@ -4670,7 +4839,7 @@ mod tests {
     fn final_answer(state: &LinkState, seq: u64, kept: &Kept, response: &[u8]) -> SettledAnswer {
         let answered = kept.answered(response);
         let history = state.history_settling(&answered, seq);
-        ExchangeEntry::build(seq, answered, history).settled_answer(kept)
+        ExchangeEntry::build(seq, answered, history).settled_answer(kept, true)
     }
 
     /// The settling entry's view of exchange `seq`, kept as `kept`, that gets `response` late,
@@ -4687,7 +4856,7 @@ mod tests {
         let history = state.history_settling(&answered, seq);
         let entry = ExchangeEntry::build(seq, answered.clone(), history);
         state.settled(seq, entry.classification, &entry.reason, answered, true);
-        let answer = entry.settled_answer(kept);
+        let answer = entry.settled_answer(kept, true);
         let (changed, through) =
             super::super::settle_later(state, seq, entry.late_restart(), &answer);
         (entry, changed, through)
@@ -5574,7 +5743,7 @@ mod tests {
             let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
             let history = state.history_settling(&response, 2);
             let entry = ExchangeEntry::build(2, response.clone(), history);
-            let mut answer = entry.settled_answer(&kept);
+            let mut answer = entry.settled_answer(&kept, true);
             assert!(answer.newly_matched, "{late_us}");
             let time =
                 kept.answer_time(Some(Some(placed_at(Clock::Device, 0, late_us))), &[], None);
@@ -5619,7 +5788,7 @@ mod tests {
             let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
             let history = state.history_settling(&response, 2);
             let entry = ExchangeEntry::build(2, response, history);
-            let mut answer = entry.settled_answer(&kept);
+            let mut answer = entry.settled_answer(&kept, true);
             assert!(!answer.newly_answered && !answer.newly_matched);
             let time =
                 kept.answer_time(Some(Some(placed_at(Clock::Device, 0, late_us))), &[], None);
@@ -6062,7 +6231,7 @@ mod tests {
             let history = state.history_settling(&answered, seq);
             let entry = ExchangeEntry::build(seq, answered.clone(), history);
             state.settled(seq, entry.classification, &entry.reason, answered, true);
-            let mut answer = entry.settled_answer(&kept);
+            let mut answer = entry.settled_answer(&kept, true);
             let (clock, placed) = placed_at(Clock::Device, 0, at);
             state.judge_answer(&mut answer, AnswerTime::At(clock, placed));
             assert!(!answer.since_error, "{seq}");
@@ -6092,7 +6261,7 @@ mod tests {
         let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
         let history = state.history_settling(&answered, 1);
         let entry = ExchangeEntry::build(1, answered.clone(), history);
-        let mut settled = entry.settled_answer(&kept);
+        let mut settled = entry.settled_answer(&kept, true);
         let (clock, placed) = placed_at(Clock::Device, 0, 2_500);
         state.judge_answer(&mut settled, AnswerTime::At(clock, placed));
         assert!(!settled.since_error);
@@ -6180,7 +6349,7 @@ mod tests {
         let late = kept.answered(&response);
         let history = state.history_settling(&late, 1);
         let entry = ExchangeEntry::build(1, late.clone(), history);
-        let mut settled = entry.settled_answer(&kept);
+        let mut settled = entry.settled_answer(&kept, true);
         let (clock, placed) = placed_at(Clock::Device, 0, 7_000);
         state.judge_answer(&mut settled, AnswerTime::At(clock, placed));
         state.settled(1, entry.classification, &entry.reason, late, true);
@@ -6204,7 +6373,7 @@ mod tests {
         let kept = state.kept(1).unwrap().clone();
         let history = state.history_settling(&kept.evidence, 1);
         let entry = ExchangeEntry::build(1, kept.evidence.clone(), history);
-        let mut settled = entry.settled_answer(&kept);
+        let mut settled = entry.settled_answer(&kept, true);
         let time = kept.answer_time(None, &[], None);
         assert_eq!(time, AnswerTime::None);
         state.judge_answer(&mut settled, time);
@@ -7127,6 +7296,7 @@ mod tests {
             limits: None,
             start_unattached: false,
             late_start: None,
+            late_start_id: None,
             answer_at: AnswerTime::None,
             late_pendings: Vec::new(),
             floor: None,
@@ -7135,7 +7305,7 @@ mod tests {
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response);
-            settle_late_response(kept, &answered, window, &LinkHistory::empty())
+            settle_late_response(kept, &answered, window, &LinkHistory::empty(), None)
         };
         let positive = [0x62, 0xF1, 0x86, 0x01];
         let vehicle = kept(Classification::Vehicle);
@@ -7178,6 +7348,52 @@ mod tests {
         );
         assert_eq!(class, Classification::System);
         assert!(reason.contains("stands"), "{reason}");
+    }
+
+    /// ADR-429: a late start bears on a late pending of the identifier it was judged on only.
+    #[test]
+    fn a_late_start_bears_on_a_late_pending_of_its_identifier_only() {
+        use super::super::timing::LateWindow;
+        let mut silent = forwarding(evidence(&READ_F186, End::NoResponse));
+        silent.vci_ended = true;
+        silent.collecting = true;
+        silent.timing.window = Window::NotJudged;
+        let kept = Kept {
+            evidence: silent.clone(),
+            origin: silent.origin,
+            request: Request::of(&silent),
+            classification: Classification::None,
+            sent: Sent::Confirmed,
+            transmit: None,
+            pendings: Vec::new(),
+            pending_order: Vec::new(),
+            answer_order: Vec::new(),
+            answer_ends: Vec::new(),
+            limits: None,
+            start_unattached: false,
+            late_start: Some(LateStart::Late {
+                by_us: 1,
+                at_limit: true,
+            }),
+            late_start_id: Some(0x7E8),
+            answer_at: AnswerTime::None,
+            late_pendings: Vec::new(),
+            floor: None,
+            clears: Clears::default(),
+            matched: false,
+        };
+        let judged = |id| {
+            settle_late_pending(
+                &kept,
+                LateWindow::Late { by_us: 1 },
+                Classification::None,
+                "",
+                id,
+            )
+            .0
+        };
+        assert_eq!(judged(Some(0x7E8)), Classification::Vehicle);
+        assert_eq!(judged(Some(0x7E9)), Classification::Undetermined);
     }
 
     #[test]
@@ -7238,6 +7454,7 @@ mod tests {
                 limits: None,
                 start_unattached: false,
                 late_start: None,
+                late_start_id: None,
                 answer_at: AnswerTime::None,
                 late_pendings: Vec::new(),
                 floor: None,

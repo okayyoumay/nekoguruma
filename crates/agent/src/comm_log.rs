@@ -1844,8 +1844,8 @@ fn judge_windows(
 /// `judge_late_start` take it: where the window started (`None` is the transmit, as for
 /// [`timing::judge`]) and the pendings that came in it (ADR-426).
 ///
-/// A collecting exchange's late item is judged as a final answer on the link's own response
-/// identifier would be at that place in the order the host read the items, by the one rule that
+/// A collecting exchange's late item is judged as a final answer on the identifier the item came on
+/// would be at that place in the order the host read the items, by the one rule that
 /// judges its answers ([`answer_windows`], ADR-425): the identifier's pendings since its previous
 /// final answer, the window starting at the latest final answer of any identifier before the
 /// first of them, or at the last final answer when there are none, else at the transmit. The
@@ -1853,7 +1853,7 @@ fn judge_windows(
 /// late one is passed over, as for [`exchange::Kept::limit_pendings`]. Any other exchange is
 /// judged from the transmit with its limit pendings (ADR-371). A window that cannot be placed is
 /// `Some(None)`, which leaves the judgement open.
-fn late_window(kept: &exchange::Kept) -> (Option<timing::At>, Vec<timing::At>) {
+fn late_window(kept: &exchange::Kept, rx_id: u32) -> (Option<timing::At>, Vec<timing::At>) {
     let evidence = &kept.evidence;
     if !evidence.collecting {
         return (None, kept.limit_pendings());
@@ -1893,10 +1893,10 @@ fn late_window(kept: &exchange::Kept) -> (Option<timing::At>, Vec<timing::At>) {
             }
         }
     }
-    // The item itself stands for a final answer on the link's identifier, read last.
+    // The item itself stands for a final answer on the identifier it came on, read last.
     let mut probe = evidence.clone();
     probe.answers.push(exchange::Answer {
-        rx_id: evidence.rx_id,
+        rx_id,
         end: exchange::End::Positive(Vec::new()),
         vci_us: None,
         clock: None,
@@ -2542,25 +2542,22 @@ impl CommLog {
             .and_then(|time| time.placed())
             .into_iter()
             .collect();
-        let awaits = !matches!(
-            evidence.end,
-            exchange::End::NotSent(_)
-                | exchange::End::VciLost {
-                    refused_after_loss: true
-                }
-        );
+        let awaits = evidence.awaits_response();
         let in_flight_tx = match evidence.target {
             exchange::Target::Endpoint { tx_id, .. } if awaits => Some(tx_id),
             _ => None,
         };
+        // A collecting exchange awaits answers on any identifier, and a functional link's own is
+        // 0 (ADR-429).
+        let in_flight_collecting = awaits && evidence.collecting;
         let in_flight_rx = awaits.then_some(evidence.rx_id);
         let in_flight_expected = evidence.expected.clone();
         let in_flight = |item: &UnattachedItem, placed, kind, id| {
             let uses = match kind {
                 LateIndication::Transmit(_) => in_flight_tx == Some(id),
-                LateIndication::Start => in_flight_rx == Some(id),
+                LateIndication::Start => in_flight_collecting || in_flight_rx == Some(id),
                 LateIndication::Pending => {
-                    in_flight_rx == Some(id)
+                    (in_flight_collecting || in_flight_rx == Some(id))
                         && item
                             .pending_bytes()
                             .is_some_and(|bytes| in_flight_expected.pending(bytes))
@@ -2966,6 +2963,7 @@ impl CommLog {
             limits: judged_from.map(|(_, limits)| limits),
             start_unattached,
             late_start: None,
+            late_start_id: None,
             answer_at: exchange::AnswerTime::None,
             late_pendings: Vec::new(),
             floor: None,
@@ -3131,6 +3129,15 @@ impl CommLog {
         let mut inner = self.lock();
         for (_, state) in &mut inner.links {
             state.release_kept(seq);
+        }
+    }
+
+    /// [`CommLog::release_kept`] for the exchange whose `primitive_ended` was just written,
+    /// except one left owed per an open identifier (ADR-429).
+    pub(crate) fn release_kept_ended(&self, seq: u64) {
+        let mut inner = self.lock();
+        for (_, state) in &mut inner.links {
+            state.release_kept_ended(seq);
         }
     }
 
@@ -3456,8 +3463,8 @@ impl CommLog {
             evidence.answers = keep_standing(answers, &standing);
             answer_order = keep_standing(answer_order, &standing);
             answer_ends = keep_standing(answer_ends, &standing);
-            // The end is the first answer left standing, as an exchange that ended on its own
-            // has it (ADR-396 item 4); an error or a lost VCI keeps its own.
+            // The end is the first standing answer that is not a pending, as an exchange that ended
+            // on its own has it (ADR-396 item 4, ADR-429); an error or a lost VCI keeps its own.
             if matches!(
                 evidence.end,
                 exchange::End::Positive(_)
@@ -3465,7 +3472,7 @@ impl CommLog {
                     | exchange::End::PositiveUnusable(_)
                     | exchange::End::NoResponse
             ) {
-                evidence.end = exchange::collecting_end(&evidence.answers);
+                evidence.end = exchange::collecting_end(&evidence.answers, &evidence.expected);
             }
         }
         // The entry's VCI times are the ones its exchange had, with the end's over them; the
@@ -3669,7 +3676,8 @@ impl CommLog {
                     });
             }
         }
-        let final_response = evidence.end.response().is_some();
+        // A collecting exchange with a pending still open on an identifier stays owed (ADR-429).
+        let final_response = evidence.settles_owed();
         let state = &mut inner.links[at].1;
         if final_response {
             state.settle_owed(seq);
@@ -3685,6 +3693,23 @@ impl CommLog {
         let times = evidence.times.vci;
         let settled_evidence = evidence.clone();
         let entry = exchange::ExchangeEntry::build(seq, evidence, history);
+        if collecting && !final_response {
+            // Still owed: on the identifiers a pending is open on after what was read, and a
+            // late item is judged against the answers read after the deadline, with the send
+            // and the transmit they show (ADR-429).
+            let state = &mut inner.links[at].1;
+            state.renew_owed(
+                seq,
+                &settled_evidence,
+                (
+                    pendings.clone(),
+                    pending_order.clone(),
+                    answer_order.clone(),
+                    answer_ends.clone(),
+                ),
+            );
+            state.update_kept(seq, settled_evidence.clone(), entry.sent, transmit, None);
+        }
         let (classification, reason) =
             exchange::settle_primitive_ended(&entry, observed, unanswered);
         // The answers its end adds count for the later exchanges on the link.
@@ -3709,7 +3734,7 @@ impl CommLog {
             answer_from.clears = inner.links[at].1.clears();
         }
         let state = &mut inner.links[at].1;
-        let mut answer = entry.settled_answer(&answer_from);
+        let mut answer = entry.settled_answer(&answer_from, final_response);
         if error_with_end.is_some() {
             answer.no_matched_answer();
         }
@@ -4297,7 +4322,9 @@ fn late_response_owner(
         return None;
     }
     let in_flight = evidence.is_some_and(|evidence| {
-        identifier.is_none_or(|id| id == evidence.rx_id) && evidence.expected.matches(bytes)
+        evidence.awaits_response()
+            && (evidence.collecting || identifier.is_none_or(|id| id == evidence.rx_id))
+            && evidence.expected.matches(bytes)
     });
     let owners = state.late_response_owners(*identifier, bytes);
     // A pending is a late item, not a late response.
@@ -4404,24 +4431,52 @@ impl Inner {
         let answered = kept.answered(bytes);
         let history = state.history_for(&answered);
         let time = item.clock.zip(placed);
-        let (window_from, in_window) = late_window(&kept);
-        let window = kept.limits.map_or(timing::LateWindow::Open, |limits| {
-            timing::judge_late(
-                limits,
-                kept.evidence.absorbing(),
-                kept.transmit,
-                window_from,
-                &in_window,
-                time,
-                bytes.len(),
-            )
-        });
+        let named = match &item.data {
+            UnattachedData::Result { identifier, .. } => *identifier,
+            _ => None,
+        };
+        // The identifiers it could have come on: the one it names, else those a pending is open
+        // on, else the link's own (ADR-429). It is judged against each one's window.
+        let ids: Vec<u32> = match &item.data {
+            UnattachedData::Result {
+                identifier: Some(identifier),
+                ..
+            } => vec![*identifier],
+            _ => match kept.evidence.open_pending_ids() {
+                open if open.is_empty() => vec![kept.evidence.rx_id],
+                open => open,
+            },
+        };
+        let judge = |rx_id| {
+            let (window_from, in_window) = late_window(&kept, rx_id);
+            kept.limits.map_or(timing::LateWindow::Open, |limits| {
+                timing::judge_late(
+                    limits,
+                    kept.evidence.absorbing(),
+                    kept.transmit,
+                    window_from,
+                    &in_window,
+                    time,
+                    bytes.len(),
+                )
+            })
+        };
+        // Verdicts that differ leave the window open.
+        let mut verdicts = ids.iter().map(|&id| judge(id));
+        let first = verdicts.next().unwrap_or(timing::LateWindow::Open);
+        let window =
+            if verdicts.all(|v| std::mem::discriminant(&v) == std::mem::discriminant(&first)) {
+                first
+            } else {
+                timing::LateWindow::Open
+            };
         let (classification, reason) =
-            exchange::settle_late_response(&kept, &answered, window, &history);
+            exchange::settle_late_response(&kept, &answered, window, &history, named);
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
-        let mut answer = entry.settled_answer(&kept);
+        // A late response always settles its exchange, whatever its kept evidence still lists.
+        let mut answer = entry.settled_answer(&kept, true);
         let answer_time = kept.answer_time(Some(time), &[], None);
         state.judge_answer(&mut answer, answer_time);
         let restart = entry.late_restart();
@@ -4550,9 +4605,15 @@ impl Inner {
         let mut vci = evidence.times.vci.unwrap_or_default();
         let time = exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed);
         let mut late_start = None;
+        // The response identifier the item came on; a functional link's own is 0, which names
+        // none of its ECUs (ADR-429).
+        let item_rx_id = match (kind, item.late_indication()) {
+            (LateIndication::Transmit(_), _) | (_, None) => evidence.rx_id,
+            (_, Some((_, id))) => id,
+        };
         // The limit in force for what came after the exchange ended, and the window it runs
         // from (ADR-426).
-        let (window_from, limit_pendings) = late_window(&kept);
+        let (window_from, limit_pendings) = late_window(&kept, item_rx_id);
         let what = match kind {
             LateIndication::Transmit(transmit) => {
                 evidence.transmit_evidence = Some(transmit);
@@ -4566,7 +4627,7 @@ impl Inner {
                 evidence.response_started = true;
                 // The response's start when it came after the last pending and the response
                 // spans frames, as for an exchange.
-                // A collecting exchange's start is the link's identifier's, so it follows that
+                // A collecting exchange's start is its identifier's, so it follows that
                 // identifier's last pending, not another's (ADR-426).
                 let last_pending = if evidence.collecting {
                     limit_pendings.last().copied()
@@ -4608,9 +4669,9 @@ impl Inner {
                     .read
                     .filter(|read| read.epoch == evidence.times.agent.epoch)
                     .map_or(evidence.times.agent.end_us, |read| read.monotonic_us);
-                // It came on the link's own response identifier (ADR-426).
+                // It came on the identifier it carries (ADR-426, ADR-429).
                 evidence.pending_ids.resize(evidence.pending.len(), None);
-                evidence.pending_ids.push(Some(evidence.rx_id));
+                evidence.pending_ids.push(Some(item_rx_id));
                 evidence.pending.push(exchange::Pending {
                     vci_us: Some(u64::from(item.vci_us)),
                     clock: item.clock,
@@ -4679,7 +4740,7 @@ impl Inner {
             // "Settlement"). The latest start is judged: one that replaces an earlier start
             // ends that one's judgement.
             // A collecting exchange the VCI ended is judged when no error, loss or unknown end
-            // ended it and the link's own identifier's latest answer is no final one (ADR-426);
+            // ended it and the late item's identifier's latest answer is no final one (ADR-426, ADR-429);
             // any other when its response did not complete.
             let judge_start = if evidence.collecting {
                 evidence.vci_ended
@@ -4694,7 +4755,7 @@ impl Inner {
                         .answers
                         .iter()
                         .rev()
-                        .find(|answer| answer.rx_id == evidence.rx_id)
+                        .find(|answer| answer.rx_id == item_rx_id)
                         .is_none_or(|answer| answer.is_pending(&evidence.expected))
             } else {
                 matches!(evidence.end, exchange::End::ResponseIncomplete)
@@ -4754,8 +4815,13 @@ impl Inner {
         // (`settle_late_response`): it stands as a floor, since a later item cannot refute a time
         // the VCI observed.
         let pending_floor = pending_window.map(|window| {
-            let (verdict, text) =
-                exchange::settle_late_pending(&kept, window, classification, &reason);
+            let (verdict, text) = exchange::settle_late_pending(
+                &kept,
+                window,
+                classification,
+                &reason,
+                Some(item_rx_id),
+            );
             classification = verdict;
             reason = text;
             let late_pending = match window {
@@ -4771,7 +4837,12 @@ impl Inner {
         };
         // While the response does not complete, `undetermined` stands (design 8.11
         // "Settlement").
-        match late_start.unwrap_or(kept.late_start) {
+        // A start bears on the item only for the identifier it was judged on (ADR-429).
+        let item_id = match kind {
+            LateIndication::Pending => Some(item_rx_id),
+            LateIndication::Transmit(_) | LateIndication::Start => None,
+        };
+        match late_start.unwrap_or_else(|| kept.late_start_for(item_id)) {
             Some(exchange::LateStart::InTime { at_us }) => {
                 classification = classification.max(exchange::Classification::Undetermined);
                 reason.push_str(&format!(
@@ -4799,7 +4870,12 @@ impl Inner {
             reason.push_str(&suffix);
         }
         state.settled_from_evidence(owner, classification, &reason, evidence.clone());
+        let collecting = evidence.collecting;
         state.update_kept(owner, evidence, entry.sent, transmit, late_start);
+        if kind == LateIndication::Start && late_start.is_some() {
+            // The start was judged on the identifier it came on (ADR-429).
+            state.set_late_start_id(owner, collecting.then_some(item_rx_id));
+        }
         if let Some((late_pending, verdict)) = pending_floor {
             state.add_kept_late_pending(owner, item.clock.zip(placed), late_pending);
             if verdict > entry.classification
@@ -4810,7 +4886,7 @@ impl Inner {
                 state.raise(owner, verdict, &reason, exchange::LATE_PENDING_FLOOR);
             }
         }
-        let mut answer = entry.settled_answer(&kept);
+        let mut answer = entry.settled_answer(&kept, entry.settles());
         // The answer's time is that of the item that answers (ADR-384): this pending, or the
         // exchange's latest, for a transmit or start indication, which answers nothing
         // (ADR-354); a start's own time decides only an answer that is a start alone.
@@ -8722,13 +8798,25 @@ pub(crate) mod tests {
 
     /// Opens a log with the link `collecting_entry` logs on: P2 1 s, P2* 5 s, a 2 ms margin.
     fn collecting_log() -> (PathBuf, CommLogSetup, CommLog) {
+        collecting_log_on(false)
+    }
+
+    /// [`collecting_log`] on a functional link when `functional` (ADR-396), whose own response
+    /// identifier is 0.
+    fn collecting_log_on(functional: bool) -> (PathBuf, CommLogSetup, CommLog) {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
         log.begin(&facts(), RunKind::First);
+        let config = crate::link::LinkConfig::iso15765(0x7E0, 0x7E8);
+        let config = if functional {
+            config.functional(0x7DF, vec![(0x7E0, 0x7E8), (0x7E1, 0x7E9)])
+        } else {
+            config
+        };
         log.link_opened(
             1,
-            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &config,
             &[],
             crate::link::Indications {
                 transmit: true,
@@ -9396,15 +9484,16 @@ pub(crate) mod tests {
         assert_eq!(entry["sent_evidence"], "tx_done_time", "{entry}");
     }
 
-    /// ADR-396 item 4, ADR-425: the end is the first answer left standing, as an exchange that
-    /// ended on its own has it: a lone pending read after the deadline is a negative end, and a
-    /// kept lone pending on another identifier stays the first answer when a final one is read.
+    /// ADR-396 item 4, ADR-425, ADR-429: the end is the first standing answer that is not a
+    /// pending, as an exchange that ended on its own has it: a lone pending read after the
+    /// deadline is no response, and a kept lone pending on another identifier does not end the
+    /// exchange when a final answer is read.
     #[test]
     fn the_end_of_a_settled_window_is_its_first_standing_answer() {
         let mut items = pending_reads(0x7E8, 200_000);
         items.push(EndItem::Finished(device_time(BASE_US + 1_200_000)));
         let lone = collecting_settled(|_| {}, exchange::End::NoResponse, false, items);
-        assert_eq!(lone["outcome"]["result"], "negative", "{lone}");
+        assert_eq!(lone["outcome"]["result"], "no_response", "{lone}");
         let kept_lone = collecting_settled(
             |evidence| {
                 evidence.answers = vec![answer_on(
@@ -9422,11 +9511,833 @@ pub(crate) mod tests {
                 EndItem::Finished(device_time(BASE_US + 1_400_000)),
             ],
         );
-        assert_eq!(kept_lone["outcome"]["result"], "negative", "{kept_lone}");
+        assert_eq!(kept_lone["outcome"]["result"], "positive", "{kept_lone}");
         assert_eq!(
             kept_lone["answers"].as_array().unwrap().len(),
             2,
             "{kept_lone}"
+        );
+    }
+
+    /// The seqs of the owed requests on link 1 (index 0) that a response of `rx_id` could belong
+    /// to, and whether the log keeps the exchange `seq`.
+    fn owed_on(log: &CommLog, rx_id: u32, seq: u64) -> (Vec<u64>, bool) {
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        (
+            state.late_response_owners(Some(rx_id), &[0x7E, 0x00]),
+            state.kept(seq).is_some(),
+        )
+    }
+
+    fn owed_on_7e8(log: &CommLog, seq: u64) -> (Vec<u64>, bool) {
+        owed_on(log, 0x7E8, seq)
+    }
+
+    /// The final answer of `rx_id` to the presence request, delivered late.
+    fn late_final_on(rx_id: u32) -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(rx_id),
+                bytes: vec![0x7E, 0x00],
+            },
+            ..tx_done(rx_id)
+        }
+    }
+
+    fn late_final_item() -> UnattachedItem {
+        late_final_on(0x7E8)
+    }
+
+    fn lone_pending_on(rx_id: u32) -> exchange::Answer {
+        answer_on(
+            rx_id,
+            exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+            200_000,
+        )
+    }
+
+    /// ADR-429 (design 8.11 "Owed request"): a collecting exchange whose only answer is a
+    /// pending ends with no response, stays owed and kept, and the identifier's later final
+    /// answer is a `late_response` of it, judged from its window (ADR-426). On a functional
+    /// link too, whose own response identifier is 0.
+    #[test]
+    fn a_collecting_exchange_with_a_lone_pending_stays_owed_and_its_final_answer_settles_it() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            });
+            assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true), "{functional}");
+            // 2.8 s after the pending, within the P2* (5 s) it put in force.
+            log.lock()
+                .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+                .unwrap();
+            assert_eq!(owed_on_7e8(&log, seq), (Vec::new(), false));
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = of_event(&lines, "exchange").remove(0);
+            assert_eq!(entry["outcome"]["result"], "no_response", "{entry}");
+            assert_eq!(entry["classification"], "undetermined", "{entry}");
+            let late = of_event(&lines, "late_response").remove(0);
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+            // Judged from the window the pending put in force: in time, so the system missed
+            // it.
+            assert_eq!(
+                late["exchanges"][0]["classification"], "system",
+                "{functional} {late}"
+            );
+            assert!(
+                late["exchanges"][0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("within the limit in force less the margin"),
+                "{functional} {late}"
+            );
+        }
+    }
+
+    /// ADR-429, case 9: a lone pending read after the deadline, with the window finished, is no
+    /// response and the exchange stays owed and kept, on the identifier the pending came on; the
+    /// identifier's final answer is then its `late_response`.
+    #[test]
+    fn a_lone_pending_read_after_the_deadline_leaves_the_exchange_owed() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |_| {});
+            let mut items = pending_reads(0x7E9, 200_000);
+            items.push(EndItem::Finished(device_time(BASE_US + 1_200_000)));
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    end: Some(exchange::End::NoResponse),
+                    detail: exchange::Detail::default(),
+                    vci_ended: true,
+                    reads: read_after_deadline(items),
+                },
+            )
+            .unwrap();
+            assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true), "{functional}");
+            assert!(owed_on(&log, 0x7E8, seq).0.is_empty(), "{functional}");
+            assert!(owed_on(&log, 0, seq).0.is_empty() || !functional);
+            log.lock()
+                .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_000_000))
+                .unwrap();
+            assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response").remove(0);
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+        }
+    }
+
+    /// ADR-429, case 11: a lone pending of 0x7E9 and a positive answer of 0x7E8 read after the
+    /// deadline end the exchange with the positive answer, which leaves it owed on 0x7E9 only.
+    #[test]
+    fn a_final_answer_of_another_identifier_does_not_settle_a_lone_pending() {
+        for functional in [false, true] {
+            let (dir, _setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.answers = vec![lone_pending_on(0x7E9)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E9)];
+            });
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    end: Some(exchange::End::Positive(FIRST.to_vec())),
+                    detail: exchange::Detail::default(),
+                    vci_ended: true,
+                    reads: read_after_deadline(vec![
+                        answer_read(0x7E8, 400_000),
+                        EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                    ]),
+                },
+            )
+            .unwrap();
+            assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true), "{functional}");
+            assert!(owed_on(&log, 0x7E8, seq).0.is_empty(), "{functional}");
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-429: a kept lone pending of 0x7E8 whose final answer is read after the deadline, and
+    /// then a pending of 0x7E9, leaves the exchange owed on 0x7E9 only.
+    #[test]
+    fn what_is_read_after_the_deadline_changes_the_identifiers_the_exchange_is_owed_on() {
+        for functional in [false, true] {
+            let (dir, _setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            });
+            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
+            let mut items = vec![answer_read(0x7E8, 400_000)];
+            items.extend(pending_reads(0x7E9, 600_000));
+            items.push(EndItem::Finished(device_time(BASE_US + 1_600_000)));
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    end: Some(exchange::End::NoResponse),
+                    detail: exchange::Detail::default(),
+                    vci_ended: true,
+                    reads: read_after_deadline(items),
+                },
+            )
+            .unwrap();
+            assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true), "{functional}");
+            assert!(owed_on(&log, 0x7E8, seq).0.is_empty(), "{functional}");
+            // The kept evidence is the one read after the deadline.
+            assert_eq!(kept_of(&log, seq).evidence.answers.len(), 2);
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-429, cases 3 and 4: an exchange that ended with 0x7E9's positive answer and holds a
+    /// lone pending of 0x7E8 is owed on 0x7E8, and not on 0x7E9.
+    #[test]
+    fn a_collecting_exchange_with_a_final_answer_and_a_lone_pending_is_owed_on_the_pending() {
+        for functional in [false, true] {
+            for order in [true, false] {
+                let (dir, _setup, log, seq) = late_collecting_on(functional, |evidence| {
+                    evidence.end = exchange::End::Positive(FIRST.to_vec());
+                    evidence.vci_ended = true;
+                    let pending = lone_pending_on(0x7E8);
+                    let positive = positive_on(0x7E9, 400_000);
+                    evidence.answers = if order {
+                        vec![pending, positive]
+                    } else {
+                        vec![positive, pending]
+                    };
+                    evidence.pending = vec![pending_on(200_000)];
+                    evidence.pending_ids = vec![Some(0x7E8)];
+                });
+                assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true));
+                assert!(owed_on(&log, 0x7E9, seq).0.is_empty());
+                std::fs::remove_dir_all(&dir).unwrap();
+            }
+        }
+    }
+
+    /// ADR-429: with two identifiers open the exchange has a row on each, and an answer that
+    /// names no identifier finds it once.
+    #[test]
+    fn an_exchange_owed_on_two_identifiers_is_one_owner() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8), lone_pending_on(0x7E9)];
+            evidence.pending = vec![pending_on(200_000), pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8), Some(0x7E9)];
+        });
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert_eq!(state.late_response_owners(None, &[0x7E, 0x00]), vec![seq]);
+        assert_eq!(state.late_start_owners(0x7E9), (vec![seq], true));
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-429, ADR-426: on a functional link a late start and a late pending of the exchange are
+    /// judged on the identifier they came on, from the window its pending put in force, and the
+    /// pending is recorded on that identifier.
+    #[test]
+    fn a_late_start_and_a_late_pending_on_a_functional_link_are_judged_on_their_identifier() {
+        let build = |evidence: &mut exchange::Evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        };
+        let (dir, _setup, log, seq) = late_collecting_on(true, build);
+        // 4.5 s after the transmit, 4.3 s after the pending: within its P2* (5 s).
+        assert!(
+            matches!(
+                late_start_judged(&log, seq, 4_500_000),
+                Some(exchange::LateStart::InTime { .. })
+            ),
+            "{:?}",
+            kept_of(&log, seq).late_start
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+        let (dir, _setup, log, seq) = late_collecting_on(true, build);
+        assert_eq!(
+            late_pending_judged(&log, seq, 4_500_000),
+            exchange::LatePending::InTime
+        );
+        assert_eq!(
+            kept_of(&log, seq).evidence.pending_ids.last(),
+            Some(&Some(0x7E8))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-429: a presence resend answered on an identifier the earlier exchange is open on has
+    /// that exchange as an owner, and stays `undetermined` while the earlier exchange's
+    /// primitive ends and leaves it owed.
+    #[test]
+    fn an_answer_with_an_owner_stays_undetermined_when_the_owner_stays_owed() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.answers = vec![lone_pending_on(0x7E9)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E9)];
+            });
+            let mut resend = collecting_waited(|evidence| {
+                evidence.end = exchange::End::Positive(FIRST.to_vec());
+                evidence.vci_ended = true;
+                evidence.answers = vec![positive_on(0x7E9, 20_000)];
+            });
+            resend.times.agent.before_us += 10_000_000;
+            resend.times.agent.end_us += 10_000_000;
+            if functional {
+                resend.rx_id = 0;
+            }
+            let resent = log.exchange(resend).unwrap();
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    end: Some(exchange::End::Positive(FIRST.to_vec())),
+                    detail: exchange::Detail::default(),
+                    vci_ended: true,
+                    reads: read_after_deadline(vec![
+                        answer_read(0x7E8, 400_000),
+                        EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                    ]),
+                },
+            )
+            .unwrap();
+            assert!(owed_on(&log, 0x7E9, seq).0.contains(&seq), "{functional}");
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let ended = of_event(&lines, "primitive_ended").remove(0);
+            let exchanges = ended["exchanges"].as_array().unwrap();
+            assert!(
+                exchanges
+                    .iter()
+                    .filter(|settled| settled["seq"] == resent)
+                    .all(|settled| settled["classification"] == "undetermined"),
+                "{functional} {ended}"
+            );
+            let resent_entry = of_event(&lines, "exchange")
+                .into_iter()
+                .find(|entry| entry["seq"] == resent)
+                .unwrap();
+            assert_eq!(
+                resent_entry["classification"], "undetermined",
+                "{resent_entry}"
+            );
+        }
+    }
+
+    /// The primitive-ended entry of `seq` that reads a pending of 0x7E8 and the finished
+    /// status, leaving the exchange a lone pending.
+    fn end_with_lone_pending(log: &CommLog, seq: u64, mut items: Vec<EndItem>) {
+        items.extend(pending_reads(0x7E8, 200_000));
+        items.push(EndItem::Finished(device_time(BASE_US + 1_200_000)));
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(items),
+            },
+        )
+        .unwrap();
+    }
+
+    /// ADR-429, ADR-367 item 3: the host releases what the log kept of a cancelled primitive's
+    /// exchange after its `primitive_ended`, except one left owed per an open identifier, whose
+    /// ECU's later final answer is then its `late_response`.
+    #[test]
+    fn the_release_after_a_primitive_ended_keeps_an_exchange_left_owed_per_an_open_identifier() {
+        for functional in [false, true] {
+            let (dir, _setup, log, seq) = late_collecting_on(functional, |_| {});
+            end_with_lone_pending(&log, seq, Vec::new());
+            log.release_kept_ended(seq);
+            assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true), "{functional}");
+            let inner = log.lock();
+            assert_eq!(
+                late_response_owner(&inner.links[0].1, &late_final_item(), None),
+                Some(LateOwner::One(seq)),
+                "{functional}"
+            );
+            drop(inner);
+            // Any other exchange is released as before.
+            let (other, _setup, quiet, seq) = late_collecting_on(functional, |_| {});
+            quiet.release_kept_ended(seq);
+            assert!(quiet.lock().links[0].1.kept(seq).is_none());
+            std::fs::remove_dir_all(&other).unwrap();
+            std::fs::remove_dir_all(&dir).unwrap();
+        }
+    }
+
+    /// ADR-429: an exchange with no transmit done that a pending read after the deadline
+    /// carries one for is kept with the send confirmed and the transmit placed, so a late final
+    /// answer is judged from it.
+    #[test]
+    fn a_renewed_owed_exchange_keeps_the_send_and_the_transmit_its_end_read() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.times.vci = None;
+            });
+            let mut carrier = lone_pending_on(0x7E8);
+            carrier.tx_done_us = Some(BASE_US);
+            let items = vec![
+                EndItem::Answer(carrier),
+                EndItem::Pending(pending_on(200_000), Some(0x7E8)),
+                EndItem::Finished(device_time(BASE_US + 1_200_000)),
+            ];
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    end: Some(exchange::End::NoResponse),
+                    detail: exchange::Detail::default(),
+                    vci_ended: true,
+                    reads: read_after_deadline(items),
+                },
+            )
+            .unwrap();
+            let kept = kept_of(&log, seq);
+            assert_eq!(kept.sent, exchange::Sent::Confirmed, "{functional}");
+            assert!(kept.transmit.is_some(), "{functional}");
+            log.lock()
+                .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response").remove(0);
+            assert_eq!(late["exchanges"][0]["classification"], "system", "{late}");
+            assert!(
+                late["exchanges"][0]["reason"]
+                    .as_str()
+                    .unwrap()
+                    .contains("within the limit in force less the margin"),
+                "{functional} {late}"
+            );
+        }
+    }
+
+    /// ADR-429: the late pendings an exchange has are in its kept pendings once its primitive
+    /// ends again, and are not counted twice.
+    #[test]
+    fn a_renewed_owed_exchange_counts_its_late_pendings_once() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, |_| {});
+        late_pending_judged(&log, seq, 300_000);
+        assert_eq!(kept_of(&log, seq).late_pendings.len(), 1);
+        end_with_lone_pending(&log, seq, Vec::new());
+        let kept = kept_of(&log, seq);
+        assert_eq!(kept.all_pendings().len(), kept.evidence.pending.len());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-429: a late response that names no identifier is judged on the exchange's single open
+    /// identifier, not on a functional link's own (0).
+    #[test]
+    fn a_late_response_naming_no_identifier_is_judged_on_the_open_identifier() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        let mut item = late_final_item();
+        item.data = UnattachedData::Result {
+            rx_flag: vec![0, 0, 0, 0],
+            identifier: None,
+            bytes: vec![0x7E, 0x00],
+        };
+        log.lock()
+            .late_response(0, seq, &item, placed_after(3_000_000))
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response").remove(0);
+        assert!(
+            late["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("within the limit in force less the margin"),
+            "{late}"
+        );
+    }
+
+    /// ADR-429: a late response that names no identifier, of an exchange open on two, is judged
+    /// against each identifier's window: both in time is `system`, and verdicts that differ leave
+    /// it `undetermined`.
+    #[test]
+    fn a_late_response_naming_no_identifier_is_judged_against_every_open_identifier() {
+        let classified = |second_pending_at_us: u64, second_id: Option<u32>| {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![
+                    lone_pending_on(0x7E8),
+                    answer_on(
+                        0x7E9,
+                        exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+                        second_pending_at_us,
+                    ),
+                ];
+                evidence.pending = vec![pending_on(200_000), pending_on(second_pending_at_us)];
+                evidence.pending_ids = vec![Some(0x7E8), second_id];
+            });
+            let mut item = late_final_item();
+            item.data = UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: None,
+                bytes: vec![0x7E, 0x00],
+            };
+            log.lock()
+                .late_response(0, seq, &item, placed_after(3_000_000))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            of_event(&lines, "late_response").remove(0)["exchanges"][0].clone()
+        };
+        // Pendings at 200 ms on both: 2.8 s later is within P2* (5 s) on each.
+        let both = classified(200_000, Some(0x7E9));
+        assert_eq!(both["classification"], "system", "{both}");
+        // Both pendings came on 0x7E8, so 0x7E9's window has no pending
+        // and P2 (1 s) applies there while 0x7E8's is within P2*: the verdicts differ.
+        let differ = classified(200_000, Some(0x7E8));
+        assert_eq!(differ["classification"], "undetermined", "{differ}");
+    }
+
+    /// ADR-429: a late start is judged on the identifier it came on, and bears on a response of
+    /// that identifier only (an unnamed one when it is the only identifier open).
+    #[test]
+    fn a_late_start_bears_on_a_response_of_its_own_identifier_only() {
+        // `Some(id)`: the final answer names `id`; `None`: it names none. Multi-frame, at 6 s.
+        let classified = |response_id: Option<u32>| {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![lone_pending_on(0x7E8), lone_pending_on(0x7E9)];
+                evidence.pending = vec![pending_on(200_000), pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8), Some(0x7E9)];
+            });
+            // A start on 0x7E8 at 3 s: within the limit its pending put in force.
+            let start = UnattachedItem {
+                vci_us: 7,
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+                    identifier: Some(0x7E8),
+                    bytes: Vec::new(),
+                },
+                ..tx_done(0x7E8)
+            };
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Start,
+                    &start,
+                    placed_after(3_000_000),
+                )
+                .unwrap();
+            assert!(
+                matches!(
+                    kept_of(&log, seq).late_start,
+                    Some(exchange::LateStart::InTime { .. })
+                ),
+                "the start is judged"
+            );
+            let mut bytes = vec![0x7E, 0x00];
+            bytes.resize(20, 0);
+            let response = UnattachedItem {
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, 0],
+                    identifier: response_id,
+                    bytes,
+                },
+                ..tx_done(0x7E8)
+            };
+            log.lock()
+                .late_response(0, seq, &response, placed_after(6_000_000))
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            of_event(&lines, "late_response").remove(0)["exchanges"][0].clone()
+        };
+        // Its own identifier: the response started in time, so the system missed it.
+        let own = classified(Some(0x7E8));
+        assert_eq!(own["classification"], "system", "{own}");
+        // Another identifier's response, and one naming none with two identifiers open: the
+        // start says nothing of them, and the response itself came after the limit.
+        for other in [Some(0x7E9), None] {
+            let entry = classified(other);
+            assert_ne!(entry["classification"], "system", "{other:?} {entry}");
+        }
+    }
+
+    /// ADR-429: a late start on one identifier does not colour the settlement of a late pending
+    /// of another.
+    #[test]
+    fn a_late_start_does_not_colour_a_late_pending_of_another_identifier() {
+        let reason_of = |pending_id: u32| {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![lone_pending_on(0x7E8), lone_pending_on(0x7E9)];
+                evidence.pending = vec![pending_on(200_000), pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8), Some(0x7E9)];
+            });
+            late_start_judged(&log, seq, 3_000_000);
+            let mut pending = late_pending_item();
+            pending.data = UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(pending_id),
+                bytes: vec![0x7F, 0x3E, 0x78],
+            };
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Pending,
+                    &pending,
+                    placed_after(3_500_000),
+                )
+                .unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let items = of_event(&lines, "late_item");
+            items.last().unwrap()["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .to_owned()
+        };
+        assert!(
+            reason_of(0x7E8).contains("The response started"),
+            "its own identifier"
+        );
+        assert!(
+            !reason_of(0x7E9).contains("The response started"),
+            "another identifier"
+        );
+    }
+
+    /// ADR-429: a later exchange of the link that was not sent awaits no answer, so a late final
+    /// answer read during it is the earlier exchange's.
+    #[test]
+    fn an_exchange_that_was_not_sent_awaits_no_answer_of_its_own() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        let mut refused = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NotSent(exchange::RefusalCause::Policy);
+        });
+        refused.rx_id = 0;
+        refused.times.agent.before_us += 10_000_000;
+        refused.times.agent.end_us += 10_000_000;
+        let mut response = late_final_item();
+        response.earlier_primitive = true;
+        response.vci_us = u32::try_from(BASE_US + 3_000_000).unwrap();
+        response.read = Some(AgentNow {
+            epoch: 0,
+            monotonic_us: BASE_US + 10_500_000,
+            wall_unix_ms: 0,
+        });
+        log.exchange_with(refused, vec![response]).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:?}");
+        let late = of_event(&lines, "late_response").remove(0);
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+    }
+
+    /// An exchange B on target 0x7DF whose answer A (a lone pending of 0x7E8) could own.
+    fn answered_by_owner(request: &[u8], end: exchange::End) -> exchange::Evidence {
+        let mut b = evidence(endpoint(0x7DF), request, end);
+        b.vci_ended = true;
+        b.times.agent.before_us = BASE_US + 20_000;
+        b.times.agent.end_us = BASE_US + 40_000;
+        b
+    }
+
+    /// ADR-429: a late final answer settles its exchange whatever its kept evidence lists, so an
+    /// exchange whose answer it could own is no longer held to it.
+    #[test]
+    fn a_late_response_frees_the_exchange_whose_answer_it_could_own() {
+        let (dir, _setup, log, seq) = late_collecting(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        let b = log
+            .exchange(answered_by_owner(
+                &[0x3E, 0x01],
+                exchange::End::Negative(vec![0x7F, 0x3E, 0x12]),
+            ))
+            .unwrap();
+        let owners = |log: &CommLog| {
+            log.lock().links[0]
+                .1
+                .late_response_owners(Some(0x7E8), &[0x7F, 0x3E, 0x12])
+        };
+        assert_eq!(owners(&log), vec![seq, b]);
+        log.lock()
+            .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+            .unwrap();
+        assert_eq!(owners(&log), Vec::<u64>::new());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-429: an exchange B logged before A's primitive ended whose answer A could own stays an
+    /// owner of it when that end reads another identifier's final answer and leaves A owed.
+    #[test]
+    fn an_exchange_logged_before_the_end_stays_an_owner_of_a_still_owed_exchange() {
+        let (dir, _setup, log, seq) = late_collecting(|_| {});
+        let b = log
+            .exchange(answered_by_owner(
+                &[0x3E, 0x00],
+                exchange::End::Positive(vec![0x7E, 0x00]),
+            ))
+            .unwrap();
+        end_with_lone_pending(&log, seq, vec![answer_read(0x7E9, 400_000)]);
+        assert_eq!(
+            log.lock().links[0]
+                .1
+                .late_response_owners(Some(0x7E8), &[0x7E, 0x00]),
+            vec![seq, b]
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-429, on a functional link: an unbound positive answer of 0x7E8 read during a presence
+    /// resend could be the resend's own or the earlier exchange's, so it settles neither.
+    #[test]
+    fn an_answer_read_during_a_collecting_resend_may_be_the_resends() {
+        let (dir, setup, log, _seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        let mut resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+        });
+        resend.rx_id = 0;
+        resend.times.agent.before_us += 10_000_000;
+        resend.times.agent.end_us += 10_000_000;
+        let mut response = late_final_item();
+        response.earlier_primitive = true;
+        response.vci_us = u32::try_from(BASE_US + 11_000_000).unwrap();
+        response.read = Some(AgentNow {
+            epoch: 0,
+            monotonic_us: BASE_US + 10_500_000,
+            wall_unix_ms: 0,
+        });
+        log.exchange_with(resend, vec![response]).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Logged unattached, and the earlier exchange only raised: it is not settled.
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:?}");
+        for late in of_event(&lines, "late_response") {
+            assert_eq!(late["classification"], "undetermined", "{late}");
+            assert!(late["unattached"].is_number(), "{late}");
+        }
+    }
+
+    /// ADR-429: a functional link's own response identifier is 0, so the exchange is owed on the
+    /// identifier its pending came on, and the ECU's final answer is attached to it.
+    #[test]
+    fn a_functional_exchange_with_a_lone_pending_owns_its_ecus_late_final_answer() {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8)
+                .functional(0x7DF, vec![(0x7E0, 0x7E8)]),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+                ..Default::default()
+            },
+            Some(true),
+        )
+        .unwrap();
+        let mut presence = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        presence.rx_id = 0;
+        let seq = log.exchange(presence).unwrap();
+        assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true));
+        // A later exchange on the link reads the ECU's final answer.
+        let device = |us| exchange::VciTime::new(us, Some(exchange::Clock::Device));
+        let mut later = evidence(
+            endpoint(0x7DF),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        later.pending_visibility = exchange::PendingVisibility::Forwarded;
+        later.vci_ended = true;
+        later.times.agent.before_us = BASE_US + 10_000_000;
+        later.times.agent.end_us = BASE_US + 11_001_000;
+        let mut response = late_final_item();
+        response.earlier_primitive = true;
+        response.vci_us = u32::try_from(BASE_US + 3_000_000).unwrap();
+        response.read = Some(AgentNow {
+            epoch: 0,
+            monotonic_us: BASE_US + 10_000_100,
+            wall_unix_ms: 0,
+        });
+        later.times.vci = Some(exchange::VciTimes {
+            rx_timeout: Some(device(BASE_US + 11_000_000)),
+            error: Some(device(BASE_US + 11_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        let transmit = UnattachedItem {
+            vci_us: u32::try_from(BASE_US + 10_000_000).unwrap(),
+            read: response.read,
+            ..tx_done(0x7DF)
+        };
+        log.exchange_with(later, vec![transmit, response]).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:?}");
+        let late = of_event(&lines, "late_response").remove(0);
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+        // Judged from the window the pending put in force (3 s after the transmit, 2.8 s after
+        // the pending): in time, so the system missed it.
+        assert_eq!(late["exchanges"][0]["classification"], "system", "{late}");
+        assert!(
+            late["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("within the limit in force less the margin"),
+            "{late}"
         );
     }
 
@@ -9613,10 +10524,22 @@ pub(crate) mod tests {
     fn late_collecting(
         build: impl FnOnce(&mut exchange::Evidence),
     ) -> (PathBuf, CommLogSetup, CommLog, u64) {
-        let (dir, setup, log) = collecting_log();
+        late_collecting_on(false, build)
+    }
+
+    /// [`late_collecting`] on a functional link, whose response identifier is 0, when
+    /// `functional`.
+    fn late_collecting_on(
+        functional: bool,
+        build: impl FnOnce(&mut exchange::Evidence),
+    ) -> (PathBuf, CommLogSetup, CommLog, u64) {
+        let (dir, setup, log) = collecting_log_on(functional);
         let seq = log
             .exchange(collecting_waited(|evidence| {
                 build(evidence);
+                if functional {
+                    evidence.rx_id = 0;
+                }
             }))
             .unwrap();
         (dir, setup, log, seq)
@@ -9844,15 +10767,15 @@ pub(crate) mod tests {
             evidence.pending_ids = vec![Some(0x7E8)];
         });
         let kept = kept_of(&log, seq);
-        let (from, in_window) = late_window(&kept);
+        let (from, in_window) = late_window(&kept, 0x7E8);
         assert_eq!((from, in_window.len()), (None, 1));
         let mut unplaced = kept.clone();
         unplaced.pending_order = vec![usize::MAX];
-        let (from, in_window) = late_window(&unplaced);
+        let (from, in_window) = late_window(&unplaced, 0x7E8);
         assert_eq!((from, in_window.len()), (None, 0));
         // Not collecting: it counts, and the window is the transmit's.
         unplaced.evidence.collecting = false;
-        let (from, in_window) = late_window(&unplaced);
+        let (from, in_window) = late_window(&unplaced, 0x7E8);
         assert_eq!((from, in_window.len()), (None, 1));
         // A late pending in time is in the window, an open one is an unplaced time, and a late one
         // is passed over.
@@ -9883,7 +10806,7 @@ pub(crate) mod tests {
                 exchange::LatePending::Open => vec![kept.pendings[0], None],
                 exchange::LatePending::Late => vec![kept.pendings[0]],
             };
-            assert_eq!(late_window(&kept), (None, expected), "{window:?}");
+            assert_eq!(late_window(&kept, 0x7E8), (None, expected), "{window:?}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }

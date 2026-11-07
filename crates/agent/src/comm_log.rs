@@ -2899,17 +2899,22 @@ impl CommLog {
                 && !start_unbound
                 && evidence.rejected.is_empty()
             {
-                evidence.vci_limits_past_by_us = vci.deadline.and_then(|reading| {
-                    timing::past_vci_limits(
-                        *limits,
-                        evidence.absorbing(),
-                        transmit,
-                        entry_window.from,
-                        &entry_window.pendings,
-                        reading.time.placed(),
-                        reading.round_trip_us,
-                    )
-                });
+                // A pending read at no known place is in no window and may have extended the
+                // limit, so it leaves the check unshown, as for the end (`primitive_ended`).
+                evidence.vci_limits_past_by_us = vci
+                    .deadline
+                    .filter(|_| entry_window.unordered.is_empty())
+                    .and_then(|reading| {
+                        timing::past_vci_limits(
+                            *limits,
+                            evidence.absorbing(),
+                            transmit,
+                            entry_window.from,
+                            &entry_window.pendings,
+                            reading.time.placed(),
+                            reading.round_trip_us,
+                        )
+                    });
             }
             judged_from = Some((pendings, *limits));
         }
@@ -3571,7 +3576,7 @@ impl CommLog {
                 .any(|(item, _)| item.is_start_indication_for(rx_id));
         // The window of a collecting entry ends on the primitive's finished status or the
         // receive timeout, from where its last answer ended (ADR-425).
-        let entry_window = judge_windows(
+        judge_windows(
             &mut evidence,
             &WindowItems {
                 pendings: &pendings,
@@ -3588,9 +3593,12 @@ impl CommLog {
         if let Some(limits) = kept.limits {
             // A pending read at job end from at or before the reading, or one whose order with
             // it is unknown, may extend the limit past it: the kept `system` stands only while
-            // the VCI's limits are still past by the reading with every such pending.
+            // the VCI's limits are still past by the reading with every such pending. The
+            // window is that of the items not after the reading (a probe of the evidence with
+            // the later answers and pendings left out, judged by the one window rule), since an
+            // answer read after it does not change what the reading showed.
             if observed {
-                let not_after_reading = |pending: &timing::At| match (pending, reading_at) {
+                let not_after_reading = |time: &timing::At| match (time, reading_at) {
                     (Some((clock, at)), Some((own, reading))) => {
                         !(*clock == own
                             && at.epoch == reading.epoch
@@ -3598,23 +3606,41 @@ impl CommLog {
                     }
                     _ => true,
                 };
-                let at_reading: Vec<_> = entry_window
-                    .pendings
-                    .iter()
-                    .copied()
-                    .filter(not_after_reading)
-                    .collect();
+                let answers_standing: Vec<bool> =
+                    answer_ends.iter().map(not_after_reading).collect();
+                let pendings_standing: Vec<bool> = pendings.iter().map(not_after_reading).collect();
+                let mut probe = evidence.clone();
+                probe.answers = keep_standing(probe.answers, &answers_standing);
+                probe.pending = keep_standing(probe.pending, &pendings_standing);
+                probe.pending_ids = keep_standing(probe.pending_ids, &pendings_standing);
+                let masked_answer_order = keep_standing(answer_order.clone(), &answers_standing);
+                let masked_answer_ends = keep_standing(answer_ends.clone(), &answers_standing);
+                let masked_pending_order = keep_standing(pending_order.clone(), &pendings_standing);
+                let masked_pendings = keep_standing(pendings.clone(), &pendings_standing);
+                let window = judge_windows(
+                    &mut probe,
+                    &WindowItems {
+                        pendings: &masked_pendings,
+                        pending_order: &masked_pending_order,
+                        answer_order: &masked_answer_order,
+                        answer_ends: &masked_answer_ends,
+                    },
+                    Some(limits),
+                    &vci,
+                    transmit,
+                    response_may_have_begun,
+                    false,
+                );
                 // A late pending is in no window (ADR-426 decision 6), but one that may have
                 // come by the reading refutes the check all the same.
-                observed = !entry_window.unordered.iter().any(not_after_reading);
-                observed = observed
+                observed = window.unordered.is_empty()
                     && reading.is_some_and(|reading| {
                         timing::past_vci_limits(
                             limits,
                             evidence.absorbing(),
                             transmit,
-                            entry_window.from,
-                            &at_reading,
+                            window.from,
+                            &window.pendings,
                             reading_at,
                             reading.round_trip_us,
                         )
@@ -8850,6 +8876,12 @@ pub(crate) mod tests {
             evidence.answers = vec![positive_on(0x7E8, 4_800_000)];
         });
         assert_eq!(recent["classification"], "undetermined", "{recent}");
+        // It takes the generic `vci_did_not_end` row (design 8.11).
+        assert_eq!(
+            recent["reason"],
+            "The agent stopped waiting before the VCI ended the exchange; a long transfer can outlast the agent's deadline.",
+            "{recent}"
+        );
         // 2 s before the reading: past by 2 s less 1.00232 s.
         let past = collecting_read_at_deadline(|evidence| {
             evidence.answers = vec![positive_on(0x7E8, 3_000_000)];
@@ -8866,37 +8898,108 @@ pub(crate) mod tests {
         );
     }
 
-    /// The `primitive_ended` re-check reads the same window: an answer read for the end that
-    /// restarts it shortly before the reading refutes the `system` the entry showed.
-    #[test]
-    fn the_end_re_checks_the_vci_limits_from_the_window_the_end_leaves() {
-        let (dir, setup, log) = collecting_log();
-        let seq = log
-            .exchange(collecting_waited(|evidence| {
-                evidence.answers = vec![positive_on(0x7E8, 3_000_000)];
-                evidence.times.vci.as_mut().unwrap().deadline = Some(exchange::ClockReading {
-                    time: device_time(BASE_US + 5_000_000),
-                    round_trip_us: 0,
-                });
-            }))
-            .unwrap();
+    /// Logs the collecting exchange `build` makes with the VCI's clock read at its deadline 5 s
+    /// after the transmit, then ends its primitive with `end` and the `items` read for the end;
+    /// returns the exchange's entry and the `primitive_ended` entry.
+    fn collecting_read_then_ended(
+        build: impl FnOnce(&mut exchange::Evidence),
+        late_pending_us: Option<i64>,
+        end: exchange::End,
+        items: Vec<EndItem>,
+    ) -> (serde_json::Value, serde_json::Value) {
+        let (dir, setup, log, seq) = late_collecting(|evidence| {
+            build(evidence);
+            evidence.times.vci.as_mut().unwrap().deadline = Some(exchange::ClockReading {
+                time: device_time(BASE_US + 5_000_000),
+                round_trip_us: 0,
+            });
+        });
+        if let Some(after_us) = late_pending_us {
+            late_pending_judged(&log, seq, after_us);
+        }
         log.primitive_ended(
             seq,
             PrimitiveEnded {
-                end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+                end: Some(end),
                 detail: exchange::Detail::default(),
                 vci_ended: false,
-                reads: read_after_deadline(vec![answer_read(0x7E8, 4_500_000)]),
+                reads: read_after_deadline(items),
             },
         )
         .unwrap();
         log.end("ok");
         let lines = lines(&setup);
         std::fs::remove_dir_all(&dir).unwrap();
-        let entry = of_event(&lines, "exchange").remove(0);
+        (
+            of_event(&lines, "exchange").remove(0),
+            of_event(&lines, "primitive_ended").remove(0),
+        )
+    }
+
+    /// The `primitive_ended` re-check judges the VCI limits from the window of the items not
+    /// after the reading at the deadline: an answer read for the end after it leaves a `system`
+    /// the reading showed standing, and one at or before it that restarts the window refutes it.
+    #[test]
+    fn the_end_re_checks_the_vci_limits_from_the_window_as_of_the_reading() {
+        let lost = || exchange::End::VciLost {
+            refused_after_loss: false,
+        };
+        let entry_answer = |evidence: &mut exchange::Evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 3_000_000)];
+        };
+        let ended = |after_us: u64, unplaced: bool| {
+            let mut answer = positive_on(0x7E8, after_us);
+            if unplaced {
+                answer.vci_us = None;
+                answer.clock = None;
+            }
+            collecting_read_then_ended(entry_answer, None, lost(), vec![EndItem::Answer(answer)])
+        };
+        // After the reading: the window as of the reading is the entry's, so `system` stands.
+        let (entry, after) = ended(5_200_000, false);
         assert_eq!(entry["classification"], "system", "{entry}");
-        let ended = of_event(&lines, "primitive_ended").remove(0);
-        assert_ne!(ended["classification"], "system", "{ended}");
+        assert_eq!(after["classification"], "system", "{after}");
+        // Before it: the answer restarts the window, 0.5 s before the reading.
+        let (_, before) = ended(4_500_000, false);
+        assert_ne!(before["classification"], "system", "{before}");
+        // An answer read at no known place may be before it: not shown.
+        let (_, unplaced) = ended(5_200_000, true);
+        assert_ne!(unplaced["classification"], "system", "{unplaced}");
+    }
+
+    /// A late pending read before the end is in no window, but one not shown after the reading
+    /// refutes the `system` the entry showed (both the entry and the end).
+    #[test]
+    fn a_late_pending_that_may_precede_the_reading_refutes_the_kept_system() {
+        let end = |late_pending_us| {
+            collecting_read_then_ended(
+                |evidence| evidence.answers = vec![positive_on(0x7E8, 3_000_000)],
+                Some(late_pending_us),
+                exchange::End::LinkError(exchange::LinkErrorKind::Receive),
+                Vec::new(),
+            )
+        };
+        // At 4.9 s, before the reading: the limit may have been extended by it.
+        let (entry, refuted) = end(4_900_000);
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert_ne!(refuted["classification"], "system", "{refuted}");
+        // At 5.1 s, after it: the reading stands.
+        let (_, stands) = end(5_100_000);
+        assert_eq!(stands["classification"], "system", "{stands}");
+    }
+
+    /// The entry passes the window's pendings, not all the exchange's: a pending of 0x7E8 at 1 s
+    /// before its final answer at 3 s is in that answer's window, not the entry's.
+    #[test]
+    fn a_collecting_entry_s_vci_limits_leave_out_the_pendings_of_answered_windows() {
+        let entry = collecting_read_at_deadline(|evidence| {
+            evidence.pending = vec![pending_on(1_000_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+            evidence.answers = vec![positive_on(0x7E8, 3_000_000)];
+        });
+        assert_eq!(entry["classification"], "system", "{entry}");
+        let reason = entry["reason"].as_str().unwrap();
+        assert!(reason.contains("997.7"), "{reason}");
     }
 
     /// ADR-425, case table rows 1 and 2: the answers read after the deadline are listed after the

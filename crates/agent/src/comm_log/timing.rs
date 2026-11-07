@@ -376,8 +376,9 @@ fn judge_late_at(
 /// (design 8.11 `vci_did_not_end`): the reading less its round trip, from the window's start,
 /// past the latest limit in force plus the margin plus the longest transfer of a single-frame
 /// response, which would have given no start-of-message indication. The window starts at the
-/// transmit, or where `window_from` is, the end of a collecting request's last final answer
-/// (ADR-400, ADR-426), and `pendings` are those of that window. `None` when it is not past,
+/// transmit, or where `window_from` is: the end of a collecting request's last final answer,
+/// or, with pendings still open, of the latest final answer before them (the transmit when none;
+/// ADR-400, ADR-426). `pendings` are those of that window. `None` when it is not past,
 /// or cannot be shown: no profile gives the link's margin (ADR-377), the reading or the transmit
 /// is not on the device clock (on a J2534 link the reading is the worker's, ADR-120), they are
 /// on different epochs, the window's start or a pending is not on their clock and epoch or came

@@ -3409,6 +3409,9 @@ impl CommLog {
         // the entry's that came last on its identifier and now has a final answer after it is
         // that answer's pending, not an answer of its own (ADR-396).
         let mut carried_tx_done = None;
+        // The answers before the fold below, for the window as of the reading: a pending whose
+        // final answer was read after the reading is still open then.
+        let mut unfolded_answers = None;
         if collecting {
             evidence.pending_ids = pending_ids;
             let mut answers = std::mem::take(&mut evidence.answers);
@@ -3444,6 +3447,7 @@ impl CommLog {
                 answer_ends.push(answer.clock.zip(placed));
                 answers.push(answer);
             }
+            unfolded_answers = Some((answers.clone(), answer_order.clone(), answer_ends.clone()));
             let standing = exchange::standing_answers(
                 &answers,
                 |answer| answer.rx_id,
@@ -3606,15 +3610,32 @@ impl CommLog {
                     }
                     _ => true,
                 };
-                let answers_standing: Vec<bool> =
-                    answer_ends.iter().map(not_after_reading).collect();
                 let pendings_standing: Vec<bool> = pendings.iter().map(not_after_reading).collect();
                 let mut probe = evidence.clone();
-                probe.answers = keep_standing(probe.answers, &answers_standing);
+                // The answers as of the reading: those read before it, from the list before the
+                // fold, folded again by the one rule (a pending whose final answer came after the
+                // reading stands).
+                let (base_answers, base_order, base_ends) = unfolded_answers.unwrap_or_else(|| {
+                    (
+                        evidence.answers.clone(),
+                        answer_order.clone(),
+                        answer_ends.clone(),
+                    )
+                });
+                let read_by: Vec<bool> = base_ends.iter().map(not_after_reading).collect();
+                let by_answers = keep_standing(base_answers, &read_by);
+                let by_order = keep_standing(base_order, &read_by);
+                let by_ends = keep_standing(base_ends, &read_by);
+                let answers_standing = exchange::standing_answers(
+                    &by_answers,
+                    |answer| answer.rx_id,
+                    |answer| answer.is_pending(&evidence.expected),
+                );
+                probe.answers = keep_standing(by_answers, &answers_standing);
                 probe.pending = keep_standing(probe.pending, &pendings_standing);
                 probe.pending_ids = keep_standing(probe.pending_ids, &pendings_standing);
-                let masked_answer_order = keep_standing(answer_order.clone(), &answers_standing);
-                let masked_answer_ends = keep_standing(answer_ends.clone(), &answers_standing);
+                let masked_answer_order = keep_standing(by_order, &answers_standing);
+                let masked_answer_ends = keep_standing(by_ends, &answers_standing);
                 let masked_pending_order = keep_standing(pending_order.clone(), &pendings_standing);
                 let masked_pendings = keep_standing(pendings.clone(), &pendings_standing);
                 let window = judge_windows(
@@ -8965,6 +8986,30 @@ pub(crate) mod tests {
         // An answer read at no known place may be before it: not shown.
         let (_, unplaced) = ended(5_200_000, true);
         assert_ne!(unplaced["classification"], "system", "{unplaced}");
+    }
+
+    /// A pending read for the end before the reading, whose ECU's final answer was read after it,
+    /// is still open at the reading and puts P2* in force: the kept `system` is refuted.
+    #[test]
+    fn a_pending_whose_final_answer_came_after_the_reading_still_limits_the_reading() {
+        let (entry, ended) = collecting_read_then_ended(
+            |evidence| evidence.answers = vec![positive_on(0x7E8, 200_000)],
+            None,
+            exchange::End::VciLost {
+                refused_after_loss: false,
+            },
+            vec![
+                EndItem::Answer(answer_on(
+                    0x7E9,
+                    exchange::End::Negative(vec![0x7F, 0x3E, 0x78]),
+                    800_000,
+                )),
+                EndItem::Pending(pending_on(800_000), Some(0x7E9)),
+                answer_read(0x7E9, 5_200_000),
+            ],
+        );
+        assert_eq!(entry["classification"], "system", "{entry}");
+        assert_ne!(ended["classification"], "system", "{ended}");
     }
 
     /// A late pending read before the end is in no window, but one not shown after the reading

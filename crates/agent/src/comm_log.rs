@@ -9772,6 +9772,140 @@ pub(crate) mod tests {
         assert_eq!(entries[1]["classification"], "undetermined", "{entries:#?}");
     }
 
+    /// ADR-432 (review): a presence exchange the agent's deadline ended, with a final answer on
+    /// 0x7E9 and nothing open, is owed on no identifier, so a later resend's answer on 0x7E9 is
+    /// placed alone and has no owner.
+    #[test]
+    fn a_deadline_ended_exchange_with_a_final_answer_owes_no_identifier() {
+        let (dir, _setup, log, first) = late_collecting_on(true, |evidence| {
+            evidence.answers = vec![positive_on(0x7E9, 100_000)];
+        });
+        assert!(owed_on(&log, 0x7E9, first).0.is_empty());
+        assert!(owed_on(&log, 0x7E8, first).0.is_empty());
+        let resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0x7E9, 100_000)];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        assert_eq!(log.lock().links[0].1.history_for(&resend).owed_matching, 0);
+        let second = log.exchange(resend).unwrap();
+        assert!(owed_on(&log, 0x7E9, second).0.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-432 (review): a link with no receive table owes a non-collecting exchange on its own
+    /// identifier whatever its answers name, so unnamed results do not move it to identifier 0.
+    #[test]
+    fn a_physical_exchange_with_unnamed_answers_stays_owed_on_its_own_identifier() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let silent = evidence(endpoint(0x7E0), &[0x3E, 0x00], exchange::End::NoResponse);
+        let first = log.exchange(silent).unwrap();
+        let mut both = evidence(
+            endpoint(0x7E0),
+            &[0x3E, 0x00],
+            exchange::End::Positive(FIRST.to_vec()),
+        );
+        both.answers = vec![positive_on(0, 100_000), positive_on(0, 200_000)];
+        assert_eq!(both.owed_ids(), vec![0x7E8]);
+        let second = log.exchange(both).unwrap();
+        assert_eq!(owed_on_7e8(&log, first).0, vec![first, second]);
+        assert!(owed_on(&log, 0, first).0.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-432 (review): a resend with final answers on 0x7E8 and 0x7E9, where only the 0x7E9
+    /// one could be the earlier exchange's, is owed on 0x7E9 alone.
+    #[test]
+    fn a_resend_is_owed_on_the_identifiers_of_the_answers_an_owner_could_own() {
+        let (dir, _setup, log, first) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E9)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+        });
+        let resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0x7E8, 100_000), positive_on(0x7E9, 200_000)];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        let second = log.exchange(resend).unwrap();
+        assert_eq!(owed_on(&log, 0x7E9, first).0, vec![first, second]);
+        assert!(owed_on(&log, 0x7E8, first).0.is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-432 (review): in case B' (a final answer of 0x7E9 and an unnamed pending, owed on
+    /// 0x7E8), a late start on 0x7E8 counts for a final answer that names no identifier.
+    #[test]
+    fn a_late_start_counts_for_an_unnamed_response_when_one_identifier_is_owed() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0x7E9, 100_000), lone_pending_on(0)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![None];
+        });
+        let mut kept = kept_of(&log, seq);
+        kept.late_start = Some(exchange::LateStart::InTime { at_us: 1 });
+        kept.late_start_id = Some(0x7E8);
+        assert!(kept.late_start_for(None).is_some());
+        assert!(kept.late_start_for(Some(0x7E8)).is_some());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-432 (review): an unnamed pending beside final answers on every receive identifier
+    /// covers no identifier, so a resend with no owner is owed on none; with an owner for one of
+    /// those answers it is owed on that answer's identifier, not dropped.
+    #[test]
+    fn an_unnamed_pending_beside_final_answers_on_every_identifier_is_covered() {
+        let answers = || {
+            vec![
+                positive_on(0x7E8, 100_000),
+                positive_on(0x7E9, 200_000),
+                lone_pending_on(0),
+            ]
+        };
+        let (dir, _setup, log) = collecting_log_on(true);
+        let covered = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = answers();
+            evidence.pending = vec![pending_on(300_000)];
+            evidence.pending_ids = vec![None];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        assert!(covered.owed_ids().is_empty());
+        let first = log.exchange(covered).unwrap();
+        assert!(owed_on_7e8(&log, first).0.is_empty());
+        // An owner for the 0x7E9 answer keeps the exchange owed on that identifier.
+        let (dir2, _setup2, log2, x) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E9)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+        });
+        let resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = answers();
+            evidence.pending = vec![pending_on(300_000)];
+            evidence.pending_ids = vec![None];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        let second = log2.exchange(resend).unwrap();
+        assert_eq!(owed_on(&log2, 0x7E9, x).0, vec![x, second]);
+        std::fs::remove_dir_all(&dir).unwrap();
+        std::fs::remove_dir_all(&dir2).unwrap();
+    }
+
     /// ADR-429, case 9: a lone pending read after the deadline, with the window finished, is no
     /// response and the exchange stays owed and kept, on the identifier the pending came on; the
     /// identifier's final answer is then its `late_response`.

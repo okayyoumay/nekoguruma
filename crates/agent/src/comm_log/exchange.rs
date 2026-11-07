@@ -1295,52 +1295,83 @@ impl Evidence {
         ids
     }
 
-    /// The response identifiers the exchange is owed on (design 8.11 "Owed request", ADR-432):
-    /// those a pending is open on, where an unnamed pending (identifier 0) stands for every
-    /// receive identifier with no final answer; with none open and no final response, every
-    /// receive identifier; with a final response, the identifier of the first one (the link's
-    /// own when no answer names it). Without a receive table
-    /// the receive identifiers are the link's own, so a physical link is owed on its `rx_id`.
-    /// No identifier twice.
+    /// Whether a final answer on the named identifier `id` stands in the exchange.
+    fn final_standing(&self, id: u32) -> bool {
+        self.answers
+            .iter()
+            .any(|answer| answer.rx_id == id && !answer.is_pending(&self.expected))
+    }
+
+    /// The response identifiers the exchange is owed on (design 8.11 "Owed request", ADR-432),
+    /// each once. With no receive table (a physical link) it is owed as before: on the
+    /// identifiers a pending is open on, else on its link's `rx_id`. With a table, a request
+    /// that is not collecting is owed on its `rx_id` once a final response ended it, else on
+    /// every receive identifier; a collecting request with no answer on every receive
+    /// identifier. With answers, an identifier with a final answer standing is never owed; only
+    /// the identifiers a pending is open on are, an unnamed pending (identifier 0) standing for
+    /// every receive identifier with no final answer, and for none when every one has it (the
+    /// pending is covered by those answers, ADR-400 decision 1). A collecting request that
+    /// ended with a final response and is left with none owes the identifiers whose final
+    /// answers' own histories show an owner, else (with no pending open) the first final
+    /// answer's, so the request it could be a late answer of finds it.
     pub(crate) fn owed_ids(&self) -> Vec<u32> {
-        let table: Vec<u32> = if self.receive_ids.is_empty() {
-            vec![self.rx_id]
-        } else {
-            self.receive_ids.clone()
-        };
-        let mut ids = Vec::new();
-        let mut add = |id: u32| {
+        // A link with no receive table (a physical one) is owed as before ADR-432: on the
+        // identifiers a pending is open on, else on its own.
+        if self.receive_ids.is_empty() {
+            let open = self.open_pending_ids();
+            return if self.collecting && !open.is_empty() {
+                open
+            } else {
+                vec![self.rx_id]
+            };
+        }
+        let table = self.receive_ids.clone();
+        let mut ids: Vec<u32> = Vec::new();
+        fn add(ids: &mut Vec<u32>, id: u32) {
             if !ids.contains(&id) {
                 ids.push(id);
             }
-        };
-        let open = self.open_pending_ids();
-        if open.is_empty() {
+        }
+        if !self.collecting {
             if self.final_response().is_some() {
-                // The identifier the final response came on; a collecting request's `end` is
-                // its first final answer's.
-                let first = self
-                    .answers
-                    .iter()
-                    .find(|answer| !answer.is_pending(&self.expected));
-                add(first.map_or(self.rx_id, |answer| answer.rx_id));
+                add(&mut ids, self.rx_id);
             } else {
-                table.iter().copied().for_each(add);
+                table.iter().for_each(|&id| add(&mut ids, id));
             }
             return ids;
         }
-        for id in open {
+        if self.answers.is_empty() {
+            table.iter().for_each(|&id| add(&mut ids, id));
+            return ids;
+        }
+        for id in self.open_pending_ids() {
             if id == 0 {
                 for &receive in &table {
-                    let final_standing = self.answers.iter().any(|answer| {
-                        answer.rx_id == receive && !answer.is_pending(&self.expected)
-                    });
-                    if !final_standing {
-                        add(receive);
+                    if !self.final_standing(receive) {
+                        add(&mut ids, receive);
                     }
                 }
-            } else {
-                add(id);
+            } else if !self.final_standing(id) {
+                add(&mut ids, id);
+            }
+        }
+        if ids.is_empty() && self.final_response().is_some() {
+            let finals = || {
+                self.answers
+                    .iter()
+                    .filter(|answer| !answer.is_pending(&self.expected))
+            };
+            finals()
+                .filter(|answer| {
+                    answer
+                        .history
+                        .as_ref()
+                        .is_some_and(|history| !history.owners.is_empty())
+                })
+                .for_each(|answer| add(&mut ids, answer.rx_id));
+            if ids.is_empty() && self.open_pending_ids().is_empty() {
+                let first = finals().next().map_or(self.rx_id, |answer| answer.rx_id);
+                add(&mut ids, first);
             }
         }
         ids
@@ -1661,7 +1692,7 @@ impl Kept {
         };
         let applies = match response_id {
             Some(id) => id == own,
-            None => self.evidence.open_pending_ids() == [own],
+            None => self.evidence.owed_ids() == [own],
         };
         applies.then_some(start)
     }

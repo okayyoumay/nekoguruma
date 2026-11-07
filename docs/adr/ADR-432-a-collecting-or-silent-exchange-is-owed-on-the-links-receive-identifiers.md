@@ -25,15 +25,24 @@ not itself owed, while its answers' histories left it `undetermined` (ADR-400 ro
    (`Evidence::receive_ids`, from the table the runner sets for the link, each identifier once,
    not written to the log). An empty list stands for the link's own `rx_id`, so a physical link,
    whose table is its own identifier, is unchanged.
-2. **One function names the identifiers an exchange is owed on** (`Evidence::owed_ids`): those a
-   pending is open on, where an unnamed pending (identifier 0) stands for every receive
-   identifier with no final answer in the exchange (ADR-400 decision 1: the pending is judged
-   against each one's window); with none open and no final response, every receive identifier;
-   with none open and a final response, the identifier of the first final answer (the link's own
-   when no answer names it). `LinkState::set_owed_rows` takes that list, once per identifier,
-   from `record`, from `renew_owed` and, for a late response that names no identifier, as the
-   list it is judged against (differing verdicts leave the window open, as ADR-429 had it).
-   The exchange in flight that is not collecting awaits a response on those identifiers too.
+2. **One function names the identifiers an exchange is owed on** (`Evidence::owed_ids`). With
+   no receive table (a physical link) it is as before: the identifiers a pending is open on, else
+   the link's own. With a table: a request that is not collecting is owed on its own `rx_id` once
+   a final response ended it, else on every receive identifier; a collecting request with no
+   answer on every receive identifier. With answers, an identifier with a final answer standing
+   is never owed (ADR-429 decision 2 stands: only an open pending owes an identifier once an
+   answer exists), so a deadline-ended exchange with a final answer and nothing open is owed on
+   nothing. An unnamed pending (identifier 0) stands for every receive identifier with no final
+   answer (ADR-400 decision 1: it is judged against each one's window), and for none when every
+   one has it, since those answers cover it. A collecting request that ended with a final
+   response and is left owing nothing owes the identifiers whose final answers' own histories
+   (set before the entry is built) show an owner, so it is found as the earlier request's late
+   answer; with no owner shown and no pending open, the identifier of its first final answer.
+   `LinkState::set_owed_rows` takes that list, once per identifier, from `record`, from
+   `renew_owed` and, for a late response that names no identifier, as the list it is judged
+   against (differing verdicts leave the window open, as ADR-429 had it). `Kept::late_start_for`
+   reads it too, for an unnamed response. The exchange in flight that is not collecting awaits a
+   response on those identifiers too.
 3. **`history_for` of a collecting exchange looks the owners up by its answers' identifiers,**
    deduplicated by exchange, not by its own `rx_id`. A presence resend whose final answer an
    earlier owed exchange could own is then owed itself and `undetermined`, as ADR-429 intended.

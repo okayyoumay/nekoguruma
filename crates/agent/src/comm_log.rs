@@ -1686,12 +1686,24 @@ struct WindowItems<'a> {
     answer_ends: &'a [timing::At],
 }
 
+/// The window an entry's VCI limits run in (design 8.11 `vci_did_not_end`): where it started and
+/// its pendings, those of the window the entry's timing is judged from. A non-collecting entry's
+/// is the whole exchange.
+struct EntryWindow {
+    /// `None` is the transmit.
+    from: Option<timing::At>,
+    pendings: Vec<timing::At>,
+    /// Pendings in no window, because the host did not read them at a known place.
+    unordered: Vec<timing::At>,
+}
+
 /// Judges the windows of `evidence` (ADR-400): the pendings each answer's window holds, the
 /// entry's own timing, and with `judge_answers` each answer's timing. The one place that does
 /// it, for the exchange's entry and for the settling entries of its primitive's end, so that an
 /// answer is judged the same wherever it is listed (ADR-425). `vci` is the entry's VCI times and
 /// `transmit` the placed transmit done; the timings are judged only on a link whose `limits` the
-/// log knows.
+/// log knows. Returns the entry's window, which its VCI-limits check reads (empty when `limits`
+/// is `None`).
 fn judge_windows(
     evidence: &mut exchange::Evidence,
     items: &WindowItems<'_>,
@@ -1700,7 +1712,7 @@ fn judge_windows(
     transmit: timing::At,
     response_may_have_begun: bool,
     judge_answers: bool,
-) {
+) -> EntryWindow {
     // A collecting exchange's windows read the placed pendings by their place in the evidence's
     // list; a link whose limits are not known has none.
     debug_assert!(
@@ -1723,7 +1735,11 @@ fn judge_windows(
         }
     }
     let Some(limits) = limits else {
-        return;
+        return EntryWindow {
+            from: None,
+            pendings: Vec::new(),
+            unordered: Vec::new(),
+        };
     };
     let pendings = items.pendings;
     let in_window = |window: &AnswerWindow| -> Vec<timing::At> {
@@ -1766,8 +1782,22 @@ fn judge_windows(
             response_may_have_begun,
         },
     );
+    let entry = EntryWindow {
+        from: collecting.then_some(entry_window.from).flatten(),
+        pendings: entry_pendings,
+        unordered: if collecting {
+            pendings
+                .iter()
+                .zip(items.pending_order)
+                .filter(|&(_, &order)| order == usize::MAX)
+                .map(|(&at, _)| at)
+                .collect()
+        } else {
+            Vec::new()
+        },
+    };
     if !judge_answers {
-        return;
+        return entry;
     }
     // Each answer from the end of the one before it, with the response time from the transmit.
     let answer_timings: Vec<_> = evidence
@@ -1807,6 +1837,7 @@ fn judge_windows(
     for (answer, timing) in evidence.answers.iter_mut().zip(answer_timings) {
         answer.timing = timing;
     }
+    entry
 }
 
 /// The window a late item of `kept`, read after its entry, closes, as `judge_late` and
@@ -2838,7 +2869,7 @@ impl CommLog {
             || unbound
                 .iter()
                 .any(|item| item.is_start_indication_for(rx_id));
-        judge_windows(
+        let entry_window = judge_windows(
             &mut evidence,
             &WindowItems {
                 pendings: &pendings,
@@ -2873,7 +2904,8 @@ impl CommLog {
                         *limits,
                         evidence.absorbing(),
                         transmit,
-                        &pendings,
+                        entry_window.from,
+                        &entry_window.pendings,
                         reading.time.placed(),
                         reading.round_trip_us,
                     )
@@ -3539,7 +3571,7 @@ impl CommLog {
                 .any(|(item, _)| item.is_start_indication_for(rx_id));
         // The window of a collecting entry ends on the primitive's finished status or the
         // receive timeout, from where its last answer ended (ADR-425).
-        judge_windows(
+        let entry_window = judge_windows(
             &mut evidence,
             &WindowItems {
                 pendings: &pendings,
@@ -3558,29 +3590,36 @@ impl CommLog {
             // it is unknown, may extend the limit past it: the kept `system` stands only while
             // the VCI's limits are still past by the reading with every such pending.
             if observed {
-                let at_reading: Vec<_> = pendings
+                let not_after_reading = |pending: &timing::At| match (pending, reading_at) {
+                    (Some((clock, at)), Some((own, reading))) => {
+                        !(*clock == own
+                            && at.epoch == reading.epoch
+                            && at.unwrapped > reading.unwrapped)
+                    }
+                    _ => true,
+                };
+                let at_reading: Vec<_> = entry_window
+                    .pendings
                     .iter()
                     .copied()
-                    .filter(|pending| match (pending, reading_at) {
-                        (Some((clock, at)), Some((own, reading))) => {
-                            !(*clock == own
-                                && at.epoch == reading.epoch
-                                && at.unwrapped > reading.unwrapped)
-                        }
-                        _ => true,
-                    })
+                    .filter(not_after_reading)
                     .collect();
-                observed = reading.is_some_and(|reading| {
-                    timing::past_vci_limits(
-                        limits,
-                        evidence.absorbing(),
-                        transmit,
-                        &at_reading,
-                        reading_at,
-                        reading.round_trip_us,
-                    )
-                    .is_some()
-                });
+                // A late pending is in no window (ADR-426 decision 6), but one that may have
+                // come by the reading refutes the check all the same.
+                observed = !entry_window.unordered.iter().any(not_after_reading);
+                observed = observed
+                    && reading.is_some_and(|reading| {
+                        timing::past_vci_limits(
+                            limits,
+                            evidence.absorbing(),
+                            transmit,
+                            entry_window.from,
+                            &at_reading,
+                            reading_at,
+                            reading.round_trip_us,
+                        )
+                        .is_some()
+                    });
             }
         }
         let final_response = evidence.end.response().is_some();
@@ -8780,6 +8819,85 @@ pub(crate) mod tests {
     }
 
     const FIRST: [u8; 2] = [0x7E, 0x00];
+
+    /// Logs the collecting exchange `build` makes, ended by the agent's deadline, with the VCI's
+    /// clock read at it (5 s after the transmit, no round trip), and returns its entry.
+    fn collecting_read_at_deadline(
+        build: impl FnOnce(&mut exchange::Evidence),
+    ) -> serde_json::Value {
+        let (dir, setup, log) = collecting_log();
+        log.exchange(collecting_waited(|evidence| {
+            build(evidence);
+            evidence.times.vci.as_mut().unwrap().deadline = Some(exchange::ClockReading {
+                time: device_time(BASE_US + 5_000_000),
+                round_trip_us: 0,
+            });
+        }))
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        of_event(&lines, "exchange").remove(0)
+    }
+
+    /// ADR-426 Consequences, design 8.11 `vci_did_not_end`: a collecting exchange's VCI limits run
+    /// from the window's start, the end of its last answer, not from the transmit. P2 is 1 s, the
+    /// margin 2 ms and a frame 320 µs.
+    #[test]
+    fn a_collecting_exchange_s_vci_limits_run_from_its_last_answer() {
+        // The last answer ended 0.2 s before the reading: not past, though 5 s from the transmit.
+        let recent = collecting_read_at_deadline(|evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 4_800_000)];
+        });
+        assert_eq!(recent["classification"], "undetermined", "{recent}");
+        // 2 s before the reading: past by 2 s less 1.00232 s.
+        let past = collecting_read_at_deadline(|evidence| {
+            evidence.answers = vec![positive_on(0x7E8, 3_000_000)];
+        });
+        assert_eq!(past["classification"], "system", "{past}");
+        let reason = past["reason"].as_str().unwrap();
+        assert!(reason.contains("997.7"), "{reason}");
+        // With no answer the window is the transmit's, as before.
+        let none = collecting_read_at_deadline(|_| {});
+        assert_eq!(none["classification"], "system", "{none}");
+        assert!(
+            none["reason"].as_str().unwrap().contains("3997.7"),
+            "{none}"
+        );
+    }
+
+    /// The `primitive_ended` re-check reads the same window: an answer read for the end that
+    /// restarts it shortly before the reading refutes the `system` the entry showed.
+    #[test]
+    fn the_end_re_checks_the_vci_limits_from_the_window_the_end_leaves() {
+        let (dir, setup, log) = collecting_log();
+        let seq = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.answers = vec![positive_on(0x7E8, 3_000_000)];
+                evidence.times.vci.as_mut().unwrap().deadline = Some(exchange::ClockReading {
+                    time: device_time(BASE_US + 5_000_000),
+                    round_trip_us: 0,
+                });
+            }))
+            .unwrap();
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+                detail: exchange::Detail::default(),
+                vci_ended: false,
+                reads: read_after_deadline(vec![answer_read(0x7E8, 4_500_000)]),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = of_event(&lines, "exchange").remove(0);
+        assert_eq!(entry["classification"], "system", "{entry}");
+        let ended = of_event(&lines, "primitive_ended").remove(0);
+        assert_ne!(ended["classification"], "system", "{ended}");
+    }
 
     /// ADR-425, case table rows 1 and 2: the answers read after the deadline are listed after the
     /// entry's, each judged from the end of the answer before it (the first from the last the

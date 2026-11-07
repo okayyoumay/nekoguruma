@@ -1,7 +1,7 @@
 # ADR-423: The D-PDU Mock Keeps a Started Link's Tester-Present
 
 **Date:** 2026-11-05
-**Status:** Accepted (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication)
+**Status:** Accepted (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication; by ADR-430: with no header, in every binding mode)
 **Affects:** `crates/iso22900-mock` (`PDUSetComParam`, `PDUGetComParam`, `PDUGetStatus`,
 `PDUStartComPrimitive`, `PDUConstruct`, the delivery thread, `NGR_SIM_ECU_COMMANDS`),
 `crates/iso22900-mock/docs/`, `crates/iso22900-service/tests/grpc_mock.rs`; ADR-299, ADR-418,

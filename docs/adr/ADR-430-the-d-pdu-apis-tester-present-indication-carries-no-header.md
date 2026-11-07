@@ -30,8 +30,10 @@ D.2.1). So the API's tester-present transmit indication, if the library raises i
 ComPrimitive and no header. A request's own transmit indication is bound to its ComPrimitive,
 and the agent prefers a bound one; its unbound path needs the identifier from a header.
 
-8.1.3 lets a tester present go out while a request is extended by a response pending (Table 1
-governs), so a tester present can fall between a request and its response after all.
+Table 1 of 8.1.3 makes a physical request wait for the final answer of the previous physical one
+(a response pending excluded). Its paragraph on sending a request at once also lets a library
+send a tester present during a response pending when that has no undesirable effect, so a D-PDU
+library may put one between a request and its response.
 
 ## Decision
 
@@ -58,15 +60,19 @@ governs), so a tester present can fall between a request and its response after 
 
 - On a non-conforming library that raises the tester present's indication unbound with a header
   and gives the request's own indication unbound too, the agent can take the tester present's
-  as the transmit done. The tester present is sent before the request, so this only lengthens
-  `response_ms`, never shortens it. This is the residual ADR-356 accepts, and the worker's
+  as the transmit done. The agent takes the first match in read order (`comm_log.rs`), so an
+  earlier-queued tester present's item wins, which gives an earlier transmit done and a longer
+  response time; it never shortens `response_ms`. This is the residual ADR-356 accepts, and the worker's
   warning shows it. Reconsider if a hardware run (design 13.5) shows such items.
 - The agent's end-to-end tests cover both bindings: the VIN read after a session control keeps
   its own transmit done, whether the mock queues the request's indications unbound or bound.
-- A mid-exchange tester present can still shorten a measured latency only for the J2534 shape
-  (ADR-419 serializes it per 8.1.3 Table 1, which also allows one during a response pending).
-  ADR-427's statement that a conforming library lands it never between a request and its
-  response is corrected accordingly.
+- ADR-427's statement that a library following Table 1 lands the tester present before a request
+  or after its response holds only for such a library; one using the paragraph above may send it
+  during a response pending. That does not matter here, since its item has no header either way.
+  The J2534 worker holds its tester present for the whole pending chain (ADR-419).
+- The counts are summed up only after a successful native destroy or disconnect, never on the
+  worker's exit, and a failed destroy leaves them, so a reused link handle gets no first warning.
+  This is the pattern of the COP tags (ADR-205).
 
 ## Alternatives considered
 

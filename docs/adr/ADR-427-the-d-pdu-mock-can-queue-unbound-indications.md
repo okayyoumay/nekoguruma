@@ -29,7 +29,7 @@ is on by B.5.1's default for the UDS protocols and the guard leaves it as is, bu
 the `CoptStartcomm` the guard grants, so no guarded link is COMM_STARTED. The tester present goes
 at once when the link starts and then every `CP_TesterPresentTime`, and 8.1.3 Table 1 holds a
 physical transmit until the previous physical request's final answer (a response pending
-excepted), so a conforming library lands it before a request or after its response (ADR-430: 8.1.3 also lets one go out while a request is extended by a response pending, so it can fall between). One sent before the request is overridden by the handle's "latest unbound indication
+excepted), so a conforming library lands it before a request or after its response (ADR-430: this holds for a library that follows Table 1; 8.1.3's paragraph on sending at once lets a library send one during a response pending, which does not matter, since the item has no header). One sent before the request is overridden by the handle's "latest unbound indication
 before the response" rule. With address mode 1 it goes out on the functional identifier, which
 the handle's identifier check does not match.
 
@@ -49,9 +49,11 @@ the handle's identifier check does not match.
 2. **The mock's tester present raises an unbound transmit indication under that control.** When
    the ECU's own tester present (ADR-423 item 5) is sent, the link's active `CP_TransmitIndEnable`
    is on, the active tester-present address mode is 0 and the binding is unbound, the mock
-   queues an unbound transmit indication with `request_id`, at the send's time. Amended by ADR-430: the indication carries no header and is raised in every binding mode. Otherwise it
+   queues an unbound transmit indication with `request_id`, at the send's time. Otherwise it
    queues none: a bound mode has no identifier to give it, and a functional send goes out on an
-   identifier the control does not supply.
+   identifier the control does not supply. Amended by ADR-430: the indication carries no header
+   and is raised in every binding mode, so the bound-mode clause no longer holds; the functional
+   one still raises none.
 3. **The handle keeps its rule.** `note_indication` takes the latest unbound indication on the
    request identifier before the response. "The first after the send" would be wrong for a
    tester present followed by the request, an order 8.1.3 Table 1 allows. The handle's unit
@@ -74,6 +76,7 @@ the handle's identifier check does not match.
   makes an on-time response late.
 - The agent's end-to-end coverage of the unbound path is still open (closed by ADR-430's tests). Design 8.11 `sent_evidence`
   takes an unbound transmit done only when the API sends no tester present on that identifier,
-  and the agent's tests through the mock use the default, bound mode.
+  and the agent's tests through the mock use the default, bound mode (ADR-430's tests cover both
+  bindings).
 - The agent's D-PDU link sends no TxFlag, so on a real library its response items carry no
   header; settled by ADR-428: the D-PDU worker sets ENABLE_EXTRA_INFO on every ComPrimitive.

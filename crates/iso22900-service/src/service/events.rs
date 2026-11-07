@@ -73,7 +73,7 @@ fn item_clock(h_mod: ModuleHandle) -> vci_service_interface::TimestampClock {
 /// The kind of an item from its RxFlag: byte 3 of the four-byte flag carries the transmit
 /// indication (bit 3) and start of message (bit 1) bits (ISO 22900-2 (2022) D.2.2).
 fn unbound_item_kind(rx_flag: &[u8]) -> UnboundItemKind {
-    match rx_flag.last().copied().unwrap_or(0) {
+    match rx_flag.get(3).copied().unwrap_or(0) {
         flags if flags & 0x08 != 0 => UnboundItemKind::TransmitIndication,
         flags if flags & 0x02 != 0 => UnboundItemKind::StartOfMessage,
         _ => UnboundItemKind::Other,
@@ -444,6 +444,16 @@ mod tests {
         assert_eq!(unbound_item_kind(&START), UnboundItemKind::StartOfMessage);
         assert_eq!(unbound_item_kind(&[0; 4]), UnboundItemKind::Other);
         assert_eq!(unbound_item_kind(&[]), UnboundItemKind::Other);
+        // Byte 3 decides: a one-byte flag has none, a longer one is read at its fourth byte.
+        assert_eq!(unbound_item_kind(&[0x08]), UnboundItemKind::Other);
+        assert_eq!(
+            unbound_item_kind(&[0, 0, 0, 0x08, 0x02]),
+            UnboundItemKind::TransmitIndication
+        );
+        assert_eq!(
+            unbound_item_kind(&[0, 0, 0, 0, 0x08]),
+            UnboundItemKind::Other
+        );
         assert_eq!(header_description(&[0, 0, 7, 0xE0]), "identifier 0x7e0");
         assert_eq!(header_description(&[1, 2]), "2 bytes");
     }

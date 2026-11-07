@@ -118,6 +118,16 @@ fn run(procedure: &Program) -> Vec<serde_json::Value> {
 
 /// Like [`run`], with the mock's control `commands`.
 fn run_with(procedure: &Program, commands: &str) -> Vec<serde_json::Value> {
+    run_log(procedure, commands)
+        .0
+        .into_iter()
+        .filter(|line| line["event"] == "exchange")
+        .collect()
+}
+
+/// Like [`run_with`], but returns every line of the communication log, in file order, and the
+/// agent's stderr, which the worker it spawns shares (its log lines).
+fn run_log(procedure: &Program, commands: &str) -> (Vec<serde_json::Value>, String) {
     let temp = tempfile::tempdir().expect("temporary directory");
     let root = temp.path();
     let library = iso22900_mock::mock_library_path().expect("the mock cdylib should be built");
@@ -156,9 +166,22 @@ fn run_with(procedure: &Program, commands: &str) -> Vec<serde_json::Value> {
         .env_remove("NGR_SIM_ECU_STATE")
         .env_remove("VCI_SERVICE_INSECURE_NO_AUTH")
         .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("ngr-agent should start");
+    // Drained while the agent runs, so a full pipe cannot stall it; echoed for the test output.
+    let stderr_reader = {
+        use std::io::Read;
+        let mut stderr = child.stderr.take().expect("piped stderr");
+        std::thread::spawn(move || {
+            let mut text = String::new();
+            let mut bytes = Vec::new();
+            let _ = stderr.read_to_end(&mut bytes);
+            text.push_str(&String::from_utf8_lossy(&bytes));
+            eprint!("{text}");
+            text
+        })
+    };
     // A wedged agent or worker must fail the test, not hang the CI job.
     let deadline = Instant::now() + Duration::from_secs(120);
     let status = loop {
@@ -177,7 +200,8 @@ fn run_with(procedure: &Program, commands: &str) -> Vec<serde_json::Value> {
         status.success(),
         "ngr-agent failed: {status}, stdout {stdout}"
     );
-    std::fs::read_dir(&comm_log)
+    let stderr = stderr_reader.join().expect("stderr reader");
+    let lines = std::fs::read_dir(&comm_log)
         .expect("the communication log directory")
         .map(|entry| entry.expect("an entry").path())
         .filter(|path| path.to_string_lossy().ends_with(".commlog.jsonl"))
@@ -188,8 +212,8 @@ fn run_with(procedure: &Program, commands: &str) -> Vec<serde_json::Value> {
                 .map(|line| serde_json::from_str::<serde_json::Value>(line).expect("a JSON line"))
                 .collect::<Vec<_>>()
         })
-        .filter(|line| line["event"] == "exchange")
-        .collect()
+        .collect::<Vec<_>>();
+    (lines, stderr)
 }
 
 /// The VCI time `field` of an exchange's `times.vci`: its microseconds on the device clock.
@@ -235,38 +259,81 @@ fn the_agent_takes_an_exchange_s_times_from_unbound_indications() {
     }
 }
 
-/// The exchanges of `session_then_read` under the mock's control `commands`: the session control
-/// starts the mock's tester present, which raises an unbound transmit indication of its own
-/// (without a header, ADR-430), and the VIN read follows. The VIN read's transmit done is its
-/// own, taken from its own indication: later than the session control's end, and before the
-/// response's end by the ECU's response time, not by the time since the tester present.
-fn check_read_after_tester_present(commands: &str) {
-    let exchanges = run_with(&session_then_read(), commands);
-    assert_eq!(exchanges.len(), 2, "{exchanges:?}");
-    let (session, read) = (&exchanges[0], &exchanges[1]);
+/// The log of `session_then_read` under the mock's control `commands`: the session control
+/// starts the mock's tester present, which raises an unbound transmit indication of its own with
+/// no header (ADR-430). The agent cannot match it to a request, so it logs it as an `unattached`
+/// transmit indication with no identifier. The VIN read that follows has its own transmit done,
+/// taken from its own indication and later than the tester present's, and the tester present's
+/// line changes neither exchange's `sent` nor `sent_evidence`.
+fn check_read_after_tester_present(commands: &str, evidence_of_session: &str) -> String {
+    let (lines, stderr) = run_log(&session_then_read(), commands);
+    let exchanges: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "exchange")
+        .collect();
+    assert_eq!(exchanges.len(), 2, "{lines:?}");
+    let (session, read) = (exchanges[0], exchanges[1]);
     assert_eq!(session["outcome"]["result"], "positive", "{session}");
     assert_eq!(read["outcome"]["result"], "positive", "{read}");
     assert_eq!(read["sent"], "confirmed", "{read}");
     assert_eq!(read["sent_evidence"], "tx_indication", "{read}");
+    // The tester present's indication, logged apart from the exchanges.
+    let tester_present: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "unattached" && line["item"] == "transmit_indication")
+        .collect();
+    assert!(!tester_present.is_empty(), "no unattached line: {lines:?}");
+    for line in &tester_present {
+        assert!(line.get("identifier").is_none(), "{line}");
+        assert_eq!(line["clock"], "device", "{line}");
+    }
+    // It changes no exchange's evidence: the session control's is what it is without it.
+    assert_eq!(session["sent"], "confirmed", "{session}");
+    assert_eq!(session["sent_evidence"], evidence_of_session, "{session}");
     let session_end = vci_us(session, "rx_end");
     let (tx_done, rx_end) = (vci_us(read, "tx_done"), vci_us(read, "rx_end"));
     assert!(tx_done > session_end, "{read}");
     assert!(tx_done <= rx_end, "{read}");
-    // The mock answers the VIN read at once. The tester present's indication went out when the
-    // session control ended, some 45 ms before the read on a quiet machine, so taking it would
-    // leave a gap of that size; the read's own is within a few milliseconds of the response.
-    assert!(rx_end - tx_done < 30_000, "{read}");
+    // The read's transmit done is its own: not any tester present's time, and later than the
+    // first one's, which went out when the session control ended.
+    let times: Vec<u64> = tester_present
+        .iter()
+        .map(|line| line["vci_us"].as_u64().expect("a raw VCI time"))
+        .collect();
+    assert!(times.iter().all(|time| *time != tx_done), "{lines:?}");
+    assert!(times.iter().any(|time| *time > session_end), "{lines:?}");
+    let first = times.iter().copied().filter(|t| *t > session_end).min();
+    assert!(first.is_some_and(|first| tx_done > first), "{lines:?}");
+    stderr
 }
 
 /// Unbound items: the agent's tester present starts after the session control and its headerless
 /// unbound transmit indication is not taken for the VIN read's.
 #[test]
 fn the_tester_presents_headerless_indication_is_not_the_reads_transmit_done_unbound() {
-    check_read_after_tester_present(COMMANDS);
+    let stderr = check_read_after_tester_present(COMMANDS, "tx_indication");
+    // The mock's control gives the request's indications a header with no ComPrimitive, which the
+    // worker warns about once for the link and kind (ADR-430), and sums up when the link goes.
+    let warnings: Vec<_> = stderr
+        .lines()
+        .filter(|line| line.contains("an extra info header (identifier 0x7e0)"))
+        .collect();
+    assert_eq!(warnings.len(), 1, "{stderr}");
+    assert!(warnings[0].contains("transmit indication"), "{stderr}");
+    assert!(
+        stderr
+            .lines()
+            .any(|line| line.contains("items of no ComPrimitive with an extra info header")),
+        "no summary: {stderr}"
+    );
 }
 
-/// Bound items (the default binding): the VIN read's transmit done is its own bound indication.
+/// Bound items (the default binding): the mock's tester present still raises its headerless
+/// transmit indication, which the agent logs as an `unattached` line without an identifier, and
+/// the VIN read's transmit done is its own bound indication.
 #[test]
-fn the_tester_presents_indication_is_not_the_reads_transmit_done_bound() {
-    check_read_after_tester_present(BOUND_COMMANDS);
+fn the_tester_presents_indication_is_logged_apart_and_the_read_keeps_its_own_when_bound() {
+    let stderr = check_read_after_tester_present(BOUND_COMMANDS, "tx_indication");
+    // The tester present's item has no header, and the others are bound: nothing to warn about.
+    assert!(!stderr.contains("an extra info header"), "{stderr}");
 }

@@ -201,6 +201,14 @@ fn the_handle_takes_its_times_from_unbound_indication_items() {
                     Some(true),
                     "{times:?}"
                 );
+                // The exchange read three unbound transmit indications on the request identifier:
+                // the start of communication's, the tester present's (both at least the 500 ms
+                // wait old) and its own. The ECU answers at once, so the newest is within
+                // 500 ms of the response; the oldest two are not.
+                assert!(
+                    own_tx_done.until(rx_end).is_some_and(|us| us < 500_000),
+                    "the transmit done is not the newest indication: {times:?}"
+                );
 
                 drop(handle);
                 guard.pass();

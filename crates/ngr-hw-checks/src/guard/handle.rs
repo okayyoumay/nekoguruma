@@ -3541,6 +3541,32 @@ mod tests {
     }
 
     #[test]
+    fn an_unbound_transmit_without_extra_info_keeps_the_bound_transmit_done() {
+        // A D-PDU library attaches extra info only when the primitive set ENABLE_EXTRA_INFO
+        // (ISO 22900-2 (2022) 10.1.4.11.4, D.2.1), so an unbound item (an API tester present's)
+        // has no identifier to match and is ignored.
+        let expected = Expectation::of(&[0x3E, 0x00]);
+        let mut progress = Progress {
+            ids: Some(IDS),
+            ..Progress::default()
+        };
+        let mut on = |item| progress.on_item(item, COP, Some(&expected));
+        let device_clock = TimestampClock::Device;
+        let bound = ResultData {
+            data_bytes: vec![0x3E, 0x00],
+            ..indication(0x08, 0)
+        };
+        assert!(on(timed_event(Some(COP), 1_000, device_clock, bound)).is_none());
+        let bare = ResultData {
+            rx_flag: vec![0, 0, 0, 0x08],
+            extra_info: None,
+            ..ResultData::default()
+        };
+        assert!(on(timed_event(None, 2_000, device_clock, bare)).is_none());
+        assert_eq!(progress.times.tx_done, device(1_000));
+    }
+
+    #[test]
     fn an_unbound_transmit_on_the_functional_identifier_is_not_the_transmit_done() {
         // A tester-present with address mode 1 goes out on the functional identifier, which is
         // not the link's request identifier.

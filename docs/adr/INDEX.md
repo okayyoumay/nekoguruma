@@ -345,7 +345,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-353](ADR-353-event-items-name-the-clock-of-their-time.md) | Event Items Name the Clock of Their Time | Accepted | `vci-service-interface` (`EventItem.timestamp_clock`), `j2534-0404-service` and `iso22900-service` event items, `agent` communication log; design 8.11 "On one clock", design principle 6, ADR-120 |
 | [ADR-354](ADR-354-a-response-start-alone-is-no-matched-answer.md) | A Response Start Alone Is No Matched Answer | Accepted | `agent` communication log (`comm_log/exchange.rs`, `crates/agent/docs/ngr-agent.md`); design 8.11 "Answer of the ECU", "Matched answer", H2, `response_incomplete`, "Settlement" `late_item`; ADR-346 item 6 |
 | [ADR-355](ADR-355-a-link-says-whether-it-forwards-every-pending.md) | A Link Says Whether It Forwards Every Pending | Accepted | `vci-service-interface` (`ComLogicalLinkResponse.pending_forwarding`), `j2534-0404-service` and `iso22900-service` `CreateComLogicalLink`, `agent` link and communication log; design 8.11 `link_opened`, `pending`, H4; design principle 6, ADR-346 item 3 |
-| [ADR-356](ADR-356-the-t2-timing-check-judges-the-latency-the-vci-measured.md) | The T2 Timing Check Judges the Latency the VCI Measured | Accepted | `ngr-hw-checks` guarded handle (`send_receive_timed`, the link's indications), profile (`timing_margin_us`) and T2 timing check, `crates/ngr-hw-checks/docs/hardware-profile.md`; design 13.5, design 8.11 "Timing margin", "Timing judged", "On one clock"; ADR-275, ADR-333, ADR-353 |
+| [ADR-356](ADR-356-the-t2-timing-check-judges-the-latency-the-vci-measured.md) | The T2 Timing Check Judges the Latency the VCI Measured | Accepted (Consequences on the D-PDU mock amended by ADR-427) | `ngr-hw-checks` guarded handle (`send_receive_timed`, the link's indications), profile (`timing_margin_us`) and T2 timing check, `crates/ngr-hw-checks/docs/hardware-profile.md`; design 13.5, design 8.11 "Timing margin", "Timing judged", "On one clock"; ADR-275, ADR-333, ADR-353 |
 | [ADR-357](ADR-357-the-vci-margins-take-a-profile-s-values-or-the-agent-s-defaults.md) | The VCI Margins Take a Profile's Values or the Agent's Defaults | Accepted (the default timing margin, in items 1, 3 and 5, superseded by ADR-377: without a margin a profile gives, no time is judged; the default drift bound and clock margin no longer settle a loss, ADR-378) | `agent` communication log (`VciMargins`, `vci_connected`, `link_opened`) and `Job::with_vci_margins`, `ngr-hw-checks` profile (`drift_bound_ppm`, `clock_margin_us`) and `GuardedClient`; design 8.11 "Timing margin", "Drift bound", 9.3, 13.5 |
 | [ADR-358](ADR-358-the-job-end-wait-is-the-link-s-worst-case-for-a-response.md) | The Job-End Wait Is the Link's Worst Case for a Response | Accepted (item 5's items read but not logged now logged, ADR-386) | `agent` link (`LinkConfig::job_end_wait`), host (`WorkerHost::settle_at_end`) and runner (job end); design 8.11 "Settlement" |
 | [ADR-359](ADR-359-the-exchange-entry-records-rejected-results-and-lost-events.md) | The Exchange Entry Records Rejected Results and Lost Events | Accepted | `agent` host (`Progress::on_event`) and communication log (`rejected`, `events_lost`), `sim-ecu` (`Fault::TruncateResponse`); design 8.11 "Exchange entry" |
@@ -412,10 +412,11 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-420](ADR-420-the-agents-keep-alive-mechanics.md) | The Agent's Keep-Alive Mechanics | Accepted | `agent` (`LinkConfig`, link open, `keep_alive.rs`, host, `WorkerApi`), communication log `keep_alive` and `link_opened`, `diag-ir` `SET_BY_LINK`, `ngr-hw-checks`; design 8.2.5, 8.11; ADR-264, ADR-324, ADR-389, ADR-392, ADR-393, ADR-408, ADR-417, ADR-418, ADR-419 |
 | [ADR-421](ADR-421-a-functional-requests-txdone-reaches-the-link-that-sent-it.md) | A Functional Request's TxDone Reaches the Link That Sent It | Accepted | `j2534-0404-service` (`open_func_tx`, `handle_send_recv`, `route_frame_with_role`), `docs/j2534-0404-architecture.md`; design 8.11; ADR-099, ADR-100, ADR-352 item 3, ADR-400, ADR-419 |
 | [ADR-422](ADR-422-a-failed-device-close-keeps-the-workers-slot.md) | A Failed Device Close Keeps the Worker's Slot | Accepted | `j2534-0404-service` (`rpc_module_disconnect`), `j2534-0404-mock`, `sim-vci` (`fail_closes`), `docs/j2534-0404-architecture.md`; ADR-107 addendum (h), ADR-132, ADR-258, ADR-393 item 2 |
-| [ADR-423](ADR-423-the-d-pdu-mock-keeps-a-started-links-tester-present.md) | The D-PDU Mock Keeps a Started Link's Tester-Present | Accepted | `iso22900-mock` (tester-present ComParams, link state, `PDUGetStatus`, delivery thread, `NGR_SIM_ECU_COMMANDS`), `iso22900-service` `grpc_mock` test; ADR-299, ADR-418, ADR-419, ADR-420 |
+| [ADR-423](ADR-423-the-d-pdu-mock-keeps-a-started-links-tester-present.md) | The D-PDU Mock Keeps a Started Link's Tester-Present | Accepted (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication) | `iso22900-mock` (tester-present ComParams, link state, `PDUGetStatus`, delivery thread, `NGR_SIM_ECU_COMMANDS`), `iso22900-service` `grpc_mock` test; ADR-299, ADR-418, ADR-419, ADR-420 |
 | [ADR-424](ADR-424-the-d-pdu-mock-absorbs-response-pendings.md) | The D-PDU Mock Absorbs Response Pendings | Accepted | `iso22900-mock` (response pending ComParams, `receive_events`, `PDUConnect`, UPDATEPARAM), mock testing guide, `iso22900-service` `agent_suppressed_send_receive` test; ADR-102, ADR-299, ADR-423 |
 | [ADR-425](ADR-425-a-stray-collecting-primitives-answers-reach-its-primitive-ended.md) | A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry | Accepted (Consequences' `late_item` gap closed by ADR-426) | `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`, `judge_windows`); design 8.11 `primitive_ended`; ADR-386, ADR-396, ADR-400, ADR-416 |
 | [ADR-426](ADR-426-a-collecting-exchanges-late-items-are-judged-from-their-windows-start.md) | A Collecting Exchange's Late Items Are Judged From Their Window's Start | Accepted | `agent` (`comm_log` `late_item`, `late_response`, `timing::judge_late`); design 8.11 `late_item`, `late_response`; ADR-371, ADR-400, ADR-425 |
+| [ADR-427](ADR-427-the-d-pdu-mock-can-queue-unbound-indications.md) | The D-PDU Mock Can Queue Its Indications Unbound | Accepted | `iso22900-mock` (`SimEcuCommand::IndicationBinding`, indication items, tester-present indication), mock testing guide, `iso22900-service` `t2_indication_unbound` test, `ngr-hw-checks` handle unit tests; ADR-299, ADR-356, ADR-423 |
 
 ## Status Legend
 
@@ -775,7 +776,7 @@ the predecessor repository these ADRs came from.
 - ADR-334
 - ADR-343
 - ADR-349 (Decision items 1 and 4 amended by ADR-381: the pause applies to code pull requests too)
-- ADR-356
+- ADR-356 (Consequences on the D-PDU mock amended by ADR-427)
 - ADR-360 (Decision item 2's 30-minute wait superseded by ADR-380: 15 minutes, on a timer)
 - ADR-380
 - ADR-381 (item 1 extended by ADR-387: one row per path that writes the value the rule decides)
@@ -786,8 +787,9 @@ the predecessor repository these ADRs came from.
 - ADR-404
 - ADR-407 (item 4 amended by ADR-413: `status` proposes `close`, which starts with the sweep)
 - ADR-413
-- ADR-423
+- ADR-423 (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication)
 - ADR-424
+- ADR-427
 
 ### Timestamps / Clock
 - ADR-057 (amended by ADR-102)

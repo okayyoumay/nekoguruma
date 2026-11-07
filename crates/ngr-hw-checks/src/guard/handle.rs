@@ -3507,6 +3507,72 @@ mod tests {
         assert_eq!(blind.times, VciTimes::default());
     }
 
+    /// The transmit done after a bound transmit indication at 1 000 us, an unbound one naming
+    /// `id` at 2 000 us (the API's own tester-present may queue one) and the response at 3 000 us.
+    fn tx_done_with_unbound_transmit_on(id: u32) -> Option<VciTime> {
+        let expected = Expectation::of(&[0x3E, 0x00]);
+        let mut progress = Progress {
+            ids: Some(IDS),
+            ..Progress::default()
+        };
+        let mut on = |item| progress.on_item(item, COP, Some(&expected));
+        let device_clock = TimestampClock::Device;
+        let bound = ResultData {
+            data_bytes: vec![0x3E, 0x00],
+            ..indication(0x08, 0)
+        };
+        assert!(on(timed_event(Some(COP), 1_000, device_clock, bound)).is_none());
+        assert!(on(timed_event(None, 2_000, device_clock, indication(0x08, id))).is_none());
+        let response = ResultData {
+            data_bytes: vec![0x7E, 0x00],
+            ..ResultData::default()
+        };
+        assert!(on(timed_event(Some(COP), 3_000, device_clock, response)).is_none());
+        progress.times.tx_done
+    }
+
+    #[test]
+    fn an_unbound_transmit_on_the_request_identifier_before_the_response_is_the_transmit_done() {
+        // Latest before the response: a tester-present the API sends on the physical identifier
+        // between the request and its response would shorten the latency, never lengthen it
+        // (ADR-356); ISO 22900-2 (2022) 8.1.3 Table 1 makes that order impossible for a library
+        // that follows it.
+        assert_eq!(tx_done_with_unbound_transmit_on(0x7E0), device(2_000));
+    }
+
+    #[test]
+    fn an_unbound_transmit_without_extra_info_keeps_the_bound_transmit_done() {
+        // A D-PDU library attaches extra info only when the primitive set ENABLE_EXTRA_INFO
+        // (ISO 22900-2 (2022) 10.1.4.11.4, D.2.1), so an unbound item (an API tester present's)
+        // has no identifier to match and is ignored.
+        let expected = Expectation::of(&[0x3E, 0x00]);
+        let mut progress = Progress {
+            ids: Some(IDS),
+            ..Progress::default()
+        };
+        let mut on = |item| progress.on_item(item, COP, Some(&expected));
+        let device_clock = TimestampClock::Device;
+        let bound = ResultData {
+            data_bytes: vec![0x3E, 0x00],
+            ..indication(0x08, 0)
+        };
+        assert!(on(timed_event(Some(COP), 1_000, device_clock, bound)).is_none());
+        let bare = ResultData {
+            rx_flag: vec![0, 0, 0, 0x08],
+            extra_info: None,
+            ..ResultData::default()
+        };
+        assert!(on(timed_event(None, 2_000, device_clock, bare)).is_none());
+        assert_eq!(progress.times.tx_done, device(1_000));
+    }
+
+    #[test]
+    fn an_unbound_transmit_on_the_functional_identifier_is_not_the_transmit_done() {
+        // A tester-present with address mode 1 goes out on the functional identifier, which is
+        // not the link's request identifier.
+        assert_eq!(tx_done_with_unbound_transmit_on(0x7DF), device(1_000));
+    }
+
     #[test]
     fn a_response_s_own_times_and_bound_indications_time_the_exchange() {
         // The shape a D-PDU library may give: an indication bound to the primitive, and the

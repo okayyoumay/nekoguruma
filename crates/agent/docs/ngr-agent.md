@@ -644,6 +644,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   (`Kept::late_start`), so a late response that completes it, spanning frames, is `system`; a
   start after the limit plus the margin is kept the same way, and any response completing it is
   judged as a late one (`vehicle` when the VCI ended its wait at the limit).
+  For a collecting exchange these judgements (and a late response's) run from the window that its
+  response identifier's final answer would get at that place, by `late_window`, which reuses
+  `answer_windows`; the time reported stays from the transmit (ADR-426).
   One that two exchanges could own stays `unattached`, followed by a `late_item` that raises each
   owed one to at least `undetermined` (once: an owed one already raised is not named again), and
   the exchange in flight that could own it is at least `undetermined` too when the item could

@@ -1724,6 +1724,13 @@ async fn a_result_item_carries_the_table_response_id_as_its_header() {
         })
         .await
         .expect("set_unique_resp_id_table should succeed");
+    // The table is a working buffer; the connect makes it active (8.4.28.1, 8.4.15.6).
+    setup_client
+        .connect_com_logical_link(ConnectComLogicalLinkRequest {
+            cll_handle: Some(cll_handle),
+        })
+        .await
+        .expect("connect_com_logical_link should succeed");
     let mut stream_client = server.client().await;
     let mut stream = stream_client
         .subscribe_event(SubscribeEventRequest {

@@ -152,7 +152,7 @@ struct PendingEvent {
     /// (ADR-428): an indication item the mock queues unbound ([`SimEcuCommand::IndicationBinding`]),
     /// which has `hCop` undefined, takes it from that control; a result item of the attached ECU
     /// takes the response identifier of the unique response table, when its ComPrimitive set
-    /// ENABLE_EXTRA_INFO and the table gave one ([`MockState::table_response_id`]).
+    /// ENABLE_EXTRA_INFO and the table gave one ([`MockState::table_active`], as it was when the ComPrimitive started).
     identifier: Option<u32>,
     kind: EventKind,
     /// The link state change that takes effect when this item is delivered, set on the last
@@ -609,7 +609,11 @@ struct MockState {
     /// `PDUSetUniqueRespIdTable` last set (the mock's ECU always answers as unique 1): the
     /// response identifier the result items of a ComPrimitive that set ENABLE_EXTRA_INFO carry
     /// in their header (ADR-428). `None` until a table gave one. Reset with the link.
-    table_response_id: Option<u32>,
+    table_active: Option<u32>,
+    /// The id the last `PDUSetUniqueRespIdTable` gave: the working buffer, which `PDUConnect` and
+    /// the start of an UPDATEPARAM copy to `table_active` like the other ComParams (ISO 22900-2
+    /// (2022) 8.4.28.1, 8.4.15.6). A ComPrimitive keeps the active id from when it was started.
+    table_working: Option<u32>,
     /// When the next tester-present is due; `None` while the tester-present is off, that is,
     /// unless the link is COMM_STARTED with the active handling on.
     tp_due: Option<Instant>,
@@ -625,7 +629,8 @@ impl MockState {
         self.rc78_active = Rc78::default();
         self.ind_working = Indications::default();
         self.ind_active = Indications::default();
-        self.table_response_id = None;
+        self.table_working = None;
+        self.table_active = None;
     }
 
     /// The link is ONLINE with no tester-present. A ComPrimitive still waiting or running keeps
@@ -840,7 +845,9 @@ unsafe fn table_response_id(table: *const PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> Opti
                 && param.ComParamDataType == E_PDU_PT::PDU_PT_UNUM32
                 && !param.pComParamData.is_null()
         })
-        .map(|param| unsafe { *param.pComParamData.cast::<UNUM32>() })
+        .map(|param| unsafe { param.pComParamData.cast::<UNUM32>().read_unaligned() })
+        // All ones is the value for "not used".
+        .filter(|&id| id != u32::MAX)
 }
 
 /// A flag field with no bytes.
@@ -1010,6 +1017,8 @@ struct WaitingCop {
     /// Whether its control set ENABLE_EXTRA_INFO in the TxFlag (ISO 22900-2 (2022) D.2.1): its
     /// result items then carry the table's response identifier as a header (ADR-428).
     extra_info: bool,
+    /// The table's response identifier in force when it was started (`table_active`).
+    table_id: Option<u32>,
     /// The state change its last item makes when delivered.
     hook: Option<Hook>,
 }
@@ -1025,11 +1034,7 @@ fn begin_next(state: &mut MockState, now: Instant) {
     let hook = cop.hook;
     let no_response_times = state.no_response_times;
     let unbound = cop.unbound;
-    let header_id = if cop.extra_info {
-        state.table_response_id
-    } else {
-        None
-    };
+    let header_id = if cop.extra_info { cop.table_id } else { None };
     let mut events = match (state.ecu.as_mut(), cop.request) {
         (Some(ecu), Some((request, cycles))) => {
             let sent = clock_at(now);
@@ -1338,8 +1343,6 @@ enum Cycles {
     SendReceive,
 }
 
-/// `PDU_COP_CTRL_DATA`'s send and receive cycles (ISO 22900-2 (2022) 8.2.6.2). Without control
-/// data the mock sends once and receives once.
 /// Whether the control's TxFlag sets ENABLE_EXTRA_INFO: byte 0, bit 5 (D.2.1 Table D.4). Reads
 /// the flag only when it has a byte to read.
 fn requests_extra_info(control: Option<&PDU_COP_CTRL_DATA>) -> bool {
@@ -1352,6 +1355,8 @@ fn requests_extra_info(control: Option<&PDU_COP_CTRL_DATA>) -> bool {
         && unsafe { *flag.pFlagData } & TX_FLAG_ENABLE_EXTRA_INFO != 0
 }
 
+/// `PDU_COP_CTRL_DATA`'s send and receive cycles (ISO 22900-2 (2022) 8.2.6.2). Without control
+/// data the mock sends once and receives once.
 fn cycles(control: Option<&PDU_COP_CTRL_DATA>) -> Cycles {
     match control {
         None => Cycles::SendReceive,
@@ -1964,6 +1969,7 @@ exported_fn!(PDUConnect(_h_mod: UNUM32, _h_cll: UNUM32) -> T_PDU_ERROR {
     guard.counters.connect += 1;
     guard.rc78_active = guard.rc78_working;
     guard.ind_active = guard.ind_working;
+    guard.table_active = guard.table_working;
     drop(guard);
     no_error()
 });
@@ -2127,6 +2133,7 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         if cop_type == E_PDU_COPT::PDU_COPT_UPDATEPARAM {
             guard.rc78_active = guard.rc78_working;
             guard.ind_active = guard.ind_working;
+            guard.table_active = guard.table_working;
         }
         let busy = !guard.waiting.is_empty() || !guard.scheduled.is_empty();
         let immediate = if guard.ecu.is_some() || busy {
@@ -2139,6 +2146,7 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             let indications = guard.ind_active;
             let unbound = guard.unbound_indications;
             let extra_info = requests_extra_info(control);
+            let table_id = guard.table_active;
             guard.waiting.push_back(WaitingCop {
                 event,
                 request,
@@ -2146,6 +2154,7 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
                 indications,
                 unbound,
                 extra_info,
+                table_id,
                 hook,
             });
             // On an idle link it begins at once, as it would without the delivery thread.
@@ -2455,8 +2464,13 @@ exported_fn!(PDUGetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, p_unique_re
 
 exported_fn!(PDUSetUniqueRespIdTable(_h_mod: UNUM32, _h_cll: UNUM32, p_unique_resp_id_table: *mut PDU_UNIQUE_RESP_ID_TABLE_ITEM) -> T_PDU_ERROR {
     // The mock keeps only the response identifier of the entry its ECU answers as (ADR-428).
+    if p_unique_resp_id_table.is_null() {
+        // 8.4.28.2: no table is a parameter error. The wrapper always passes a table struct,
+        // with a null entry array when it is empty, which this accepts.
+        return invalid_parameters();
+    }
     let id = unsafe { table_response_id(p_unique_resp_id_table) };
-    state().lock().expect("mock state poisoned").table_response_id = id;
+    state().lock().expect("mock state poisoned").table_working = id;
     no_error()
 });
 
@@ -4480,6 +4494,84 @@ mod tester_present_tests {
             }
         }
 
+        /// Starts `request` as a send-receive with `control` (null: none) and returns its handle.
+        fn start_with(request: &[u8], control: *mut PDU_COP_CTRL_DATA) -> UNUM32 {
+            let mut data = request.to_vec();
+            let mut handle = 0;
+            unsafe {
+                PDUStartComPrimitive(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    E_PDU_COPT::PDU_COPT_SENDRECV,
+                    data.len() as UNUM32,
+                    data.as_mut_ptr(),
+                    control,
+                    ptr::null_mut(),
+                    &mut handle,
+                );
+            }
+            handle
+        }
+
+        /// A control for one send and one receive with the TxFlag `flag` of `count` bytes.
+        fn control_with(flag: &mut [u8], count: UNUM32) -> PDU_COP_CTRL_DATA {
+            PDU_COP_CTRL_DATA {
+                Time: 0,
+                NumSendCycles: 1,
+                NumReceiveCycles: 1,
+                TempParamUpdate: 0,
+                TxFlag: PDU_FLAG_DATA {
+                    NumFlagBytes: count,
+                    pFlagData: flag.as_mut_ptr(),
+                },
+                NumPossibleExpectedResponses: 0,
+                pExpectedResponseArray: ptr::null_mut(),
+            }
+        }
+
+        /// The events of `handle` up to its end (a FINISHED status).
+        fn until_finished(handle: UNUM32) -> Vec<PendingEvent> {
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
+                taken.extend(queued.into_iter().filter(|event| event.h_cop == handle));
+                if taken.iter().any(|event| {
+                    matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+                }) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(5), "no end");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        /// Every event queued, until `done` holds for what has been taken so far.
+        fn collect(done: impl Fn(&[PendingEvent]) -> bool) -> Vec<PendingEvent> {
+            let mut taken = Vec::new();
+            let started = Instant::now();
+            loop {
+                taken.extend(std::mem::take(&mut state().lock().unwrap().pending_events));
+                if done(&taken) {
+                    return taken;
+                }
+                assert!(started.elapsed() < Duration::from_secs(10), "not done");
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+
+        fn finished(events: &[PendingEvent], handle: UNUM32) -> bool {
+            events.iter().any(|event| {
+                event.h_cop == handle
+                    && matches!(event.kind, EventKind::Status(s) if s == E_PDU_STATUS::PDU_COPST_FINISHED)
+            })
+        }
+
+        fn update_param(rig: &Rig) {
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+        }
+
         fn results(events: &[PendingEvent]) -> Vec<&PendingEvent> {
             events
                 .iter()
@@ -4490,16 +4582,101 @@ mod tester_present_tests {
         const FLAG_SET: &[u8] = &[0x20, 0, 0, 0];
 
         #[test]
-        fn the_table_response_id_is_recorded_for_the_entry_of_unique_1_and_cleared_with_the_link() {
+        fn the_table_response_id_is_a_working_buffer_active_at_connect_and_cleared_with_the_link() {
             let rig = Rig::new();
-            assert_eq!(state().lock().unwrap().table_response_id, None);
+            assert_eq!(state().lock().unwrap().table_active, None);
             set_table(Some(0x7E8));
-            assert_eq!(state().lock().unwrap().table_response_id, Some(0x7E8));
+            assert_eq!(state().lock().unwrap().table_working, Some(0x7E8));
+            assert_eq!(state().lock().unwrap().table_active, None);
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E8));
+            // A later table is active at the next UPDATEPARAM.
             set_table(None);
-            assert_eq!(state().lock().unwrap().table_response_id, None);
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E8));
+            update_param(&rig);
+            assert_eq!(state().lock().unwrap().table_active, None);
             set_table(Some(0x7E8));
+            update_param(&rig);
             unsafe { PDUDestroyComLogicalLink(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
-            assert_eq!(state().lock().unwrap().table_response_id, None);
+            assert_eq!(state().lock().unwrap().table_active, None);
+            assert_eq!(state().lock().unwrap().table_working, None);
+        }
+
+        #[test]
+        fn a_table_set_after_connect_without_an_updateparam_keeps_the_connect_time_id() {
+            let rig = Rig::new();
+            // Nothing active at connect: no header, though the working buffer has an id.
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            set_table(Some(0x7E8));
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(item_of(results(&until_finished(handle))[0]).0, None);
+            // An id active at connect stays until the next UPDATEPARAM.
+            unsafe { PDUConnect(MOCK_MODULE_HANDLE, MOCK_LOGICAL_LINK_HANDLE) };
+            set_table(Some(0x7E9));
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(
+                item_of(results(&until_finished(handle))[0]).0,
+                Some(vec![0, 0, 0x07, 0xE8])
+            );
+            drop(rig);
+        }
+
+        #[test]
+        fn a_primitive_keeps_the_id_active_when_it_started() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 4);
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":200}},"request":[16,3]}}"#);
+            let first = start_with(SESSION, &mut control);
+            let second = start_with(&[0x22, 0xF1, 0x90], &mut control);
+            // Both are started: a table change that is active from now on leaves them alone.
+            set_table(Some(0x7E9));
+            let _update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            assert_eq!(state().lock().unwrap().table_active, Some(0x7E9));
+            let events = collect(|e| finished(e, first) && finished(e, second));
+            let of = |handle: UNUM32| -> Vec<PendingEvent> {
+                events
+                    .iter()
+                    .filter(|e| e.h_cop == handle)
+                    .cloned()
+                    .collect()
+            };
+            for handle in [first, second] {
+                for event in results(&of(handle)) {
+                    assert_eq!(item_of(event).0, Some(vec![0, 0, 0x07, 0xE8]));
+                }
+            }
+            // A primitive started now takes the new id.
+            let third = start_with(SESSION, &mut control);
+            let events = collect(|e| finished(e, third));
+            let third_events: Vec<_> = events
+                .iter()
+                .filter(|e| e.h_cop == third)
+                .cloned()
+                .collect();
+            assert_eq!(
+                item_of(results(&third_events)[0]).0,
+                Some(vec![0, 0, 0x07, 0xE9])
+            );
+        }
+
+        #[test]
+        fn a_table_id_of_all_ones_means_not_used_and_no_table_is_refused() {
+            let rig = Rig::new();
+            set_table(Some(u32::MAX));
+            assert_eq!(state().lock().unwrap().table_working, None);
+            let status = unsafe {
+                PDUSetUniqueRespIdTable(
+                    MOCK_MODULE_HANDLE,
+                    MOCK_LOGICAL_LINK_HANDLE,
+                    ptr::null_mut(),
+                )
+            };
+            assert_eq!(status, invalid_parameters());
             drop(rig);
         }
 
@@ -4559,17 +4736,22 @@ mod tester_present_tests {
         fn a_null_control_gives_no_header() {
             let rig = Rig::new();
             set_table(Some(0x7E8));
-            let cop = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, SESSION);
-            let started = Instant::now();
-            let mut seen = Vec::new();
-            while !seen.iter().any(|(_, s)| matches!(s, Seen::Status(_)))
-                && started.elapsed() < Duration::from_secs(5)
-            {
-                seen.extend(rig.events());
-                std::thread::sleep(Duration::from_millis(2));
-            }
-            assert!(seen.iter().any(|(c, _)| *c == cop));
+            update_param(&rig);
+            let handle = start_with(SESSION, ptr::null_mut());
+            let events = until_finished(handle);
+            assert_eq!(item_of(results(&events)[0]).0, None);
             assert!(!requests_extra_info(None));
+        }
+
+        #[test]
+        fn a_flag_with_no_bytes_but_a_pointer_gives_no_header() {
+            let rig = Rig::new();
+            set_table(Some(0x7E8));
+            update_param(&rig);
+            let mut flag = FLAG_SET.to_vec();
+            let mut control = control_with(&mut flag, 0);
+            let handle = start_with(SESSION, &mut control);
+            assert_eq!(item_of(results(&until_finished(handle))[0]).0, None);
         }
 
         #[test]
@@ -4587,43 +4769,30 @@ mod tester_present_tests {
         fn the_synthetic_completion_has_no_header() {
             let rig = Rig::new();
             set_table(Some(0x7E8));
-            rig.ecu(r#"{"detach":{}}"#);
+            update_param(&rig);
             let mut flag = FLAG_SET.to_vec();
-            let mut control = PDU_COP_CTRL_DATA {
-                Time: 0,
-                NumSendCycles: 1,
-                NumReceiveCycles: 1,
-                TempParamUpdate: 0,
-                TxFlag: PDU_FLAG_DATA {
-                    NumFlagBytes: 4,
-                    pFlagData: flag.as_mut_ptr(),
-                },
-                NumPossibleExpectedResponses: 0,
-                pExpectedResponseArray: ptr::null_mut(),
+            let mut control = control_with(&mut flag, 4);
+            let completion_of = |events: &[PendingEvent], handle: UNUM32| -> Option<PendingEvent> {
+                events
+                    .iter()
+                    .find(|e| e.h_cop == handle && matches!(e.kind, EventKind::Result(_)))
+                    .cloned()
             };
-            let mut handle = 0;
-            unsafe {
-                PDUStartComPrimitive(
-                    MOCK_MODULE_HANDLE,
-                    MOCK_LOGICAL_LINK_HANDLE,
-                    E_PDU_COPT::PDU_COPT_SENDRECV,
-                    0,
-                    ptr::null_mut(),
-                    &mut control,
-                    ptr::null_mut(),
-                    &mut handle,
-                );
-            }
-            let started = Instant::now();
-            let completion = loop {
-                let queued = std::mem::take(&mut state().lock().unwrap().pending_events);
-                if let Some(event) = queued.into_iter().find(|event| event.h_cop == handle) {
-                    break event;
-                }
-                assert!(started.elapsed() < Duration::from_secs(5), "no completion");
-                std::thread::sleep(Duration::from_millis(2));
-            };
-            assert!(matches!(completion.kind, EventKind::Result(_)));
+            // No ECU at the start: the completion is queued at once.
+            rig.ecu(r#"{"detach":{}}"#);
+            let handle = start_with(&[], &mut control);
+            let events = collect(|e| completion_of(e, handle).is_some());
+            assert_eq!(item_of(&completion_of(&events, handle).unwrap()).0, None);
+
+            // Queued behind a running primitive while attached, the ECU gone when it begins:
+            // the completion comes from `begin_next`'s fallback.
+            rig.ecu(r#"{"attach":{}}"#);
+            rig.ecu(r#"{"inject_fault":{"fault":{"response_pending":{"count":1,"interval_ms":300}},"request":[16,3]}}"#);
+            let first = start_with(SESSION, &mut control);
+            let second = start_with(&[0x22, 0xF1, 0x90], &mut control);
+            rig.ecu(r#"{"detach":{}}"#);
+            let events = collect(|e| finished(e, first) && completion_of(e, second).is_some());
+            let completion = completion_of(&events, second).unwrap();
             assert_eq!(item_of(&completion).0, None);
         }
 

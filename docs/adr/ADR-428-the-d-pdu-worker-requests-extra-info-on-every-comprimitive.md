@@ -31,9 +31,12 @@ showed the agent reading a header from a response item.
    with zeros to the default length of four bytes (D.2); a longer raw flag keeps its length. The
    agent is unchanged.
 2. **The mock gives result items a header when asked.** `PDUSetUniqueRespIdTable` records the
-   `CP_CanRespUSDTId` value (a `PDU_PT_UNUM32` ComParam) of the entry whose
-   `UniqueRespIdentifier` is 1, the identifier its ECU always answers as, and the link's reset
-   clears it. `PDUStartComPrimitive` notes whether byte 0 of the TxFlag has the bit, reading the
+   `CP_CanRespUSDTId` value (a `PDU_PT_UNUM32` ComParam; all ones means not used) of the entry
+   whose `UniqueRespIdentifier` is 1, the identifier its ECU always answers as. Like the other
+   ComParams it goes to a working buffer, which `PDUConnect` and the start of an UPDATEPARAM make
+   active (ISO 22900-2:2022 8.4.28.1, 8.4.15.6), and a ComPrimitive keeps the id active when it
+   was started (8.4.17.2). A null table is refused (8.4.28.2). The link's reset clears both
+   buffers. `PDUStartComPrimitive` notes whether byte 0 of the TxFlag has the bit, reading the
    flag only when it has a byte to read. When the bit was set and the table gave an identifier,
    each result item of the attached ECU (responses and response pendings) carries a four-byte
    big-endian header, no footer, and its data bytes are unchanged. There is no header without the

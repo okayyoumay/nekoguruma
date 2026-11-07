@@ -8980,8 +8980,10 @@ pub(crate) mod tests {
         let (entry, after) = ended(5_200_000, false);
         assert_eq!(entry["classification"], "system", "{entry}");
         assert_eq!(after["classification"], "system", "{after}");
-        // Before it: the answer restarts the window, 0.5 s before the reading.
-        let (_, before) = ended(4_500_000, false);
+        // Just before it, within the clock's tolerance (so on the reading's epoch): the answer
+        // restarts the window, 1 ms before the reading.
+        let (_, before) = ended(4_999_000, false);
+        assert_eq!(before["answers"][1]["epoch"], 0, "{before}");
         assert_ne!(before["classification"], "system", "{before}");
         // An answer read at no known place may be before it: not shown.
         let (_, unplaced) = ended(5_200_000, true);

@@ -44,11 +44,14 @@ directions:
 3. **`late_response` judges from the same window**, by the same function: the two are writers of
    one judgement. Any exchange that is not collecting is unchanged: the transmit and
    `limit_pendings` (ADR-371).
-4. **A late start is judged when the link's own identifier has no final answer standing**
-   (silent or only pending), whether or not other identifiers answered; with one standing it only
-   restates, as ADR-425 does. The exchange's outcome stays its first answer. The response a
-   collecting exchange's late start begins is not the first answer's, so the single-frame
-   exception for a start that replaces the response's start does not apply to it.
+4. **A late start is judged when the VCI ended the window and the link's own identifier has
+   no final answer standing.** The conditions are that the exchange's `vci_ended` is set, that
+   its end is no link error, refusal, loss or unknown end (a start whose handle failed,
+   ADR-416, is `Unknown`), and that the latest answer on the exchange's `rx_id` is none or a
+   pending, whether or not other identifiers answered. A window the agent's deadline ended, or
+   with a final answer on the identifier, is only restated, as ADR-425 does. The exchange's
+   outcome is unchanged. The start must come after the identifier's own last pending in the
+   window, not any identifier's, to be taken as the response's start.
 5. **A late pending is kept with the identifier it came on** (`Evidence::pending_ids`), so a
    later late item takes it into the chain of that identifier only.
 6. **The entry's own timing is unchanged.** The judgement of the exchange's own timing in a
@@ -66,3 +69,15 @@ directions:
   (`past_vci_limits`) measures from the transmit, and a lone pending of a collecting exchange
   counts as a final response, which owes the exchange no late item (ADR-400 reads it as none).
   Both are backlog items.
+- A collecting exchange whose window the VCI ended is owed only when it has no answer at all,
+  while a lone pending counts as a final response (the backlog item on `collecting_end`). So a
+  late start of one whose other identifiers answered is reached only once that item lands. The
+  rule is still the right one to have in place.
+- `at_limit` (whether the VCI ended its wait at the limit, `settle_late_pending`,
+  `settle_late_response`) keeps the entry's merged window: it asks about the VCI's single wait
+  (ADR-400 decision 2), while lateness asks about the ECU's window, per identifier.
+- `primitive_ended` read the placed pendings of a collecting exchange by their place in the
+  evidence's list but built them from the entry's pendings only, so a late pending kept before
+  it put the lists out of step (an out-of-bounds read, and the end's pendings measured from the
+  wrong one). It now builds them from all the exchange's pendings, with the late ones in no
+  window, and `judge_windows` checks the lists' lengths.

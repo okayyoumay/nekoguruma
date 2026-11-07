@@ -2966,6 +2966,7 @@ impl CommLog {
             late_start_id: None,
             answer_at: exchange::AnswerTime::None,
             late_pendings: Vec::new(),
+            late_places: Vec::new(),
             floor: None,
             clears,
             matched: false,
@@ -3371,9 +3372,15 @@ impl CommLog {
             evidence.end = exchange::End::ResponseIncomplete;
         }
         // The pendings, read after the entry, come after the kept ones.
-        // The evidence lists the late pendings too, between the entry's and the end's own, so the
-        // placed pendings do (the window rule reads them by their place in the list, ADR-426).
-        let mut pendings = kept.all_pendings();
+        // A collecting exchange's evidence lists its late pendings too, so its placed pendings
+        // do (the window rule reads them by their place in the list, ADR-426). An ordinary
+        // exchange's are its entry's and the end's own, its late pendings keep their verdicts
+        // (ADR-431).
+        let mut pendings = if kept.evidence.collecting {
+            kept.all_pendings()
+        } else {
+            kept.pendings.clone()
+        };
         let kept_pendings = pendings.len();
         let mut placed_all: Vec<Option<clocks::Placed>> = pendings
             .iter()
@@ -10148,9 +10155,9 @@ pub(crate) mod tests {
         );
     }
 
-    /// ADR-431 decision 4: renewing a non-collecting exchange keeps its placed pendings in the
-    /// evidence's order (the entry's, the late ones, the end's own), counts none twice, and the
-    /// limit runs from the latest in time.
+    /// ADR-431 decision 4: renewing an ordinary exchange keeps its late pendings with their
+    /// verdicts and lists its placed pendings in the evidence's order (the entry's, the late
+    /// ones, the end's own), counting none twice; the limit runs from the latest in time.
     #[test]
     fn a_renewed_ordinary_exchange_places_its_pendings_in_the_evidence_s_order() {
         let (dir, _setup, log, seq) = ordinary_stray_on(false);
@@ -10171,7 +10178,8 @@ pub(crate) mod tests {
         .unwrap();
         let kept = kept_of(&log, seq);
         assert_eq!(kept.all_pendings().len(), kept.evidence.pending.len());
-        assert!(kept.late_pendings.is_empty());
+        assert_eq!(kept.pendings.len(), 1, "the end's own only");
+        assert_eq!(kept.late_pendings.len(), 1, "its verdict kept");
         let placed: Vec<i64> = kept
             .all_pendings()
             .iter()
@@ -10186,6 +10194,76 @@ pub(crate) mod tests {
             limit.last().unwrap().unwrap().1.unwrapped,
             *placed.iter().max().unwrap()
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-431 decision 4, ADR-371 item 4: after a renewal an ordinary exchange's late pending
+    /// still stands by its verdict. P2 is 1 s and P2* 5 s: a pending at 1.5 s was late, so a
+    /// final answer at 3.5 s is judged without it (it would be in time after the pending), one
+    /// in time still carries the limit on, and an open one leaves it unknown.
+    #[test]
+    fn a_renewed_ordinary_exchange_judges_by_its_late_pendings_verdicts() {
+        use exchange::LatePending::{InTime, Late, Open};
+        // The transmit of `ordinary_stray_on` is at 10.5 ms.
+        let after_transmit = |after_us: i64| {
+            Some(clocks::Placed {
+                epoch: 0,
+                unwrapped: 10_500 + after_us,
+            })
+        };
+        for (after_us, verdict) in [(1_500_000, Late), (300_000, InTime)] {
+            let (dir, setup, log, seq) = ordinary_stray_on(false);
+            log.lock()
+                .late_item(
+                    0,
+                    seq,
+                    LateIndication::Pending,
+                    &late_pending_item(),
+                    after_transmit(after_us),
+                )
+                .unwrap();
+            assert_eq!(kept_of(&log, seq).late_pendings[0].1, verdict);
+            end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+            log.release_kept_ended(seq);
+            let kept = kept_of(&log, seq);
+            assert_eq!(kept.late_pendings.len(), 1, "{verdict:?}");
+            let counted = kept
+                .limit_pendings()
+                .iter()
+                .filter(|at| at.is_some_and(|(_, p)| p.unwrapped == 10_500 + after_us))
+                .count();
+            assert_eq!(counted, usize::from(verdict == InTime), "{verdict:?}");
+            log.lock()
+                .late_response(
+                    0,
+                    seq,
+                    &late_f190_response(false, 0),
+                    after_transmit(3_500_000),
+                )
+                .unwrap();
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+            // Past the limit of a late pending (1.5 s + P2* is 6.5 s) the answer at 3.5 s
+            // would be in time; judged from the transmit alone it is late.
+            assert_eq!(
+                reason.contains("at least"),
+                verdict == Late,
+                "{verdict:?}: {late}"
+            );
+        }
+        // An open one leaves the limit after it unknown.
+        let (dir, _setup, log, seq) = ordinary_stray_on(false);
+        end_ordinary(&log, seq, Some(exchange::End::NoResponse));
+        let at = Some((
+            exchange::Clock::Device,
+            clocks::Placed {
+                epoch: 0,
+                unwrapped: 10_500 + 700_000,
+            },
+        ));
+        log.lock().links[0].1.add_kept_late_pending(seq, at, Open);
+        assert_eq!(kept_of(&log, seq).limit_pendings().last(), Some(&None));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

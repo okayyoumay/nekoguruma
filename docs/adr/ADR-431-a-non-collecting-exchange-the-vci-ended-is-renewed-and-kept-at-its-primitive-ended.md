@@ -38,9 +38,14 @@ since no pending was open.
    record is released and a later response is `unattached`. `PrimitiveEnded.vci_ended` is true
    when a receive timeout was read, whatever else the end read after it, so such an end that
    did read one is kept, as an entry with `vci_ended` is.
-4. **The late pendings of a renewed exchange are placed in the evidence's order.** Its placed
-   pendings are the entry's, the late ones, then the end's own, as `evidence.pending` lists
-   them, so the limit a later item is judged against runs from the latest in time.
+4. **An ordinary exchange keeps its late pendings with their verdicts.** Renewal sets its
+   placed pendings to the entry's and the end's own and leaves `late_pendings` (each with its
+   `LatePending` verdict, ADR-371 item 4) and `late_places`, the number of placed pendings
+   before each, so `Kept::all_pendings` and `Kept::limit_pendings` merge them in the order of
+   `evidence.pending`: a late one is passed over, an open one leaves the limit unknown, an
+   in-time one extends it. A collecting exchange is renewed as ADR-429 had it (its placed
+   pendings include the late ones and the late list is cleared), since its windows read the
+   placed pendings by their place and would count the late ones twice.
 
 ## Consequences
 

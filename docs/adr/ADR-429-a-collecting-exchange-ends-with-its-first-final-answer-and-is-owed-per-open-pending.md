@@ -35,9 +35,14 @@ even an exchange that stayed owed could never own it.
    here. The owner lookups count distinct exchanges, since two rows can share one kept exchange.
    At `primitive_ended` the exchange is settled only when no identifier is left open; when it
    stays owed, its rows are set again from the answers read after the deadline and its kept
-   evidence is replaced with them, so a later late item is judged against them. One predicate
-   (a final response and no open identifier) decides this for `record`, `primitive_ended` and
-   the answers a settling entry frees.
+   evidence is replaced with them, so a later late item is judged against them. One condition
+   (a final response and no open identifier) is shared by `record`, `primitive_ended` and the
+   answer a settling entry adds (`settled_answer`, which a late response always settles);
+   `record` and the answers freed for later exchanges also require that no owed request could
+   own the answer (`placed_alone`), a part `primitive_ended` does not apply, as before. The
+   host's release of the kept record after a `primitive_ended` (ADR-367 item 3) does not apply
+   to an exchange left owed per an open identifier, and a renewed exchange keeps the send and
+   the transmit that end read.
 4. **Amendments.** ADR-396 item 4's outcome for a lone pending is `no_response`, not the
    pending's negative result. ADR-425 decision 5's "a lone pending read after the deadline is a
    negative end" becomes no response. ADR-426's open bullets (a lone pending counted as a final

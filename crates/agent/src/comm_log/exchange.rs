@@ -1290,6 +1290,18 @@ impl Evidence {
         ids
     }
 
+    /// The request may have reached the ECU, so the exchange awaits an answer: it was neither
+    /// not sent nor refused after a VCI loss.
+    pub(crate) fn awaits_response(&self) -> bool {
+        !matches!(
+            self.end,
+            End::NotSent(_)
+                | End::VciLost {
+                    refused_after_loss: true
+                }
+        )
+    }
+
     /// The exchange has a final response and no identifier is left open on a pending
     /// ([`LinkEffect::settles`]), so a final response settles its owed request.
     pub(crate) fn settles_owed(&self) -> bool {
@@ -1478,9 +1490,9 @@ struct LinkEffect {
 }
 
 impl LinkEffect {
-    /// The exchange has a final response and no identifier is left open on a pending: its
-    /// response is placed with it alone and it is owed nothing (ADR-429). The one predicate
-    /// `record`, the settling entries and the freed answers read.
+    /// The exchange has a final response and no identifier is left open on a pending (ADR-429).
+    /// `placed_alone` adds to it that no owed request could own the answer, and `record` reads
+    /// that; a settling entry adds the answer's own end ([`ExchangeEntry::settled_answer`]).
     fn settles(&self) -> bool {
         self.final_response && self.open_pending_ids.is_empty()
     }
@@ -2027,6 +2039,20 @@ impl LinkState {
         self.kept.remove(&seq);
     }
 
+    /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
+    /// still owed per an identifier a pending is open on: its ECU's final answer can still settle
+    /// it (ADR-429).
+    pub(crate) fn release_kept_ended(&mut self, seq: u64) {
+        let open = self.owed.iter().any(|owed| owed.seq == seq)
+            && self
+                .kept
+                .get(&seq)
+                .is_some_and(|kept| !kept.evidence.open_pending_ids().is_empty());
+        if !open {
+            self.kept.remove(&seq);
+        }
+    }
+
     /// The history of `evidence`, an exchange's evidence that a settling entry for exchange
     /// `seq` gives: the exchange is not an owed request its own answer could belong to.
     /// (Answer histories: [`LinkState::answer_histories`].)
@@ -2200,6 +2226,8 @@ impl LinkState {
             &evidence.open_pending_ids(),
         );
         if let Some(kept) = self.kept.get_mut(&seq) {
+            // The late pendings are in `placed` already (`Kept::all_pendings`).
+            kept.late_pendings.clear();
             kept.evidence = evidence.clone();
             (
                 kept.pendings,
@@ -3281,10 +3309,16 @@ impl ExchangeEntry {
         self.effect.link_error
     }
 
+    /// Whether the exchange has a final response and no identifier open on a pending
+    /// ([`LinkEffect::settles`]).
+    pub(crate) fn settles(&self) -> bool {
+        self.effect.settles()
+    }
+
     /// The answer this entry, a settling entry's view of the earlier exchange `kept` with its new
     /// evidence, adds for the later exchanges on its link ([`LinkState::reclassify_after`]),
     /// counted as [`LinkState::record`] counts an exchange's answer.
-    pub(crate) fn settled_answer(&self, kept: &Kept) -> SettledAnswer {
+    pub(crate) fn settled_answer(&self, kept: &Kept, settles: bool) -> SettledAnswer {
         let effect = &self.effect;
         let before = &kept.evidence;
         SettledAnswer {
@@ -3294,7 +3328,7 @@ impl ExchangeEntry {
                 && before.answer_head().is_none()
                 && !before.response_started,
             newly_matched: self.matched_answer() && !kept.matched,
-            final_response: effect.settles(),
+            final_response: settles,
             clears: kept.clears,
             since_error: true,
         }
@@ -4777,7 +4811,7 @@ mod tests {
     fn final_answer(state: &LinkState, seq: u64, kept: &Kept, response: &[u8]) -> SettledAnswer {
         let answered = kept.answered(response);
         let history = state.history_settling(&answered, seq);
-        ExchangeEntry::build(seq, answered, history).settled_answer(kept)
+        ExchangeEntry::build(seq, answered, history).settled_answer(kept, true)
     }
 
     /// The settling entry's view of exchange `seq`, kept as `kept`, that gets `response` late,
@@ -4794,7 +4828,7 @@ mod tests {
         let history = state.history_settling(&answered, seq);
         let entry = ExchangeEntry::build(seq, answered.clone(), history);
         state.settled(seq, entry.classification, &entry.reason, answered, true);
-        let answer = entry.settled_answer(kept);
+        let answer = entry.settled_answer(kept, true);
         let (changed, through) =
             super::super::settle_later(state, seq, entry.late_restart(), &answer);
         (entry, changed, through)
@@ -5681,7 +5715,7 @@ mod tests {
             let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
             let history = state.history_settling(&response, 2);
             let entry = ExchangeEntry::build(2, response.clone(), history);
-            let mut answer = entry.settled_answer(&kept);
+            let mut answer = entry.settled_answer(&kept, true);
             assert!(answer.newly_matched, "{late_us}");
             let time =
                 kept.answer_time(Some(Some(placed_at(Clock::Device, 0, late_us))), &[], None);
@@ -5726,7 +5760,7 @@ mod tests {
             let response = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
             let history = state.history_settling(&response, 2);
             let entry = ExchangeEntry::build(2, response, history);
-            let mut answer = entry.settled_answer(&kept);
+            let mut answer = entry.settled_answer(&kept, true);
             assert!(!answer.newly_answered && !answer.newly_matched);
             let time =
                 kept.answer_time(Some(Some(placed_at(Clock::Device, 0, late_us))), &[], None);
@@ -6169,7 +6203,7 @@ mod tests {
             let history = state.history_settling(&answered, seq);
             let entry = ExchangeEntry::build(seq, answered.clone(), history);
             state.settled(seq, entry.classification, &entry.reason, answered, true);
-            let mut answer = entry.settled_answer(&kept);
+            let mut answer = entry.settled_answer(&kept, true);
             let (clock, placed) = placed_at(Clock::Device, 0, at);
             state.judge_answer(&mut answer, AnswerTime::At(clock, placed));
             assert!(!answer.since_error, "{seq}");
@@ -6199,7 +6233,7 @@ mod tests {
         let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41]);
         let history = state.history_settling(&answered, 1);
         let entry = ExchangeEntry::build(1, answered.clone(), history);
-        let mut settled = entry.settled_answer(&kept);
+        let mut settled = entry.settled_answer(&kept, true);
         let (clock, placed) = placed_at(Clock::Device, 0, 2_500);
         state.judge_answer(&mut settled, AnswerTime::At(clock, placed));
         assert!(!settled.since_error);
@@ -6287,7 +6321,7 @@ mod tests {
         let late = kept.answered(&response);
         let history = state.history_settling(&late, 1);
         let entry = ExchangeEntry::build(1, late.clone(), history);
-        let mut settled = entry.settled_answer(&kept);
+        let mut settled = entry.settled_answer(&kept, true);
         let (clock, placed) = placed_at(Clock::Device, 0, 7_000);
         state.judge_answer(&mut settled, AnswerTime::At(clock, placed));
         state.settled(1, entry.classification, &entry.reason, late, true);
@@ -6311,7 +6345,7 @@ mod tests {
         let kept = state.kept(1).unwrap().clone();
         let history = state.history_settling(&kept.evidence, 1);
         let entry = ExchangeEntry::build(1, kept.evidence.clone(), history);
-        let mut settled = entry.settled_answer(&kept);
+        let mut settled = entry.settled_answer(&kept, true);
         let time = kept.answer_time(None, &[], None);
         assert_eq!(time, AnswerTime::None);
         state.judge_answer(&mut settled, time);

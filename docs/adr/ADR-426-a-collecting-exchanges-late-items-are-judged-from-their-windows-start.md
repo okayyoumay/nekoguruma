@@ -1,7 +1,7 @@
 # ADR-426: A Collecting Exchange's Late Items Are Judged From Their Window's Start
 
 **Date:** 2026-11-07
-**Status:** Accepted (Consequences' `past_vci_limits` gap closed)
+**Status:** Accepted (Consequences' `past_vci_limits` gap closed; the open bullets on a lone pending closed by ADR-429)
 **Affects:** `agent` (`comm_log` `Inner::late_item`, `Inner::late_response`, `late_window`;
 `comm_log/timing.rs` `judge_late`, `judge_late_start`); design 8.11 `late_item`,
 `late_response`; ADR-371 item 3, ADR-400 decision 1, ADR-425
@@ -68,13 +68,11 @@ directions:
 - The agent's own deadline check for a collecting exchange with answers (`past_vci_limits`,
   design 8.11 `vci_did_not_end`) reads the entry's merged window, the one the entry's `timing` is
   judged from, as `at_limit` does: the limits run from the end of the last final answer, with
-  the window's open pendings, not from the transmit. Still open: a lone pending of a collecting
-  exchange counts as a final response, which owes the exchange no late item (ADR-400 reads it
-  as none). It is a backlog item.
-- A collecting exchange whose window the VCI ended is owed only when it has no answer at all,
-  while a lone pending counts as a final response (the backlog item on `collecting_end`). So a
-  late start of one whose other identifiers answered is reached only once that item lands. The
-  rule is still the right one to have in place.
+  the window's open pendings, not from the transmit. A lone pending of a collecting exchange
+  counted as a final response then, which owed the exchange no late item; ADR-429 closes that.
+- A collecting exchange whose window the VCI ended was owed only when it had no answer at all,
+  while a lone pending counted as a final response; ADR-429 owes it on each identifier a pending
+  is open on, so a late start of one whose other identifiers answered is reached.
 - `at_limit` (whether the VCI ended its wait at the limit, `settle_late_pending`,
   `settle_late_response`) keeps the entry's merged window: it asks about the VCI's single wait
   (ADR-400 decision 2), while lateness asks about the ECU's window, per identifier.

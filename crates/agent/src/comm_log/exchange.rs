@@ -903,12 +903,15 @@ pub(crate) fn standing_answers<T, K: PartialEq>(
         .collect()
 }
 
-/// The end of a collecting request that was not ended by an error or the agent's deadline: its
-/// first answer's, or no response when nothing answered (ADR-396 item 4). The one rule the host
-/// ends an exchange by and the log restates a settled end by (ADR-425).
-pub(crate) fn collecting_end(answers: &[Answer]) -> End {
+/// The end of a collecting request that was not ended by an error or the agent's deadline: the
+/// end of its first standing answer that is not a pending, or no response when nothing answered
+/// or only pendings did (ADR-396 item 4, ADR-429). A pending is no final response, so a lone
+/// one leaves the request owed. The one rule the host ends an exchange by and the log restates
+/// a settled end by (ADR-425).
+pub(crate) fn collecting_end(answers: &[Answer], expected: &Expected) -> End {
     answers
-        .first()
+        .iter()
+        .find(|answer| !answer.is_pending(expected))
         .map_or(End::NoResponse, |answer| answer.end.clone())
 }
 
@@ -1271,6 +1274,22 @@ impl Evidence {
         self.request.first().copied()
     }
 
+    /// The response identifiers whose last standing answer is a pending, in the order they first
+    /// answered: a collecting request is owed once on each of them (design 8.11 "Owed request",
+    /// ADR-429). Empty for any other request.
+    pub(crate) fn open_pending_ids(&self) -> Vec<u32> {
+        let mut ids = Vec::new();
+        if !self.collecting {
+            return ids;
+        }
+        for answer in &self.answers {
+            if answer.is_pending(&self.expected) && !ids.contains(&answer.rx_id) {
+                ids.push(answer.rx_id);
+            }
+        }
+        ids
+    }
+
     /// The final response's bytes, when the exchange ended with one.
     fn final_response(&self) -> Option<&[u8]> {
         match &self.end {
@@ -1435,6 +1454,9 @@ struct LinkEffect {
     /// The owed requests the answer could belong to.
     owners: Vec<u64>,
     final_response: bool,
+    /// The response identifiers whose last standing answer is a pending
+    /// ([`Evidence::open_pending_ids`]): the exchange is owed on each.
+    open_pending_ids: Vec<u32>,
     positive: bool,
     /// The final response is one the agent cannot use.
     unusable: bool,
@@ -1847,6 +1869,8 @@ impl LinkState {
                 rx_id.is_none_or(|id| id == owed.rx_id) && owed.expected.matches(response)
             })
             .map(|owed| owed.seq)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect()
     }
 
@@ -1906,6 +1930,8 @@ impl LinkState {
             .iter()
             .filter(|owed| owed.rx_id == rx_id)
             .map(|owed| owed.seq)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         let kept: Vec<u64> = owed
             .iter()
@@ -1926,6 +1952,8 @@ impl LinkState {
             .iter()
             .filter(|owed| owed.rx_id == rx_id && owed.expected.pending(pending))
             .map(|owed| owed.seq)
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
             .collect();
         let kept: Vec<u64> = owed
             .iter()
@@ -2092,15 +2120,24 @@ impl LinkState {
         if effect.sent == Sent::Unknown {
             self.unknown_sends += 1;
         }
-        let placed_alone = effect.owners.is_empty() && (effect.final_response || accepting);
+        let placed_alone = entry.placed_alone();
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
         if let (true, false, Some(sid)) = (may_have_arrived, placed_alone, effect.sid) {
-            self.owed.push(Owed {
-                seq: entry.seq,
-                rx_id: effect.rx_id,
-                sid,
-                expected: effect.expected.clone(),
-            });
+            // One row per response identifier a pending is open on (ADR-429); a functional
+            // link's own identifier is 0, which no late item carries.
+            let ids = if effect.open_pending_ids.is_empty() {
+                vec![effect.rx_id]
+            } else {
+                effect.open_pending_ids.clone()
+            };
+            for rx_id in ids {
+                self.owed.push(Owed {
+                    seq: entry.seq,
+                    rx_id,
+                    sid,
+                    expected: effect.expected.clone(),
+                });
+            }
         }
     }
 
@@ -3236,7 +3273,9 @@ impl ExchangeEntry {
     /// Whether its answer is placed with it alone, so it is owed nothing, as
     /// [`LinkState::record`] reads it.
     fn placed_alone(&self) -> bool {
-        self.effect.owners.is_empty() && (self.effect.final_response || self.accepting())
+        self.effect.owners.is_empty()
+            && (self.accepting()
+                || (self.effect.final_response && self.effect.open_pending_ids.is_empty()))
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -3256,6 +3295,7 @@ impl ExchangeEntry {
             bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
             final_response: evidence.final_response().is_some() && !evidence.end_rejected,
+            open_pending_ids: evidence.open_pending_ids(),
             positive: matches!(evidence.end, End::Positive(_)),
             unusable: matches!(evidence.end, End::PositiveUnusable(_)),
             suppressed: evidence.suppressed,

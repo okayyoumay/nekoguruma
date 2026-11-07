@@ -496,7 +496,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   every answer: each is placed on its clock (`clock`, `epoch`), judged from the end of the answer
   before it, with its pendings kept per response identifier, and classified as an exchange of its
   own (`Evidence::as_answer`) against its own link history, with its response time from the
-  transmit. The entry's classification is the most severe of its answers' (design 8.11
+  transmit. Its end is its first standing answer that is not a pending, else no response, and it
+  stays owed on each response identifier whose last answer is a pending (ADR-429). The entry's
+  classification is the most severe of its answers' (design 8.11
   `answers`); its `timing` judges where the window ended, by the primitive's finished item when
   that is on the clock the answers are, and its transmit done comes from the first answer that
   carries one. Lost events end the wait at the worker's first
@@ -559,7 +561,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   reads after the deadline reaches the entry (ADR-425): each result as an answer (`EndItem::Answer`,
   a pending with the identifier it came on) and the finished status (`EndItem::Finished`). The
   entry lists them after the exchange's own answers, folds a lone pending whose identifier then
-  got its final answer, and judges all of them, and its own window from the last answer, with the
+  got its final answer (a lone pending that stays one leaves the exchange owed, ADR-429), and
+  judges all of them, and its own window from the last answer, with the
   one function the exchange's entry uses (`judge_windows`, ADR-400).
   The `primitive_ended` entry gives the end as an
   exchange entry does, classified by the exchange rows as if the agent had waited, except that a

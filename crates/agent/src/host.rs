@@ -1522,7 +1522,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             // response (ADR-396); any other end is judged as for any request.
             let (end, mut detail) = match &sent.result {
                 Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => (
-                    crate::comm_log::exchange::collecting_end(&answers),
+                    crate::comm_log::exchange::collecting_end(&answers, &expected),
                     Detail::default(),
                 ),
                 _ => sent_end(&request, &sent.result, &negative, sid),
@@ -7747,6 +7747,55 @@ mod tests {
         let _ = by_number.on_event(answer_on(None, 3, &[0x7F, 0x3E, 0x78]), COP);
         by_number.pendings[0].read = read;
         assert_eq!(pending_ids_of(&by_number.pendings, &TABLE), [Some(0x7EA)]);
+    }
+
+    /// ADR-429: a collecting window whose only answer is a pending ends with no response (the
+    /// pending stays in `pending_ids` and the answers), and a pending of one identifier beside a
+    /// final answer of another ends with that final answer.
+    #[test]
+    fn a_lone_pending_is_no_response_and_another_identifiers_final_answer_is_the_end() {
+        let finished = || event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        let read = Some(AgentNow {
+            epoch: 0,
+            monotonic_us: 1,
+            wall_unix_ms: 0,
+        });
+        let ended = |events: Vec<_>| {
+            let (mut progress, _) = collect(events);
+            for pending in &mut progress.pendings {
+                pending.read = read;
+            }
+            let expected = Expected {
+                positive_prefix: progress.positive_prefix.clone(),
+                negative_pattern: progress.negative.pattern(progress.sid),
+            };
+            let answers = answer_items(
+                &progress.collected,
+                &TABLE,
+                &expected,
+                &progress.negative,
+                progress.sid,
+            );
+            let end = crate::comm_log::exchange::collecting_end(&answers, &expected);
+            (end, answers, pending_ids_of(&progress.pendings, &TABLE))
+        };
+        let (end, answers, pending_ids) = ended(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            finished(),
+        ]);
+        assert!(matches!(end, End::NoResponse), "{end:?}");
+        assert_eq!(answers.len(), 1);
+        assert_eq!(pending_ids, [Some(0x7E8)]);
+        let (end, answers, _) = ended(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+            finished(),
+        ]);
+        assert!(
+            matches!(end, End::Positive(ref bytes) if bytes == &[0x7E, 0x00]),
+            "{end:?}"
+        );
+        assert_eq!(answers.len(), 2);
     }
 
     /// ADR-425: the stray of a collecting primitive goes on collecting, so what it reads after

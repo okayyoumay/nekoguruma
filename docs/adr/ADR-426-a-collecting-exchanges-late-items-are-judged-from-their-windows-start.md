@@ -1,7 +1,7 @@
 # ADR-426: A Collecting Exchange's Late Items Are Judged From Their Window's Start
 
 **Date:** 2026-11-07
-**Status:** Accepted
+**Status:** Accepted (Consequences' `past_vci_limits` gap closed)
 **Affects:** `agent` (`comm_log` `Inner::late_item`, `Inner::late_response`, `late_window`;
 `comm_log/timing.rs` `judge_late`, `judge_late_start`); design 8.11 `late_item`,
 `late_response`; ADR-371 item 3, ADR-400 decision 1, ADR-425
@@ -65,10 +65,12 @@ directions:
   answer would get, not from the transmit.
 - A per-identifier window differs from the entry's merged window: an item on one identifier is
   judged from its own chain, so another ECU's open pending does not extend its limit.
-- Still open: the agent's own deadline for a collecting exchange with answers
-  (`past_vci_limits`) measures from the transmit, and a lone pending of a collecting exchange
-  counts as a final response, which owes the exchange no late item (ADR-400 reads it as none).
-  Both are backlog items.
+- The agent's own deadline check for a collecting exchange with answers (`past_vci_limits`,
+  design 8.11 `vci_did_not_end`) reads the entry's merged window, the one the entry's `timing` is
+  judged from, as `at_limit` does: the limits run from the end of the last final answer, with
+  the window's open pendings, not from the transmit. Still open: a lone pending of a collecting
+  exchange counts as a final response, which owes the exchange no late item (ADR-400 reads it
+  as none). It is a backlog item.
 - A collecting exchange whose window the VCI ended is owed only when it has no answer at all,
   while a lone pending counts as a final response (the backlog item on `collecting_end`). So a
   late start of one whose other identifiers answered is reached only once that item lands. The

@@ -415,7 +415,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-423](ADR-423-the-d-pdu-mock-keeps-a-started-links-tester-present.md) | The D-PDU Mock Keeps a Started Link's Tester-Present | Accepted (Decision item 5 amended by ADR-427: a send can raise an unbound transmit indication) | `iso22900-mock` (tester-present ComParams, link state, `PDUGetStatus`, delivery thread, `NGR_SIM_ECU_COMMANDS`), `iso22900-service` `grpc_mock` test; ADR-299, ADR-418, ADR-419, ADR-420 |
 | [ADR-424](ADR-424-the-d-pdu-mock-absorbs-response-pendings.md) | The D-PDU Mock Absorbs Response Pendings | Accepted | `iso22900-mock` (response pending ComParams, `receive_events`, `PDUConnect`, UPDATEPARAM), mock testing guide, `iso22900-service` `agent_suppressed_send_receive` test; ADR-102, ADR-299, ADR-423 |
 | [ADR-425](ADR-425-a-stray-collecting-primitives-answers-reach-its-primitive-ended.md) | A Stray Collecting Primitive's Answers Are Carried Into Its `primitive_ended` Entry | Accepted (Consequences' `late_item` gap closed by ADR-426) | `agent` (`host` `Stray`, `Progress`; `comm_log` `primitive_ended`, `late_item`, `judge_windows`); design 8.11 `primitive_ended`; ADR-386, ADR-396, ADR-400, ADR-416 |
-| [ADR-426](ADR-426-a-collecting-exchanges-late-items-are-judged-from-their-windows-start.md) | A Collecting Exchange's Late Items Are Judged From Their Window's Start | Accepted | `agent` (`comm_log` `late_item`, `late_response`, `timing::judge_late`); design 8.11 `late_item`, `late_response`; ADR-371, ADR-400, ADR-425 |
+| [ADR-426](ADR-426-a-collecting-exchanges-late-items-are-judged-from-their-windows-start.md) | A Collecting Exchange's Late Items Are Judged From Their Window's Start | Accepted (Consequences' `past_vci_limits` gap closed) | `agent` (`comm_log` `late_item`, `late_response`, `timing::judge_late`); design 8.11 `late_item`, `late_response`; ADR-371, ADR-400, ADR-425 |
 | [ADR-427](ADR-427-the-d-pdu-mock-can-queue-unbound-indications.md) | The D-PDU Mock Can Queue Its Indications Unbound | Accepted | `iso22900-mock` (`SimEcuCommand::IndicationBinding`, indication items, tester-present indication), mock testing guide, `iso22900-service` `t2_indication_unbound` test, `ngr-hw-checks` handle unit tests; ADR-299, ADR-356, ADR-423 |
 
 ## Status Legend
@@ -821,7 +821,7 @@ the predecessor repository these ADRs came from.
 - ADR-385
 - ADR-386
 - ADR-425 (Consequences' `late_item` gap closed by ADR-426)
-- ADR-426
+- ADR-426 (Consequences' `past_vci_limits` gap closed)
 
 ### Write Jobs & Resume
 - ADR-229 (item 1's `recovery_required_from_step` replaced by ADR-245; item 2's failed confirmation after an accepted reset gets one passive retry since ADR-265; item 2 step 3's post-transfer completion counts only for the interrupted pass since ADR-269; item 2's identity abort is journaled as a terminal state since ADR-286; item 2's steps after the per-vehicle lock preceded by the access programs of ADR-325 item 5, which also ends a failed step 2 VIN read in on-site intervention there; item 2's VIN and hardware identity reads joined by the variant guard's check for a second ECU, and its checkpoint summary extended by the guard record, by ADR-327)
@@ -947,7 +947,7 @@ the predecessor repository these ADRs came from.
 - ADR-411
 - ADR-412
 - ADR-425 (Consequences' `late_item` gap closed by ADR-426)
-- ADR-426
+- ADR-426 (Consequences' `past_vci_limits` gap closed)
 
 ### Acquired Data & Monitoring
 - ADR-236

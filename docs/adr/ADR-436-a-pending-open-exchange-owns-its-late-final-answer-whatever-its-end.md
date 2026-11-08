@@ -1,7 +1,7 @@
 # ADR-436: An Exchange With a Pending Open Owns Its Late Final Answer, Whatever Its End
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (the Consequences' finished-time gap closed by ADR-438)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::late_final_settles`,
 `Kept::late_final_settles`, `Kept::pending_at_end`, `LinkState::note_pending_at_end`,
 `LinkState::release_kept_ended`; `comm_log.rs` `late_response_owner`, the entry's keep in
@@ -75,8 +75,8 @@ exchange owns a response only when its evidence shows `vci_ended`).
   owner.
 - An entry's finished time is dropped by the host for an error result, so an entry's late final
   cannot be judged at the limit and is `undetermined`; the same exchange's `primitive_ended`
-  places the finished time (though the `system` of its `vci_did_not_end` entry stands). This is
-  a host-side gap, not changed here.
+  places the finished time (though the `system` of its `vci_did_not_end` entry stands). This
+  host-side gap is closed by ADR-438.
 - An ordinary exchange is unaffected: it has no open pending, so the predicate reduces to
   `vci_ended`.
 - ADR-366 decision 1, ADR-429 decision 3, ADR-431 decisions 2 and 3 and ADR-435 decision 4 are

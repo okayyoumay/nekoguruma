@@ -1,7 +1,7 @@
 # ADR-429: A Collecting Exchange Ends With Its First Final Answer and Is Owed Once per Identifier With an Open Pending
 
 **Date:** 2026-11-07
-**Status:** Accepted (item 3's renewal at `primitive_ended` and release exception also apply to an exchange left owed that the VCI ended, by its entry or by a receive timeout its `primitive_ended` read, ADR-431; decision 2's fallback on the link's identifier superseded by ADR-432, and the Consequences' deferred bullets on identifier 0 and on `Kept::answered` closed; decision 3's whole settlement superseded by ADR-433, which settles per identifier; decision 2's "only an open pending owes an identifier once an answer exists" superseded by ADR-435 on a link with a receive table; decision 3's late final answer, for an exchange a pending is open on, settles it whatever its end, ADR-436)
+**Status:** Accepted (item 3's renewal at `primitive_ended` and release exception also apply to an exchange left owed that the VCI ended, by its entry or by a receive timeout its `primitive_ended` read, ADR-431; decision 2's fallback on the link's identifier superseded by ADR-432, and the Consequences' deferred bullets on identifier 0 and on `Kept::answered` closed; decision 3's whole settlement superseded by ADR-433, which settles per identifier; decision 2's "only an open pending owes an identifier once an answer exists" superseded by ADR-435 on a link with a receive table; decision 3's late final answer, for an exchange a pending is open on, settles it whatever its end, ADR-436; decision 1's end superseded by ADR-437: a rejected result is neither a pending nor an answer, so the end is the first standing answer that is neither, else the first rejected result)
 **Affects:** `agent` (`comm_log/exchange.rs` `collecting_end`, `Evidence::open_pending_ids`,
 `LinkEffect`, `LinkState::record`, the owner lookups; `comm_log.rs` `primitive_ended`,
 `late_item`; `host.rs`); design 8.11 "Owed request", `answers`; ADR-396 item 4, ADR-400,
@@ -22,7 +22,8 @@ even an exchange that stayed owed could never own it.
 
 ## Decision
 
-1. **The end is the first standing answer that is not a pending, else no response.**
+1. **The end is the first standing answer that is not a pending, else no response.** (ADR-437
+   also passes over a rejected result, ending with it only when no other answer stands.)
    `collecting_end` takes the request's expected answers to tell a pending. The host's end and
    the log's restatement at `primitive_ended` use the one function. A lone pending stays in the
    entry's `pending`, `pending_ids` and `answers`.

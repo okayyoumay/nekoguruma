@@ -3557,6 +3557,7 @@ impl CommLog {
                 &answers,
                 |answer| answer.rx_id,
                 |answer| answer.is_pending(&evidence.expected),
+                exchange::Answer::is_rejected,
                 &evidence.receive_ids,
             );
             evidence.answers = keep_standing(answers, &standing);
@@ -3571,7 +3572,8 @@ impl CommLog {
                     | exchange::End::PositiveUnusable(_)
                     | exchange::End::NoResponse
             ) {
-                evidence.end = exchange::collecting_end(&evidence.answers, &evidence.expected);
+                (evidence.end, evidence.end_rejected) =
+                    exchange::collecting_end(&evidence.answers, &evidence.expected);
             }
         }
         // The entry's VCI times are the ones its exchange had, with the end's over them; the
@@ -3736,6 +3738,7 @@ impl CommLog {
                     &by_answers,
                     |answer| answer.rx_id,
                     |answer| answer.is_pending(&evidence.expected),
+                    exchange::Answer::is_rejected,
                     &evidence.receive_ids,
                 );
                 probe.answers = keep_standing(by_answers, &answers_standing);
@@ -11161,27 +11164,166 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// ADR-435: a result the worker rejected is no answer: with the table covered by named final
-    /// answers the exchange is still owed on every identifier, and a final answer delivered late
-    /// settles it.
+    /// A result of `rx_id` the worker took and the agent cannot use (a wrong echo), as the host
+    /// hands it.
+    fn rejected_on(rx_id: u32, after_us: u64) -> exchange::Answer {
+        answer_on(
+            rx_id,
+            exchange::End::PositiveUnusable(vec![0x7E, 0x01]),
+            after_us,
+        )
+    }
+
+    /// `evidence` ended as the host ends a collecting exchange from its answers (ADR-437).
+    fn ended_by_answers(evidence: &mut exchange::Evidence) {
+        (evidence.end, evidence.end_rejected) =
+            exchange::collecting_end(&evidence.answers, &evidence.expected);
+    }
+
+    /// ADR-435, ADR-437: results the worker rejected are no answers: with every identifier of the
+    /// table holding one, the exchange is still silent and owed on each, ends as
+    /// `positive_unusable`, and a final answer delivered late on one identifier leaves the other
+    /// owed until its own settles the exchange.
     #[test]
-    fn a_rejected_end_with_the_table_covered_stays_owed_until_a_late_final_answer() {
+    fn rejected_results_on_the_table_stay_owed_until_a_late_final_answer_on_each() {
         let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
             evidence.vci_ended = true;
-            evidence.end_rejected = true;
-            evidence.answers = vec![positive_on(0x7E8, 100_000), positive_on(0x7E9, 200_000)];
+            evidence.answers = vec![rejected_on(0x7E8, 100_000), rejected_on(0x7E9, 200_000)];
+            ended_by_answers(evidence);
+            assert!(evidence.end_rejected);
         });
         assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
         assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
         log.lock()
             .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
             .unwrap();
+        assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), true));
+        assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E9), placed_after(4_000_000))
+            .unwrap();
         assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
         assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
         log.end("ok");
         let lines = lines(&setup);
         std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(of_event(&lines, "late_response").len(), 2, "{lines:#?}");
+    }
+
+    /// ADR-437: a wrong echo on one identifier beside a usable answer on the other ends the
+    /// exchange with the usable answer, and the echo's identifier stays silent and owed until a
+    /// final answer delivered late names it, which then settles the whole exchange.
+    #[test]
+    fn a_wrong_echo_beside_a_usable_answer_leaves_its_identifier_owed_until_a_late_final_answer() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.vci_ended = true;
+            evidence.answers = vec![rejected_on(0x7E8, 100_000), positive_on(0x7E9, 200_000)];
+            ended_by_answers(evidence);
+            assert!(!evidence.end_rejected);
+        });
+        assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
+        assert!(owed_on(&log, 0x7E9, seq).0.is_empty());
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(of_event(&lines, "late_response").len(), 1, "{lines:#?}");
+    }
+
+    /// ADR-437: a wrong echo alone, read by the end of a primitive the agent's deadline cut off,
+    /// ends the exchange as `positive_unusable` with `end_rejected` derived from the answers (the
+    /// entry's was false), so it is owed on the whole table, its answer listed with its bytes
+    /// redacted as a rejected result's are.
+    #[test]
+    fn a_wrong_echo_alone_at_the_primitive_end_is_a_rejected_end() {
+        // A SecurityAccess key response read where the request was another service: a rejected
+        // result keeps its data back, an answer would show it whole.
+        let stray = vec![0x67, 0x02, 0xAA, 0xBB];
+        let (dir, setup, log, seq) = late_collecting_on(true, |_| {});
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    EndItem::Answer(answer_on(
+                        0x7E8,
+                        exchange::End::PositiveUnusable(stray.clone()),
+                        1_000_000,
+                    )),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        let kept = kept_of(&log, seq);
+        assert!(kept.evidence.end_rejected);
+        assert_eq!(kept.evidence.owed_ids(), [0x7E8, 0x7E9]);
+        assert!(!kept.evidence.settles_owed());
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = &of_event(&lines, "primitive_ended")[0];
+        assert_eq!(entry["outcome"]["result"], "positive_unusable", "{entry}");
+        let redacted = serde_json::to_value(redaction::redact_unanswering(&stray)).unwrap();
+        assert_eq!(entry["outcome"]["response"], redacted, "{entry}");
+        assert_eq!(entry["answers"][0]["response"], redacted, "{entry}");
+        assert_eq!(
+            entry["answers"][0]["outcome"]["result"], "positive_unusable",
+            "{entry}"
+        );
+        assert_eq!(
+            entry["answers"][0]["outcome"]["response"], redacted,
+            "{entry}"
+        );
+    }
+
+    /// ADR-437: at the restatement of a primitive's end a rejected result covers no identifier,
+    /// so it does not fold a pending that names none (the pending stands beside the results),
+    /// and the end is the usable answer's.
+    #[test]
+    fn a_rejected_result_covers_no_unnamed_pending_in_the_restatement() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.vci_ended = true;
+            evidence.end = exchange::End::NoResponse;
+            evidence.answers = vec![lone_pending_on(0)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![None];
+        });
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    EndItem::Answer(rejected_on(0x7E8, 1_000_000)),
+                    answer_read(0x7E9, 1_100_000),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = &of_event(&lines, "primitive_ended")[0];
+        assert_eq!(entry["outcome"]["result"], "positive", "{entry}");
+        let results: Vec<_> = entry["answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|answer| answer["outcome"]["result"].as_str().unwrap().to_owned())
+            .collect();
+        assert_eq!(
+            results,
+            ["negative", "positive_unusable", "positive"],
+            "{entry}"
+        );
     }
 
     /// ADR-384, ADR-435: an exchange with a final answer on one identifier and a pending open on

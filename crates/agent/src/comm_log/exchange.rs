@@ -864,6 +864,14 @@ impl Answer {
         matches!(&self.end, End::Negative(bytes) if expected.pending(bytes))
     }
 
+    /// Whether the answer is a result the worker took and the agent cannot use as the request's
+    /// answer (`positive_unusable`, a wrong echo or a negative of another service): it is no
+    /// answer on its identifier, so it folds no pending and covers no identifier (design 8.11
+    /// "Owed request", ADR-437).
+    pub(crate) fn is_rejected(&self) -> bool {
+        matches!(self.end, End::PositiveUnusable(_))
+    }
+
     /// The end and the pendings the answer stands for as an exchange of its own: a lone pending
     /// is a request that got a pending and no response, its own pending the last of its list.
     /// The one conversion both the classification ([`Evidence::as_answer`]) and the log's
@@ -887,18 +895,24 @@ impl Answer {
 /// Which of `items`, the results of a collecting primitive in the order they were read, stand as
 /// answers: every result that is not a pending, and a pending only when no result on its
 /// identifier (`key`) came after it, so a pending followed by its final answer is one answer
-/// (ADR-396). The one rule both the host's list of a window's answers and the log's restatement
-/// of them at a settlement follow (ADR-425).
+/// (ADR-396). A later result that is `rejected` (one the agent cannot use) is no answer on its
+/// identifier, so it does not fold the pending before it (ADR-437). The one rule both the host's
+/// list of a window's answers and the log's restatement of them at a settlement follow
+/// (ADR-425).
 pub(crate) fn standing_answers<T, K: PartialEq>(
     items: &[T],
     key: impl Fn(&T) -> K,
     pending: impl Fn(&T) -> bool,
+    rejected: impl Fn(&T) -> bool,
 ) -> Vec<bool> {
     items
         .iter()
         .enumerate()
         .map(|(at, item)| {
-            !pending(item) || !items[at + 1..].iter().any(|later| key(later) == key(item))
+            !pending(item)
+                || !items[at + 1..]
+                    .iter()
+                    .any(|later| key(later) == key(item) && !rejected(later))
         })
         .collect()
 }
@@ -921,13 +935,15 @@ pub(crate) fn standing_answers_covering<T>(
     items: &[T],
     id: impl Fn(&T) -> u32,
     pending: impl Fn(&T) -> bool,
+    rejected: impl Fn(&T) -> bool,
     table: &[u32],
 ) -> Vec<bool> {
-    let mut standing = standing_answers(items, &id, &pending);
+    let mut standing = standing_answers(items, &id, &pending, &rejected);
+    // A rejected result is no final answer, so it covers no identifier (ADR-437).
     let final_on = |wanted: u32| {
         items
             .iter()
-            .any(|item| !pending(item) && id(item) == wanted)
+            .any(|item| !pending(item) && !rejected(item) && id(item) == wanted)
     };
     if table_covered(table, final_on) {
         for (item, standing) in items.iter().zip(&mut standing) {
@@ -939,16 +955,27 @@ pub(crate) fn standing_answers_covering<T>(
     standing
 }
 
-/// The end of a collecting request that was not ended by an error or the agent's deadline: the
-/// end of its first standing answer that is not a pending, or no response when nothing answered
-/// or only pendings did (ADR-396 item 4, ADR-429). A pending is no final response, so a lone
-/// one leaves the request owed. The one rule the host ends an exchange by and the log restates
-/// a settled end by (ADR-425).
-pub(crate) fn collecting_end(answers: &[Answer], expected: &Expected) -> End {
+/// The end of a collecting request that was not ended by an error or the agent's deadline, and
+/// whether that end is a rejected result (`end_rejected`): the end of its first standing answer
+/// that is neither a pending nor a rejected result; else, when only rejected results (and
+/// pendings) stood, the first rejected result's, as `positive_unusable` (ADR-437); else no
+/// response, when nothing answered or only pendings did (ADR-396 item 4, ADR-429). A pending is
+/// no final response, so a lone one leaves the request owed. The one rule the host ends an
+/// exchange by and the log restates a settled end by (ADR-425); `end_rejected` is derived here
+/// wherever an end is stated.
+pub(crate) fn collecting_end(answers: &[Answer], expected: &Expected) -> (End, bool) {
+    if let Some(answer) = answers
+        .iter()
+        .find(|answer| !answer.is_pending(expected) && !answer.is_rejected())
+    {
+        return (answer.end.clone(), false);
+    }
     answers
         .iter()
-        .find(|answer| !answer.is_pending(expected))
-        .map_or(End::NoResponse, |answer| answer.end.clone())
+        .find(|answer| answer.is_rejected())
+        .map_or((End::NoResponse, false), |answer| {
+            (answer.end.clone(), true)
+        })
 }
 
 /// An [`Answer`] as the entry gives it, with its own outcome and classification.
@@ -974,13 +1001,24 @@ impl AnswerItem {
     fn of(answer: &Answer, classification: Classification, reason: String) -> Self {
         Self {
             rx_id: answer.rx_id,
-            response: redact(Direction::Response, answer.end.response().unwrap_or(&[])),
+            // A rejected result is no answer: its bytes are redacted as a rejected result's are
+            // (ADR-359 item 1, ADR-437).
+            response: if answer.is_rejected() {
+                redact_unanswering(answer.end.response().unwrap_or(&[]))
+            } else {
+                redact(Direction::Response, answer.end.response().unwrap_or(&[]))
+            },
             vci_us: answer.vci_us,
             clock: answer.clock,
             epoch: answer.epoch,
             agent_us: answer.agent_us,
             response_ms: answer.timing.response_ms,
-            outcome: Outcome::of(&answer.end),
+            outcome: match &answer.end {
+                End::PositiveUnusable(bytes) => Outcome::PositiveUnusable {
+                    response: redact_unanswering(bytes),
+                },
+                end => Outcome::of(end),
+            },
             classification,
             reason,
         }
@@ -1354,11 +1392,12 @@ impl Evidence {
         self.answers.iter().rev().find(|answer| answer.rx_id == id)
     }
 
-    /// Whether a final answer on the named identifier `id` stands in the exchange.
+    /// Whether a final answer on the named identifier `id` stands in the exchange; a rejected
+    /// result is none (ADR-437).
     fn final_standing(&self, id: u32) -> bool {
-        self.answers
-            .iter()
-            .any(|answer| answer.rx_id == id && !answer.is_pending(&self.expected))
+        self.answers.iter().any(|answer| {
+            answer.rx_id == id && !answer.is_pending(&self.expected) && !answer.is_rejected()
+        })
     }
 
     /// The response identifiers the exchange is owed on (design 8.11 "Owed request", ADR-432),
@@ -1414,6 +1453,7 @@ impl Evidence {
         if self.final_response().is_some() {
             for answer in self.answers.iter().filter(|answer| {
                 !answer.is_pending(&self.expected)
+                    && !answer.is_rejected()
                     && answer
                         .history
                         .as_ref()
@@ -1430,7 +1470,9 @@ impl Evidence {
         // A result the worker rejected is no answer (ADR-359): the exchange is owed as one with
         // no answer is, on every receive identifier, whatever else it is owed on, since it is not
         // settled either ([`Self::settles_owed`]). The set does not depend on its owners, so it
-        // never grows after the fact.
+        // never grows after the fact. For a collecting request the rejected result covers no
+        // identifier, so the silent ones already make the table; the rule stays whole as an
+        // invariant (ADR-435 decision 7, ADR-437).
         if self.end_rejected {
             table.iter().for_each(|&id| add(&mut ids, id));
         }
@@ -1572,7 +1614,7 @@ impl Evidence {
         one.link_errors.clear();
         one.channel_link_errors.clear();
         one.events_lost = None;
-        one.end_rejected = false;
+        one.end_rejected = answer.is_rejected();
         one
     }
 
@@ -4254,6 +4296,7 @@ impl Kept {
             &answers,
             |a| a.rx_id,
             |a| a.is_pending(expected),
+            Answer::is_rejected,
             &self.evidence.receive_ids,
         );
         let mut chain: Option<Vec<Pending>> = None;
@@ -4274,7 +4317,7 @@ impl Kept {
         if let Some(last) = folded.last_mut() {
             last.pending = chain.unwrap_or_default();
         }
-        let end = collecting_end(&folded, expected);
+        let (end, end_rejected) = collecting_end(&folded, expected);
         // The window's end stays judged by the entry's timing (`Evidence::collecting`), which a
         // late answer does not change; only the answer it adds is taken as within the limit. A
         // late start judged at the limit showed that end was the VCI's at the limit.
@@ -4287,9 +4330,9 @@ impl Kept {
             window.not_judged_reason = None;
         }
         let mut evidence = self.evidence.ended_as(end, window);
-        // A response delivered late is a usable final one: a result the worker had rejected no
-        // longer stands for the end (ADR-359, ADR-435).
-        evidence.end_rejected = false;
+        // Derived from the folded list as the entry derives it: a rejected result stands for the
+        // end only while no usable answer does (ADR-359, ADR-437).
+        evidence.end_rejected = end_rejected;
         evidence.answers = folded;
         (evidence, folded_order, folded_ends)
     }
@@ -10145,6 +10188,27 @@ mod tests {
         )
     }
 
+    /// The bytes of a wrong echo of the presence request (not `7E 00`).
+    const WRONG_ECHO: [u8; 2] = [0x7E, 0x01];
+
+    /// A result on `rx_id` the worker took and the agent cannot use (a wrong echo), as the host
+    /// judges it (`positive_unusable`).
+    fn rejected(rx_id: u32) -> Answer {
+        answer(
+            rx_id,
+            End::PositiveUnusable(WRONG_ECHO.to_vec()),
+            Window::WithinP2,
+            5.0,
+        )
+    }
+
+    /// `evidence` with the end and `end_rejected` the host derives from its answers.
+    fn ended(mut evidence: Evidence) -> Evidence {
+        (evidence.end, evidence.end_rejected) =
+            collecting_end(&evidence.answers, &evidence.expected);
+        evidence
+    }
+
     /// The kept collecting exchange with `answers` (its end the first final answer's); on a
     /// functional link (`functional`) its own identifier is 0 and it receives on 0x7E8, 0x7E9.
     fn kept_collecting(answers: Vec<Answer>, functional: bool) -> Kept {
@@ -10154,7 +10218,8 @@ mod tests {
     /// [`kept_collecting`] on a link that receives on `table` (empty: a physical link).
     fn kept_on(answers: Vec<Answer>, table: &[u32]) -> Kept {
         let mut evidence = collecting(answers);
-        evidence.end = collecting_end(&evidence.answers, &evidence.expected);
+        (evidence.end, evidence.end_rejected) =
+            collecting_end(&evidence.answers, &evidence.expected);
         if !table.is_empty() {
             evidence.rx_id = 0;
             evidence.receive_ids = table.to_vec();
@@ -10200,7 +10265,12 @@ mod tests {
         let mut items = kept.evidence.answers.clone();
         items.push(answered.answers[0].clone());
         let expected = &kept.evidence.expected;
-        let standing = standing_answers(&items, |a| a.rx_id, |a| a.is_pending(expected));
+        let standing = standing_answers(
+            &items,
+            |a| a.rx_id,
+            |a| a.is_pending(expected),
+            Answer::is_rejected,
+        );
         let rule = super::super::keep_standing(items, &standing);
         assert_eq!(
             rule.iter()
@@ -10550,13 +10620,24 @@ mod tests {
             positive(RX2, Window::WithinP2),
         ];
         let fold = |items: &[Answer], table: &[u32]| {
-            standing_answers_covering(items, |a| a.rx_id, |a| a.is_pending(&expected), table)
+            standing_answers_covering(
+                items,
+                |a| a.rx_id,
+                |a| a.is_pending(&expected),
+                Answer::is_rejected,
+                table,
+            )
         };
         assert_eq!(fold(&items, &[RX, RX2]), [false, true, true]);
         assert_eq!(fold(&items[..2], &[RX, RX2]), [true, true]);
         assert_eq!(fold(&items, &[]), [true, true, true]);
         // The plain rule is the covering rule with no table.
-        let plain = standing_answers(&items, |a| a.rx_id, |a| a.is_pending(&expected));
+        let plain = standing_answers(
+            &items,
+            |a| a.rx_id,
+            |a| a.is_pending(&expected),
+            Answer::is_rejected,
+        );
         assert_eq!(plain, fold(&items, &[]));
     }
 
@@ -10899,26 +10980,224 @@ mod tests {
         assert!(answered.settles_owed());
     }
 
-    /// ADR-435: a result the worker rejected is no answer, so an exchange whose named final
-    /// answers cover the table is not settled and is owed, like one with no answer, on every
-    /// receive identifier; a final answer delivered late settles it.
+    /// ADR-435, ADR-437: a result the worker rejected is no answer on its identifier, so an
+    /// exchange whose only results are rejected ones ends as `positive_unusable` with the first
+    /// one's bytes, is not settled and is owed on every receive identifier; a final answer
+    /// delivered late ends it with that answer, and settles it once no identifier is silent.
     #[test]
-    fn a_rejected_end_with_the_table_covered_is_owed_on_every_identifier() {
-        let mut kept = kept_collecting(
-            vec![
-                positive(RX, Window::WithinP2),
-                positive(RX2, Window::WithinP2),
-            ],
-            true,
-        );
-        assert!(kept.evidence.owed_ids().is_empty());
-        assert!(kept.evidence.settles_owed());
-        kept.evidence.end_rejected = true;
-        assert!(!kept.evidence.settles_owed());
-        assert_eq!(kept.evidence.owed_ids(), [RX, RX2]);
+    fn a_rejected_only_window_is_owed_on_every_identifier_and_a_late_final_answer_ends_it() {
+        let mut other = rejected(RX2);
+        other.end = End::PositiveUnusable(vec![0x7E, 0x02]);
+        let kept = kept_collecting(vec![rejected(RX), other], true);
+        let evidence = &kept.evidence;
+        assert!(evidence.end_rejected);
+        assert!(matches!(&evidence.end, End::PositiveUnusable(bytes) if bytes == &WRONG_ECHO));
+        assert_eq!(evidence.silent_ids(), [RX, RX2]);
+        assert!(!evidence.settles_owed());
+        assert_eq!(evidence.owed_ids(), [RX, RX2]);
         let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
-        assert!(answered.settles_owed());
-        assert!(answered.owed_ids().is_empty());
+        assert!(!answered.end_rejected);
+        assert_eq!(answered.end.response(), Some(&POSITIVE[..]));
+        assert_eq!(answered.silent_ids(), [RX2]);
+        assert!(!answered.settles_owed());
+        assert_eq!(answered.owed_ids(), [RX2]);
+    }
+
+    /// ADR-437: a rejected result beside a usable answer on another identifier changes neither
+    /// the end (the usable answer's, whatever the order) nor the debt on its own identifier: the
+    /// identifier stays silent and owed.
+    #[test]
+    fn a_rejected_result_beside_a_usable_answer_leaves_its_identifier_silent() {
+        for answers in [
+            vec![rejected(RX), positive(RX2, Window::WithinP2)],
+            vec![positive(RX2, Window::WithinP2), rejected(RX)],
+        ] {
+            let evidence = kept_collecting(answers, true).evidence;
+            assert!(!evidence.end_rejected);
+            assert_eq!(evidence.end.response(), Some(&POSITIVE[..]));
+            assert_eq!(evidence.silent_ids(), [RX]);
+            assert_eq!(evidence.owed_ids(), [RX]);
+            assert!(!evidence.settles_owed());
+        }
+    }
+
+    /// ADR-437: the whole-table debt of a rejected end (ADR-435 decision 7) holds whenever the
+    /// end is a rejected result, whatever the answers beside it: pendings, a physical link, or a
+    /// result the exchange's owners could own.
+    #[test]
+    fn a_rejected_end_is_always_owed_on_the_whole_table() {
+        let table = [RX, RX2];
+        for answers in [
+            vec![rejected(RX)],
+            vec![rejected(RX2)],
+            vec![lone(RX), rejected(RX)],
+            vec![rejected(RX), lone(RX2)],
+            vec![lone(RX), lone(RX2), rejected(RX2)],
+            vec![owned(rejected(RX)), rejected(RX2)],
+        ] {
+            let evidence = kept_collecting(answers, true).evidence;
+            assert!(evidence.end_rejected, "{:?}", evidence.answers);
+            let owed = evidence.owed_ids();
+            for id in table {
+                assert!(owed.contains(&id), "{id:#x} missing in {owed:x?}");
+            }
+            assert!(owed.iter().all(|id| table.contains(id)), "{owed:x?}");
+        }
+    }
+
+    /// ADR-437: a rejected result folds no pending and covers no unnamed pending; the end is
+    /// the first standing answer that is neither pending nor rejected, else the first rejected
+    /// result's, else no response.
+    #[test]
+    fn the_fold_and_the_end_treat_a_rejected_result_as_no_answer_on_its_identifier() {
+        let expected = Expected::uds(&PRESENCE);
+        let fold = |items: &[Answer], table: &[u32]| {
+            standing_answers_covering(
+                items,
+                |a| a.rx_id,
+                |a| a.is_pending(&expected),
+                Answer::is_rejected,
+                table,
+            )
+        };
+        // A rejected result after a pending of its identifier leaves the pending standing; a
+        // usable one folds it.
+        assert_eq!(fold(&[lone(RX), rejected(RX)], &[RX, RX2]), [true, true]);
+        assert_eq!(
+            fold(&[lone(RX), positive(RX, Window::WithinP2)], &[RX, RX2]),
+            [false, true]
+        );
+        // The unnamed pending stays while a rejected result stands for one identifier.
+        let items = [lone(0), rejected(RX), positive(RX2, Window::WithinP2)];
+        assert_eq!(fold(&items, &[RX, RX2]), [true, true, true]);
+        let items = [
+            lone(0),
+            positive(RX, Window::WithinP2),
+            positive(RX2, Window::WithinP2),
+        ];
+        assert_eq!(fold(&items, &[RX, RX2]), [false, true, true]);
+        // The end rule: the first usable answer wins over an earlier rejected one; with none, the
+        // first rejected result's bytes; with only pendings or nothing, no response.
+        let first = |items: &[Answer]| format!("{:?}", collecting_end(items, &expected));
+        let mut second = rejected(RX2);
+        second.end = End::PositiveUnusable(vec![0x7E, 0x02]);
+        assert_eq!(
+            first(&[rejected(RX), positive(RX2, Window::WithinP2)]),
+            "(Positive([126, 0]), false)"
+        );
+        assert_eq!(
+            first(&[lone(RX), rejected(RX2), second.clone()]),
+            "(PositiveUnusable([126, 1]), true)"
+        );
+        assert_eq!(
+            first(&[second, rejected(RX)]),
+            "(PositiveUnusable([126, 2]), true)"
+        );
+        assert_eq!(first(&[lone(RX)]), "(NoResponse, false)");
+        assert_eq!(first(&[]), "(NoResponse, false)");
+    }
+
+    /// ADR-437: a rejected answer is no final answer standing on its identifier, and its
+    /// owners do not make the identifier owed through step three of the owed rule.
+    #[test]
+    fn a_rejected_answer_is_no_final_answer_and_owes_nothing_through_its_owners() {
+        let mut evidence = ended(collecting(vec![
+            owned(rejected(RX)),
+            owned(positive(RX2, Window::WithinP2)),
+        ]));
+        evidence.rx_id = 0;
+        evidence.receive_ids = vec![RX, RX2];
+        assert!(!evidence.final_standing(RX));
+        assert!(evidence.final_standing(RX2));
+        // RX is silent (rejected); RX2 is owed only through its owner.
+        assert_eq!(evidence.silent_ids(), [RX]);
+        assert_eq!(evidence.owed_ids(), [RX, RX2]);
+        // With the rejected answer alone owned, the owner adds nothing beyond the silence.
+        let mut evidence = ended(collecting(vec![
+            owned(rejected(RX)),
+            positive(RX2, Window::WithinP2),
+        ]));
+        evidence.rx_id = 0;
+        evidence.receive_ids = vec![RX, RX2];
+        assert_eq!(evidence.owed_ids(), [RX]);
+        // A rejected result that names no identifier may have come on any of them, yet it owns
+        // none: with both identifiers answered usably, nothing is owed through its owners.
+        let mut evidence = ended(collecting(vec![
+            owned(rejected(0)),
+            positive(RX, Window::WithinP2),
+            positive(RX2, Window::WithinP2),
+        ]));
+        evidence.rx_id = 0;
+        evidence.receive_ids = vec![RX, RX2];
+        assert!(!evidence.end_rejected);
+        assert!(evidence.silent_ids().is_empty());
+        assert!(evidence.owed_ids().is_empty());
+    }
+
+    /// ADR-437: a final answer delivered late folds the pending of its own identifier only: a
+    /// rejected result read after a pending on another identifier folded nothing, so the pending
+    /// is still open when the late answer comes on a different identifier.
+    #[test]
+    fn a_late_answer_on_another_identifier_leaves_the_pending_a_rejected_result_did_not_fold() {
+        let kept = kept_collecting(vec![lone(RX), rejected(RX)], true);
+        assert_eq!(kept.evidence.answers.len(), 2);
+        assert_eq!(kept.evidence.open_pending_ids(), [RX]);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX2)));
+        assert_eq!(answered.answers.len(), 3);
+        assert_eq!(answered.open_pending_ids(), [RX]);
+        assert!(!answered.end_rejected);
+        assert!(!answered.settles_owed());
+    }
+
+    /// ADR-437: `as_answer` derives `end_rejected` from the answer, so a rejected answer is no
+    /// answer head for ownership and a usable one is.
+    #[test]
+    fn as_answer_derives_end_rejected_from_the_answer() {
+        let evidence = ended(collecting(vec![
+            rejected(RX),
+            positive(RX2, Window::WithinP2),
+        ]));
+        assert!(!evidence.end_rejected);
+        let one = evidence.as_answer(&evidence.answers[0]);
+        assert!(one.end_rejected && one.answer_head().is_none());
+        let one = evidence.as_answer(&evidence.answers[1]);
+        assert!(!one.end_rejected && one.answer_head().is_some());
+    }
+
+    /// ADR-437: the answers list keeps a rejected result with its own outcome, its bytes
+    /// redacted as a rejected result's are (ADR-359 item 1), and a usable answer's as an answer's.
+    /// A SecurityAccess key response read where the request was another service tells the two
+    /// apart: an answer shows it whole, a rejected result keeps its data back.
+    #[test]
+    fn a_rejected_result_stays_in_the_answers_list_redacted() {
+        let bytes = vec![0x67, 0x02, 0xAA, 0xBB];
+        let mut stray = rejected(RX);
+        stray.end = End::PositiveUnusable(bytes.clone());
+        let entry = entry_of(ended(collecting(vec![
+            stray,
+            positive(RX2, Window::WithinP2),
+        ])));
+        assert_eq!(entry.answers.len(), 2);
+        assert_ne!(
+            redact_unanswering(&bytes),
+            redact(Direction::Response, &bytes)
+        );
+        assert_eq!(entry.answers[0].response, redact_unanswering(&bytes));
+        assert!(
+            matches!(&entry.answers[0].outcome, Outcome::PositiveUnusable { response }
+                if *response == redact_unanswering(&bytes)),
+            "{:?}",
+            entry.answers[0].outcome
+        );
+        assert_eq!(
+            entry.answers[1].response,
+            redact(Direction::Response, &POSITIVE)
+        );
+        assert!(
+            matches!(entry.outcome, Outcome::Positive { .. }),
+            "{:?}",
+            entry.outcome
+        );
     }
 
     /// ADR-435: a reset that ends the owners before it makes a later exchange drop the rows it
@@ -10963,9 +11242,9 @@ mod tests {
             evidence.receive_ids = vec![RX, RX2];
             evidence
         };
-        let mut rejected = table(collecting(vec![positive(RX, Window::WithinP2), lone(RX2)]));
-        rejected.end_rejected = true;
-        assert_eq!(rejected.owed_ids(), [RX2, RX]);
+        let rejected_end = table(ended(collecting(vec![rejected(RX), lone(RX2)])));
+        assert!(rejected_end.end_rejected);
+        assert_eq!(rejected_end.owed_ids(), [RX2, RX]);
         let mut state = LinkState::default();
         let (_, kept) = log_kept_owned(
             &mut state,
@@ -10973,11 +11252,7 @@ mod tests {
             table(collecting(vec![positive(RX2, Window::WithinP2), lone(RX)])),
         );
         state.keep(1, kept.clone());
-        let mut second = table(collecting(vec![
-            positive(RX, Window::WithinP2),
-            positive(RX2, Window::WithinP2),
-        ]));
-        second.end_rejected = true;
+        let second = table(ended(collecting(vec![rejected(RX), rejected(RX2)])));
         let (_, second_kept) = log_kept_owned(&mut state, 2, second);
         state.keep(2, second_kept);
         log_kept_owned(

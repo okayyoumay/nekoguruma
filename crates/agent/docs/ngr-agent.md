@@ -489,14 +489,21 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   neither the classification nor `link_history`, except that a primitive that ended with no answer
   after a rejected result of positive form gives that response as the entry's outcome,
   `positive_unusable` (`unanswered_end`, `Evidence::end_rejected`), redacted as a rejected result
-  and counted for no answer in `link_history`; the job still gets no answer. An ordinary
+  and counted for no answer in `link_history`; the job still gets no answer. A collecting
+  request lists such results among its `answers` instead (`Answer::is_rejected`): a rejected
+  answer is no answer on its identifier, so it folds no pending, covers no identifier or unnamed
+  pending (`standing_answers_covering`) and leaves its identifier silent; `collecting_end` gives
+  the entry's end as the first standing answer that is neither pending nor rejected, else the
+  first rejected result's bytes with `end_rejected` set, and the host, `primitive_ended` and the
+  late-answer restatement all take both values from it (ADR-437). An ordinary
   primitive keeps its first answering result as its response and its times; when the worker
   binds more than one answering result to it, the entry lists all of them in `answers` (ADR-400).
   A collecting request (the presence request) takes no response times for its entry and lists
   every answer: each is placed on its clock (`clock`, `epoch`), judged from the end of the answer
   before it, with its pendings kept per response identifier, and classified as an exchange of its
   own (`Evidence::as_answer`) against its own link history, with its response time from the
-  transmit. Its end is its first standing answer that is not a pending, else no response, and it
+  transmit. Its end is its first standing answer that is neither a pending nor a rejected result,
+  else the first rejected result, else no response, and it
   stays owed on each response identifier whose last answer is a pending (ADR-429). The entry's
   classification is the most severe of its answers' (design 8.11
   `answers`); its `timing` judges where the window ended, by the primitive's finished item when

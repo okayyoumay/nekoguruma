@@ -1207,8 +1207,9 @@ impl<C: WorkerApi> WorkerHost<C> {
         if items.is_empty() {
             return;
         }
-        let logged =
-            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| log.late_link_errors(items)));
+        let logged = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            log.late_link_errors(items, seq)
+        }));
         if logged.is_err() {
             tracing::warn!("writing late link errors panicked");
         }

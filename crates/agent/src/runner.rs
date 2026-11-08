@@ -17273,6 +17273,109 @@ def main():
         );
     }
 
+    /// Design 8.11 `primitive_ended` (ADR-386, ADR-431): a response the stray's job-end wait
+    /// reads before the item that ended the primitive, bound to no primitive, is written
+    /// `unattached` before the entry; read after the receive timeout it is the stray's own late
+    /// response, written after the entry.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbound_response_read_in_the_job_end_wait_is_written_around_the_entry() {
+        const BEFORE_END: &[Step] = &[
+            Step::Release,
+            Step::From(Bound::None, 5_000, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+            Step::TimeOut(5_500),
+            Step::Finish,
+        ];
+        const AFTER_END: &[Step] = &[
+            Step::Release,
+            Step::TimeOut(5_000),
+            Step::From(Bound::None, 5_500, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+            Step::Finish,
+        ];
+        let lines = job_end_script_run(BEFORE_END, true, CancelAnswer::Done).await;
+        let ended = position_of(&lines, "primitive_ended");
+        let unattached = position_of(&lines, "unattached");
+        assert!(unattached < ended, "{lines:#?}");
+        assert!(of_event(&lines, "late_response").is_empty(), "{lines:#?}");
+        let lines = job_end_script_run(AFTER_END, true, CancelAnswer::Done).await;
+        let exchange = &of_event(&lines, "exchange")[0];
+        let ended = position_of(&lines, "primitive_ended");
+        let late = position_of(&lines, "late_response");
+        assert!(ended < late, "{lines:#?}");
+        assert_eq!(
+            lines[late]["refers_to"],
+            serde_json::json!([exchange["seq"]]),
+            "{lines:#?}"
+        );
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// Two requests of the same service: the first (X) is ended by the VCI's receive timeout
+    /// after the agent gave up, the second (S) is the stray at job end. A response of that
+    /// service read in S's job-end wait before S's end could be X's or S's: it is `unattached`
+    /// before S's entry with X named, not dropped.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_unbound_response_two_strays_could_own_is_written_unattached_at_job_end() {
+        const FIRST: &[Step] = &[Step::Release, Step::TimeOut(5_000), Step::Finish];
+        const SECOND: &[Step] = &[
+            Step::Release,
+            Step::From(Bound::None, 6_000, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+            Step::TimeOut(6_500),
+            Step::Finish,
+        ];
+        let dir = journal_dir("two-strays");
+        let script = vec![
+            (When::After(Duration::ZERO), StartEvent::Script(FIRST)),
+            (When::After(Duration::ZERO), StartEvent::Script(SECOND)),
+        ];
+        let (mut client, fake) =
+            fake_worker_scripted(CancelAnswer::Done, None, true, false, script).await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: PAST_DEADLINE,
+        };
+        let released = Arc::clone(&fake.released);
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(JOB_END_WAIT);
+            assert!(host.service_request(0x22, &[0xF1, 0x90]).is_err());
+            // The first primitive's receive timeout comes now; the second request's wait reads it.
+            released.add_permits(1);
+            assert!(host.service_request(0x22, &[0xF1, 0x90]).is_err());
+            released.add_permits(1);
+            host.settle_at_end();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 2, "{lines:#?}");
+        let unattached = of_event(&lines, "unattached");
+        assert_eq!(unattached.len(), 1, "{lines:#?}");
+        let stray_end = lines
+            .iter()
+            .rposition(|line| line["event"] == "primitive_ended")
+            .unwrap();
+        assert!(position_of(&lines, "unattached") < stray_end, "{lines:#?}");
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+    }
+
     /// The lines of `event` in `lines`.
     fn of_event(lines: &[serde_json::Value], event: &str) -> Vec<serde_json::Value> {
         lines

@@ -1,7 +1,7 @@
 # ADR-431: An Exchange Left Owed by Its `primitive_ended` Is Renewed, and Kept When the VCI Ended Its Wait
 
 **Date:** 2026-11-07
-**Status:** Accepted
+**Status:** Accepted (the Consequences' deferred bullet on a response read in the stray primitive's job-end wait closed)
 **Affects:** `agent` (`comm_log.rs` `CommLog::primitive_ended`, `release_kept_ended`;
 `comm_log/exchange.rs` `LinkState::renew_owed`, `LinkState::release_kept_ended`; `host.rs`
 `settle_cancelled`, comments only); design 8.11 `primitive_ended`, `late_response`; ADR-367 item
@@ -55,5 +55,12 @@ since no pending was open.
 - The `system` that the `primitive_ended` entry gives an end within the limit stands under the
   late response (design 8.11 "Settlement"), so a response past the limit is `system` with the
   reason that the VCI had ended its wait at the limit, not `vehicle`.
-- Deferred: a response read during the stray primitive's job-end wait with no owner bound is
-  never written, since only link errors among the end's unattached items reach the log.
+- Closed: an item read during the stray primitive's job-end wait with no owner bound is
+  written. `primitive_ended` hands it over at the item that ended the primitive (its receive
+  timeout, finished status, final response or ending error): an item read before it is read
+  while the exchange is in flight and is placed as `exchange_with` places an unbound item, before
+  the entry, with the stray counted as the one in flight and not among the owners, and the entry
+  floored as an exchange's is; one read at or after it is placed after the entry beside the link
+  errors, with no exchange in flight: the stray owns a response only as decision 2 allows, and an
+  indication or pending whenever it is still owed and kept. A
+  cancelled primitive has no such item, so everything it read counts as read in flight.

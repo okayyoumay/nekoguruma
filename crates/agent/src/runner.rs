@@ -17171,9 +17171,9 @@ def main():
         }
     }
 
-    /// ADR-367 item 3 as annotated by ADR-429, ADR-432, ADR-435: a functional presence exchange
-    /// the agent's deadline ended, whose pending (on 7E8), receive timeout and finished status
-    /// the resend's wait reads, is kept by the release after its `primitive_ended` since the
+    /// ADR-367 item 3 as annotated by ADR-429, ADR-432, ADR-435, ADR-436: a functional presence
+    /// exchange the agent's deadline ended, whose pending (on 7E8) and finished status (no
+    /// receive timeout) the resend's wait reads, is kept by the release after its `primitive_ended` since the
     /// pending is still open on 7E8. The resend was answered on 7E9 only, so it is owed on the
     /// silent 7E8 too: the ECU's final answer there, read once no exchange awaits one, could be
     /// either's, and is `unattached`, with both left `undetermined`.
@@ -17182,7 +17182,6 @@ def main():
         const FIRST: &[Step] = &[
             Step::Release,
             Step::From(Bound::Own, 5_000, 0x7E8, &[0x7F, 0x3E, 0x78]),
-            Step::TimeOut(5_500),
             Step::Finish,
         ];
         const SECOND: &[Step] = &[
@@ -17225,6 +17224,36 @@ def main():
         const FIRST: &[Step] = &[
             Step::Release,
             Step::From(Bound::Own, 5_000, 0x7E9, &[0x7E, 0x00]),
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 2_000_000, 0x7E8, &[0x7E, 0x00]),
+        ];
+        let lines = presence_single_run(FIRST).await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 1, "{lines:#?}");
+        assert_eq!(exchanges[0]["outcome"]["result"], "vci_did_not_end");
+        let ended = of_event(&lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+        assert_eq!(late[0]["identifier"], 0x7E8, "{lines:#?}");
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-436 (the single-owner variant of the test above): a functional presence window whose
+    /// pending on 7E8 and finished status (no receive timeout) the job end reads, with no resend,
+    /// leaves the exchange kept and owed by the pending; the ECU's final answer on 7E8, read
+    /// later, is its `late_response`, not `unattached`. 7E9 stayed silent and is owed too.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_lone_pending_of_a_window_ended_by_finished_owns_its_late_final_answer() {
+        const FIRST: &[Step] = &[
+            Step::Release,
+            Step::From(Bound::Own, 5_000, 0x7E8, &[0x7F, 0x3E, 0x78]),
             Step::Finish,
             Step::Release,
             Step::From(Bound::Earlier, 2_000_000, 0x7E8, &[0x7E, 0x00]),

@@ -1315,6 +1315,16 @@ impl Evidence {
         self.request.first().copied()
     }
 
+    /// Whether a late final response can settle this exchange once it is kept: the evidence shows
+    /// the VCI ended its wait (`vci_ended`), or an identifier is still open on a pending (design
+    /// 8.11 `late_response`, ADR-436). The pending alone is enough, whatever the primitive's
+    /// end: a pending shows the ECU still owes its final answer, which the missing receive
+    /// timeout does not contradict. The test is on the exchange, not on the identifier the final
+    /// names, so a silent identifier of the same request settles too.
+    pub(crate) fn late_final_settles(&self) -> bool {
+        self.vci_ended || !self.open_pending_ids().is_empty()
+    }
+
     /// The response identifiers whose last standing answer is a pending, in the order they first
     /// answered: a collecting request is owed once on each of them (design 8.11 "Owed request",
     /// ADR-429). An unnamed pending (identifier 0) is open while some identifier of the receive
@@ -2305,17 +2315,18 @@ impl LinkState {
     }
 
     /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
-    /// still owed and either has an identifier a pending is open on or shows, in the evidence
-    /// its `primitive_ended` renewed, that the VCI ended its wait: its ECU's final answer can
-    /// still settle it (ADR-429, ADR-431). `vci_ended` is true when the end read a receive
+    /// still owed and whose evidence allows a late final to settle it
+    /// ([`Evidence::late_final_settles`]): an identifier a pending is open on, or a renewed
+    /// `vci_ended` (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
     /// timeout, whatever else it read after (as an entry's is), so an end that read none (a
     /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
-    /// released.
+    /// released unless a pending is open.
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
-            && self.kept.get(&seq).is_some_and(|kept| {
-                !kept.evidence.open_pending_ids().is_empty() || kept.evidence.vci_ended
-            });
+            && self
+                .kept
+                .get(&seq)
+                .is_some_and(|kept| kept.evidence.late_final_settles());
         if !open {
             self.kept.remove(&seq);
         }

@@ -1,7 +1,7 @@
 # ADR-435: A Silent Receive Identifier of a Collecting Exchange Is Owed
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (Decision item 4's release amended by ADR-436: an exchange a pending is open on is kept after any end, and a late final answer on its silent identifier settles it there)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `Evidence::silent_ids`,
 `Evidence::settles_owed`, `Evidence::unanswered_ids`, `Evidence::answerable_ids`, `LinkEffect`,
 `Kept::answered_placed`, `Kept::late_start_for`, `LinkState::reclassify_one`,

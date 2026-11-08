@@ -3011,8 +3011,9 @@ impl CommLog {
         };
         // Only an exchange the VCI ended can be settled by a late response (ADR-365), and one
         // the agent's deadline ended by its primitive's end (ADR-366), and one whose start the
-        // worker did not answer by the end of the primitive it may have started (ADR-416).
-        if kept.evidence.vci_ended
+        // worker did not answer by the end of the primitive it may have started (ADR-416), and
+        // one a pending is open on, whatever its end (ADR-436).
+        if kept.evidence.late_final_settles()
             || kept.evidence.start_unresolved
             || matches!(kept.evidence.end, exchange::End::VciDidNotEnd)
         {
@@ -3158,8 +3159,8 @@ impl CommLog {
     }
 
     /// [`CommLog::release_kept`] for the exchange whose `primitive_ended` was just written,
-    /// except one left owed per an open identifier, or whose renewed evidence shows the VCI
-    /// ended its wait (ADR-429, ADR-431).
+    /// except one left owed whose evidence lets a late final settle it: an open pending, or a
+    /// renewed `vci_ended` (ADR-429, ADR-431, ADR-436).
     pub(crate) fn release_kept_ended(&self, seq: u64) {
         let mut inner = self.lock();
         for (_, state) in &mut inner.links {
@@ -4496,7 +4497,8 @@ fn late_indication_owners_of(
 /// `late_response`).
 #[derive(Debug, PartialEq, Eq)]
 enum LateOwner {
-    /// The one owed exchange the VCI ended that could own it.
+    /// The one owed exchange a late final can settle (the VCI ended its wait, or a pending is
+    /// open on it, ADR-436) that could own it.
     One(u64),
     /// Two or more could (owed exchanges, or one of them and the exchange in flight, which
     /// awaits the same response): the owed ones the log keeps, and whether the exchange in
@@ -4557,7 +4559,8 @@ fn late_response_owner(
     };
     if let ([owner], false) = (&owners[..], in_flight) {
         let kept = state.kept(*owner)?;
-        return (!pending(kept) && kept.evidence.vci_ended).then_some(LateOwner::One(*owner));
+        return (!pending(kept) && kept.evidence.late_final_settles())
+            .then_some(LateOwner::One(*owner));
     }
     if owners.len() + usize::from(in_flight) < 2 {
         return None;
@@ -10543,7 +10546,13 @@ pub(crate) mod tests {
         let lines = lines(&setup);
         std::fs::remove_dir_all(&dir).unwrap();
         let late = of_event(&lines, "late_response").remove(0);
-        assert_eq!(late["exchanges"][0]["classification"], "vehicle", "{late}");
+        // The verdict keeps the entry's own `system` fault, but the reason now shows the VCI's
+        // wait ended at the limit, which the unshown case above does not.
+        let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("VCI had ended its wait at the limit"),
+            "{reason}"
+        );
     }
 
     /// ADR-433: what a partial settlement judged stands against an ambiguity read for the
@@ -11446,7 +11455,8 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
-                    vci_ended: true,
+                    // The host reads no receive timeout for a finished status (host.rs `vci_ended`).
+                    vci_ended: false,
                     reads: read_after_deadline(items),
                 },
             )
@@ -11696,7 +11706,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
-                vci_ended: true,
+                vci_ended: false,
                 reads: read_after_deadline(items),
             },
         )
@@ -11727,6 +11737,228 @@ pub(crate) mod tests {
             std::fs::remove_dir_all(&other).unwrap();
             std::fs::remove_dir_all(&dir).unwrap();
         }
+    }
+
+    /// The primitive-ended entry of `seq` that reads a pending of 0x7E8 and the finished status
+    /// (read `finished_us` after the transmit) and ends as `end`, with no receive timeout read (`vci_ended` false), as the host writes
+    /// a finished status, a link error or an unknown end.
+    fn end_pending_without_timeout(log: &CommLog, seq: u64, end: exchange::End, finished_us: u64) {
+        let mut items = pending_reads(0x7E8, 200_000);
+        items.push(EndItem::Finished(device_time(BASE_US + finished_us)));
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(end),
+                detail: exchange::Detail::default(),
+                vci_ended: false,
+                reads: read_after_deadline(items),
+            },
+        )
+        .unwrap();
+    }
+
+    /// ADR-436: a lone pending and the finished status, with no receive timeout read, leave the
+    /// exchange kept and owed, and its ECU's final answer is its `late_response`, in time or
+    /// not. On a functional link the silent identifier's final settles it on that identifier
+    /// (ADR-435); on a physical link the pending's own identifier is the link's.
+    #[test]
+    fn a_lone_pending_and_a_finished_status_with_no_receive_timeout_leave_the_late_final_to_settle()
+    {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |_| {});
+            end_pending_without_timeout(&log, seq, exchange::End::NoResponse, 1_200_000);
+            log.release_kept_ended(seq);
+            assert!(!kept_of(&log, seq).evidence.vci_ended, "{functional}");
+            assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true), "{functional}");
+            assert_eq!(
+                late_owner_of(&log, &late_final_item()),
+                Some(LateOwner::One(seq)),
+                "{functional}"
+            );
+            // On a functional link the silent 0x7E9 is owed and settled on its own.
+            assert_eq!(
+                late_owner_of(&log, &late_final_on(0x7E9)),
+                functional.then_some(LateOwner::One(seq)),
+                "{functional}"
+            );
+            // 2.8 s after the pending, within its P2*: in time, so the system missed it.
+            log.lock()
+                .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+                .unwrap();
+            assert!(owed_on_7e8(&log, seq).0.is_empty(), "{functional}");
+            if functional {
+                assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
+                log.lock()
+                    .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_500_000))
+                    .unwrap();
+                assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
+            } else {
+                assert!(!owed_on_7e8(&log, seq).1);
+            }
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), 1 + usize::from(functional), "{late:?}");
+            for entry in &late {
+                assert_eq!(entry["refers_to"], serde_json::json!([seq]), "{entry}");
+                assert_eq!(entry["exchanges"][0]["classification"], "system", "{entry}");
+            }
+        }
+    }
+
+    /// ADR-436: a final answer past the limit the pending put in force is held to a VCI that
+    /// ended its wait at the limit only when the entry shows that; with no receive timeout and no
+    /// finished time it stays `undetermined`, never `vehicle`.
+    #[test]
+    fn a_late_final_of_a_lone_pending_with_no_receive_timeout_is_undetermined_unless_the_limit_is_shown()
+     {
+        // The entry path: the host's own wait read the pending, then the finished status, and
+        // wrote no times for the error result.
+        let (dir, setup, log, seq) = late_collecting_on(false, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        log.lock()
+            .late_response(0, seq, &late_final_item(), placed_after(9_000_000))
+            .unwrap();
+        log.end("ok");
+        let entry_lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&entry_lines, "late_response").remove(0);
+        assert_eq!(
+            late["exchanges"][0]["classification"], "undetermined",
+            "{late}"
+        );
+        let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(!reason.contains("VCI had ended its wait"), "{reason}");
+        // The same exchange once its finished status is placed at the limit the pending put in
+        // force (0.2 s + 5 s): the window is shown to end at the limit. The fixture's entry
+        // already shows a fault of the system, which stands; the reason names the limit.
+        let (dir, setup, log, seq) = late_collecting_on(false, |_| {});
+        end_pending_without_timeout(&log, seq, exchange::End::NoResponse, 5_200_000);
+        log.release_kept_ended(seq);
+        log.lock()
+            .late_response(0, seq, &late_final_item(), placed_after(9_000_000))
+            .unwrap();
+        log.end("ok");
+        let at_limit = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&at_limit, "late_response").remove(0);
+        let reason = late["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains("VCI had ended its wait at the limit"),
+            "{reason}"
+        );
+    }
+
+    /// ADR-436 (entry path): a collecting exchange whose own wait ended with the finished status
+    /// and a lone pending, no receive timeout, is kept at its entry, so its final answer settles
+    /// it; a silent identifier of the same request settles on that identifier.
+    #[test]
+    fn an_entry_with_a_lone_pending_and_no_receive_timeout_is_kept_for_its_late_final() {
+        for functional in [false, true] {
+            let (dir, setup, log, seq) = late_collecting_on(functional, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            });
+            assert!(!kept_of(&log, seq).evidence.vci_ended);
+            assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true), "{functional}");
+            assert_eq!(
+                late_owner_of(&log, &late_final_item()),
+                Some(LateOwner::One(seq)),
+                "{functional}"
+            );
+            if functional {
+                // The silent 0x7E9 of the same request: settled on that identifier, the pending
+                // identifier stays owed.
+                assert_eq!(
+                    late_owner_of(&log, &late_final_on(0x7E9)),
+                    Some(LateOwner::One(seq))
+                );
+                log.lock()
+                    .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_000_000))
+                    .unwrap();
+                assert_eq!(owed_on(&log, 0x7E9, seq).0, Vec::<u64>::new());
+                assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true));
+            }
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), usize::from(functional), "{functional}");
+        }
+    }
+
+    /// ADR-436: whatever the end of a primitive that left a pending open (a link error, a
+    /// lost VCI, an unknown end), the log keeps the exchange and its final answer settles it;
+    /// an exchange with no pending open is released as before.
+    #[test]
+    fn a_pending_keeps_the_exchange_whatever_the_end_without_a_receive_timeout() {
+        let ends = [
+            exchange::End::LinkError(exchange::LinkErrorKind::Receive),
+            exchange::End::VciLost {
+                refused_after_loss: false,
+            },
+        ];
+        for end in ends {
+            let (dir, setup, log, seq) = late_collecting_on(false, |_| {});
+            end_pending_without_timeout(&log, seq, end.clone(), 1_200_000);
+            log.release_kept_ended(seq);
+            assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true), "{end:?}");
+            assert_eq!(
+                late_owner_of(&log, &late_final_item()),
+                Some(LateOwner::One(seq)),
+                "{end:?}"
+            );
+            log.lock()
+                .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+                .unwrap();
+            assert!(!owed_on_7e8(&log, seq).1, "{end:?}");
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response").remove(0);
+            assert_eq!(late["refers_to"], serde_json::json!([seq]), "{end:?}");
+        }
+        // No pending open: the same end is released.
+        let (dir, _setup, log, seq) = late_collecting_on(false, |_| {});
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
+                detail: exchange::Detail::default(),
+                vci_ended: false,
+                reads: read_after_deadline(vec![EndItem::Finished(device_time(
+                    BASE_US + 1_200_000,
+                ))]),
+            },
+        )
+        .unwrap();
+        log.release_kept_ended(seq);
+        assert!(log.lock().links[0].1.kept(seq).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-436: `Evidence::late_final_settles` is the receive timeout read or a pending open.
+    #[test]
+    fn a_late_final_settles_on_a_read_receive_timeout_or_an_open_pending() {
+        let mut evidence = collecting_waited(|_| {});
+        assert!(!evidence.late_final_settles());
+        evidence.vci_ended = true;
+        assert!(evidence.late_final_settles());
+        evidence.vci_ended = false;
+        evidence.answers = vec![lone_pending_on(0x7E8)];
+        evidence.pending = vec![pending_on(200_000)];
+        evidence.pending_ids = vec![Some(0x7E8)];
+        assert!(evidence.late_final_settles());
+        // An ordinary request has no open pending to settle on.
+        evidence.collecting = false;
+        assert!(!evidence.late_final_settles());
     }
 
     /// A log whose one ordinary exchange, a read of F190 the agent's deadline ended

@@ -1,7 +1,7 @@
 # ADR-429: A Collecting Exchange Ends With Its First Final Answer and Is Owed Once per Identifier With an Open Pending
 
 **Date:** 2026-11-07
-**Status:** Accepted (item 3's renewal at `primitive_ended` and release exception also apply to an exchange left owed that the VCI ended, by its entry or by a receive timeout its `primitive_ended` read, ADR-431; decision 2's fallback on the link's identifier superseded by ADR-432, and the Consequences' deferred bullets on identifier 0 and on `Kept::answered` closed)
+**Status:** Accepted (item 3's renewal at `primitive_ended` and release exception also apply to an exchange left owed that the VCI ended, by its entry or by a receive timeout its `primitive_ended` read, ADR-431; decision 2's fallback on the link's identifier superseded by ADR-432, and the Consequences' deferred bullets on identifier 0 and on `Kept::answered` closed; decision 3's whole settlement superseded by ADR-433, which settles per identifier)
 **Affects:** `agent` (`comm_log/exchange.rs` `collecting_end`, `Evidence::open_pending_ids`,
 `LinkEffect`, `LinkState::record`, the owner lookups; `comm_log.rs` `primitive_ended`,
 `late_item`; `host.rs`); design 8.11 "Owed request", `answers`; ADR-396 item 4, ADR-400,

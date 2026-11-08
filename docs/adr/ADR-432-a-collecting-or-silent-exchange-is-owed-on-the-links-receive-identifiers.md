@@ -1,7 +1,7 @@
 # ADR-432: A Collecting or Silent Exchange Is Owed on the Link's Receive Identifiers
 
 **Date:** 2026-11-07
-**Status:** Accepted
+**Status:** Accepted (Consequence 1's whole settlement amended by ADR-433: per identifier when several are open; the deferred bullet on settling per identifier closed)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::receive_ids`, `Evidence::owed_ids`,
 `LinkState::set_owed_rows`, `LinkState::history_for`, `LinkState::record`,
 `LinkState::renew_owed`; `comm_log.rs` `late_response`, `late_response_owner`; `host.rs`

@@ -2846,7 +2846,8 @@ impl LinkState {
             self.last_reset = self.last_reset.max(Some(seq));
         }
         let mut changed = Vec::new();
-        // Exchanges after it that are placed alone now, and so no owners of the later answers.
+        // Exchanges after it whose rows the reset dropped, wholly or in part: no longer owners
+        // of the later answers on those identifiers.
         let mut freed_answers: Vec<SettledAnswer> = Vec::new();
         for at in 0..self.window.len() {
             let logged = &self.window[at];

@@ -5,7 +5,8 @@
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `Evidence::silent_ids`,
 `Evidence::settles_owed`, `Evidence::unanswered_ids`, `Evidence::answerable_ids`, `LinkEffect`,
 `Kept::answered_placed`, `Kept::late_start_for`, `LinkState::reclassify_one`,
-`LinkState::refresh_owed_rows`, `LinkState::reset_after`; `comm_log.rs` `primitive_ended`,
+`LinkState::refresh_owed_rows`, `LinkState::reset_after`, `LinkState::reclassify_after`,
+`LinkState::error_after`, `LinkState::frees_owner`; `comm_log.rs` `primitive_ended`,
 `settled_final_time`, `late_response`), design 8.11 "Owed request", `late_response`; ADR-429 decision 2, ADR-432
 decision 2, ADR-433 decision 6 and Consequences
 
@@ -79,9 +80,19 @@ VCI ended the window.
 
 - The refresh of decision 6 reaches the exchanges in the link's window. An owed exchange that
   has left the window keeps a row it holds only because an owner could own its answer there,
-  after that owner lets the answer go, until its own `late_response` takes the answers' owners
-  again and drops it; until then it counts as an owner of a late final answer on that
+  after that owner lets the answer go, until its own `primitive_ended` or `late_response` takes
+  the answers' owners again and drops it, or an accepted ECUReset or change of session ends it;
+  until then it counts as an owner of a late final answer on that
   identifier, which is then `unattached`.
+- A resend that is silent on an identifier the first exchange is owed on shares the ownership
+  of a late final answer there: the answer has two owners, is `unattached`, and both exchanges
+  are at least `undetermined` (design 8.11 "Owed request"). More resends are `undetermined`;
+  the owed rows of a presence exchange grow to the size of the table. The two runner tests of
+  a pending read in the resend's wait and of a silent presence exchange assert this outcome.
+- A collecting answer that is a result the worker rejected (a wrong echo, `positive_unusable`)
+  still stands as a final answer on its identifier, as the entry's end takes it (ADR-429): the
+  identifier is not silent, so an unnamed late final answer is not keyed on it. Whether such a
+  result leaves its identifier unanswered, and how the entry's end treats it, is left open.
 - ADR-432's deferred bullet on an identifier that stays silent beside another's final answer is
   closed, and ADR-433's Consequence that it stands is superseded by decision 1. ADR-429
   decision 2, ADR-432 decision 2 and ADR-433 decision 6 and Consequences are marked as

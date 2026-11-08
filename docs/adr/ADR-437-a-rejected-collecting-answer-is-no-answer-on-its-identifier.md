@@ -63,9 +63,11 @@ states an end.
    `owed_ids` is the whole table whenever `end_rejected` holds.
 
 6. **Timing models the VCI; attribution does not count a rejected result.** The VCI takes a
-   rejected result as a response and ends its wait for that identifier's window (only the
-   worker rejects it, after the VCI delivered it). So the window rules (`answer_windows`,
-   `final_before`, `chain_from`, the open pendings, the late judgement) keep a rejected result
+   rejected result as a response and ends its wait for that identifier's window (the worker
+   matched the result and bound it to the primitive; the agent's host rejects it, by
+   `Progress::answers`, which is stricter than the worker's match). So the window rules
+   (`answer_windows`, `final_before`, `chain_from`, `answer_windows`' `open_pendings`, the late
+   judgement) keep a rejected result
    as a final: it ends a pending's window, a final answer delivered late is judged against P2
    from its end, and it restarts the window of the next answer. Attribution (the end, the folds,
    `final_standing`, silence, the owed identifiers, settlement) does not count it, as decisions

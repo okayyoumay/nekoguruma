@@ -11383,12 +11383,16 @@ pub(crate) mod tests {
     }
 
     /// The host orders a link error against the first result that answers and is no pending, never
-    /// a rejected one; the log orders the errors it reads for an end the same way. An error read
-    /// between a wrong echo and the usable answer is before the answer.
+    /// a rejected one; the log does the same for an exchange whose entry held a wrong echo and a
+    /// link error it took: the first answer read for the end after the deadline is the usable
+    /// one, so the entry's error is before it.
     #[test]
-    fn an_error_between_a_wrong_echo_and_the_usable_answer_is_before_the_answer() {
+    fn an_entrys_link_error_beside_a_wrong_echo_is_before_the_usable_answer_read_for_the_end() {
         let (dir, _setup, log, seq) = late_collecting_on(true, |evidence| {
             evidence.vci_ended = true;
+            evidence.link_errors = vec![exchange::LinkErrorKind::Frame];
+            evidence.answers = vec![rejected_on(0x7E8, 100_000)];
+            ended_by_answers(evidence);
         });
         log.primitive_ended(
             seq,
@@ -11397,8 +11401,6 @@ pub(crate) mod tests {
                 detail: exchange::Detail::default(),
                 vci_ended: true,
                 reads: read_after_deadline(vec![
-                    EndItem::Answer(rejected_on(0x7E8, 1_000_000)),
-                    end_error(Some(exchange::LinkErrorKind::Frame), 1_100_000),
                     answer_read(0x7E9, 1_200_000),
                     EndItem::Finished(device_time(BASE_US + 1_400_000)),
                 ]),

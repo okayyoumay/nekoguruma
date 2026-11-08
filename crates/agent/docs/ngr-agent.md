@@ -495,7 +495,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   pending (`standing_answers_covering`) and leaves its identifier silent; `collecting_end` gives
   the entry's end as the first standing answer that is neither pending nor rejected, else the
   first rejected result's bytes with `end_rejected` set, and the host, `primitive_ended` and the
-  late-answer restatement all take both values from it (ADR-437). An ordinary
+  late-answer restatement all take both values from it (ADR-437). For timing the VCI took a
+  rejected result as a response and ended its wait, so it still ends a pending's window
+  (`answer_windows`), a final answer delivered late is judged against P2 from its end, and it
+  restarts the window of the answer after it; the link errors read for an end are ordered
+  against the first answer for which `Answer::is_response` holds, as the host orders them. An ordinary
   primitive keeps its first answering result as its response and its times; when the worker
   binds more than one answering result to it, the entry lists all of them in `answers` (ADR-400).
   A collecting request (the presence request) takes no response times for its entry and lists
@@ -503,7 +507,8 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   before it, with its pendings kept per response identifier, and classified as an exchange of its
   own (`Evidence::as_answer`) against its own link history, with its response time from the
   transmit. Its end is its first standing answer that is neither a pending nor a rejected result,
-  else the first rejected result, else no response, and it
+  else the first rejected result, else no response (`primitive_ended` keeps a
+  `response_incomplete` end while `collecting_end` gives no response), and it
   stays owed on each response identifier whose last answer is a pending (ADR-429). The entry's
   classification is the most severe of its answers' (design 8.11
   `answers`); its `timing` judges where the window ended, by the primitive's finished item when

@@ -3021,7 +3021,6 @@ impl CommLog {
             inner.links[at].1.keep(
                 seq,
                 exchange::Kept {
-                    pending_at_end: !kept.evidence.open_pending_ids().is_empty(),
                     classification: entry.classification,
                     sent: entry.sent,
                     clears,
@@ -3031,6 +3030,7 @@ impl CommLog {
                     ..kept
                 },
             );
+            inner.links[at].1.note_pending_at_end(seq);
         }
         if let Some(kind) = entry.link_error() {
             for (other, (_, state)) in inner.links.iter_mut().enumerate() {
@@ -3815,6 +3815,7 @@ impl CommLog {
                 ),
             );
             state.update_kept(seq, settled_evidence.clone(), entry.sent, transmit, None);
+            state.note_pending_at_end(seq);
             // The identifiers it is owed on no more: the later exchanges' answers on them are
             // freed from it (ADR-433).
             let now = state.owed_row_ids(seq);
@@ -4561,8 +4562,7 @@ fn late_response_owner(
     };
     if let ([owner], false) = (&owners[..], in_flight) {
         let kept = state.kept(*owner)?;
-        return (!pending(kept) && (kept.evidence.late_final_settles() || kept.pending_at_end))
-            .then_some(LateOwner::One(*owner));
+        return (!pending(kept) && kept.late_final_settles()).then_some(LateOwner::One(*owner));
     }
     if owners.len() + usize::from(in_flight) < 2 {
         return None;
@@ -11937,6 +11937,125 @@ pub(crate) mod tests {
                 assert_eq!(entry["refers_to"], serde_json::json!([seq]), "{entry}");
                 assert_eq!(entry["exchanges"][0]["classification"], "system", "{entry}");
             }
+        }
+    }
+
+    /// The primitive-ended entry of `seq` that reads `items`, then the finals of `ids` (of no
+    /// primitive) after the finished status, with no receive timeout (`vci_ended` false).
+    fn end_then_unbound_finals(
+        log: &CommLog,
+        seq: u64,
+        end: exchange::End,
+        mut items: Vec<EndItem>,
+        ids: &[u32],
+    ) {
+        items.push(EndItem::Finished(device_time(BASE_US + 1_200_000)));
+        items.extend(ids.iter().map(|id| EndItem::Unattached(late_final_on(*id))));
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(end),
+                detail: exchange::Detail::default(),
+                vci_ended: false,
+                reads: read_after_deadline(items),
+            },
+        )
+        .unwrap();
+    }
+
+    /// ADR-436: a `primitive_ended` that reads a pending on 0x7E8, the finished status and then
+    /// the finals of both identifiers of no primitive settles both, whichever comes first: the
+    /// first final folds the pending out of the evidence, which does not end the claim.
+    #[test]
+    fn the_finals_read_after_an_end_with_a_pending_settle_both_identifiers_in_either_order() {
+        for ids in [[0x7E8, 0x7E9], [0x7E9, 0x7E8]] {
+            let (dir, setup, log, seq) = late_collecting_on(true, |_| {});
+            end_then_unbound_finals(
+                &log,
+                seq,
+                exchange::End::NoResponse,
+                pending_reads(0x7E8, 200_000),
+                &ids,
+            );
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), 2, "{ids:?} {lines:#?}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{ids:?}");
+            for entry in &late {
+                assert_eq!(entry["refers_to"], serde_json::json!([seq]), "{entry}");
+            }
+        }
+    }
+
+    /// ADR-436: the same end with only the 0x7E8 final read in the wait: the release keeps the
+    /// exchange although the final folded the pending, so the 0x7E9 final read after it is the
+    /// exchange's.
+    #[test]
+    fn the_release_keeps_an_exchange_whose_pending_the_end_s_wait_settled() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, |_| {});
+        end_then_unbound_finals(
+            &log,
+            seq,
+            exchange::End::NoResponse,
+            pending_reads(0x7E8, 200_000),
+            &[0x7E8],
+        );
+        log.release_kept_ended(seq);
+        assert!(kept_of(&log, seq).evidence.open_pending_ids().is_empty());
+        assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
+        assert_eq!(
+            late_owner_of(&log, &late_final_on(0x7E9)),
+            Some(LateOwner::One(seq))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-436: an entry with a lone pending on 0x7E8 whose end reads that identifier's final
+    /// answer bound to the primitive, then the finished status, with no receive timeout, stays
+    /// kept and settleable on the silent 0x7E9: a final read in the same wait and one read after
+    /// the release are both the exchange's `late_response`.
+    #[test]
+    fn a_pending_the_end_itself_answers_leaves_the_silent_identifier_settleable() {
+        let build = |evidence: &mut exchange::Evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        };
+        for in_wait in [true, false] {
+            let (dir, setup, log, seq) = late_collecting_on(true, build);
+            assert!(kept_of(&log, seq).pending_at_end);
+            end_then_unbound_finals(
+                &log,
+                seq,
+                exchange::End::Positive(FIRST.to_vec()),
+                vec![answer_read(0x7E8, 400_000)],
+                if in_wait { &[0x7E9] } else { &[] },
+            );
+            log.release_kept_ended(seq);
+            if in_wait {
+                // The 0x7E9 final read in the wait settled the exchange whole.
+                assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
+            } else {
+                assert!(!kept_of(&log, seq).evidence.vci_ended);
+                assert!(kept_of(&log, seq).evidence.open_pending_ids().is_empty());
+                assert_eq!(
+                    late_owner_of(&log, &late_final_on(0x7E9)),
+                    Some(LateOwner::One(seq))
+                );
+                log.lock()
+                    .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_000_000))
+                    .unwrap();
+            }
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), 1, "{in_wait} {lines:#?}");
+            assert_eq!(late[0]["identifier"], 0x7E9, "{in_wait} {late:?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([seq]));
         }
     }
 

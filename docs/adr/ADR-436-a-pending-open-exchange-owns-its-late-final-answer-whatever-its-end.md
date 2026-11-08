@@ -3,9 +3,10 @@
 **Date:** 2026-11-08
 **Status:** Accepted
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::late_final_settles`,
-`Kept::pending_at_end`, `LinkState::release_kept_ended`; `comm_log.rs` `late_response_owner`, the entry's keep in
-`CommLog::exchange`), design 8.11 `primitive_ended`, `late_response`; ADR-366 decision 1,
-ADR-429 decision 3, ADR-431 decisions 2 and 3, ADR-435 decision 4
+`Kept::late_final_settles`, `Kept::pending_at_end`, `LinkState::note_pending_at_end`,
+`LinkState::release_kept_ended`; `comm_log.rs` `late_response_owner`, the entry's keep in
+`CommLog::exchange`, `primitive_ended`), design 8.11 `primitive_ended`, `late_response`; ADR-366
+decision 1, ADR-429 decision 3, ADR-431 decisions 2 and 3, ADR-435 decision 4
 
 ## Context
 
@@ -40,11 +41,15 @@ ended the primitive.
 4. **The test is on the exchange, not on the response's identifier, and it does not lapse.**
    A final answer on a silent identifier of the same request (ADR-435) settles that identifier
    as well, and the exchange stays owed and kept on the others, as it does for one the VCI
-   ended. The first final answer folds the pending out of the evidence, so the exchange records
-   when it is kept (`Kept::pending_at_end`: at its entry, and at the release after each
-   `primitive_ended`, which recomputes it from that end) that a pending was open; the owner
-   gate reads `vci_ended`, a pending open now, or that record. The order of the identifiers'
-   final answers therefore does not matter.
+   ended. The first final answer folds the pending out of the evidence, so the kept exchange
+   carries a flag (`Kept::pending_at_end`) that a pending was open on it.
+   `LinkState::note_pending_at_end` sets it at two points: when the exchange is kept at its entry, and in `primitive_ended` right
+   after the evidence is renewed, before the end's after-end items are placed. The flag only
+   rises (`|=`), so a pending the end itself answers, or a late final that folds it, does not
+   lower it. One predicate, `Kept::late_final_settles` (the evidence's, or the flag), is read by
+   the owner gate and by `release_kept_ended`, which therefore does not recompute from folded
+   evidence. The order of the identifiers' final answers does not matter, whether they are read
+   in the end's wait, after the release, or one in each.
 5. **The judgement is unchanged.** The late window comes from the pending's window and is judged
    against the limit in force then. In time it is `system`; past it, `vehicle` only when the
    entry shows the VCI ended its wait at the limit (`timeout_at_limit`), else `undetermined`;

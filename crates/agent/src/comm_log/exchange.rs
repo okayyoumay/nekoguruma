@@ -1775,10 +1775,10 @@ pub(crate) struct Kept {
     /// identifiers gave it, while it stays owed on the others (ADR-433): a later final answer
     /// is not judged below it. Kept apart from [`Kept::floor`], which ambiguous items set too.
     pub partial: Option<Classification>,
-    /// A pending was open on the exchange when it was kept (at its entry, or by the release after
-    /// its `primitive_ended`, which recomputes it from that end): its late final answers settle
-    /// it on every identifier it stays owed on, though the first of them folds the pending out
-    /// of the evidence (ADR-436).
+    /// A pending was open on the exchange when it was kept, at its entry or in the evidence its
+    /// `primitive_ended` renewed ([`LinkState::note_pending_at_end`]; it only rises): its late
+    /// final answers settle it on every identifier it stays owed on, though the first of them
+    /// folds the pending out of the evidence (ADR-436).
     pub pending_at_end: bool,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
@@ -1810,6 +1810,13 @@ impl From<Option<(Clock, super::clocks::Placed)>> for AnswerTime {
 }
 
 impl Kept {
+    /// Whether a late final response can settle this kept exchange: its evidence allows it
+    /// ([`Evidence::late_final_settles`]), or a pending was open when it was kept
+    /// ([`Kept::pending_at_end`]) (ADR-436).
+    pub(crate) fn late_final_settles(&self) -> bool {
+        self.evidence.late_final_settles() || self.pending_at_end
+    }
+
     /// The late start that bears on a response with identifier `response_id` (`None` when it
     /// names none): a collecting exchange's start counts for a response on the identifier it was
     /// judged on, or an unnamed one when that is the only identifier open; any other exchange's
@@ -2320,9 +2327,9 @@ impl LinkState {
     }
 
     /// [`LinkState::release_kept`] for an exchange whose primitive just ended, except one that is
-    /// still owed and whose evidence allows a late final to settle it
-    /// ([`Evidence::late_final_settles`]): an identifier a pending is open on, or a renewed
-    /// `vci_ended` (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
+    /// still owed and that a late final can settle ([`Kept::late_final_settles`]): an identifier
+    /// a pending is open on or was open on when it was kept, or a renewed `vci_ended`
+    /// (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
     /// timeout, whatever else it read after (as an entry's is), so an end that read none (a
     /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
     /// released unless a pending is open.
@@ -2331,13 +2338,19 @@ impl LinkState {
             && self
                 .kept
                 .get(&seq)
-                .is_some_and(|kept| kept.evidence.late_final_settles());
-        if open {
-            if let Some(kept) = self.kept.get_mut(&seq) {
-                kept.pending_at_end = !kept.evidence.open_pending_ids().is_empty();
-            }
-        } else {
+                .is_some_and(|kept| kept.late_final_settles());
+        if !open {
             self.kept.remove(&seq);
+        }
+    }
+
+    /// Records on the kept exchange `seq` that a pending is open on its evidence now: the flag
+    /// [`Kept::pending_at_end`] only rises, so a settlement or an end that folds the pending
+    /// out of the evidence does not take the exchange's claim on its other identifiers away
+    /// (ADR-436). Called when the exchange is kept and when `primitive_ended` renews it.
+    pub(crate) fn note_pending_at_end(&mut self, seq: u64) {
+        if let Some(kept) = self.kept.get_mut(&seq) {
+            kept.pending_at_end |= !kept.evidence.open_pending_ids().is_empty();
         }
     }
 

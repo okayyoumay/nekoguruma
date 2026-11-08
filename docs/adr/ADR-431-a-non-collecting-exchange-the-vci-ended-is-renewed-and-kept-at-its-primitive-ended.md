@@ -55,11 +55,11 @@ since no pending was open.
 - The `system` that the `primitive_ended` entry gives an end within the limit stands under the
   late response (design 8.11 "Settlement"), so a response past the limit is `system` with the
   reason that the VCI had ended its wait at the limit, not `vehicle`.
-- Closed: a response read during the stray primitive's job-end wait with no owner bound is
+- Closed: an item read during the stray primitive's job-end wait with no owner bound is
   written. `primitive_ended` hands it over at the item that ended the primitive (its receive
-  timeout, finished status, final response or ending error): a response read before that item
-  is read while the exchange is in flight and is placed as `exchange_with` places one, before
-  the entry, with the stray at least `undetermined` when it awaits the response; one read at or
-  after it is read after the VCI ended the wait (decision 2) and is placed after the entry,
-  beside the link errors, with the stray an ended owner. A cancelled primitive has no such item,
-  so everything it read counts as read in flight.
+  timeout, finished status, final response or ending error): an item read before it is read
+  while the exchange is in flight and is placed as `exchange_with` places an unbound item, before
+  the entry, with the stray counted as the one in flight and not among the owners, and the entry
+  floored as an exchange's is; one read at or after it is placed after the entry beside the link
+  errors, with no exchange in flight, and the stray is an owner only as decision 2 allows. A
+  cancelled primitive has no such item, so everything it read counts as read in flight.

@@ -2543,47 +2543,21 @@ impl CommLog {
             .and_then(|time| time.placed())
             .into_iter()
             .collect();
-        let awaits = evidence.awaits_response();
-        let in_flight_tx = match evidence.target {
-            exchange::Target::Endpoint { tx_id, .. } if awaits => Some(tx_id),
-            _ => None,
-        };
-        // A collecting exchange awaits answers on any identifier, and a functional link's own is
-        // 0 (ADR-429).
-        let in_flight_collecting = awaits && evidence.collecting;
-        let in_flight_rx = awaits.then_some(evidence.rx_id);
-        let in_flight_expected = evidence.expected.clone();
-        let in_flight = |item: &UnattachedItem, placed, kind, id| {
-            let uses = match kind {
-                LateIndication::Transmit(_) => in_flight_tx == Some(id),
-                LateIndication::Start => in_flight_collecting || in_flight_rx == Some(id),
-                LateIndication::Pending => {
-                    (in_flight_collecting || in_flight_rx == Some(id))
-                        && item
-                            .pending_bytes()
-                            .is_some_and(|bytes| in_flight_expected.pending(bytes))
-                }
-            };
-            uses && !before_starts(&own_starts, item.clock, placed)
-        };
+        let in_flight = in_flight_of(&evidence, own_starts);
         let mut index = 0;
         while index < unbound.len() {
-            let Some((kind, id)) = unbound[index].late_indication() else {
+            if inner.late_item_lone_owner(
+                at,
+                &unbound[index],
+                unbound_placed[index],
+                &in_flight,
+                None,
+            )? {
+                unbound.remove(index);
+                unbound_placed.remove(index);
+            } else {
                 index += 1;
-                continue;
-            };
-            let (owners, all) =
-                late_indication_owners(&inner.links[at].1, &unbound[index], kind, id);
-            if in_flight(&unbound[index], unbound_placed[index], kind, id)
-                || !all
-                || owners.len() != 1
-            {
-                index += 1;
-                continue;
             }
-            let item = unbound.remove(index);
-            let placed = unbound_placed.remove(index);
-            inner.late_item(at, owners[0], kind, &item, placed)?;
         }
         // The response's own transmit done, which the host read from its item.
         let response_tx_done = vci.tx_done.is_some();
@@ -2995,20 +2969,20 @@ impl CommLog {
                 .then(|| entry_times.and_then(|times| times.rx_start?.placed()));
             kept.answer_at = kept.answer_time(final_response, &pendings, start);
         }
-        let may_own_indication = (may_own_transmit && entry.sent == exchange::Sent::Unknown)
-            || (may_own_start && !entry.link_history.this_exchange);
-        let floor_reason = match (may_own_unattached, may_own_indication) {
-            (true, true) => Some(format!("{MAY_OWN_UNATTACHED}{MAY_OWN_INDICATION}")),
-            (true, false) => Some(MAY_OWN_UNATTACHED.to_owned()),
-            (false, true) => Some(MAY_OWN_INDICATION.to_owned()),
-            (false, false) => None,
-        };
-        if let Some(floor_reason) = &floor_reason
-            && entry.classification < exchange::Classification::Undetermined
-        {
-            entry.classification = exchange::Classification::Undetermined;
-            entry.reason.push_str(floor_reason);
-        }
+        let floor_reason = floor_reason_of(
+            UnboundFlags {
+                unattached: may_own_unattached,
+                transmit: may_own_transmit,
+                start: may_own_start,
+            },
+            entry.sent == exchange::Sent::Unknown,
+            entry.link_history.this_exchange,
+        );
+        apply_floor(
+            &mut entry.classification,
+            &mut entry.reason,
+            floor_reason.as_deref(),
+        );
         let seq = inner.append_with(|_, line| serde_json::to_writer(line, &entry))?;
         inner.links[at].1.record(&entry);
         inner.links[at]
@@ -3109,14 +3083,10 @@ impl CommLog {
                     serde_json::to_writer(line, &Line { seq, event: &event })
                 })?;
             } else {
-                inner.place_unbound_item(
-                    0,
-                    item,
-                    placed[index].time,
-                    None,
-                    &|_, _, _, _| false,
-                    None,
-                )?;
+                let none: &InFlight<'_> = &|_, _, _, _| false;
+                if !inner.late_item_lone_owner(0, item, placed[index].time, none, None)? {
+                    inner.place_unbound_item(0, item, placed[index].time, None, none, None)?;
+                }
             }
         }
         for read in &reads {
@@ -3198,43 +3168,62 @@ impl CommLog {
             TakenIndications::default()
         };
         // Read while the primitive was in flight (before the item that ended it, any item when
-        // the agent cancelled it), a response the exchange could own is judged as an exchange
-        // judges one it reads, and written before the entry (design 8.11 `primitive_ended`).
+        // the agent cancelled it), an item is judged as `exchange_with` judges the unbound items
+        // an exchange reads, with this exchange in flight and not counted among the owners, and
+        // written before the entry (design 8.11 `primitive_ended`).
         let end_ordinal = ended_ordinal(&ended);
-        let mut may_own_unattached = false;
+        let own_starts: Vec<(exchange::Clock, clocks::Placed)> = kept
+            .evidence
+            .times
+            .vci
+            .and_then(|vci| vci.tx_done)
+            .and_then(|time| time.placed())
+            .into_iter()
+            .collect();
+        let in_flight = in_flight_of(&kept.evidence, own_starts);
+        let mut in_wait = Vec::new();
         for (index, (read, placed)) in ended.reads.iter().zip(&placed).enumerate() {
             let EndItem::Unattached(item) = &read.item else {
                 continue;
             };
-            if index >= end_ordinal || item.link_error().is_some() || taken.contains(index) {
-                continue;
+            if index < end_ordinal && item.link_error().is_none() && !taken.contains(index) {
+                in_wait.push((item, placed.time));
             }
-            may_own_unattached |= awaited_by(item, &kept.evidence);
-            let flags = inner.place_unbound_item(
+        }
+        // A late indication one other exchange alone could own is settled first.
+        let mut waiting = Vec::new();
+        for (item, placed) in in_wait {
+            if !inner.late_item_lone_owner(at, item, placed, &in_flight, Some(seq))? {
+                waiting.push((item, placed));
+            }
+        }
+        let mut flags = UnboundFlags::default();
+        for (item, placed) in waiting {
+            let placed_flags = inner.place_unbound_item(
                 at,
                 item,
-                placed.time,
+                placed,
                 Some(&kept.evidence),
-                &|_, _, _, _| false,
+                &in_flight,
                 Some(seq),
             )?;
-            may_own_unattached |= flags.unattached;
+            flags.unattached |= placed_flags.unattached;
+            flags.transmit |= placed_flags.transmit;
+            flags.start |= placed_flags.start;
         }
         // Writing them may have settled other exchanges, which the entry then sees.
         let kept = inner.links[at].1.kept(seq)?.clone();
         let Some(end) = ended.end else {
             let mut classification = kept.classification;
             let mut reason = "The agent cancelled the primitive before it ended; this settles nothing, and the exchange keeps its classification.".to_owned();
-            if may_own_unattached && classification < exchange::Classification::Undetermined {
-                classification = exchange::Classification::Undetermined;
-                reason.push_str(MAY_OWN_UNATTACHED);
-            }
-            if may_own_unattached {
-                inner.links[at].1.floor(
-                    seq,
-                    exchange::Classification::Undetermined,
-                    MAY_OWN_UNATTACHED,
-                );
+            let answered = kept.evidence.response_started || !kept.evidence.pending.is_empty();
+            let floor_reason =
+                floor_reason_of(flags, kept.sent == exchange::Sent::Unknown, answered);
+            apply_floor(&mut classification, &mut reason, floor_reason.as_deref());
+            if let Some(floor_reason) = &floor_reason {
+                inner.links[at]
+                    .1
+                    .floor(seq, exchange::Classification::Undetermined, floor_reason);
             }
             let event = Event::PrimitiveEnded(Box::new(PrimitiveEndedEntry {
                 refers_to: vec![seq],
@@ -3770,12 +3759,14 @@ impl CommLog {
         }
         let (mut classification, mut reason) =
             exchange::settle_primitive_ended(&entry, observed, unanswered);
-        // A response read while the primitive was in flight that it or an earlier exchange
-        // could own leaves the entry at least `undetermined`, as for an exchange.
-        if may_own_unattached && classification < exchange::Classification::Undetermined {
-            classification = exchange::Classification::Undetermined;
-            reason.push_str(MAY_OWN_UNATTACHED);
-        }
+        // An item read while the primitive was in flight that it or an earlier exchange could
+        // own leaves the entry at least `undetermined`, as for an exchange.
+        let floor_reason = floor_reason_of(
+            flags,
+            entry.sent == exchange::Sent::Unknown,
+            entry.link_history.this_exchange,
+        );
+        apply_floor(&mut classification, &mut reason, floor_reason.as_deref());
         // The answers its end adds count for the later exchanges on the link.
         let state = &mut inner.links[at].1;
         state.settled(
@@ -3786,12 +3777,8 @@ impl CommLog {
             final_response,
         );
         // `settled` replaces the floor of a non-final end, so this one is set after it.
-        if may_own_unattached {
-            state.floor(
-                seq,
-                exchange::Classification::Undetermined,
-                MAY_OWN_UNATTACHED,
-            );
+        if let Some(floor_reason) = &floor_reason {
+            state.floor(seq, exchange::Classification::Undetermined, floor_reason);
         }
         // A link error that came before the answer ends the matched answers and the answers
         // since an error from before it, and the answer then counts after it (design 8.11
@@ -4343,9 +4330,83 @@ fn before_starts(
     })
 }
 
+/// Whether an indication of `item` may be the own of the exchange of `evidence` that is in
+/// flight (design 8.11 `late_item`): it was read while the exchange awaited a response, uses the
+/// identifier it awaits, and does not come before the exchange's own transmit done (`own_starts`,
+/// on one clock and epoch: nothing it sent or received comes before its transmit, the
+/// maintainer's decisions, 2026-10-28). The one rule `exchange_with` and `primitive_ended` share.
+fn in_flight_of(
+    evidence: &exchange::Evidence,
+    own_starts: Vec<(exchange::Clock, clocks::Placed)>,
+) -> impl Fn(&UnattachedItem, Option<clocks::Placed>, LateIndication, u32) -> bool + use<> {
+    let awaits = evidence.awaits_response();
+    let tx = match evidence.target {
+        exchange::Target::Endpoint { tx_id, .. } if awaits => Some(tx_id),
+        _ => None,
+    };
+    // A collecting exchange awaits answers on any identifier, and a functional link's own is 0
+    // (ADR-429).
+    let collecting = awaits && evidence.collecting;
+    let rx = awaits.then_some(evidence.rx_id);
+    let expected = evidence.expected.clone();
+    move |item, placed, kind, id| {
+        let uses = match kind {
+            LateIndication::Transmit(_) => tx == Some(id),
+            LateIndication::Start => collecting || rx == Some(id),
+            LateIndication::Pending => {
+                (collecting || rx == Some(id))
+                    && item
+                        .pending_bytes()
+                        .is_some_and(|bytes| expected.pending(bytes))
+            }
+        };
+        uses && !before_starts(&own_starts, item.clock, placed)
+    }
+}
+
+/// Why an exchange that read unbound items stays at least `undetermined`, if it does: a
+/// response it or an earlier exchange could own, an indication that would change it (a transmit
+/// while its own send stays unknown, a start while it has no answer of its own, the
+/// maintainer's decision, 2026-10-28). The one rule `exchange_with` and `primitive_ended` share.
+fn floor_reason_of(flags: UnboundFlags, sent_unknown: bool, answered: bool) -> Option<String> {
+    let indication = (flags.transmit && sent_unknown) || (flags.start && !answered);
+    match (flags.unattached, indication) {
+        (true, true) => Some(format!("{MAY_OWN_UNATTACHED}{MAY_OWN_INDICATION}")),
+        (true, false) => Some(MAY_OWN_UNATTACHED.to_owned()),
+        (false, true) => Some(MAY_OWN_INDICATION.to_owned()),
+        (false, false) => None,
+    }
+}
+
+/// Raises `classification` to `undetermined` for `floor_reason`, which `reason` then ends with.
+fn apply_floor(
+    classification: &mut exchange::Classification,
+    reason: &mut String,
+    floor_reason: Option<&str>,
+) {
+    if let Some(floor_reason) = floor_reason
+        && *classification < exchange::Classification::Undetermined
+    {
+        *classification = exchange::Classification::Undetermined;
+        reason.push_str(floor_reason);
+    }
+}
+
 /// The kept exchanges a late indication of `kind` with identifier `id` could belong to, and
 /// whether they are every ended exchange on the link that could (design 8.11 `late_item`).
 fn late_indication_owners(
+    state: &exchange::LinkState,
+    item: &UnattachedItem,
+    kind: LateIndication,
+    id: u32,
+    besides: Option<u64>,
+) -> (Vec<u64>, bool) {
+    let (mut owners, all) = late_indication_owners_of(state, item, kind, id);
+    owners.retain(|owner| Some(*owner) != besides);
+    (owners, all)
+}
+
+fn late_indication_owners_of(
     state: &exchange::LinkState,
     item: &UnattachedItem,
     kind: LateIndication,
@@ -4485,6 +4546,30 @@ struct UnboundFlags {
 }
 
 impl Inner {
+    /// Settles `item` as a late item of the one ended exchange that could own it, when it is an
+    /// indication (or a pending) that exchange alone could own and the exchange in flight
+    /// (`in_flight`) does not use (design 8.11 `late_item`, ADR-370). `besides` is the owed
+    /// exchange that is the one in flight when the log keeps it. Whether it was settled; `None`
+    /// once the log has failed.
+    fn late_item_lone_owner(
+        &mut self,
+        at: usize,
+        item: &UnattachedItem,
+        placed: Option<clocks::Placed>,
+        in_flight: &InFlight<'_>,
+        besides: Option<u64>,
+    ) -> Option<bool> {
+        let Some((kind, id)) = item.late_indication() else {
+            return Some(false);
+        };
+        let (owners, all) = late_indication_owners(&self.links[at].1, item, kind, id, besides);
+        if in_flight(item, placed, kind, id) || !all || owners.len() != 1 {
+            return Some(false);
+        }
+        self.late_item(at, owners[0], kind, item, placed)?;
+        Some(true)
+    }
+
     /// The indications read at job end that the entry of the exchange `seq` (kept as `kept` on
     /// link `at`) takes as its own, which are not written beside it: the latest start of its
     /// response and the first transmit indication of its send, when no other exchange could
@@ -4558,7 +4643,7 @@ impl Inner {
             }
         }
         if let Some((kind, id)) = item.late_indication() {
-            let (owners, all) = late_indication_owners(&self.links[at].1, item, kind, id);
+            let (owners, all) = late_indication_owners(&self.links[at].1, item, kind, id, besides);
             let in_flight = in_flight(item, placed, kind, id);
             if owners.len() + usize::from(in_flight) + usize::from(!all) >= 2 {
                 match kind {
@@ -5348,14 +5433,17 @@ impl Inner {
                             && index >= from
                             && !taken.contains(index)
                         {
-                            self.place_unbound_item(
-                                link_at,
-                                item,
-                                placed.time,
-                                None,
-                                &|_, _, _, _| false,
-                                None,
-                            )?;
+                            let none: &InFlight<'_> = &|_, _, _, _| false;
+                            if !self.late_item_lone_owner(link_at, item, placed.time, none, None)? {
+                                self.place_unbound_item(
+                                    link_at,
+                                    item,
+                                    placed.time,
+                                    None,
+                                    none,
+                                    None,
+                                )?;
+                            }
                         }
                         continue;
                     };
@@ -19753,6 +19841,15 @@ pub(crate) mod tests {
         earlier: &[u8],
         request: &[u8],
     ) -> (PathBuf, CommLogSetup, CommLog, u64, u64) {
+        let (dir, setup, log, firsts, seq) = stray_log_after(&[earlier], request);
+        (dir, setup, log, firsts[0], seq)
+    }
+
+    /// [`stray_log_behind`] with several earlier exchanges, each ended by the VCI.
+    fn stray_log_after(
+        earlier: &[&[u8]],
+        request: &[u8],
+    ) -> (PathBuf, CommLogSetup, CommLog, Vec<u64>, u64) {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
@@ -19769,15 +19866,18 @@ pub(crate) mod tests {
             Some(true),
         )
         .unwrap();
-        let mut ended = evidence(endpoint(0x7E0), earlier, exchange::End::NoResponse);
-        ended.vci_ended = true;
-        ended.times.agent.before_us = 1_000;
-        ended.times.agent.end_us = 5_000;
-        let sent = UnattachedItem {
-            vci_us: 1_500,
-            ..tx_done(0x7E0)
-        };
-        let first = log.exchange_with(ended, vec![sent]).unwrap();
+        let mut firsts = Vec::new();
+        for (index, earlier) in (0u64..).zip(earlier) {
+            let mut ended = evidence(endpoint(0x7E0), earlier, exchange::End::NoResponse);
+            ended.vci_ended = true;
+            ended.times.agent.before_us = 1_000 + 3_000 * index;
+            ended.times.agent.end_us = 3_000 + 3_000 * index;
+            let sent = UnattachedItem {
+                vci_us: u32::try_from(1_500 + 3_000 * index).unwrap(),
+                ..tx_done(0x7E0)
+            };
+            firsts.push(log.exchange_with(ended, vec![sent]).unwrap());
+        }
         let mut waited = evidence(endpoint(0x7E0), request, exchange::End::VciDidNotEnd);
         waited.pending_visibility = exchange::PendingVisibility::Forwarded;
         waited.times.agent.before_us = 10_000;
@@ -19788,7 +19888,7 @@ pub(crate) mod tests {
             ..tx_done(0x7E0)
         };
         let seq = log.exchange_with(waited, vec![transmit]).unwrap();
-        (dir, setup, log, first, seq)
+        (dir, setup, log, firsts, seq)
     }
 
     /// The `refers_to` and position of the `late_response` lines and the `unattached` lines.
@@ -19908,11 +20008,10 @@ pub(crate) mod tests {
         );
     }
 
-    /// The stray's own response, read in its wait but bound to no primitive, is written
-    /// `unattached` before its entry and floors the stray at `undetermined`; `settled` replaces the
-    /// floor of a non-final end, so the floor is set after it.
+    /// A response only the stray awaits, read in its wait and bound to no primitive, is written
+    /// `unattached` before the entry and floors nothing, as for an exchange in flight (ADR-368).
     #[test]
-    fn an_unbound_response_only_the_stray_awaits_floors_its_entry_and_stays() {
+    fn an_unbound_response_only_the_stray_awaits_is_written_unattached_with_no_floor() {
         let (dir, setup, log, seq) = stray_log(facts());
         log.primitive_ended(
             seq,
@@ -19925,13 +20024,7 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(
-            floor_of(&log, seq),
-            Some((
-                exchange::Classification::Undetermined,
-                MAY_OWN_UNATTACHED.to_owned()
-            ))
-        );
+        assert_eq!(floor_of(&log, seq), None);
         let lines = finished(&log, &setup, &dir);
         assert_eq!(
             order_of(&lines),
@@ -19989,8 +20082,8 @@ pub(crate) mod tests {
     }
 
     /// The agent cancelled the primitive: everything read was read while it was in flight, so a
-    /// response the stray awaits is written before the cancel entry, which is then at least
-    /// `undetermined`.
+    /// response the stray awaits is written `unattached` before the cancel entry, which keeps
+    /// its classification and reason.
     #[test]
     fn an_unbound_response_read_for_a_cancelled_primitive_is_written_before_its_entry() {
         let (dir, setup, log, seq) = stray_log(facts());
@@ -20002,11 +20095,26 @@ pub(crate) mod tests {
             ),
         )
         .unwrap();
-        assert_eq!(
-            floor_of(&log, seq).map(|(classification, _)| classification),
-            Some(exchange::Classification::Undetermined)
-        );
+        assert_eq!(floor_of(&log, seq), None);
+        let kept = kept_of(&log, seq).classification;
         let lines = finished(&log, &setup, &dir);
+        let entry = line_of(&lines, "primitive_ended");
+        assert_eq!(
+            entry["exchanges"][0]["classification"],
+            serde_json::to_value(kept).unwrap(),
+            "{entry}"
+        );
+        assert_eq!(
+            entry["classification"],
+            entry["exchanges"][0]["classification"]
+        );
+        assert!(
+            !entry["exchanges"][0]["reason"]
+                .as_str()
+                .unwrap()
+                .contains("may be this exchange's"),
+            "{entry}"
+        );
         assert_eq!(
             order_of(&lines),
             ["unattached", "primitive_ended"],
@@ -20041,5 +20149,202 @@ pub(crate) mod tests {
         .unwrap();
         let lines = finished(&log, &setup, &dir);
         assert_eq!(order_of(&lines), ["primitive_ended"], "{lines:#?}");
+    }
+
+    /// A response two ended exchanges could own (and the stray, which has another request, not)
+    /// is `unattached` with both named, written before the entry (design 8.11 `late_response`).
+    #[test]
+    fn an_unbound_response_two_ended_exchanges_could_own_names_both() {
+        let (dir, setup, log, firsts, seq) =
+            stray_log_after(&[&[0x3E, 0x00], &[0x3E, 0x80]], &[0x22, 0xF1, 0x90]);
+        let mut ended = ended_with(
+            Some(exchange::End::NoResponse),
+            vec![
+                unbound_result(300_000, 310_500, 0x7E8, &PRESENCE_FINAL),
+                end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+            ],
+        );
+        ended.vci_ended = true;
+        log.primitive_ended(seq, ended).unwrap();
+        assert_eq!(floor_of(&log, seq), None);
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "late_response", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_response");
+        let mut named: Vec<_> = late["refers_to"].as_array().unwrap().clone();
+        named.sort_by_key(|seq| seq.as_u64());
+        assert_eq!(named, firsts, "{late}");
+    }
+
+    /// An indication the stray and one ended exchange could both own, read in the stray's wait:
+    /// the stray counts as the exchange in flight, as `exchange_with` counts it, so the line
+    /// names the ended exchange alone and the stray, which has no answer of its own, is floored
+    /// for the indication (`start`), and the pending `7F 22 78` both could own is the same.
+    #[test]
+    fn an_indication_the_stray_and_an_ended_exchange_could_own_names_the_ended_one_only() {
+        let start = |read: EndRead| {
+            let EndItem::Unattached(mut item) = read.item else {
+                unreachable!()
+            };
+            item.data = UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+                identifier: Some(0x7E8),
+                bytes: Vec::new(),
+            };
+            end_read(300_000, EndItem::Unattached(item))
+        };
+        for pending in [false, true] {
+            let (dir, setup, log, first, seq) =
+                stray_log_behind(&[0x22, 0xF1, 0x90], &[0x22, 0xF1, 0x91]);
+            let item = unbound_result(300_000, 310_500, 0x7E8, &[0x7F, 0x22, 0x78]);
+            log.primitive_ended(
+                seq,
+                ended_with(
+                    Some(exchange::End::NoResponse),
+                    vec![
+                        if pending { item } else { start(item) },
+                        end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                    ],
+                ),
+            )
+            .unwrap();
+            assert_eq!(
+                floor_of(&log, seq),
+                Some((
+                    exchange::Classification::Undetermined,
+                    MAY_OWN_INDICATION.to_owned()
+                )),
+                "pending {pending}"
+            );
+            let lines = finished(&log, &setup, &dir);
+            assert_eq!(
+                order_of(&lines),
+                ["unattached", "late_item", "primitive_ended"],
+                "pending {pending}: {lines:#?}"
+            );
+            let late = line_of(&lines, "late_item");
+            assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+        }
+    }
+
+    /// A pending only one ended exchange could own, read in the stray's wait, is that exchange's
+    /// `late_item` (the lone-owner step of `exchange_with`); one only the stray could own is
+    /// `unattached` and takes no `late_item` of the stray before its own entry.
+    #[test]
+    fn a_pending_one_ended_exchange_alone_could_own_is_its_late_item() {
+        let pending = || {
+            vec![
+                unbound_result(300_000, 310_500, 0x7E8, &[0x7F, 0x22, 0x78]),
+                end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+            ]
+        };
+        let (dir, setup, log, first, seq) =
+            stray_log_behind(&[0x22, 0xF1, 0x90], &[0x31, 0x01, 0xFF, 0x00]);
+        log.primitive_ended(seq, ended_with(Some(exchange::End::NoResponse), pending()))
+            .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["late_item", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+        // Only the stray could own it, and not as the exchange in flight (its time comes
+        // before the stray's own transmit done): it is not counted among the owners, so the
+        // item is `unattached`, not the stray's `late_item` before its own entry.
+        let (dir, setup, log, seq) = stray_log(facts());
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                vec![
+                    unbound_result(300_000, 10_000, 0x7E8, &[0x7F, 0x22, 0x78]),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "primitive_ended"],
+            "{lines:#?}"
+        );
+    }
+
+    /// The drain at job end places an unbound pending the same way: the one ended exchange that
+    /// could own it takes it as its `late_item`.
+    #[test]
+    fn a_pending_the_job_end_drain_reads_is_the_lone_owner_s_late_item() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        let mut ended = ended_with(
+            Some(exchange::End::NoResponse),
+            vec![end_read(500_000, EndItem::RxTimeout(dev(1_010_500)))],
+        );
+        ended.vci_ended = true;
+        log.primitive_ended(seq, ended).unwrap();
+        let EndItem::Unattached(item) =
+            unbound_result(700_000, 1_020_000, 0x7E8, &[0x7F, 0x22, 0x78]).item
+        else {
+            unreachable!()
+        };
+        log.late_link_errors(vec![item]).unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["primitive_ended", "late_item"],
+            "{lines:#?}"
+        );
+    }
+
+    /// The same pending read at or after the end, with the stray an ended owner and no exchange
+    /// in flight, is the lone owner's `late_item` too, written after the entry.
+    #[test]
+    fn a_pending_read_after_the_end_is_the_lone_owner_s_late_item() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        let mut ended = ended_with(
+            Some(exchange::End::NoResponse),
+            vec![
+                end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                unbound_result(600_000, 1_020_000, 0x7E8, &[0x7F, 0x22, 0x78]),
+            ],
+        );
+        ended.vci_ended = true;
+        log.primitive_ended(seq, ended).unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["primitive_ended", "late_item"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+    }
+
+    /// A cancelled primitive's floor is that of an exchange that read the same: a response an
+    /// ended exchange and the cancelled one could both own floors it at `undetermined`.
+    #[test]
+    fn a_response_two_could_own_floors_a_cancelled_primitive() {
+        let (dir, setup, log, _first, seq) = stray_log_behind(&[0x3E, 0x00], &[0x3E, 0x00]);
+        log.primitive_ended(
+            seq,
+            ended_with(
+                None,
+                vec![unbound_result(300_000, 310_500, 0x7E8, &PRESENCE_FINAL)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            floor_of(&log, seq),
+            Some((
+                exchange::Classification::Undetermined,
+                MAY_OWN_UNATTACHED.to_owned()
+            ))
+        );
+        finished(&log, &setup, &dir);
     }
 }

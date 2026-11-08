@@ -903,6 +903,42 @@ pub(crate) fn standing_answers<T, K: PartialEq>(
         .collect()
 }
 
+/// Whether the final answers cover the receive table: every identifier of a non-empty `table`
+/// has one (`final_on` tells it). An unnamed pending (identifier 0) is covered by them, as it
+/// stands for the identifiers with no final answer (design 8.11 "Owed request", ADR-433). The
+/// one definition [`Evidence::open_pending_ids`] and [`standing_answers_covering`] read.
+pub(crate) fn table_covered(table: &[u32], final_on: impl Fn(u32) -> bool) -> bool {
+    !table.is_empty() && table.iter().all(|&id| final_on(id))
+}
+
+/// [`standing_answers`] with the covering fold of an unnamed pending (ADR-433): once the final
+/// answers cover every identifier of `table`, a standing pending that names none (`id` is 0)
+/// leaves the list as well, since the last uncovered identifier's final answer is the one it
+/// stood for. `id` is an item's response identifier, 0 when it names none. The one rule the
+/// three restatements of a collecting exchange's answers follow: [`Kept::answered`], the log's
+/// `primitive_ended`, and the host's collected answers.
+pub(crate) fn standing_answers_covering<T>(
+    items: &[T],
+    id: impl Fn(&T) -> u32,
+    pending: impl Fn(&T) -> bool,
+    table: &[u32],
+) -> Vec<bool> {
+    let mut standing = standing_answers(items, &id, &pending);
+    let final_on = |wanted: u32| {
+        items
+            .iter()
+            .any(|item| !pending(item) && id(item) == wanted)
+    };
+    if table_covered(table, final_on) {
+        for (item, standing) in items.iter().zip(&mut standing) {
+            if *standing && pending(item) && id(item) == 0 {
+                *standing = false;
+            }
+        }
+    }
+    standing
+}
+
 /// The end of a collecting request that was not ended by an error or the agent's deadline: the
 /// end of its first standing answer that is not a pending, or no response when nothing answered
 /// or only pendings did (ADR-396 item 4, ADR-429). A pending is no final response, so a lone
@@ -1281,14 +1317,21 @@ impl Evidence {
 
     /// The response identifiers whose last standing answer is a pending, in the order they first
     /// answered: a collecting request is owed once on each of them (design 8.11 "Owed request",
-    /// ADR-429). Empty for any other request.
+    /// ADR-429). An unnamed pending (identifier 0) is open while some identifier of the receive
+    /// table has no final answer, and not once every one has it (ADR-433). Empty for any other
+    /// request.
     pub(crate) fn open_pending_ids(&self) -> Vec<u32> {
         let mut ids = Vec::new();
         if !self.collecting {
             return ids;
         }
+        // An unnamed pending is covered once the final answers cover the receive table.
+        let covered = table_covered(&self.receive_ids, |id| self.final_standing(id));
         for answer in &self.answers {
-            if answer.is_pending(&self.expected) && !ids.contains(&answer.rx_id) {
+            if answer.is_pending(&self.expected)
+                && !ids.contains(&answer.rx_id)
+                && !(answer.rx_id == 0 && covered)
+            {
                 ids.push(answer.rx_id);
             }
         }
@@ -1383,7 +1426,13 @@ impl Evidence {
             }) {
                 add_answer(&mut ids, answer.rx_id);
             }
-            if ids.is_empty() && self.open_pending_ids().is_empty() {
+            // A pending left standing, though covered by the final answers, still owes no
+            // identifier and leaves the first final answer's out (ADR-432, ADR-433).
+            let pending_standing = self
+                .answers
+                .iter()
+                .any(|answer| answer.is_pending(&self.expected));
+            if ids.is_empty() && !pending_standing {
                 let first = finals().next().map_or(self.rx_id, |answer| answer.rx_id);
                 add_answer(&mut ids, first);
             }
@@ -3978,15 +4027,14 @@ impl Kept {
             );
         }
         let expected = &self.evidence.expected;
-        // The identifier the response is keyed on, as the host keys an answer that names none:
-        // 0 on a link with a receive table, else the link's own.
-        let own_id = late
-            .rx_id
-            .unwrap_or(if self.evidence.receive_ids.is_empty() {
-                self.evidence.rx_id
-            } else {
-                0
-            });
+        // The identifier the response is keyed on, as the host keys an answer that names none
+        // (`response_id`): the only identifier of a one-ECU table, 0 on a larger table, else the
+        // link's own.
+        let own_id = late.rx_id.unwrap_or(match self.evidence.receive_ids[..] {
+            [] => self.evidence.rx_id,
+            [only] => only,
+            _ => 0,
+        });
         let mut answers = self.evidence.answers.clone();
         let mut order = self.answer_order.clone();
         order.resize(answers.len(), usize::MAX);
@@ -4018,7 +4066,13 @@ impl Kept {
         });
         // The one generic fold (ADR-425 decision 4): the pending of the same identifier leaves
         // the list and is the final answer's pending chain.
-        let standing = standing_answers(&answers, |a| a.rx_id, |a| a.is_pending(expected));
+        // With the covering fold of an unnamed pending (ADR-433).
+        let standing = standing_answers_covering(
+            &answers,
+            |a| a.rx_id,
+            |a| a.is_pending(expected),
+            &self.evidence.receive_ids,
+        );
         let mut chain: Option<Vec<Pending>> = None;
         let mut folded = Vec::with_capacity(answers.len());
         let mut folded_order = Vec::with_capacity(answers.len());
@@ -10205,6 +10259,96 @@ mod tests {
         assert_eq!(answered.answers.len(), 2);
         assert_eq!(answered.open_pending_ids(), [0]);
         assert_eq!(answered.owed_ids(), [RX2]);
+    }
+
+    /// ADR-433 decision C (design 8.11 "Owed request"): an unnamed pending is open while some
+    /// identifier of the receive table has no final answer, and on none once every one has it;
+    /// the owed identifiers read the same definition.
+    #[test]
+    fn an_unnamed_pending_is_open_only_while_a_table_identifier_lacks_a_final_answer() {
+        // Every identifier answered: nothing open, the exchange settles.
+        let both = kept_collecting(
+            vec![
+                lone(0),
+                positive(RX, Window::WithinP2),
+                positive(RX2, Window::WithinP2),
+            ],
+            true,
+        );
+        assert!(both.evidence.open_pending_ids().is_empty());
+        assert!(both.evidence.owed_ids().is_empty());
+        assert!(both.evidence.settles_owed());
+        // One of two answered: the pending stays open on the other.
+        let one = kept_collecting(vec![lone(0), positive(RX, Window::WithinP2)], true);
+        assert_eq!(one.evidence.open_pending_ids(), [0]);
+        assert_eq!(one.evidence.owed_ids(), [RX2]);
+        assert!(!one.evidence.settles_owed());
+        // A one-ECU table answered: covered; unanswered: open on the table's identifier.
+        let lone_ecu = kept_on(vec![lone(0), positive(RX, Window::WithinP2)], &[RX]);
+        assert!(lone_ecu.evidence.open_pending_ids().is_empty());
+        assert!(lone_ecu.evidence.settles_owed());
+        let waiting = kept_on(vec![lone(0)], &[RX]);
+        assert_eq!(waiting.evidence.open_pending_ids(), [0]);
+        assert_eq!(waiting.evidence.owed_ids(), [RX]);
+        // No receive table: nothing covers an identifier, the pending stays open.
+        let physical = kept_on(vec![lone(0), positive(RX, Window::WithinP2)], &[]);
+        assert_eq!(physical.evidence.open_pending_ids(), [0]);
+    }
+
+    /// ADR-433 decision C: the named final answer that covers the last uncovered identifier
+    /// folds the unnamed pending, which leaves the list with its pending chain on the answer.
+    #[test]
+    fn a_named_late_final_answer_covering_the_table_folds_the_unnamed_pending() {
+        let kept = kept_collecting(vec![lone(0), positive(RX, Window::WithinP2)], true);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX2)));
+        assert_eq!(
+            shape(&answered)
+                .iter()
+                .map(|(id, _)| *id)
+                .collect::<Vec<_>>(),
+            [RX, RX2]
+        );
+        assert!(answered.open_pending_ids().is_empty());
+        assert!(answered.settles_owed());
+        assert_eq!(answered.answers.last().unwrap().pending.len(), 1);
+        // The first of two does not cover the table: the unnamed pending stays.
+        let kept = kept_collecting(vec![lone(0)], true);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert_eq!(answered.open_pending_ids(), [0]);
+        assert_eq!(answered.owed_ids(), [RX2]);
+    }
+
+    /// ADR-433 decision C: on a one-ECU table an unnamed final answer is keyed on the table's
+    /// identifier as the host keys it, and folds the unnamed lone pending.
+    #[test]
+    fn an_unnamed_late_final_answer_on_a_one_ecu_table_is_keyed_on_its_identifier() {
+        let kept = kept_on(vec![lone(0)], &[RX]);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(shape(&answered), [(RX, Some(POSITIVE.to_vec()))]);
+        assert_eq!(answered.answers[0].pending.len(), 1);
+        assert!(answered.open_pending_ids().is_empty());
+        assert!(answered.settles_owed());
+    }
+
+    /// The covering rule is one function: the same answers fold to the same list through it,
+    /// whichever restatement calls it.
+    #[test]
+    fn the_covering_fold_leaves_the_unnamed_pending_only_while_the_table_is_uncovered() {
+        let expected = kept_on(Vec::new(), &[RX, RX2]).evidence.expected;
+        let items = [
+            lone(0),
+            positive(RX, Window::WithinP2),
+            positive(RX2, Window::WithinP2),
+        ];
+        let fold = |items: &[Answer], table: &[u32]| {
+            standing_answers_covering(items, |a| a.rx_id, |a| a.is_pending(&expected), table)
+        };
+        assert_eq!(fold(&items, &[RX, RX2]), [false, true, true]);
+        assert_eq!(fold(&items[..2], &[RX, RX2]), [true, true]);
+        assert_eq!(fold(&items, &[]), [true, true, true]);
+        // The plain rule is the covering rule with no table.
+        let plain = standing_answers(&items, |a| a.rx_id, |a| a.is_pending(&expected));
+        assert_eq!(plain, fold(&items, &[]));
     }
 
     /// A request meant for one ECU that got `count` answers, with one earlier request on the

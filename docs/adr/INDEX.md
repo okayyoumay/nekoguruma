@@ -422,7 +422,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-430](ADR-430-the-d-pdu-apis-tester-present-indication-carries-no-header.md) | The D-PDU API's Tester-Present Indication Carries No Header, and the Worker Logs One That Does | Accepted | `iso22900-service` (`events.rs` `note_unbound_header`, `rpc.rs` `CopTagMap`), `iso22900-mock` (`send_tester_present`), agent end-to-end tests, design 8.11 `sent_evidence`; ADR-099, ADR-356, ADR-423, ADR-427, ADR-428 |
 | [ADR-431](ADR-431-a-non-collecting-exchange-the-vci-ended-is-renewed-and-kept-at-its-primitive-ended.md) | An Exchange Left Owed by Its `primitive_ended` Is Renewed, and Kept When the VCI Ended Its Wait | Accepted | `agent` (`comm_log.rs` `primitive_ended`, `release_kept_ended`; `comm_log/exchange.rs` `renew_owed`, `release_kept_ended`), design 8.11 `primitive_ended`, `late_response`; ADR-366, ADR-367, ADR-429 |
 | [ADR-432](ADR-432-a-collecting-or-silent-exchange-is-owed-on-the-links-receive-identifiers.md) | A Collecting or Silent Exchange Is Owed on the Link's Receive Identifiers | Accepted (Consequence 1's whole settlement amended by ADR-433: per identifier when several are open; the deferred bullet on settling per identifier closed) | `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `set_owed_rows`, `history_for`; `comm_log.rs` `late_response`; `host.rs`), design 8.11 "Owed request"; ADR-400, ADR-429 |
-| [ADR-433](ADR-433-a-collecting-exchange-is-settled-per-response-identifier.md) | A Collecting Exchange Is Settled per Response Identifier | Accepted | `agent` (`comm_log.rs` `late_response`, `late_item`, `primitive_ended`; `comm_log/exchange.rs` `settle_on`, `reclassify_after`, `Kept::answered_placed`), design 8.11 "Owed request", `late_response`; ADR-426, ADR-429, ADR-432 |
+| [ADR-433](ADR-433-a-collecting-exchange-is-settled-per-response-identifier.md) | A Collecting Exchange Is Settled per Response Identifier | Accepted (decision C built: the covering fold of an unnamed pending) | `agent` (`comm_log.rs` `late_response`, `late_item`, `primitive_ended`; `comm_log/exchange.rs` `settle_on`, `reclassify_after`, `Kept::answered_placed`), design 8.11 "Owed request", `late_response`; ADR-426, ADR-429, ADR-432 |
 | [ADR-434](ADR-434-a-deadline-ended-collecting-entry-with-answers-takes-its-answers-classifications.md) | A Deadline-Ended Collecting Entry With Answers Takes Its Answers' Classifications | Accepted | `agent` (`comm_log/exchange.rs` `rows`, `silence_open`, `collecting_row`), design 8.11 `vci_did_not_end`, `answers`; ADR-400 decision 4(B), ADR-426 |
 
 ## Status Legend
@@ -835,7 +835,7 @@ the predecessor repository these ADRs came from.
 - ADR-429 (item 3's renewal and release exception also apply to an exchange the VCI ended, ADR-431; decision 2's fallback on the link's identifier superseded by ADR-432; the Consequences' deferred bullet on `Kept::answered` closed; decision 3's whole settlement superseded by ADR-433)
 - ADR-431
 - ADR-432 (Consequence 1's whole settlement amended by ADR-433; the deferred bullet on settling per identifier closed)
-- ADR-433
+- ADR-433 (decision C built: the covering fold of an unnamed pending)
 - ADR-434
 
 ### Write Jobs & Resume
@@ -966,7 +966,7 @@ the predecessor repository these ADRs came from.
 - ADR-429 (item 3's renewal and release exception also apply to an exchange the VCI ended, ADR-431; decision 2's fallback on the link's identifier superseded by ADR-432; the Consequences' deferred bullet on `Kept::answered` closed; decision 3's whole settlement superseded by ADR-433)
 - ADR-431
 - ADR-432 (Consequence 1's whole settlement amended by ADR-433; the deferred bullet on settling per identifier closed)
-- ADR-433
+- ADR-433 (decision C built: the covering fold of an unnamed pending)
 
 ### Acquired Data & Monitoring
 - ADR-236

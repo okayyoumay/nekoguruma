@@ -3460,10 +3460,11 @@ impl CommLog {
                 answers.push(answer);
             }
             unfolded_answers = Some((answers.clone(), answer_order.clone(), answer_ends.clone()));
-            let standing = exchange::standing_answers(
+            let standing = exchange::standing_answers_covering(
                 &answers,
                 |answer| answer.rx_id,
                 |answer| answer.is_pending(&evidence.expected),
+                &evidence.receive_ids,
             );
             evidence.answers = keep_standing(answers, &standing);
             answer_order = keep_standing(answer_order, &standing);
@@ -3638,10 +3639,11 @@ impl CommLog {
                 let by_answers = keep_standing(base_answers, &read_by);
                 let by_order = keep_standing(base_order, &read_by);
                 let by_ends = keep_standing(base_ends, &read_by);
-                let answers_standing = exchange::standing_answers(
+                let answers_standing = exchange::standing_answers_covering(
                     &by_answers,
                     |answer| answer.rx_id,
                     |answer| answer.is_pending(&evidence.expected),
+                    &evidence.receive_ids,
                 );
                 probe.answers = keep_standing(by_answers, &answers_standing);
                 probe.pending = keep_standing(probe.pending, &pendings_standing);
@@ -4497,12 +4499,12 @@ impl Inner {
             };
         let (classification, reason) =
             exchange::settle_late_response(&kept, &answered, window, &history, named, bytes);
-        // A final answer settles the exchange whole when no identifier is left to owe it on; an
-        // exchange that is a collecting one, owed on others still, is settled on the identifier
-        // the answer came on only, and stays owed and kept (design 8.11 `late_response`,
-        // ADR-433). Nothing owed on any identifier settles whole as well.
-        let settles =
-            !answered.collecting || answered.settles_owed() || answered.owed_ids().is_empty();
+        // A final answer settles the exchange whole when the restated evidence settles it; a
+        // collecting one with a pending still open is settled on the identifier the answer came
+        // on only, and stays owed and kept (design 8.11 `late_response`, ADR-433). An unnamed
+        // pending covered by the final answers of the receive table is no open pending, so no
+        // identifier is left owing the exchange without it settling.
+        let settles = !answered.collecting || answered.settles_owed();
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
@@ -9736,6 +9738,103 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         let late = of_event(&lines, "late_response").remove(0);
         assert_eq!(late["exchanges"][0]["classification"], "system", "{late}");
+    }
+
+    /// ADR-433 decision C, case table row 15: an unnamed pending that stays open for the
+    /// identifiers with no final answer is settled with the last one's; the exchange stays owed
+    /// after the first, and is settled whole by the second with no identifier left open.
+    #[test]
+    fn an_unnamed_pending_is_folded_by_the_final_answers_that_cover_the_table() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![None];
+        });
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        let kept = kept_of(&log, seq);
+        assert_eq!(kept.evidence.open_pending_ids(), [0]);
+        assert_eq!(kept.evidence.owed_ids(), [0x7E9]);
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_500_000))
+            .unwrap();
+        assert!(log.lock().links[0].1.kept(seq).is_none());
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(of_event(&lines, "late_response").len(), 2);
+    }
+
+    /// ADR-433 decision C, row 16: on a one-ECU receive table a lone unnamed pending is open on
+    /// the table's identifier, and a final answer that names none is keyed on it and settles.
+    #[test]
+    fn an_unnamed_final_answer_settles_the_unnamed_lone_pending_of_a_one_ecu_table() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let seq = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.answers = vec![lone_pending_on(0)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![None];
+                evidence.rx_id = 0;
+                evidence.receive_ids = vec![0x7E8];
+            }))
+            .unwrap();
+        assert_eq!(kept_of(&log, seq).evidence.open_pending_ids(), [0]);
+        assert_eq!(kept_of(&log, seq).evidence.owed_ids(), [0x7E8]);
+        log.lock()
+            .late_response(0, seq, &late_final_unnamed(), placed_after(3_000_000))
+            .unwrap();
+        assert!(log.lock().links[0].1.kept(seq).is_none());
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(of_event(&lines, "late_response").len(), 1);
+    }
+
+    /// ADR-433 decision C: `primitive_ended` restates the answers read after the deadline with
+    /// the same covering fold: the final answers of both table identifiers fold the unnamed
+    /// pending the entry had.
+    #[test]
+    fn a_primitive_ended_folds_an_unnamed_pending_covered_by_the_answers_it_reads() {
+        let (dir, setup, log) = collecting_log_on(true);
+        let seq = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.answers = vec![lone_pending_on(0)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![None];
+                evidence.rx_id = 0;
+                evidence.receive_ids = vec![0x7E8, 0x7E9];
+            }))
+            .unwrap();
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::Positive(FIRST.to_vec())),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    answer_read(0x7E8, 300_000),
+                    answer_read(0x7E9, 400_000),
+                ]),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = of_event(&lines, "primitive_ended").remove(0);
+        let ids: Vec<_> = entry["answers"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|answer| answer["rx_id"].clone())
+            .collect();
+        assert_eq!(ids, [0x7E8, 0x7E9], "{entry}");
     }
 
     /// The evidence of a collecting exchange that got a lone pending on each identifier of a

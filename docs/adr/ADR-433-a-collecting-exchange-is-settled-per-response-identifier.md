@@ -1,7 +1,7 @@
 # ADR-433: A Collecting Exchange Is Settled per Response Identifier
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (decision C built: the covering fold of an unnamed pending)
 **Affects:** `agent` (`comm_log.rs` `late_response`, `late_item`, `primitive_ended`;
 `comm_log/exchange.rs` `Kept::answered_placed`, `LinkState::settle_on`, `LinkState::reclassify_after`,
 `SettledAnswer`, `settle_late_response`, `Evidence::latest_answer_on`); design 8.11 "Owed
@@ -69,10 +69,10 @@ answer missed the in-time `system`.
   another's final answer is not owed stands.
 - A reset or session change accepted later ends every row and kept exchange as before, and the
   host's release after a `primitive_ended` keeps an exchange the VCI ended its wait for.
-- Decided, not built here: an unnamed pending (identifier 0) is covered by the final answers
-  of the table's identifiers, so on a one-ECU table an unnamed lone pending is no longer open
-  once the table's identifier has its final answer. The covering rule goes into all three
-  restatements of a collecting exchange's answers (`Kept::answered`, `primitive_ended`, the host's
-  collected answers) in one change, so the log keys an unnamed late answer as the host does.
-  Until then the partial settlement settles whole when no identifier is left to owe the
-  exchange on, as before.
+- Built: an unnamed pending (identifier 0) is covered by the final answers of the table's
+  identifiers, so on a one-ECU table an unnamed lone pending is no longer open once the table's
+  identifier has its final answer. The covering rule is one function
+  (`standing_answers_covering`) in all three restatements of a collecting exchange's answers
+  (`Kept::answered`, `primitive_ended`, the host's collected answers), and the log keys an
+  unnamed late answer as the host does. The partial settlement's guard that settled whole when
+  no identifier was left to owe the exchange on is removed, since `settles_owed` now says it.

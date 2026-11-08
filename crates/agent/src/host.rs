@@ -3411,20 +3411,66 @@ fn response_id(identifier: Option<u32>, unique: u32, table: &[(u32, u32)]) -> Op
 /// on: every result that is not a pending, and a pending only when no result came on its
 /// identifier after it (a pending followed by its final answer is one answer). A result's
 /// identifier is the header's, else the table entry its unique-response number names, else the
-/// table's only pair; `None` when the worker gave none of these (ADR-396).
+/// table's only pair; `None` when the worker gave none of these (ADR-396). A pending that names
+/// no identifier also leaves once the final answers cover the table (ADR-433).
 fn collected_answers<'a>(
     collected: &'a [CollectedRead],
     table: &[(u32, u32)],
 ) -> Vec<(Option<u32>, &'a CollectedRead)> {
     let id_of = |read: &CollectedRead| response_id(read.identifier, read.unique, table);
-    let standing =
-        crate::comm_log::exchange::standing_answers(collected, id_of, |read| read.pending);
+    let rx_ids: Vec<u32> = table.iter().map(|&(_, rx)| rx).collect();
+    let standing = crate::comm_log::exchange::standing_answers_covering(
+        collected,
+        |read| id_of(read).unwrap_or(0),
+        |read| read.pending,
+        &rx_ids,
+    );
     collected
         .iter()
         .zip(standing)
         .filter(|&(_, standing)| standing)
         .map(|(read, _)| (id_of(read), read))
         .collect()
+}
+
+#[cfg(test)]
+mod collected_answers_tests {
+    use super::*;
+
+    fn read(identifier: Option<u32>, pending: bool) -> CollectedRead {
+        CollectedRead {
+            identifier,
+            unique: 0,
+            bytes: vec![0x7E, 0x00],
+            vci_us: 0,
+            clock: None,
+            start_us: None,
+            tx_done_us: None,
+            pending,
+            read: None,
+        }
+    }
+
+    /// ADR-433 decision C: a pending that names no identifier leaves the host's list once the
+    /// final answers cover the table, as it does the log's restatements; it stays while one
+    /// table identifier has no final answer.
+    #[test]
+    fn an_unnamed_pending_leaves_the_collected_answers_once_the_table_is_covered() {
+        let table = [(0x7E0, 0x7E8), (0x7E1, 0x7E9)];
+        let reads = [
+            read(None, true),
+            read(Some(0x7E8), false),
+            read(Some(0x7E9), false),
+        ];
+        let ids = |reads: &[CollectedRead]| -> Vec<Option<u32>> {
+            collected_answers(reads, &table)
+                .into_iter()
+                .map(|(id, _)| id)
+                .collect()
+        };
+        assert_eq!(ids(&reads), [Some(0x7E8), Some(0x7E9)]);
+        assert_eq!(ids(&reads[..2]), [None, Some(0x7E8)]);
+    }
 }
 
 /// The answers of a primitive as its exchange entry lists them, each with the end its bytes have

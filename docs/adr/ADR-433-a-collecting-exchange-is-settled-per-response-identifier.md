@@ -1,7 +1,7 @@
 # ADR-433: A Collecting Exchange Is Settled per Response Identifier
 
 **Date:** 2026-11-08
-**Status:** Accepted (decision C built: the covering fold of an unnamed pending; Decision item 6's "open" and the Consequences' bullet that a silent identifier is not owed superseded by ADR-435 (read as "owed", owed on every silent identifier))
+**Status:** Accepted (decision C built: the covering fold of an unnamed pending; Decision item 6's "open" and the Consequences' bullet that a silent identifier is not owed superseded by ADR-435 (read as "unanswered": silent, or with a pending open))
 **Affects:** `agent` (`comm_log.rs` `late_response`, `late_item`, `primitive_ended`;
 `comm_log/exchange.rs` `Kept::answered_placed`, `LinkState::settle_on`, `LinkState::reclassify_after`,
 `SettledAnswer`, `settle_late_response`, `Evidence::latest_answer_on`); design 8.11 "Owed

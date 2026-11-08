@@ -4470,14 +4470,14 @@ impl Inner {
         // `primitive_ended` (ADR-400 item 4), so the rows below do not keep an identifier an
         // earlier owner has since let go of (ADR-435).
         answered.set_answer_histories(state.answer_histories(&answered, &history, owner));
-        // The identifiers it could have come on: the one it names, else those the exchange is
-        // owed on (ADR-429, ADR-432). It is judged against each one's window.
+        // The identifiers it could have come on: the one it names, else those still unanswered
+        // (ADR-429, ADR-432, ADR-435). It is judged against each one's window.
         let ids: Vec<u32> = match &item.data {
             UnattachedData::Result {
                 identifier: Some(identifier),
                 ..
             } => vec![*identifier],
-            _ => kept.evidence.owed_ids(),
+            _ => kept.evidence.answerable_ids(),
         };
         let judge = |rx_id| {
             let (window_from, in_window) = late_window(&kept, rx_id);
@@ -10871,6 +10871,65 @@ pub(crate) mod tests {
         let kept = kept_of(&log, seq);
         assert!(!kept.evidence.settles_owed());
         assert_eq!(kept.answer_at, exchange::AnswerTime::Unknown);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-435: an owed exchange that has left the window is not visited when its owner lets go
+    /// of an answer, so it keeps the row it held only because the owner could own its answer
+    /// there, until its own late response takes the answers' owners again and drops it.
+    #[test]
+    fn a_late_response_drops_the_row_an_owner_let_go_of_for_an_exchange_beyond_the_window() {
+        let table = [0x7E8, 0x7E9, 0x7EA];
+        let (dir, _setup, log) = collecting_log_on(true);
+        let first = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.rx_id = 0;
+                evidence.receive_ids = table.to_vec();
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            }))
+            .unwrap();
+        let second = resend_with_table(&log, &table, &[0x7E8], 10);
+        // Enough ordinary exchanges after it for it to leave the window.
+        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
+            let mut filler = evidence(
+                endpoint(0x7DF),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
+            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
+            log.exchange(filler).unwrap();
+        }
+        assert!(log.lock().links[0].1.logged_history(second).is_none());
+        assert!(log.lock().links[0].1.kept(second).is_some());
+        // The first exchange's own final answers on 0x7E8 and 0x7E9 come at its end; the
+        // resend, beyond the window, still holds its row for 0x7E8.
+        log.primitive_ended(
+            first,
+            PrimitiveEnded {
+                end: Some(exchange::End::Positive(FIRST.to_vec())),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    answer_read(0x7E8, 400_000),
+                    answer_read(0x7E9, 500_000),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        assert_eq!(owed_on(&log, 0x7E8, second).0, vec![second]);
+        // 0x7E9's final answer is the resend's alone to own (the first has its own there).
+        log.lock()
+            .late_response(0, second, &late_final_on(0x7E9), placed_after(3_000_000))
+            .unwrap();
+        assert!(owed_on(&log, 0x7E8, second).0.is_empty());
+        assert!(owed_on(&log, 0x7E9, second).0.is_empty());
+        assert_eq!(owed_on(&log, 0x7EA, second), (vec![first, second], true));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

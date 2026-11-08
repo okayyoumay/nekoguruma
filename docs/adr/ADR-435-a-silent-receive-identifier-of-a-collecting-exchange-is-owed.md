@@ -3,8 +3,10 @@
 **Date:** 2026-11-08
 **Status:** Accepted
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `Evidence::silent_ids`,
-`Evidence::settles_owed`, `LinkEffect`, `Kept::answered_placed`; `comm_log.rs` `primitive_ended`,
-`settled_final_time`), design 8.11 "Owed request", `late_response`; ADR-429 decision 2, ADR-432
+`Evidence::settles_owed`, `Evidence::unanswered_ids`, `Evidence::answerable_ids`, `LinkEffect`,
+`Kept::answered_placed`, `Kept::late_start_for`, `LinkState::reclassify_one`,
+`LinkState::refresh_owed_rows`, `LinkState::reset_after`; `comm_log.rs` `primitive_ended`,
+`settled_final_time`, `late_response`), design 8.11 "Owed request", `late_response`; ADR-429 decision 2, ADR-432
 decision 2, ADR-433 decision 6 and Consequences
 
 ## Context
@@ -66,18 +68,20 @@ VCI ended the window.
    because an owner could own its final answer there goes when that owner no longer can, and
    the identifiers dropped free the later answers on them; an exchange left with no row is owed
    no more, like one placed alone.
-7. **A result the worker rejected is no answer** (ADR-359): when nothing else is owed, an
-   exchange whose end is a rejected result is owed on every table identifier, as one with no
-   answer is, since it is not settled either. A final answer delivered late is a usable
+7. **A result the worker rejected is no answer** (ADR-359): an exchange whose end is a rejected
+   result is owed on every table identifier, as one with no answer is, whatever else it is owed
+   on, since it is not settled either. The set does not depend on any owner, so it cannot grow
+   after the fact; and a refresh of rows (decision 6) only drops rows, never adds one: the new
+   rows are the old ones that the exchange is still owed on. A final answer delivered late is a usable
    response, so the restated evidence no longer carries the rejection.
 
 ## Consequences
 
-- A resend that is silent on an identifier the first exchange is owed on shares the ownership
-  of a late final answer there: the answer has two owners, is `unattached`, and both exchanges
-  are at least `undetermined` (design 8.11 "Owed request"). More resends are `undetermined`;
-  the owed rows of a presence exchange grow to the size of the table. The two runner tests of
-  a pending read in the resend's wait and of a silent presence exchange assert this outcome.
+- The refresh of decision 6 reaches the exchanges in the link's window. An owed exchange that
+  has left the window keeps a row it holds only because an owner could own its answer there,
+  after that owner lets the answer go, until its own `late_response` takes the answers' owners
+  again and drops it; until then it counts as an owner of a late final answer on that
+  identifier, which is then `unattached`.
 - ADR-432's deferred bullet on an identifier that stays silent beside another's final answer is
   closed, and ADR-433's Consequence that it stands is superseded by decision 1. ADR-429
   decision 2, ADR-432 decision 2 and ADR-433 decision 6 and Consequences are marked as

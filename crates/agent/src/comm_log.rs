@@ -12174,8 +12174,8 @@ pub(crate) mod tests {
     #[test]
     fn a_late_final_of_a_lone_pending_with_no_receive_timeout_is_undetermined_unless_the_limit_is_shown()
      {
-        // The entry path with nothing shown: the pending and no finished time (an agent deadline
-        // or a failed window, whose entry keeps none).
+        // The entry path with nothing shown: the pending and no finished time (a collecting
+        // primitive the library cancelled, whose entry has none).
         let (dir, setup, log, seq) = late_collecting_on(false, |evidence| {
             evidence.end = exchange::End::NoResponse;
             evidence.answers = vec![lone_pending_on(0x7E8)];
@@ -12285,6 +12285,34 @@ pub(crate) mod tests {
         });
         assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
         assert_eq!(entry["classification"], "undetermined", "{entry}");
+    }
+
+    /// ADR-438: the existing rows apply to the finished time an entry now keeps: a collecting
+    /// window with a lone pending whose finished status is judged early or late is a fault of the
+    /// system (the VCI ended its wait before or after the limit in force), as for a receive
+    /// timeout; at the limit it stays `undetermined`.
+    #[test]
+    fn a_kept_finished_time_judged_early_or_late_takes_the_timeout_rows() {
+        for (finished_us, window, class) in [
+            (1_200_000, "timeout_early", "system"),
+            (5_300_000, "timeout_late", "system"),
+            (5_200_000, "timeout_at_limit", "undetermined"),
+        ] {
+            let (dir, setup, log, _) = late_collecting_on(false, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+                evidence.times.vci.as_mut().unwrap().finished =
+                    Some(device_time(BASE_US + finished_us));
+            });
+            log.end("ok");
+            let written = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = of_event(&written, "exchange").remove(0);
+            assert_eq!(entry["timing"]["window"], window, "{entry}");
+            assert_eq!(entry["classification"], class, "{entry}");
+        }
     }
 
     /// ADR-436 (entry path): a collecting exchange whose own wait ended with the finished status

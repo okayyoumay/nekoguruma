@@ -4,10 +4,13 @@
 **Status:** Accepted
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `Evidence::silent_ids`,
 `Evidence::settles_owed`, `Evidence::unanswered_ids`, `Evidence::answerable_ids`, `LinkEffect`,
-`Kept::answered_placed`, `Kept::late_start_for`, `LinkState::reclassify_one`,
-`LinkState::refresh_owed_rows`, `LinkState::reset_after`; `comm_log.rs` `primitive_ended`,
-`settled_final_time`, `late_response`), design 8.11 "Owed request", `late_response`; ADR-429 decision 2, ADR-432
-decision 2, ADR-433 decision 6 and Consequences
+`Kept::answered_placed`, `Kept::late_start_for`, `Answer::is_rejected`,
+`standing_answers_covering`, `LinkState::reclassify_one`, `LinkState::reclassify_after`,
+`LinkState::refresh_owed_rows`, `LinkState::reset_after`, `LinkState::error_after`,
+`LinkState::frees_owner`; `comm_log.rs` `primitive_ended`, `settled_final_time`,
+`late_response`, `late_response_ids`; `host.rs` `collected_answers`, `rejected_read`), design
+8.11 "Owed request", `late_response`; ADR-429 decision 2, ADR-432 decision 2, ADR-433
+decision 6 and Consequences
 
 ## Context
 
@@ -75,13 +78,32 @@ VCI ended the window.
    rows are the old ones that the exchange is still owed on. A final answer delivered late is a usable
    response, so the restated evidence no longer carries the rejection.
 
+8. **A result the worker rejected stands for no final answer on its identifier, per answer.**
+   An answer whose bytes are neither the request's positive response nor a negative one (a
+   wrong echo, `Answer::is_rejected`, the same test that makes the exchange's end rejected when
+   the host ends it with that answer) does not count in `final_standing`, so its identifier
+   stays silent for `owed_ids`, `silent_ids`, `unanswered_ids`, `answerable_ids` and
+   `settles_owed`; it covers no unnamed pending (`standing_answers_covering`, in the log's
+   restatements and in the host's collected answers), and it owns no identifier as a final
+   answer an owner could own. The end of a restated exchange is its first standing final answer
+   that was not rejected, so a final answer delivered late is the end when the rejected result
+   was all that stood. The whole-table rule of decision 7 stays: a rejected end that is not
+   among the answers (the host ended on another error's result) still owes every identifier.
+   No field of the log's output changes; `Answer` records no new fact, since its end already
+   tells a rejected result from a usable one.
+
 ## Consequences
 
+- A resend that is silent on an identifier the first exchange is owed on shares the ownership
+  of a late final answer there: the answer has two owners, is `unattached`, and both exchanges
+  are at least `undetermined` (design 8.11 "Owed request"). More resends are `undetermined`;
+  the owed rows of a presence exchange grow to the size of the table. The runner tests of a
+  pending read in the resend's wait and of a silent presence exchange assert this outcome.
 - The refresh of decision 6 reaches the exchanges in the link's window. An owed exchange that
   has left the window keeps a row it holds only because an owner could own its answer there,
-  after that owner lets the answer go, until its own `late_response` takes the answers' owners
-  again and drops it; until then it counts as an owner of a late final answer on that
-  identifier, which is then `unattached`.
+  after that owner lets the answer go, until its own `primitive_ended` or `late_response` takes
+  its answers' owners again, or an accepted ECUReset or session change ends it; until then it
+  counts as an owner of a late final answer on that identifier, which is then `unattached`.
 - ADR-432's deferred bullet on an identifier that stays silent beside another's final answer is
   closed, and ADR-433's Consequence that it stands is superseded by decision 1. ADR-429
   decision 2, ADR-432 decision 2 and ADR-433 decision 6 and Consequences are marked as

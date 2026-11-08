@@ -864,6 +864,13 @@ impl Answer {
         matches!(&self.end, End::Negative(bytes) if expected.pending(bytes))
     }
 
+    /// Whether the answer is a result the worker rejected: bytes that are neither the request's
+    /// positive response nor a negative one (a wrong echo). It is no answer (ADR-359, ADR-435):
+    /// it stands for no final answer on its identifier.
+    pub(crate) fn is_rejected(&self) -> bool {
+        matches!(self.end, End::PositiveUnusable(_))
+    }
+
     /// The end and the pendings the answer stands for as an exchange of its own: a lone pending
     /// is a request that got a pending and no response, its own pending the last of its list.
     /// The one conversion both the classification ([`Evidence::as_answer`]) and the log's
@@ -914,20 +921,23 @@ pub(crate) fn table_covered(table: &[u32], final_on: impl Fn(u32) -> bool) -> bo
 /// [`standing_answers`] with the covering fold of an unnamed pending (ADR-433): once the final
 /// answers cover every identifier of `table`, a standing pending that names none (`id` is 0)
 /// leaves the list as well, since the last uncovered identifier's final answer is the one it
-/// stood for. `id` is an item's response identifier, 0 when it names none. The one rule the
+/// stood for. `id` is an item's response identifier, 0 when it names none, and `rejected` tells
+/// a result the worker rejected, which covers nothing. The one rule the
 /// three restatements of a collecting exchange's answers follow: [`Kept::answered`], the log's
 /// `primitive_ended`, and the host's collected answers.
 pub(crate) fn standing_answers_covering<T>(
     items: &[T],
     id: impl Fn(&T) -> u32,
     pending: impl Fn(&T) -> bool,
+    rejected: impl Fn(&T) -> bool,
     table: &[u32],
 ) -> Vec<bool> {
     let mut standing = standing_answers(items, &id, &pending);
+    // A result the worker rejected is no final answer on its identifier (ADR-359, ADR-435).
     let final_on = |wanted: u32| {
         items
             .iter()
-            .any(|item| !pending(item) && id(item) == wanted)
+            .any(|item| !pending(item) && !rejected(item) && id(item) == wanted)
     };
     if table_covered(table, final_on) {
         for (item, standing) in items.iter().zip(&mut standing) {
@@ -1346,9 +1356,9 @@ impl Evidence {
 
     /// Whether a final answer on the named identifier `id` stands in the exchange.
     fn final_standing(&self, id: u32) -> bool {
-        self.answers
-            .iter()
-            .any(|answer| answer.rx_id == id && !answer.is_pending(&self.expected))
+        self.answers.iter().any(|answer| {
+            answer.rx_id == id && !answer.is_pending(&self.expected) && !answer.is_rejected()
+        })
     }
 
     /// The response identifiers the exchange is owed on (design 8.11 "Owed request", ADR-432),
@@ -1404,6 +1414,7 @@ impl Evidence {
         if self.final_response().is_some() {
             for answer in self.answers.iter().filter(|answer| {
                 !answer.is_pending(&self.expected)
+                    && !answer.is_rejected()
                     && answer
                         .history
                         .as_ref()
@@ -2499,14 +2510,12 @@ impl LinkState {
             .get(&seq)
             .map_or_else(|| fallback.clone(), |kept| kept.evidence.clone());
         evidence.set_answer_histories(self.answer_histories(&evidence, history, seq));
+        // Only rows go: what it was owed on and still is (a refresh never adds one).
         let before = self.owed_row_ids(seq);
-        // Only rows go: what it was owed on and still is (a refresh never adds one, since the
-        // answers' owners it reads can only have shrunk).
-        let had = self.owed_row_ids(seq);
         let ids: Vec<u32> = evidence
             .owed_ids()
             .into_iter()
-            .filter(|id| had.contains(id))
+            .filter(|id| before.contains(id))
             .collect();
         let emptied = ids.is_empty();
         if emptied {
@@ -2846,7 +2855,8 @@ impl LinkState {
             self.last_reset = self.last_reset.max(Some(seq));
         }
         let mut changed = Vec::new();
-        // Exchanges after it that are placed alone now, and so no owners of the later answers.
+        // Exchanges after it that stop owning the later answers: those placed alone now, and
+        // those owed on fewer identifiers (ADR-433, ADR-435).
         let mut freed_answers: Vec<SettledAnswer> = Vec::new();
         for at in 0..self.window.len() {
             let logged = &self.window[at];
@@ -4219,6 +4229,7 @@ impl Kept {
             &answers,
             |a| a.rx_id,
             |a| a.is_pending(expected),
+            Answer::is_rejected,
             &self.evidence.receive_ids,
         );
         let mut chain: Option<Vec<Pending>> = None;
@@ -4239,7 +4250,13 @@ impl Kept {
         if let Some(last) = folded.last_mut() {
             last.pending = chain.unwrap_or_default();
         }
-        let end = collecting_end(&folded, expected);
+        // The end is the first standing final answer the worker did not reject: a rejected result
+        // is no answer (ADR-359, ADR-435), so a final answer delivered late is the end when that
+        // is all there was before it.
+        let end = folded
+            .iter()
+            .find(|answer| !answer.is_pending(expected) && !answer.is_rejected())
+            .map_or_else(|| collecting_end(&folded, expected), |a| a.end.clone());
         // The window's end stays judged by the entry's timing (`Evidence::collecting`), which a
         // late answer does not change; only the answer it adds is taken as within the limit. A
         // late start judged at the limit showed that end was the VCI's at the limit.
@@ -10511,7 +10528,13 @@ mod tests {
             positive(RX2, Window::WithinP2),
         ];
         let fold = |items: &[Answer], table: &[u32]| {
-            standing_answers_covering(items, |a| a.rx_id, |a| a.is_pending(&expected), table)
+            standing_answers_covering(
+                items,
+                |a| a.rx_id,
+                |a| a.is_pending(&expected),
+                Answer::is_rejected,
+                table,
+            )
         };
         assert_eq!(fold(&items, &[RX, RX2]), [false, true, true]);
         assert_eq!(fold(&items[..2], &[RX, RX2]), [true, true]);
@@ -11039,5 +11062,85 @@ mod tests {
         let (dropped, emptied) = state.refresh_owed_rows(2, &kept.evidence, &entry.link_history);
         assert!(dropped.is_empty() && !emptied);
         assert_eq!(state.owed_row_ids(2), [RX2]);
+    }
+
+    /// A wrong-echo result as the host lists it: unusable bytes on `rx_id`.
+    fn rejected_on(rx_id: u32) -> Answer {
+        answer(
+            rx_id,
+            End::PositiveUnusable(vec![0x7E, 0x01]),
+            Window::WithinP2,
+            5.0,
+        )
+    }
+
+    /// ADR-435 (ADR-359): a result the worker rejected stands for no final answer on its
+    /// identifier. The host ends the exchange with it as the first standing answer
+    /// (`end_rejected`), 0x7E8 stays unanswered beside the silent 0x7E9, and no late final
+    /// answer settles the exchange until each has a usable one.
+    #[test]
+    fn a_rejected_result_leaves_its_identifier_unanswered() {
+        let mut kept = kept_collecting(vec![rejected_on(RX)], true);
+        kept.evidence.end_rejected = true;
+        assert_eq!(kept.evidence.silent_ids(), [RX, RX2]);
+        assert_eq!(kept.evidence.unanswered_ids(), [RX, RX2]);
+        assert_eq!(kept.evidence.answerable_ids(), [RX, RX2]);
+        assert_eq!(kept.evidence.owed_ids(), [RX, RX2]);
+        assert!(!kept.evidence.settles_owed());
+        // An unnamed final answer is keyed on none of them and settles nothing.
+        let unnamed = kept.answered(&POSITIVE, &late_on(None));
+        assert!(!unnamed.settles_owed());
+        assert_eq!(unnamed.owed_ids(), [RX, RX2]);
+        // Named, it settles its identifier; the end is that answer, not the rejected result.
+        let named = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert_eq!(named.end.response(), Some(&POSITIVE[..]));
+        assert!(!named.end_rejected);
+        assert_eq!(named.owed_ids(), [RX2]);
+        assert!(!named.settles_owed());
+        // The order of the answers does not matter: a usable answer first, the rejected one
+        // after, the end is the usable one's and the exchange is not settled either.
+        let reversed =
+            kept_collecting(vec![positive(RX2, Window::WithinP2), rejected_on(RX)], true);
+        assert!(!reversed.evidence.end_rejected);
+        assert_eq!(reversed.evidence.silent_ids(), [RX]);
+        assert!(!reversed.evidence.settles_owed());
+        assert_eq!(reversed.evidence.owed_ids(), [RX]);
+    }
+
+    /// ADR-435: a rejected result that names no identifier and that an owner could own adds no
+    /// identifier as an owned final answer would.
+    #[test]
+    fn an_owned_rejected_result_owes_no_identifier_as_an_owned_final_answer_would() {
+        let answers = |last: Answer| {
+            vec![
+                positive(RX, Window::WithinP2),
+                positive(RX2, Window::WithinP2),
+                last,
+            ]
+        };
+        let usable = kept_collecting(answers(owned(positive(0, Window::WithinP2))), true);
+        assert_eq!(usable.evidence.owed_ids(), [RX, RX2]);
+        let rejected = kept_collecting(answers(owned(rejected_on(0))), true);
+        assert!(rejected.evidence.owed_ids().is_empty());
+    }
+
+    /// ADR-435: a rejected result covers no unnamed pending either, so the pending stays open
+    /// while the table's identifiers lack a usable final answer.
+    #[test]
+    fn a_rejected_result_does_not_cover_an_unnamed_pending() {
+        let expected = kept_on(Vec::new(), &[RX, RX2]).evidence.expected;
+        let items = [lone(0), rejected_on(RX), positive(RX2, Window::WithinP2)];
+        let fold = |items: &[Answer]| {
+            standing_answers_covering(
+                items,
+                |a| a.rx_id,
+                |a| a.is_pending(&expected),
+                Answer::is_rejected,
+                &[RX, RX2],
+            )
+        };
+        assert_eq!(fold(&items), [true, true, true]);
+        let usable = [lone(0), positive(RX, Window::WithinP2), items[2].clone()];
+        assert_eq!(fold(&usable), [false, true, true]);
     }
 }

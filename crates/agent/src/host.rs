@@ -1997,7 +1997,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             Err(error) => Err(error),
         };
         // Only an identifier of the table marks presence (ADR-396); the log lists every result.
-        let answers = collected_answers(&sent.collected, &self.receive_table)
+        let answers = collected_answers(&sent.collected, &self.receive_table, |_| false)
             .into_iter()
             .filter_map(|(rx_id, read)| {
                 let rx_id =
@@ -3416,6 +3416,7 @@ fn response_id(identifier: Option<u32>, unique: u32, table: &[(u32, u32)]) -> Op
 fn collected_answers<'a>(
     collected: &'a [CollectedRead],
     table: &[(u32, u32)],
+    rejected: impl Fn(&CollectedRead) -> bool,
 ) -> Vec<(Option<u32>, &'a CollectedRead)> {
     let id_of = |read: &CollectedRead| response_id(read.identifier, read.unique, table);
     let rx_ids: Vec<u32> = table.iter().map(|&(_, rx)| rx).collect();
@@ -3423,6 +3424,7 @@ fn collected_answers<'a>(
         collected,
         |read| id_of(read).unwrap_or(0),
         |read| read.pending,
+        rejected,
         &rx_ids,
     );
     collected
@@ -3463,13 +3465,35 @@ mod collected_answers_tests {
             read(Some(0x7E9), false),
         ];
         let ids = |reads: &[CollectedRead]| -> Vec<Option<u32>> {
-            collected_answers(reads, &table)
+            collected_answers(reads, &table, |_| false)
                 .into_iter()
                 .map(|(id, _)| id)
                 .collect()
         };
         assert_eq!(ids(&reads), [Some(0x7E8), Some(0x7E9)]);
         assert_eq!(ids(&reads[..2]), [None, Some(0x7E8)]);
+    }
+
+    /// ADR-435: a result the worker rejected covers no identifier, so an unnamed pending stays
+    /// in the host's list while one table identifier has only a rejected result.
+    #[test]
+    fn a_rejected_result_does_not_cover_an_unnamed_pending_in_the_collected_answers() {
+        let table = [(0x7E0, 0x7E8), (0x7E1, 0x7E9)];
+        let mut wrong_echo = read(Some(0x7E8), false);
+        wrong_echo.bytes = vec![0x7E, 0x01];
+        let reads = [read(None, true), wrong_echo, read(Some(0x7E9), false)];
+        let expected = Expected {
+            positive_prefix: vec![0x7E, 0x00],
+            negative_pattern: vec![0x7F, 0x3E],
+        };
+        let negative = crate::send_receive::NegativeShape::uds();
+        let ids: Vec<Option<u32>> = collected_answers(&reads, &table, |read| {
+            rejected_read(read, &expected, &negative, 0x3E)
+        })
+        .into_iter()
+        .map(|(id, _)| id)
+        .collect();
+        assert_eq!(ids, [None, Some(0x7E8), Some(0x7E9)]);
     }
 }
 
@@ -3483,10 +3507,22 @@ fn answer_items(
     negative: &NegativeShape,
     sid: u8,
 ) -> Vec<Answer> {
-    collected_answers(collected, table)
+    let rejected = |read: &CollectedRead| rejected_read(read, expected, negative, sid);
+    collected_answers(collected, table, rejected)
         .into_iter()
         .map(|(rx_id, read)| answer_of(read, rx_id, &expected.positive_prefix, negative, sid))
         .collect()
+}
+
+/// Whether a result of a collecting primitive is one the worker rejected: neither the request's
+/// positive response nor a negative one (ADR-359). It is no final answer on its identifier.
+fn rejected_read(
+    read: &CollectedRead,
+    expected: &Expected,
+    negative: &NegativeShape,
+    sid: u8,
+) -> bool {
+    !negative.is_negative(sid, &read.bytes) && !read.bytes.starts_with(&expected.positive_prefix)
 }
 
 /// One result of a collecting primitive as the entry lists it: the end its bytes have against
@@ -7463,11 +7499,13 @@ mod tests {
             &progress.negative,
             progress.sid,
         );
-        collected_answers(&progress.collected, table)
-            .into_iter()
-            .zip(items)
-            .map(|((id, read), answer)| (id, read.bytes.clone(), format!("{:?}", answer.end)))
-            .collect()
+        collected_answers(&progress.collected, table, |read| {
+            rejected_read(read, &expected, &progress.negative, progress.sid)
+        })
+        .into_iter()
+        .zip(items)
+        .map(|((id, read), answer)| (id, read.bytes.clone(), format!("{:?}", answer.end)))
+        .collect()
     }
 
     /// ADR-396: the presence request collects until its window ends; every answer on a distinct

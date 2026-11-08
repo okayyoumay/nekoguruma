@@ -1270,9 +1270,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                 items
             }
         };
-        // Not the kept record of an exchange left owed per an open identifier, or one whose end
-        // shows the VCI ended its wait: its ECU's final answer can still settle it (ADR-429,
-        // ADR-431).
+        // Not the kept record of an exchange left owed per an open identifier (or noted so by
+        // the record when it was kept or renewed), or one whose end shows the VCI ended its
+        // wait: its ECU's final answer can still settle it (ADR-429, ADR-431, ADR-436).
         if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
             log.release_kept_ended(seq);
         }

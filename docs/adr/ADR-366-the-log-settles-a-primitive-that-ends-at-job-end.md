@@ -1,7 +1,7 @@
 # ADR-366: The Log Settles a Primitive That Ends at Job End
 
 **Date:** 2026-10-27
-**Status:** Accepted (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367; item 3's placement of the end's times and its inputs superseded by ADR-386; item 1's "a late response still settles only an exchange the VCI ended" also covers an exchange whose primitive's receive timeout its `primitive_ended` read, ADR-431)
+**Status:** Accepted (Decision item 1's release of the kept exchange at the cancel before the next request, and the Consequences' `unattached` end read before that request, superseded by ADR-367; item 3's placement of the end's times and its inputs superseded by ADR-386; item 1's "a late response still settles only an exchange the VCI ended" also covers an exchange whose primitive's receive timeout its `primitive_ended` read, ADR-431; item 1's "a late response still settles only an exchange the VCI ended" superseded by ADR-436 for an exchange a pending is open on)
 **Affects:** `agent` host (`WorkerHost::settle_at_end`, `log_primitive_end`, `Stray`) and
 communication log (`CommLog::primitive_ended`, `PrimitiveEnded`, `PrimitiveEndedEntry`,
 `exchange::settle_primitive_ended`); design 8.11 ("Settlement", `primitive_ended`); ADR-346,

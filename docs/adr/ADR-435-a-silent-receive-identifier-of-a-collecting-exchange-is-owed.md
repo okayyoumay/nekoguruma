@@ -1,7 +1,7 @@
 # ADR-435: A Silent Receive Identifier of a Collecting Exchange Is Owed
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (Decision item 4's release amended by ADR-436: an exchange a pending is open on, or whose kept record notes one open at its keep or after the end's renewal, is kept after any end, and a late final answer on its silent identifier settles it there)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `Evidence::silent_ids`,
 `Evidence::settles_owed`, `Evidence::unanswered_ids`, `Evidence::answerable_ids`, `LinkEffect`,
 `Kept::answered_placed`, `Kept::late_start_for`, `LinkState::reclassify_one`,
@@ -52,8 +52,9 @@ VCI ended the window.
    several unanswered it is appended unnamed and settles none, and the final answers that name
    an identifier settle them. This reads ADR-433 decision 6's "open" as "unanswered".
 4. **The release after `primitive_ended` is ADR-431's, unchanged.** A silent identifier alone
-   keeps no record: the exchange is kept when a pending is open or the renewed evidence shows
-   the VCI ended its wait (a receive timeout, or the finished status of an answered window), and
+   keeps no record (ADR-436 keeps an exchange whose kept record notes a pending
+   open at its keep or after the end's renewal): the exchange is kept when a pending is open or
+   the renewed evidence shows the VCI ended its wait (a receive timeout, or the finished status of an answered window), and
    released after a link error, a cancel or an unknown end, when its owed rows remain and a
    later final answer on the silent identifier is `unattached`, as for an ordinary exchange.
 5. **`primitive_ended` takes the time of the answer from whether a final answer exists**, not

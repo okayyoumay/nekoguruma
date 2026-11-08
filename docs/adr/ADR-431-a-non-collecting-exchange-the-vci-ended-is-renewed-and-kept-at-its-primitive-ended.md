@@ -1,7 +1,7 @@
 # ADR-431: An Exchange Left Owed by Its `primitive_ended` Is Renewed, and Kept When the VCI Ended Its Wait
 
 **Date:** 2026-11-07
-**Status:** Accepted (the Consequences' deferred bullet on a response read in the stray primitive's job-end wait closed)
+**Status:** Accepted (the Consequences' deferred bullet on a response read in the stray primitive's job-end wait closed; Decision items 2 and 3's gate on `vci_ended` superseded by ADR-436 for an exchange a pending is open on or noted open on its kept record)
 **Affects:** `agent` (`comm_log.rs` `CommLog::primitive_ended`, `release_kept_ended`;
 `comm_log/exchange.rs` `LinkState::renew_owed`, `LinkState::release_kept_ended`; `host.rs`
 `settle_cancelled`, comments only); design 8.11 `primitive_ended`, `late_response`; ADR-367 item

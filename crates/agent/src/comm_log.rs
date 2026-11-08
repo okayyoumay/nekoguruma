@@ -2955,6 +2955,7 @@ impl CommLog {
             late_places: Vec::new(),
             floor: None,
             partial: None,
+            pending_at_end: false,
             clears,
             matched: false,
         };
@@ -3020,6 +3021,7 @@ impl CommLog {
             inner.links[at].1.keep(
                 seq,
                 exchange::Kept {
+                    pending_at_end: !kept.evidence.open_pending_ids().is_empty(),
                     classification: entry.classification,
                     sent: entry.sent,
                     clears,
@@ -4559,7 +4561,7 @@ fn late_response_owner(
     };
     if let ([owner], false) = (&owners[..], in_flight) {
         let kept = state.kept(*owner)?;
-        return (!pending(kept) && kept.evidence.late_final_settles())
+        return (!pending(kept) && (kept.evidence.late_final_settles() || kept.pending_at_end))
             .then_some(LateOwner::One(*owner));
     }
     if owners.len() + usize::from(in_flight) < 2 {
@@ -10546,13 +10548,7 @@ pub(crate) mod tests {
         let lines = lines(&setup);
         std::fs::remove_dir_all(&dir).unwrap();
         let late = of_event(&lines, "late_response").remove(0);
-        // The verdict keeps the entry's own `system` fault, but the reason now shows the VCI's
-        // wait ended at the limit, which the unshown case above does not.
-        let reason = late["exchanges"][0]["reason"].as_str().unwrap();
-        assert!(
-            reason.contains("VCI had ended its wait at the limit"),
-            "{reason}"
-        );
+        assert_eq!(late["exchanges"][0]["classification"], "vehicle", "{late}");
     }
 
     /// ADR-433: what a partial settlement judged stands against an ambiguity read for the
@@ -11455,7 +11451,7 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
-                    // The host reads no receive timeout for a finished status (host.rs `vci_ended`).
+                    // The host reads no receive timeout for a finished status.
                     vci_ended: false,
                     reads: read_after_deadline(items),
                 },
@@ -11740,8 +11736,9 @@ pub(crate) mod tests {
     }
 
     /// The primitive-ended entry of `seq` that reads a pending of 0x7E8 and the finished status
-    /// (read `finished_us` after the transmit) and ends as `end`, with no receive timeout read (`vci_ended` false), as the host writes
-    /// a finished status, a link error or an unknown end.
+    /// (read `finished_us` after the transmit) and ends as `end`, with no receive timeout read
+    /// (`vci_ended` false), as the host writes a finished status, a link error or an unknown
+    /// end.
     fn end_pending_without_timeout(log: &CommLog, seq: u64, end: exchange::End, finished_us: u64) {
         let mut items = pending_reads(0x7E8, 200_000);
         items.push(EndItem::Finished(device_time(BASE_US + finished_us)));
@@ -11788,6 +11785,16 @@ pub(crate) mod tests {
             assert!(owed_on_7e8(&log, seq).0.is_empty(), "{functional}");
             if functional {
                 assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
+                // The 0x7E8 settlement folded the pending out of the evidence; the exchange was
+                // kept for it, so it still owns the final answer of the silent identifier.
+                assert_eq!(
+                    kept_of(&log, seq).evidence.open_pending_ids(),
+                    Vec::<u32>::new()
+                );
+                assert_eq!(
+                    late_owner_of(&log, &late_final_on(0x7E9)),
+                    Some(LateOwner::One(seq))
+                );
                 log.lock()
                     .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_500_000))
                     .unwrap();
@@ -11852,11 +11859,36 @@ pub(crate) mod tests {
             reason.contains("VCI had ended its wait at the limit"),
             "{reason}"
         );
+        // An entry that shows the window ended at the limit (a receive timeout time, here with
+        // no `vci_ended`, which the judgement does not read) and no fault of the system of its
+        // own: the late final is the vehicle's.
+        let (dir, setup, log, seq) = late_collecting_on(false, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.times.vci.as_mut().unwrap().rx_timeout =
+                Some(device_time(BASE_US + 5_200_000));
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        assert!(!kept_of(&log, seq).evidence.vci_ended);
+        assert_eq!(
+            late_owner_of(&log, &late_final_item()),
+            Some(LateOwner::One(seq))
+        );
+        log.lock()
+            .late_response(0, seq, &late_final_item(), placed_after(9_000_000))
+            .unwrap();
+        log.end("ok");
+        let vehicle = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&vehicle, "late_response").remove(0);
+        assert_eq!(late["exchanges"][0]["classification"], "vehicle", "{late}");
     }
 
     /// ADR-436 (entry path): a collecting exchange whose own wait ended with the finished status
     /// and a lone pending, no receive timeout, is kept at its entry, so its final answer settles
-    /// it; a silent identifier of the same request settles on that identifier.
+    /// it; a silent identifier of the same request settles on that identifier, whichever
+    /// identifier's final answer comes first.
     #[test]
     fn an_entry_with_a_lone_pending_and_no_receive_timeout_is_kept_for_its_late_final() {
         for functional in [false, true] {
@@ -11874,23 +11906,37 @@ pub(crate) mod tests {
                 "{functional}"
             );
             if functional {
-                // The silent 0x7E9 of the same request: settled on that identifier, the pending
-                // identifier stays owed.
+                // The pending's identifier settles first and folds the pending out of the
+                // evidence; the silent 0x7E9 of the same request is still settled on its own
+                // identifier (the exchange was kept for the pending).
+                log.lock()
+                    .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+                    .unwrap();
+                assert!(kept_of(&log, seq).evidence.open_pending_ids().is_empty());
+                assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
                 assert_eq!(
                     late_owner_of(&log, &late_final_on(0x7E9)),
                     Some(LateOwner::One(seq))
                 );
                 log.lock()
-                    .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_000_000))
+                    .late_response(0, seq, &late_final_on(0x7E9), placed_after(3_500_000))
                     .unwrap();
-                assert_eq!(owed_on(&log, 0x7E9, seq).0, Vec::<u64>::new());
-                assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true));
+                assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
+                assert_eq!(owed_on_7e8(&log, seq), (Vec::new(), false));
+            } else {
+                log.lock()
+                    .late_response(0, seq, &late_final_item(), placed_after(3_000_000))
+                    .unwrap();
             }
             log.end("ok");
             let lines = lines(&setup);
             std::fs::remove_dir_all(&dir).unwrap();
             let late = of_event(&lines, "late_response");
-            assert_eq!(late.len(), usize::from(functional), "{functional}");
+            assert_eq!(late.len(), 1 + usize::from(functional), "{functional}");
+            for entry in &late {
+                assert_eq!(entry["refers_to"], serde_json::json!([seq]), "{entry}");
+                assert_eq!(entry["exchanges"][0]["classification"], "system", "{entry}");
+            }
         }
     }
 

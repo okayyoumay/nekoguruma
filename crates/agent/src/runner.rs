@@ -17173,8 +17173,8 @@ def main():
 
     /// ADR-367 item 3 as annotated by ADR-429, ADR-432, ADR-435, ADR-436: a functional presence
     /// exchange the agent's deadline ended, whose pending (on 7E8) and finished status (no
-    /// receive timeout) the resend's wait reads, is kept by the release after its `primitive_ended` since the
-    /// pending is still open on 7E8. The resend was answered on 7E9 only, so it is owed on the
+    /// receive timeout) the resend's wait reads, is kept by the release after its
+    /// `primitive_ended` since the pending is still open on 7E8. The resend was answered on 7E9 only, so it is owed on the
     /// silent 7E8 too: the ECU's final answer there, read once no exchange awaits one, could be
     /// either's, and is `unattached`, with both left `undetermined`.
     #[tokio::test(flavor = "multi_thread")]
@@ -17248,7 +17248,7 @@ def main():
     /// ADR-436 (the single-owner variant of the test above): a functional presence window whose
     /// pending on 7E8 and finished status (no receive timeout) the job end reads, with no resend,
     /// leaves the exchange kept and owed by the pending; the ECU's final answer on 7E8, read
-    /// later, is its `late_response`, not `unattached`. 7E9 stayed silent and is owed too.
+    /// later, is its `late_response`, not `unattached`.
     #[tokio::test(flavor = "multi_thread")]
     async fn a_lone_pending_of_a_window_ended_by_finished_owns_its_late_final_answer() {
         const FIRST: &[Step] = &[

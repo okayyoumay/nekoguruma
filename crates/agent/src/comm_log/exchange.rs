@@ -1775,6 +1775,11 @@ pub(crate) struct Kept {
     /// identifiers gave it, while it stays owed on the others (ADR-433): a later final answer
     /// is not judged below it. Kept apart from [`Kept::floor`], which ambiguous items set too.
     pub partial: Option<Classification>,
+    /// A pending was open on the exchange when it was kept (at its entry, or by the release after
+    /// its `primitive_ended`, which recomputes it from that end): its late final answers settle
+    /// it on every identifier it stays owed on, though the first of them folds the pending out
+    /// of the evidence (ADR-436).
+    pub pending_at_end: bool,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
     pub clears: Clears,
@@ -2327,7 +2332,11 @@ impl LinkState {
                 .kept
                 .get(&seq)
                 .is_some_and(|kept| kept.evidence.late_final_settles());
-        if !open {
+        if open {
+            if let Some(kept) = self.kept.get_mut(&seq) {
+                kept.pending_at_end = !kept.evidence.open_pending_ids().is_empty();
+            }
+        } else {
             self.kept.remove(&seq);
         }
     }
@@ -5386,6 +5395,7 @@ mod tests {
             late_places: Vec::new(),
             floor: None,
             partial: None,
+            pending_at_end: false,
             clears: state.clears(),
             matched: entry.matched_answer(),
         };
@@ -7896,6 +7906,7 @@ mod tests {
             late_places: Vec::new(),
             floor: None,
             partial: None,
+            pending_at_end: false,
             clears: Clears::default(),
             matched: false,
         };
@@ -7984,6 +7995,7 @@ mod tests {
             late_places: Vec::new(),
             floor: None,
             partial: None,
+            pending_at_end: false,
             clears: Clears::default(),
             matched: false,
         };
@@ -8065,6 +8077,7 @@ mod tests {
                 late_places: Vec::new(),
                 floor: None,
                 partial: None,
+                pending_at_end: false,
                 clears: Clears::default(),
                 matched: false,
             },

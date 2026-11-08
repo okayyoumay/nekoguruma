@@ -3,7 +3,7 @@
 **Date:** 2026-11-08
 **Status:** Accepted
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::late_final_settles`,
-`LinkState::release_kept_ended`; `comm_log.rs` `late_response_owner`, the entry's keep in
+`Kept::pending_at_end`, `LinkState::release_kept_ended`; `comm_log.rs` `late_response_owner`, the entry's keep in
 `CommLog::exchange`), design 8.11 `primitive_ended`, `late_response`; ADR-366 decision 1,
 ADR-429 decision 3, ADR-431 decisions 2 and 3, ADR-435 decision 4
 
@@ -37,9 +37,14 @@ ended the primitive.
    settles nothing (ADR-366). An end with no pending open is released as before.
 3. **The entry keeps it too.** A collecting entry with a pending open is kept on the same
    predicate, so a final answer after an entry with no agent deadline is its `late_response`.
-4. **The test is on the exchange, not on the response's identifier.** A final answer on a silent
-   identifier of the same request (ADR-435) settles that identifier as well, and the exchange
-   stays owed and kept on the others, as it does for one the VCI ended.
+4. **The test is on the exchange, not on the response's identifier, and it does not lapse.**
+   A final answer on a silent identifier of the same request (ADR-435) settles that identifier
+   as well, and the exchange stays owed and kept on the others, as it does for one the VCI
+   ended. The first final answer folds the pending out of the evidence, so the exchange records
+   when it is kept (`Kept::pending_at_end`: at its entry, and at the release after each
+   `primitive_ended`, which recomputes it from that end) that a pending was open; the owner
+   gate reads `vci_ended`, a pending open now, or that record. The order of the identifiers'
+   final answers therefore does not matter.
 5. **The judgement is unchanged.** The late window comes from the pending's window and is judged
    against the limit in force then. In time it is `system`; past it, `vehicle` only when the
    entry shows the VCI ended its wait at the limit (`timeout_at_limit`), else `undetermined`;
@@ -57,8 +62,9 @@ exchange owns a response only when its evidence shows `vci_ended`).
   wait now asserts that without the receive-timeout item, and a new test covers the single
   owner.
 - An entry's finished time is dropped by the host for an error result, so an entry's late final
-  cannot be judged at the limit where the same exchange's `primitive_ended` can: the entry's is
-  `undetermined`, the end's may be `vehicle`. This is a host-side gap, not changed here.
+  cannot be judged at the limit and is `undetermined`; the same exchange's `primitive_ended`
+  places the finished time (though the `system` of its `vci_did_not_end` entry stands). This is
+  a host-side gap, not changed here.
 - An ordinary exchange is unaffected: it has no open pending, so the predicate reduces to
   `vci_ended`.
 - ADR-366 decision 1, ADR-429 decision 3, ADR-431 decisions 2 and 3 and ADR-435 decision 4 are

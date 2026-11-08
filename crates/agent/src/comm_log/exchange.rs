@@ -2616,6 +2616,55 @@ impl LinkState {
         (dropped, emptied)
     }
 
+    /// The owed exchanges after `after` that have left the window and are kept: their rows are
+    /// taken again from their answers' owners as they are now, in `seq` order (ADR-439). Their
+    /// classification is not (ADR-368): the entry's history is not kept, so the owners are read
+    /// from the live rows ([`LinkState::history_settling`]), which is all the rows need. Gives
+    /// the answer each that drops a row or is owed no more adds for the exchanges after it.
+    fn refresh_kept_beyond_window(&mut self, after: u64) -> Vec<SettledAnswer> {
+        let beyond: Vec<u64> = self
+            .kept
+            .keys()
+            .copied()
+            .filter(|seq| *seq > after && !self.window.iter().any(|logged| logged.seq == *seq))
+            .collect();
+        let mut freed = Vec::new();
+        for seq in beyond {
+            let Some(kept) = self.kept.get(&seq) else {
+                continue;
+            };
+            let (matched, clears, answer_at) = (kept.matched, kept.clears, kept.answer_at);
+            let evidence = kept.evidence.clone();
+            let history = self.history_settling(&evidence, seq);
+            let (dropped, emptied) = self.refresh_owed_rows(seq, &evidence, &history);
+            if dropped.is_empty() && !emptied {
+                continue;
+            }
+            // As `reclassify_one` counts a freed answer: an exchange owed no more has its matched
+            // answer counted, once, when no late link error may have come after it.
+            let newly_matched = emptied
+                && !matched
+                && {
+                    let mut judged = evidence.clone();
+                    let owners = self.answer_histories(&judged, &history, seq);
+                    judged.set_answer_histories(owners);
+                    ExchangeEntry::build(seq, judged, history).matched_answer()
+                }
+                && self.since_late_error(seq, answer_at);
+            freed.push(SettledAnswer {
+                seq,
+                key: MatchKey::of(&evidence),
+                newly_answered: false,
+                newly_matched,
+                final_response: emptied,
+                clears,
+                since_error: self.since_late_error(seq, answer_at),
+                settled_ids: dropped,
+            });
+        }
+        freed
+    }
+
     /// Sets the rows exchange `seq` is owed on, replacing any it had: one for each identifier in
     /// `owed_ids` ([`Evidence::owed_ids`], ADR-429, ADR-432), once each.
     fn set_owed_rows(&mut self, seq: u64, sid: u8, expected: &Expected, owed_ids: &[u32]) {
@@ -2826,7 +2875,8 @@ impl LinkState {
     ///   answers on those (`settled_ids`).
     ///
     /// Gives each whose classification or reason this changes, in `seq` order, and the largest
-    /// `seq` of a later exchange that had left the window, which is not reclassified.
+    /// `seq` of a later exchange that had left the window, which is not reclassified: its owed
+    /// rows still follow the owners it loses (ADR-439).
     pub(crate) fn reclassify_after(
         &mut self,
         answer: &SettledAnswer,
@@ -2835,6 +2885,9 @@ impl LinkState {
         let mut answers = vec![answer.clone()];
         while let Some(answer) = answers.pop() {
             self.take_answer(&answer);
+            // The owed exchanges beyond the window follow the owners they lost in their rows
+            // only (ADR-439); each such freed answer comes through this loop in turn.
+            answers.extend(self.refresh_kept_beyond_window(answer.seq));
             for at in 0..self.window.len() {
                 let logged = &self.window[at];
                 if logged.seq <= answer.seq {
@@ -2894,7 +2947,7 @@ impl LinkState {
     ///
     /// Gives each later exchange whose classification or reason this changes, in `seq` order,
     /// and the largest `seq` of a later exchange that had left the window, which is not
-    /// reclassified.
+    /// reclassified: its owed rows still lose the owners before `earliest` (ADR-439).
     pub(crate) fn reset_after(
         &mut self,
         seq: u64,
@@ -2933,6 +2986,11 @@ impl LinkState {
         // Exchanges after it whose rows the reset dropped, wholly or in part: no longer owners
         // of the later answers on those identifiers.
         let mut freed_answers: Vec<SettledAnswer> = Vec::new();
+        if accepting {
+            // The owed exchanges beyond the window lose the owners before `earliest` in their
+            // rows too (ADR-439); they are not reclassified.
+            freed_answers.extend(self.refresh_kept_beyond_window(seq));
+        }
         for at in 0..self.window.len() {
             let logged = &self.window[at];
             if logged.seq <= seq {

@@ -12174,8 +12174,8 @@ pub(crate) mod tests {
     #[test]
     fn a_late_final_of_a_lone_pending_with_no_receive_timeout_is_undetermined_unless_the_limit_is_shown()
      {
-        // The entry path: the host's own wait read the pending, then the finished status, and
-        // wrote no times for the error result.
+        // The entry path with nothing shown: the pending and no finished time (a collecting
+        // primitive the library cancelled, whose entry has none).
         let (dir, setup, log, seq) = late_collecting_on(false, |evidence| {
             evidence.end = exchange::End::NoResponse;
             evidence.answers = vec![lone_pending_on(0x7E8)];
@@ -12195,6 +12195,36 @@ pub(crate) mod tests {
         );
         let reason = late["exchanges"][0]["reason"].as_str().unwrap();
         assert!(!reason.contains("VCI had ended its wait"), "{reason}");
+        // The entry path as the host writes it for a window that ran its course (ADR-438): the
+        // entry keeps the finished time, 5 s after the pending, so its window is judged at the
+        // limit and the late final is the vehicle's, as the primitive-ended path judges it. A
+        // finished time on the worker's clock is not placed on the transmit's, so it stays
+        // `undetermined`.
+        for (clock, window, class) in [
+            (exchange::Clock::Device, "timeout_at_limit", "vehicle"),
+            (exchange::Clock::Worker, "not_judged", "undetermined"),
+        ] {
+            let (dir, setup, log, seq) = late_collecting_on(false, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+                evidence.times.vci.as_mut().unwrap().finished =
+                    Some(exchange::VciTime::new(BASE_US + 5_200_000, Some(clock)));
+            });
+            assert!(!kept_of(&log, seq).evidence.vci_ended);
+            log.lock()
+                .late_response(0, seq, &late_final_item(), placed_after(9_000_000))
+                .unwrap();
+            log.end("ok");
+            let finished_lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = of_event(&finished_lines, "exchange").remove(0);
+            assert_eq!(entry["timing"]["window"], window, "{entry}");
+            assert_eq!(entry["classification"], "undetermined", "{entry}");
+            let late = of_event(&finished_lines, "late_response").remove(0);
+            assert_eq!(late["exchanges"][0]["classification"], class, "{late}");
+        }
         // The same exchange once its finished status is placed at the limit the pending put in
         // force (0.2 s + 5 s): the window is shown to end at the limit. The fixture's entry
         // already shows a fault of the system, which stands; the reason names the limit.
@@ -12237,6 +12267,52 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
         let late = of_event(&vehicle, "late_response").remove(0);
         assert_eq!(late["exchanges"][0]["classification"], "vehicle", "{late}");
+    }
+
+    /// ADR-438: the entry of a collecting window whose host kept only the finished time (no
+    /// transmit done, no other time) is written, with the finished time shown and the window not
+    /// judged for want of a transmit to place it on.
+    #[test]
+    fn an_entry_with_only_a_finished_time_is_written_and_not_judged() {
+        let entry = collecting_entry(|evidence| {
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+            evidence.times.vci = Some(exchange::VciTimes {
+                finished: Some(device_time(BASE_US + 5_200_000)),
+                ..exchange::VciTimes::default()
+            });
+        });
+        assert_eq!(entry["timing"]["window"], "not_judged", "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
+    }
+
+    /// ADR-438: the existing rows apply to the finished time an entry now keeps: a collecting
+    /// window with a lone pending whose finished status is judged early or late is a fault of the
+    /// system (the VCI ended its wait before or after the limit in force), as for a receive
+    /// timeout; at the limit it stays `undetermined`.
+    #[test]
+    fn a_kept_finished_time_judged_early_or_late_takes_the_timeout_rows() {
+        for (finished_us, window, class) in [
+            (1_200_000, "timeout_early", "system"),
+            (5_300_000, "timeout_late", "system"),
+            (5_200_000, "timeout_at_limit", "undetermined"),
+        ] {
+            let (dir, setup, log, _) = late_collecting_on(false, |evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+                evidence.times.vci.as_mut().unwrap().finished =
+                    Some(device_time(BASE_US + finished_us));
+            });
+            log.end("ok");
+            let written = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = of_event(&written, "exchange").remove(0);
+            assert_eq!(entry["timing"]["window"], window, "{entry}");
+            assert_eq!(entry["classification"], class, "{entry}");
+        }
     }
 
     /// ADR-436 (entry path): a collecting exchange whose own wait ended with the finished status

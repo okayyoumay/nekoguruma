@@ -1546,14 +1546,12 @@ impl<C: WorkerApi> WorkerHost<C> {
             let end_rejected = collected_rejected
                 .unwrap_or(matches!(end, End::PositiveUnusable(_)) && sent.result.is_err());
             let (link_errors, error_at) = events_seen(&sent, &mut detail);
-            // A response's times only for an exchange that ended with that response: one read
-            // before the agent's deadline, lost events or a lost VCI ended the wait is not the
-            // entry's outcome.
-            let response_times = if sent.result.is_ok() {
-                sent.response_times
-            } else {
-                VciTimes::default()
-            };
+            let response_times = entry_response_times(
+                &sent.result,
+                collecting,
+                sent.agent_deadline,
+                sent.response_times,
+            );
             // A transmit indication bound to the primitive confirms the send, with its time
             // (design 8.11 `sent_evidence`), over the transmit done the response carries.
             let vci = VciTimes {
@@ -2604,6 +2602,28 @@ fn carries_a_request(cop_type: ComOperationType) -> bool {
         cop_type,
         ComOperationType::CoptSendrecv | ComOperationType::CoptStartcomm
     )
+}
+
+/// The VCI times of the response an entry takes. A response's times count only for an exchange
+/// that ended with that response: one read before the agent's deadline, lost events or a lost
+/// VCI ended the wait is not the entry's outcome. The finished time of a collecting window is no
+/// response's: it is kept when the window ran its course without a usable answer
+/// (`Err(NoResponse)`, no agent deadline), so the log can judge a late final answer at the limit
+/// (ADR-438); a failed window (ADR-425 decision 5) or an agent deadline keeps none.
+fn entry_response_times(
+    result: &Result<Vec<u8>, HostError>,
+    collecting: bool,
+    agent_deadline: bool,
+    times: VciTimes,
+) -> VciTimes {
+    match result {
+        Ok(_) => times,
+        Err(HostError::NoResponse) if collecting && !agent_deadline => VciTimes {
+            finished: times.finished,
+            ..VciTimes::default()
+        },
+        Err(_) => VciTimes::default(),
+    }
 }
 
 /// The end an exchange's entry gives when the agent's own deadline (`agent_deadline`) ended the
@@ -7959,6 +7979,52 @@ mod tests {
         let _ = by_number.on_event(answer_on(None, 3, &[0x7F, 0x3E, 0x78]), COP);
         by_number.pendings[0].read = read;
         assert_eq!(pending_ids_of(&by_number.pendings, &TABLE), [Some(0x7EA)]);
+    }
+
+    /// ADR-438: an entry keeps the finished time of a collecting window that ran its course with
+    /// no usable answer (`Err(NoResponse)`, no agent deadline), and only that time; a failed
+    /// window, an agent deadline and a non-collecting error keep none; a result keeps all.
+    #[test]
+    fn an_entry_keeps_only_the_finished_time_of_a_collecting_window_with_no_response() {
+        let mut finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        finished.timestamp = 7_000;
+        let (progress, _) = collect(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            finished,
+        ]);
+        let mut times = progress.response_times;
+        assert!(times.finished.is_some());
+        times.tx_done = times.finished;
+        times.rx_end = times.finished;
+        let none = || Err(HostError::NoResponse);
+        let kept = entry_response_times(&none(), true, false, times);
+        assert_eq!(kept.finished, times.finished);
+        assert_eq!(kept.tx_done, None);
+        assert_eq!(kept.rx_end, None);
+        // A failed window is not judged at its limit (ADR-425 decision 5).
+        let failed = Err(HostError::PrimitiveFailed(1));
+        assert_eq!(
+            entry_response_times(&failed, true, false, times).finished,
+            None
+        );
+        // The agent's deadline ended the wait; a non-collecting error drops everything.
+        assert_eq!(
+            entry_response_times(&none(), true, true, times).finished,
+            None
+        );
+        assert_eq!(
+            entry_response_times(&none(), false, false, times).finished,
+            None
+        );
+        let lost = Err(HostError::EventsLost);
+        assert_eq!(
+            entry_response_times(&lost, true, false, times).finished,
+            None
+        );
+        // A result keeps every time.
+        let ok = Ok(vec![0x7E, 0x00]);
+        let all = entry_response_times(&ok, true, false, times);
+        assert_eq!((all.finished, all.tx_done), (times.finished, times.tx_done));
     }
 
     /// ADR-429: a collecting window whose only answer is a pending ends with no response (the

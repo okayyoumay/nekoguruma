@@ -15428,6 +15428,8 @@ def main():
         TimeOut(u32),
         /// The primitive's finished status.
         Finish,
+        /// The primitive's finished status with a VCI time in microseconds.
+        FinishAt(u32),
         /// The worker reports the VCI lost: an error of no primitive.
         LostVci(u32),
         /// The worker reports lost events: a notification that carries no item.
@@ -15893,9 +15895,12 @@ def main():
                                         vci_service_interface::PduErrorEvent::PduErrEvtLostCommToVci,
                                     ),
                                 ),
-                                Step::Finish => (
+                                Step::Finish | Step::FinishAt(_) => (
                                     Bound::Own,
-                                    0,
+                                    match *step {
+                                        Step::FinishAt(at) => at,
+                                        _ => 0,
+                                    },
                                     Data::CopStatus(
                                         vci_service_interface::PduComPrimitiveStatus::PduCopstFinished
                                             as i32,
@@ -17130,6 +17135,120 @@ def main():
         let lines = comm_log_lines(&dir);
         std::fs::remove_dir_all(&dir).unwrap();
         lines
+    }
+
+    /// [`presence_single_run`] for a window the host's own wait ends (the timeout is not past):
+    /// the script's items up to `Step::Release` are read by the entry's own wait, and the
+    /// items after it, an ECU's late final answer, by the log afterwards. Returns the log's lines
+    async fn presence_own_wait_run(script: &'static [Step]) -> Vec<serde_json::Value> {
+        let dir = journal_dir("presence-own-wait");
+        let script = vec![(When::After(Duration::ZERO), StartEvent::Script(script))];
+        let (mut client, fake) =
+            fake_worker_scripted(CancelAnswer::Done, None, true, false, script).await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let table = vec![(0x7E0, 0x7E8), (0x7E1, 0x7E9)];
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8).functional(0x7DF, table.clone());
+        let mut link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        // The worker passes every pending on; the fake's answer does not say.
+        link.forwards_pendings = Some(true);
+        log.begin(
+            &crate::comm_log::RunFacts {
+                job_id: "own-wait".to_owned(),
+                generation: 1,
+                kind: crate::comm_log::JobKind::Procedure,
+                plan_sha256: None,
+                document_sha256: None,
+                variant_name: None,
+                target_vin: None,
+                writes: false,
+                vci: None,
+                margins: crate::comm_log::VciMargins {
+                    timing_margin_us: Some(2_000),
+                    drift_bound_ppm: Some(100),
+                    clock_margin_us: Some(1_000),
+                },
+            },
+            crate::comm_log::RunKind::First,
+        );
+        // The link the log judges windows on: P2* 5 s, pendings forwarded, a transmit indication.
+        log.link_opened(
+            1,
+            &config,
+            &[],
+            link::Indications {
+                transmit: true,
+                start_of_message: true,
+                ..Default::default()
+            },
+            link.forwards_pendings,
+        );
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_secs(5),
+        };
+        let released = Arc::clone(&fake.released);
+        let read_dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(config.tx_id, config.rx_id);
+            host.set_receive_table(table);
+            host.own_reads(Some(OwnRead::Identification));
+            // The finished status ends the window within the host's own wait.
+            let first = host.presence(&[0x3E, 0x00]);
+            assert!(first.end.is_ok(), "{:?}", first.end);
+            released.add_permits(1);
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                host.settle_at_end();
+                let lines = comm_log_lines(&read_dir);
+                if lines
+                    .iter()
+                    .any(|line| line["event"] == "late_response" || line["event"] == "unattached")
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < until,
+                    "no late answer written: {lines:#?}"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// ADR-438: a functional presence window the host's own wait ends with a pending on 7E8 and
+    /// the finished status, 5 s after the pending (the limit the pending put in force), keeps the
+    /// finished time on its entry (not written, so the window's judgement shows it), so the window is judged at its limit and the ECU's final
+    /// answer past it is the vehicle's.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_own_wait_window_with_a_lone_pending_keeps_its_finished_time_for_the_late_final() {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::From(Bound::Own, 203_000, 0x7E8, &[0x7F, 0x3E, 0x78]),
+            Step::FinishAt(5_203_000),
+            Step::Release,
+            Step::From(Bound::Earlier, 9_000_000, 0x7E8, &[0x7E, 0x00]),
+        ];
+        let lines = presence_own_wait_run(SCRIPT).await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 1, "{lines:#?}");
+        let entry = &exchanges[0];
+        assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["exchanges"][0]["classification"], "vehicle",
+            "{lines:#?}"
+        );
     }
 
     /// Asserts that `lines` hold two presence exchanges, that the ECU's final answer on

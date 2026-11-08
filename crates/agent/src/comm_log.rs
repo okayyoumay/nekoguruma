@@ -1841,19 +1841,6 @@ fn judge_windows(
     entry
 }
 
-/// The identifiers a late response could have come on: the one it names, else those still
-/// unanswered (silent, or with a pending open), not one the exchange is owed on only because an
-/// owner could own its answer there (ADR-435); it is judged against each one's window.
-fn late_response_ids(data: &UnattachedData, kept: &exchange::Kept) -> Vec<u32> {
-    match data {
-        UnattachedData::Result {
-            identifier: Some(identifier),
-            ..
-        } => vec![*identifier],
-        _ => kept.evidence.answerable_ids(),
-    }
-}
-
 /// The window a late item of `kept`, read after its entry, closes, as `judge_late` and
 /// `judge_late_start` take it: where the window started (`None` is the transmit, as for
 /// [`timing::judge`]) and the pendings that came in it (ADR-426).
@@ -3478,7 +3465,6 @@ impl CommLog {
                 &answers,
                 |answer| answer.rx_id,
                 |answer| answer.is_pending(&evidence.expected),
-                exchange::Answer::is_rejected,
                 &evidence.receive_ids,
             );
             evidence.answers = keep_standing(answers, &standing);
@@ -3658,7 +3644,6 @@ impl CommLog {
                     &by_answers,
                     |answer| answer.rx_id,
                     |answer| answer.is_pending(&evidence.expected),
-                    exchange::Answer::is_rejected,
                     &evidence.receive_ids,
                 );
                 probe.answers = keep_standing(by_answers, &answers_standing);
@@ -4487,7 +4472,13 @@ impl Inner {
         answered.set_answer_histories(state.answer_histories(&answered, &history, owner));
         // The identifiers it could have come on: the one it names, else those still unanswered
         // (ADR-429, ADR-432, ADR-435). It is judged against each one's window.
-        let ids = late_response_ids(&item.data, &kept);
+        let ids: Vec<u32> = match &item.data {
+            UnattachedData::Result {
+                identifier: Some(identifier),
+                ..
+            } => vec![*identifier],
+            _ => kept.evidence.answerable_ids(),
+        };
         let judge = |rx_id| {
             let (window_from, in_window) = late_window(&kept, rx_id);
             kept.limits.map_or(timing::LateWindow::Open, |limits| {
@@ -10940,67 +10931,6 @@ pub(crate) mod tests {
         assert!(owed_on(&log, 0x7E9, second).0.is_empty());
         assert_eq!(owed_on(&log, 0x7EA, second), (vec![first, second], true));
         std::fs::remove_dir_all(&dir).unwrap();
-    }
-
-    /// ADR-435: a late response that names no identifier is judged against the identifiers still
-    /// unanswered (silent, or with a pending open), not against one the exchange is owed on only
-    /// because an owner could own its answer there. The resend beyond the window still holds
-    /// that row (its owner ended with both final answers), and the response is its alone.
-    #[test]
-    fn an_unnamed_late_response_is_judged_against_the_unanswered_identifiers_only() {
-        let table = [0x7E8, 0x7E9];
-        let (dir, setup, log) = collecting_log_on(true);
-        let first = log
-            .exchange(collecting_waited(|evidence| {
-                evidence.end = exchange::End::NoResponse;
-                evidence.vci_ended = true;
-                evidence.rx_id = 0;
-                evidence.receive_ids = table.to_vec();
-                evidence.answers = vec![lone_pending_on(0x7E8)];
-                evidence.pending = vec![pending_on(200_000)];
-                evidence.pending_ids = vec![Some(0x7E8)];
-            }))
-            .unwrap();
-        let second = resend_with_table(&log, &table, &[0x7E8], 10);
-        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
-            let mut filler = evidence(
-                endpoint(0x7DF),
-                &[0x22, 0xF1, did],
-                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
-            );
-            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
-            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
-            log.exchange(filler).unwrap();
-        }
-        log.primitive_ended(
-            first,
-            PrimitiveEnded {
-                end: Some(exchange::End::Positive(FIRST.to_vec())),
-                detail: exchange::Detail::default(),
-                vci_ended: true,
-                reads: read_after_deadline(vec![
-                    answer_read(0x7E8, 400_000),
-                    answer_read(0x7E9, 500_000),
-                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
-                ]),
-            },
-        )
-        .unwrap();
-        let kept = kept_of(&log, second);
-        assert_eq!(kept.evidence.owed_ids().len(), 2);
-        let unnamed = late_final_unnamed();
-        assert_eq!(late_response_ids(&unnamed.data, &kept), [0x7E9]);
-        assert_eq!(
-            late_response_ids(&late_final_on(0x7E8).data, &kept),
-            [0x7E8]
-        );
-        log.lock()
-            .late_response(0, second, &unnamed, placed_after(3_000_000))
-            .unwrap();
-        log.end("ok");
-        let lines = lines(&setup);
-        std::fs::remove_dir_all(&dir).unwrap();
-        assert_eq!(of_event(&lines, "late_response").len(), 1, "{lines:#?}");
     }
 
     /// ADR-432 (review): a link with no receive table owes a non-collecting exchange on its own

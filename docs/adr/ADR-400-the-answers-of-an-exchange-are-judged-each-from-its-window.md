@@ -1,7 +1,7 @@
 # ADR-400: The Answers of an Exchange Are Judged Each From Its Own Window
 
 **Date:** 2026-10-31
-**Status:** Accepted (Consequences on settling entries superseded by ADR-425)
+**Status:** Accepted (Consequences on settling entries superseded by ADR-425; decision 4(B) applied to a window the agent's deadline ended by ADR-434)
 **Affects:** `agent` (`host`, `comm_log` `exchange`, `timing`, `comm_log`), `sim-ecu`
 (`Fault::RepeatResponse`), `sim-vci`, `j2534-0404-service` tests; design 8.11 "Exchange entry"
 (`answers`, `timing`) and "Classification"; ADR-327 item 2, ADR-361, ADR-376, ADR-396 item 4

@@ -506,7 +506,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   agent's own deadline, not the
   worker's receive timeout, ends an exchange with no response, the entry's outcome is
   `vci_did_not_end` (`deadline_end`), classified `undetermined`, since the limit in force may not
-  have run out, with or without a pending; a pending then silence is `vehicle` only when the
+  have run out, with or without a pending (a collecting request with answers is the exception:
+  it takes the most severe of its answers' classifications, at least `undetermined` with the
+  deadline named as an open reading, ADR-434); a pending then silence is `vehicle` only when the
   VCI ended the wait. It is `system` when the send was confirmed, the link's start-of-message
   indications are on and showed no response under way (none attached, none bound to the
   primitive, which the host notes, none unbound that names no identifier or the link's

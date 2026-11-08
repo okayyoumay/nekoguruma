@@ -1667,6 +1667,21 @@ fn answer_carrier(
     ))
 }
 
+/// The transmit done the first of `fresh` that carries one gives a collecting exchange, placed
+/// from where that answer ended, as `exchange_with` takes it; `fresh_placed` is where each ended.
+/// The one rule `primitive_ended` shares for the entry and for the items it places before it.
+fn carried_tx_done_of(
+    fresh: &[exchange::Answer],
+    fresh_placed: &[Option<clocks::Placed>],
+) -> Option<exchange::VciTime> {
+    answer_carrier(fresh, fresh_placed).map(|(time, anchor)| match (time.clock, anchor) {
+        (Some(clock), Some((own, end))) if clock == own => {
+            time.at(Some(clocks::before(end, time.us)))
+        }
+        _ => time.at(None),
+    })
+}
+
 /// The elements of `items` whose place `standing` marks.
 fn keep_standing<T>(items: Vec<T>, standing: &[bool]) -> Vec<T> {
     items
@@ -3029,8 +3044,12 @@ impl CommLog {
 
     /// Writes the link errors the host read at job end that no exchange's end carries (design
     /// 8.11 `late_item`, ADR-386): for a primitive left with no entry to write, because its
-    /// exchange has none, its handle was invalid, or its cancel failed with no end read. Each is
-    /// placed once in the order given, takes no owner, and is a `late_item` or `unattached`.
+    /// exchange has none, its handle was invalid, or its cancel failed with no end read, and the
+    /// other unbound items read with them. Each is placed once in the order given. A link error
+    /// takes no owner and is a `late_item` or `unattached`; any other item is placed as an
+    /// exchange places its unbound items. `stray` is the exchange of the primitive that has no
+    /// entry, when there is one: if the log keeps it with the VCI's end not shown, it is the
+    /// exchange in flight that read the items, not an owner; otherwise no exchange is in flight.
     /// `None` once the log has failed.
     pub(crate) fn late_link_errors(
         &self,
@@ -3063,7 +3082,7 @@ impl CommLog {
             })
         });
         // In the order the host read them: a link error as at a job end, any other item as an
-        // exchange places its unbound items (ADR-397), with no exchange in flight.
+        // exchange places its unbound items (ADR-397), with the stray in flight if it is kept.
         for (index, read) in reads.iter().enumerate() {
             let EndItem::Unattached(item) = &read.item else {
                 inner.job_end_link_errors(
@@ -3203,8 +3222,35 @@ impl CommLog {
             .end
             .as_ref()
             .is_some_and(|end| end.response().is_some());
-        let own_starts = transmit_starts(
-            [kept.evidence.times.vci.and_then(|vci| vci.tx_done)]
+        // The transmit done a collecting primitive's answer read after the deadline carries,
+        // when the entry had none (as `exchange_with` takes it from the first answer that has
+        // one): the same one the entry takes.
+        let pre_carried = (kept.evidence.collecting
+            && kept
+                .evidence
+                .times
+                .vci
+                .and_then(|vci| vci.tx_done)
+                .is_none())
+        .then(|| {
+            let (fresh, fresh_placed): (Vec<_>, Vec<_>) = ended
+                .reads
+                .iter()
+                .zip(&placed)
+                .filter_map(|(read, placed)| match &read.item {
+                    EndItem::Answer(answer) => Some((answer.clone(), placed.time)),
+                    _ => None,
+                })
+                .unzip();
+            carried_tx_done_of(&fresh, &fresh_placed)
+        })
+        .flatten();
+        let own_starts =
+            transmit_starts(
+                [
+                    kept.evidence.times.vci.and_then(|vci| vci.tx_done),
+                    pre_carried,
+                ]
                 .into_iter()
                 .chain(ended.reads.iter().zip(&placed).flat_map(
                     |(read, placed)| match &read.item {
@@ -3215,7 +3261,7 @@ impl CommLog {
                         _ => Vec::new(),
                     },
                 )),
-        );
+            );
         let in_flight = in_flight_of(&kept.evidence, own_starts);
         let mut in_wait = Vec::new();
         for (index, (read, placed)) in ended.reads.iter().zip(&placed).enumerate() {
@@ -3492,29 +3538,7 @@ impl CommLog {
         if collecting {
             evidence.pending_ids = pending_ids;
             let mut answers = std::mem::take(&mut evidence.answers);
-            let (fresh, fresh_placed): (Vec<_>, Vec<_>) = new_answers
-                .iter()
-                .map(|(_, _, answer, placed)| ((*answer).clone(), *placed))
-                .unzip();
-            // The transmit done an answer read after the deadline carries, when the entry had
-            // none (as `exchange_with` takes it from the first answer that has one).
-            if kept
-                .evidence
-                .times
-                .vci
-                .and_then(|vci| vci.tx_done)
-                .is_none()
-            {
-                carried_tx_done =
-                    answer_carrier(&fresh, &fresh_placed).map(|(time, anchor)| {
-                        match (time.clock, anchor) {
-                            (Some(clock), Some((own, end))) if clock == own => {
-                                time.at(Some(clocks::before(end, time.us)))
-                            }
-                            _ => time.at(None),
-                        }
-                    });
-            }
+            carried_tx_done = pre_carried;
             for (index, read, answer, placed) in new_answers {
                 let mut answer = answer.clone();
                 // The answer's agent time is when the host read it.
@@ -20531,5 +20555,89 @@ pub(crate) mod tests {
             ["unattached", "primitive_ended"],
             "{lines:#?}"
         );
+    }
+
+    /// An indication bound to the primitive gives the stray's own transmit done, as it does an
+    /// exchange's: a start before it is the earlier exchange's `late_item`.
+    #[test]
+    fn a_transmit_indication_bound_to_the_primitive_places_an_indication_before_the_send() {
+        let (dir, setup, log, firsts, seq) =
+            stray_log_after_with(&[&[0x22, 0xF1, 0x90]], &[0x22, 0xF1, 0x91], false);
+        log.primitive_ended(
+            seq,
+            ended_with(
+                positive(),
+                vec![
+                    unbound_start(300_000, 9_000),
+                    end_read(400_000, EndItem::TxIndication(dev(10_000))),
+                    response_read(600_000, 510_500),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["late_item", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([firsts[0]]), "{late}");
+    }
+
+    /// A transmit done on a `Response` item counts only when the end is the stray's response:
+    /// for an end that is not, the start stays one the stray in flight could own.
+    #[test]
+    fn a_response_item_of_an_end_that_is_not_a_response_gives_no_transmit_done() {
+        let (dir, setup, log, firsts, seq) =
+            stray_log_after_with(&[&[0x22, 0xF1, 0x90]], &[0x22, 0xF1, 0x91], false);
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                vec![
+                    unbound_start(300_000, 9_000),
+                    end_read(
+                        600_000,
+                        EndItem::Response {
+                            end: dev(510_500),
+                            tx_done: Some(dev(10_000)),
+                            rx_start: None,
+                        },
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "late_item", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([firsts[0]]), "{late}");
+    }
+
+    /// The drain for a stray still in flight, with an earlier exchange that could own the same
+    /// pending: the pending is `unattached`, the earlier exchange alone is named in a
+    /// `late_item` and raised to at least `undetermined`; the stray is not named.
+    #[test]
+    fn the_drain_counts_a_stray_in_flight_as_the_exchange_that_read_the_item() {
+        let (dir, setup, log, first, seq) =
+            stray_log_behind(&[0x22, 0xF1, 0x90], &[0x22, 0xF1, 0x91]);
+        log.late_link_errors(
+            vec![unbound_item(700_000, 1_020_000, 0x7E8, &[0x7F, 0x22, 0x78])],
+            Some(seq),
+        )
+        .unwrap();
+        assert!(
+            log.lock().links[0].1.standing(first).unwrap()
+                >= exchange::Classification::Undetermined
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(order_of(&lines), ["unattached", "late_item"], "{lines:#?}");
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
     }
 }

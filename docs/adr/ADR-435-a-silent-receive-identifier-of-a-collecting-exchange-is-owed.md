@@ -43,10 +43,11 @@ VCI ended the window.
    from settling it.
 3. **A final answer that names no identifier covers none.** The exchange is owed on every table
    identifier with no named final answer. An unnamed late final answer is keyed on the one
-   identifier the exchange is owed on when there is exactly one, which folds that identifier's
-   pending and covers it; with several owed it is appended unnamed and settles none, and the
-   final answers that name an identifier settle them. This reads ADR-433 decision 6's "open" as
-   "owed".
+   identifier that is unanswered (silent, or with a pending open) when there is exactly one,
+   which folds that identifier's pending and covers it; an identifier owed only because an
+   owner could own a final answer there does not count (`Evidence::unanswered_ids`). With
+   several unanswered it is appended unnamed and settles none, and the final answers that name
+   an identifier settle them. This reads ADR-433 decision 6's "open" as "unanswered".
 4. **The release after `primitive_ended` is ADR-431's, unchanged.** A silent identifier alone
    keeps no record: the exchange is kept when a pending is open or the renewed evidence shows
    the VCI ended its wait (a receive timeout, or the finished status of an answered window), and
@@ -57,6 +58,19 @@ VCI ended the window.
    one identifier and a silent one still has that answer's time, which ADR-384's test of a late
    link error against the answer reads.
 
+6. **The rows follow the owners as they are now.** An exchange that stays owed re-derives its
+   rows from its answers' histories whenever a settlement frees an answer of it
+   (`LinkState::reclassify_one`, through `refresh_owed_rows`, which also refreshes the evidence
+   the log kept), and `late_response` takes the histories of the restated answers again before
+   it sets the rows, as `primitive_ended` does. An identifier an exchange was owed on only
+   because an owner could own its final answer there goes when that owner no longer can, and
+   the identifiers dropped free the later answers on them; an exchange left with no row is owed
+   no more, like one placed alone.
+7. **A result the worker rejected is no answer** (ADR-359): when nothing else is owed, an
+   exchange whose end is a rejected result is owed on every table identifier, as one with no
+   answer is, since it is not settled either. A final answer delivered late is a usable
+   response, so the restated evidence no longer carries the rejection.
+
 ## Consequences
 
 - A resend that is silent on an identifier the first exchange is owed on shares the ownership
@@ -64,10 +78,7 @@ VCI ended the window.
   are at least `undetermined` (design 8.11 "Owed request"). More resends are `undetermined`;
   the owed rows of a presence exchange grow to the size of the table. The two runner tests of
   a pending read in the resend's wait and of a silent presence exchange assert this outcome.
-- A later exchange that was given an owned-final row keeps it after its owner settles that
-  identifier while it is still owed on a silent one, since it is then not placed alone; the
-  row is dropped when the exchange itself settles. This is accepted here.
 - ADR-432's deferred bullet on an identifier that stays silent beside another's final answer is
   closed, and ADR-433's Consequence that it stands is superseded by decision 1. ADR-429
-  decision 2 and ADR-432 decision 2 are annotated; ADR-433 decision 6 and Consequences are
-  annotated.
+  decision 2, ADR-432 decision 2 and ADR-433 decision 6 and Consequences are marked as
+  superseded in their Status lines.

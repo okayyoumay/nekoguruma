@@ -3708,9 +3708,9 @@ impl CommLog {
         let mut dropped: Vec<u32> = Vec::new();
         if !final_response {
             // Still owed, collecting or not: on the identifiers it is owed on (a pending
-            // open, or no final answer, ADR-435) after what was read, and a late item is judged against the answers read after the deadline,
-            // with the send and the transmit they show, and whether the VCI ended (ADR-429,
-            // ADR-431).
+            // open, or no final answer, ADR-435) after what was read, and a late item is
+            // judged against the answers read after the deadline, with the send and the
+            // transmit they show, and whether the VCI ended (ADR-429, ADR-431).
             let state = &mut inner.links[at].1;
             let rows = state.owed_row_ids(seq);
             state.renew_owed(
@@ -4464,8 +4464,12 @@ impl Inner {
                 .map_or(kept.evidence.times.agent.end_us, |read| read.monotonic_us),
         };
         let time = item.clock.zip(placed);
-        let (answered, answer_order, answer_ends) = kept.answered_placed(bytes, &late, time);
+        let (mut answered, answer_order, answer_ends) = kept.answered_placed(bytes, &late, time);
         let history = state.history_settling(&answered, owner);
+        // Each answer's owners follow the owed requests as they are now, as at a
+        // `primitive_ended` (ADR-400 item 4), so the rows below do not keep an identifier an
+        // earlier owner has since let go of (ADR-435).
+        answered.set_answer_histories(state.answer_histories(&answered, &history, owner));
         // The identifiers it could have come on: the one it names, else those the exchange is
         // owed on (ADR-429, ADR-432). It is judged against each one's window.
         let ids: Vec<u32> = match &item.data {
@@ -10706,6 +10710,170 @@ pub(crate) mod tests {
         assert_eq!(entries[1]["classification"], "undetermined", "{entries:#?}");
     }
 
+    /// A functional exchange on the table `table` that the agent's deadline ended, with the
+    /// final answers `answered` (identifier, microseconds after the transmit), sent `after_s`
+    /// seconds after the first one's start.
+    fn resend_with_table(log: &CommLog, table: &[u32], answered: &[u32], after_s: u64) -> u64 {
+        let mut resend = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = answered
+                .iter()
+                .zip(20_000..)
+                .map(|(&id, at)| positive_on(id, at))
+                .collect();
+            evidence.rx_id = 0;
+            evidence.receive_ids = table.to_vec();
+        });
+        resend.times.agent.before_us += after_s * 1_000_000;
+        resend.times.agent.end_us += after_s * 1_000_000;
+        log.exchange(resend).unwrap()
+    }
+
+    /// ADR-435: a resend owed on an identifier only because the first exchange could own its
+    /// final answer there loses that row once the first exchange has its own final answer on it;
+    /// the third send's answer there has no owner (design 8.11 "Owed request").
+    #[test]
+    fn a_resend_loses_the_owned_row_once_the_owner_has_its_own_final_answer() {
+        let (dir, _setup, log, first) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        let second = resend_answered_on(&log, true, 0x7E8, 10);
+        assert_eq!(answer_owners(&log, second), [first]);
+        assert_eq!(owed_on(&log, 0x7E8, first).0, vec![first, second]);
+        // A send logged before the first exchange ends: its answer has both as owners now.
+        let between = resend_answered_on(&log, true, 0x7E8, 15);
+        let mut owners = answer_owners(&log, between);
+        owners.sort_unstable();
+        assert_eq!(owners, [first, second]);
+        log.primitive_ended(
+            first,
+            PrimitiveEnded {
+                end: Some(exchange::End::Positive(FIRST.to_vec())),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    answer_read(0x7E8, 400_000),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        // The first exchange has a final answer of its own on 0x7E8; the resend is owed there no
+        // more, and both stay owed on the silent 0x7E9.
+        assert!(owed_on(&log, 0x7E8, first).0.is_empty());
+        assert_eq!(owed_on(&log, 0x7E9, first).0, vec![first, second, between]);
+        // The identifiers the resend let go of free the answers after it from it too.
+        assert!(answer_owners(&log, between).is_empty());
+        assert!(
+            log.lock().links[0]
+                .1
+                .logged_history(between)
+                .is_some_and(|history| !history.owners.contains(&second))
+        );
+        let third = resend_answered_on(&log, true, 0x7E8, 20);
+        assert!(answer_owners(&log, third).is_empty());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-435: on a three-identifier table, a partial late settlement of a resend does not
+    /// bring back the row its owner's own final answer took away.
+    #[test]
+    fn a_partial_late_settlement_does_not_restore_a_row_the_owner_let_go_of() {
+        let table = [0x7E8, 0x7E9, 0x7EA];
+        let (dir, _setup, log) = collecting_log_on(true);
+        let first = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.rx_id = 0;
+                evidence.receive_ids = table.to_vec();
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            }))
+            .unwrap();
+        let second = resend_with_table(&log, &table, &[0x7E8], 10);
+        assert_eq!(owed_on(&log, 0x7E8, first).0, vec![first, second]);
+        // The first exchange's own final answers on 0x7E8 and 0x7E9 come at its end.
+        log.primitive_ended(
+            first,
+            PrimitiveEnded {
+                end: Some(exchange::End::Positive(FIRST.to_vec())),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    answer_read(0x7E8, 400_000),
+                    answer_read(0x7E9, 500_000),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        assert!(owed_on(&log, 0x7E8, second).0.is_empty());
+        assert_eq!(owed_on(&log, 0x7EA, second).0, vec![first, second]);
+        // 0x7E9's final answer is the resend's alone to own; it stays owed on 0x7EA.
+        log.lock()
+            .late_response(0, second, &late_final_on(0x7E9), placed_after(3_000_000))
+            .unwrap();
+        assert!(owed_on(&log, 0x7E8, second).0.is_empty());
+        assert!(owed_on(&log, 0x7E9, second).0.is_empty());
+        assert_eq!(owed_on(&log, 0x7EA, second), (vec![first, second], true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-435: a result the worker rejected is no answer: with the table covered by named final
+    /// answers the exchange is still owed on every identifier, and a final answer delivered late
+    /// settles it.
+    #[test]
+    fn a_rejected_end_with_the_table_covered_stays_owed_until_a_late_final_answer() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.vci_ended = true;
+            evidence.end_rejected = true;
+            evidence.answers = vec![positive_on(0x7E8, 100_000), positive_on(0x7E9, 200_000)];
+        });
+        assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
+        assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+        assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(of_event(&lines, "late_response").len(), 1, "{lines:#?}");
+    }
+
+    /// ADR-384, ADR-435: an exchange with a final answer on one identifier and a pending open on
+    /// another is not settled, yet the time of its answer is its final answer's (a collecting
+    /// entry has no placed time), not the pending's, which a late link error is tested against.
+    #[test]
+    fn a_half_answered_exchange_takes_its_final_answers_time_not_the_pendings() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, |_| {});
+        let mut items = pending_reads(0x7E8, 200_000);
+        items.push(answer_read(0x7E9, 400_000));
+        items.push(EndItem::Finished(device_time(BASE_US + 1_400_000)));
+        log.primitive_ended(
+            seq,
+            PrimitiveEnded {
+                end: Some(exchange::End::Positive(FIRST.to_vec())),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(items),
+            },
+        )
+        .unwrap();
+        let kept = kept_of(&log, seq);
+        assert!(!kept.evidence.settles_owed());
+        assert_eq!(kept.answer_at, exchange::AnswerTime::Unknown);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// ADR-432 (review): a link with no receive table owes a non-collecting exchange on its own
     /// identifier whatever its answers name, so unnamed results do not move it to identifier 0.
     #[test]
@@ -10980,10 +11148,9 @@ pub(crate) mod tests {
                 vec![seq]
             };
             assert_eq!(owed_on(&log, 0x7E9, seq), (owners, true), "{functional}");
-            // The later exchange keeps the row it got for 0x7E8 while it is owed on the silent
-            // 0x7E9 (it is not placed alone then, ADR-435).
-            let on_7e8 = if functional { vec![resent] } else { Vec::new() };
-            assert_eq!(owed_on(&log, 0x7E8, seq).0, on_7e8, "{functional}");
+            // The later exchange is still owed on the silent 0x7E9, but its row for 0x7E8 went
+            // with the owner that could own its answer there (ADR-435).
+            assert!(owed_on(&log, 0x7E8, seq).0.is_empty(), "{functional}");
             // The kept evidence is the one read after the deadline.
             assert_eq!(kept_of(&log, seq).evidence.answers.len(), 2);
             // The exchange is owed on 0x7E8 no more: that answer of the later exchange is freed.

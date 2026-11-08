@@ -8,6 +8,7 @@ description: >
   for a single quick `cargo check -p <crate>` the caller can run directly.
 tools: Bash, Read, Grep, Glob
 model: haiku
+effort: low
 omitClaudeMd: true
 maxTurns: 50
 ---

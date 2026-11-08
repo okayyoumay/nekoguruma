@@ -18,7 +18,7 @@ capability unless the user asks for one.
 | Agent | Model (effort) | Tools | Use for |
 |---|---|---|---|
 | `code-scout` | haiku | read-only | Fan-out searches across many crates or docs; returns conclusions and `path:line`, never file dumps |
-| `cargo-runner` | haiku | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files; runs `cargo clean` before a workspace-wide run when less than 10 GB is free |
+| `cargo-runner` | haiku (low) | Bash + read-only | Builds, tests, clippy and fmt with long output; returns a compact pass/fail summary. Never edits files; runs `cargo clean` before a workspace-wide run when less than 10 GB is free |
 | `doc-sync-checker` | sonnet (medium) | Bash (git read) + read-only | Pre-commit audit of the diff against CLAUDE.md's documentation-sync table, the `work/` rule and the spec copyright rule |
 | `scope-shaper` | sonnet (high) | read-only | Turns a fuzzy or oversized request into a minimal scope with acceptance criteria |
 | `implementer` | sonnet (medium) | Bash + edit | Code, tests and doc edits from a distilled brief |
@@ -31,8 +31,11 @@ Each tier is used for what it does best, following the official model descriptio
 when a new model generation ships, since the price ratios between tiers move:
 
 - **Haiku** (`code-scout`, `cargo-runner`): mechanical work with a short report (locating code,
-  running commands). It is the cheapest tier, has a 200K context window and carries no
-  `effort` key (unsupported there), so it gets the agents whose output needs no judgment.
+  running commands). It is the cheapest tier, so it gets the agents whose output needs no
+  judgment. `code-scout` runs at Haiku's default effort (`medium`), since judging which match
+  answers the question still takes some reasoning; `cargo-runner` runs at `low`, which the
+  official effort guidance suggests for simple subagent work, since it only runs commands and
+  summarizes their output.
 - **Sonnet** (`scope-shaper`, `implementer`, `doc-sync-checker`): everyday reasoning at a
   fifth of the top tier's price. `implementer` runs at `medium`, which fits implementation
   from a distilled brief; `scope-shaper` at `high` for the scoping judgment. `doc-sync-checker`
@@ -127,10 +130,11 @@ delegated (the final commit and push) or a single targeted read to check an agen
 Claude Code also offers built-in agents. They are not pinned by this configuration, so route
 around the expensive ones:
 
-- **`Explore`** runs on the session model (Opus by default). For read-only searches, use
-  `code-scout` (Haiku) instead; use `Explore` only when the user asks for it.
-- **`Plan`, `general-purpose` and `claude`** use `CLAUDE_CODE_SUBAGENT_MODEL`, which
-  `settings.json` sets to `sonnet`. Prefer a project agent when one fits the task.
+- **`Explore`** and **`Plan`** run on the session model (Opus by default);
+  `CLAUDE_CODE_SUBAGENT_MODEL` does not change them. For read-only searches, use `code-scout`
+  (Haiku) instead; use `Explore` or `Plan` only when the user asks for it.
+- **`general-purpose` and `claude`** use `CLAUDE_CODE_SUBAGENT_MODEL`, which `settings.json`
+  sets to `sonnet`. Prefer a project agent when one fits the task.
 - Forks (`/subtask`) inherit the session model and history. They reuse the parent's prompt
   cache, so they suit a short side task that needs the conversation's context; for anything
   that a brief can describe, a pinned agent is cheaper.

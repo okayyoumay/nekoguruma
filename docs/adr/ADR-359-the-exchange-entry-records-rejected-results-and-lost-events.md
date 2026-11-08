@@ -1,7 +1,7 @@
 # ADR-359: The Exchange Entry Records Rejected Results and Lost Events
 
 **Date:** 2026-10-26
-**Status:** Accepted
+**Status:** Accepted (item 3 extended by ADR-437: a collecting request lists its rejected results among its answers, and its end is a rejected result only while no usable answer stands)
 **Affects:** `agent` host (`host.rs` `Progress::on_event`, `RejectedRead`, `is_indication`) and
 communication log (`comm_log/exchange.rs` `Rejected`, `RejectedItem`, `EventsLost`, the exchange
 entry), `sim-ecu` (`Fault::TruncateResponse`), `crates/agent/docs/ngr-agent.md`,

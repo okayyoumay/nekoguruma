@@ -1524,18 +1524,27 @@ impl<C: WorkerApi> WorkerHost<C> {
                 Vec::new()
             };
             // A collecting request that ended on its own has the end of its first standing answer
-            // that is not a pending, or no response (ADR-396, ADR-429); any other end is judged as for any request.
-            let (end, mut detail) = match &sent.result {
-                Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => (
-                    crate::comm_log::exchange::collecting_end(&answers, &expected),
-                    Detail::default(),
-                ),
-                _ => sent_end(&request, &sent.result, &negative, sid),
+            // that is neither a pending nor a rejected result, else the first rejected result's,
+            // or no response (ADR-396, ADR-429, ADR-437); any other end is judged as for any
+            // request.
+            // The same rule says whether that end is a rejected result, which is no answer of the
+            // request (ADR-437).
+            let (end, mut detail, collected_rejected) = match &sent.result {
+                Ok(_) | Err(HostError::NoResponse) if collecting && !sent.agent_deadline => {
+                    let (end, rejected) =
+                        crate::comm_log::exchange::collecting_end(&answers, &expected);
+                    (end, Detail::default(), Some(rejected))
+                }
+                _ => {
+                    let (end, detail) = sent_end(&request, &sent.result, &negative, sid);
+                    (end, detail, None)
+                }
             };
             detail.cop_type = start_comm.then_some("startcomm");
             let end = deadline_end(end, sent.agent_deadline);
             let end = unanswered_end(end, &sent);
-            let end_rejected = matches!(end, End::PositiveUnusable(_)) && sent.result.is_err();
+            let end_rejected = collected_rejected
+                .unwrap_or(matches!(end, End::PositiveUnusable(_)) && sent.result.is_err());
             let (link_errors, error_at) = events_seen(&sent, &mut detail);
             // A response's times only for an exchange that ended with that response: one read
             // before the agent's deadline, lost events or a lost VCI ended the wait is not the
@@ -1989,6 +1998,11 @@ impl<C: WorkerApi> WorkerHost<C> {
                 };
             }
         };
+        let expected = Expected {
+            positive_prefix: progress.positive_prefix.clone(),
+            negative_pattern: progress.negative.pattern(progress.sid),
+        };
+        let (negative, sid) = (progress.negative.clone(), progress.sid);
         let sent = self.exchange(request.to_vec(), progress, before);
         // A window that ends with no answer is the silent outcome, not a failure; one the
         // agent's deadline ended is, since the VCI did not end it.
@@ -1998,14 +2012,16 @@ impl<C: WorkerApi> WorkerHost<C> {
             Err(error) => Err(error),
         };
         // Only an identifier of the table marks presence (ADR-396); the log lists every result.
-        let answers = collected_answers(&sent.collected, &self.receive_table)
-            .into_iter()
-            .filter_map(|(rx_id, read)| {
-                let rx_id =
-                    rx_id.filter(|id| self.receive_table.iter().any(|&(_, rx)| rx == *id))?;
-                Some((rx_id, read.bytes.clone()))
-            })
-            .collect();
+        let answers = presence_answers(
+            &answer_items(
+                &sent.collected,
+                &self.receive_table,
+                &expected,
+                &negative,
+                sid,
+            ),
+            &self.receive_table,
+        );
         Presence { answers, end }
     }
 
@@ -3381,7 +3397,6 @@ struct CollectedRead {
     clock: Option<Clock>,
     start_us: Option<u64>,
     tx_done_us: Option<u64>,
-    pending: bool,
     read: Option<AgentNow>,
 }
 
@@ -3408,29 +3423,53 @@ fn response_id(identifier: Option<u32>, unique: u32, table: &[(u32, u32)]) -> Op
         })
 }
 
-/// The answers a collecting primitive read, in order, each with the response identifier it came
-/// on: every result that is not a pending, and a pending only when no result came on its
-/// identifier after it (a pending followed by its final answer is one answer). A result's
-/// identifier is the header's, else the table entry its unique-response number names, else the
-/// table's only pair; `None` when the worker gave none of these (ADR-396). A pending that names
-/// no identifier also leaves once the final answers cover the table (ADR-433).
-fn collected_answers<'a>(
-    collected: &'a [CollectedRead],
+/// The answers of a primitive as its exchange entry lists them, each with the end its bytes have
+/// against the request's expected answer, in the order they were read, each with the response
+/// identifier it came on (0 when it names none): every result that is not a pending, and a
+/// pending only when no result usable as an answer came on its identifier after it (a pending
+/// followed by its final answer is one answer; a rejected result folds none, ADR-437). A
+/// result's identifier is the header's, else the table entry its unique-response number names,
+/// else the table's only pair; `None` when the worker gave none of these (ADR-396). A pending
+/// that names no identifier also leaves once the final answers cover the table (ADR-433), which a
+/// rejected result does not. The log places them in time and classifies them (ADR-400). The
+/// results are judged once, into [`Answer`]s, and the one fold of
+/// [`standing_answers_covering`](crate::comm_log::exchange::standing_answers_covering) reads
+/// them, as the log's restatements do.
+fn answer_items(
+    collected: &[CollectedRead],
     table: &[(u32, u32)],
-) -> Vec<(Option<u32>, &'a CollectedRead)> {
-    let id_of = |read: &CollectedRead| response_id(read.identifier, read.unique, table);
+    expected: &Expected,
+    negative: &NegativeShape,
+    sid: u8,
+) -> Vec<Answer> {
+    let all: Vec<Answer> = collected
+        .iter()
+        .map(|read| {
+            let rx_id = response_id(read.identifier, read.unique, table);
+            answer_of(read, rx_id, &expected.positive_prefix, negative, sid)
+        })
+        .collect();
     let rx_ids: Vec<u32> = table.iter().map(|&(_, rx)| rx).collect();
     let standing = crate::comm_log::exchange::standing_answers_covering(
-        collected,
-        |read| id_of(read).unwrap_or(0),
-        |read| read.pending,
+        &all,
+        |answer| answer.rx_id,
+        |answer| answer.is_pending(expected),
+        Answer::is_rejected,
         &rx_ids,
     );
-    collected
-        .iter()
+    all.into_iter()
         .zip(standing)
-        .filter(|&(_, standing)| standing)
-        .map(|(read, _)| (id_of(read), read))
+        .filter_map(|(answer, standing)| standing.then_some(answer))
+        .collect()
+}
+
+/// The answers a presence request counts: those on an identifier of the receive table (ADR-396),
+/// with their bytes.
+fn presence_answers(answers: &[Answer], table: &[(u32, u32)]) -> Vec<(u32, Vec<u8>)> {
+    answers
+        .iter()
+        .filter(|answer| answer.rx_id != 0 && table.iter().any(|&(_, rx)| rx == answer.rx_id))
+        .map(|answer| (answer.rx_id, answer.end.response().unwrap_or(&[]).to_vec()))
         .collect()
 }
 
@@ -3442,14 +3481,28 @@ mod collected_answers_tests {
         CollectedRead {
             identifier,
             unique: 0,
-            bytes: vec![0x7E, 0x00],
+            bytes: if pending {
+                vec![0x7F, 0x3E, 0x78]
+            } else {
+                vec![0x7E, 0x00]
+            },
             vci_us: 0,
             clock: None,
             start_us: None,
             tx_done_us: None,
-            pending,
             read: None,
         }
+    }
+
+    fn ids(reads: &[CollectedRead], table: &[(u32, u32)]) -> Vec<u32> {
+        let expected = Expected {
+            positive_prefix: vec![0x7E, 0x00],
+            negative_pattern: vec![0x7F, 0x3E],
+        };
+        answer_items(reads, table, &expected, &NegativeShape::uds(), 0x3E)
+            .into_iter()
+            .map(|answer| answer.rx_id)
+            .collect()
     }
 
     /// ADR-433 decision C: a pending that names no identifier leaves the host's list once the
@@ -3463,31 +3516,9 @@ mod collected_answers_tests {
             read(Some(0x7E8), false),
             read(Some(0x7E9), false),
         ];
-        let ids = |reads: &[CollectedRead]| -> Vec<Option<u32>> {
-            collected_answers(reads, &table)
-                .into_iter()
-                .map(|(id, _)| id)
-                .collect()
-        };
-        assert_eq!(ids(&reads), [Some(0x7E8), Some(0x7E9)]);
-        assert_eq!(ids(&reads[..2]), [None, Some(0x7E8)]);
+        assert_eq!(ids(&reads, &table), [0x7E8, 0x7E9]);
+        assert_eq!(ids(&reads[..2], &table), [0, 0x7E8]);
     }
-}
-
-/// The answers of a primitive as its exchange entry lists them, each with the end its bytes have
-/// against the request's expected answer. The log places them in time and classifies them
-/// (ADR-400).
-fn answer_items(
-    collected: &[CollectedRead],
-    table: &[(u32, u32)],
-    expected: &Expected,
-    negative: &NegativeShape,
-    sid: u8,
-) -> Vec<Answer> {
-    collected_answers(collected, table)
-        .into_iter()
-        .map(|(rx_id, read)| answer_of(read, rx_id, &expected.positive_prefix, negative, sid))
-        .collect()
 }
 
 /// One result of a collecting primitive as the entry lists it: the end its bytes have against
@@ -4372,7 +4403,6 @@ impl Progress {
                     clock: clock_of(&item),
                     start_us: result.start_msg_timestamp.map(u64::from),
                     tx_done_us: result.tx_msg_done_timestamp.map(u64::from),
-                    pending,
                     read: None,
                 };
                 // A collecting wait that keeps its reads hands each result to the entry as an
@@ -7464,10 +7494,15 @@ mod tests {
             &progress.negative,
             progress.sid,
         );
-        collected_answers(&progress.collected, table)
+        items
             .into_iter()
-            .zip(items)
-            .map(|((id, read), answer)| (id, read.bytes.clone(), format!("{:?}", answer.end)))
+            .map(|answer| {
+                (
+                    Some(answer.rx_id).filter(|&id| id != 0),
+                    answer.end.response().unwrap_or(&[]).to_vec(),
+                    format!("{:?}", answer.end),
+                )
+            })
             .collect()
     }
 
@@ -7550,6 +7585,113 @@ mod tests {
                 (Some(0x7E8), vec![0x7F, 0x3E, 0x78]),
                 (Some(0x7E9), vec![0x7E, 0x00]),
                 (Some(0x7E9), vec![0x7E, 0x00]),
+            ]
+        );
+    }
+
+    /// The answers of `events` as the entry lists them, the end the host ends the exchange with
+    /// and whether that end is a rejected result (ADR-437).
+    fn collected_end_of(events: Vec<EventItem>) -> (Vec<Answer>, String) {
+        let (progress, _) = collect(events);
+        let expected = Expected {
+            positive_prefix: progress.positive_prefix.clone(),
+            negative_pattern: progress.negative.pattern(progress.sid),
+        };
+        let answers = answer_items(
+            &progress.collected,
+            &TABLE,
+            &expected,
+            &progress.negative,
+            progress.sid,
+        );
+        let ended = crate::comm_log::exchange::collecting_end(&answers, &expected);
+        (answers, format!("{ended:?}"))
+    }
+
+    const WRONG_ECHO: [u8; 2] = [0x7E, 0x01];
+
+    /// ADR-437: a wrong echo is no answer on its identifier, whichever side of a usable answer
+    /// it came: the window ends with the usable answer, and the echo stays in the list.
+    #[test]
+    fn a_wrong_echo_beside_a_usable_answer_does_not_end_the_window() {
+        let finished = || event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        for events in [
+            vec![
+                answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+                answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+                finished(),
+            ],
+            vec![
+                answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+                answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+                finished(),
+            ],
+        ] {
+            let (answers, ended) = collected_end_of(events);
+            assert_eq!(ended, "(Positive([126, 0]), false)");
+            assert_eq!(answers.len(), 2);
+            assert_eq!(answers.iter().filter(|a| a.is_rejected()).count(), 1);
+        }
+    }
+
+    /// ADR-437: a window whose only result is a wrong echo ends as `positive_unusable` carrying
+    /// the first rejected result's bytes, and that end is a rejected result.
+    #[test]
+    fn a_wrong_echo_alone_ends_the_window_as_a_rejected_result() {
+        let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        let (answers, ended) = collected_end_of(vec![
+            answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+            answer_on(Some(0x7E9), 2, &[0x7E, 0x02]),
+            finished,
+        ]);
+        assert_eq!(ended, "(PositiveUnusable([126, 1]), true)");
+        assert_eq!(answers.len(), 2);
+    }
+
+    /// ADR-437: a wrong echo after a pending of its identifier folds nothing: the pending stands
+    /// beside it, and the end is the rejected result.
+    #[test]
+    fn a_wrong_echo_after_a_pending_on_its_identifier_leaves_the_pending_standing() {
+        let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        let (answers, ended) = collected_end_of(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+            finished,
+        ]);
+        assert_eq!(ended, "(PositiveUnusable([126, 1]), true)");
+        let shown: Vec<_> = answers.iter().map(|a| format!("{:?}", a.end)).collect();
+        assert_eq!(
+            shown,
+            ["Negative([127, 62, 120])", "PositiveUnusable([126, 1])"]
+        );
+        // A usable answer after the pair folds the pending, as before.
+        let (answers, ended) = collected_end_of(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+            answer_on(Some(0x7E8), 1, &[0x7E, 0x00]),
+        ]);
+        assert_eq!(ended, "(Positive([126, 0]), false)");
+        assert_eq!(answers.len(), 2);
+    }
+
+    /// ADR-437, ADR-396: presence counts the answers that stand on an identifier of the receive
+    /// table, so a pending left standing beside a wrong echo on one identifier gives that
+    /// identifier twice (the consumer keeps one answer per distinct bytes and asks by
+    /// identifier), and an answer that names no identifier gives none.
+    #[test]
+    fn presence_counts_the_standing_answers_on_the_receive_table() {
+        let (answers, _) = collected_end_of(vec![
+            answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]),
+            answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+            answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+            answer_on(Some(0x7F0), 0, &[0x7E, 0x00]),
+        ]);
+        assert_eq!(
+            presence_answers(&answers, &TABLE),
+            [
+                (0x7E8, vec![0x7F, 0x3E, 0x78]),
+                (0x7E8, WRONG_ECHO.to_vec()),
+                (0x7E9, vec![0x7E, 0x00]),
             ]
         );
     }
@@ -7846,7 +7988,7 @@ mod tests {
                 &progress.negative,
                 progress.sid,
             );
-            let end = crate::comm_log::exchange::collecting_end(&answers, &expected);
+            let (end, _) = crate::comm_log::exchange::collecting_end(&answers, &expected);
             (end, answers, pending_ids_of(&progress.pendings, &TABLE))
         };
         let (end, answers, pending_ids) = ended(vec![
@@ -7983,6 +8125,7 @@ mod tests {
                 &[(1u32, true), (2, false), (1, false)],
                 |item| item.0,
                 |item| item.1,
+                |_| false,
             ),
             [false, true, true]
         );

@@ -1,7 +1,7 @@
 # ADR-435: A Silent Receive Identifier of a Collecting Exchange Is Owed
 
 **Date:** 2026-11-08
-**Status:** Accepted (Decision item 4's release amended by ADR-436: an exchange a pending is open on, or whose kept record notes one open at its keep or after the end's renewal, is kept after any end, and a late final answer on its silent identifier settles it there)
+**Status:** Accepted (Decision item 4's release amended by ADR-436: an exchange a pending is open on, or whose kept record notes one open at its keep or after the end's renewal, is kept after any end, and a late final answer on its silent identifier settles it there; decision 7 stands as an invariant for a collecting request, whose rejected results now leave their identifiers silent, and the Consequences' bullet on whether a rejected collecting answer leaves its identifier unanswered is closed, ADR-437)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::owed_ids`, `Evidence::silent_ids`,
 `Evidence::settles_owed`, `Evidence::unanswered_ids`, `Evidence::answerable_ids`, `LinkEffect`,
 `Kept::answered_placed`, `Kept::late_start_for`, `LinkState::reclassify_one`,
@@ -75,7 +75,10 @@ VCI ended the window.
    on, since it is not settled either. The set does not depend on any owner, so it cannot grow
    after the fact; and a refresh of rows (decision 6) only drops rows, never adds one: the new
    rows are the old ones that the exchange is still owed on. A final answer delivered late is a usable
-   response, so the restated evidence no longer carries the rejection.
+   response, so the restated evidence no longer carries the rejection. Since ADR-437 a collecting
+   request's rejected results leave their identifiers silent, so for it the rule is a stated
+   invariant (every identifier is owed whenever the end is a rejected result) rather than an
+   addition, and the flag is derived from the answers.
 
 ## Consequences
 
@@ -91,9 +94,9 @@ VCI ended the window.
   the owed rows of a presence exchange grow to the size of the table. The two runner tests of
   a pending read in the resend's wait and of a silent presence exchange assert this outcome.
 - A collecting answer that is a result the worker rejected (a wrong echo, `positive_unusable`)
-  still stands as a final answer on its identifier, as the entry's end takes it (ADR-429): the
-  identifier is not silent, so an unnamed late final answer is not keyed on it. Whether such a
-  result leaves its identifier unanswered, and how the entry's end treats it, is left open.
+  stood as a final answer on its identifier, as the entry's end took it (ADR-429), so the
+  identifier was not silent. ADR-437 closes this: such a result leaves its identifier unanswered
+  and the entry's end passes it over for a usable answer.
 - ADR-432's deferred bullet on an identifier that stays silent beside another's final answer is
   closed, and ADR-433's Consequence that it stands is superseded by decision 1. ADR-429
   decision 2, ADR-432 decision 2 and ADR-433 decision 6 and Consequences are marked as

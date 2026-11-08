@@ -2332,7 +2332,8 @@ impl LinkState {
     /// (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
     /// timeout, whatever else it read after (as an entry's is), so an end that read none (a
     /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
-    /// released unless a pending is open.
+    /// released unless a pending is open on it or the kept record notes one open at its keep or
+    /// after the end's renewal ([`Kept::pending_at_end`]).
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
             && self

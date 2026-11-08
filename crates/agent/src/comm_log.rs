@@ -3161,8 +3161,9 @@ impl CommLog {
     }
 
     /// [`CommLog::release_kept`] for the exchange whose `primitive_ended` was just written,
-    /// except one left owed whose evidence lets a late final settle it: an open pending, or a
-    /// renewed `vci_ended` (ADR-429, ADR-431, ADR-436).
+    /// except one left owed that a late final can settle: a pending open on its evidence or
+    /// noted open on the kept record (its entry's keep, or the end's renewal), or a renewed
+    /// `vci_ended` (ADR-429, ADR-431, ADR-436).
     pub(crate) fn release_kept_ended(&self, seq: u64) {
         let mut inner = self.lock();
         for (_, state) in &mut inner.links {
@@ -12056,6 +12057,48 @@ pub(crate) mod tests {
             assert_eq!(late.len(), 1, "{in_wait} {lines:#?}");
             assert_eq!(late[0]["identifier"], 0x7E9, "{in_wait} {late:?}");
             assert_eq!(late[0]["refers_to"], serde_json::json!([seq]));
+        }
+    }
+
+    /// ADR-436: an entry with a lone pending on 0x7E8 (the flag is set at its keep) whose
+    /// primitive ends in a link error or a lost VCI, with 0x7E8's final answer read, leaves only
+    /// the silent 0x7E9: the release keeps the exchange on the flag, and a later 0x7E9 final is
+    /// its own.
+    #[test]
+    fn an_end_that_answers_the_entry_s_pending_and_leaves_a_silent_identifier_is_kept() {
+        let build = |evidence: &mut exchange::Evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        };
+        let ends = [
+            exchange::End::LinkError(exchange::LinkErrorKind::Receive),
+            exchange::End::VciLost {
+                refused_after_loss: false,
+            },
+        ];
+        for end in ends {
+            let (dir, _setup, log, seq) = late_collecting_on(true, build);
+            end_then_unbound_finals(
+                &log,
+                seq,
+                end.clone(),
+                vec![answer_read(0x7E8, 400_000)],
+                &[],
+            );
+            log.release_kept_ended(seq);
+            assert!(
+                kept_of(&log, seq).evidence.open_pending_ids().is_empty(),
+                "{end:?}"
+            );
+            assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true), "{end:?}");
+            assert_eq!(
+                late_owner_of(&log, &late_final_on(0x7E9)),
+                Some(LateOwner::One(seq)),
+                "{end:?}"
+            );
+            std::fs::remove_dir_all(&dir).unwrap();
         }
     }
 

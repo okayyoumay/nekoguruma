@@ -35,7 +35,8 @@ ended the primitive.
 2. **The end does not limit it.** An exchange a pending is open on stays kept and owed after a
    finished status without a receive timeout, a link error, a lost VCI, an unknown end or a
    cancel by the agent, as the release already kept it (ADR-429 decision 3); the cancel still
-   settles nothing (ADR-366). An end with no pending open is released as before.
+   settles nothing (ADR-366). An end that leaves no pending open, and whose exchange the kept
+   record notes no pending open on (decision 4), is released as before.
 3. **The entry keeps it too.** A collecting entry with a pending open is kept on the same
    predicate, so a final answer after an entry with no agent deadline is its `late_response`.
 4. **The test is on the exchange, not on the response's identifier, and it does not lapse.**
@@ -50,6 +51,12 @@ ended the primitive.
    the owner gate and by `release_kept_ended`, which therefore does not recompute from folded
    evidence. The order of the identifiers' final answers does not matter, whether they are read
    in the end's wait, after the release, or one in each.
+   The flag counts a pending open in the evidence at the entry's keep, or right after
+   `primitive_ended`'s renewal (so in the evidence that renewal folded). A pending the end both
+   reads and answers bound, with the finished status, is already kept by the host's `vci_ended`
+   (a collecting primitive with a final answer read and the finished status); with a link
+   error, a lost VCI or an unknown end it is kept only when the entry's keep noted a pending
+   open, and an entry with none is released as ADR-431 decision 3 says.
 5. **The judgement is unchanged.** The late window comes from the pending's window and is judged
    against the limit in force then. In time it is `system`; past it, `vehicle` only when the
    entry shows the VCI ended its wait at the limit (`timeout_at_limit`), else `undetermined`;

@@ -1356,13 +1356,14 @@ impl Evidence {
     /// identifiers a pending is open on, else on its link's `rx_id`. With a table, a request
     /// that is not collecting is owed on its `rx_id` once a final response ended it, else on
     /// every receive identifier; a collecting request with no answer on every receive
-    /// identifier. With answers, an identifier with a final answer standing is never owed; only
-    /// the identifiers a pending is open on are, an unnamed pending (identifier 0) standing for
-    /// every receive identifier with no final answer, and for none when every one has it (the
-    /// pending is covered by those answers, ADR-400 decision 1). A collecting request that
-    /// ended with a final response and is left with none owes the identifiers whose final
-    /// answers' own histories show an owner, else (with no pending open) the first final
-    /// answer's, so the request it could be a late answer of finds it.
+    /// identifier. With answers, it is owed on each of these once, in this order: the
+    /// identifiers a pending is open on (an unnamed pending, identifier 0, standing for every
+    /// receive identifier with no final answer, and for none when every one has it, ADR-400
+    /// decision 1); every receive identifier with no named final answer standing
+    /// ([`Self::silent_ids`], ADR-435); and, when the request ended with a final response, the
+    /// identifiers whose final answers' own histories show an owner, so the owner is not the
+    /// only request to find a late answer there. An identifier whose final answer no owed
+    /// request could own is not owed.
     pub(crate) fn owed_ids(&self) -> Vec<u32> {
         // A link with no receive table (a physical one) is owed as before ADR-432: on the
         // identifiers a pending is open on, else on its own.
@@ -1393,51 +1394,94 @@ impl Evidence {
             table.iter().for_each(|&id| add(&mut ids, id));
             return ids;
         }
-        for id in self.open_pending_ids() {
-            if id == 0 {
-                for &receive in &table {
-                    if !self.final_standing(receive) {
-                        add(&mut ids, receive);
-                    }
+        // (1) The identifiers a pending is open on, and (2) the silent ones, whatever another
+        // identifier answered (ADR-435).
+        for id in self.unanswered_ids() {
+            add(&mut ids, id);
+        }
+        // (3) The identifiers of the final answers an owed request could own, so that request
+        // is not the only one to find a late answer there.
+        if self.final_response().is_some() {
+            for answer in self.answers.iter().filter(|answer| {
+                !answer.is_pending(&self.expected)
+                    && answer
+                        .history
+                        .as_ref()
+                        .is_some_and(|history| !history.owners.is_empty())
+            }) {
+                // An unnamed answer (0) may have come on any identifier of the table.
+                if answer.rx_id == 0 {
+                    table.iter().for_each(|&id| add(&mut ids, id));
+                } else {
+                    add(&mut ids, answer.rx_id);
                 }
-            } else if !self.final_standing(id) {
-                add(&mut ids, id);
             }
         }
-        if ids.is_empty() && self.final_response().is_some() {
-            let finals = || {
-                self.answers
-                    .iter()
-                    .filter(|answer| !answer.is_pending(&self.expected))
+        // A result the worker rejected is no answer (ADR-359): the exchange is owed as one with
+        // no answer is, on every receive identifier, whatever else it is owed on, since it is not
+        // settled either ([`Self::settles_owed`]). The set does not depend on its owners, so it
+        // never grows after the fact.
+        if self.end_rejected {
+            table.iter().for_each(|&id| add(&mut ids, id));
+        }
+        ids
+    }
+
+    /// The identifiers a response that names none may have come on: for a collecting request
+    /// with a receive table those still unanswered ([`Self::unanswered_ids`], so an identifier
+    /// owed only because an owner could own its final answer does not count, ADR-435), else
+    /// those the exchange is owed on.
+    pub(crate) fn answerable_ids(&self) -> Vec<u32> {
+        let unanswered = self.unanswered_ids();
+        if unanswered.is_empty() {
+            self.owed_ids()
+        } else {
+            unanswered
+        }
+    }
+
+    /// The identifiers a collecting request's pendings are open on, with an unnamed pending
+    /// standing for every receive identifier with no final answer, then its silent identifiers
+    /// ([`Self::silent_ids`]), each once: those still unanswered by a final answer. A request
+    /// that is not collecting, or has no receive table, has none.
+    pub(crate) fn unanswered_ids(&self) -> Vec<u32> {
+        let mut ids: Vec<u32> = Vec::new();
+        if !self.collecting || self.receive_ids.is_empty() {
+            return ids;
+        }
+        for id in self.open_pending_ids() {
+            let named = if id == 0 {
+                self.receive_ids.clone()
+            } else {
+                vec![id]
             };
-            // An unnamed answer (0) may have come on any identifier of the table.
-            let add_answer = |ids: &mut Vec<u32>, rx_id: u32| {
-                if rx_id == 0 {
-                    table.iter().for_each(|&id| add(ids, id));
-                } else {
-                    add(ids, rx_id);
+            for id in named {
+                if !self.final_standing(id) && !ids.contains(&id) {
+                    ids.push(id);
                 }
-            };
-            for answer in finals().filter(|answer| {
-                answer
-                    .history
-                    .as_ref()
-                    .is_some_and(|history| !history.owners.is_empty())
-            }) {
-                add_answer(&mut ids, answer.rx_id);
             }
-            // A pending left standing, though covered by the final answers, still owes no
-            // identifier and leaves the first final answer's out (ADR-432, ADR-433).
-            let pending_standing = self
-                .answers
-                .iter()
-                .any(|answer| answer.is_pending(&self.expected));
-            if ids.is_empty() && !pending_standing {
-                let first = finals().next().map_or(self.rx_id, |answer| answer.rx_id);
-                add_answer(&mut ids, first);
+        }
+        for id in self.silent_ids() {
+            if !ids.contains(&id) {
+                ids.push(id);
             }
         }
         ids
+    }
+
+    /// The identifiers of a collecting request's receive table with no named final answer
+    /// standing, in table order: what the ECUs behind them have not answered finally yet, whatever
+    /// another identifier answered (ADR-435). An unnamed final answer (identifier 0) covers none.
+    /// Empty with no receive table, and for a request that is not collecting.
+    pub(crate) fn silent_ids(&self) -> Vec<u32> {
+        if !self.collecting {
+            return Vec::new();
+        }
+        self.receive_ids
+            .iter()
+            .copied()
+            .filter(|&id| !self.final_standing(id))
+            .collect()
     }
 
     /// The request may have reached the ECU, so the exchange awaits an answer: it was neither
@@ -1452,14 +1496,17 @@ impl Evidence {
         )
     }
 
-    /// The exchange has a final response and no identifier is left open on a pending
-    /// ([`LinkEffect::settles`]), so a final response settles its owed request.
+    /// The exchange has a final response, no identifier is left open on a pending and none is
+    /// silent ([`LinkEffect::settles`]), so a final response settles its owed request.
     pub(crate) fn settles_owed(&self) -> bool {
-        self.final_response().is_some() && !self.end_rejected && self.open_pending_ids().is_empty()
+        self.final_response().is_some()
+            && !self.end_rejected
+            && self.open_pending_ids().is_empty()
+            && self.silent_ids().is_empty()
     }
 
     /// The final response's bytes, when the exchange ended with one.
-    fn final_response(&self) -> Option<&[u8]> {
+    pub(crate) fn final_response(&self) -> Option<&[u8]> {
         match &self.end {
             End::Positive(bytes) | End::PositiveUnusable(bytes) | End::Negative(bytes) => {
                 Some(bytes)
@@ -1621,9 +1668,8 @@ struct LinkEffect {
     /// The owed requests the answer could belong to.
     owners: Vec<u64>,
     final_response: bool,
-    /// The response identifiers whose last standing answer is a pending
-    /// ([`Evidence::open_pending_ids`]): the exchange is owed on each.
-    open_pending_ids: Vec<u32>,
+    /// [`Evidence::settles_owed`]: a final response, no identifier open on a pending, none silent.
+    settles_owed: bool,
     /// The identifiers the exchange is owed on ([`Evidence::owed_ids`]).
     owed_ids: Vec<u32>,
     positive: bool,
@@ -1641,11 +1687,12 @@ struct LinkEffect {
 }
 
 impl LinkEffect {
-    /// The exchange has a final response and no identifier is left open on a pending (ADR-429).
+    /// The exchange has a final response and no identifier is left open on a pending or silent
+    /// (ADR-429, ADR-435).
     /// `placed_alone` adds to it that no owed request could own the answer, and `record` reads
     /// that; a settling entry adds the answer's own end ([`ExchangeEntry::settled_answer`]).
     fn settles(&self) -> bool {
-        self.final_response && self.open_pending_ids.is_empty()
+        self.settles_owed
     }
 
     /// A session change or ECUReset that may have been carried out, though nothing shows it:
@@ -1759,7 +1806,7 @@ impl Kept {
         };
         let applies = match response_id {
             Some(id) => id == own,
-            None => self.evidence.owed_ids() == [own],
+            None => self.evidence.answerable_ids() == [own],
         };
         applies.then_some(start)
     }
@@ -2429,6 +2476,62 @@ impl LinkState {
             .collect()
     }
 
+    /// Owed exchange `seq`: its answers' histories are taken again from the owed requests as they
+    /// are now (`history` is the entry's), in the evidence the log kept of it (else `fallback`),
+    /// and its rows are set again from them. Gives the identifiers it is owed on no more, and
+    /// whether none is left, in which case it is released as one placed alone is.
+    fn refresh_owed_rows(
+        &mut self,
+        seq: u64,
+        fallback: &Evidence,
+        history: &LinkHistory,
+    ) -> (Vec<u32>, bool) {
+        let Some(sid) = self
+            .owed
+            .iter()
+            .find(|owed| owed.seq == seq)
+            .map(|owed| owed.sid)
+        else {
+            return (Vec::new(), false);
+        };
+        let mut evidence = self
+            .kept
+            .get(&seq)
+            .map_or_else(|| fallback.clone(), |kept| kept.evidence.clone());
+        evidence.set_answer_histories(self.answer_histories(&evidence, history, seq));
+        let before = self.owed_row_ids(seq);
+        // Only rows go: what it was owed on and still is (a refresh never adds one, since the
+        // answers' owners it reads can only have shrunk).
+        let had = self.owed_row_ids(seq);
+        let ids: Vec<u32> = evidence
+            .owed_ids()
+            .into_iter()
+            .filter(|id| had.contains(id))
+            .collect();
+        let emptied = ids.is_empty();
+        if emptied {
+            self.owed.retain(|owed| owed.seq != seq);
+            if self
+                .kept
+                .remove(&seq)
+                .is_some_and(|kept| kept.sent == Sent::Unknown)
+            {
+                self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            }
+        } else {
+            self.set_owed_rows(seq, sid, &evidence.expected, &ids);
+            if let Some(kept) = self.kept.get_mut(&seq) {
+                kept.evidence = evidence;
+            }
+        }
+        let after = self.owed_row_ids(seq);
+        let dropped = before
+            .into_iter()
+            .filter(|id| !after.contains(id))
+            .collect();
+        (dropped, emptied)
+    }
+
     /// Sets the rows exchange `seq` is owed on, replacing any it had: one for each identifier in
     /// `owed_ids` ([`Evidence::owed_ids`], ADR-429, ADR-432), once each.
     fn set_owed_rows(&mut self, seq: u64, sid: u8, expected: &Expected, owed_ids: &[u32]) {
@@ -2449,10 +2552,11 @@ impl LinkState {
     }
 
     /// Exchange `seq`, still owed after its primitive ended (collecting or not, ADR-431), has
-    /// `evidence` and the placed items of it now: it is owed on the identifiers a pending is
-    /// open on in them, and a late item is judged against them (ADR-429). Its late pendings are
-    /// in the placed pendings already for a collecting exchange only; an ordinary exchange keeps
-    /// them, with their verdicts (ADR-431). Nothing for an exchange that is not owed.
+    /// `evidence` and the placed items of it now: it is owed on the identifiers it is owed on in
+    /// them (a pending open, or no final answer, ADR-435), and a late item is judged against
+    /// them (ADR-429). Its late pendings are in the placed pendings already for a collecting
+    /// exchange only; an ordinary exchange keeps them, with their verdicts (ADR-431). Nothing for
+    /// an exchange that is not owed.
     pub(crate) fn renew_owed(
         &mut self,
         seq: u64,
@@ -2667,13 +2771,7 @@ impl LinkState {
                 }
                 // An exchange owed on fewer identifiers than before owns the later answers on
                 // the others no more: the owner goes when the rows it has now no longer list it.
-                if answer.final_response
-                    || (!answer.settled_ids.is_empty()
-                        && !self
-                            .history_for(&logged.evidence)
-                            .owners
-                            .contains(&answer.seq))
-                {
+                if self.frees_owner(&answer, &logged.evidence) {
                     history.owners.retain(|owner| *owner != answer.seq);
                     history.owed_matching = history.owners.len() as u32;
                 }
@@ -2688,6 +2786,15 @@ impl LinkState {
         changed.sort_by_key(|later| later.seq);
         let not_reclassified = self.left_window.filter(|left| *left > answer.seq);
         (changed, not_reclassified)
+    }
+
+    /// Whether `answer`, a settling entry's answer of an earlier exchange, frees that exchange
+    /// from owning the answers of the exchange with `evidence`: it was placed alone, or it is
+    /// owed on fewer identifiers and its rows no longer list it for those answers.
+    fn frees_owner(&self, answer: &SettledAnswer, evidence: &Evidence) -> bool {
+        answer.final_response
+            || (!answer.settled_ids.is_empty()
+                && !self.history_for(evidence).owners.contains(&answer.seq))
     }
 
     /// Exchange `seq`'s final response, read after its entry, accepts its ECUReset or session
@@ -2739,17 +2846,23 @@ impl LinkState {
             self.last_reset = self.last_reset.max(Some(seq));
         }
         let mut changed = Vec::new();
-        // Exchanges after it that are placed alone now, and so no owners of the later answers.
-        let mut freed_owners: Vec<u64> = Vec::new();
+        // Exchanges after it whose rows the reset dropped, wholly or in part: no longer owners
+        // of the later answers on those identifiers.
+        let mut freed_answers: Vec<SettledAnswer> = Vec::new();
         for at in 0..self.window.len() {
             let logged = &self.window[at];
             if logged.seq <= seq {
                 continue;
             }
             let mut history = logged.history.clone();
-            history.owners.retain(|owner| {
-                (!accepting || *owner >= earliest) && !freed_owners.contains(owner)
-            });
+            let goes: Vec<u64> = freed_answers
+                .iter()
+                .filter(|freed| self.frees_owner(freed, &logged.evidence))
+                .map(|freed| freed.seq)
+                .collect();
+            history
+                .owners
+                .retain(|owner| (!accepting || *owner >= earliest) && !goes.contains(owner));
             history.owed_matching = history.owners.len() as u32;
             let key = MatchKey::of(&logged.evidence);
             let (later, epoch) = (logged.seq, logged.clears.matched);
@@ -2764,12 +2877,10 @@ impl LinkState {
                 .count() as u32;
             let (freed, reclassified) = self.reclassify_one(at, history);
             if let Some(freed) = freed {
-                if freed.final_response {
-                    freed_owners.push(freed.seq);
-                }
                 if freed.newly_matched {
                     self.window[at].matched_at = Some(freed.clears.matched);
                 }
+                freed_answers.push(freed);
             }
             changed.extend(reclassified);
         }
@@ -2970,6 +3081,15 @@ impl LinkState {
             .map(|logged| &logged.evidence)
     }
 
+    /// The history the window holds for logged exchange `seq`.
+    #[cfg(test)]
+    pub(crate) fn logged_history(&self, seq: u64) -> Option<&LinkHistory> {
+        self.window
+            .iter()
+            .find(|logged| logged.seq == seq)
+            .map(|logged| &logged.history)
+    }
+
     /// The window's newest exchange.
     pub(crate) fn window_last(&self) -> Option<u64> {
         self.window.back().map(|logged| logged.seq)
@@ -3158,12 +3278,22 @@ impl LinkState {
             }
         };
         let mut changed = Vec::new();
+        let mut freed_answers: Vec<SettledAnswer> = Vec::new();
         for at in 0..self.window.len() {
             let logged = &self.window[at];
             if !after(logged.seq) {
                 continue;
             }
             let mut history = logged.history.clone();
+            let goes: Vec<u64> = freed_answers
+                .iter()
+                .filter(|freed| self.frees_owner(freed, &logged.evidence))
+                .map(|freed| freed.seq)
+                .collect();
+            if !goes.is_empty() {
+                history.owners.retain(|owner| !goes.contains(owner));
+                history.owed_matching = history.owners.len() as u32;
+            }
             let key = MatchKey::of(&logged.evidence);
             let (later, clears) = (logged.seq, logged.clears);
             let since: Vec<&Logged> = self
@@ -3185,10 +3315,11 @@ impl LinkState {
                 })
                 .count() as u32;
             let (freed, reclassified) = self.reclassify_one(at, history);
-            if let Some(freed) = freed
-                && freed.newly_matched
-            {
-                self.window[at].matched_at = Some(freed.clears.matched);
+            if let Some(freed) = freed {
+                if freed.newly_matched {
+                    self.window[at].matched_at = Some(freed.clears.matched);
+                }
+                freed_answers.push(freed);
             }
             changed.extend(reclassified);
         }
@@ -3402,8 +3533,19 @@ impl LinkState {
                 kept.sent = Sent::Confirmed;
             }
         }
-        let alone =
+        let mut alone =
             !settled && entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
+        // An exchange that stays owed re-derives its rows from its answers' owners as they are
+        // now: an identifier it was owed on only because an owner could own its final answer
+        // there goes when that owner no longer can (ADR-435). With no row left it is owed no
+        // more, like one placed alone.
+        let mut dropped_rows: Vec<u32> = Vec::new();
+        if !settled && !alone && self.owed.iter().any(|owed| owed.seq == seq) {
+            let fallback = self.window[at].evidence.clone();
+            let (dropped, emptied) = self.refresh_owed_rows(seq, &fallback, &entry.link_history);
+            dropped_rows = dropped;
+            alone = emptied;
+        }
         if alone {
             self.owed.retain(|owed| owed.seq != seq);
             if self
@@ -3414,7 +3556,7 @@ impl LinkState {
                 self.unknown_sends = self.unknown_sends.saturating_sub(1);
             }
         }
-        let freed = (alone || now_matched).then(|| SettledAnswer {
+        let freed = (alone || now_matched || !dropped_rows.is_empty()).then(|| SettledAnswer {
             seq,
             key: entry.effect.key.clone(),
             newly_answered: false,
@@ -3428,7 +3570,7 @@ impl LinkState {
                 self.window[at].after
             },
             since_error: since,
-            settled_ids: Vec::new(),
+            settled_ids: dropped_rows,
         });
         let logged = &mut self.window[at];
         logged.history = entry.link_history.clone();
@@ -3586,8 +3728,8 @@ impl ExchangeEntry {
         self.effect.link_error
     }
 
-    /// Whether the exchange has a final response and no identifier open on a pending
-    /// ([`LinkEffect::settles`]).
+    /// Whether the exchange has a final response and no identifier open on a pending or silent
+    /// ([`LinkEffect::settles`], ADR-435).
     pub(crate) fn settles(&self) -> bool {
         self.effect.settles()
     }
@@ -3673,7 +3815,7 @@ impl ExchangeEntry {
             bound_answer: evidence.bound_answer(),
             owners: history.owners.clone(),
             final_response: evidence.final_response().is_some() && !evidence.end_rejected,
-            open_pending_ids: evidence.open_pending_ids(),
+            settles_owed: evidence.settles_owed(),
             owed_ids: evidence.owed_ids(),
             positive: matches!(evidence.end, End::Positive(_)),
             unusable: matches!(evidence.end, End::PositiveUnusable(_)),
@@ -4028,12 +4170,19 @@ impl Kept {
         }
         let expected = &self.evidence.expected;
         // The identifier the response is keyed on, as the host keys an answer that names none
-        // (`response_id`): the only identifier of a one-ECU table, 0 on a larger table, else the
-        // link's own.
+        // (`response_id`): the only identifier of a one-ECU table, else the link's own. On a
+        // larger table it is 0, unless exactly one identifier is unanswered (silent, or with a
+        // pending open), which the response is then taken to answer: keyed on it, it folds that
+        // identifier's pending and covers it (ADR-433 decision 6, ADR-435); an identifier owed
+        // only because an earlier exchange could own its answer does not count, and with several
+        // unanswered it settles none.
         let own_id = late.rx_id.unwrap_or(match self.evidence.receive_ids[..] {
             [] => self.evidence.rx_id,
             [only] => only,
-            _ => 0,
+            _ => match self.evidence.unanswered_ids()[..] {
+                [unanswered] => unanswered,
+                _ => 0,
+            },
         });
         let mut answers = self.evidence.answers.clone();
         let mut order = self.answer_order.clone();
@@ -4088,19 +4237,6 @@ impl Kept {
                 chain.get_or_insert_with(|| answer.as_exchange(expected).1);
             }
         }
-        // A response that names no identifier is also taken on the one identifier the exchange
-        // is owed on; with several open it folds nothing more.
-        if chain.is_none()
-            && late.rx_id.is_none()
-            && let [only] = self.evidence.owed_ids()[..]
-            && let Some(at) = folded
-                .iter()
-                .rposition(|answer| answer.rx_id == only && answer.is_pending(expected))
-        {
-            chain = Some(folded.remove(at).as_exchange(expected).1);
-            folded_order.remove(at);
-            folded_ends.remove(at);
-        }
         if let Some(last) = folded.last_mut() {
             last.pending = chain.unwrap_or_default();
         }
@@ -4117,6 +4253,9 @@ impl Kept {
             window.not_judged_reason = None;
         }
         let mut evidence = self.evidence.ended_as(end, window);
+        // A response delivered late is a usable final one: a result the worker had rejected no
+        // longer stands for the end (ADR-359, ADR-435).
+        evidence.end_rejected = false;
         evidence.answers = folded;
         (evidence, folded_order, folded_ends)
     }
@@ -5198,6 +5337,18 @@ mod tests {
     }
 
     const READ_F186: [u8; 3] = [0x22, 0xF1, 0x86];
+
+    /// [`log_kept`] with each answer's history set from the owed requests first, as the log
+    /// does for a collecting exchange.
+    fn log_kept_owned(
+        state: &mut LinkState,
+        seq: u64,
+        mut evidence: Evidence,
+    ) -> (ExchangeEntry, Kept) {
+        let history = state.history_for(&evidence);
+        evidence.set_answer_histories(state.answer_histories(&evidence, &history, seq));
+        log_kept(state, seq, evidence)
+    }
 
     /// Logs `evidence` as line `seq` on `state`, as the log does, into its window too; what the
     /// log keeps of it, as a settling entry finds it.
@@ -10121,7 +10272,9 @@ mod tests {
         );
         assert_eq!(state.owed_row_ids(1), [RX, RX2]);
         assert_eq!(window_history(&state, 2).owners, [1]);
-        assert_eq!(window_history(&state, 3).owners, [1]);
+        // Entry 2 answered on RX only: it is itself owed on the silent RX2 (ADR-435), so it and
+        // entry 1 could both own entry 3's answer there.
+        assert_eq!(window_history(&state, 3).owners, [1, 2]);
         let (answered, order, ends) = kept.answered_placed(&POSITIVE, &late_on(Some(RX)), None);
         let history = state.history_settling(&answered, 1);
         let entry = ExchangeEntry::build(1, answered.clone(), history);
@@ -10141,7 +10294,7 @@ mod tests {
         let answer = entry.settled_answer(&kept, false).with_settled_ids(dropped);
         state.reclassify_after(&answer);
         assert!(window_history(&state, 2).owners.is_empty());
-        assert_eq!(window_history(&state, 3).owners, [1]);
+        assert_eq!(window_history(&state, 3).owners, [1, 2]);
     }
 
     /// Row E: the end is the first standing final answer, which another identifier's earlier one
@@ -10170,17 +10323,34 @@ mod tests {
     }
 
     /// Row F: an unnamed final answer folds the pending of the one identifier the exchange is
-    /// owed on; it carries identifier 0, which may be any identifier of the table.
+    /// owed on, keyed on that identifier (ADR-433 decision 6, ADR-435). With a lone pending on
+    /// RX and RX2 silent the exchange is owed on both, so the unnamed final answer, which may be
+    /// any identifier's, folds nothing and covers none: the exchange stays owed.
     #[test]
-    fn an_unnamed_late_final_answer_folds_the_one_owed_identifier() {
+    fn an_unnamed_late_final_answer_folds_nothing_with_several_owed() {
         let kept = kept_collecting(vec![lone(RX)], true);
+        assert_eq!(kept.evidence.owed_ids(), [RX, RX2]);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(answered.open_pending_ids(), [RX]);
+        assert_eq!(answered.answers.len(), 2);
+        assert_eq!(answered.answers[1].rx_id, 0);
+        assert!(answered.answers[1].pending.is_empty());
+        assert_eq!(answered.owed_ids(), [RX, RX2]);
+        assert!(!answered.settles_owed());
+    }
+
+    /// Row F, one owed identifier: an unnamed final answer is keyed on the one identifier the
+    /// exchange is owed on, folds its pending and covers it (ADR-433 decision 6, ADR-435).
+    #[test]
+    fn an_unnamed_late_final_answer_is_keyed_on_the_one_owed_identifier() {
+        let kept = kept_collecting(vec![lone(RX), positive(RX2, Window::WithinP2)], true);
         assert_eq!(kept.evidence.owed_ids(), [RX]);
         let answered = kept.answered(&POSITIVE, &late_on(None));
         assert!(answered.open_pending_ids().is_empty());
-        assert_eq!(answered.answers.len(), 1);
-        assert_eq!(answered.answers[0].rx_id, 0);
-        assert_eq!(answered.answers[0].pending.len(), 1);
-        assert_eq!(answered.owed_ids(), [RX, RX2]);
+        assert_eq!(answered.answers.len(), 2);
+        assert_eq!(answered.answers[1].rx_id, RX);
+        assert_eq!(answered.answers[1].pending.len(), 1);
+        assert!(answered.owed_ids().is_empty());
         assert!(answered.settles_owed());
     }
 
@@ -10211,7 +10381,8 @@ mod tests {
             assert!(answered.open_pending_ids().is_empty(), "{table:?}");
             assert_eq!(answered.answers.len(), 1);
             assert_eq!(answered.answers[0].pending.len(), 1);
-            assert!(answered.settles_owed(), "{table:?}");
+            // An unnamed final answer covers no identifier of a larger table (ADR-435).
+            assert_eq!(answered.settles_owed(), table.len() == 1, "{table:?}");
         }
         let kept = kept_on(vec![lone(RX)], &[]);
         let answered = kept.answered(&POSITIVE, &late_on(None));
@@ -10605,5 +10776,269 @@ mod tests {
             [Classification::None, Classification::Undetermined]
         );
         assert_eq!(entry.classification, Classification::Undetermined);
+    }
+
+    /// ADR-435 (case a): a final answer on one identifier of the table leaves the other, which
+    /// is silent, owed: the exchange does not settle, and the silent identifier's late final
+    /// answer settles it whole.
+    #[test]
+    fn a_silent_identifier_beside_a_final_answer_is_owed_and_unsettled() {
+        let kept = kept_collecting(vec![positive(RX2, Window::WithinP2)], true);
+        assert_eq!(kept.evidence.silent_ids(), [RX]);
+        assert_eq!(kept.evidence.owed_ids(), [RX]);
+        assert!(!kept.evidence.settles_owed());
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert!(answered.silent_ids().is_empty());
+        assert!(answered.owed_ids().is_empty());
+        assert!(answered.settles_owed());
+        // A physical link has no table: nothing is silent.
+        let physical = kept_collecting(vec![positive(RX, Window::WithinP2)], false);
+        assert!(physical.evidence.silent_ids().is_empty());
+        assert!(physical.evidence.settles_owed());
+    }
+
+    /// ADR-435 (case d): an unnamed final answer covers no identifier of the table, so both are
+    /// owed. A late final answer naming one settles that one only; a late one naming none is
+    /// keyed on the one identifier then owed and settles the exchange, and with both owed it
+    /// settles none.
+    #[test]
+    fn an_unnamed_final_answer_covers_no_identifier_and_a_late_one_is_keyed_on_the_one_owed() {
+        let kept = kept_collecting(vec![positive(0, Window::WithinP2)], true);
+        assert_eq!(kept.evidence.owed_ids(), [RX, RX2]);
+        assert!(!kept.evidence.settles_owed());
+        let both = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(both.owed_ids(), [RX, RX2]);
+        assert!(!both.settles_owed());
+        let named = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert_eq!(named.owed_ids(), [RX2]);
+        assert!(!named.settles_owed());
+        // Kept again as it now stands, the one identifier owed takes an unnamed final answer.
+        let rekept = kept_on(named.answers.clone(), &[RX, RX2]);
+        assert_eq!(rekept.evidence.owed_ids(), [RX2]);
+        let unnamed = rekept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(unnamed.answers.last().map(|a| a.rx_id), Some(RX2));
+        assert!(unnamed.owed_ids().is_empty());
+        assert!(unnamed.settles_owed());
+    }
+
+    /// An answer whose history shows an owner, for the owned-final tests.
+    fn owned(mut answer: Answer) -> Answer {
+        let mut history = LinkHistory::empty();
+        history.owners = vec![9];
+        history.owed_matching = 1;
+        answer.history = Some(history);
+        answer
+    }
+
+    /// ADR-435 (cases f and f'): a final answer an owed request could own stays an owed
+    /// identifier whatever else is owed: beside a silent identifier, and beside an open pending.
+    #[test]
+    fn an_owned_final_answer_is_owed_beside_a_silent_identifier_and_an_open_pending() {
+        // Case f: final answer of RX2 owned, RX silent.
+        let silent = kept_collecting(vec![owned(positive(RX2, Window::WithinP2))], true);
+        assert_eq!(silent.evidence.owed_ids(), [RX, RX2]);
+        assert!(!silent.evidence.settles_owed());
+        // Case f': final answer of RX2 owned, a pending open on RX.
+        let pending = kept_collecting(vec![owned(positive(RX2, Window::WithinP2)), lone(RX)], true);
+        assert_eq!(pending.evidence.open_pending_ids(), [RX]);
+        assert_eq!(pending.evidence.owed_ids(), [RX, RX2]);
+        // Not owned: only the open pending's identifier.
+        let unowned = kept_collecting(vec![positive(RX2, Window::WithinP2), lone(RX)], true);
+        assert_eq!(unowned.evidence.owed_ids(), [RX]);
+    }
+
+    /// ADR-435: an unnamed late final answer is keyed on the one identifier that is unanswered
+    /// (silent, or with a pending open), not on one owed only because an owner could own its
+    /// final answer.
+    #[test]
+    fn an_unnamed_late_final_answer_is_not_keyed_on_an_identifier_owed_through_an_owner() {
+        let kept = kept_collecting(vec![owned(positive(RX, Window::WithinP2)), lone(RX2)], true);
+        assert_eq!(kept.evidence.unanswered_ids(), [RX2]);
+        assert_eq!(kept.evidence.owed_ids(), [RX2, RX]);
+        let answered = kept.answered(&POSITIVE, &late_on(None));
+        assert_eq!(answered.answers.last().map(|a| a.rx_id), Some(RX2));
+        assert!(answered.open_pending_ids().is_empty());
+        assert!(answered.settles_owed());
+    }
+
+    /// ADR-435: a result the worker rejected is no answer, so an exchange whose named final
+    /// answers cover the table is not settled and is owed, like one with no answer, on every
+    /// receive identifier; a final answer delivered late settles it.
+    #[test]
+    fn a_rejected_end_with_the_table_covered_is_owed_on_every_identifier() {
+        let mut kept = kept_collecting(
+            vec![
+                positive(RX, Window::WithinP2),
+                positive(RX2, Window::WithinP2),
+            ],
+            true,
+        );
+        assert!(kept.evidence.owed_ids().is_empty());
+        assert!(kept.evidence.settles_owed());
+        kept.evidence.end_rejected = true;
+        assert!(!kept.evidence.settles_owed());
+        assert_eq!(kept.evidence.owed_ids(), [RX, RX2]);
+        let answered = kept.answered(&POSITIVE, &late_on(Some(RX)));
+        assert!(answered.settles_owed());
+        assert!(answered.owed_ids().is_empty());
+    }
+
+    /// ADR-435: a reset that ends the owners before it makes a later exchange drop the rows it
+    /// held only because they could own its answers, and frees the answers after it from it.
+    #[test]
+    fn a_reset_that_drops_a_later_exchanges_row_frees_the_answers_after_it() {
+        let table = |mut evidence: Evidence| {
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![RX, RX2];
+            evidence
+        };
+        let mut state = LinkState::default();
+        let mut first = table(collecting(vec![lone(RX), lone(RX2)]));
+        first.end = End::NoResponse;
+        let (_, kept) = log_kept_owned(&mut state, 1, first);
+        state.keep(1, kept);
+        let mut reset = judged(forwarding(evidence(&[0x10, 0x03], End::NoResponse)));
+        reset.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let (_, kept) = log_kept_owned(&mut state, 2, reset);
+        state.keep(2, kept);
+        let answered = || table(collecting(vec![positive(RX, Window::WithinP2)]));
+        let (_, kept) = log_kept_owned(&mut state, 3, answered());
+        state.keep(3, kept);
+        log_kept_owned(&mut state, 4, answered());
+        assert_eq!(window_history(&state, 3).owners, [1]);
+        assert_eq!(state.owed_row_ids(3), [RX2, RX]);
+        assert_eq!(window_history(&state, 4).owners, [1, 3]);
+        state.reset_after(2, 2, true);
+        // The first exchange ended with the reset: the third is owed on its silent RX2 only,
+        // and no longer owns the fourth's answer.
+        assert_eq!(state.owed_row_ids(3), [RX2]);
+        assert!(window_history(&state, 4).owners.is_empty());
+    }
+
+    /// ADR-435: a result the worker rejected owes every receive identifier whatever else is
+    /// owed, and a refresh of rows only drops them: a settlement of an earlier exchange does not
+    /// make the rejected one owed on more, nor give its answers' owners to a later answer.
+    #[test]
+    fn a_rejected_end_is_owed_on_every_identifier_and_a_refresh_never_adds_rows() {
+        let table = |mut evidence: Evidence| {
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![RX, RX2];
+            evidence
+        };
+        let mut rejected = table(collecting(vec![positive(RX, Window::WithinP2), lone(RX2)]));
+        rejected.end_rejected = true;
+        assert_eq!(rejected.owed_ids(), [RX2, RX]);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept_owned(
+            &mut state,
+            1,
+            table(collecting(vec![positive(RX2, Window::WithinP2), lone(RX)])),
+        );
+        state.keep(1, kept.clone());
+        let mut second = table(collecting(vec![
+            positive(RX, Window::WithinP2),
+            positive(RX2, Window::WithinP2),
+        ]));
+        second.end_rejected = true;
+        let (_, second_kept) = log_kept_owned(&mut state, 2, second);
+        state.keep(2, second_kept);
+        log_kept_owned(
+            &mut state,
+            3,
+            table(collecting(vec![
+                positive(RX2, Window::WithinP2),
+                positive(RX, Window::WithinP2),
+            ])),
+        );
+        assert_eq!(state.owed_row_ids(2), [RX, RX2]);
+        let owners = |state: &LinkState| {
+            state
+                .logged_evidence(3)
+                .unwrap()
+                .answers
+                .iter()
+                .map(|answer| answer.history.clone().unwrap().owners)
+                .collect::<Vec<_>>()
+        };
+        let before = owners(&state);
+        settle_late(&mut state, 1, &kept, &POSITIVE);
+        assert_eq!(state.owed_row_ids(2), [RX, RX2]);
+        // An answer's owners only shrink: 1 let go of RX, the answer on RX2 gains none.
+        let after = owners(&state);
+        assert_eq!(after[0], before[0]);
+        assert!(after[1].iter().all(|owner| before[1].contains(owner)));
+    }
+
+    /// ADR-435: a late start applies to a response that names no identifier when one identifier
+    /// is unanswered, though another is owed only because an owner could own its final answer,
+    /// as the response is keyed on the unanswered one.
+    #[test]
+    fn a_late_start_applies_to_an_unnamed_response_keyed_on_the_one_unanswered_identifier() {
+        let mut kept = kept_collecting(vec![owned(positive(RX, Window::WithinP2))], true);
+        assert_eq!(kept.evidence.owed_ids(), [RX2, RX]);
+        kept.late_start = Some(LateStart::Late {
+            by_us: 2_000,
+            at_limit: true,
+        });
+        kept.late_start_id = Some(RX2);
+        assert!(kept.late_start_for(None).is_some());
+        assert!(kept.late_start_for(Some(RX2)).is_some());
+    }
+
+    /// ADR-435: the same, through a late link error read after the first exchange's answer: the
+    /// owner went (the log ended it), the third exchange drops its row, and the fourth's answer
+    /// is freed from it.
+    #[test]
+    fn a_late_link_error_that_drops_a_row_frees_the_answers_after_it() {
+        let table = |mut evidence: Evidence| {
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![RX, RX2];
+            evidence
+        };
+        let mut state = LinkState::default();
+        let mut first = table(collecting(vec![lone(RX), lone(RX2)]));
+        first.end = End::NoResponse;
+        let (_, kept) = log_kept_owned(&mut state, 1, first);
+        state.keep(1, kept);
+        let mut other = judged(forwarding(evidence(&[0x10, 0x03], End::NoResponse)));
+        other.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        log_kept_owned(&mut state, 2, other);
+        let answered = || table(collecting(vec![positive(RX, Window::WithinP2)]));
+        let (_, kept) = log_kept_owned(&mut state, 3, answered());
+        state.keep(3, kept);
+        log_kept_owned(&mut state, 4, answered());
+        assert!(window_history(&state, 4).owners.contains(&3));
+        state.owed.retain(|owed| owed.seq != 1);
+        state.error_after(Some(2), 9, LinkErrorKind::Receive, None);
+        assert_eq!(state.owed_row_ids(3), [RX2]);
+        assert!(!window_history(&state, 4).owners.contains(&3));
+    }
+
+    /// ADR-435: refreshing an owed exchange's rows only drops rows: one it no longer holds is
+    /// not added back, though its answers' owners would owe it.
+    #[test]
+    fn refreshing_the_rows_of_an_owed_exchange_never_adds_one() {
+        let table = |mut evidence: Evidence| {
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![RX, RX2];
+            evidence
+        };
+        let mut state = LinkState::default();
+        let mut first = table(collecting(vec![lone(RX), lone(RX2)]));
+        first.end = End::NoResponse;
+        let (_, kept) = log_kept_owned(&mut state, 1, first);
+        state.keep(1, kept);
+        let (entry, kept) = log_kept_owned(
+            &mut state,
+            2,
+            table(collecting(vec![positive(RX, Window::WithinP2)])),
+        );
+        state.keep(2, kept.clone());
+        assert_eq!(state.owed_row_ids(2), [RX2, RX]);
+        let (sid, expected) = (kept.evidence.sid().unwrap(), kept.evidence.expected.clone());
+        state.set_owed_rows(2, sid, &expected, &[RX2]);
+        let (dropped, emptied) = state.refresh_owed_rows(2, &kept.evidence, &entry.link_history);
+        assert!(dropped.is_empty() && !emptied);
+        assert_eq!(state.owed_row_ids(2), [RX2]);
     }
 }

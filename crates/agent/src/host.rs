@@ -1524,7 +1524,9 @@ impl<C: WorkerApi> WorkerHost<C> {
                 Vec::new()
             };
             // A collecting request that ended on its own has the end of its first standing answer
-            // that is not a pending, or no response (ADR-396, ADR-429); any other end is judged as for any request.
+            // that is neither a pending nor a rejected result, else the first rejected result's,
+            // or no response (ADR-396, ADR-429, ADR-437); any other end is judged as for any
+            // request.
             // The same rule says whether that end is a rejected result, which is no answer of the
             // request (ADR-437).
             let (end, mut detail, collected_rejected) = match &sent.result {

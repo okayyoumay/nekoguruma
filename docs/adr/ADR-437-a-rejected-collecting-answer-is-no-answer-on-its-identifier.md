@@ -2,10 +2,11 @@
 
 **Date:** 2026-11-08
 **Status:** Accepted
-**Affects:** `agent` (`comm_log/exchange.rs` `Answer::is_rejected`, `standing_answers`,
-`standing_answers_covering`, `collecting_end`, `Evidence::final_standing`, `Evidence::owed_ids`,
-`Evidence::as_answer`, `Kept::answered_placed`, `AnswerItem`; `comm_log.rs` `primitive_ended`;
-`host.rs` `answer_items`, `exchange`, `presence`), design 8.11 `answers`, `outcome`, "Owed
+**Affects:** `agent` (`comm_log/exchange.rs` `Answer::is_rejected`, `Answer::is_response`,
+`standing_answers`, `standing_answers_covering`, `collecting_end`, `Evidence::final_standing`,
+`Evidence::owed_ids`, `Evidence::as_answer`, `Kept::answered_placed`, `AnswerItem`; `comm_log.rs`
+`primitive_ended`, `first_new_answer`; `host.rs` `answer_items`, `exchange`, `presence`), design
+8.11 `answers`, `outcome`, "Owed
 request", `primitive_ended`, `late_response`, `crates/agent/docs/ngr-agent.md`; ADR-359 item 3,
 ADR-429 decision 1, ADR-435 decision 7 and Consequences
 
@@ -50,14 +51,29 @@ states an end.
    replaces a rejected end, and one that is read beside a usable answer leaves the flag false. A
    primitive that is not collecting keeps ADR-359 item 3's formula.
 4. **The answers list keeps a rejected result with its own outcome.** `AnswerItem` carries
-   `positive_unusable`, classified `undetermined`, and the bytes of both its `response` and its
+   `positive_unusable`, classified by the existing rows (`undetermined` by the
+   `positive_unusable` row, and `system` when it came late, as any final response does), and the bytes of both its `response` and its
    `outcome` are redacted as a rejected result's are (ADR-359 item 1). The entry's
-   classification, as the worst of its answers', can then be `undetermined` beside a usable end.
+   classification, as the worst of its answers', can then be `undetermined`, or `system` for a
+   late one, beside a usable end.
 5. **ADR-435 decision 7's whole-table debt stays as a stated invariant.** An exchange whose end is
    a rejected result is owed on every identifier of the receive table. With decision 1 every
    identifier of such an exchange is silent or open, so the rule is redundant for a collecting
    request, and it stays as the statement of what a rejected end owes. A test asserts that
    `owed_ids` is the whole table whenever `end_rejected` holds.
+
+6. **Timing models the VCI; attribution does not count a rejected result.** The VCI takes a
+   rejected result as a response and ends its wait for that identifier's window (only the
+   worker rejects it, after the VCI delivered it). So the window rules (`answer_windows`,
+   `final_before`, `chain_from`, the open pendings, the late judgement) keep a rejected result
+   as a final: it ends a pending's window, a final answer delivered late is judged against P2
+   from its end, and it restarts the window of the next answer. Attribution (the end, the folds,
+   `final_standing`, silence, the owed identifiers, settlement) does not count it, as decisions
+   1 to 3 say. The two read the same list; the split follows what each models. The link errors
+   the log reads for an end are ordered against the first answer that is neither a pending nor
+   a rejected result, as the host orders them (`Answer::is_response`). A response that began
+   and did not complete stays so only while no answer stands; an answer, a rejected result
+   included, is the end as the host has it.
 
 Presence (ADR-396) counts the answers that stand on an identifier of the receive table. A pending
 left standing beside a wrong echo on one identifier gives that identifier two answers; the

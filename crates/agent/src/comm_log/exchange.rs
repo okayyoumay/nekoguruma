@@ -872,6 +872,14 @@ impl Answer {
         matches!(self.end, End::PositiveUnusable(_))
     }
 
+    /// Whether the answer is one the host takes as the primitive's response: neither a pending
+    /// nor a rejected result (`Progress::answers`). The link errors the host reads are ordered
+    /// against the first of these (`Progress::errors_before_response`), so the log orders the
+    /// ones it reads for an end by the same answer.
+    pub(crate) fn is_response(&self, expected: &Expected) -> bool {
+        !self.is_pending(expected) && !self.is_rejected()
+    }
+
     /// The end and the pendings the answer stands for as an exchange of its own: a lone pending
     /// is a request that got a pending and no response, its own pending the last of its list.
     /// The one conversion both the classification ([`Evidence::as_answer`]) and the log's

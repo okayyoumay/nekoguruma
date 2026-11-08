@@ -2929,7 +2929,8 @@ impl CommLog {
         let mut may_own_transmit = false;
         let mut may_own_start = false;
         for (item, placed) in unbound.iter().zip(unbound_placed) {
-            let flags = inner.place_unbound_item(at, item, placed, Some(&evidence), &in_flight)?;
+            let flags =
+                inner.place_unbound_item(at, item, placed, Some(&evidence), &in_flight, None)?;
             may_own_unattached |= flags.unattached;
             may_own_transmit |= flags.transmit;
             may_own_start |= flags.start;
@@ -3086,10 +3087,10 @@ impl CommLog {
                 inner.job_end_link_errors(
                     None,
                     0,
-                    &reads[index..=index],
-                    &placed[index..=index],
+                    (&reads[index..=index], &placed[index..=index]),
                     None,
                     false,
+                    None,
                 )?;
                 continue;
             };
@@ -3097,10 +3098,10 @@ impl CommLog {
                 inner.job_end_link_errors(
                     None,
                     0,
-                    &reads[index..=index],
-                    &placed[index..=index],
+                    (&reads[index..=index], &placed[index..=index]),
                     None,
                     false,
+                    None,
                 )?;
             } else if inner.links.is_empty() {
                 let event = Event::Unattached(UnattachedEntry::of(item, placed[index].time));
@@ -3108,7 +3109,14 @@ impl CommLog {
                     serde_json::to_writer(line, &Line { seq, event: &event })
                 })?;
             } else {
-                inner.place_unbound_item(0, item, placed[index].time, None, &|_, _, _, _| false)?;
+                inner.place_unbound_item(
+                    0,
+                    item,
+                    placed[index].time,
+                    None,
+                    &|_, _, _, _| false,
+                    None,
+                )?;
             }
         }
         for read in &reads {
@@ -3182,7 +3190,52 @@ impl CommLog {
         let placed = inner.place_end_reads(&ended.reads, ended.end.is_none(), Some(early));
         inner.exchange_began_us = None;
         let placed = placed?;
+        // The items of no primitive the entry takes as its own (an indication of its response
+        // or its send) are not written beside it.
+        let taken = if ended.end.is_some() {
+            inner.taken_indications(at, seq, &kept, &ended.reads)
+        } else {
+            TakenIndications::default()
+        };
+        // Read while the primitive was in flight (before the item that ended it, any item when
+        // the agent cancelled it), a response the exchange could own is judged as an exchange
+        // judges one it reads, and written before the entry (design 8.11 `primitive_ended`).
+        let end_ordinal = ended_ordinal(&ended);
+        let mut may_own_unattached = false;
+        for (index, (read, placed)) in ended.reads.iter().zip(&placed).enumerate() {
+            let EndItem::Unattached(item) = &read.item else {
+                continue;
+            };
+            if index >= end_ordinal || item.link_error().is_some() || taken.contains(index) {
+                continue;
+            }
+            may_own_unattached |= awaited_by(item, &kept.evidence);
+            let flags = inner.place_unbound_item(
+                at,
+                item,
+                placed.time,
+                Some(&kept.evidence),
+                &|_, _, _, _| false,
+                Some(seq),
+            )?;
+            may_own_unattached |= flags.unattached;
+        }
+        // Writing them may have settled other exchanges, which the entry then sees.
+        let kept = inner.links[at].1.kept(seq)?.clone();
         let Some(end) = ended.end else {
+            let mut classification = kept.classification;
+            let mut reason = "The agent cancelled the primitive before it ended; this settles nothing, and the exchange keeps its classification.".to_owned();
+            if may_own_unattached && classification < exchange::Classification::Undetermined {
+                classification = exchange::Classification::Undetermined;
+                reason.push_str(MAY_OWN_UNATTACHED);
+            }
+            if may_own_unattached {
+                inner.links[at].1.floor(
+                    seq,
+                    exchange::Classification::Undetermined,
+                    MAY_OWN_UNATTACHED,
+                );
+            }
             let event = Event::PrimitiveEnded(Box::new(PrimitiveEndedEntry {
                 refers_to: vec![seq],
                 link,
@@ -3200,14 +3253,12 @@ impl CommLog {
                     link,
                     origin: kept.origin,
                     request: kept.request.clone(),
-                    classification: kept.classification,
-                    reason: "The agent cancelled the primitive before it ended; this settles nothing, and the exchange keeps its classification.".to_owned(),
+                    classification,
+                    reason,
                 }],
                 not_reclassified_through: None,
-                text: format!(
-                    "The agent cancelled the primitive of the exchange logged as {seq}."
-                ),
-                classification: kept.classification,
+                text: format!("The agent cancelled the primitive of the exchange logged as {seq}."),
+                classification,
             }));
             let written = inner.append_with(|seq, line| {
                 serde_json::to_writer(line, &Line { seq, event: &event })
@@ -3218,10 +3269,10 @@ impl CommLog {
             inner.job_end_link_errors(
                 Some((seq, &starts)),
                 link,
-                &ended.reads,
-                &placed,
+                (&ended.reads, &placed),
                 None,
                 true,
+                None,
             )?;
             inner.note_end_reads(link, &ended.reads);
             return Some(written);
@@ -3336,36 +3387,24 @@ impl CommLog {
         // An indication of no primitive read at job end is the exchange's, as it would have
         // been during it, when no other exchange on the link could own it (design 8.11 "Link
         // settings for the log").
-        let state = &inner.links[at].1;
         let rx_id = evidence.rx_id;
-        let late_start = if state.may_own_start_indication_besides(rx_id, seq) {
-            None
-        } else {
-            unattached
-                .iter()
-                .rev()
-                .find(|(item, _)| item.is_start_indication_for(rx_id))
-                .copied()
-        };
+        let taken_item =
+            |index: Option<usize>| match index.map(|index| (&ended.reads[index], &placed[index])) {
+                Some((
+                    EndRead {
+                        item: EndItem::Unattached(item),
+                        ..
+                    },
+                    placed,
+                )) => Some((item, placed.time)),
+                _ => None,
+            };
+        let late_start = taken_item(taken.start);
         if late_start.is_some() {
             evidence.response_started = true;
         }
-        // A transmit indication bound to the primitive is the exchange's own; one of no
-        // primitive is taken only without it.
         let bound_transmit = transmit_read.filter(|_| evidence.transmit_evidence.is_none());
-        let late_transmit = match evidence.target {
-            exchange::Target::Endpoint { tx_id, .. }
-                if evidence.transmit_evidence.is_none()
-                    && bound_transmit.is_none()
-                    && !state.may_own_tx_indication_besides(kept.sent) =>
-            {
-                unattached
-                    .iter()
-                    .find(|(item, _)| item.is_tx_indication_for(tx_id))
-                    .copied()
-            }
-            _ => None,
-        };
+        let late_transmit = taken_item(taken.transmit);
         // A response that began and did not complete, as an exchange's end gives it.
         if evidence.vci_ended
             && evidence.response_started
@@ -3729,8 +3768,14 @@ impl CommLog {
             let now = state.owed_row_ids(seq);
             dropped = rows.into_iter().filter(|id| !now.contains(id)).collect();
         }
-        let (classification, reason) =
+        let (mut classification, mut reason) =
             exchange::settle_primitive_ended(&entry, observed, unanswered);
+        // A response read while the primitive was in flight that it or an earlier exchange
+        // could own leaves the entry at least `undetermined`, as for an exchange.
+        if may_own_unattached && classification < exchange::Classification::Undetermined {
+            classification = exchange::Classification::Undetermined;
+            reason.push_str(MAY_OWN_UNATTACHED);
+        }
         // The answers its end adds count for the later exchanges on the link.
         let state = &mut inner.links[at].1;
         state.settled(
@@ -3740,6 +3785,14 @@ impl CommLog {
             settled_evidence,
             final_response,
         );
+        // `settled` replaces the floor of a non-final end, so this one is set after it.
+        if may_own_unattached {
+            state.floor(
+                seq,
+                exchange::Classification::Undetermined,
+                MAY_OWN_UNATTACHED,
+            );
+        }
         // A link error that came before the answer ends the matched answers and the answers
         // since an error from before it, and the answer then counts after it (design 8.11
         // "Link error", as `record` applies it): applied before the answer is counted, which
@@ -3833,10 +3886,10 @@ impl CommLog {
         inner.job_end_link_errors(
             Some((seq, &starts)),
             link,
-            &ended.reads,
-            &placed,
+            (&ended.reads, &placed),
             response_ordinal,
             false,
+            Some((at, end_ordinal, &taken)),
         )?;
         inner.note_end_reads(link, &ended.reads);
         // The loss record comes last, after the lines of the job end (ADR-386), with the
@@ -4319,12 +4372,34 @@ enum LateOwner {
     Several(Vec<u64>, bool),
 }
 
+/// Whether `item`, a message another node sent and not a pending, is one the exchange of
+/// `evidence` awaits: it is in flight and could be its response (design 8.11 `late_response`).
+fn awaited_by(item: &UnattachedItem, evidence: &exchange::Evidence) -> bool {
+    let UnattachedData::Result {
+        rx_flag,
+        identifier,
+        bytes,
+    } = &item.data
+    else {
+        return false;
+    };
+    !bytes.is_empty()
+        && is_received(rx_flag)
+        && item.pending_bytes().is_none()
+        && evidence.awaits_response()
+        && (evidence.collecting || identifier.is_none_or(|id| evidence.owed_ids().contains(&id)))
+        && evidence.expected.matches(bytes)
+}
+
 /// [`LateOwner`] of `item`: a message another node sent, not a pending, that an owed exchange
-/// could own; `None` for any other item, or one no kept exchange could own.
+/// could own; `None` for any other item, or one no kept exchange could own. `besides` is an
+/// owed exchange left out of the owners, because `evidence` is it (a primitive at job end is
+/// both the exchange in flight and a kept one).
 fn late_response_owner(
     state: &exchange::LinkState,
     item: &UnattachedItem,
     evidence: Option<&exchange::Evidence>,
+    besides: Option<u64>,
 ) -> Option<LateOwner> {
     let UnattachedData::Result {
         rx_flag,
@@ -4338,13 +4413,9 @@ fn late_response_owner(
     if bytes.is_empty() || !is_received(rx_flag) || item.pending_bytes().is_some() {
         return None;
     }
-    let in_flight = evidence.is_some_and(|evidence| {
-        evidence.awaits_response()
-            && (evidence.collecting
-                || identifier.is_none_or(|id| evidence.owed_ids().contains(&id)))
-            && evidence.expected.matches(bytes)
-    });
-    let owners = state.late_response_owners(*identifier, bytes);
+    let in_flight = evidence.is_some_and(|evidence| awaited_by(item, evidence));
+    let mut owners = state.late_response_owners(*identifier, bytes);
+    owners.retain(|owner| Some(*owner) != besides);
     // A pending is a late item, not a late response.
     let pending = |kept: &exchange::Kept| {
         let negative = &kept.evidence.expected.negative_pattern;
@@ -4366,6 +4437,39 @@ fn late_response_owner(
     (!kept.is_empty() || in_flight).then_some(LateOwner::Several(kept, in_flight))
 }
 
+/// The items of no primitive that a `primitive_ended` entry takes as its own, by read ordinal.
+#[derive(Debug, Default)]
+struct TakenIndications {
+    /// The start of the response, when no other exchange could own it.
+    start: Option<usize>,
+    /// The transmit indication of its send, when no other exchange could own it.
+    transmit: Option<usize>,
+}
+
+impl TakenIndications {
+    fn contains(&self, index: usize) -> bool {
+        self.start == Some(index) || self.transmit == Some(index)
+    }
+}
+
+/// The read ordinal of the item that ended the primitive: its receive timeout, finished status,
+/// final response, or the error that ended it; past the last read when the agent cancelled it
+/// or none of them was read.
+fn ended_ordinal(ended: &PrimitiveEnded) -> usize {
+    if ended.end.is_none() {
+        return ended.reads.len();
+    }
+    ended
+        .reads
+        .iter()
+        .position(|read| match &read.item {
+            EndItem::RxTimeout(_) | EndItem::Finished(_) | EndItem::Response { .. } => true,
+            EndItem::Error(error) => error.kind.is_none(),
+            _ => false,
+        })
+        .unwrap_or(ended.reads.len())
+}
+
 /// Whether an indication of the item may be the exchange in flight's own.
 type InFlight<'a> =
     dyn Fn(&UnattachedItem, Option<clocks::Placed>, LateIndication, u32) -> bool + 'a;
@@ -4381,13 +4485,53 @@ struct UnboundFlags {
 }
 
 impl Inner {
+    /// The indications read at job end that the entry of the exchange `seq` (kept as `kept` on
+    /// link `at`) takes as its own, which are not written beside it: the latest start of its
+    /// response and the first transmit indication of its send, when no other exchange could
+    /// own them (design 8.11 "Link settings for the log").
+    fn taken_indications(
+        &self,
+        at: usize,
+        seq: u64,
+        kept: &exchange::Kept,
+        reads: &[EndRead],
+    ) -> TakenIndications {
+        let state = &self.links[at].1;
+        let evidence = &kept.evidence;
+        let rx_id = evidence.rx_id;
+        let start = if state.may_own_start_indication_besides(rx_id, seq) {
+            None
+        } else {
+            reads.iter().rposition(|read| {
+                matches!(&read.item, EndItem::Unattached(item) if item.is_start_indication_for(rx_id))
+            })
+        };
+        let transmit_read = reads
+            .iter()
+            .any(|read| matches!(read.item, EndItem::TxIndication(_)));
+        let transmit = match evidence.target {
+            exchange::Target::Endpoint { tx_id, .. }
+                if evidence.transmit_evidence.is_none()
+                    && !transmit_read
+                    && !state.may_own_tx_indication_besides(kept.sent) =>
+            {
+                reads.iter().position(|read| {
+                    matches!(&read.item, EndItem::Unattached(item) if item.is_tx_indication_for(tx_id))
+                })
+            }
+            _ => None,
+        };
+        TakenIndications { start, transmit }
+    }
+
     /// Places one item of no primitive, or of an earlier one, that the host read (design 8.11
     /// `unattached`, `late_response`, `late_item`, ADR-397): a response only one owed exchange
     /// could own settles it, any other item is written `unattached`, and the indications that
     /// owners could share are settled as late items. `evidence` is the exchange that read the
     /// item, `in_flight` tells whether an indication may be that exchange's own; with none in
-    /// flight (items read between exchanges, or at job end) nothing is. `None` once the log has
-    /// failed.
+    /// flight (items read between exchanges, or at job end) nothing is. `besides` is the owed
+    /// exchange `evidence` is, when the log keeps it (a stray primitive at job end), so that it
+    /// is counted once. `None` once the log has failed.
     fn place_unbound_item(
         &mut self,
         at: usize,
@@ -4395,9 +4539,10 @@ impl Inner {
         placed: Option<clocks::Placed>,
         evidence: Option<&exchange::Evidence>,
         in_flight: &InFlight<'_>,
+        besides: Option<u64>,
     ) -> Option<UnboundFlags> {
         let mut flags = UnboundFlags::default();
-        let owner = late_response_owner(&self.links[at].1, item, evidence);
+        let owner = late_response_owner(&self.links[at].1, item, evidence, besides);
         if let Some(LateOwner::One(owner)) = owner {
             self.late_response(at, owner, item, placed)?;
             return Some(flags);
@@ -5161,14 +5306,19 @@ impl Inner {
     /// has no end to be written in, and is the exchange's own. An error is before the exchange's
     /// answer when its read ordinal is below the `response`'s. One that writes no line is
     /// written `unattached`. `None` once the log has failed.
+    ///
+    /// With `late` (the link's position, the read ordinal of the item that ended the primitive,
+    /// and the ordinals of the items the entry took), every other item of no primitive read at or
+    /// after that ordinal is placed in the same pass as an exchange places its unbound items,
+    /// with no exchange in flight (ADR-431 decision 2).
     fn job_end_link_errors(
         &mut self,
         owner: Option<(u64, &[(exchange::Clock, clocks::Placed)])>,
         link: u32,
-        reads: &[EndRead],
-        placed: &[EndPlaced],
+        (reads, placed): (&[EndRead], &[EndPlaced]),
         response: Option<usize>,
         no_end: bool,
+        late: Option<(usize, usize, &TakenIndications)>,
     ) -> Option<()> {
         for (index, (read, placed)) in reads.iter().zip(placed).enumerate() {
             let (item, kind, owned) = match &read.item {
@@ -5194,6 +5344,19 @@ impl Inner {
                 }
                 EndItem::Unattached(item) => {
                     let Some(kind) = item.link_error() else {
+                        if let Some((link_at, from, taken)) = late
+                            && index >= from
+                            && !taken.contains(index)
+                        {
+                            self.place_unbound_item(
+                                link_at,
+                                item,
+                                placed.time,
+                                None,
+                                &|_, _, _, _| false,
+                                None,
+                            )?;
+                        }
                         continue;
                     };
                     let at = placed.time;
@@ -10300,7 +10463,14 @@ pub(crate) mod tests {
             Some(LateOwner::Several(ref owners, false)) if *owners == vec![seq, second]
         ));
         log.lock()
-            .place_unbound_item(0, &item, placed_after(3_500_000), None, &|_, _, _, _| false)
+            .place_unbound_item(
+                0,
+                &item,
+                placed_after(3_500_000),
+                None,
+                &|_, _, _, _| false,
+                None,
+            )
             .unwrap();
         // Neither is settled; both are at least undetermined.
         assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq, second], true));
@@ -10350,7 +10520,7 @@ pub(crate) mod tests {
     /// The late response decision for `item` on link 0, as the log takes it.
     fn late_owner_of(log: &CommLog, item: &UnattachedItem) -> Option<LateOwner> {
         let inner = log.lock();
-        late_response_owner(&inner.links[0].1, item, None)
+        late_response_owner(&inner.links[0].1, item, None, None)
     }
 
     /// ADR-432 case A: on a functional link (receive table 0x7E8, 0x7E9) a collecting exchange
@@ -11386,7 +11556,7 @@ pub(crate) mod tests {
             assert_eq!(owed_on_7e8(&log, seq), (vec![seq], true), "{functional}");
             let inner = log.lock();
             assert_eq!(
-                late_response_owner(&inner.links[0].1, &late_final_item(), None),
+                late_response_owner(&inner.links[0].1, &late_final_item(), None, None),
                 Some(LateOwner::One(seq)),
                 "{functional}"
             );
@@ -19554,5 +19724,322 @@ pub(crate) mod tests {
                     .unwrap(),
             "{lines:#?}"
         );
+    }
+
+    /// A message `bytes` another node sent on `identifier`, of no primitive, read at job end
+    /// `at_us` after the stray's entry; its VCI time is `vci_us`.
+    fn unbound_result(at_us: u64, vci_us: u32, identifier: u32, bytes: &[u8]) -> EndRead {
+        end_read(
+            at_us,
+            EndItem::Unattached(UnattachedItem {
+                link: 1,
+                earlier_primitive: false,
+                owner: None,
+                vci_us,
+                clock: Some(exchange::Clock::Device),
+                read: Some(read_at(at_us)),
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, 0],
+                    identifier: Some(identifier),
+                    bytes: bytes.to_vec(),
+                },
+            }),
+        )
+    }
+
+    /// [`stray_log`] with an earlier exchange `earlier`, a request the VCI ended its wait for
+    /// (owed and kept), logged before the stray, which asks `request`.
+    fn stray_log_behind(
+        earlier: &[u8],
+        request: &[u8],
+    ) -> (PathBuf, CommLogSetup, CommLog, u64, u64) {
+        let dir = dir();
+        let setup = setup(&dir);
+        let log = CommLog::open(&setup).unwrap();
+        log.begin(&facts(), RunKind::First);
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+                ..Default::default()
+            },
+            Some(true),
+        )
+        .unwrap();
+        let mut ended = evidence(endpoint(0x7E0), earlier, exchange::End::NoResponse);
+        ended.vci_ended = true;
+        ended.times.agent.before_us = 1_000;
+        ended.times.agent.end_us = 5_000;
+        let sent = UnattachedItem {
+            vci_us: 1_500,
+            ..tx_done(0x7E0)
+        };
+        let first = log.exchange_with(ended, vec![sent]).unwrap();
+        let mut waited = evidence(endpoint(0x7E0), request, exchange::End::VciDidNotEnd);
+        waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.times.agent.before_us = 10_000;
+        waited.times.agent.end_us = JOB_END_US;
+        let transmit = UnattachedItem {
+            vci_us: 10_500,
+            read: Some(read_at(0)),
+            ..tx_done(0x7E0)
+        };
+        let seq = log.exchange_with(waited, vec![transmit]).unwrap();
+        (dir, setup, log, first, seq)
+    }
+
+    /// The `refers_to` and position of the `late_response` lines and the `unattached` lines.
+    fn order_of(lines: &[serde_json::Value]) -> Vec<&str> {
+        lines
+            .iter()
+            .filter_map(|line| line["event"].as_str())
+            .filter(|event| {
+                [
+                    "unattached",
+                    "late_response",
+                    "primitive_ended",
+                    "late_item",
+                ]
+                .contains(event)
+            })
+            .collect()
+    }
+
+    const PRESENCE_FINAL: [u8; 2] = [0x7E, 0x00];
+    const F190_FINAL: [u8; 4] = [0x62, 0xF1, 0x90, 0x41];
+
+    /// Design 8.11 `primitive_ended`: a response one earlier ended exchange alone could own,
+    /// read before the stray's receive timeout, is that exchange's `late_response`, written
+    /// before the stray's entry as an exchange writes the ones it reads; the stray, which does
+    /// not await it, keeps the classification it has when the response comes after the timeout.
+    #[test]
+    fn an_unbound_response_read_before_the_end_settles_the_one_ended_owner() {
+        let mut classifications = Vec::new();
+        for before in [true, false] {
+            let (dir, setup, log, first, seq) =
+                stray_log_behind(&[0x3E, 0x00], &[0x22, 0xF1, 0x90]);
+            let item = unbound_result(300_000, 310_500, 0x7E8, &PRESENCE_FINAL);
+            let timeout = end_read(500_000, EndItem::RxTimeout(dev(1_000_000)));
+            let reads = if before {
+                vec![item, timeout]
+            } else {
+                vec![timeout, item]
+            };
+            let mut ended = ended_with(Some(exchange::End::NoResponse), reads);
+            ended.vci_ended = true;
+            log.primitive_ended(seq, ended).unwrap();
+            let lines = finished(&log, &setup, &dir);
+            let late = line_of(&lines, "late_response");
+            assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+            let expected = if before {
+                ["late_response", "primitive_ended"]
+            } else {
+                ["primitive_ended", "late_response"]
+            };
+            assert_eq!(order_of(&lines), expected, "{lines:#?}");
+            classifications.push(line_of(&lines, "primitive_ended")["classification"].clone());
+        }
+        assert_eq!(classifications[0], classifications[1]);
+    }
+
+    /// The floor the log keeps for `seq` and its reason.
+    fn floor_of(log: &CommLog, seq: u64) -> Option<(exchange::Classification, String)> {
+        kept_of(log, seq).floor
+    }
+
+    /// Design 8.11 `late_response`: a response that an ended exchange and the stray, which was
+    /// still waiting, could both own is `unattached` with the ended exchange named, and floors
+    /// the stray at `undetermined`, as it would an exchange that read it.
+    #[test]
+    fn an_unbound_response_the_stray_and_an_ended_exchange_could_own_floors_the_entry() {
+        let (dir, setup, log, first, seq) = stray_log_behind(&[0x3E, 0x00], &[0x3E, 0x00]);
+        let mut ended = ended_with(
+            Some(exchange::End::NoResponse),
+            vec![
+                unbound_result(300_000, 310_500, 0x7E8, &PRESENCE_FINAL),
+                end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+            ],
+        );
+        ended.vci_ended = true;
+        log.primitive_ended(seq, ended).unwrap();
+        assert_eq!(
+            floor_of(&log, seq),
+            Some((
+                exchange::Classification::Undetermined,
+                MAY_OWN_UNATTACHED.to_owned()
+            ))
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "late_response", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_response");
+        assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+    }
+
+    /// A response nothing awaits or owes (another identifier) is only `unattached`: the entry
+    /// keeps its classification.
+    #[test]
+    fn an_unbound_response_no_exchange_could_own_is_written_unattached() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                vec![
+                    unbound_result(300_000, 310_500, 0x7E9, &PRESENCE_FINAL),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(floor_of(&log, seq), None);
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "primitive_ended"],
+            "{lines:#?}"
+        );
+    }
+
+    /// The stray's own response, read in its wait but bound to no primitive, is written
+    /// `unattached` before its entry and floors the stray at `undetermined`; `settled` replaces the
+    /// floor of a non-final end, so the floor is set after it.
+    #[test]
+    fn an_unbound_response_only_the_stray_awaits_floors_its_entry_and_stays() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                vec![
+                    unbound_result(300_000, 310_500, 0x7E8, &F190_FINAL),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                ],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            floor_of(&log, seq),
+            Some((
+                exchange::Classification::Undetermined,
+                MAY_OWN_UNATTACHED.to_owned()
+            ))
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "primitive_ended"],
+            "{lines:#?}"
+        );
+    }
+
+    /// ADR-431 decision 2: the stray's own response read after its receive timeout is a late
+    /// response of the stray, whose wait the VCI had ended; it follows the entry.
+    #[test]
+    fn an_unbound_response_read_after_the_receive_timeout_is_the_stray_s_late_response() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        let mut ended = ended_with(
+            Some(exchange::End::NoResponse),
+            vec![
+                end_read(500_000, EndItem::RxTimeout(dev(1_000_000))),
+                unbound_result(600_000, 1_100_000, 0x7E8, &F190_FINAL),
+            ],
+        );
+        ended.vci_ended = true;
+        log.primitive_ended(seq, ended).unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["primitive_ended", "late_response"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_response");
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
+    }
+
+    /// A pending the stray's wait read, bound to no primitive, is no late response: it is
+    /// `unattached`, and the lone owner it could belong to takes no line of its own.
+    #[test]
+    fn an_unbound_pending_read_at_job_end_is_written_unattached() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                vec![
+                    unbound_result(300_000, 310_500, 0x7E8, &[0x7F, 0x22, 0x78]),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_000_000))),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "primitive_ended"],
+            "{lines:#?}"
+        );
+    }
+
+    /// The agent cancelled the primitive: everything read was read while it was in flight, so a
+    /// response the stray awaits is written before the cancel entry, which is then at least
+    /// `undetermined`.
+    #[test]
+    fn an_unbound_response_read_for_a_cancelled_primitive_is_written_before_its_entry() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        log.primitive_ended(
+            seq,
+            ended_with(
+                None,
+                vec![unbound_result(300_000, 310_500, 0x7E8, &F190_FINAL)],
+            ),
+        )
+        .unwrap();
+        assert_eq!(
+            floor_of(&log, seq).map(|(classification, _)| classification),
+            Some(exchange::Classification::Undetermined)
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "primitive_ended"],
+            "{lines:#?}"
+        );
+    }
+
+    /// The start of the stray's response, read at job end, is the entry's own (`late_start`): it
+    /// is not written beside the entry as well.
+    #[test]
+    fn a_start_indication_the_entry_takes_is_not_written_unattached() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        let EndItem::Unattached(mut start) = unbound_result(300_000, 310_500, 0x7E8, &[]).item
+        else {
+            unreachable!()
+        };
+        start.data = UnattachedData::Result {
+            rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+            identifier: Some(0x7E8),
+            bytes: Vec::new(),
+        };
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                vec![
+                    end_read(300_000, EndItem::Unattached(start)),
+                    end_read(500_000, EndItem::RxTimeout(dev(1_010_500))),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(order_of(&lines), ["primitive_ended"], "{lines:#?}");
     }
 }

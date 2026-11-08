@@ -4389,13 +4389,19 @@ fn negative_note(code: Option<u8>) -> &'static str {
     }
 }
 
+/// The reading a window the agent's deadline ended leaves open (ADR-434).
+const DEADLINE_OPEN: &str = "the agent stopped waiting before the VCI ended the window, so whether the VCI would have ended it at its limit is not shown";
+
 /// Why the end of an exchange's wait, with no response, does not show that the limit in
 /// force ran out (ADR-376): `None` only for a receive timeout judged at the limit on one clock
 /// on a link that forwards pendings. The log presumes neither the VCI's timer nor, on J2534,
 /// the worker's right, nor that a pending the VCI absorbed restarted its wait.
 fn silence_open(evidence: &Evidence) -> Option<String> {
     let mut open = Vec::new();
-    if evidence.timing.window != Window::TimeoutAtLimit {
+    if matches!(evidence.end, End::VciDidNotEnd) {
+        // The agent's deadline ended the window (ADR-434), not the VCI.
+        open.push(DEADLINE_OPEN);
+    } else if evidence.timing.window != Window::TimeoutAtLimit {
         open.push(
             "the end of the wait is not judged against the limit in force on one clock, so it may have come early or late: the VCI's timer, or on a J2534 link the worker's, is not presumed right",
         );
@@ -4477,7 +4483,9 @@ fn answer_that_set_it(evidence: &Evidence, verdicts: &[(Classification, String)]
 /// pending the VCI absorbed, a window end not judged against its limit on one clock. A link
 /// error on the exchange's own link is the link-error rows' (`classify`). With no answer the
 /// silence is `none` only for a confirmed send, on a link that forwards pendings, with the end
-/// judged at its limit and no link error.
+/// judged at its limit and no link error. A window the agent's deadline ended (ADR-434) takes
+/// this row when it has answers and its VCI limits are not past; it has the deadline among the
+/// open readings.
 fn collecting_row(
     evidence: &Evidence,
     history: &LinkHistory,
@@ -4761,6 +4769,12 @@ fn rows(
                     evidence.vci_limits_past_by_us.unwrap_or_default() as f64 / 1000.0
                 ),
             )
+        }
+        // A collecting request with answers: the most severe of them, at least `undetermined`
+        // with the deadline open (ADR-434, ADR-400 decision 4(B)). Without answers the generic
+        // row below stands.
+        End::VciDidNotEnd if evidence.collecting && answers_listed => {
+            collecting_row(evidence, history, sent, owed_handled)
         }
         End::VciDidNotEnd => (
             Undetermined,
@@ -7868,6 +7882,17 @@ mod tests {
         let mut unconfirmed = past.clone();
         unconfirmed.transmit_evidence = None;
         assert_eq!(verdict_of(&unconfirmed).0, Classification::Undetermined);
+        // A collecting entry with answers past its limits stays the system's, and one without
+        // answers takes the generic row when they are not (ADR-434).
+        let mut collecting_past = deadline_ended(vec![positive(RX, Window::WithinP2)]);
+        collecting_past.vci_limits_past_by_us = Some(12_500);
+        let (class, reason) = verdict_of(&collecting_past);
+        assert_eq!(class, Classification::System, "{reason}");
+        assert!(reason.contains("12.5 ms past the latest limit"), "{reason}");
+        let silent = deadline_ended(Vec::new());
+        let (class, reason) = verdict_of(&silent);
+        assert_eq!(class, Classification::Undetermined);
+        assert!(reason.starts_with("The agent stopped waiting"), "{reason}");
     }
 
     #[test]
@@ -9305,6 +9330,26 @@ mod tests {
         evidence
     }
 
+    /// A collecting exchange the agent's deadline ended before the VCI ended its window, its
+    /// VCI limits not shown past (ADR-434).
+    fn deadline_ended(answers: Vec<Answer>) -> Evidence {
+        let mut evidence = collecting(answers);
+        evidence.end = End::VciDidNotEnd;
+        evidence.vci_ended = false;
+        evidence.timing.window = Window::NotJudged;
+        evidence.timing.not_judged_reason = Some(NotJudgedReason::NoTimeToJudge);
+        evidence
+    }
+
+    /// A final answer on `rx_id` whose own response pending came after the limit in force.
+    fn late_pending_answer(rx_id: u32) -> Answer {
+        let mut late = positive(rx_id, Window::Late);
+        late.pending = vec![pending()];
+        late.timing.window_by_ms = Some(3.0);
+        late.timing.late_pending = Some(0);
+        late
+    }
+
     fn entry_of(evidence: Evidence) -> ExchangeEntry {
         let history = LinkState::default().history_for(&evidence);
         ExchangeEntry::build(1, evidence, history)
@@ -9557,6 +9602,101 @@ mod tests {
             assert_eq!(entry.classification, class, "{}", entry.reason);
             assert_eq!(entry.answers.len(), 2);
         }
+    }
+
+    #[test]
+    fn a_deadline_ended_collecting_entry_with_in_time_answers_is_undetermined_naming_the_deadline()
+    {
+        // ADR-434 case 1: the answers weigh none, the deadline stays open.
+        let entry = entry_of(deadline_ended(vec![positive(RX, Window::WithinP2)]));
+        assert_eq!(classes(&entry), [Classification::None]);
+        assert_eq!(
+            entry.classification,
+            Classification::Undetermined,
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("1 answer on 1 identifier"),
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry
+                .reason
+                .contains("whether the VCI would have ended it at its limit is not shown"),
+            "{}",
+            entry.reason
+        );
+        assert!(!entry.reason.contains("on one clock"), "{}", entry.reason);
+    }
+
+    #[test]
+    fn a_deadline_ended_collecting_entry_with_a_late_pending_answer_is_system() {
+        // ADR-434 case 2: the answer's own late pending is the system's.
+        let entry = entry_of(deadline_ended(vec![late_pending_answer(RX)]));
+        assert_eq!(classes(&entry), [Classification::System]);
+        assert_eq!(
+            entry.classification,
+            Classification::System,
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("The answer that set it: #1"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn a_deadline_ended_functional_window_names_the_answers_on_both_identifiers() {
+        // ADR-434 case 3, on a functional link receiving on 0x7E8 and 0x7E9: a final answer and
+        // a lone pending.
+        let mut evidence = deadline_ended(vec![positive(RX, Window::WithinP2), lone(RX2)]);
+        evidence.rx_id = 0;
+        evidence.receive_ids = vec![RX, RX2];
+        let entry = entry_of(evidence);
+        assert_eq!(
+            entry.classification,
+            Classification::Undetermined,
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("2 answers on 2 identifiers"),
+            "{}",
+            entry.reason
+        );
+        // A late pending on 0x7E9 makes it the system's, as on a physical link.
+        let mut evidence = deadline_ended(vec![
+            positive(RX, Window::WithinP2),
+            late_pending_answer(RX2),
+        ]);
+        evidence.rx_id = 0;
+        evidence.receive_ids = vec![RX, RX2];
+        let entry = entry_of(evidence);
+        assert_eq!(
+            entry.classification,
+            Classification::System,
+            "{}",
+            entry.reason
+        );
+        assert!(
+            entry.reason.contains("The answer that set it: #2 on 0x7e9"),
+            "{}",
+            entry.reason
+        );
+    }
+
+    #[test]
+    fn a_deadline_ended_collecting_entry_with_a_channel_link_error_names_h3() {
+        // ADR-434 case 8.
+        let mut evidence = deadline_ended(vec![positive(RX, Window::WithinP2)]);
+        evidence.channel_link_errors = vec![LinkErrorKind::Frame];
+        let entry = entry_of(evidence);
+        assert_eq!(entry.classification, Classification::Undetermined);
+        assert!(entry.reason.contains("(H3)"), "{}", entry.reason);
     }
 
     #[test]

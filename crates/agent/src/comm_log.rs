@@ -9045,12 +9045,16 @@ pub(crate) mod tests {
         let recent = collecting_read_at_deadline(|evidence| {
             evidence.answers = vec![positive_on(0x7E8, 4_800_000)];
         });
-        assert_eq!(recent["classification"], "undetermined", "{recent}");
-        // It takes the generic `vci_did_not_end` row (design 8.11).
-        assert_eq!(
-            recent["reason"],
-            "The agent stopped waiting before the VCI ended the exchange; a long transfer can outlast the agent's deadline.",
-            "{recent}"
+        // It takes the collecting row with the deadline open (design 8.11, ADR-434). Its answer
+        // came 4.8 s after the transmit against a P2 of 1 s, so the answer's own verdict is
+        // `system`; the VCI's limits are not what makes it so.
+        assert_eq!(recent["classification"], "system", "{recent}");
+        let reason = recent["reason"].as_str().unwrap();
+        assert!(!reason.contains("past the latest limit"), "{reason}");
+        assert!(reason.contains("1 answer on 1 identifier"), "{reason}");
+        assert!(
+            reason.contains("whether the VCI would have ended it at its limit is not shown"),
+            "{reason}"
         );
         // 2 s before the reading: past by 2 s less 1.00232 s.
         let past = collecting_read_at_deadline(|evidence| {

@@ -38,8 +38,11 @@ answer missed the in-time `system`.
 3. **The standing classification is the most severe of the per-identifier verdicts so far,
    with the `system` the exchange's entry observed.** A partial settlement keeps its verdict as
    the exchange's floor, with a reason suffix, and `settle_late_response` raises a later
-   verdict to it. It does not take the exchange's classification wholesale, which an entry's
-   `undetermined` would then lift for a final answer that is the vehicle's.
+   verdict to it. The verdict is kept apart from the floors ambiguous items set (`Kept::partial`,
+   not `Kept::floor`), and it does not take the exchange's classification wholesale, which an
+   entry's `undetermined` would then lift for a final answer that is the vehicle's. An ambiguity
+   raise (`LinkState::raise`) keeps the higher of the floor it finds and its own, so a partial
+   settlement's `system` survives it and the rebuilds that follow.
 4. **The later exchanges' answers are freed per identifier.** `SettledAnswer` carries the
    identifiers the exchange is owed on no more (`settled_ids`); `reclassify_after` drops the
    exchange from a later exchange's owners only when the rows it has now no longer list it for

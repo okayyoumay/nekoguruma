@@ -2968,6 +2968,7 @@ impl CommLog {
             late_pendings: Vec::new(),
             late_places: Vec::new(),
             floor: None,
+            partial: None,
             clears,
             matched: false,
         };
@@ -4523,6 +4524,7 @@ impl Inner {
                 entry.sent,
                 kept.transmit,
                 (answer_order, answer_ends),
+                classification,
             );
             answer = answer.with_settled_ids(dropped);
             state.settled(owner, classification, &reason, answered_evidence, false);
@@ -10048,6 +10050,159 @@ pub(crate) mod tests {
             kept_of(&log, seq).late_pendings.last().unwrap().1,
             exchange::LatePending::InTime
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-433: a final answer in the entry's own window is no earlier settlement, and a floor
+    /// an ambiguous item set is not one either: the late final answer of the open identifier,
+    /// after the limit with the VCI shown to have ended its wait there, is the vehicle's.
+    #[test]
+    fn a_floor_an_ambiguous_item_set_is_no_per_identifier_verdict() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.times.vci.as_mut().unwrap().rx_timeout =
+                Some(device_time(BASE_US + 5_200_000));
+            evidence.answers = vec![lone_pending_on(0x7E8), positive_on(0x7E9, 400_000)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        log.lock().links[0].1.raise(
+            seq,
+            exchange::Classification::Undetermined,
+            "raised",
+            " raised",
+        );
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(9_000_000))
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response").remove(0);
+        assert_eq!(late["exchanges"][0]["classification"], "vehicle", "{late}");
+    }
+
+    /// ADR-433: what a partial settlement judged stands against an ambiguity read for the
+    /// exchange (the floor keeps the higher), a late link error that rebuilds it, and the final
+    /// answer of the identifier still open.
+    #[test]
+    fn a_partial_settlements_verdict_survives_an_ambiguity_and_a_late_error() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, |evidence| {
+            two_lone_pendings(evidence);
+            evidence.times.vci.as_mut().unwrap().rx_timeout =
+                Some(device_time(BASE_US + 5_200_000));
+        });
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        assert_eq!(
+            log.lock().links[0].1.standing(seq),
+            Some(exchange::Classification::System)
+        );
+        // A final answer of 0x7E9 that another exchange could own too raises this one.
+        log.lock()
+            .late_response_unowned(
+                0,
+                &[seq],
+                &late_final_on(0x7E9),
+                placed_after(3_200_000),
+                999,
+            )
+            .unwrap();
+        let rebuilt = log.lock().links[0]
+            .1
+            .error_in(seq, exchange::LinkErrorKind::Receive, 1, true, false)
+            .unwrap()
+            .0;
+        assert_eq!(rebuilt.classification, exchange::Classification::System);
+        // The open identifier's final answer, after the limit, is the vehicle's alone, and the
+        // exchange stays at what it was left.
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E9), placed_after(9_000_000))
+            .unwrap();
+        assert_eq!(
+            log.lock().links[0].1.standing(seq),
+            Some(exchange::Classification::System)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A second collecting exchange, owed on 0x7E9 alone, logged 10 s after the first.
+    fn second_owed_on_7e9(log: &CommLog) -> u64 {
+        let mut second = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.answers = vec![lone_pending_on(0x7E9)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E9)];
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+        });
+        second.times.agent.before_us += 10_000_000;
+        second.times.agent.end_us += 10_000_000;
+        log.exchange(second).unwrap()
+    }
+
+    /// ADR-433, case table row 10: after a partial settlement, a final answer of the identifier
+    /// still open that another exchange owed on it could own is `unattached` and raises both.
+    #[test]
+    fn an_ambiguous_final_answer_raises_a_partly_settled_exchange_and_the_other() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, two_lone_pendings);
+        let second = second_owed_on_7e9(&log);
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        let item = late_final_on(0x7E9);
+        assert!(matches!(
+            late_owner_of(&log, &item),
+            Some(LateOwner::Several(ref owners, false)) if *owners == vec![seq, second]
+        ));
+        log.lock()
+            .place_unbound_item(0, &item, placed_after(3_500_000), None, &|_, _, _, _| false)
+            .unwrap();
+        // Neither is settled; both are at least undetermined.
+        assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq, second], true));
+        assert!(owed_on(&log, 0x7E9, second).1);
+        let standing = |seq| log.lock().links[0].1.standing(seq).unwrap();
+        assert!(standing(second) >= exchange::Classification::Undetermined);
+        assert_eq!(standing(seq), exchange::Classification::System);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-433, case table row 11: an accepted ECUReset ends the rows and the kept evidence of a
+    /// partly settled exchange, as it does an exchange owed on every identifier.
+    #[test]
+    fn an_accepted_reset_ends_a_partly_settled_exchange() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, two_lone_pendings);
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
+        let mut reset = evidence(
+            endpoint(0x7DF),
+            &[0x11, 0x01],
+            exchange::End::Positive(vec![0x51, 0x01]),
+        );
+        reset.pending_visibility = exchange::PendingVisibility::Forwarded;
+        reset.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
+        reset.times.agent.before_us = BASE_US + 20_000_000;
+        reset.times.agent.end_us = BASE_US + 20_100_000;
+        log.exchange(reset).unwrap();
+        assert_eq!(owed_on(&log, 0x7E9, seq), (Vec::new(), false));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-433, case table row 12: the host's release after the exchange's primitive ends keeps
+    /// a partly settled exchange, which the VCI ended its wait for.
+    #[test]
+    fn the_release_after_a_primitive_ended_keeps_a_partly_settled_exchange() {
+        let (dir, _setup, log, seq) = late_collecting_on(true, two_lone_pendings);
+        log.lock()
+            .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+            .unwrap();
+        log.release_kept_ended(seq);
+        assert_eq!(owed_on(&log, 0x7E9, seq), (vec![seq], true));
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

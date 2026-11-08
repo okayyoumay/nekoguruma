@@ -1665,6 +1665,10 @@ pub(crate) struct Kept {
     /// reason its reason then ends with: kept with the owed exchange too, so it stands after the
     /// exchange leaves the window (ADR-370).
     pub floor: Option<(Classification, String)>,
+    /// The most severe verdict the late final answers that settled the exchange on some of its
+    /// identifiers gave it, while it stays owed on the others (ADR-433): a later final answer
+    /// is not judged below it. Kept apart from [`Kept::floor`], which ambiguous items set too.
+    pub partial: Option<Classification>,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
     pub clears: Clears,
@@ -2352,6 +2356,7 @@ impl LinkState {
         sent: Sent,
         transmit: super::timing::At,
         placed: (Vec<usize>, Vec<super::timing::At>),
+        verdict: Classification,
     ) -> Vec<u32> {
         let Some(sid) = self
             .owed
@@ -2367,6 +2372,7 @@ impl LinkState {
         self.update_kept(seq, evidence, sent, transmit, None);
         if let Some(kept) = self.kept.get_mut(&seq) {
             (kept.answer_order, kept.answer_ends) = placed;
+            kept.partial = Some(kept.partial.map_or(verdict, |had| had.max(verdict)));
         }
         before
             .into_iter()
@@ -2558,11 +2564,17 @@ impl LinkState {
                 logged.classification = floor;
                 logged.reason = reason.to_owned();
             }
-            logged.floor = Some((floor, suffix.to_owned()));
+            // The higher floor stands: an ambiguity never lowers what an earlier settlement or
+            // item kept (ADR-433).
+            if logged.floor.as_ref().is_none_or(|(had, _)| *had <= floor) {
+                logged.floor = Some((floor, suffix.to_owned()));
+            }
         }
         if let Some(kept) = self.kept.get_mut(&seq) {
             kept.classification = kept.classification.max(floor);
-            kept.floor = Some((floor, suffix.to_owned()));
+            if kept.floor.as_ref().is_none_or(|(had, _)| *had <= floor) {
+                kept.floor = Some((floor, suffix.to_owned()));
+            }
         }
     }
 
@@ -4054,18 +4066,6 @@ impl Kept {
         evidence.answers = folded;
         (evidence, folded_order, folded_ends)
     }
-
-    /// Whether a late final answer already settled this collecting exchange on some of its
-    /// identifiers, which it stays owed on the others of: the classification it stands at then is
-    /// the floor that settlement kept (ADR-433).
-    fn partly_settled(&self) -> bool {
-        self.evidence.collecting
-            && self
-                .evidence
-                .answers
-                .iter()
-                .any(|answer| !answer.is_pending(&self.evidence.expected))
-    }
 }
 
 /// The item of a late response that [`Kept::answered`] restates as an answer of a collecting
@@ -4084,7 +4084,7 @@ pub(crate) struct LateAnswer {
 /// only, which keeps `classification` as the least its later final answers give (ADR-433).
 pub(crate) fn per_identifier_floor(classification: Classification) -> String {
     format!(
-        " An earlier final answer of the exchange, on another response identifier, left it at {}, which stands.",
+        " An earlier final answer of the exchange left it at {}, which stands.",
         severity_word(classification)
     )
 }
@@ -4176,12 +4176,11 @@ pub(crate) fn settle_late_response(
     // What an earlier late final answer of the exchange, on another identifier, was judged
     // stands: the exchange's classification is the most severe of its per-identifier verdicts
     // (design 8.11 `late_response`, ADR-433).
-    if kept.partly_settled()
-        && let Some((floor, suffix)) = &kept.floor
-        && classification < *floor
+    if let Some(partial) = kept.partial
+        && classification < partial
     {
-        reason.push_str(suffix);
-        return (*floor, reason);
+        reason.push_str(&per_identifier_floor(partial));
+        return (partial, reason);
     }
     // A fault of the system the exchange's entry observed stands (design 8.11 "Settlement").
     if kept.classification == System && classification != System {
@@ -5156,6 +5155,7 @@ mod tests {
             late_pendings: Vec::new(),
             late_places: Vec::new(),
             floor: None,
+            partial: None,
             clears: state.clears(),
             matched: entry.matched_answer(),
         };
@@ -7665,6 +7665,7 @@ mod tests {
             late_pendings: Vec::new(),
             late_places: Vec::new(),
             floor: None,
+            partial: None,
             clears: Clears::default(),
             matched: false,
         };
@@ -7752,6 +7753,7 @@ mod tests {
             late_pendings: Vec::new(),
             late_places: Vec::new(),
             floor: None,
+            partial: None,
             clears: Clears::default(),
             matched: false,
         };
@@ -7832,6 +7834,7 @@ mod tests {
                 late_pendings: Vec::new(),
                 late_places: Vec::new(),
                 floor: None,
+                partial: None,
                 clears: Clears::default(),
                 matched: false,
             },
@@ -9876,6 +9879,27 @@ mod tests {
         assert_ne!(order[1], usize::MAX);
     }
 
+    /// ADR-433, row 13: the folded list keeps the places of the answers that stand: the pending
+    /// the final answer folds leaves with its place, and the final answer comes after every item.
+    #[test]
+    fn the_places_follow_the_folded_answers() {
+        let mut kept = kept_collecting(vec![lone(RX), lone(RX2)], true);
+        kept.pending_order = vec![0, 1];
+        kept.answer_order = vec![2, 3];
+        kept.answer_ends = vec![None, None];
+        let end = Some((
+            Clock::Device,
+            super::super::clocks::Placed {
+                epoch: 0,
+                unwrapped: 77,
+            },
+        ));
+        let (answered, order, ends) = kept.answered_placed(&POSITIVE, &late_on(Some(RX)), end);
+        assert_eq!(shape(&answered)[0].0, RX2);
+        assert_eq!(order, [3, 4]);
+        assert_eq!(ends, [None, end]);
+    }
+
     /// ADR-433: settling an owed exchange on one identifier sets its rows to the identifiers
     /// still open and frees the later answers on the settled one; the other identifier's later
     /// answers keep it as an owner.
@@ -9907,7 +9931,14 @@ mod tests {
         let (answered, order, ends) = kept.answered_placed(&POSITIVE, &late_on(Some(RX)), None);
         let history = state.history_settling(&answered, 1);
         let entry = ExchangeEntry::build(1, answered.clone(), history);
-        let dropped = state.settle_on(1, answered, entry.sent, kept.transmit, (order, ends));
+        let dropped = state.settle_on(
+            1,
+            answered,
+            entry.sent,
+            kept.transmit,
+            (order, ends),
+            Classification::Undetermined,
+        );
         assert_eq!(dropped, [RX]);
         assert_eq!(state.owed_row_ids(1), [RX2]);
         assert!(state.kept(1).is_some());

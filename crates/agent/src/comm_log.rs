@@ -2538,12 +2538,7 @@ impl CommLog {
         // nothing it sent or received comes before its transmit (the maintainer's decisions,
         // 2026-10-28). Settled first, so this exchange then takes its own indications as it
         // would have.
-        let own_starts: Vec<(exchange::Clock, clocks::Placed)> = vci
-            .tx_done
-            .and_then(|time| time.placed())
-            .into_iter()
-            .collect();
-        let in_flight = in_flight_of(&evidence, own_starts);
+        let in_flight = in_flight_of(&evidence, transmit_starts([vci.tx_done]));
         let mut index = 0;
         while index < unbound.len() {
             if inner.late_item_lone_owner(
@@ -3037,7 +3032,11 @@ impl CommLog {
     /// exchange has none, its handle was invalid, or its cancel failed with no end read. Each is
     /// placed once in the order given, takes no owner, and is a `late_item` or `unattached`.
     /// `None` once the log has failed.
-    pub(crate) fn late_link_errors(&self, items: Vec<UnattachedItem>) -> Option<()> {
+    pub(crate) fn late_link_errors(
+        &self,
+        items: Vec<UnattachedItem>,
+        stray: Option<u64>,
+    ) -> Option<()> {
         let mut inner = self.lock();
         let clock = inner.clock();
         inner.sample_boot_at(clock.monotonic_us);
@@ -3054,6 +3053,15 @@ impl CommLog {
             })
             .collect();
         let placed = inner.place_end_reads(&reads, false, None)?;
+        let in_flight = stray.and_then(|seq| {
+            let kept = inner.links.iter().find_map(|(_, state)| state.kept(seq))?;
+            (!kept.evidence.vci_ended).then(|| {
+                (
+                    kept.evidence.clone(),
+                    transmit_starts([kept.evidence.times.vci.and_then(|vci| vci.tx_done)]),
+                )
+            })
+        });
         // In the order the host read them: a link error as at a job end, any other item as an
         // exchange places its unbound items (ADR-397), with no exchange in flight.
         for (index, read) in reads.iter().enumerate() {
@@ -3083,9 +3091,26 @@ impl CommLog {
                     serde_json::to_writer(line, &Line { seq, event: &event })
                 })?;
             } else {
-                let none: &InFlight<'_> = &|_, _, _, _| false;
-                if !inner.late_item_lone_owner(0, item, placed[index].time, none, None)? {
-                    inner.place_unbound_item(0, item, placed[index].time, None, none, None)?;
+                // The stray's primitive, if the log still keeps its exchange in flight, is the
+                // exchange that read the item, as in `primitive_ended` before its entry.
+                let time = placed[index].time;
+                if let Some((evidence, own_starts)) = &in_flight {
+                    let in_flight = in_flight_of(evidence, own_starts.clone());
+                    if !inner.late_item_lone_owner(0, item, time, &in_flight, stray)? {
+                        inner.place_unbound_item(
+                            0,
+                            item,
+                            time,
+                            Some(evidence),
+                            &in_flight,
+                            stray,
+                        )?;
+                    }
+                } else {
+                    let none: &InFlight<'_> = &|_, _, _, _| false;
+                    if !inner.late_item_lone_owner(0, item, time, none, None)? {
+                        inner.place_unbound_item(0, item, time, None, none, None)?;
+                    }
                 }
             }
         }
@@ -3172,14 +3197,25 @@ impl CommLog {
         // an exchange reads, with this exchange in flight and not counted among the owners, and
         // written before the entry (design 8.11 `primitive_ended`).
         let end_ordinal = ended_ordinal(&ended);
-        let own_starts: Vec<(exchange::Clock, clocks::Placed)> = kept
-            .evidence
-            .times
-            .vci
-            .and_then(|vci| vci.tx_done)
-            .and_then(|time| time.placed())
-            .into_iter()
-            .collect();
+        // The exchange's own transmit done is the one it kept, the one its response item carries
+        // and the one an indication bound to the primitive gives, as `exchange_with` takes them.
+        let own_response = ended
+            .end
+            .as_ref()
+            .is_some_and(|end| end.response().is_some());
+        let own_starts = transmit_starts(
+            [kept.evidence.times.vci.and_then(|vci| vci.tx_done)]
+                .into_iter()
+                .chain(ended.reads.iter().zip(&placed).flat_map(
+                    |(read, placed)| match &read.item {
+                        EndItem::Response { tx_done, .. } if own_response => {
+                            vec![tx_done.map(|time| time.at(placed.tx_done))]
+                        }
+                        EndItem::TxIndication(time) => vec![Some(time.at(placed.time))],
+                        _ => Vec::new(),
+                    },
+                )),
+        );
         let in_flight = in_flight_of(&kept.evidence, own_starts);
         let mut in_wait = Vec::new();
         for (index, (read, placed)) in ended.reads.iter().zip(&placed).enumerate() {
@@ -4328,6 +4364,17 @@ fn before_starts(
             .min()
             .is_some_and(|start| placed.unwrapped < start)
     })
+}
+
+/// The placed transmit dones among `times`: where an exchange's own send stands on its clock.
+fn transmit_starts(
+    times: impl IntoIterator<Item = Option<exchange::VciTime>>,
+) -> Vec<(exchange::Clock, clocks::Placed)> {
+    times
+        .into_iter()
+        .flatten()
+        .filter_map(|time| time.placed())
+        .collect()
 }
 
 /// Whether an indication of `item` may be the own of the exchange of `evidence` that is in
@@ -11773,7 +11820,7 @@ pub(crate) mod tests {
                         timed_out,
                         "{functional} {end:?} {timed_out}"
                     );
-                    log.late_link_errors(vec![late_f190_response(2_000_000)])
+                    log.late_link_errors(vec![late_f190_response(2_000_000)], None)
                         .unwrap();
                     let lines = finished(&log, &setup, &dir);
                     let late = of_event(&lines, "late_response");
@@ -11804,7 +11851,7 @@ pub(crate) mod tests {
             assert!(kept_of(&log, seq).evidence.vci_ended, "{functional}");
             log.release_kept_ended(seq);
             assert!(log.lock().links[0].1.kept(seq).is_some(), "{functional}");
-            log.late_link_errors(vec![late_f190_response(600_000)])
+            log.late_link_errors(vec![late_f190_response(600_000)], None)
                 .unwrap();
             let lines = finished(&log, &setup, &dir);
             let late = line_of(&lines, "late_response");
@@ -11896,7 +11943,7 @@ pub(crate) mod tests {
                     log.lock().links[0].1.kept(seq).is_none(),
                     "{functional} {end:?}"
                 );
-                log.late_link_errors(vec![late_f190_response(600_000)])
+                log.late_link_errors(vec![late_f190_response(600_000)], None)
                     .unwrap();
                 let lines = finished(&log, &setup, &dir);
                 assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
@@ -11913,7 +11960,7 @@ pub(crate) mod tests {
         let (dir, setup, log, seq) = ordinary_stray_on(false);
         end_ordinary(&log, seq, Some(exchange::End::NoResponse));
         log.release_kept_ended(seq);
-        log.late_link_errors(vec![late_f190_response(2_000_000)])
+        log.late_link_errors(vec![late_f190_response(2_000_000)], None)
             .unwrap();
         let lines = finished(&log, &setup, &dir);
         let late = line_of(&lines, "late_response");
@@ -19620,7 +19667,7 @@ pub(crate) mod tests {
             _ => unreachable!(),
         })
         .to_vec();
-        log.late_link_errors(items).unwrap();
+        log.late_link_errors(items, None).unwrap();
         let lines = finished(&log, &setup, &dir);
         let late = of_event(&lines, "late_item");
         assert_eq!(late.len(), 1, "{lines:#?}");
@@ -19788,7 +19835,7 @@ pub(crate) mod tests {
             _ => unreachable!(),
         };
         item.read = Some(read_at(600_000));
-        log.late_link_errors(vec![item]).unwrap();
+        log.late_link_errors(vec![item], None).unwrap();
         let lines = finished(&log, &setup, &dir);
         let records = of_event(&lines, "vci_loss");
         let late = line_of(&lines, "late_item");
@@ -19850,6 +19897,15 @@ pub(crate) mod tests {
         earlier: &[&[u8]],
         request: &[u8],
     ) -> (PathBuf, CommLogSetup, CommLog, Vec<u64>, u64) {
+        stray_log_after_with(earlier, request, true)
+    }
+
+    /// [`stray_log_after`]; the stray has no transmit indication unless `transmit`.
+    fn stray_log_after_with(
+        earlier: &[&[u8]],
+        request: &[u8],
+        transmit: bool,
+    ) -> (PathBuf, CommLogSetup, CommLog, Vec<u64>, u64) {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
@@ -19882,12 +19938,14 @@ pub(crate) mod tests {
         waited.pending_visibility = exchange::PendingVisibility::Forwarded;
         waited.times.agent.before_us = 10_000;
         waited.times.agent.end_us = JOB_END_US;
-        let transmit = UnattachedItem {
+        let tx = UnattachedItem {
             vci_us: 10_500,
             read: Some(read_at(0)),
             ..tx_done(0x7E0)
         };
-        let seq = log.exchange_with(waited, vec![transmit]).unwrap();
+        let seq = log
+            .exchange_with(waited, if transmit { vec![tx] } else { Vec::new() })
+            .unwrap();
         (dir, setup, log, firsts, seq)
     }
 
@@ -20058,7 +20116,8 @@ pub(crate) mod tests {
     }
 
     /// A pending the stray's wait read, bound to no primitive, is no late response: it is
-    /// `unattached`, and the lone owner it could belong to takes no line of its own.
+    /// `unattached`, since the only exchange that could own it is the stray, which is in flight
+    /// and so is not counted as an owner.
     #[test]
     fn an_unbound_pending_read_at_job_end_is_written_unattached() {
         let (dir, setup, log, seq) = stray_log(facts());
@@ -20292,13 +20351,15 @@ pub(crate) mod tests {
         else {
             unreachable!()
         };
-        log.late_link_errors(vec![item]).unwrap();
+        log.late_link_errors(vec![item], None).unwrap();
         let lines = finished(&log, &setup, &dir);
         assert_eq!(
             order_of(&lines),
             ["primitive_ended", "late_item"],
             "{lines:#?}"
         );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([seq]), "{late}");
     }
 
     /// The same pending read at or after the end, with the stray an ended owner and no exchange
@@ -20346,5 +20407,129 @@ pub(crate) mod tests {
             ))
         );
         finished(&log, &setup, &dir);
+    }
+
+    /// The unattached item of [`unbound_result`].
+    fn unbound_item(at_us: u64, vci_us: u32, identifier: u32, bytes: &[u8]) -> UnattachedItem {
+        let EndItem::Unattached(item) = unbound_result(at_us, vci_us, identifier, bytes).item
+        else {
+            unreachable!()
+        };
+        item
+    }
+
+    /// A start-of-message indication of the response identifier 0x7E8, of no primitive.
+    fn unbound_start(at_us: u64, vci_us: u32) -> EndRead {
+        let mut item = unbound_item(at_us, vci_us, 0x7E8, &[]);
+        item.data = UnattachedData::Result {
+            rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+            identifier: Some(0x7E8),
+            bytes: Vec::new(),
+        };
+        end_read(at_us, EndItem::Unattached(item))
+    }
+
+    /// The drain at job end for a stray whose primitive has not ended (its tag wait found
+    /// nothing): the stray is the exchange in flight, not an ended owner, so a pending only it
+    /// could own is `unattached` and the stray keeps its classification (ADR-416 item 5, design
+    /// 8.11 `late_item`).
+    #[test]
+    fn the_drain_does_not_make_a_stray_in_flight_an_ended_owner() {
+        let (dir, setup, log, seq) = stray_log(facts());
+        let before = log.lock().links[0].1.standing(seq);
+        log.late_link_errors(
+            vec![unbound_item(700_000, 1_020_000, 0x7E8, &[0x7F, 0x22, 0x78])],
+            Some(seq),
+        )
+        .unwrap();
+        assert_eq!(log.lock().links[0].1.standing(seq), before);
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(order_of(&lines), ["unattached"], "{lines:#?}");
+    }
+
+    /// The stray's own transmit done, carried by its response item, places the indications it
+    /// may own as the exchange in flight's: a start before it, on the same clock, is the one
+    /// ended exchange's `late_item` (design 8.11 `late_item`, ADR-370).
+    #[test]
+    fn the_transmit_done_of_the_end_s_response_places_an_indication_before_the_send() {
+        let (dir, setup, log, firsts, seq) =
+            stray_log_after_with(&[&[0x22, 0xF1, 0x90]], &[0x22, 0xF1, 0x91], false);
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::Positive(vec![0x62, 0xF1, 0x91, 0x41])),
+                vec![
+                    unbound_start(300_000, 9_000),
+                    end_read(
+                        600_000,
+                        EndItem::Response {
+                            end: dev(510_500),
+                            tx_done: Some(dev(10_000)),
+                            rx_start: None,
+                        },
+                    ),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["late_item", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([firsts[0]]), "{late}");
+    }
+
+    /// The cancelled primitive's floor for an indication it and an ended exchange could own.
+    #[test]
+    fn an_indication_two_could_own_floors_a_cancelled_primitive() {
+        let (dir, setup, log, _first, seq) =
+            stray_log_behind(&[0x22, 0xF1, 0x90], &[0x22, 0xF1, 0x91]);
+        log.primitive_ended(seq, ended_with(None, vec![unbound_start(300_000, 310_500)]))
+            .unwrap();
+        assert_eq!(
+            floor_of(&log, seq),
+            Some((
+                exchange::Classification::Undetermined,
+                MAY_OWN_INDICATION.to_owned()
+            ))
+        );
+        finished(&log, &setup, &dir);
+    }
+
+    /// A collecting stray awaits answers on any identifier, but a response only it could own is
+    /// `unattached` with no floor, as for an exchange in flight (ADR-368).
+    #[test]
+    fn an_unnamed_response_only_a_collecting_stray_awaits_is_written_unattached() {
+        let (dir, setup, log, seq) = late_collecting_on(true, |_| {});
+        let mut item = unbound_item(0, 6_000_000, 0x7E8, &[0x7E, 0x00]);
+        item.data = UnattachedData::Result {
+            rx_flag: vec![0, 0, 0, 0],
+            identifier: None,
+            bytes: vec![0x7E, 0x00],
+        };
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::NoResponse),
+                read_after_deadline(vec![
+                    EndItem::Unattached(UnattachedItem {
+                        read: Some(read_at(0)),
+                        ..item
+                    }),
+                    EndItem::Finished(device_time(BASE_US + 5_100_000)),
+                ]),
+            ),
+        )
+        .unwrap();
+        assert_eq!(floor_of(&log, seq), None);
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["unattached", "primitive_ended"],
+            "{lines:#?}"
+        );
     }
 }

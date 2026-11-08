@@ -61,5 +61,6 @@ since no pending was open.
   while the exchange is in flight and is placed as `exchange_with` places an unbound item, before
   the entry, with the stray counted as the one in flight and not among the owners, and the entry
   floored as an exchange's is; one read at or after it is placed after the entry beside the link
-  errors, with no exchange in flight, and the stray is an owner only as decision 2 allows. A
+  errors, with no exchange in flight: the stray owns a response only as decision 2 allows, and an
+  indication or pending whenever it is still owed and kept. A
   cancelled primitive has no such item, so everything it read counts as read in flight.

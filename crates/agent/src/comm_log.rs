@@ -3874,6 +3874,7 @@ impl CommLog {
             answer_from.clears = inner.links[at].1.clears();
         }
         let state = &mut inner.links[at].1;
+        // `final_response` ends the owed request of this exchange (`ends_owed`).
         let mut answer = entry
             .settled_answer(&answer_from, final_response)
             .with_settled_ids(dropped);
@@ -4839,6 +4840,7 @@ impl Inner {
         if settles {
             state.settle_owed(owner);
         }
+        // `settles` ends the owed request here, so it is the `ends_owed` the answer carries.
         let mut answer = entry.settled_answer(&kept, settles);
         let answer_time = kept.answer_time(Some(time), &[], None);
         state.judge_answer(&mut answer, answer_time);
@@ -12023,6 +12025,18 @@ pub(crate) mod tests {
         silent
     }
 
+    /// A presence exchange `request`, `after_s` seconds in, that the agent's deadline ended with
+    /// no response, the VCI's wait not ended (`End::VciDidNotEnd`): the kind whose primitive the
+    /// host stopped waiting for, so the only kind that reaches `primitive_ended`.
+    fn waited_after(request: &[u8], after_s: u64) -> exchange::Evidence {
+        let mut waited = collecting_waited(|_| {});
+        waited.request = request.to_vec();
+        waited.expected = exchange::Expected::uds(request);
+        waited.times.agent.before_us += after_s * 1_000_000;
+        waited.times.agent.end_us += after_s * 1_000_000;
+        waited
+    }
+
     /// An answered presence exchange `after_s` seconds in whose window the VCI did not end, so
     /// the log keeps it only for the rows an owner holds for it (ADR-442).
     fn answered_after(after_s: u64) -> exchange::Evidence {
@@ -12068,8 +12082,11 @@ pub(crate) mod tests {
         let owner = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
         let earliest = log.exchange(silent_after(&[0x10, 0x03], 2)).unwrap();
         let dependent = log.exchange(answered_after(3)).unwrap();
+        // A reset after `earliest` is the exchange a test ends with `primitive_ended`, so it is one
+        // the agent stopped waiting for; one that is `earliest` itself is settled by a late
+        // answer instead, which needs the VCI to have ended it.
         let reset = if survivor {
-            log.exchange(silent_after(&[0x10, 0x03], 4)).unwrap()
+            log.exchange(waited_after(&[0x10, 0x03], 4)).unwrap()
         } else {
             earliest
         };
@@ -12096,7 +12113,7 @@ pub(crate) mod tests {
     #[test]
     fn an_answered_exchange_owed_through_an_owner_is_kept_and_released_when_the_owner_settles() {
         let (dir, _setup, log) = collecting_log_on(false);
-        let first = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let first = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
         let dependent = log.exchange(answered_after(10)).unwrap();
         assert!(log.lock().links[0].1.kept(dependent).is_some());
         assert_eq!(log.lock().links[0].1.owed_row_ids(dependent), [0x7E8]);
@@ -12225,8 +12242,8 @@ pub(crate) mod tests {
     #[test]
     fn an_exchange_owed_through_two_owners_stays_kept_while_one_is_left() {
         let (dir, _setup, log) = collecting_log_on(false);
-        let first = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
-        let second = log.exchange(silent_after(&[0x3E, 0x00], 2)).unwrap();
+        let first = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let second = log.exchange(waited_after(&[0x3E, 0x00], 2)).unwrap();
         let dependent = log.exchange(answered_after(3)).unwrap();
         leave_window(&log);
         assert_eq!(
@@ -12534,6 +12551,58 @@ pub(crate) mod tests {
         }
     }
 
+    /// ADR-442, design 8.11 `late_item`: a transmit indication read during the in-wait loop of
+    /// the owner's `primitive_ended` settles the record `dependent` (answered, kept with its VCI
+    /// ended, its send unknown, the owner's own primitive the one it was read in), but
+    /// ends no owed request of its own, so a later window exchange keeps `dependent` among its
+    /// owners and the entry names the dependent alone.
+    #[test]
+    fn an_indication_read_in_a_primitive_ended_wait_settles_the_record_without_freeing_its_owners()
+    {
+        let (dir, setup, log) = collecting_log_on(false);
+        let owner = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let mut dependent = answered_after(2);
+        dependent.vci_ended = true;
+        dependent.times.vci = None;
+        let dependent = log.exchange(dependent).unwrap();
+        // Its send is confirmed, so it is no owner of the indication, but the owner and the
+        // dependent could own its answer.
+        let window = log.exchange(answered_after(30)).unwrap();
+        let owners_of_window = |log: &CommLog| {
+            let inner = log.lock();
+            inner.links[0]
+                .1
+                .logged_history(window)
+                .map(|history| history.owners.clone())
+        };
+        assert_eq!(owners_of_window(&log), Some(vec![owner, dependent]));
+        assert_eq!(
+            log.lock().links[0].1.late_transmit_owners(0x7DF),
+            (vec![dependent], true)
+        );
+        // The indication is read in the owner's wait but stands before the owner's own transmit
+        // done, so it is not the owner's own and the dependent alone could own it.
+        log.primitive_ended(
+            owner,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: false,
+                reads: read_after_deadline(vec![
+                    EndItem::Unattached(tx_done(0x7DF)),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        // The dependent is still owed, so it still owns the window exchange's answer.
+        assert_eq!(owners_of_window(&log), Some(vec![owner, dependent]));
+        let lines = finished(&log, &setup, &dir);
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([dependent]));
+    }
+
     /// ADR-442, ADR-441 (restart in time, `LinkState::record`'s accepting branch): an accepted
     /// session change logged as an exchange, whose answer only the request `earliest` could own,
     /// drops the owner before it and the dependent before `earliest`, record and row, and
@@ -12581,8 +12650,8 @@ pub(crate) mod tests {
     #[test]
     fn the_matched_answer_of_an_exchange_owed_through_owners_is_counted_once_when_it_is_released() {
         let (dir, _setup, log) = collecting_log_on(false);
-        let first = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
-        let second = log.exchange(silent_after(&[0x3E, 0x00], 2)).unwrap();
+        let first = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let second = log.exchange(waited_after(&[0x3E, 0x00], 2)).unwrap();
         let dependent = log.exchange(answered_after(3)).unwrap();
         leave_window(&log);
         let repeated = log.exchange(silent_after(&[0x3E, 0x00], 30)).unwrap();

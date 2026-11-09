@@ -4182,8 +4182,11 @@ impl ExchangeEntry {
 
     /// The answer this entry, a settling entry's view of the earlier exchange `kept` with its new
     /// evidence, adds for the later exchanges on its link ([`LinkState::reclassify_after`]),
-    /// counted as [`LinkState::record`] counts an exchange's answer.
-    pub(crate) fn settled_answer(&self, kept: &Kept, settles: bool) -> SettledAnswer {
+    /// counted as [`LinkState::record`] counts an exchange's answer. `ends_owed` must be true only
+    /// when the caller ends the exchange's owed request; it becomes
+    /// [`SettledAnswer::final_response`], which `frees_owner` reads to free the exchange from
+    /// later owners.
+    pub(crate) fn settled_answer(&self, kept: &Kept, ends_owed: bool) -> SettledAnswer {
         let effect = &self.effect;
         let before = &kept.evidence;
         SettledAnswer {
@@ -4193,7 +4196,7 @@ impl ExchangeEntry {
                 && before.answer_head().is_none()
                 && !before.response_started,
             newly_matched: self.matched_answer() && !kept.matched,
-            final_response: settles,
+            final_response: ends_owed,
             clears: kept.clears,
             since_error: true,
             settled_ids: Vec::new(),

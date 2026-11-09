@@ -2,8 +2,9 @@
 
 **Date:** 2026-11-09
 **Status:** Accepted
-**Affects:** `agent` (`comm_log/exchange.rs` `ExchangeEntry::owed_through_owners`; `comm_log.rs`
-the entry's keep in `CommLog::exchange`), design 8.11 "Settlement", `late_response`, `late_item`; ADR-365
+**Affects:** `agent` (`comm_log/exchange.rs` `ExchangeEntry::owed_through_owners`,
+`ExchangeEntry::settled_answer`; `comm_log.rs` the entry's keep in `CommLog::exchange`,
+`Inner::late_item`), design 8.11 "Settlement", `late_response`, `late_item`; ADR-365
 decision 1, ADR-436 decisions 1 and 3, ADR-439 Consequences, ADR-441 decision 2 and
 Consequences
 
@@ -53,6 +54,15 @@ refreshed only the survivors in the window or kept).
    did not end its window, stays unkept (ADR-435 decision 4) and its row can still go stale
    beyond the window; that stays a backlog item. A link error or a lost VCI lets no owner go
    (the owed requests survive them), so they are out of scope.
+5. **A `late_item` settling entry ends no owed request.** An indication is no final response,
+   so `Inner::late_item` hands the later exchanges an answer that frees no owner
+   (`ExchangeEntry::settled_answer` with `ends_owed` false, whether or not the entry's evidence
+   settles). An exchange that stays owed through it, a record kept for its rows or a
+   collecting record kept with its VCI ended and owners (kept before this ADR too), stays among
+   the owners of the exchanges logged after it, and the entry refers to it alone. Before, the
+   entry passed the exchange's own settling as a final response, which removed it from those
+   owners and reclassified them as if it had answered. This changes behaviour for the records
+   kept before this ADR.
 
 ## Consequences
 
@@ -73,13 +83,9 @@ refreshed only the survivors in the window or kept).
   start, pending or transmit indication read while the owner stands now has the owners
   `[owner, record]` and every owner known, so `late_item_unowned` floors the record too. This
   holds with the record in the window as well.
-- A `late_item` settling entry ends no owed request (an indication is no final response), so
-  it hands the later exchanges an answer that frees no owner: a record that stays owed
-  through it (one kept for its rows, or a collecting record kept with its VCI ended and
-  owners) stays among the owners of the exchanges logged after it, and its entry refers to
-  it alone. Before, the entry passed the exchange's own settling as a final response, which
-  removed it from those owners and reclassified them as if it had answered; this also holds
-  for the collecting records that were kept before this ADR.
+- A `late_item` settling entry ends no owed request, so a record kept for it stays among
+  the owners of the later exchanges (decision 5), which holds for the records kept before this
+  ADR too.
 - `place_error` sees the record's evidence (design 8.11 "Link error", ADR-384), as it does for
   any kept exchange: after a restart clears the window it can answer `BeforeWindow` from the
   record's times.

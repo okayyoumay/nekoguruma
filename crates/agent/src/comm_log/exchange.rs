@@ -2679,6 +2679,14 @@ impl LinkState {
         // 8.11 "Matched answer", "Owed request").
         let mut alone =
             !settled && entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
+        // An answer no owed request can own confirms its send (`sent_of`): it can own a late
+        // transmit indication no more.
+        if !settled && old_sent == Sent::Unknown && entry.sent == Sent::Confirmed {
+            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            if let Some(kept) = self.kept.get_mut(&seq) {
+                kept.sent = Sent::Confirmed;
+            }
+        }
         // An exchange that stays owed re-derives its rows from its answers' owners as they are
         // now: an identifier it was owed on only because an owner could own its final answer
         // there goes when that owner no longer can (ADR-435). With no row left it is owed no
@@ -2690,12 +2698,12 @@ impl LinkState {
             alone = emptied;
         }
         let now_matched = entry.matched_answer()
-            && !old_matched
             && match place {
-                Place::Window | Place::Beyond => true,
+                Place::Window | Place::Beyond => !old_matched,
                 Place::BeyondRows => false,
-                // Counted only when the visit releases the exchange (ADR-441), since no later
-                // visit can count it then, as a settlement's would.
+                // Counted when the visit releases the exchange (ADR-441), since no later visit
+                // can count it then, as a settlement's would, and even when it counted at its
+                // record: the restart's recount starts the new epoch over.
                 Place::BeyondReleased => alone,
             };
         // The freed answer counts as a matched answer only when its stored time is shown after
@@ -2708,14 +2716,6 @@ impl LinkState {
         {
             // Counted once: its final response later is no new matched answer.
             kept.matched = true;
-        }
-        // An answer no owed request can own confirms its send (`sent_of`): it can own a late
-        // transmit indication no more.
-        if !settled && old_sent == Sent::Unknown && entry.sent == Sent::Confirmed {
-            self.unknown_sends = self.unknown_sends.saturating_sub(1);
-            if let Some(kept) = self.kept.get_mut(&seq) {
-                kept.sent = Sent::Confirmed;
-            }
         }
         if alone {
             self.owed.retain(|owed| owed.seq != seq);
@@ -3232,6 +3232,27 @@ impl LinkState {
             released = self.refresh_kept_beyond_window(seq + 1..u64::MAX, Place::BeyondReleased);
             freed_answers.extend(released.iter().cloned());
         }
+        // The matched answers of the exchanges after it, in its epoch, which the window's
+        // `matched_at` does not hold: those the visit released, and the kept ones beyond the
+        // window that counted at their record (their epoch shifted above). An exchange the
+        // visit released is no longer kept, so none is counted twice (ADR-441).
+        let mut beyond: Vec<(u64, MatchKey, u64)> = released
+            .iter()
+            .filter(|answer| answer.newly_matched)
+            .map(|answer| (answer.seq, answer.key.clone(), answer.clears.matched))
+            .collect();
+        beyond.extend(
+            self.kept
+                .iter()
+                .filter(|(kept_seq, kept)| {
+                    **kept_seq > seq
+                        && kept.matched
+                        && !self.window.iter().any(|logged| logged.seq == **kept_seq)
+                })
+                .map(|(kept_seq, kept)| {
+                    (*kept_seq, MatchKey::of(&kept.evidence), kept.clears.matched)
+                }),
+        );
         for at in 0..self.window.len() {
             let logged = &self.window[at];
             if logged.seq <= seq {
@@ -3258,13 +3279,10 @@ impl LinkState {
                         && MatchKey::of(&earlier.evidence) == key
                 })
                 .count() as u32;
-            history.answered_same_match += released
+            history.answered_same_match += beyond
                 .iter()
-                .filter(|answer| {
-                    answer.newly_matched
-                        && answer.seq < later
-                        && answer.clears.matched == epoch
-                        && answer.key == key
+                .filter(|(earlier, earlier_key, at)| {
+                    *earlier < later && *at == epoch && *earlier_key == key
                 })
                 .count() as u32;
             let (freed, reclassified) = self.reclassify_one(at, history);
@@ -3285,8 +3303,10 @@ impl LinkState {
                     .or_insert(0) += 1;
             }
         }
-        for answer in &released {
-            self.take_answer(answer);
+        for (_, key, at) in beyond {
+            if at == self.clears.matched {
+                *self.matched.entry(key).or_insert(0) += 1;
+            }
         }
         let not_reclassified = self.left_window.filter(|left| *left > seq);
         if accepting {
@@ -6147,6 +6167,87 @@ mod tests {
                 .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
                 .is_empty()
         );
+    }
+
+    /// The count of matched answers with the key of the exchanges `owners_and_answered_beyond_window`
+    /// logs, for the link's next exchange.
+    fn link_matched(state: &LinkState) -> u32 {
+        let key = MatchKey::of(&state.window.back().unwrap().evidence);
+        state.matched.get(&key).copied().unwrap_or(0)
+    }
+
+    fn same_match(state: &LinkState, seq: u64) -> u32 {
+        state.logged_history(seq).unwrap().answered_same_match
+    }
+
+    /// ADR-441 decision 7: the matched answer of a kept exchange after the restart's exchange,
+    /// released by the restart's visit, is counted once for the window's later exchange and the
+    /// link, as a settlement counts it; whether it counted at its record or not.
+    #[test]
+    fn a_restart_counts_the_matched_answer_of_a_released_exchange_once() {
+        for matched_at_record in [false, true] {
+            let (mut state, _) = owners_and_answered_beyond_window(1, |_, _| {}, false);
+            state.kept.get_mut(&2).unwrap().matched = matched_at_record;
+            let window_exchange = state.window.back().unwrap().seq;
+            // The restart is exchange 1; the earliest request its answer could belong to is 2,
+            // so no owner is left for exchange 2, which is released.
+            state.reset_after(1, 2, true);
+            assert!(state.kept(2).is_none(), "{matched_at_record}");
+            assert_eq!(
+                same_match(&state, window_exchange),
+                1,
+                "{matched_at_record}"
+            );
+            assert_eq!(link_matched(&state), 1, "{matched_at_record}");
+        }
+    }
+
+    /// ADR-441 decision 7: a kept exchange after the restart's that stays kept and counted at its
+    /// record counts in the new epoch too, as a released one does, and once.
+    #[test]
+    fn a_restart_counts_the_matched_answer_of_a_kept_exchange_that_stays_kept() {
+        let (mut state, _) = owners_and_answered_beyond_window(1, |_, _| {}, false);
+        state.kept.get_mut(&2).unwrap().matched = true;
+        let window_exchange = state.window.back().unwrap().seq;
+        // Not accepted: nothing is released, only the matched answers end.
+        state.reset_after(1, 2, false);
+        assert!(state.kept(2).is_some());
+        assert_eq!(same_match(&state, window_exchange), 1);
+        assert_eq!(link_matched(&state), 1);
+    }
+
+    /// ADR-441: a kept exchange after the restart's that stays kept and did not count is counted
+    /// by the settlement after the restart, once.
+    #[test]
+    fn a_kept_exchange_that_stays_kept_after_a_restart_is_counted_by_the_settlement_once() {
+        let (mut state, owner) = owners_and_answered_beyond_window(1, |_, _| {}, false);
+        let window_exchange = state.window.back().unwrap().seq;
+        state.reset_after(1, 1, true);
+        assert!(state.kept(2).is_some());
+        assert_eq!(same_match(&state, window_exchange), 0);
+        assert_eq!(link_matched(&state), 0);
+        state.settle_owed(1);
+        let answer = final_answer(&state, 1, &owner, &[0x62, 0xF1, 0x86, 0x41]);
+        state.reclassify_after(&answer);
+        assert!(state.kept(2).is_none());
+        assert_eq!(same_match(&state, window_exchange), 1);
+        assert_eq!(link_matched(&state), 1);
+    }
+
+    /// ADR-441 decision 3: a survivor between the earliest request and the restart's exchange is
+    /// released without counting its matched answer, which is from before the restart.
+    #[test]
+    fn a_released_survivor_does_not_count_its_matched_answer() {
+        let (mut state, _) = owners_and_answered_beyond_window(1, |_, _| {}, false);
+        // The restart is a window exchange; exchange 2 survives it (earliest 2), loses its
+        // owner 1 and is released.
+        let restart = state.window.front().unwrap().seq;
+        state.reset_after(restart, 2, true);
+        assert!(state.kept(2).is_none());
+        let after = state.window.back().unwrap().seq;
+        assert!(after > restart);
+        assert_eq!(same_match(&state, after), 0);
+        assert_eq!(link_matched(&state), 0);
     }
 
     /// ADR-439: an answer a link error followed ended its matched answer, so the freed answer of

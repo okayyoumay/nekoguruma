@@ -11912,26 +11912,6 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// ADR-441: a survivor of the restart, between its earliest request and itself, is released
-    /// without counting its matched answer, which is from before the restart.
-    #[test]
-    fn a_released_survivor_does_not_count_its_matched_answer() {
-        let (dir, log, [owner, reset, later], _) = restart_beyond_window_with(false);
-        let mut repeated = collecting_waited(|evidence| {
-            evidence.end = exchange::End::NoResponse;
-            evidence.vci_ended = true;
-        });
-        repeated.times.agent.before_us += 30_000_000;
-        repeated.times.agent.end_us += 30_000_000;
-        let repeated = log.exchange(repeated).unwrap();
-        // `later` is the survivor: the restart is the newest exchange before the repeat.
-        assert!(owner < reset && reset < later && later < repeated);
-        log.lock().links[0].1.reset_after(repeated, later, true);
-        assert!(log.lock().links[0].1.kept(later).is_none());
-        assert_eq!(same_match_of(&log, repeated), 0);
-        std::fs::remove_dir_all(&dir).unwrap();
-    }
-
     /// ADR-439, ADR-369: an ECUReset or session change accepted by a response read late, beyond
     /// the window, ends the owed requests sent before it, so an owed exchange after it whose
     /// answer only such a request could own loses its rows and its record, though it too has

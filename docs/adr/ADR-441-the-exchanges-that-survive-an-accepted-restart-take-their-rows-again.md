@@ -80,12 +80,15 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
      counts its matched answer when it is placed alone or loses its last row, also when it
      counted at its record, since it is no longer kept and no later visit can count it;
    - an exchange that stays kept counts when its record notes a matched answer
-     (`Kept::matched`) and the answer still counts as a freed one does: no link error its
-     entry saw came after the answer (the record's note ignores that, since `record` keeps the
-     answer's earlier epoch for it), and its stored time is shown after every late link error
-     read since (ADR-385). One test decides this for a freed answer and for a kept record
-     (`LinkState::answer_counts`); one that did not count yet is counted by the settlement that
-     follows (`Place::Beyond`), once, since that sets `Kept::matched`.
+     (`Kept::matched`) and no link error its own entry saw came after the answer (the record's
+     note ignores that, since `record` keeps the answer's earlier epoch for it). A late link
+     error read later ends a kept record's answer as it ends a window exchange's: `error_after`
+     clears `Kept::matched` of a record after the error's place whose stored answer time is not
+     shown after the error (ADR-385), through the step it takes for the window's exchanges.
+     The recount does not test that time again, since it would then also drop the record for
+     exchanges before the error, which the error does not end it for; one that did not count
+     yet is counted by the settlement that follows (`Place::Beyond`), once, since that sets
+     `Kept::matched`.
 
    Both kinds are counted on the unusable path too (a positive response the agent cannot use,
    `accepting` false): nothing is released then, so only the kept records are read, and a

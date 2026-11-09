@@ -2616,6 +2616,98 @@ impl LinkState {
         (dropped, emptied)
     }
 
+    /// What a new classification `entry` of the owed exchange `entry.seq` does to the owed requests
+    /// and to the link's counts, shared by the window ([`LinkState::reclassify_one`]) and the
+    /// kept exchanges beyond it ([`LinkState::refresh_kept_beyond_window`], ADR-439),
+    /// `before` being the exchange's `sent` and whether its answer was a matched answer before. An answer no owed request can own any more is a matched
+    /// answer for the exchanges after it, a pending too, as `record` would have counted it; it
+    /// confirms the send; a final response is placed with its exchange alone, which is then owed
+    /// no more and no owner of theirs; an exchange that stays owed re-derives its rows from its
+    /// answers' owners as they are now (ADR-435), and with no row left it is owed no more, like
+    /// one placed alone (design 8.11 "Matched answer", "Owed request"). `clears` are the link's
+    /// clears before and after the exchange's entry; `in_window` is false for a kept exchange
+    /// beyond the window, which has the latter only, so an answer a link error may have followed
+    /// is not counted as matched there. `settled`: a final response settled it, so it keeps its
+    /// rows and its answer is only freed.
+    ///
+    /// Gives the answer it frees for the exchanges after it.
+    #[expect(clippy::too_many_arguments, reason = "one step shared by two callers")]
+    fn free_owner_answer(
+        &mut self,
+        before: (Sent, bool),
+        entry: &ExchangeEntry,
+        settled: bool,
+        fallback: &Evidence,
+        answer_at: AnswerTime,
+        clears: (Clears, Clears),
+        in_window: bool,
+    ) -> Option<SettledAnswer> {
+        let (old_sent, old_matched) = before;
+        let seq = entry.seq;
+        // An answer no owed request can own any more is a matched answer for the exchanges
+        // after it, a pending too, as `record` would have counted it; a final response is placed
+        // with its exchange alone, which is then owed no more and no owner of theirs (design
+        // 8.11 "Matched answer", "Owed request").
+        let now_matched = entry.matched_answer() && !old_matched;
+        // The freed answer counts as a matched answer only when its stored time is shown after
+        // every late link error that may have come after it, as when it was offered before
+        // (ADR-384, ADR-385).
+        let since = self.since_late_error(seq, answer_at);
+        if now_matched
+            && since
+            && let Some(kept) = self.kept.get_mut(&seq)
+        {
+            // Counted once: its final response later is no new matched answer.
+            kept.matched = true;
+        }
+        // An answer no owed request can own confirms its send (`sent_of`): it can own a late
+        // transmit indication no more.
+        if !settled && old_sent == Sent::Unknown && entry.sent == Sent::Confirmed {
+            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            if let Some(kept) = self.kept.get_mut(&seq) {
+                kept.sent = Sent::Confirmed;
+            }
+        }
+        let mut alone =
+            !settled && entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
+        // An exchange that stays owed re-derives its rows from its answers' owners as they are
+        // now: an identifier it was owed on only because an owner could own its final answer
+        // there goes when that owner no longer can (ADR-435). With no row left it is owed no
+        // more, like one placed alone.
+        let mut dropped_rows: Vec<u32> = Vec::new();
+        if !settled && !alone && self.owed.iter().any(|owed| owed.seq == seq) {
+            let (dropped, emptied) = self.refresh_owed_rows(seq, fallback, &entry.link_history);
+            dropped_rows = dropped;
+            alone = emptied;
+        }
+        if alone {
+            self.owed.retain(|owed| owed.seq != seq);
+            if self
+                .kept
+                .remove(&seq)
+                .is_some_and(|kept| kept.sent == Sent::Unknown)
+            {
+                self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            }
+        }
+        (alone || now_matched || !dropped_rows.is_empty()).then(|| SettledAnswer {
+            seq,
+            key: entry.effect.key.clone(),
+            newly_answered: false,
+            newly_matched: now_matched && since && (in_window || !entry.error_after_answer()),
+            final_response: alone,
+            // A link error after the answer, or in no known order with it, ended its matched
+            // answer, as `record` applies it: the answer comes before.
+            clears: if entry.error_after_answer() {
+                clears.0
+            } else {
+                clears.1
+            },
+            since_error: since,
+            settled_ids: dropped_rows,
+        })
+    }
+
     /// The owed exchanges after `after` that have left the window and are kept: their rows are
     /// taken again from their answers' owners as they are now, in `seq` order (ADR-439). Their
     /// classification is not (ADR-368): the entry's history is not kept, so the owners are read
@@ -2633,34 +2725,29 @@ impl LinkState {
             let Some(kept) = self.kept.get(&seq) else {
                 continue;
             };
-            let (matched, clears, answer_at) = (kept.matched, kept.clears, kept.answer_at);
+            let (clears, answer_at) = (kept.clears, kept.answer_at);
+            let (kept_sent, kept_matched) = (kept.sent, kept.matched);
             let evidence = kept.evidence.clone();
-            let history = self.history_settling(&evidence, seq);
-            let (dropped, emptied) = self.refresh_owed_rows(seq, &evidence, &history);
-            if dropped.is_empty() && !emptied {
-                continue;
-            }
-            // As `reclassify_one` counts a freed answer: an exchange owed no more has its matched
-            // answer counted, once, when no late link error may have come after it.
-            let newly_matched = emptied
-                && !matched
-                && {
-                    let mut judged = evidence.clone();
-                    let owners = self.answer_histories(&judged, &history, seq);
-                    judged.set_answer_histories(owners);
-                    ExchangeEntry::build(seq, judged, history).matched_answer()
-                }
-                && self.since_late_error(seq, answer_at);
-            freed.push(SettledAnswer {
-                seq,
-                key: MatchKey::of(&evidence),
-                newly_answered: false,
-                newly_matched,
-                final_response: emptied,
-                clears,
-                since_error: self.since_late_error(seq, answer_at),
-                settled_ids: dropped,
-            });
+            // Only the requests sent before it can own its answer.
+            let mut history = self.history_settling(&evidence, seq);
+            history.owners.retain(|owner| *owner < seq);
+            history.owed_matching = history.owners.len() as u32;
+            // The entry as the owners are now, set against the kept evidence as it was: the
+            // rows and the kept record change, the classification and the logged history do
+            // not (ADR-368).
+            let mut judged = evidence.clone();
+            let owners = self.answer_histories(&judged, &history, seq);
+            judged.set_answer_histories(owners);
+            let entry = ExchangeEntry::build(seq, judged, history);
+            freed.extend(self.free_owner_answer(
+                (kept_sent, kept_matched),
+                &entry,
+                false,
+                &evidence,
+                answer_at,
+                (clears, clears),
+                false,
+            ));
         }
         freed
     }
@@ -3651,69 +3738,18 @@ impl LinkState {
             entry.classification = *floor;
             entry.reason.push_str(reason);
         }
-        // An answer no owed request can own any more is a matched answer for the exchanges
-        // after it, a pending too, as `record` would have counted it; a final response is placed
-        // with its exchange alone, which is then owed no more and no owner of theirs (design
-        // 8.11 "Matched answer", "Owed request").
-        let now_matched = entry.matched_answer() && !old.matched_answer();
-        // The freed answer counts as a matched answer only when its stored time is shown after
-        // every late link error that may have come after it, as when it was offered before
-        // (ADR-384, ADR-385).
-        let since = self.since_late_error(seq, self.window[at].answer_at);
-        if now_matched
-            && since
-            && let Some(kept) = self.kept.get_mut(&seq)
-        {
-            // Counted once: its final response later is no new matched answer.
-            kept.matched = true;
-        }
-        // An answer no owed request can own confirms its send (`sent_of`): it can own a late
-        // transmit indication no more.
-        if !settled && old.sent == Sent::Unknown && entry.sent == Sent::Confirmed {
-            self.unknown_sends = self.unknown_sends.saturating_sub(1);
-            if let Some(kept) = self.kept.get_mut(&seq) {
-                kept.sent = Sent::Confirmed;
-            }
-        }
-        let mut alone =
-            !settled && entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
-        // An exchange that stays owed re-derives its rows from its answers' owners as they are
-        // now: an identifier it was owed on only because an owner could own its final answer
-        // there goes when that owner no longer can (ADR-435). With no row left it is owed no
-        // more, like one placed alone.
-        let mut dropped_rows: Vec<u32> = Vec::new();
-        if !settled && !alone && self.owed.iter().any(|owed| owed.seq == seq) {
-            let fallback = self.window[at].evidence.clone();
-            let (dropped, emptied) = self.refresh_owed_rows(seq, &fallback, &entry.link_history);
-            dropped_rows = dropped;
-            alone = emptied;
-        }
-        if alone {
-            self.owed.retain(|owed| owed.seq != seq);
-            if self
-                .kept
-                .remove(&seq)
-                .is_some_and(|kept| kept.sent == Sent::Unknown)
-            {
-                self.unknown_sends = self.unknown_sends.saturating_sub(1);
-            }
-        }
-        let freed = (alone || now_matched || !dropped_rows.is_empty()).then(|| SettledAnswer {
-            seq,
-            key: entry.effect.key.clone(),
-            newly_answered: false,
-            newly_matched: now_matched && since,
-            final_response: alone,
-            // A link error after the answer, or in no known order with it, ended its matched
-            // answer, as `record` applies it: the answer comes before.
-            clears: if entry.error_after_answer() {
-                self.window[at].clears
-            } else {
-                self.window[at].after
-            },
-            since_error: since,
-            settled_ids: dropped_rows,
-        });
+        let answer_at = self.window[at].answer_at;
+        let clears = (self.window[at].clears, self.window[at].after);
+        let fallback = self.window[at].evidence.clone();
+        let freed = self.free_owner_answer(
+            (old.sent, old.matched_answer()),
+            &entry,
+            settled,
+            &fallback,
+            answer_at,
+            clears,
+            true,
+        );
         let logged = &mut self.window[at];
         logged.history = entry.link_history.clone();
         logged.evidence.set_answer_histories(answer_histories);
@@ -5864,6 +5900,76 @@ mod tests {
             "{changed:?}"
         );
         assert!(!changed.is_empty());
+    }
+
+    /// An owed first exchange `1`, kept, and an exchange `2` after it whose answer only `1` could
+    /// own, kept and owed through it, then enough exchanges for `2` to leave the window.
+    fn owner_and_answered_beyond_window(
+        second: impl FnOnce(&mut Evidence),
+        sent_unknown: bool,
+    ) -> (LinkState, Kept) {
+        let confirmed = |end| {
+            let mut evidence = forwarding(evidence(&READ_F186, end));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let mut state = LinkState::default();
+        let (_, first) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        state.keep(1, first.clone());
+        let mut answered = confirmed(End::Positive(vec![0x62, 0xF1, 0x86, 0x41]));
+        second(&mut answered);
+        let (_, mut kept) = log_kept_owned(&mut state, 2, answered);
+        assert!(!kept.matched);
+        if sent_unknown {
+            kept.sent = Sent::Unknown;
+            state.unknown_sends += 1;
+        }
+        state.keep(2, kept);
+        assert!(state.owed.iter().any(|owed| owed.seq == 2));
+        for seq in 3..=2 + WINDOW as u64 {
+            log_kept(&mut state, seq, confirmed(End::NoResponse));
+        }
+        assert!(state.window.iter().all(|logged| logged.seq != 2));
+        (state, first)
+    }
+
+    /// ADR-439: a kept exchange beyond the window that only an owner could own the answer of is
+    /// placed alone when that owner settles, as in the window: released, its send confirmed, its
+    /// answer freed as final and counted once as a matched answer.
+    #[test]
+    fn an_exchange_beyond_the_window_is_released_when_its_owner_settles() {
+        let (mut state, _) = owner_and_answered_beyond_window(|_| {}, true);
+        assert_eq!(state.unknown_sends, 1);
+        state.settle_owed(1);
+        assert!(state.kept(2).is_some());
+        let freed = state.refresh_kept_beyond_window(1);
+        let [freed] = &freed[..] else {
+            panic!("{freed:?}");
+        };
+        assert_eq!(freed.seq, 2);
+        assert!(freed.final_response && freed.newly_matched, "{freed:?}");
+        assert!(state.kept(2).is_none());
+        assert!(state.owed.iter().all(|owed| owed.seq != 2));
+        assert_eq!(state.unknown_sends, 0);
+        // Counted once: a second pass finds nothing to free.
+        assert!(state.refresh_kept_beyond_window(1).is_empty());
+    }
+
+    /// ADR-439: an answer a link error followed ended its matched answer, so the freed answer of
+    /// an exchange beyond the window is no matched answer either.
+    #[test]
+    fn an_answer_freed_beyond_the_window_after_a_link_error_is_no_matched_answer() {
+        let (mut state, _) = owner_and_answered_beyond_window(
+            |evidence| evidence.link_errors = vec![LinkErrorKind::Receive],
+            false,
+        );
+        state.settle_owed(1);
+        let freed = state.refresh_kept_beyond_window(1);
+        let [freed] = &freed[..] else {
+            panic!("{freed:?}");
+        };
+        assert!(freed.final_response && !freed.newly_matched, "{freed:?}");
+        assert!(state.kept(2).is_none());
     }
 
     /// Design 8.11 "Settlement": a pending of a later exchange that the earlier owed request

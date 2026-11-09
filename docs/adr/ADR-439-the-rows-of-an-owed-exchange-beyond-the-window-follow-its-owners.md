@@ -28,12 +28,20 @@ in-window path gave the opposite outcome for the same facts.
    later than the settled exchange, in `seq` order, and takes its rows again from its answers'
    owners as they are in the live rows (`refresh_owed_rows`). The rows only lose identifiers,
    as in ADR-435 decision 7, so the passes end.
-2. **A visit that drops a row or empties the exchange frees its answer for the later
-   exchanges**, as one in the window does: the dropped identifiers are its `settled_ids`; an
-   exchange left with no row is released like one placed alone and its answer is final, with
-   its matched answer counted once, by the same tests as a freed answer in the window. The
-   answer goes through the same worklist, so a chain of kept exchanges, and the window's
-   exchanges after them, lose the owner in one pass.
+2. **A visit takes the step the window's reclassification takes, from one shared helper
+   (`LinkState::free_owner_answer`, also used by `reclassify_one`).** An answer no owed
+   request can own confirms the exchange's send; a final response that only the owners that are
+   gone could own is placed alone, so the exchange is released with its record (a link with no
+   receive table, which owes the exchange on its own identifier whatever its owners, is
+   released this way and not by a dropped row); otherwise the rows are taken again and an
+   exchange left with none is released too. The visit frees its answer for the later exchanges
+   when it releases the exchange, drops an identifier (`settled_ids`) or turns the answer into
+   a matched one, counted once (`Kept::matched`) and only when no late link error may have
+   come after it. Beyond the window only the clears after the entry are kept, so an answer a
+   link error of its own exchange followed is not counted as a matched answer there (in the
+   window it is counted with the clears before the entry). The answer goes through the same
+   worklist, so a chain of kept exchanges, and the window's exchanges after them, lose the
+   owner in one pass.
 3. **Classification beyond the window is not re-derived.** ADR-368's window scope stands: the
    entry's history is not kept, so the visit reads the owners from the live rows (the
    approximation the late link error already uses for such an exchange) and changes rows and
@@ -48,3 +56,8 @@ in-window path gave the opposite outcome for the same facts.
 - An accepting restart (`LinkState::record`, and `reset_after` for exchanges between the
   earliest request and the reset) still drops owners without refreshing the rows of the
   surviving exchanges, in or out of the window; this is not changed here.
+- An owed exchange beyond the window with no kept record (a non-collecting exchange with a
+  final response whose answer had an owner is owed on its identifier but not kept) is never
+  visited and its evidence is gone, so its stale row still counts among a late response's
+  owners (`late_response_owner`) and can make a single kept owner's late final answer
+  ambiguous.

@@ -1,7 +1,7 @@
 # ADR-439: The Rows of an Owed Exchange Beyond the Window Follow Its Owners
 
 **Date:** 2026-11-08
-**Status:** Accepted (Decision item 1's "later than the settled exchange" and item 3's restart sentence revised by ADR-441: the survivors of an accepted restart take their rows again too; the Consequences' bullet on the survivors of an accepting restart closed; the restart sentence's uncounted matched answer of a released exchange after the restart's exchange closed, ADR-441 decision 7)
+**Status:** Accepted (Decision item 1's "later than the settled exchange" and item 3's restart sentence revised by ADR-441: the survivors of an accepted restart take their rows again too; the Consequences' bullet on the survivors of an accepting restart closed; the restart sentence's uncounted matched answer of a released exchange after the restart's exchange closed, ADR-441 decision 7; the last Consequences bullet, an owed exchange with no kept record, closed by ADR-442)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState::refresh_kept_beyond_window`,
 `LinkState::reclassify_after`, `LinkState::reset_after`, `LinkState::refresh_owed_rows`),
 design 8.11 "Settlement", "Owed request"; ADR-435 decision 6 and first Consequences bullet,

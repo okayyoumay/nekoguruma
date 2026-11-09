@@ -4182,8 +4182,11 @@ impl ExchangeEntry {
 
     /// The answer this entry, a settling entry's view of the earlier exchange `kept` with its new
     /// evidence, adds for the later exchanges on its link ([`LinkState::reclassify_after`]),
-    /// counted as [`LinkState::record`] counts an exchange's answer.
-    pub(crate) fn settled_answer(&self, kept: &Kept, settles: bool) -> SettledAnswer {
+    /// counted as [`LinkState::record`] counts an exchange's answer. `ends_owed` must be true only
+    /// when the caller ends the exchange's owed request; it becomes
+    /// [`SettledAnswer::final_response`], which `frees_owner` reads to free the exchange from
+    /// later owners.
+    pub(crate) fn settled_answer(&self, kept: &Kept, ends_owed: bool) -> SettledAnswer {
         let effect = &self.effect;
         let before = &kept.evidence;
         SettledAnswer {
@@ -4193,7 +4196,7 @@ impl ExchangeEntry {
                 && before.answer_head().is_none()
                 && !before.response_started,
             newly_matched: self.matched_answer() && !kept.matched,
-            final_response: settles,
+            final_response: ends_owed,
             clears: kept.clears,
             since_error: true,
             settled_ids: Vec::new(),
@@ -4244,6 +4247,13 @@ impl ExchangeEntry {
     /// [`LinkState::record`] reads it.
     fn placed_alone(&self) -> bool {
         self.effect.owners.is_empty() && (self.accepting() || self.effect.settles())
+    }
+
+    /// Whether it is owed only because an owner could own its final answer: it settles, and an
+    /// earlier owed request still stands that could own that answer (design 8.11, ADR-442). The
+    /// log keeps its record for its rows until the owners let go.
+    pub(crate) fn owed_through_owners(&self) -> bool {
+        self.effect.settles() && !self.effect.owners.is_empty()
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -6698,6 +6708,52 @@ mod tests {
         assert!(state.kept(2).is_none());
         assert!(state.owed_row_ids(2).is_empty());
         assert_eq!(state.unknown_sends, 1);
+    }
+
+    /// ADR-442: an entry is owed through its owners only when it settles and an owner stands:
+    /// not when it is placed alone, has no final response, or is open on a pending or silent.
+    #[test]
+    fn an_entry_is_owed_through_owners_only_when_it_settles_with_an_owner() {
+        let mut state = LinkState::default();
+        // Alone: no owner stands.
+        let alone = log(
+            &mut state,
+            1,
+            collecting(vec![positive(RX, Window::WithinP2)]),
+        );
+        assert!(alone.placed_alone() && !alone.owed_through_owners());
+        // An owner that has no answer.
+        let mut state = LinkState::default();
+        log(&mut state, 1, collecting(Vec::new()));
+        // A final response with the owner standing.
+        let settling = log(
+            &mut state,
+            2,
+            collecting(vec![positive(RX, Window::WithinP2)]),
+        );
+        assert!(settling.owed_through_owners() && !settling.placed_alone());
+        // No final response.
+        let silent = log(&mut state, 3, collecting(Vec::new()));
+        assert!(!silent.owed_through_owners());
+        // Open on a pending.
+        let mut open = collecting(vec![lone(RX)]);
+        open.pending = vec![pending()];
+        open.pending_ids = vec![Some(RX)];
+        let open = log(&mut state, 4, open);
+        assert!(!open.owed_through_owners());
+        // A silent identifier beside an answer an owner could own: it does not settle.
+        let table = vec![RX, RX2];
+        let mut state = LinkState::default();
+        let mut owner = collecting(Vec::new());
+        owner.rx_id = 0;
+        owner.receive_ids = table.clone();
+        log(&mut state, 1, owner);
+        let mut beside = collecting(vec![positive(RX, Window::WithinP2)]);
+        beside.rx_id = 0;
+        beside.receive_ids = table;
+        let beside = log(&mut state, 2, beside);
+        assert!(!beside.effect.owners.is_empty());
+        assert!(!beside.settles() && !beside.owed_through_owners());
     }
 
     /// ADR-439: the refresh after an accepted restart changes rows and records only; it does not

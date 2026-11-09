@@ -3015,7 +3015,9 @@ impl CommLog {
         // worker did not answer by the end of the primitive it may have started (ADR-416), and
         // one a pending is open on, whatever its end (ADR-436), and one the VCI ended, by a
         // receive timeout or the finished status of a window that took a result (ADR-440).
+        // And one owed only through its owners, for its rows (ADR-442).
         if kept.evidence.late_final_settles()
+            || entry.owed_through_owners()
             || kept.evidence.start_unresolved
             || matches!(kept.evidence.end, exchange::End::VciDidNotEnd)
         {
@@ -3872,6 +3874,7 @@ impl CommLog {
             answer_from.clears = inner.links[at].1.clears();
         }
         let state = &mut inner.links[at].1;
+        // `final_response` ends the owed request of this exchange (`ends_owed`).
         let mut answer = entry
             .settled_answer(&answer_from, final_response)
             .with_settled_ids(dropped);
@@ -4837,6 +4840,7 @@ impl Inner {
         if settles {
             state.settle_owed(owner);
         }
+        // `settles` ends the owed request here, so it is the `ends_owed` the answer carries.
         let mut answer = entry.settled_answer(&kept, settles);
         let answer_time = kept.answer_time(Some(time), &[], None);
         state.judge_answer(&mut answer, answer_time);
@@ -5275,7 +5279,9 @@ impl Inner {
                 state.raise(owner, verdict, &reason, exchange::LATE_PENDING_FLOOR);
             }
         }
-        let mut answer = entry.settled_answer(&kept, entry.settles());
+        // An indication ends no owed request, so the exchange is owed no less after it, whether
+        // or not its evidence settles: the later exchanges keep it among their owners.
+        let mut answer = entry.settled_answer(&kept, false);
         // The answer's time is that of the item that answers (ADR-384): this pending, or the
         // exchange's latest, for a transmit or start indication, which answers nothing
         // (ADR-354); a start's own time decides only an answer that is a start alone.
@@ -12002,6 +12008,680 @@ pub(crate) mod tests {
         assert!(state.owed_row_ids(survivor).is_empty());
         assert!(state.kept(earliest).is_some());
         drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A silent presence exchange `after_s` seconds in, or `request` when given, that the VCI
+    /// ended.
+    fn silent_after(request: &[u8], after_s: u64) -> exchange::Evidence {
+        let mut silent = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+        });
+        silent.request = request.to_vec();
+        silent.expected = exchange::Expected::uds(request);
+        silent.times.agent.before_us += after_s * 1_000_000;
+        silent.times.agent.end_us += after_s * 1_000_000;
+        silent
+    }
+
+    /// A presence exchange `request`, `after_s` seconds in, that the agent's deadline ended with
+    /// no response, the VCI's wait not ended (`End::VciDidNotEnd`): the kind whose primitive the
+    /// host stopped waiting for, so the only kind that reaches `primitive_ended`.
+    fn waited_after(request: &[u8], after_s: u64) -> exchange::Evidence {
+        let mut waited = collecting_waited(|_| {});
+        waited.request = request.to_vec();
+        waited.expected = exchange::Expected::uds(request);
+        waited.times.agent.before_us += after_s * 1_000_000;
+        waited.times.agent.end_us += after_s * 1_000_000;
+        waited
+    }
+
+    /// An answered presence exchange `after_s` seconds in whose window the VCI did not end, so
+    /// the log keeps it only for the rows an owner holds for it (ADR-442).
+    fn answered_after(after_s: u64) -> exchange::Evidence {
+        let mut answered = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = false;
+            evidence.answers = vec![positive_on(0x7E8, 20_000)];
+        });
+        answered.times.agent.before_us += after_s * 1_000_000;
+        answered.times.agent.end_us += after_s * 1_000_000;
+        answered
+    }
+
+    /// Enough ordinary exchanges, 20 s on, for everything logged before to leave the window.
+    fn leave_window(log: &CommLog) {
+        leave_window_to(log, 0x7DF);
+    }
+
+    /// [`leave_window`] with the fillers sent to request identifier `tx_id`.
+    fn leave_window_to(log: &CommLog, tx_id: u32) {
+        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
+            let mut filler = evidence(
+                endpoint(tx_id),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
+            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
+            log.exchange(filler).unwrap();
+        }
+    }
+
+    /// An owner `owner` (a silent presence request), an answered exchange `dependent` whose
+    /// window the VCI did not end and which the owner could own the answer of, beyond the
+    /// window and kept for its row on 0x7E8 (ADR-442). With `survivor` a session change
+    /// `earliest` comes between them and a second one `reset` after, else `reset` comes between
+    /// them; with `repeat` an exchange of the dependent's key is logged after, in the window.
+    fn owed_through_owner_beyond_window(
+        survivor: bool,
+        repeat: bool,
+    ) -> (PathBuf, CommLog, [u64; 4], Option<u64>) {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let owner = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let earliest = log.exchange(silent_after(&[0x10, 0x03], 2)).unwrap();
+        let dependent = log.exchange(answered_after(3)).unwrap();
+        // A reset after `earliest` is the exchange a test ends with `primitive_ended`, so it is one
+        // the agent stopped waiting for; one that is `earliest` itself is settled by a late
+        // answer instead, which needs the VCI to have ended it.
+        let reset = if survivor {
+            log.exchange(waited_after(&[0x10, 0x03], 4)).unwrap()
+        } else {
+            earliest
+        };
+        leave_window(&log);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.logged_history(dependent).is_none());
+            assert!(state.kept(owner).is_some() && state.kept(dependent).is_some());
+            assert_eq!(state.owed_row_ids(dependent), [0x7E8]);
+        }
+        let repeated = repeat.then(|| {
+            let mut repeated = silent_after(&[0x3E, 0x00], 30);
+            repeated.vci_ended = true;
+            log.exchange(repeated).unwrap()
+        });
+        (dir, log, [owner, earliest, dependent, reset], repeated)
+    }
+
+    /// ADR-442, Done when: an answered exchange owed only through an owner is kept beyond the
+    /// window for its row, and released with it when the owner lets go, so its row and send are
+    /// no more counted and a later exchange's late final answer has one owner. Cases: owner's
+    /// own answer; kept D beyond the window; D visited later; late answer after the release.
+    #[test]
+    fn an_answered_exchange_owed_through_an_owner_is_kept_and_released_when_the_owner_settles() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let first = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let dependent = log.exchange(answered_after(10)).unwrap();
+        assert!(log.lock().links[0].1.kept(dependent).is_some());
+        assert_eq!(log.lock().links[0].1.owed_row_ids(dependent), [0x7E8]);
+        leave_window(&log);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.logged_history(dependent).is_none());
+            assert!(state.kept(dependent).is_some());
+            assert_eq!(state.owed_row_ids(dependent), [0x7E8]);
+        }
+        assert_eq!(
+            owed_on(&log, 0x7E8, dependent),
+            (vec![first, dependent], true)
+        );
+        end_first_with_answers(&log, first);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(dependent).is_none());
+            assert!(state.owed_row_ids(dependent).is_empty());
+            assert!(!state.may_own_tx_indication());
+        }
+        // A later owner of the same request has the only claim on its late final answer.
+        let mut later = silent_after(&[0x3E, 0x00], 40);
+        later.vci_ended = true;
+        let later = log.exchange(later).unwrap();
+        assert_eq!(
+            late_owner_of(&log, &late_final_on(0x7E8)),
+            Some(LateOwner::One(later))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442, ADR-441 (`reset_after`, which a late accepted restart calls): the accepted
+    /// restart's earliest request cuts the owners before it. A dependent between it and the
+    /// reset survives and is released with its record, its answer not counted; a dependent
+    /// before it is dropped with its record.
+    #[test]
+    fn an_exchange_owed_through_an_owner_is_released_when_reset_after_cuts_the_owner() {
+        // Survivor: owner < earliest <= dependent < reset.
+        let (dir, log, [owner, earliest, dependent, reset], repeated) =
+            owed_through_owner_beyond_window(true, true);
+        let repeated = repeated.unwrap();
+        log.lock().links[0].1.reset_after(reset, earliest, true);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(owner).is_none());
+            assert!(state.kept(dependent).is_none());
+            assert!(state.owed_row_ids(dependent).is_empty());
+        }
+        // Released rows-only: the dependent's answer is not counted for the later exchange.
+        assert_eq!(same_match_of(&log, repeated), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // Before the earliest request: dropped by the retain, record and row.
+        let (dir, log, [_, _, dependent, reset], _) = owed_through_owner_beyond_window(true, false);
+        log.lock().links[0].1.reset_after(reset, reset, true);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(dependent).is_none());
+            assert!(state.owed_row_ids(dependent).is_empty());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442, ADR-441: a survivor between the earliest request and the reset is released
+    /// rows-only when the reset ends with an accepted answer; a dependent after the reset is
+    /// released and its matched answer is counted once in the new epoch when the reset's late
+    /// accepted answer (routed to it alone) arrives.
+    #[test]
+    fn an_exchange_owed_through_an_owner_is_released_when_a_late_accepted_restart_lets_the_owner_go()
+     {
+        // The earliest request and the reset are the same request, so a late answer to it is
+        // ambiguous between them: the reset ends with the accepted answer (`primitive_ended`).
+        let (dir, log, [owner, _, dependent, reset], repeated) =
+            owed_through_owner_beyond_window(true, true);
+        let repeated = repeated.unwrap();
+        let accepted = vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4];
+        log.primitive_ended(
+            reset,
+            PrimitiveEnded {
+                end: Some(exchange::End::Positive(accepted.clone())),
+                detail: exchange::Detail::default(),
+                vci_ended: true,
+                reads: read_after_deadline(vec![
+                    EndItem::Answer(answer_on(0x7E8, exchange::End::Positive(accepted), 400_000)),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(owner).is_none());
+            assert!(state.kept(dependent).is_none());
+            assert!(state.owed_row_ids(dependent).is_empty());
+        }
+        assert_eq!(same_match_of(&log, repeated), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
+        // After the reset: reclassified in the new epoch, its answer counted once.
+        let (dir, log, [owner, _, dependent, reset], repeated) =
+            owed_through_owner_beyond_window(false, true);
+        let repeated = repeated.unwrap();
+        assert_eq!(same_match_of(&log, repeated), 0);
+        assert_eq!(
+            late_owner_of(&log, &accepted_session_change()),
+            Some(LateOwner::One(reset))
+        );
+        place_unbound(&log, &accepted_session_change(), 2_000_000);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(owner).is_none());
+            assert!(state.kept(dependent).is_none());
+            assert!(state.owed_row_ids(dependent).is_empty());
+        }
+        assert_eq!(same_match_of(&log, repeated), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442: with two owners the record stays while one is left, and goes, with its row,
+    /// when the second lets go; the first letting go emits nothing for it.
+    #[test]
+    fn an_exchange_owed_through_two_owners_stays_kept_while_one_is_left() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let first = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let second = log.exchange(waited_after(&[0x3E, 0x00], 2)).unwrap();
+        let dependent = log.exchange(answered_after(3)).unwrap();
+        leave_window(&log);
+        assert_eq!(
+            owed_on(&log, 0x7E8, dependent).0,
+            vec![first, second, dependent]
+        );
+        end_first_with_answers(&log, first);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(second).is_some());
+            assert!(state.kept(dependent).is_some());
+            assert_eq!(state.owed_row_ids(dependent), [0x7E8]);
+        }
+        end_first_with_answers(&log, second);
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(dependent).is_none());
+        assert!(state.owed_row_ids(dependent).is_empty());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442: a record kept for its row owns no late final answer of its own: with its owner
+    /// standing the answer is ambiguous and lists both; once the owner is released with no
+    /// answer the record's rows stay but it alone is no owner a late final settles.
+    #[test]
+    fn a_record_kept_for_its_rows_owns_no_late_final_answer() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let first = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let dependent = log.exchange(answered_after(3)).unwrap();
+        leave_window(&log);
+        assert!(!kept_of(&log, dependent).late_final_settles());
+        // Ambiguous: the owner and the record, the record floored with the owner.
+        assert_eq!(
+            late_owner_of(&log, &late_final_on(0x7E8)),
+            Some(LateOwner::Several(vec![first, dependent], false))
+        );
+        // The owner released with no answer keeps its rows: the record is listed beside the
+        // owner's rows but a lone record is no owner a late final settles, so it never reaches
+        // the single-owner gate and is named as ambiguous.
+        log.release_kept(first);
+        assert!(log.lock().links[0].1.kept(dependent).is_some());
+        assert_eq!(
+            late_owner_of(&log, &late_final_on(0x7E8)),
+            Some(LateOwner::Several(vec![dependent], false))
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A non-collecting `22 F1 86` exchange to 0x7E0, `after_s` seconds in, that ended as `end`
+    /// with `answers`; `vci_ended` tells whether the VCI ended its wait.
+    fn read_f186_after(
+        end: exchange::End,
+        answers: Vec<exchange::Answer>,
+        vci_ended: bool,
+        after_s: u64,
+    ) -> exchange::Evidence {
+        let mut read = evidence(endpoint(0x7E0), &[0x22, 0xF1, 0x86], end);
+        read.expected = exchange::Expected::uds(&[0x22, 0xF1, 0x86]);
+        read.pending_visibility = exchange::PendingVisibility::Forwarded;
+        read.vci_ended = vci_ended;
+        read.answers = answers;
+        read.times.agent.before_us = BASE_US - 100_000 + after_s * 1_000_000;
+        read.times.agent.end_us = BASE_US + 1_000_000 + after_s * 1_000_000;
+        read
+    }
+
+    /// A non-collecting `22 F1 86` owner `owner` (no answer, the VCI ended its wait) and a
+    /// dependent `22 F1 90` that ended on a negative response, which the owner's negative
+    /// pattern could also own (ADR-442), so it is owed through the owner and kept beyond the
+    /// window for its row on 0x7E8. A positive `22 F1 86` answer on 0x7E8 is then the owner's
+    /// alone: it misses the dependent's row, so the log routes it to the owner.
+    fn f186_owner_with_negative_dependent() -> (PathBuf, CommLogSetup, CommLog, [u64; 2]) {
+        let (dir, setup, log) = collecting_log_on(false);
+        let owner = log
+            .exchange(read_f186_after(
+                exchange::End::NoResponse,
+                Vec::new(),
+                true,
+                1,
+            ))
+            .unwrap();
+        let negative = vec![0x7F, 0x22, 0x31];
+        let mut dependent = read_f186_after(
+            exchange::End::Negative(negative.clone()),
+            vec![answer_on(0x7E8, exchange::End::Negative(negative), 20_000)],
+            false,
+            10,
+        );
+        dependent.request = vec![0x22, 0xF1, 0x90];
+        dependent.expected = exchange::Expected::uds(&[0x22, 0xF1, 0x90]);
+        let dependent = log.exchange(dependent).unwrap();
+        leave_window_to(&log, 0x7E0);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.logged_history(dependent).is_none());
+            assert!(state.kept(owner).is_some() && state.kept(dependent).is_some());
+            assert_eq!(state.owed_row_ids(dependent), [0x7E8]);
+            assert!(!state.kept(dependent).unwrap().late_final_settles());
+        }
+        (dir, setup, log, [owner, dependent])
+    }
+
+    /// A positive `22 F1 <did>` answer on 0x7E8, read late.
+    fn late_f1_reply(did: u8) -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x62, 0xF1, did, 0x41],
+            },
+            ..tx_done(0x7E8)
+        }
+    }
+
+    /// Places `item` as the log does an unbound item read between exchanges.
+    fn place_unbound(log: &CommLog, item: &UnattachedItem, after_us: i64) {
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        log.lock()
+            .place_unbound_item(0, item, placed_after(after_us), None, none, None)
+            .unwrap();
+    }
+
+    /// ADR-442, Done when, non-collecting: an ordinary `22 F1 90` request with a final answer
+    /// that an owner (`22 F1 86`, no answer, the VCI ended its wait) could own is owed through
+    /// the owner, kept beyond the window for its row, and released when the owner's own late
+    /// answer (routed to it alone, as it misses the dependent's row) settles it.
+    #[test]
+    fn a_non_collecting_exchange_owed_through_an_owner_is_kept_and_released_when_the_owner_settles()
+    {
+        let (dir, _setup, log, [owner, dependent]) = f186_owner_with_negative_dependent();
+        assert_eq!(
+            late_owner_of(&log, &late_f1_reply(0x86)),
+            Some(LateOwner::One(owner))
+        );
+        place_unbound(&log, &late_f1_reply(0x86), 3_000_000);
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(owner).is_none());
+        assert!(state.kept(dependent).is_none());
+        assert!(state.owed_row_ids(dependent).is_empty());
+        assert!(!state.may_own_tx_indication());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442, `late_response_owner`: a late answer only the dependent's row matches has the
+    /// dependent as its one owner, which a record kept for its row cannot be
+    /// (`late_final_settles`), so it is plain `unattached` and floors no one.
+    #[test]
+    fn the_only_owner_of_a_late_answer_being_a_record_kept_for_its_row_leaves_it_unattached() {
+        let (dir, setup, log, [owner, dependent]) = f186_owner_with_negative_dependent();
+        assert_eq!(
+            log.lock().links[0]
+                .1
+                .late_response_owners(Some(0x7E8), &[0x62, 0xF1, 0x90, 0x41]),
+            [dependent]
+        );
+        assert_eq!(late_owner_of(&log, &late_f1_reply(0x90)), None);
+        place_unbound(&log, &late_f1_reply(0x90), 3_000_000);
+        for seq in [owner, dependent] {
+            assert!(floor_of(&log, seq).is_none(), "{seq}");
+        }
+        assert!(log.lock().links[0].1.kept(dependent).is_some());
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+        assert!(of_event(&lines, "late_response").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-442, case table: the owner lets go by its own late answer (`settle_owed`, not
+    /// `primitive_ended`), and the dependent beyond the window is released with it.
+    #[test]
+    fn an_owner_settled_by_its_own_late_answer_releases_the_exchange_owed_through_it() {
+        let (dir, _setup, log, [owner, dependent]) = f186_owner_with_negative_dependent();
+        place_unbound(&log, &late_f1_reply(0x86), 6_000_000);
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(owner).is_none());
+        assert!(state.kept(dependent).is_none());
+        assert!(state.owed_row_ids(dependent).is_empty());
+        assert!(!state.may_own_tx_indication());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An owner `owner` (a silent presence request to 0x7DF, its send confirmed by its transmit
+    /// done) and an answered exchange `dependent` owed through it, whose send is unknown
+    /// (ADR-442); beyond the window when `beyond`.
+    fn owner_and_dependent(beyond: bool) -> (PathBuf, CommLogSetup, CommLog, [u64; 2]) {
+        let (dir, setup, log) = collecting_log_on(false);
+        let owner = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let mut dependent = answered_after(3);
+        // No transmit done: its send is unknown, as an answer an owner could own cannot show it.
+        dependent.times.vci = None;
+        let dependent = log.exchange(dependent).unwrap();
+        if beyond {
+            leave_window(&log);
+        }
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert_eq!(state.logged_history(dependent).is_none(), beyond);
+            assert!(state.kept(owner).is_some() && state.kept(dependent).is_some());
+            assert_eq!(
+                state.kept(dependent).map(|kept| kept.sent),
+                Some(exchange::Sent::Unknown)
+            );
+        }
+        (dir, setup, log, [owner, dependent])
+    }
+
+    /// ADR-442, design 8.11 `late_item`: an unbound transmit indication on the request
+    /// identifier, with the owner's send confirmed and the dependent's unknown, has the
+    /// dependent as its one possible owner (the log keeps it), so it settles as the
+    /// dependent's late item: its send confirmed, the unknown count lowered, no `unattached`.
+    #[test]
+    fn a_transmit_indication_only_the_exchange_owed_through_an_owner_could_own_is_its_late_item() {
+        for beyond in [false, true] {
+            let (dir, setup, log, [_, dependent]) = owner_and_dependent(beyond);
+            {
+                let inner = log.lock();
+                let state = &inner.links[0].1;
+                assert_eq!(state.late_transmit_owners(0x7DF), (vec![dependent], true));
+                assert!(state.may_own_tx_indication());
+            }
+            // A later answered exchange the owner and the dependent could both own.
+            let later = log.exchange(answered_after(30)).unwrap();
+            let owners_of_later = |log: &CommLog| {
+                let inner = log.lock();
+                inner.links[0]
+                    .1
+                    .logged_history(later)
+                    .map(|h| h.owners.clone())
+            };
+            let before = owners_of_later(&log);
+            assert_eq!(before.as_ref().map(Vec::len), Some(2), "beyond {beyond}");
+            let none: &InFlight<'_> = &|_, _, _, _| false;
+            let settled = log
+                .lock()
+                .late_item_lone_owner(0, &tx_done(0x7DF), placed_after(100), none, None)
+                .unwrap();
+            assert!(settled, "beyond {beyond}");
+            // The dependent is still owed, so it still owns the later exchange's answer.
+            assert_eq!(owners_of_later(&log), before, "beyond {beyond}");
+            {
+                let inner = log.lock();
+                let state = &inner.links[0].1;
+                assert_eq!(
+                    state.kept(dependent).map(|kept| kept.sent),
+                    Some(exchange::Sent::Confirmed)
+                );
+                assert!(!state.may_own_tx_indication());
+            }
+            let lines = finished(&log, &setup, &dir);
+            let late = of_event(&lines, "late_item");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([dependent]));
+            assert_eq!(late[0]["exchanges"].as_array().map(Vec::len), Some(1));
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// ADR-442, design 8.11 `late_item`: an unbound start of the response on 0x7E8 read while
+    /// the owner and the dependent owed through it both stand could belong to either, so it is
+    /// `unattached` and both are named and floored at `undetermined`, the dependent too.
+    #[test]
+    fn a_start_the_owner_and_the_exchange_owed_through_it_could_own_floors_both() {
+        for beyond in [false, true] {
+            let (dir, setup, log, [owner, dependent]) = owner_and_dependent(beyond);
+            let start = UnattachedItem {
+                vci_us: 7,
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, RX_FLAG_START_OF_MESSAGE],
+                    identifier: Some(0x7E8),
+                    bytes: Vec::new(),
+                },
+                ..tx_done(0x7E8)
+            };
+            assert_eq!(
+                log.lock().links[0].1.late_start_owners(0x7E8),
+                (vec![owner, dependent], true)
+            );
+            let none: &InFlight<'_> = &|_, _, _, _| false;
+            {
+                let mut inner = log.lock();
+                assert_eq!(
+                    inner.late_item_lone_owner(0, &start, placed_after(100), none, None),
+                    Some(false)
+                );
+                inner
+                    .place_unbound_item(0, &start, placed_after(100), None, none, None)
+                    .unwrap();
+            }
+            for seq in [owner, dependent] {
+                let floor = floor_of(&log, seq).map(|(floor, _)| floor);
+                assert_eq!(floor, Some(exchange::Classification::Undetermined), "{seq}");
+            }
+            let lines = finished(&log, &setup, &dir);
+            let late = of_event(&lines, "late_item");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([owner, dependent]));
+            assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+        }
+    }
+
+    /// ADR-442, design 8.11 `late_item`: a transmit indication read during the in-wait loop of
+    /// the owner's `primitive_ended` settles the record `dependent` (answered, kept with its VCI
+    /// ended, its send unknown, the owner's own primitive the one it was read in), but
+    /// ends no owed request of its own, so a later window exchange keeps `dependent` among its
+    /// owners and the entry names the dependent alone.
+    #[test]
+    fn an_indication_read_in_a_primitive_ended_wait_settles_the_record_without_freeing_its_owners()
+    {
+        let (dir, setup, log) = collecting_log_on(false);
+        let owner = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let mut dependent = answered_after(2);
+        dependent.vci_ended = true;
+        dependent.times.vci = None;
+        let dependent = log.exchange(dependent).unwrap();
+        // Its send is confirmed, so it is no owner of the indication, but the owner and the
+        // dependent could own its answer.
+        let window = log.exchange(answered_after(30)).unwrap();
+        let owners_of_window = |log: &CommLog| {
+            let inner = log.lock();
+            inner.links[0]
+                .1
+                .logged_history(window)
+                .map(|history| history.owners.clone())
+        };
+        assert_eq!(owners_of_window(&log), Some(vec![owner, dependent]));
+        assert_eq!(
+            log.lock().links[0].1.late_transmit_owners(0x7DF),
+            (vec![dependent], true)
+        );
+        // The indication is read in the owner's wait but stands before the owner's own transmit
+        // done, so it is not the owner's own and the dependent alone could own it.
+        log.primitive_ended(
+            owner,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                vci_ended: false,
+                reads: read_after_deadline(vec![
+                    EndItem::Unattached(tx_done(0x7DF)),
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                ]),
+            },
+        )
+        .unwrap();
+        // The dependent is still owed, so it still owns the window exchange's answer.
+        assert_eq!(owners_of_window(&log), Some(vec![owner, dependent]));
+        let lines = finished(&log, &setup, &dir);
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([dependent]));
+    }
+
+    /// ADR-442, ADR-441 (restart in time, `LinkState::record`'s accepting branch): an accepted
+    /// session change logged as an exchange, whose answer only the request `earliest` could own,
+    /// drops the owner before it and the dependent before `earliest`, record and row, and
+    /// releases the dependent between `earliest` and itself rows-only (a survivor).
+    #[test]
+    fn an_exchange_owed_through_an_owner_is_released_when_an_accepted_restart_is_logged_in_time() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let owner = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let before = log.exchange(answered_after(2)).unwrap();
+        let earliest = log.exchange(silent_after(&[0x10, 0x03], 3)).unwrap();
+        let survivor = log.exchange(answered_after(4)).unwrap();
+        leave_window(&log);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            for seq in [owner, before, earliest, survivor] {
+                assert!(state.kept(seq).is_some(), "{seq}");
+            }
+            assert_eq!(state.owed_row_ids(before), [0x7E8]);
+            assert_eq!(state.owed_row_ids(survivor), [0x7E8]);
+        }
+        let accepted = vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4];
+        let mut restart = silent_after(&[0x10, 0x03], 40);
+        restart.end = exchange::End::Positive(accepted.clone());
+        restart.answers = vec![answer_on(0x7E8, exchange::End::Positive(accepted), 20_000)];
+        let restart = log.exchange(restart).unwrap();
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.logged_history(restart).is_some());
+        assert!(state.kept(owner).is_none());
+        for seq in [before, survivor] {
+            assert!(state.kept(seq).is_none(), "{seq}");
+            assert!(state.owed_row_ids(seq).is_empty(), "{seq}");
+        }
+        assert!(state.kept(earliest).is_some());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442, ADR-439 (`Place::Beyond`): the matched answer of an exchange owed through two
+    /// owners is counted for a later window exchange with its key once, when the second owner
+    /// lets go and the visit releases it; the first owner's letting go counts nothing. Each
+    /// owner ends with its answers (`primitive_ended`): a late answer to the same request would
+    /// be ambiguous between the two owners and the dependent, so it is not routed to one.
+    #[test]
+    fn the_matched_answer_of_an_exchange_owed_through_owners_is_counted_once_when_it_is_released() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let first = log.exchange(waited_after(&[0x3E, 0x00], 1)).unwrap();
+        let second = log.exchange(waited_after(&[0x3E, 0x00], 2)).unwrap();
+        let dependent = log.exchange(answered_after(3)).unwrap();
+        leave_window(&log);
+        let repeated = log.exchange(silent_after(&[0x3E, 0x00], 30)).unwrap();
+        assert_eq!(same_match_of(&log, repeated), 0);
+        end_first_with_answers(&log, first);
+        assert!(log.lock().links[0].1.kept(dependent).is_some());
+        assert_eq!(same_match_of(&log, repeated), 0);
+        end_first_with_answers(&log, second);
+        assert!(log.lock().links[0].1.kept(dependent).is_none());
+        assert_eq!(same_match_of(&log, repeated), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-442: an exchange that ended on a rejected result does not settle, so an owner
+    /// standing does not make the log keep it for its rows (ADR-437).
+    #[test]
+    fn an_exchange_that_ended_on_a_rejected_result_is_not_kept_for_its_rows() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let mut rejected = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = false;
+            evidence.answers = vec![rejected_on(0x7E8, 20_000)];
+            evidence.end_rejected = true;
+        });
+        rejected.times.agent.before_us += 3_000_000;
+        rejected.times.agent.end_us += 3_000_000;
+        let rejected = log.exchange(rejected).unwrap();
+        leave_window(&log);
+        assert!(log.lock().links[0].1.kept(rejected).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

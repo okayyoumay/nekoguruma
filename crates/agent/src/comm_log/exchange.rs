@@ -2437,10 +2437,12 @@ impl LinkState {
     /// after the end's renewal ([`Kept::pending_at_end`]).
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
-            && self
-                .kept
-                .get(&seq)
-                .is_some_and(|kept| kept.late_final_settles());
+            && self.kept.get(&seq).is_some_and(|kept| {
+                kept.late_final_settles()
+                    || self
+                        .kept_entry(seq, &kept.evidence, kept.classification)
+                        .owed_through_owners()
+            });
         if !open {
             self.kept.remove(&seq);
         }
@@ -4030,10 +4032,11 @@ impl LinkState {
         let answer_at = self.window[at].answer_at;
         let clears = (self.window[at].clears, self.window[at].after);
         let fallback = self.window[at].evidence.clone();
+        let ended = settled && !self.owed.iter().any(|owed| owed.seq == seq);
         let freed = self.free_owner_answer(
             (old.sent, old.matched_answer()),
             &entry,
-            settled,
+            ended,
             &fallback,
             answer_at,
             clears,
@@ -4274,7 +4277,7 @@ impl ExchangeEntry {
     /// earlier owed request still stands that could own that answer (design 8.11, ADR-442). The
     /// log keeps its record for its rows until the owners let go.
     pub(crate) fn owed_through_owners(&self) -> bool {
-        self.effect.settles() && !self.effect.owners.is_empty()
+        self.effect.settles() && self.effect.owners.iter().any(|owner| *owner < self.seq)
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -7044,6 +7047,14 @@ mod tests {
             collecting(vec![positive(RX, Window::WithinP2)]),
         );
         assert!(settling.owed_through_owners() && !settling.placed_alone());
+        // Only owners sent after it could own its answer (ADR-445): it ends the owed request.
+        let mut later_only = settling.clone();
+        later_only.effect.owners = vec![3];
+        assert!(!later_only.owed_through_owners());
+        // An owner sent before it and one after it: the earlier one keeps it owed.
+        let mut both = settling.clone();
+        both.effect.owners = vec![1, 3];
+        assert!(both.owed_through_owners());
         // No final response.
         let silent = log(&mut state, 3, collecting(Vec::new()));
         assert!(!silent.owed_through_owners());

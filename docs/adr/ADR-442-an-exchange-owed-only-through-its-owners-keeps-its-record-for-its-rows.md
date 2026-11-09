@@ -1,7 +1,7 @@
 # ADR-442: An Exchange Owed Only Through Its Owners Keeps Its Record for Its Rows
 
 **Date:** 2026-11-09
-**Status:** Accepted
+**Status:** Accepted (decision 1 extended by ADR-445 to the entries that settle at a primitive's end and by a late response, with the owners sent before the exchange; the release after the end keeps such a record)
 **Affects:** `agent` (`comm_log/exchange.rs` `ExchangeEntry::owed_through_owners`,
 `ExchangeEntry::settled_answer`; `comm_log.rs` the entry's keep in `CommLog::exchange`,
 `Inner::late_item`), design 8.11 "Settlement", `late_response`, `late_item`; ADR-365

@@ -1222,7 +1222,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// ended (its handle invalid) or that a lost VCI ended, with no end read, keeps its
     /// exchange's classification. What the log kept for the exchange is then released, since
     /// nothing else settles it, unless it stays owed per an identifier a pending is open on, or
-    /// its end shows the VCI ended its wait (ADR-429, ADR-431). Returns the results and errors
+    /// its end shows the VCI ended its wait (ADR-429, ADR-431), or its final response is one an
+    /// earlier owed request could own, so the record stays for its rows until that request lets
+    /// go (ADR-445). Returns the results and errors
     /// read for it that no entry carries (its end was not read), which go to the exchange in
     /// flight's unbound items of an earlier primitive: a link error among them goes to the stray's exchange once tagged with
     /// its `seq` (ADR-372).
@@ -1272,7 +1274,8 @@ impl<C: WorkerApi> WorkerHost<C> {
         };
         // Not the kept record of an exchange left owed per an open identifier (or noted so by
         // the record when it was kept or renewed), or one whose end shows the VCI ended its
-        // wait: its ECU's final answer can still settle it (ADR-429, ADR-431, ADR-436).
+        // wait: its ECU's final answer can still settle it (ADR-429, ADR-431, ADR-436). Nor one
+        // kept for its rows, which an earlier owed request's letting go releases (ADR-445).
         if let (Some(seq), Some(log)) = (stray.seq, &self.comm_log) {
             log.release_kept_ended(seq);
         }
@@ -8747,6 +8750,68 @@ mod tests {
             ended_kept = Some((summary, crate::comm_log::tests::is_kept(log, seq)));
         });
         ended_kept.unwrap()
+    }
+
+    /// ADR-445, the backlog example: an exchange whose final response is read in the settling wait
+    /// (so it comes with the primitive's end), after an earlier owed request that could own that
+    /// response, stays owed through it: `primitive_ended_of` hands the log the response, the log
+    /// keeps the record for its rows through the release `settle_cancelled` ends with, and a late
+    /// answer both could own names both.
+    #[test]
+    fn a_final_response_read_in_the_settling_wait_keeps_the_exchange_owed_through_an_owner() {
+        let mut named = None;
+        let lines = crate::comm_log::tests::settle_read_after_owner(|log, owner, seq| {
+            let mut stray = read_stray(seq, false);
+            let progress = stray.take_progress();
+            let mut settling = Settling {
+                progress,
+                cop: COP,
+                stray,
+                carried_out: true,
+                carried: 0,
+                end: None,
+                items: Vec::new(),
+            };
+            let read = Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 6_000_000,
+                wall_unix_ms: 0,
+            });
+            settling.read(
+                Some(event_notification::EventData::Item(event(
+                    Some(COP),
+                    result(&[0x62, 0xF1, 0x86, 0x41]),
+                ))),
+                read,
+            );
+            settling.read(
+                Some(event_notification::EventData::Item(event(
+                    Some(COP),
+                    status(PduComPrimitiveStatus::PduCopstFinished),
+                ))),
+                read,
+            );
+            let Some(SettlingEnd::Ended(result)) = settling.end.take() else {
+                panic!("the status ends the primitive as its exchange's wait would have");
+            };
+            let ended = primitive_ended_of(
+                &settling.stray,
+                &mut settling.progress,
+                StrayEnd::Ended(&result),
+                0,
+            );
+            assert!(
+                matches!(ended.end, Some(End::Positive(_))),
+                "{:?}",
+                ended.end
+            );
+            assert!(log.primitive_ended(seq, ended).is_some());
+            log.release_kept_ended(seq);
+            named = Some(crate::comm_log::tests::late_f186_names_both(
+                log, owner, seq,
+            ));
+        });
+        assert_eq!(named, Some(true), "{lines:#?}");
     }
 
     /// ADR-443, the next request's settling wait: the primitive's finished status read there,

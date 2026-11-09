@@ -1,7 +1,7 @@
 # ADR-431: An Exchange Left Owed by Its `primitive_ended` Is Renewed, and Kept When the VCI Ended Its Wait
 
 **Date:** 2026-11-07
-**Status:** Accepted (the Consequences' deferred bullet on a response read in the stray primitive's job-end wait closed; Decision items 2 and 3's gate on `vci_ended` superseded by ADR-436 for an exchange a pending is open on or noted open on its kept record; Decision item 3's `vci_ended` of a renewed record extended by ADR-440: the finished status of a collecting window that took a rejected result counts too; amended by ADR-443: the finished status of a non-collecting primitive that ended on a wrong echo counts too)
+**Status:** Accepted (the Consequences' deferred bullet on a response read in the stray primitive's job-end wait closed; Decision items 2 and 3's gate on `vci_ended` superseded by ADR-436 for an exchange a pending is open on or noted open on its kept record; Decision item 3's `vci_ended` of a renewed record extended by ADR-440: the finished status of a collecting window that took a rejected result counts too; amended by ADR-443: the finished status of a non-collecting primitive that ended on a wrong echo counts too; Decision item 1's "no final response" and item 2's reasons to keep a record revised by ADR-445: an exchange whose final response an earlier owed request could own is renewed and kept for its rows too)
 **Affects:** `agent` (`comm_log.rs` `CommLog::primitive_ended`, `release_kept_ended`;
 `comm_log/exchange.rs` `LinkState::renew_owed`, `LinkState::release_kept_ended`; `host.rs`
 `settle_cancelled`, comments only); design 8.11 `primitive_ended`, `late_response`; ADR-367 item

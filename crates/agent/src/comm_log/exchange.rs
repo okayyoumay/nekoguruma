@@ -2709,7 +2709,7 @@ impl LinkState {
         // The freed answer counts as a matched answer only when its stored time is shown after
         // every late link error that may have come after it, as when it was offered before
         // (ADR-384, ADR-385).
-        let since = self.since_late_error(seq, answer_at);
+        let (since, counts) = self.answer_counts(entry, answer_at, place);
         if now_matched
             && since
             && let Some(kept) = self.kept.get_mut(&seq)
@@ -2730,8 +2730,7 @@ impl LinkState {
         // Beyond the window a matched answer that does not count (no time shown after a late
         // link error, or a link error after it) changes nothing for the later exchanges and
         // would be offered again at every visit, so it is not emitted.
-        let counted =
-            now_matched && since && (place == Place::Window || !entry.error_after_answer());
+        let counted = now_matched && counts;
         let emit = match place {
             Place::Window => alone || now_matched || !dropped_rows.is_empty(),
             Place::Beyond | Place::BeyondRows | Place::BeyondReleased => {
@@ -2754,6 +2753,59 @@ impl LinkState {
             since_error: since,
             settled_ids: dropped_rows,
         })
+    }
+
+    /// Whether the answer of `entry`, stored at `answer_at`, counts as a matched answer once it
+    /// is a matched answer at all, and whether its time is shown after every late link error
+    /// (the first of the pair, which `counts` implies). In the window an answer is counted when
+    /// its time passes; beyond it a link error the entry saw after its answer ends it too, as
+    /// `record` applies it. The one place both are decided: a freed answer
+    /// ([`LinkState::free_owner_answer`]) and a restart's recount of the kept records
+    /// ([`LinkState::kept_matched_after`]) ask it.
+    fn answer_counts(
+        &self,
+        entry: &ExchangeEntry,
+        answer_at: AnswerTime,
+        place: Place,
+    ) -> (bool, bool) {
+        let since = self.since_late_error(entry.seq, answer_at);
+        let counts = since && (place == Place::Window || !entry.error_after_answer());
+        (since, counts)
+    }
+
+    /// The entry of the kept exchange `seq` as the live rows' owners read it now, not classified
+    /// again: the standing `classification` is the entry's (ADR-368). Only the requests sent
+    /// before the exchange can own its answer.
+    fn kept_entry(
+        &self,
+        seq: u64,
+        evidence: &Evidence,
+        classification: Classification,
+    ) -> ExchangeEntry {
+        let mut history = self.history_settling(evidence, seq);
+        history.owners.retain(|owner| *owner < seq);
+        history.owed_matching = history.owners.len() as u32;
+        // The entry as the owners are now, set against the evidence as it was: the rows and the
+        // kept record change, the classification and the logged history do not (ADR-368).
+        let mut judged = evidence.clone();
+        let owners = self.answer_histories(&judged, &history, seq);
+        judged.set_answer_histories(owners);
+        let mut entry = ExchangeEntry::build(seq, judged, history);
+        // Not classified again: the standing classification, floor included, is what the
+        // entry's reads (an accepted restart, a restart to be unsure of) go by.
+        entry.classification = classification;
+        entry
+    }
+
+    /// The matched answer of the kept exchange `seq` beyond the window, with its key and the
+    /// `Clears::matched` epoch it counted in, when it counts as one for the exchanges after it:
+    /// the record says so, no link error the entry saw came after its answer and its time is
+    /// shown after every late link error ([`LinkState::answer_counts`]).
+    fn kept_matched_after(&self, seq: u64) -> Option<(MatchKey, u64)> {
+        let kept = self.kept.get(&seq).filter(|kept| kept.matched)?;
+        let entry = self.kept_entry(seq, &kept.evidence, kept.classification);
+        let (_, counts) = self.answer_counts(&entry, kept.answer_at, Place::Beyond);
+        counts.then(|| (entry.effect.key.clone(), kept.clears.matched))
     }
 
     /// The owed exchanges with a `seq` in `seqs` that have left the window and are kept: their
@@ -2867,19 +2919,7 @@ impl LinkState {
         place: Place,
     ) -> Option<SettledAnswer> {
         let (clears, answer_at) = at;
-        // Only the requests sent before it can own its answer.
-        let mut history = self.history_settling(&evidence, seq);
-        history.owners.retain(|owner| *owner < seq);
-        history.owed_matching = history.owners.len() as u32;
-        // The entry as the owners are now, set against the evidence as it was: the rows and the
-        // kept record change, the classification and the logged history do not (ADR-368).
-        let mut judged = evidence.clone();
-        let owners = self.answer_histories(&judged, &history, seq);
-        judged.set_answer_histories(owners);
-        let mut entry = ExchangeEntry::build(seq, judged, history);
-        // Not classified again: the standing classification, floor included, is what the
-        // entry's reads (an accepted restart, a restart to be unsure of) go by.
-        entry.classification = classification;
+        let entry = self.kept_entry(seq, &evidence, classification);
         self.free_owner_answer(
             before,
             &entry,
@@ -3167,7 +3207,9 @@ impl LinkState {
     /// "Matched answer", ADR-369).
     ///
     /// - The matched answers from before it end: the exchanges logged after it count their
-    ///   matched answers again from the window's exchanges after it alone.
+    ///   matched answers again from the window's exchanges after it and from the kept exchanges
+    ///   beyond the window after it whose answer still counts (the ones an accepting visit
+    ///   releases, and those that stay kept: [`LinkState::kept_matched_after`]), in both cases.
     /// - Accepting, the owed requests sent before `earliest`, the earliest request its answer
     ///   could belong to, end, and are no owners of the later exchanges' answers; the window
     ///   keeps it and the exchanges after it.
@@ -3243,14 +3285,13 @@ impl LinkState {
             .collect();
         beyond.extend(
             self.kept
-                .iter()
-                .filter(|(kept_seq, kept)| {
-                    **kept_seq > seq
-                        && kept.matched
-                        && !self.window.iter().any(|logged| logged.seq == **kept_seq)
+                .keys()
+                .filter(|kept_seq| {
+                    **kept_seq > seq && !self.window.iter().any(|logged| logged.seq == **kept_seq)
                 })
-                .map(|(kept_seq, kept)| {
-                    (*kept_seq, MatchKey::of(&kept.evidence), kept.clears.matched)
+                .filter_map(|kept_seq| {
+                    let (key, epoch) = self.kept_matched_after(*kept_seq)?;
+                    Some((*kept_seq, key, epoch))
                 }),
         );
         for at in 0..self.window.len() {
@@ -6327,6 +6368,127 @@ mod tests {
         // The settling of the first reaches all of them in one visit each.
         state.reclassify_after(&final_answer(&state, 1, &kept, &[0x62, 0xF1, 0x86, 0x41]));
         assert!((2..8).all(|seq| state.kept(seq).is_some()));
+    }
+
+    /// ADR-441 decision 7: a kept exchange beyond the window whose own link error came after its
+    /// answer has no matched answer to count in the new epoch, though its record says it
+    /// counted: `record` ended that answer, as the freed answer of a released one is not counted
+    /// either. Accepting or not.
+    #[test]
+    fn a_restart_does_not_count_a_kept_answer_a_link_error_followed() {
+        for (earliest, accepting) in [(2, false), (1, true)] {
+            let (mut state, _) = owner_and_answered_beyond_window(
+                |evidence| evidence.link_errors = vec![LinkErrorKind::Receive],
+                false,
+            );
+            state.kept.get_mut(&2).unwrap().matched = true;
+            let window_exchange = state.window.back().unwrap().seq;
+            state.reset_after(1, earliest, accepting);
+            assert!(state.kept(2).is_some(), "{accepting}");
+            assert_eq!(same_match(&state, window_exchange), 0, "{accepting}");
+            assert_eq!(link_matched(&state), 0, "{accepting}");
+        }
+    }
+
+    /// ADR-441 decision 7: nor does one whose answer is not shown after a late link error read
+    /// since (the error's place is unknown, or its time is the later), which a freed answer is
+    /// tested against too (ADR-385); the same answer shown after the error counts.
+    #[test]
+    fn a_restart_does_not_count_a_kept_answer_a_late_link_error_may_have_followed() {
+        let at = |us| {
+            let (clock, placed) = placed_at(Clock::Device, 0, us);
+            AnswerTime::At(clock, placed)
+        };
+        let error = LateError {
+            clock: Clock::Device,
+            epoch: 0,
+            unwrapped: 2_000,
+            through: 100,
+        };
+        // (late error unplaced, error placed at 2 000 us, answer time, counted)
+        let cases = [
+            (true, false, AnswerTime::Unknown, 0),
+            (false, true, at(1_000), 0),
+            (false, true, at(3_000), 1),
+            (false, false, AnswerTime::Unknown, 1),
+        ];
+        for (unplaced, placed, answer_at, counted) in cases {
+            for (earliest, accepting) in [(2, false), (1, true)] {
+                let (mut state, _) = owner_and_answered_beyond_window(|_| {}, false);
+                {
+                    let kept = state.kept.get_mut(&2).unwrap();
+                    kept.matched = true;
+                    kept.answer_at = answer_at;
+                }
+                if unplaced {
+                    state.late_error_unplaced = Some(1_000);
+                }
+                if placed {
+                    state.late_errors.push(error);
+                }
+                let window_exchange = state.window.back().unwrap().seq;
+                state.reset_after(1, earliest, accepting);
+                assert_eq!(
+                    same_match(&state, window_exchange),
+                    counted,
+                    "{unplaced} {placed} {answer_at:?} {accepting}"
+                );
+                assert_eq!(link_matched(&state), counted);
+            }
+        }
+    }
+
+    /// ADR-439: an owed exchange the refresh leaves no row (its answers have no owner left on any
+    /// identifier it was owed on) and that is not placed alone, since its exchange-level history
+    /// still names an owner, is released with its send confirmed once: the count of unknown sends
+    /// goes down by one for it, not two. The entry is made so by hand, as no log of events gives
+    /// the two reads different owners here.
+    #[test]
+    fn an_exchange_emptied_of_rows_lowers_the_unknown_sends_once() {
+        let table = vec![RX, RX2];
+        let mut state = LinkState::default();
+        let mut owner = collecting(vec![lone(RX2)]);
+        owner.end = End::NoResponse;
+        owner.pending = vec![pending()];
+        owner.pending_ids = vec![Some(RX2)];
+        owner.rx_id = 0;
+        owner.receive_ids = table.clone();
+        let (_, kept_owner) = log_kept_owned(&mut state, 1, owner);
+        state.keep(1, kept_owner);
+        // Final answers on both identifiers, which the owner could own: owed on both through it.
+        let mut resend = collecting(vec![
+            positive(RX, Window::WithinP2),
+            positive(RX2, Window::WithinP2),
+        ]);
+        resend.rx_id = 0;
+        resend.receive_ids = table;
+        let (_, mut kept_resend) = log_kept_owned(&mut state, 2, resend);
+        kept_resend.sent = Sent::Unknown;
+        state.keep(2, kept_resend);
+        assert_eq!(state.owed_row_ids(2).len(), 2);
+        // The owner's and the resend's sends are unknown, and a third send elsewhere.
+        state.kept.get_mut(&1).unwrap().sent = Sent::Unknown;
+        state.unknown_sends = 3;
+        state.settle_owed(1);
+        assert_eq!(state.unknown_sends, 2);
+        let kept = state.kept(2).unwrap().clone();
+        let mut entry = state.kept_entry(2, &kept.evidence, kept.classification);
+        assert!(entry.placed_alone());
+        entry.effect.owners = vec![1];
+        assert!(!entry.placed_alone());
+        let freed = state.free_owner_answer(
+            (Sent::Unknown, false),
+            &entry,
+            false,
+            &kept.evidence,
+            kept.answer_at,
+            (kept.clears, kept.clears),
+            Place::Beyond,
+        );
+        assert!(freed.is_some_and(|freed| freed.final_response));
+        assert!(state.kept(2).is_none());
+        assert!(state.owed_row_ids(2).is_empty());
+        assert_eq!(state.unknown_sends, 1);
     }
 
     /// ADR-439: the refresh after an accepted restart changes rows and records only; it does not

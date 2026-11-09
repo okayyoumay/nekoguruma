@@ -1417,7 +1417,8 @@ impl Evidence {
     /// that is not collecting is owed on its `rx_id` once a final response ended it (and, when
     /// that end is a rejected one, on every receive identifier too, ADR-443), else on every
     /// receive identifier; a collecting request with no answer on every receive identifier.
-    /// With answers, it is owed on each of these once, in this order: the identifiers a pending is open on (an unnamed pending, identifier 0, standing for every
+    /// With answers, it is owed on each of these once, in this order: the identifiers a pending
+    /// is open on (an unnamed pending, identifier 0, standing for every
     /// receive identifier with no final answer, and for none when every one has it, ADR-400
     /// decision 1); every receive identifier with no named final answer standing
     /// ([`Self::silent_ids`], ADR-435); and, when the request ended with a final response, the
@@ -1480,7 +1481,7 @@ impl Evidence {
         // no answer is, on every receive identifier, whatever else it is owed on, since it is not
         // settled either ([`Self::settles_owed`]). The set does not depend on its owners, so it
         // never grows after the fact. A request that is not collecting and ended with a rejected
-        // end (a wrong echo the primitive finished on, ADR-443) is owed on its own identifier
+        // end (`positive_unusable` on a wrong echo, ADR-443) is owed on its own identifier
         // and the table; for a collecting request the rejected result covers no identifier, so
         // the silent ones already make the table and the rule stays whole as an invariant
         // (ADR-435 decision 7, ADR-437).
@@ -2429,8 +2430,8 @@ impl LinkState {
     /// (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
     /// timeout, or the finished status of a collecting window that took a result, usable or
     /// rejected (ADR-440), or of a primitive that is not collecting on a wrong echo with no
-    /// usable answer (ADR-443), whatever else it read after (as an entry's is), so an end that read none (a
-    /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
+    /// usable answer (ADR-443), whatever else it read after (as an entry's is), so an end that
+    /// read none (a cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
     /// released unless a pending is open on it or the kept record notes one open at its keep or
     /// after the end's renewal ([`Kept::pending_at_end`]).
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {

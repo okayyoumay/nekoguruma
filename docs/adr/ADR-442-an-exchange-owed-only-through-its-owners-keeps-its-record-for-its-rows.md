@@ -11,12 +11,13 @@ Consequences
 
 ADR-439 and ADR-441 refresh the rows of the exchanges the log keeps (`Kept`) when an owner
 lets go: `refresh_kept_beyond_window`, `refresh_window_survivors`, `refresh_row_owners` and the
-release in `free_owner_answer` reach a kept record or a window entry. A non-collecting
-exchange with a final response whose answer had an owner (an earlier owed request that could
-own it) is owed on its identifier (`LinkState::record`), yet the log kept no record of it:
+release in `free_owner_answer` reach a kept record or a window entry. An exchange that
+settles (a final response and no identifier open on a pending or silent, collecting or not)
+whose answer had an owner (an earlier owed request that could own it) is owed on its
+identifier (`LinkState::record`), yet the log kept no record of it:
 the entry's keep was gated on a late final answer settling the exchange (the VCI ended it, or
 a pending is open on it, ADR-365 decision 1, ADR-436 decisions 1 and 3), and this exchange
-has its answer. Once it left the window nothing visited it. Its row stayed after its owner
+has its answer and its window ended by it. Once it left the window nothing visited it. Its row stayed after its owner
 let go, and its send stayed counted among the unknown ones (`unknown_sends`), so it still
 counted as an owner of a late response and made a single kept owner's late final answer
 ambiguous. The case also arose when an accepted restart was what let the owner go (ADR-441
@@ -42,7 +43,10 @@ refreshed only the survivors in the window or kept).
    (`free_owner_answer`) and lowers `unknown_sends`; an exchange released after a late
    restart counts its matched answer once, as ADR-441 decision 7 says. With two owners it
    stays until the second lets go; an owner released with no answer (`release_kept`) leaves
-   its rows, so the record's row stays right.
+   its rows, so the record's row stays right, and the record is then the only kept candidate
+   for a late response on its identifier: an ambiguous late response lists it alone
+   (`Several([record])`) and floors it, where it wrote nothing before; an ambiguous start or
+   pending likewise.
 4. **Scope.** An exchange that does not settle is not kept by this rule: one that ended on a
    rejected result (ADR-437), one open on a pending (kept already, ADR-436), one with a silent
    identifier. A collecting exchange with a row an owner holds beside a silent row, whose VCI
@@ -60,7 +64,23 @@ refreshed only the survivors in the window or kept).
 - A late response read while such an exchange and its owner stand now lists the exchange
   among the owners and floors it, where it was left out; the owner count of a single kept
   owner is no more inflated by it once the owner has let go.
+- A late indication sees the record too, among the kept exchanges `late_transmit_owners`,
+  `late_start_owners` and `late_pending_owners` read (design 8.11 `late_item`). A transmit
+  indication on the request identifier of a record whose send is still `unknown`, with every
+  other owner's send confirmed, now has it as its lone owner and settles it as its late item
+  (its send confirmed, the unknown count lowered), where it was `unattached`. An ambiguous
+  start, pending or transmit indication read while the owner stands now has the owners
+  `[owner, record]` and every owner known, so `late_item_unowned` floors the record too. This
+  holds with the record in the window as well.
 - `place_error` sees the record's evidence (design 8.11 "Link error", ADR-384), as it does for
-  any kept exchange.
-- The record costs one `Kept` per such exchange while its owner stands and it is the owner's to
-  release; it is released with the owner, so the log's size is bounded as before.
+  any kept exchange: after a restart clears the window it can answer `BeforeWindow` from the
+  record's times.
+- Cost: the record costs one `Kept` per such exchange while its owner stands, and it is the
+  owner's to release. That is not bounded by the window. With an owner kept on a receive
+  timeout whose answer never comes, every later answered poll of the same request is owed
+  through it and kept, each with a full `Kept`; each later settlement's
+  `refresh_kept_beyond_window` visits all N records and `kept_entry` reads all N owed rows,
+  O(N squared) per settlement under the log lock; an ambiguous late response floors and lists
+  all N. The owed rows already grew by one per poll, and timed-out exchanges are already kept; what
+  is new is a full `Kept` per answered poll and the visit of all of them at each settlement.
+  A backlog item measures it in a long polling run and bounds it if it matters.

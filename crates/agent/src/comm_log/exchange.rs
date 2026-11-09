@@ -6738,6 +6738,19 @@ mod tests {
         open.pending_ids = vec![Some(RX)];
         let open = log(&mut state, 4, open);
         assert!(!open.owed_through_owners());
+        // A silent identifier beside an answer an owner could own: it does not settle.
+        let table = vec![RX, RX2];
+        let mut state = LinkState::default();
+        let mut owner = collecting(Vec::new());
+        owner.rx_id = 0;
+        owner.receive_ids = table.clone();
+        log(&mut state, 1, owner);
+        let mut beside = collecting(vec![positive(RX, Window::WithinP2)]);
+        beside.rx_id = 0;
+        beside.receive_ids = table;
+        let beside = log(&mut state, 2, beside);
+        assert!(!beside.effect.owners.is_empty());
+        assert!(!beside.settles() && !beside.owed_through_owners());
     }
 
     /// ADR-439: the refresh after an accepted restart changes rows and records only; it does not

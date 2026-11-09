@@ -1254,7 +1254,8 @@ pub(crate) struct Evidence {
     /// frame of a response is an answer of the ECU (design 8.11 "Answer of the ECU").
     pub response_started: bool,
     /// The VCI ended the exchange itself: the worker reported a receive timeout for the
-    /// primitive. An exchange the agent's own deadline ended did not (design 8.11
+    /// primitive, or the primitive's finished status ended a collecting window that took a
+    /// result, usable or rejected (ADR-440). An exchange the agent's own deadline ended did not (design 8.11
     /// `vci_did_not_end`).
     pub vci_ended: bool,
     /// A start-of-message indication bound to the exchange's primitive was read.
@@ -2392,7 +2393,8 @@ impl LinkState {
     /// still owed and that a late final can settle ([`Kept::late_final_settles`]): an identifier
     /// a pending is open on or was open on when it was kept, or a renewed `vci_ended`
     /// (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
-    /// timeout, whatever else it read after (as an entry's is), so an end that read none (a
+    /// timeout, or the finished status of a collecting window that took a result, usable or
+    /// rejected (ADR-440), whatever else it read after (as an entry's is), so an end that read none (a
     /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
     /// released unless a pending is open on it or the kept record notes one open at its keep or
     /// after the end's renewal ([`Kept::pending_at_end`]).
@@ -5272,7 +5274,8 @@ fn rows(
             }
         }
         // The VCI ended a collecting window before or after the limit in force from the last
-        // answer: its own timer, as for a request with no answer.
+        // answer: its own timer, as for a request with no answer. A window whose only results
+        // are rejected ones counts (the VCI took them as responses, ADR-440).
         _ if evidence.collecting && evidence.vci_ended && timed_out_unjudged => (
             System,
             format!(

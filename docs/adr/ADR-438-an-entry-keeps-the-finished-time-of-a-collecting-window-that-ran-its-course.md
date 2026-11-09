@@ -1,7 +1,7 @@
 # ADR-438: An Entry Keeps the Finished Time of a Collecting Window That Ran Its Course
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (Decision item 3's `vci_ended` sentence and "stays `undetermined` whatever the window reads" superseded by ADR-440; Consequences bullet 2 closed)
 **Affects:** `agent` (`host.rs` `entry_response_times`, the entry built in `exchange`), design
 8.11 `late_response`; ADR-436 Consequences, ADR-425 decision 5
 

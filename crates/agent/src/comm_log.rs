@@ -3013,7 +3013,8 @@ impl CommLog {
         // Only an exchange the VCI ended can be settled by a late response (ADR-365), and one
         // the agent's deadline ended by its primitive's end (ADR-366), and one whose start the
         // worker did not answer by the end of the primitive it may have started (ADR-416), and
-        // one a pending is open on, whatever its end (ADR-436).
+        // one a pending is open on, whatever its end (ADR-436), and one the VCI ended, by a
+        // receive timeout or the finished status of a window that took a result (ADR-440).
         if kept.evidence.late_final_settles()
             || kept.evidence.start_unresolved
             || matches!(kept.evidence.end, exchange::End::VciDidNotEnd)
@@ -3163,7 +3164,8 @@ impl CommLog {
     /// [`CommLog::release_kept`] for the exchange whose `primitive_ended` was just written,
     /// except one left owed that a late final can settle: a pending open on its evidence or
     /// noted open on the kept record (its entry's keep, or the end's renewal), or a renewed
-    /// `vci_ended` (ADR-429, ADR-431, ADR-436).
+    /// `vci_ended`, which a finished window that took a rejected result sets too (ADR-429,
+    /// ADR-431, ADR-436, ADR-440).
     pub(crate) fn release_kept_ended(&self, seq: u64) {
         let mut inner = self.lock();
         for (_, state) in &mut inner.links {
@@ -11277,6 +11279,70 @@ pub(crate) mod tests {
         let lines = lines(&setup);
         std::fs::remove_dir_all(&dir).unwrap();
         assert_eq!(of_event(&lines, "late_response").len(), 2, "{lines:#?}");
+    }
+
+    /// ADR-440: a rejected-only window the finished status ended (`vci_ended` as the host sets
+    /// it) is kept at its entry, so a usable answer read later is the exchange's `late_response`,
+    /// on the rejected result's identifier (the restated end replaces the rejected end) or on
+    /// the silent one (which leaves the rejected identifier owed), and is never `unattached`.
+    #[test]
+    fn a_rejected_only_window_ended_by_the_finished_status_is_kept_for_a_late_answer() {
+        for (late_on, other) in [(0x7E8, 0x7E9), (0x7E9, 0x7E8)] {
+            let (dir, setup, log, seq) = late_collecting_on(true, |evidence| {
+                evidence.vci_ended = true;
+                evidence.times.vci.as_mut().unwrap().finished =
+                    Some(device_time(BASE_US + 1_400_000));
+                evidence.answers = vec![rejected_on(0x7E8, 100_000)];
+                ended_by_answers(evidence);
+                assert!(evidence.end_rejected);
+            });
+            assert!(kept_of(&log, seq).evidence.late_final_settles());
+            assert_eq!(
+                late_owner_of(&log, &late_final_on(late_on)),
+                Some(LateOwner::One(seq))
+            );
+            log.lock()
+                .late_response(0, seq, &late_final_on(late_on), placed_after(3_000_000))
+                .unwrap();
+            if late_on == 0x7E8 {
+                assert!(!kept_of(&log, seq).evidence.end_rejected);
+            }
+            assert_eq!(owed_on(&log, late_on, seq), (Vec::new(), true));
+            assert_eq!(owed_on(&log, other, seq).0, vec![seq]);
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([seq]), "{late:?}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+    }
+
+    /// ADR-440: a rejected-only window whose finished status is judged early or late takes the
+    /// timeout rows (the VCI ended its wait off its timer): `system`; at the limit it stays
+    /// `undetermined`.
+    #[test]
+    fn a_rejected_only_window_judged_early_or_late_is_the_systems() {
+        for (finished_us, window, class) in [
+            (800_000, "timeout_early", "system"),
+            (1_400_000, "timeout_late", "system"),
+            (1_100_000, "timeout_at_limit", "undetermined"),
+        ] {
+            let (dir, setup, log, _) = late_collecting_on(false, |evidence| {
+                evidence.vci_ended = true;
+                evidence.answers = vec![rejected_on(0x7E8, 100_000)];
+                ended_by_answers(evidence);
+                evidence.times.vci.as_mut().unwrap().finished =
+                    Some(device_time(BASE_US + finished_us));
+            });
+            log.end("ok");
+            let written = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = of_event(&written, "exchange").remove(0);
+            assert_eq!(entry["timing"]["window"], window, "{entry}");
+            assert_eq!(entry["classification"], class, "{entry}");
+        }
     }
 
     /// ADR-437: a wrong echo on one identifier beside a usable answer on the other ends the

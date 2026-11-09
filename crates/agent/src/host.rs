@@ -2352,6 +2352,7 @@ impl<C: WorkerApi> WorkerHost<C> {
                 response_times: progress.response_times,
                 error: progress.error,
                 errors: progress.errors.clone(),
+                rejected_read: !progress.rejected.is_empty(),
                 collecting: progress.collecting,
                 receive_table: self.receive_table.clone(),
                 progress: None,
@@ -2853,6 +2854,9 @@ struct Stray {
     response_times: VciTimes,
     error: Option<i32>,
     errors: Vec<ErrorSeen>,
+    /// The wait before the deadline read a rejected result of it (ADR-440): with the finished
+    /// status its end reads, the window took a result, which `vci_ended` counts.
+    rejected_read: bool,
     /// Its primitive collects every answer within its window (ADR-396): the waits for its end
     /// go on collecting, so the answers read after the deadline are its exchange's too
     /// (ADR-425).
@@ -2926,6 +2930,7 @@ impl Stray {
             response_times: VciTimes::default(),
             error: None,
             errors: Vec::new(),
+            rejected_read: false,
             collecting,
             receive_table,
             progress: None,
@@ -3173,7 +3178,7 @@ fn primitive_ended_of(
                     progress.rx_timeout.is_some(),
                     progress.collecting,
                     result,
-                    !progress.rejected.is_empty(),
+                    stray.rejected_read || !progress.rejected.is_empty(),
                     progress.response_times.finished.is_some(),
                 ),
                 reads: progress.take_reads(epoch, Some(result)),
@@ -6401,6 +6406,7 @@ mod tests {
                 response_times: VciTimes::default(),
                 error: None,
                 errors: Vec::new(),
+                rejected_read: false,
                 collecting: false,
                 receive_table: Vec::new(),
                 progress: None,
@@ -8119,6 +8125,7 @@ mod tests {
                 response_times: VciTimes::default(),
                 error: None,
                 errors: Vec::new(),
+                rejected_read: false,
                 collecting,
                 receive_table: TABLE.to_vec(),
                 progress: None,
@@ -8240,6 +8247,7 @@ mod tests {
                 response_times: VciTimes::default(),
                 error: None,
                 errors: Vec::new(),
+                rejected_read: false,
                 collecting: true,
                 receive_table: TABLE.to_vec(),
                 progress: None,
@@ -8322,9 +8330,13 @@ mod tests {
                 matches!(done, Ok(_) | Err(HostError::NoResponse)),
                 "{done:?}"
             );
-            let host_says =
-                !progress.rejected.is_empty() && matches!(done, Err(HostError::NoResponse));
-            assert_eq!(host_says, end_rejected, "{answers:?} {done:?}");
+            // The host's own rule, as the entry calls it with the finished status read.
+            let host_says = vci_ended(false, true, &done, !progress.rejected.is_empty(), true);
+            assert_eq!(
+                host_says,
+                done.is_ok() || end_rejected,
+                "{answers:?} {done:?}"
+            );
         }
     }
 
@@ -8358,6 +8370,63 @@ mod tests {
                 vci_ended(rx_timeout, collecting, &result, rejected, finished),
                 expected,
                 "{rx_timeout} {collecting} {result:?} {rejected} {finished}"
+            );
+        }
+    }
+
+    /// ADR-440, case 1b: a wrong echo read before the agent's deadline (so in the entry's wait,
+    /// not the stray's) and then only the finished status in the stray's wait still ends the
+    /// window as the VCI's: the stray carries that a rejected result was read, so
+    /// `PrimitiveEnded.vci_ended` is true; without the carried flag it is false.
+    #[test]
+    fn a_wrong_echo_read_before_the_deadline_and_the_finished_status_after_it_is_vci_ended() {
+        for carried in [true, false] {
+            let lines = crate::comm_log::tests::settle_collecting(false, |log, seq| {
+                let progress = Progress::for_request(&[0x3E, 0x00]).unwrap();
+                let mut stray = Stray {
+                    cop: Some(COP),
+                    tag: vec![0; 8],
+                    deadline: tokio::time::Instant::now(),
+                    cancel_failed: false,
+                    request: vec![0x3E, 0x00],
+                    expectation: crate::send_receive::Expectation {
+                        sid: progress.sid,
+                        positive: progress.positive_prefix.clone(),
+                        negative: progress.negative.clone(),
+                    },
+                    seq: Some(seq),
+                    exchange: Some(seq),
+                    response: None,
+                    response_times: VciTimes::default(),
+                    error: None,
+                    errors: Vec::new(),
+                    rejected_read: carried,
+                    collecting: true,
+                    receive_table: TABLE.to_vec(),
+                    progress: None,
+                };
+                let mut progress = stray.take_progress();
+                assert!(progress.rejected.is_empty(), "the entry's wait took it");
+                let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+                let done = progress
+                    .on_read(
+                        Some(event_notification::EventData::Item(finished)),
+                        COP,
+                        Some(AgentNow {
+                            epoch: 0,
+                            monotonic_us: 6_000_000,
+                            wall_unix_ms: 0,
+                        }),
+                    )
+                    .expect("the finished status ends the wait");
+                assert!(matches!(done, Err(HostError::NoResponse)), "{done:?}");
+                let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
+                assert_eq!(ended.vci_ended, carried);
+                assert!(log.primitive_ended(seq, ended).is_some());
+            });
+            assert!(
+                lines.iter().any(|line| line["event"] == "primitive_ended"),
+                "{lines:#?}"
             );
         }
     }

@@ -17281,6 +17281,154 @@ def main():
         assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
     }
 
+    /// Runs one `22 F1 90` read, which is not collecting, on a fake worker that gives `script`,
+    /// with `send_recv` as the host's own wait; the read ends with no response. Then, for each
+    /// entry of `stages`, the test releases the script's next `Step::Release` and lets the job
+    /// end read until the log shows one of that stage's events. Returns the log's lines.
+    async fn non_collecting_script_run(
+        script: &'static [Step],
+        send_recv: Duration,
+        stages: &'static [&'static [&'static str]],
+    ) -> Vec<serde_json::Value> {
+        let dir = journal_dir("non-collecting-script");
+        let (mut client, fake) = fake_worker_with_clock(
+            CancelAnswer::Done,
+            Some((When::After(Duration::ZERO), StartEvent::Script(script))),
+            true,
+        )
+        .await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv,
+        };
+        let released = Arc::clone(&fake.released);
+        let read_dir = dir.clone();
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(JOB_END_WAIT);
+            let result = host.service_request(0x22, &[0xF1, 0x90]);
+            assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            let until = std::time::Instant::now() + Duration::from_secs(30);
+            for events in stages {
+                released.add_permits(1);
+                loop {
+                    host.settle_at_end();
+                    let lines = comm_log_lines(&read_dir);
+                    if lines
+                        .iter()
+                        .any(|line| events.iter().any(|event| line["event"] == *event))
+                    {
+                        break;
+                    }
+                    assert!(
+                        std::time::Instant::now() < until,
+                        "{events:?} not written: {lines:#?}"
+                    );
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// ADR-443: a read that is not collecting, whose primitive the VCI finished on a wrong echo
+    /// within the host's own wait, ends as `positive_unusable` with that echo listed as
+    /// rejected; the exchange is kept, so the ECU's usable answer read afterwards is its
+    /// `late_response`, not `unattached`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_send_receive_finished_on_a_wrong_echo_owns_its_late_usable_answer() {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::From(Bound::Own, 203_000, 0x7E8, &[0x62, 0xF1]),
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 2_000_000, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+        ];
+        let lines = non_collecting_script_run(
+            SCRIPT,
+            Duration::from_secs(5),
+            &[&["late_response", "unattached"]],
+        )
+        .await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 1, "{lines:#?}");
+        assert_eq!(
+            exchanges[0]["outcome"]["result"], "positive_unusable",
+            "{lines:#?}"
+        );
+        assert_eq!(
+            exchanges[0]["rejected"][0]["reason"], "wrong_echo",
+            "{lines:#?}"
+        );
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-443, the stray's end: the wrong echo is read before the agent's deadline and the
+    /// finished status only after it, at job end. The entry is `vci_did_not_end`; the primitive's
+    /// end is `positive_unusable` (not `no_response`), ended by the VCI, so the exchange stays
+    /// kept and the ECU's usable answer after it is its `late_response`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_echo_before_the_deadline_and_the_finished_status_after_it_owns_the_late_answer()
+     {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::From(Bound::Own, 203_000, 0x7E8, &[0x62, 0xF1]),
+            Step::Release,
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 2_000_000, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+        ];
+        let lines = non_collecting_script_run(
+            SCRIPT,
+            Duration::from_millis(300),
+            &[&["primitive_ended"], &["late_response", "unattached"]],
+        )
+        .await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 1, "{lines:#?}");
+        assert_eq!(
+            exchanges[0]["outcome"]["result"], "vci_did_not_end",
+            "{lines:#?}"
+        );
+        let ended = of_event(&lines, "primitive_ended");
+        assert_eq!(ended.len(), 1, "{lines:#?}");
+        assert_eq!(
+            ended[0]["outcome"]["result"], "positive_unusable",
+            "{lines:#?}"
+        );
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+        // The ECU's answer came within the limit in force, so the system missed it.
+        assert_eq!(late[0]["classification"], "system", "{lines:#?}");
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
     /// Asserts that `lines` hold two presence exchanges, that the ECU's final answer on
     /// `identifier` is `unattached` because both could own it (the first is owed on that
     /// identifier by ADR-432 or ADR-435, and the resend is silent there), and that the unowned
@@ -18595,6 +18743,7 @@ def main():
                     crate::comm_log::PrimitiveEnded {
                         end: None,
                         detail: Default::default(),
+                        end_rejected: false,
                         vci_ended: false,
                         reads: Vec::new(),
                     },

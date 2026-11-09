@@ -38,9 +38,15 @@ positional treatment of `s` was the one place left that did not follow it.
 ## Consequences
 
 - The counts no longer depend on the order in which the answer and the error are read, nor on
-  whether the exchange is still in the window.
+  whether the exchange is still in the window, while the exchange has a record or is in the
+  window. An exchange a final response settled and released has no record: its answer counts in
+  the window's recount while the exchange is in the window, and not once it has left it. A
+  read-order case stays open: when the exchange at the error's place has its own error before
+  its final response, its `matched_at` can alias a later exchange's `clears` and a late accepted
+  restart then counts it for that exchange in one order and not in the other.
 - A later silent exchange of the same match can be `vehicle` where it was `undetermined`; it
   rests on the same one-clock ordering the error-first reading already used.
 - Still counted too few, as for every exchange: an in-time clear between the exchange and the
-  later one, an error placed after a later exchange, and a final response on another clock.
+  later one, an error placed after a later exchange, a final response on another clock, and the
+  released exchange above once it has left the window.
 - Invariant: a window entry's `after` equals its record's `Kept::clears`.

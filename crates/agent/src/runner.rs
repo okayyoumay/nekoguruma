@@ -17394,6 +17394,35 @@ def main():
         assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
     }
 
+    /// ADR-440 (case 1b): a functional presence window whose wrong echo on 7E8 the entry's wait
+    /// reads before the agent's deadline, and whose finished status (no receive timeout) only the
+    /// job end reads, counts as ended by the VCI: the stray carries that a rejected result was
+    /// read, so the exchange is kept and the ECU's usable answer on 7E8 read later is its
+    /// `late_response`, not `unattached`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_wrong_echo_before_the_deadline_and_finished_after_it_owns_its_late_answer() {
+        const FIRST: &[Step] = &[
+            Step::From(Bound::Own, 5_000, 0x7E8, &[0x67, 0x02, 0xAA, 0xBB]),
+            Step::Release,
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 2_000_000, 0x7E8, &[0x7E, 0x00]),
+        ];
+        let lines = presence_single_run(FIRST).await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 1, "{lines:#?}");
+        assert_eq!(exchanges[0]["outcome"]["result"], "vci_did_not_end");
+        assert_eq!(of_event(&lines, "primitive_ended").len(), 1, "{lines:#?}");
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
     /// ADR-436 (the single-owner variant of the test above): a functional presence window whose
     /// pending on 7E8 and finished status (no receive timeout) the job end reads, with no resend,
     /// leaves the exchange kept and owed by the pending; the ECU's final answer on 7E8, read

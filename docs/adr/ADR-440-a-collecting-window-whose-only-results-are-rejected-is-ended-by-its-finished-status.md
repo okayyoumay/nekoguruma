@@ -31,8 +31,8 @@ usable answer. The maintainer decided that such a window counts as the VCI endin
    lost events, a cancel, an agent deadline) leaves `vci_ended` false, so a link-error window
    stays unkept and released after its `primitive_ended` unless a pending is open (ADR-436), as
    a usable answer beside a link error already is. One shared function serves both entries: the
-   exchange's entry reads `Sent::rejected`, `primitive_ended_of` reads the stray's
-   the stray's own `Progress::rejected` seeded from whether the agent's wait read a rejected result (a flag the stray carries).
+   exchange's entry reads `Sent::rejected`; `primitive_ended_of` reads the stray's `rejected_read`
+   flag (whether the agent's wait read a rejected result) or its own `Progress::rejected`.
 2. **Nothing else in the log's rules changes.** The entry and the renewed record are kept by
    `late_final_settles`; `late_response_owner` owns the late usable answer on the rejected
    identifier or a silent one; the restated end replaces the rejected end and `end_rejected`

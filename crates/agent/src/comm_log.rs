@@ -21122,6 +21122,16 @@ pub(crate) mod tests {
         request: &[u8],
         transmit: bool,
     ) -> (PathBuf, CommLogSetup, CommLog, Vec<u64>, u64) {
+        stray_log_after_kind(earlier, request, transmit, false)
+    }
+
+    /// [`stray_log_after_with`]; the stray collects answers when `collecting`.
+    fn stray_log_after_kind(
+        earlier: &[&[u8]],
+        request: &[u8],
+        transmit: bool,
+        collecting: bool,
+    ) -> (PathBuf, CommLogSetup, CommLog, Vec<u64>, u64) {
         let dir = dir();
         let setup = setup(&dir);
         let log = CommLog::open(&setup).unwrap();
@@ -21152,6 +21162,7 @@ pub(crate) mod tests {
         }
         let mut waited = evidence(endpoint(0x7E0), request, exchange::End::VciDidNotEnd);
         waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.collecting = collecting;
         waited.times.agent.before_us = 10_000;
         waited.times.agent.end_us = JOB_END_US;
         let tx = UnattachedItem {
@@ -21763,6 +21774,38 @@ pub(crate) mod tests {
                     unbound_start(300_000, 9_000),
                     end_read(400_000, EndItem::TxIndication(dev(10_000))),
                     response_read(600_000, 510_500),
+                ],
+            ),
+        )
+        .unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            order_of(&lines),
+            ["late_item", "primitive_ended"],
+            "{lines:#?}"
+        );
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["refers_to"], serde_json::json!([firsts[0]]), "{late}");
+    }
+
+    /// A collecting stray with no transmit done of its own is given one by the answer it reads
+    /// after the deadline, and the job-end pass counts it when it judges a start read before the
+    /// end: the start, before that send, is the earlier owed exchange's `late_item`. Without it
+    /// the stray in flight and the earlier exchange could both own the start, so it is
+    /// `unattached` and no exchange alone is named (ADR-425, design 8.11 `late_item`).
+    #[test]
+    fn the_transmit_done_of_a_collecting_stray_s_answer_places_a_start_before_the_send() {
+        let (dir, setup, log, firsts, seq) =
+            stray_log_after_kind(&[&[0x22, 0xF1, 0x90]], &[0x3E, 0x00], false, true);
+        let mut carrier = positive_on(0x7E8, 20_000);
+        carrier.tx_done_us = Some(10_000);
+        log.primitive_ended(
+            seq,
+            ended_with(
+                Some(exchange::End::Positive(vec![0x7E, 0x00])),
+                vec![
+                    unbound_start(300_000, 9_000),
+                    end_read(400_000, EndItem::Answer(carrier)),
                 ],
             ),
         )

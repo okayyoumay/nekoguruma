@@ -11562,11 +11562,12 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// ADR-435: an owed exchange that has left the window is not visited when its owner lets go
-    /// of an answer, so it keeps the row it held only because the owner could own its answer
-    /// there, until its own late response takes the answers' owners again and drops it.
-    #[test]
-    fn a_late_response_drops_the_row_an_owner_let_go_of_for_an_exchange_beyond_the_window() {
+    /// The log of the beyond-the-window tests: an exchange `first` owed on the table
+    /// 0x7E8, 0x7E9, 0x7EA with a pending open on 0x7E8, and a resend `second` after it that
+    /// answered 0x7E8 and holds rows through `first`. `extra` are resends made after `second`.
+    /// Enough ordinary exchanges follow for all of them to leave the window; the last `window`
+    /// ones are returned with the exchanges `extra` made.
+    fn owner_with_exchanges_beyond_window(extra: usize) -> (PathBuf, CommLog, [u64; 2], Vec<u64>) {
         let table = [0x7E8, 0x7E9, 0x7EA];
         let (dir, _setup, log) = collecting_log_on(true);
         let first = log
@@ -11581,7 +11582,9 @@ pub(crate) mod tests {
             }))
             .unwrap();
         let second = resend_with_table(&log, &table, &[0x7E8], 10);
-        // Enough ordinary exchanges after it for it to leave the window.
+        let later: Vec<u64> = (0..extra)
+            .map(|at| resend_with_table(&log, &table, &[0x7E8], 11 + at as u64))
+            .collect();
         for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
             let mut filler = evidence(
                 endpoint(0x7DF),
@@ -11592,10 +11595,11 @@ pub(crate) mod tests {
             filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
             log.exchange(filler).unwrap();
         }
-        assert!(log.lock().links[0].1.logged_history(second).is_none());
-        assert!(log.lock().links[0].1.kept(second).is_some());
-        // The first exchange's own final answers on 0x7E8 and 0x7E9 come at its end; the
-        // resend, beyond the window, still holds its row for 0x7E8.
+        (dir, log, [first, second], later)
+    }
+
+    /// The first exchange's own final answers on 0x7E8 and 0x7E9 come at its end.
+    fn end_first_with_answers(log: &CommLog, first: u64) {
         log.primitive_ended(
             first,
             PrimitiveEnded {
@@ -11610,14 +11614,267 @@ pub(crate) mod tests {
             },
         )
         .unwrap();
-        assert_eq!(owed_on(&log, 0x7E8, second).0, vec![second]);
-        // 0x7E9's final answer is the resend's alone to own (the first has its own there).
+    }
+
+    /// ADR-435, ADR-439: an owed exchange that has left the window follows its owners in its
+    /// rows: when its owner lets go of an answer, the row it held only through that owner is
+    /// dropped at once, with no late response of its own, so a late final answer on that
+    /// identifier is no more owned by it (it was settled on the exchange before).
+    #[test]
+    fn an_owner_letting_go_drops_the_row_of_an_exchange_beyond_the_window() {
+        let (dir, log, [first, second], _) = owner_with_exchanges_beyond_window(0);
+        assert!(log.lock().links[0].1.logged_history(second).is_none());
+        assert!(log.lock().links[0].1.kept(second).is_some());
+        assert_eq!(owed_on(&log, 0x7E8, second).0, vec![first, second]);
+        end_first_with_answers(&log, first);
+        // The resend held its row for 0x7E8 only because the first could own its answer there.
+        assert!(owed_on(&log, 0x7E8, second).0.is_empty());
+        assert!(late_owner_of(&log, &late_final_on(0x7E8)).is_none());
+        // Its other rows stay: 0x7E9 is the resend's alone to own (the first has its own there),
+        // 0x7EA is open on both.
+        assert_eq!(owed_on(&log, 0x7E9, second).0, vec![second]);
+        assert_eq!(owed_on(&log, 0x7EA, second), (vec![first, second], true));
         log.lock()
             .late_response(0, second, &late_final_on(0x7E9), placed_after(3_000_000))
             .unwrap();
-        assert!(owed_on(&log, 0x7E8, second).0.is_empty());
         assert!(owed_on(&log, 0x7E9, second).0.is_empty());
         assert_eq!(owed_on(&log, 0x7EA, second), (vec![first, second], true));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-439: a chain of owed exchanges beyond the window, `first` owning `second`'s and
+    /// `third`'s rows on 0x7E8: when `first` lets go both rows go in one pass, and an exchange
+    /// still in the window no more has either as an owner of its answer.
+    #[test]
+    fn a_chain_of_exchanges_beyond_the_window_loses_its_rows_with_its_owner() {
+        let (dir, log, [first, second], later) = owner_with_exchanges_beyond_window(1);
+        let third = later[0];
+        let last = {
+            let mut resend = collecting_waited(|evidence| {
+                evidence.end = exchange::End::Positive(FIRST.to_vec());
+                evidence.vci_ended = true;
+                evidence.answers = vec![positive_on(0x7E8, 20_000)];
+                evidence.rx_id = 0;
+                evidence.receive_ids = vec![0x7E8, 0x7E9, 0x7EA];
+            });
+            resend.times.agent.before_us += 40_000_000;
+            resend.times.agent.end_us += 40_000_000;
+            log.exchange(resend).unwrap()
+        };
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.logged_history(last).is_some());
+            assert!(state.logged_history(third).is_none());
+            let owners = &state.logged_history(last).unwrap().owners;
+            assert!(
+                owners.contains(&second) && owners.contains(&third),
+                "{owners:?}"
+            );
+        }
+        end_first_with_answers(&log, first);
+        let owners = owed_on(&log, 0x7E8, second).0;
+        assert!(
+            !owners.contains(&second) && !owners.contains(&third),
+            "{owners:?}"
+        );
+        let inner = log.lock();
+        let owners = &inner.links[0].1.logged_history(last).unwrap().owners;
+        assert!(
+            !owners.contains(&second) && !owners.contains(&third),
+            "{owners:?}"
+        );
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-439: an owed exchange beyond the window on a link with no receive table is placed
+    /// alone, as in the window, when its only owner lets go: it is released with its record, and
+    /// its ECU's late final answer on the identifier has no owner left.
+    #[test]
+    fn an_exchange_beyond_the_window_with_no_table_is_released_with_its_owner() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let first = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+            }))
+            .unwrap();
+        let mut answered = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0x7E8, 20_000)];
+        });
+        answered.times.agent.before_us += 10_000_000;
+        answered.times.agent.end_us += 10_000_000;
+        let second = log.exchange(answered).unwrap();
+        assert!(log.lock().links[0].1.kept(second).is_some());
+        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
+            let mut filler = evidence(
+                endpoint(0x7DF),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
+            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
+            log.exchange(filler).unwrap();
+        }
+        assert!(log.lock().links[0].1.logged_history(second).is_none());
+        assert_eq!(owed_on(&log, 0x7E8, second), (vec![first, second], true));
+        end_first_with_answers(&log, first);
+        assert!(log.lock().links[0].1.kept(second).is_none());
+        assert!(late_owner_of(&log, &late_final_on(0x7E8)).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// An owed exchange `owner`, a session change `reset` and an owed exchange `later` whose answer
+    /// only `owner` could own, all three beyond the window.
+    fn restart_beyond_window() -> (PathBuf, CommLog, [u64; 3]) {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let silent = |request: &[u8], after_s: u64| {
+            let mut silent = collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+            });
+            silent.request = request.to_vec();
+            silent.expected = exchange::Expected::uds(request);
+            silent.times.agent.before_us += after_s * 1_000_000;
+            silent.times.agent.end_us += after_s * 1_000_000;
+            silent
+        };
+        let owner = log.exchange(silent(&[0x3E, 0x00], 1)).unwrap();
+        let reset = log.exchange(silent(&[0x10, 0x03], 2)).unwrap();
+        let mut answered = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0x7E8, 20_000)];
+        });
+        answered.times.agent.before_us += 3_000_000;
+        answered.times.agent.end_us += 3_000_000;
+        let later = log.exchange(answered).unwrap();
+        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
+            let mut filler = evidence(
+                endpoint(0x7DF),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
+            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
+            log.exchange(filler).unwrap();
+        }
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.logged_history(later).is_none());
+            assert!(state.kept(owner).is_some() && state.kept(later).is_some());
+        }
+        (dir, log, [owner, reset, later])
+    }
+
+    /// ADR-439, ADR-369: an ECUReset or session change accepted by a response read late, beyond
+    /// the window, ends the owed requests sent before it, so an owed exchange after it whose
+    /// answer only such a request could own loses its rows and its record, though it too has
+    /// left the window. The response goes through `late_response`, as the log reads it.
+    #[test]
+    fn a_late_accepted_restart_beyond_the_window_releases_the_exchanges_it_ends_the_owners_of() {
+        let (dir, log, [owner, reset, later]) = restart_beyond_window();
+        let accepted = UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4],
+            },
+            ..tx_done(0x7E8)
+        };
+        log.lock()
+            .late_response(0, reset, &accepted, placed_after(3_000_000))
+            .unwrap();
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(owner).is_none());
+        assert!(state.kept(later).is_none());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-439: the same ending applied by `reset_after` alone refreshes the kept exchanges after
+    /// the settling exchange.
+    #[test]
+    fn an_accepted_restart_refreshes_the_kept_exchanges_after_it() {
+        let (dir, log, [owner, reset, later]) = restart_beyond_window();
+        log.lock().links[0].1.reset_after(reset, reset, true);
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(owner).is_none());
+        assert!(state.kept(later).is_none());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-436, ADR-437, ADR-439: the rows an owner does not decide stay when it lets go: a
+    /// pending open at the exchange's end, and the whole table of an exchange that ended on
+    /// rejected results.
+    #[test]
+    fn rows_that_need_no_owner_stay_beyond_the_window() {
+        let table = [0x7E8, 0x7E9, 0x7EA];
+        let (dir, _setup, log) = collecting_log_on(true);
+        let first = log
+            .exchange(collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+                evidence.rx_id = 0;
+                evidence.receive_ids = table.to_vec();
+                evidence.answers = vec![lone_pending_on(0x7E8)];
+                evidence.pending = vec![pending_on(200_000)];
+                evidence.pending_ids = vec![Some(0x7E8)];
+            }))
+            .unwrap();
+        // Open on a pending of its own on 0x7E8.
+        let mut pending = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.rx_id = 0;
+            evidence.receive_ids = table.to_vec();
+            evidence.answers = vec![lone_pending_on(0x7E8)];
+            evidence.pending = vec![pending_on(200_000)];
+            evidence.pending_ids = vec![Some(0x7E8)];
+        });
+        pending.times.agent.before_us += 10_000_000;
+        pending.times.agent.end_us += 10_000_000;
+        let pending = log.exchange(pending).unwrap();
+        // Ended on a rejected result: owed on the whole table.
+        let mut rejected = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+            evidence.rx_id = 0;
+            evidence.receive_ids = table.to_vec();
+            evidence.answers = vec![rejected_on(0x7E8, 20_000)];
+            evidence.end_rejected = true;
+        });
+        rejected.times.agent.before_us += 11_000_000;
+        rejected.times.agent.end_us += 11_000_000;
+        let rejected = log.exchange(rejected).unwrap();
+        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
+            let mut filler = evidence(
+                endpoint(0x7DF),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
+            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
+            log.exchange(filler).unwrap();
+        }
+        assert!(log.lock().links[0].1.kept(pending).is_some());
+        assert!(log.lock().links[0].1.kept(rejected).is_some());
+        end_first_with_answers(&log, first);
+        let on_7e8 = owed_on(&log, 0x7E8, pending).0;
+        assert!(
+            on_7e8.contains(&pending) && on_7e8.contains(&rejected),
+            "{on_7e8:?}"
+        );
+        for id in table {
+            assert!(owed_on(&log, id, rejected).0.contains(&rejected), "{id:#x}");
+        }
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

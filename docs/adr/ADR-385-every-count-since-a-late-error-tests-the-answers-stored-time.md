@@ -1,7 +1,7 @@
 # ADR-385: Every Count Since a Late Error Tests the Answer's Stored Time
 
 **Date:** 2026-10-29
-**Status:** Accepted
+**Status:** Accepted (decision 2 extended by ADR-444 to the answer of the exchange a late error falls after; the first Consequences bullet now holds for it)
 **Affects:** `agent` communication log (`comm_log/exchange.rs` `Kept::answer_at`,
 `Logged::answer_at`, `Kept::answer_time`, `LinkState::log`, `LinkState::judge_answer`,
 `LinkState::since_late_error`, `LinkState::error_after`, `LinkState::reclassify_one`,

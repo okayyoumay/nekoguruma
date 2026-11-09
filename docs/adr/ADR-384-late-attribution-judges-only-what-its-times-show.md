@@ -1,7 +1,7 @@
 # ADR-384: Late Attribution Judges Only What Its Times Show
 
 **Date:** 2026-10-29
-**Status:** Accepted (item 2's stored answered-only flag, and the Consequences' recount by position, revised by ADR-385)
+**Status:** Accepted (item 2's stored answered-only flag, and the Consequences' recount by position, revised by ADR-385; the positional treatment of the answer of the exchange a late error falls after, item 1 as implemented, revised by ADR-444)
 **Affects:** `agent` communication log (`comm_log/exchange.rs` `ErrorPoint`,
 `LinkState::place_error`, `LinkState::error_after`, `SettledAnswer`, `LinkState::take_answer`,
 `LinkState::reclassify_after`; `comm_log.rs` `Inner::late_link_error`,

@@ -1,7 +1,7 @@
 # ADR-439: The Rows of an Owed Exchange Beyond the Window Follow Its Owners
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (Decision item 1's "later than the settled exchange" and item 3's restart sentence revised by ADR-441: the survivors of an accepted restart take their rows again too; the Consequences' bullet on the survivors of an accepting restart closed)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState::refresh_kept_beyond_window`,
 `LinkState::reclassify_after`, `LinkState::reset_after`, `LinkState::refresh_owed_rows`),
 design 8.11 "Settlement", "Owed request"; ADR-435 decision 6 and first Consequences bullet,
@@ -76,7 +76,7 @@ in-window path gave the opposite outcome for the same facts.
   kept exchanges.
 - An accepting restart (`LinkState::record`, and `reset_after` for exchanges between the
   earliest request and the reset) still drops owners without refreshing the rows of the
-  surviving exchanges, in or out of the window; this is not changed here.
+  surviving exchanges, in or out of the window; this is not changed here (closed by ADR-441).
 - An owed exchange beyond the window with no kept record (a non-collecting exchange with a
   final response whose answer had an owner is owed on its identifier but not kept) is never
   visited and its evidence is gone, so its stale row still counts among a late response's

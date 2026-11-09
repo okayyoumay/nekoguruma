@@ -11863,6 +11863,73 @@ pub(crate) mod tests {
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// ADR-441, ADR-439: an owed exchange between the earliest request the accepted response
+    /// could belong to and the settling exchange survives the restart, and takes its rows again
+    /// from the owners that are left: here none, so it is placed alone and released, though it
+    /// too has left the window. The response goes through `late_response`.
+    #[test]
+    fn a_late_accepted_restart_releases_a_survivor_between_its_earliest_request_and_itself() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let silent = |request: &[u8], after_s: u64| {
+            let mut silent = collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+            });
+            silent.request = request.to_vec();
+            silent.expected = exchange::Expected::uds(request);
+            silent.times.agent.before_us += after_s * 1_000_000;
+            silent.times.agent.end_us += after_s * 1_000_000;
+            silent
+        };
+        let owner = log.exchange(silent(&[0x3E, 0x00], 1)).unwrap();
+        let earliest = log.exchange(silent(&[0x10, 0x03], 2)).unwrap();
+        let mut answered = collecting_waited(|evidence| {
+            evidence.end = exchange::End::Positive(FIRST.to_vec());
+            evidence.vci_ended = true;
+            evidence.answers = vec![positive_on(0x7E8, 20_000)];
+        });
+        answered.times.agent.before_us += 3_000_000;
+        answered.times.agent.end_us += 3_000_000;
+        let survivor = log.exchange(answered).unwrap();
+        let reset = log.exchange(silent(&[0x10, 0x03], 4)).unwrap();
+        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
+            let mut filler = evidence(
+                endpoint(0x7DF),
+                &[0x22, 0xF1, did],
+                exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            );
+            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
+            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
+            log.exchange(filler).unwrap();
+        }
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.logged_history(survivor).is_none());
+            assert!(state.kept(survivor).is_some());
+            assert_eq!(state.owed_row_ids(survivor), [0x7E8]);
+        }
+        let accepted = UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4],
+            },
+            ..tx_done(0x7E8)
+        };
+        log.lock()
+            .late_response(0, reset, &accepted, placed_after(4_000_000))
+            .unwrap();
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(owner).is_none());
+        assert!(state.kept(survivor).is_none());
+        assert!(state.owed_row_ids(survivor).is_empty());
+        assert!(state.kept(earliest).is_some());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// ADR-439: the same ending applied by `reset_after` alone refreshes the kept exchanges after
     /// the settling exchange.
     #[test]

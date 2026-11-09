@@ -41,7 +41,9 @@ is exactly the situation `vci_ended` gates (ADR-440's reason, here more directly
    end and `primitive_ended` copies it; `primitive_ended_of` derives the end as the entry does, so
    a stray's end read after the deadline is `positive_unusable` (rejected, ended by the VCI), not
    `no_response`. `Stray` carries the wrong echo the entry's wait ended on so the stray's wait
-   reads on from it. `no_response` with `vci_ended` stays reserved for a receive timeout.
+   reads on from it. For a non-collecting exchange `no_response` with `vci_ended` stays reserved for
+   a receive timeout (a collecting window that took only rejected results ends `no_response` with
+   `vci_ended` from the finished status, ADR-440).
 4. **The late answer is judged as any late response:** `system` in time and `undetermined` past
    the limit (the VCI ended its wait before the limit), never `vehicle`.
 
@@ -50,8 +52,20 @@ is exactly the situation `vci_ended` gates (ADR-440's reason, here more directly
 - Supersedes ADR-440 Consequences bullet 3 (a non-collecting primitive finished on a wrong echo
   is unchanged); amends ADR-431 decision 3 (the renewed record's `vci_ended`) and ADR-359 item 3
   (the request stays owed, and its usable answer is its `late_response`).
+- A rejected end of a request that is not collecting is owed on the whole receive table, as a
+  collecting one is (ADR-435 decision 7): `Evidence::owed_ids` ends its non-collecting branch in
+  the one `end_rejected` table rule, so on a functional link the owed rows (own identifier 0, then
+  the table) stay whole through the entry, `record`, and the renewal a stray's `primitive_ended`
+  makes, and the ECU's usable answer on a table identifier is its `late_response`. A physical
+  link has no table and is owed on its own identifier as before. Only a rejected end changes: a
+  non-collecting exchange with a usable or negative final response is owed on its own identifier.
 - A primitive cancelled after a wrong echo keeps the end `positive_unusable` but is not ended by
-  the VCI (no finished status). A negative of another service (`PatternMismatch`) that ended a
+  the VCI (no finished status). So a cancelled status the agent's cancel did not cause
+  (`carried_out` false, `Settling::read`) that follows a wrong echo the entry's wait carried now
+  ends the stray `positive_unusable`, rejected, with `vci_ended` false and the record released
+  (it was `no_response`), as the entry ends it; the entry's cancelled asymmetry is the same
+  pair: a cancel is never the VCI's end, so neither record is kept, while a status the agent's
+  cancel did cause is no end at all (`StrayEnd::Cancelled`, nothing written, nothing rejected). A negative of another service (`PatternMismatch`) that ended a
   non-collecting primitive stays `no_response` and unkept (residual).
 - Tests: the host's truth table and the end-equals-`vci_ended` shapes, the suppressed request,
   the stray's end; the log's `owed_ids`, restatement, keep and `primitive_ended`; the runner's

@@ -17424,6 +17424,8 @@ def main():
             serde_json::json!([exchanges[0]["seq"]]),
             "{lines:#?}"
         );
+        // The ECU's answer came within the limit in force, so the system missed it.
+        assert_eq!(late[0]["classification"], "system", "{lines:#?}");
         assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
     }
 

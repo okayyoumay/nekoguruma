@@ -1256,8 +1256,9 @@ pub(crate) struct Evidence {
     pub response_started: bool,
     /// The VCI ended the exchange itself: the worker reported a receive timeout for the
     /// primitive, or the primitive's finished status ended a collecting window that took a
-    /// result, usable or rejected (ADR-440). An exchange the agent's own deadline ended did not (design 8.11
-    /// `vci_did_not_end`).
+    /// result, usable or rejected (ADR-440), or a primitive that is not collecting on a wrong
+    /// echo with no usable answer (ADR-443). An exchange the agent's own deadline ended did not
+    /// (design 8.11 `vci_did_not_end`).
     pub vci_ended: bool,
     /// A start-of-message indication bound to the exchange's primitive was read.
     pub bound_start: bool,
@@ -1413,10 +1414,10 @@ impl Evidence {
     /// The response identifiers the exchange is owed on (design 8.11 "Owed request", ADR-432),
     /// each once. With no receive table (a physical link) it is owed as before: on the
     /// identifiers a pending is open on, else on its link's `rx_id`. With a table, a request
-    /// that is not collecting is owed on its `rx_id` once a final response ended it, else on
-    /// every receive identifier; a collecting request with no answer on every receive
-    /// identifier. With answers, it is owed on each of these once, in this order: the
-    /// identifiers a pending is open on (an unnamed pending, identifier 0, standing for every
+    /// that is not collecting is owed on its `rx_id` once a final response ended it (and, when
+    /// that end is a rejected one, on every receive identifier too, ADR-443), else on every
+    /// receive identifier; a collecting request with no answer on every receive identifier.
+    /// With answers, it is owed on each of these once, in this order: the identifiers a pending is open on (an unnamed pending, identifier 0, standing for every
     /// receive identifier with no final answer, and for none when every one has it, ADR-400
     /// decision 1); every receive identifier with no named final answer standing
     /// ([`Self::silent_ids`], ADR-435); and, when the request ended with a final response, the
@@ -1447,42 +1448,42 @@ impl Evidence {
             } else {
                 table.iter().for_each(|&id| add(&mut ids, id));
             }
-            return ids;
-        }
-        if self.answers.is_empty() {
+        } else if self.answers.is_empty() {
             table.iter().for_each(|&id| add(&mut ids, id));
-            return ids;
-        }
-        // (1) The identifiers a pending is open on, and (2) the silent ones, whatever another
-        // identifier answered (ADR-435).
-        for id in self.unanswered_ids() {
-            add(&mut ids, id);
-        }
-        // (3) The identifiers of the final answers an owed request could own, so that request
-        // is not the only one to find a late answer there.
-        if self.final_response().is_some() {
-            for answer in self.answers.iter().filter(|answer| {
-                !answer.is_pending(&self.expected)
-                    && !answer.is_rejected()
-                    && answer
-                        .history
-                        .as_ref()
-                        .is_some_and(|history| !history.owners.is_empty())
-            }) {
-                // An unnamed answer (0) may have come on any identifier of the table.
-                if answer.rx_id == 0 {
-                    table.iter().for_each(|&id| add(&mut ids, id));
-                } else {
-                    add(&mut ids, answer.rx_id);
+        } else {
+            // (1) The identifiers a pending is open on, and (2) the silent ones, whatever
+            // another identifier answered (ADR-435).
+            for id in self.unanswered_ids() {
+                add(&mut ids, id);
+            }
+            // (3) The identifiers of the final answers an owed request could own, so that
+            // request is not the only one to find a late answer there.
+            if self.final_response().is_some() {
+                for answer in self.answers.iter().filter(|answer| {
+                    !answer.is_pending(&self.expected)
+                        && !answer.is_rejected()
+                        && answer
+                            .history
+                            .as_ref()
+                            .is_some_and(|history| !history.owners.is_empty())
+                }) {
+                    // An unnamed answer (0) may have come on any identifier of the table.
+                    if answer.rx_id == 0 {
+                        table.iter().for_each(|&id| add(&mut ids, id));
+                    } else {
+                        add(&mut ids, answer.rx_id);
+                    }
                 }
             }
         }
         // A result the worker rejected is no answer (ADR-359): the exchange is owed as one with
         // no answer is, on every receive identifier, whatever else it is owed on, since it is not
         // settled either ([`Self::settles_owed`]). The set does not depend on its owners, so it
-        // never grows after the fact. For a collecting request the rejected result covers no
-        // identifier, so the silent ones already make the table; the rule stays whole as an
-        // invariant (ADR-435 decision 7, ADR-437).
+        // never grows after the fact. A request that is not collecting and ended with a rejected
+        // end (a wrong echo the primitive finished on, ADR-443) is owed on its own identifier
+        // and the table; for a collecting request the rejected result covers no identifier, so
+        // the silent ones already make the table and the rule stays whole as an invariant
+        // (ADR-435 decision 7, ADR-437).
         if self.end_rejected {
             table.iter().for_each(|&id| add(&mut ids, id));
         }
@@ -2427,7 +2428,8 @@ impl LinkState {
     /// a pending is open on or was open on when it was kept, or a renewed `vci_ended`
     /// (ADR-429, ADR-431, ADR-436). `vci_ended` is true when the end read a receive
     /// timeout, or the finished status of a collecting window that took a result, usable or
-    /// rejected (ADR-440), whatever else it read after (as an entry's is), so an end that read none (a
+    /// rejected (ADR-440), or of a primitive that is not collecting on a wrong echo with no
+    /// usable answer (ADR-443), whatever else it read after (as an entry's is), so an end that read none (a
     /// cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
     /// released unless a pending is open on it or the kept record notes one open at its keep or
     /// after the end's renewal ([`Kept::pending_at_end`]).
@@ -12640,6 +12642,16 @@ mod tests {
         evidence.end_rejected = true;
         evidence.vci_ended = true;
         assert_eq!(evidence.owed_ids(), [RX]);
+        // With a receive table (a functional link, own identifier 0) the rejected end is owed on
+        // the whole table, as a collecting one is (ADR-435 decision 7, ADR-443), where a usable
+        // final response is owed on the link's identifier alone.
+        let mut table = evidence.clone();
+        table.rx_id = 0;
+        table.receive_ids = vec![RX, RX2];
+        assert_eq!(table.owed_ids(), [0, RX, RX2]);
+        table.end_rejected = false;
+        table.end = End::Positive(vec![0x62, 0xF1, 0x86, 0x01]);
+        assert_eq!(table.owed_ids(), [0]);
         assert!(!evidence.settles_owed());
         assert!(evidence.answer_head().is_none());
         let kept = log_kept(&mut LinkState::default(), 1, evidence).1;

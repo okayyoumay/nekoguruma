@@ -3018,7 +3018,8 @@ impl CommLog {
         // the agent's deadline ended by its primitive's end (ADR-366), and one whose start the
         // worker did not answer by the end of the primitive it may have started (ADR-416), and
         // one a pending is open on, whatever its end (ADR-436), and one the VCI ended, by a
-        // receive timeout or the finished status of a window that took a result (ADR-440).
+        // receive timeout, the finished status of a window that took a result (ADR-440), or the
+        // finished status of a primitive that is not collecting on a wrong echo (ADR-443).
         // And one owed only through its owners, for its rows (ADR-442).
         if kept.evidence.late_final_settles()
             || entry.owed_through_owners()
@@ -9269,9 +9270,37 @@ pub(crate) mod tests {
     /// A collecting presence exchange transmitted at `BASE_US`, ended by the agent's deadline
     /// 5 s later (`build` gives it the answers it had read), as the host logs it.
     fn collecting_waited(build: impl FnOnce(&mut exchange::Evidence)) -> exchange::Evidence {
-        let mut evidence = evidence(endpoint(0x7DF), &[0x3E, 0x00], exchange::End::VciDidNotEnd);
+        waited(endpoint(0x7DF), &[0x3E, 0x00], true, build)
+    }
+
+    /// A read request (`22 F1 86`, physical, which is not collecting: production sends a
+    /// functional `3E 00` as a presence request only, collecting) transmitted at `BASE_US`,
+    /// ended by the agent's deadline 5 s later; on a functional link (`functional`) it has the
+    /// link's receive table and own identifier 0, as `late_collecting_on` gives its exchange.
+    fn read_waited(
+        functional: bool,
+        build: impl FnOnce(&mut exchange::Evidence),
+    ) -> exchange::Evidence {
+        waited(endpoint(0x7E0), &[0x22, 0xF1, 0x86], false, |evidence| {
+            if functional {
+                evidence.rx_id = 0;
+                evidence.receive_ids = vec![0x7E8, 0x7E9];
+            }
+            build(evidence);
+        })
+    }
+
+    /// An exchange of `request` to `target`, transmitted at `BASE_US` and ended by the agent's
+    /// deadline 5 s later (`build` gives it what it had read).
+    fn waited(
+        target: exchange::Target,
+        request: &[u8],
+        collecting: bool,
+        build: impl FnOnce(&mut exchange::Evidence),
+    ) -> exchange::Evidence {
+        let mut evidence = evidence(target, request, exchange::End::VciDidNotEnd);
         evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
-        evidence.collecting = true;
+        evidence.collecting = collecting;
         evidence.times.agent.before_us = BASE_US - 100_000;
         evidence.times.agent.end_us = BASE_US + 5_000_000;
         evidence.times.vci = Some(exchange::VciTimes {
@@ -10016,10 +10045,15 @@ pub(crate) mod tests {
     /// The seqs of the owed requests on link 1 (index 0) that a response of `rx_id` could belong
     /// to, and whether the log keeps the exchange `seq`.
     fn owed_on(log: &CommLog, rx_id: u32, seq: u64) -> (Vec<u64>, bool) {
+        owed_on_for(log, rx_id, seq, &[0x7E, 0x00])
+    }
+
+    /// [`owed_on`] for a response `bytes` (the read request's positive response, say).
+    fn owed_on_for(log: &CommLog, rx_id: u32, seq: u64, bytes: &[u8]) -> (Vec<u64>, bool) {
         let inner = log.lock();
         let state = &inner.links[0].1;
         (
-            state.late_response_owners(Some(rx_id), &[0x7E, 0x00]),
+            state.late_response_owners(Some(rx_id), bytes),
             state.kept(seq).is_some(),
         )
     }
@@ -10030,11 +10064,20 @@ pub(crate) mod tests {
 
     /// The final answer of `rx_id` to the presence request, delivered late.
     fn late_final_on(rx_id: u32) -> UnattachedItem {
+        late_result_on(rx_id, vec![0x7E, 0x00])
+    }
+
+    /// The usable answer of `rx_id` to the `22 F1 86` read request, delivered late.
+    fn late_read_on(rx_id: u32) -> UnattachedItem {
+        late_result_on(rx_id, vec![0x62, 0xF1, 0x86, 0x01])
+    }
+
+    fn late_result_on(rx_id: u32, bytes: Vec<u8>) -> UnattachedItem {
         UnattachedItem {
             data: UnattachedData::Result {
                 rx_flag: vec![0, 0, 0, 0],
                 identifier: Some(rx_id),
-                bytes: vec![0x7E, 0x00],
+                bytes,
             },
             ..tx_done(rx_id)
         }
@@ -11343,15 +11386,19 @@ pub(crate) mod tests {
         }
     }
 
-    /// A presence exchange that is not collecting, whose primitive ended with a wrong echo
+    /// A read request that is not collecting, whose primitive ended with a wrong echo
     /// (`positive_unusable`, rejected), logged as the host hands it, with `vci_ended` as given.
     fn non_collecting_wrong_echo(vci_ended: bool) -> exchange::Evidence {
-        collecting_waited(|evidence| {
-            evidence.collecting = false;
-            evidence.end = exchange::End::PositiveUnusable(vec![0x7E, 0x01]);
+        read_waited(false, |evidence| {
+            evidence.end = exchange::End::PositiveUnusable(vec![0x62, 0xF1, 0x90, 0x01]);
             evidence.end_rejected = true;
             evidence.vci_ended = vci_ended;
         })
+    }
+
+    /// The owed requests of `rx_id` for the read request's late answer, and whether `seq` is kept.
+    fn read_owed_on(log: &CommLog, rx_id: u32, seq: u64) -> (Vec<u64>, bool) {
+        owed_on_for(log, rx_id, seq, &[0x62, 0xF1, 0x86, 0x01])
     }
 
     /// ADR-443: a request that is not collecting and whose primitive the VCI finished on a wrong
@@ -11365,16 +11412,16 @@ pub(crate) mod tests {
             let (dir, setup, log) = collecting_log_on(false);
             let seq = log.exchange(non_collecting_wrong_echo(true)).unwrap();
             assert!(kept_of(&log, seq).evidence.end_rejected);
-            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
+            assert_eq!(read_owed_on(&log, 0x7E8, seq), (vec![seq], true));
             assert_eq!(
-                late_owner_of(&log, &late_final_on(0x7E8)),
+                late_owner_of(&log, &late_read_on(0x7E8)),
                 Some(LateOwner::One(seq))
             );
             log.lock()
-                .late_response(0, seq, &late_final_on(0x7E8), placed_after(after_us))
+                .late_response(0, seq, &late_read_on(0x7E8), placed_after(after_us))
                 .unwrap();
             // The restated exchange is usable: settled, no longer rejected.
-            assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+            assert_eq!(read_owed_on(&log, 0x7E8, seq), (Vec::new(), false));
             log.end("ok");
             let lines = lines(&setup);
             std::fs::remove_dir_all(&dir).unwrap();
@@ -11388,57 +11435,115 @@ pub(crate) mod tests {
         // Without the VCI's end the exchange is not kept and its late answer has no owner.
         let (dir, _setup, log) = collecting_log_on(false);
         let seq = log.exchange(non_collecting_wrong_echo(false)).unwrap();
-        assert!(!owed_on(&log, 0x7E8, seq).1);
-        assert!(late_owner_of(&log, &late_final_on(0x7E8)).is_none());
+        assert!(!read_owed_on(&log, 0x7E8, seq).1);
+        assert!(late_owner_of(&log, &late_read_on(0x7E8)).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The `primitive_ended` input for a read request's primitive the VCI finished on a wrong
+    /// echo (`vci_ended`) or that ended some other way (`no_response`), as the host hands it.
+    fn read_primitive_ended(vci_ended: bool) -> PrimitiveEnded {
+        PrimitiveEnded {
+            end: Some(if vci_ended {
+                exchange::End::PositiveUnusable(vec![0x62, 0xF1, 0x90, 0x01])
+            } else {
+                exchange::End::NoResponse
+            }),
+            detail: exchange::Detail::default(),
+            end_rejected: vci_ended,
+            vci_ended,
+            reads: read_after_deadline(Vec::new()),
+        }
     }
 
     /// ADR-443 (the stray's end): an exchange the agent's deadline ended is kept by that, and its
     /// primitive's end as a wrong echo the VCI finished (`positive_unusable`, rejected,
     /// `vci_ended`) leaves it kept after the host releases it, still unsettled, so the late usable
-    /// answer is its `late_response`; an end that is not the VCI's releases it.
+    /// answer is its `late_response`, `system` in time; an end that is not the VCI's releases it.
     #[test]
     fn a_non_collecting_primitive_end_on_a_wrong_echo_keeps_the_exchange_owed() {
         for vci_ended in [true, false] {
             let (dir, setup, log) = collecting_log_on(false);
-            let seq = log
-                .exchange(collecting_waited(|evidence| evidence.collecting = false))
+            let seq = log.exchange(read_waited(false, |_| {})).unwrap();
+            assert_eq!(read_owed_on(&log, 0x7E8, seq), (vec![seq], true));
+            log.primitive_ended(seq, read_primitive_ended(vci_ended))
                 .unwrap();
-            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
-            log.primitive_ended(
-                seq,
-                PrimitiveEnded {
-                    end: Some(if vci_ended {
-                        exchange::End::PositiveUnusable(vec![0x7E, 0x01])
-                    } else {
-                        exchange::End::NoResponse
-                    }),
-                    detail: exchange::Detail::default(),
-                    end_rejected: vci_ended,
-                    vci_ended,
-                    reads: read_after_deadline(Vec::new()),
-                },
-            )
-            .unwrap();
             log.release_kept_ended(seq);
-            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], vci_ended));
+            assert_eq!(read_owed_on(&log, 0x7E8, seq), (vec![seq], vci_ended));
             if vci_ended {
                 assert!(kept_of(&log, seq).evidence.end_rejected);
                 log.lock()
-                    .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+                    .late_response(0, seq, &late_read_on(0x7E8), placed_after(500_000))
                     .unwrap();
                 // The late usable answer settled it.
-                assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+                assert_eq!(read_owed_on(&log, 0x7E8, seq), (Vec::new(), false));
             }
             log.end("ok");
             let lines = lines(&setup);
             std::fs::remove_dir_all(&dir).unwrap();
-            assert_eq!(
-                of_event(&lines, "late_response").len(),
-                usize::from(vci_ended),
-                "{lines:#?}"
-            );
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), usize::from(vci_ended), "{lines:#?}");
+            if vci_ended {
+                assert_eq!(late[0]["classification"], "system", "{late:?}");
+            }
         }
+    }
+
+    /// ADR-443, ADR-435 decision 7 (the stray's end on a functional link): a rejected end owes the
+    /// exchange on the whole receive table, so the renewal the stray's `primitive_ended` makes
+    /// keeps every row, and the usable answer of the ECU on either identifier is its
+    /// `late_response` (not `unattached`).
+    #[test]
+    fn a_non_collecting_primitive_end_on_a_wrong_echo_keeps_the_table_owed_on_a_functional_link() {
+        let (dir, setup, log) = collecting_log_on(true);
+        let seq = log.exchange(read_waited(true, |_| {})).unwrap();
+        assert_eq!(read_owed_on(&log, 0x7E8, seq), (vec![seq], true));
+        assert_eq!(read_owed_on(&log, 0x7E9, seq), (vec![seq], true));
+        log.primitive_ended(seq, read_primitive_ended(true))
+            .unwrap();
+        log.release_kept_ended(seq);
+        let kept = kept_of(&log, seq);
+        assert!(kept.evidence.end_rejected);
+        assert_eq!(kept.evidence.owed_ids(), [0, 0x7E8, 0x7E9]);
+        assert_eq!(read_owed_on(&log, 0x7E8, seq), (vec![seq], true));
+        assert_eq!(read_owed_on(&log, 0x7E9, seq), (vec![seq], true));
+        assert_eq!(
+            late_owner_of(&log, &late_read_on(0x7E8)),
+            Some(LateOwner::One(seq))
+        );
+        log.lock()
+            .late_response(0, seq, &late_read_on(0x7E8), placed_after(500_000))
+            .unwrap();
+        assert_eq!(read_owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([seq]), "{late:?}");
+        assert_eq!(late[0]["classification"], "system", "{late:?}");
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// For the host's tests: logs the read request (`22 F1 86`, not collecting) the agent's
+    /// deadline ended, `functional` on a functional link, then hands `settle` the log and the
+    /// exchange's `seq`. Returns the lines of the log.
+    pub(crate) fn settle_read(
+        functional: bool,
+        settle: impl FnOnce(&CommLog, u64),
+    ) -> Vec<serde_json::Value> {
+        let (dir, setup, log) = collecting_log_on(functional);
+        let seq = log.exchange(read_waited(functional, |_| {})).unwrap();
+        settle(&log, seq);
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// For the host's tests: whether the log keeps the exchange `seq` of link 1.
+    pub(crate) fn is_kept(log: &CommLog, seq: u64) -> bool {
+        log.lock().links[0].1.kept(seq).is_some()
     }
 
     /// ADR-440: a rejected-only window whose finished status is judged early or late takes the

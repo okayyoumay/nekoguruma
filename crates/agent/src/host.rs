@@ -4170,10 +4170,13 @@ pub(crate) fn positive_prefix(request: &[u8]) -> Vec<u8> {
 /// Whether the VCI ended an exchange: by its receive timeout, or for a collecting window the
 /// primitive's finished status ended (ISO 22900-2:2022 8.2.6.2.2) when the window took a result:
 /// a usable answer (`Ok`), or only rejected ones (`Err(NoResponse)` with a rejected result read,
-/// which the VCI took as a response, ADR-437 decision 6). A failed window, a lost VCI, lost
-/// events or a cancel keep false, as a usable answer beside a link error does (`Progress::on_read`
-/// makes that result `Err(PrimitiveFailed)`). The one rule the exchange's entry and its
-/// `primitive_ended` entry share (ADR-440).
+/// which the VCI took as a response, ADR-437 decision 6); or for a primitive that is not
+/// collecting, its finished status when it ended on a wrong echo with no usable answer
+/// (`rejected_read` then means that, `Err(NoResponse)` only, ADR-443), never a usable answer
+/// (ADR-442 decision 2). A failed window, a lost VCI, lost events or a cancel keep false, as a
+/// usable answer beside a link error does (`Progress::on_read` makes that result
+/// `Err(PrimitiveFailed)`). The one rule the exchange's entry and its `primitive_ended` entry
+/// share (ADR-440, ADR-443).
 fn vci_ended(
     rx_timeout: bool,
     collecting: bool,
@@ -4228,8 +4231,10 @@ struct Progress {
     receive_cycles: i32,
     /// The last result of the primitive was a rejected one: no pending or answer came after it.
     last_rejected: bool,
-    /// The primitive's finished status was read (not a cancel), for any primitive: the VCI ended
-    /// its wait (ADR-443).
+    /// The primitive's finished status was read (not a cancel), for any primitive. It shows the
+    /// VCI ended its wait only for a collecting window that took a result, or a primitive that is
+    /// not collecting on a wrong echo with no usable answer (`vci_ended`, ADR-440, ADR-443); a
+    /// usable answer's finished status does not (ADR-442 decision 2).
     finished: bool,
     /// A start-of-message indication bound to the primitive was read: a response may be under
     /// way (design 8.11 `vci_did_not_end`).
@@ -8636,6 +8641,164 @@ mod tests {
             );
             if !expected {
                 assert!(matches!(ended.end, Some(End::NoResponse)));
+            }
+        }
+    }
+
+    /// A stray of the read request `22 F1 86` (not collecting) the agent's deadline ended, whose
+    /// entry's wait read a wrong echo when `echo`, as the host leaves it (ADR-443).
+    fn read_stray(seq: u64, echo: bool) -> Stray {
+        let progress = Progress::for_request(&[0x22, 0xF1, 0x86]).unwrap();
+        Stray {
+            cop: Some(COP),
+            tag: vec![0; 8],
+            deadline: tokio::time::Instant::now(),
+            cancel_failed: false,
+            request: vec![0x22, 0xF1, 0x86],
+            expectation: crate::send_receive::Expectation {
+                sid: progress.sid,
+                positive: progress.positive_prefix.clone(),
+                negative: progress.negative.clone(),
+            },
+            seq: Some(seq),
+            exchange: Some(seq),
+            response: None,
+            response_times: VciTimes::default(),
+            error: None,
+            errors: Vec::new(),
+            rejected_read: echo,
+            unanswered_echo: echo.then(|| RejectedRead {
+                identifier: None,
+                bytes: vec![0x62, 0xF1],
+                vci_us: 0,
+                clock: None,
+                reason: RejectedReason::WrongEcho,
+                read: None,
+            }),
+            collecting: false,
+            receive_table: Vec::new(),
+            progress: None,
+        }
+    }
+
+    /// What the stray's settling wait read at `status` and the log does with the primitive's end
+    /// (`primitive_ended`, then the release of `settle_cancelled`): the `PrimitiveEnded` the host
+    /// handed over and whether the log still keeps the exchange. `carried_out` is whether the
+    /// agent's cancel was carried out.
+    fn settle_read_stray(
+        echo: bool,
+        in_wait_echo: bool,
+        status_read: PduComPrimitiveStatus,
+        carried_out: bool,
+    ) -> (crate::comm_log::PrimitiveEnded, bool) {
+        let mut ended_kept = None;
+        crate::comm_log::tests::settle_read(false, |log, seq| {
+            let mut stray = read_stray(seq, echo);
+            let progress = stray.take_progress();
+            let mut settling = Settling {
+                progress,
+                cop: COP,
+                stray,
+                carried_out,
+                carried: 0,
+                end: None,
+                items: Vec::new(),
+            };
+            let read = Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 6_000_000,
+                wall_unix_ms: 0,
+            });
+            if in_wait_echo {
+                settling.read(
+                    Some(event_notification::EventData::Item(event(
+                        Some(COP),
+                        result(&[0x62, 0xF1]),
+                    ))),
+                    read,
+                );
+                assert!(settling.end.is_none(), "a result alone does not end it");
+            }
+            settling.read(
+                Some(event_notification::EventData::Item(event(
+                    Some(COP),
+                    status(status_read),
+                ))),
+                read,
+            );
+            let Some(SettlingEnd::Ended(result)) = settling.end.take() else {
+                panic!("the status ends the primitive as its exchange's wait would have");
+            };
+            let ended = primitive_ended_of(
+                &settling.stray,
+                &mut settling.progress,
+                StrayEnd::Ended(&result),
+                0,
+            );
+            let summary = crate::comm_log::PrimitiveEnded {
+                reads: Vec::new(),
+                end: ended.end.clone(),
+                detail: Detail::default(),
+                end_rejected: ended.end_rejected,
+                vci_ended: ended.vci_ended,
+            };
+            assert!(log.primitive_ended(seq, ended).is_some());
+            log.release_kept_ended(seq);
+            ended_kept = Some((summary, crate::comm_log::tests::is_kept(log, seq)));
+        });
+        ended_kept.unwrap()
+    }
+
+    /// ADR-443, the next request's settling wait: the primitive's finished status read there,
+    /// after a wrong echo (read before the deadline, in that wait, or both), ends it as
+    /// `positive_unusable`, rejected and ended by the VCI, so `release_kept_ended` keeps the
+    /// record for the ECU's late usable answer; the finished status alone releases it.
+    #[test]
+    fn a_finished_status_read_in_the_settling_wait_after_a_wrong_echo_keeps_the_record() {
+        for (echo, in_wait, expected) in [
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            let (ended, kept) =
+                settle_read_stray(echo, in_wait, PduComPrimitiveStatus::PduCopstFinished, true);
+            assert_eq!(ended.vci_ended, expected, "{echo} {in_wait}");
+            assert_eq!(ended.end_rejected, expected, "{echo} {in_wait}");
+            assert_eq!(kept, expected, "{echo} {in_wait}");
+            assert_eq!(
+                matches!(ended.end, Some(End::PositiveUnusable(_))),
+                expected,
+                "{:?}",
+                ended.end
+            );
+        }
+    }
+
+    /// ADR-443, row N13: a cancelled status the agent's cancel did not cause (`carried_out`
+    /// false) after a wrong echo the entry's wait carried ends the stray as `positive_unusable`
+    /// and rejected, as the entry ends it, but not as the VCI's end (no finished status): the
+    /// record is released. With no wrong echo it stays `no_response`.
+    #[test]
+    fn a_cancelled_status_the_agents_cancel_did_not_cause_ends_a_carried_wrong_echo_unkept() {
+        for echo in [true, false] {
+            let (ended, kept) =
+                settle_read_stray(echo, false, PduComPrimitiveStatus::PduCopstCancelled, false);
+            assert!(!ended.vci_ended, "{echo}");
+            assert!(!kept, "{echo}");
+            assert_eq!(ended.end_rejected, echo, "{echo}");
+            if echo {
+                assert!(
+                    matches!(&ended.end, Some(End::PositiveUnusable(bytes)) if bytes == &[0x62, 0xF1]),
+                    "{:?}",
+                    ended.end
+                );
+            } else {
+                assert!(
+                    matches!(ended.end, Some(End::NoResponse)),
+                    "{:?}",
+                    ended.end
+                );
             }
         }
     }

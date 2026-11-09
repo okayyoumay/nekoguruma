@@ -4246,6 +4246,13 @@ impl ExchangeEntry {
         self.effect.owners.is_empty() && (self.accepting() || self.effect.settles())
     }
 
+    /// Whether it is owed only because an owner could own its final answer: it settles, and an
+    /// earlier owed request still stands that could own that answer (design 8.11, ADR-442). The
+    /// log keeps its record for its rows until the owners let go.
+    pub(crate) fn owed_through_owners(&self) -> bool {
+        self.effect.settles() && !self.effect.owners.is_empty()
+    }
+
     /// The entry for `evidence` as line `seq`, with `history` from
     /// [`LinkState::history_for`], classified by [`classify`].
     pub(crate) fn build(seq: u64, evidence: Evidence, history: LinkHistory) -> Self {
@@ -6698,6 +6705,39 @@ mod tests {
         assert!(state.kept(2).is_none());
         assert!(state.owed_row_ids(2).is_empty());
         assert_eq!(state.unknown_sends, 1);
+    }
+
+    /// ADR-442: an entry is owed through its owners only when it settles and an owner stands:
+    /// not when it is placed alone, has no final response, or is open on a pending or silent.
+    #[test]
+    fn an_entry_is_owed_through_owners_only_when_it_settles_with_an_owner() {
+        let mut state = LinkState::default();
+        // Alone: no owner stands.
+        let alone = log(
+            &mut state,
+            1,
+            collecting(vec![positive(RX, Window::WithinP2)]),
+        );
+        assert!(alone.placed_alone() && !alone.owed_through_owners());
+        // An owner that has no answer.
+        let mut state = LinkState::default();
+        log(&mut state, 1, collecting(Vec::new()));
+        // A final response with the owner standing.
+        let settling = log(
+            &mut state,
+            2,
+            collecting(vec![positive(RX, Window::WithinP2)]),
+        );
+        assert!(settling.owed_through_owners() && !settling.placed_alone());
+        // No final response.
+        let silent = log(&mut state, 3, collecting(Vec::new()));
+        assert!(!silent.owed_through_owners());
+        // Open on a pending.
+        let mut open = collecting(vec![lone(RX)]);
+        open.pending = vec![pending()];
+        open.pending_ids = vec![Some(RX)];
+        let open = log(&mut state, 4, open);
+        assert!(!open.owed_through_owners());
     }
 
     /// ADR-439: the refresh after an accepted restart changes rows and records only; it does not

@@ -1994,8 +1994,9 @@ enum Place {
     Window,
     /// Kept beyond the window, its matched answer counted when freed (ADR-439).
     Beyond,
-    /// Kept beyond the window, refreshed after an accepted restart: rows and record only, since
-    /// the restart recounts the matched answers from the window alone.
+    /// Refreshed after an accepted restart, kept beyond the window or a survivor in the window
+    /// (which may have no kept record): rows and record only, since the restart recounts the
+    /// matched answers from the window alone.
     BeyondRows,
 }
 
@@ -2640,7 +2641,9 @@ impl LinkState {
 
     /// What a new classification `entry` of the owed exchange `entry.seq` does to the owed requests
     /// and to the link's counts, shared by the window ([`LinkState::reclassify_one`]) and the
-    /// kept exchanges beyond it ([`LinkState::refresh_kept_beyond_window`], ADR-439),
+    /// kept exchanges beyond it ([`LinkState::refresh_kept_beyond_window`], ADR-439) and the
+    /// survivors of an accepted restart ([`LinkState::refresh_window_survivors`], both through
+    /// [`LinkState::refresh_row_owners`], ADR-441),
     /// `before` being the exchange's `sent` and whether its answer was a matched answer before. An answer no owed request can own any more is a matched
     /// answer for the exchanges after it, a pending too, as `record` would have counted it; it
     /// confirms the send; a final response is placed with its exchange alone, which is then owed
@@ -3160,6 +3163,9 @@ impl LinkState {
     /// - Accepting, the owed requests sent before `earliest`, the earliest request its answer
     ///   could belong to, end, and are no owners of the later exchanges' answers; the window
     ///   keeps it and the exchanges after it.
+    ///   The owed exchanges from `earliest` up to it, beyond the window and in it, take their
+    ///   rows again from the owners that are left (ADR-441), and what they free reaches the
+    ///   exchanges after it.
     ///
     /// Gives each later exchange whose classification or reason this changes, in `seq` order,
     /// and the largest `seq` of a later exchange that had left the window, which is not
@@ -5752,6 +5758,11 @@ mod tests {
         let (changed, through) =
             super::super::settle_later(state, seq, entry.late_restart(), &answer);
         (entry, changed, through)
+    }
+
+    /// Whether exchange `seq` has left the link's window.
+    fn logged_beyond(state: &LinkState, seq: u64) -> bool {
+        state.window.iter().all(|logged| logged.seq != seq)
     }
 
     fn window_history(state: &LinkState, seq: u64) -> &LinkHistory {
@@ -11210,6 +11221,111 @@ mod tests {
         state.reset_after(4, 2, true);
         assert!(state.owed_row_ids(3).is_empty());
         assert_eq!(state.history_for(&probe).owed_matching, 0);
+    }
+
+    /// ADR-441: a survivor whose send was `unknown` (no transmit evidence, an owner that could
+    /// own the indication) has it confirmed when the restart leaves it no owner: the count of
+    /// unknown sends drops, kept or not, on both paths.
+    #[test]
+    fn a_survivor_released_by_an_accepted_restart_confirms_its_unknown_send() {
+        for (keep, late) in [(true, false), (false, false), (true, true), (false, true)] {
+            let mut state = LinkState::default();
+            let answer = End::Positive(vec![0x62, 0xF1, 0x86, 0x41]);
+            log_and_keep(
+                &mut state,
+                1,
+                confirmed_request(&READ_F186, End::NoResponse),
+            );
+            log_and_keep(
+                &mut state,
+                2,
+                confirmed_request(&[0x10, 0x03], End::NoResponse),
+            );
+            let mut survivor = forwarding(evidence(&READ_F186, answer));
+            let history = state.history_for(&survivor);
+            survivor.set_answer_histories(state.answer_histories(&survivor, &history, 3));
+            let (entry, kept) = log_kept(&mut state, 3, survivor);
+            assert_eq!(entry.sent, Sent::Unknown);
+            if keep {
+                state.keep(3, kept);
+            }
+            let case = (keep, late);
+            assert_eq!(state.unknown_sends, 1, "{case:?}");
+            assert!(state.may_own_tx_indication());
+            if late {
+                log_and_keep(
+                    &mut state,
+                    4,
+                    confirmed_request(&[0x10, 0x03], End::NoResponse),
+                );
+                state.reset_after(4, 2, true);
+            } else {
+                log(
+                    &mut state,
+                    4,
+                    confirmed_request(&[0x10, 0x03], End::Positive(vec![0x50, 0x03])),
+                );
+            }
+            assert!(state.owed_row_ids(3).is_empty(), "{case:?}");
+            assert_eq!(state.unknown_sends, 0, "{case:?}");
+            assert!(!state.may_own_tx_indication(), "{case:?}");
+        }
+    }
+
+    /// ADR-441: the pass beyond the window comes before the window's: a survivor beyond the
+    /// window loses its row on `RX` first, so a survivor in the window whose final answer on `RX`
+    /// the first could own finds no owner left (visited the other way round it would keep the
+    /// row).
+    #[test]
+    fn the_survivors_beyond_the_window_are_visited_before_those_in_it() {
+        for late in [false, true] {
+            let mut state = LinkState::default();
+            log_and_keep(&mut state, 1, on_table(collecting(Vec::new())));
+            log_and_keep(
+                &mut state,
+                2,
+                confirmed_request(&[0x10, 0x03], End::NoResponse),
+            );
+            for seq in [3, 4] {
+                log_and_keep(
+                    &mut state,
+                    seq,
+                    on_table(collecting(vec![positive(RX, Window::WithinP2)])),
+                );
+            }
+            assert_eq!(window_history(&state, 4).owners, [1, 3]);
+            // One survivor beyond the window, one inside it when the restart comes.
+            let fillers = if late { 14 } else { 15 };
+            for seq in 5..5 + fillers {
+                log_kept(
+                    &mut state,
+                    seq,
+                    confirmed_request(
+                        &[0x22, 0xF1, 0x88],
+                        End::Positive(vec![0x62, 0xF1, 0x88, 0x41]),
+                    ),
+                );
+            }
+            let accept = 5 + fillers;
+            if late {
+                log_and_keep(
+                    &mut state,
+                    accept,
+                    confirmed_request(&[0x10, 0x03], End::NoResponse),
+                );
+                assert!(logged_beyond(&state, 3) && !logged_beyond(&state, 4));
+                state.reset_after(accept, 2, true);
+            } else {
+                assert!(logged_beyond(&state, 3) && !logged_beyond(&state, 4));
+                log(
+                    &mut state,
+                    accept,
+                    confirmed_request(&[0x10, 0x03], End::Positive(vec![0x50, 0x03])),
+                );
+            }
+            assert_eq!(state.owed_row_ids(3), [RX2], "{late}");
+            assert_eq!(state.owed_row_ids(4), [RX2], "{late}");
+        }
     }
 
     /// Row E: the end is the first standing final answer, which another identifier's earlier one

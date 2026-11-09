@@ -28,8 +28,9 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
    `reset_after`). The visit is the one ADR-439 decision 2 describes, from the same helper
    (`LinkState::refresh_row_owners`, the loop body of `refresh_kept_beyond_window` taken out so
    both passes share it): an answer no owner can own confirms the send, a final response placed
-   alone releases the exchange with its record (a physical link with no table, whose row is the
-   exchange's own identifier whatever its owners), otherwise the rows lose the identifiers they
+   alone releases the exchange with its record (a non-collecting exchange with a final response,
+   on a physical link or on a table link, which is owed on its own identifier alone
+   (`Evidence::owed_ids`), whatever its owners), otherwise the rows lose the identifiers they
    rested on. Rows that need no owner stay: an identifier with a pending open (ADR-436), the
    whole table of a rejected end (ADR-437), and a row an owner that is left (at or after
    `earliest`) could still own.

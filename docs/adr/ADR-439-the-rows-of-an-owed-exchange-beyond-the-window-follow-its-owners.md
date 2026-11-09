@@ -50,16 +50,26 @@ in-window path gave the opposite outcome for the same facts.
    floor included, in place of one derived from live counts. What the visit changes is the
    rows and the kept evidence, the release of an exchange placed alone (its record and
    `unknown_sends`), `Kept::sent` once an answer confirms the send, and `Kept::matched` when its
-   answer turns into a counted matched answer. A matched answer that cannot count (a late link
+   answer turns into a matched answer (as in the window, also when a link error after it keeps
+   it from counting). A matched answer that cannot count (a late link
    error may have come after it, or its own exchange saw one after it) is not offered to the
    later exchanges, since it changes nothing for them and would be offered again at every
    visit. After an accepted restart the visit changes rows and records only: the restart
    recounts the matched answers from the window alone, so a matched answer is neither counted
-   nor noted in the record, and the exchange's later final response still counts as one. Rows
+   nor noted in the record there; the settlement that follows the restart (`settle_later`, then
+   `reclassify_after`) visits the exchange again and counts it then, if it is still kept. An
+   exchange the restart's visit releases is no longer kept by then, so its matched answer is not
+   counted (Consequences). Rows
    that need no owner stay: an identifier a pending is open on (ADR-436) and the whole table
    of an exchange that ended on rejected results (ADR-437).
 
 ## Consequences
+
+- A kept exchange beyond the window that an accepted restart's visit releases (its final
+  response could be owned only by a request the restart ended) has its matched answer counted
+  by neither the restart's recount, which reads the window alone, nor the settlement after it,
+  which no longer finds the record. The same exchange released by an owner's settlement is
+  counted. Recorded as an open backlog item.
 
 - ADR-435's first Consequences bullet (an exchange beyond the window keeping a stale row until
   its own end or an accepted restart) is closed, and decision 6's window scope is widened to

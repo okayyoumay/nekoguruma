@@ -1,7 +1,7 @@
 # ADR-441: The Exchanges That Survive an Accepted Restart Take Their Rows Again
 
 **Date:** 2026-11-09
-**Status:** Accepted
+**Status:** Accepted (Consequences' bullet on the restart's uncounted matched answers closed by decision 7)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState::record`, `LinkState::reset_after`,
 `LinkState::refresh_kept_beyond_window`, `LinkState::refresh_window_survivors`,
 `LinkState::refresh_row_owners`), design 8.11 "Settlement"; ADR-368, ADR-435 decision 6,
@@ -69,6 +69,18 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
    owner of `r`. If `r` was answered by the survivor's request, `r` was sent after the
    restart and its own answer may still come; refreshing `r` from the live rows would drop a row
    that is right.
+7. **A kept exchange after `r` that the visit releases counts its matched answer.** An owed
+   exchange beyond the window with a `seq` after `r` was sent after the restart, so its answer
+   belongs to the new epoch (`reset_after` shifts its `clears.matched` with the window's later
+   exchanges) and, unlike a survivor's, can count. `reset_after` visits it with
+   `Place::BeyondReleased`: rows and record as `BeyondRows`, and its matched answer counted when
+   the visit places the exchange alone or drops its last row, since it is then no longer kept
+   and no later visit can count it; an exchange that stays kept is counted by the settlement
+   that follows, once (`Kept::matched`). The released answers join the freed answers that
+   reach the window's later exchanges, count in their `answered_same_match` (the recount from
+   the window alone cannot find them) and in the link's matched count, the one step
+   `reclassify_after` takes for an answer a settlement frees (`take_answer`). This closes the
+   gap ADR-439 decision 3 recorded; it changes no other decision.
 
 ## Consequences
 
@@ -83,5 +95,5 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
 - An owed exchange with no kept record that has left the window keeps a stale row (the case
   ADR-439's last Consequences bullet describes), also when a restart is what let its owner go;
   it stays open as a backlog item.
-- The restart's matched answers of exchanges beyond the window stay uncounted (ADR-439
-  Consequences); this is unchanged.
+- The matched answers of the survivors stay uncounted (decision 3), as they are from before the
+  restart.

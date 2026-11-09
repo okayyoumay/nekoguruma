@@ -1998,6 +1998,10 @@ enum Place {
     /// (which may have no kept record): rows and record only, since the restart recounts the
     /// matched answers from the window alone.
     BeyondRows,
+    /// Kept beyond the window and later than an accepted restart's exchange (ADR-441): rows and
+    /// record, and its matched answer counted when the visit releases the exchange. Its epoch
+    /// is the restart's, unlike a survivor's.
+    BeyondReleased,
 }
 
 /// An answer a settling entry adds to an earlier exchange, as the later exchanges on its link see
@@ -2511,7 +2515,7 @@ impl LinkState {
             // above in their rows (ADR-441). No exchange after it is logged yet, so the
             // answers they free are no one's to take, and its own entry stands as written.
             if let Some(&earliest) = effect.owners.iter().min() {
-                self.refresh_kept_beyond_window(earliest..entry.seq, false);
+                self.refresh_kept_beyond_window(earliest..entry.seq, Place::BeyondRows);
                 self.refresh_window_survivors(earliest..entry.seq);
             }
             self.matched.clear();
@@ -2673,7 +2677,27 @@ impl LinkState {
         // after it, a pending too, as `record` would have counted it; a final response is placed
         // with its exchange alone, which is then owed no more and no owner of theirs (design
         // 8.11 "Matched answer", "Owed request").
-        let now_matched = entry.matched_answer() && !old_matched && place != Place::BeyondRows;
+        let mut alone =
+            !settled && entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
+        // An exchange that stays owed re-derives its rows from its answers' owners as they are
+        // now: an identifier it was owed on only because an owner could own its final answer
+        // there goes when that owner no longer can (ADR-435). With no row left it is owed no
+        // more, like one placed alone.
+        let mut dropped_rows: Vec<u32> = Vec::new();
+        if !settled && !alone && self.owed.iter().any(|owed| owed.seq == seq) {
+            let (dropped, emptied) = self.refresh_owed_rows(seq, fallback, &entry.link_history);
+            dropped_rows = dropped;
+            alone = emptied;
+        }
+        let now_matched = entry.matched_answer()
+            && !old_matched
+            && match place {
+                Place::Window | Place::Beyond => true,
+                Place::BeyondRows => false,
+                // Counted only when the visit releases the exchange (ADR-441), since no later
+                // visit can count it then, as a settlement's would.
+                Place::BeyondReleased => alone,
+            };
         // The freed answer counts as a matched answer only when its stored time is shown after
         // every late link error that may have come after it, as when it was offered before
         // (ADR-384, ADR-385).
@@ -2693,18 +2717,6 @@ impl LinkState {
                 kept.sent = Sent::Confirmed;
             }
         }
-        let mut alone =
-            !settled && entry.placed_alone() && self.owed.iter().any(|owed| owed.seq == seq);
-        // An exchange that stays owed re-derives its rows from its answers' owners as they are
-        // now: an identifier it was owed on only because an owner could own its final answer
-        // there goes when that owner no longer can (ADR-435). With no row left it is owed no
-        // more, like one placed alone.
-        let mut dropped_rows: Vec<u32> = Vec::new();
-        if !settled && !alone && self.owed.iter().any(|owed| owed.seq == seq) {
-            let (dropped, emptied) = self.refresh_owed_rows(seq, fallback, &entry.link_history);
-            dropped_rows = dropped;
-            alone = emptied;
-        }
         if alone {
             self.owed.retain(|owed| owed.seq != seq);
             if self
@@ -2722,7 +2734,9 @@ impl LinkState {
             now_matched && since && (place == Place::Window || !entry.error_after_answer());
         let emit = match place {
             Place::Window => alone || now_matched || !dropped_rows.is_empty(),
-            Place::Beyond | Place::BeyondRows => alone || counted || !dropped_rows.is_empty(),
+            Place::Beyond | Place::BeyondRows | Place::BeyondReleased => {
+                alone || counted || !dropped_rows.is_empty()
+            }
         };
         emit.then(|| SettledAnswer {
             seq,
@@ -2750,14 +2764,12 @@ impl LinkState {
     /// re-derived (ADR-368): the entry's history is not kept, so the owners are read from the
     /// live rows ([`LinkState::history_settling`], those sent before the exchange). Gives the
     /// answer each adds for the exchanges after it when it drops a row, is owed no more or
-    /// turns into a counted matched answer. With `count_matched` false (after an accepted
-    /// restart, which recounts the matched answers from the window alone) a matched answer is
-    /// neither counted nor noted in the record.
-    fn refresh_kept_beyond_window(
-        &mut self,
-        seqs: Range<u64>,
-        count_matched: bool,
-    ) -> Vec<SettledAnswer> {
+    /// turns into a counted matched answer. With `place` [`Place::BeyondRows`] (the survivors of an
+    /// accepted restart, whose matched answers are from before it) a matched answer is neither
+    /// counted nor noted in the record; with [`Place::BeyondReleased`] (the exchanges after the
+    /// restart's) it is counted when the exchange is released, which the restart's recount
+    /// from the window cannot do (ADR-441).
+    fn refresh_kept_beyond_window(&mut self, seqs: Range<u64>, place: Place) -> Vec<SettledAnswer> {
         let mut beyond: Vec<u64> = self
             .kept
             .keys()
@@ -2777,11 +2789,6 @@ impl LinkState {
             let (clears, answer_at) = (kept.clears, kept.answer_at);
             let before = (kept.sent, kept.matched);
             let (classification, evidence) = (kept.classification, kept.evidence.clone());
-            let place = if count_matched {
-                Place::Beyond
-            } else {
-                Place::BeyondRows
-            };
             freed.extend(self.refresh_row_owners(
                 seq,
                 evidence,
@@ -2797,7 +2804,7 @@ impl LinkState {
     /// The owed exchanges in the link's window with a `seq` in `seqs`, which an accepted restart
     /// leaves out of the owners of their answers (ADR-441): their rows are taken again from the
     /// owners that are left, rows only (as [`LinkState::refresh_kept_beyond_window`] with
-    /// `count_matched` false, since the restart recounts the matched answers), before the
+    /// [`Place::BeyondRows`]), before the
     /// window forgets them or the restart's own exchange settles the later ones. An exchange the
     /// log keeps a record of is read from it, any other from its window entry. Its entry stands
     /// as written. In `seq` order, as the window is.
@@ -3106,7 +3113,8 @@ impl LinkState {
             self.take_answer(&answer);
             // The owed exchanges beyond the window follow the owners they lost in their rows
             // only (ADR-439); each such freed answer comes through this loop in turn.
-            answers.extend(self.refresh_kept_beyond_window(answer.seq + 1..u64::MAX, true));
+            answers
+                .extend(self.refresh_kept_beyond_window(answer.seq + 1..u64::MAX, Place::Beyond));
             for at in 0..self.window.len() {
                 let logged = &self.window[at];
                 if logged.seq <= answer.seq {
@@ -3208,16 +3216,21 @@ impl LinkState {
         // Exchanges after it whose rows the reset dropped, wholly or in part: no longer owners
         // of the later answers on those identifiers.
         let mut freed_answers: Vec<SettledAnswer> = Vec::new();
+        let mut released: Vec<SettledAnswer> = Vec::new();
         if accepting {
             // The owed exchanges that survive it, between `earliest` and it, lose the owners
             // before `earliest` in their rows (ADR-441), the ones beyond the window and then
             // the window's, which `seq` order puts before it; their freed answers reach the
             // exchanges after it as any other.
-            freed_answers.extend(self.refresh_kept_beyond_window(earliest..seq, false));
+            freed_answers.extend(self.refresh_kept_beyond_window(earliest..seq, Place::BeyondRows));
             freed_answers.extend(self.refresh_window_survivors(earliest..seq));
             // The owed exchanges beyond the window lose the owners before `earliest` in their
             // rows too (ADR-439); they are not reclassified.
-            freed_answers.extend(self.refresh_kept_beyond_window(seq + 1..u64::MAX, false));
+            // One the visit releases brings its matched answer, which the recount from the
+            // window below cannot find: it is counted for the exchanges after it as a
+            // settlement's would be (ADR-441).
+            released = self.refresh_kept_beyond_window(seq + 1..u64::MAX, Place::BeyondReleased);
+            freed_answers.extend(released.iter().cloned());
         }
         for at in 0..self.window.len() {
             let logged = &self.window[at];
@@ -3245,6 +3258,15 @@ impl LinkState {
                         && MatchKey::of(&earlier.evidence) == key
                 })
                 .count() as u32;
+            history.answered_same_match += released
+                .iter()
+                .filter(|answer| {
+                    answer.newly_matched
+                        && answer.seq < later
+                        && answer.clears.matched == epoch
+                        && answer.key == key
+                })
+                .count() as u32;
             let (freed, reclassified) = self.reclassify_one(at, history);
             if let Some(freed) = freed {
                 if freed.newly_matched {
@@ -3262,6 +3284,9 @@ impl LinkState {
                     .entry(MatchKey::of(&logged.evidence))
                     .or_insert(0) += 1;
             }
+        }
+        for answer in &released {
+            self.take_answer(answer);
         }
         let not_reclassified = self.left_window.filter(|left| *left > seq);
         if accepting {
@@ -6107,7 +6132,7 @@ mod tests {
         assert_eq!(state.unknown_sends, 1);
         state.settle_owed(1);
         assert!(state.kept(2).is_some());
-        let freed = state.refresh_kept_beyond_window(2..u64::MAX, true);
+        let freed = state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
         let [freed] = &freed[..] else {
             panic!("{freed:?}");
         };
@@ -6119,7 +6144,7 @@ mod tests {
         // Counted once: a second pass finds nothing to free.
         assert!(
             state
-                .refresh_kept_beyond_window(2..u64::MAX, true)
+                .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
                 .is_empty()
         );
     }
@@ -6133,7 +6158,7 @@ mod tests {
             false,
         );
         state.settle_owed(1);
-        let freed = state.refresh_kept_beyond_window(2..u64::MAX, true);
+        let freed = state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
         let [freed] = &freed[..] else {
             panic!("{freed:?}");
         };
@@ -6163,7 +6188,7 @@ mod tests {
         assert_eq!(state.unknown_sends, 1);
         assert_eq!(state.kept(2).map(|kept| kept.sent), Some(Sent::Unknown));
         state.settle_owed(1);
-        let freed = state.refresh_kept_beyond_window(2..u64::MAX, true);
+        let freed = state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
         let [freed] = &freed[..] else {
             panic!("{freed:?}");
         };
@@ -6174,7 +6199,7 @@ mod tests {
         assert_eq!(state.unknown_sends, 0);
         assert!(
             state
-                .refresh_kept_beyond_window(2..u64::MAX, true)
+                .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
                 .is_empty()
         );
     }
@@ -6189,12 +6214,12 @@ mod tests {
         state.late_error_unplaced = Some(1_000);
         assert!(
             state
-                .refresh_kept_beyond_window(2..u64::MAX, true)
+                .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
                 .is_empty()
         );
         assert!(
             state
-                .refresh_kept_beyond_window(2..u64::MAX, true)
+                .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
                 .is_empty()
         );
         assert!((2..8).all(|seq| state.kept(seq).is_some_and(|kept| !kept.matched)));
@@ -6271,7 +6296,7 @@ mod tests {
             );
         }
         assert!(state.window.iter().all(|logged| logged.seq > 1));
-        let freed = state.refresh_kept_beyond_window(1..u64::MAX, true);
+        let freed = state.refresh_kept_beyond_window(1..u64::MAX, Place::Beyond);
         assert!(
             freed.iter().all(|answer| answer.final_response),
             "{freed:?}"

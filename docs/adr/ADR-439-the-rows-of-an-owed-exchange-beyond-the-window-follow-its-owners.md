@@ -1,7 +1,7 @@
 # ADR-439: The Rows of an Owed Exchange Beyond the Window Follow Its Owners
 
 **Date:** 2026-11-08
-**Status:** Accepted (Decision item 1's "later than the settled exchange" and item 3's restart sentence revised by ADR-441: the survivors of an accepted restart take their rows again too; the Consequences' bullet on the survivors of an accepting restart closed)
+**Status:** Accepted (Decision item 1's "later than the settled exchange" and item 3's restart sentence revised by ADR-441: the survivors of an accepted restart take their rows again too; the Consequences' bullet on the survivors of an accepting restart closed; the restart sentence's uncounted matched answer of a released exchange after the restart's exchange closed, ADR-441 decision 7)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState::refresh_kept_beyond_window`,
 `LinkState::reclassify_after`, `LinkState::reset_after`, `LinkState::refresh_owed_rows`),
 design 8.11 "Settlement", "Owed request"; ADR-435 decision 6 and first Consequences bullet,
@@ -58,18 +58,13 @@ in-window path gave the opposite outcome for the same facts.
    recounts the matched answers from the window alone, so a matched answer is neither counted
    nor noted in the record there; the settlement that follows the restart (`settle_later`, then
    `reclassify_after`) visits the exchange again and counts it then, if it is still kept. An
-   exchange the restart's visit releases is no longer kept by then, so its matched answer is not
-   counted (Consequences). Rows
+   exchange the restart's visit releases is no longer kept by then, so the restart's visit
+   counts its matched answer itself, once, when it releases the exchange (ADR-441 decision 7).
+   Rows
    that need no owner stay: an identifier a pending is open on (ADR-436) and the whole table
    of an exchange that ended on rejected results (ADR-437).
 
 ## Consequences
-
-- A kept exchange beyond the window that an accepted restart's visit releases (its final
-  response could be owned only by a request the restart ended) has its matched answer counted
-  by neither the restart's recount, which reads the window alone, nor the settlement after it,
-  which no longer finds the record. The same exchange released by an owner's settlement is
-  counted. Recorded as an open backlog item.
 
 - ADR-435's first Consequences bullet (an exchange beyond the window keeping a stale row until
   its own end or an accepted restart) is closed, and decision 6's window scope is widened to

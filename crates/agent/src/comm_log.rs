@@ -11796,6 +11796,13 @@ pub(crate) mod tests {
     /// An owed exchange `owner`, a session change `reset` and an owed exchange `later` whose answer
     /// only `owner` could own, all three beyond the window.
     fn restart_beyond_window() -> (PathBuf, CommLog, [u64; 3]) {
+        let (dir, log, owners, _) = restart_beyond_window_with(false);
+        (dir, log, owners)
+    }
+
+    /// [`restart_beyond_window`], with `repeat` logging after the fillers, in the window, an
+    /// exchange with the same match key as `later` and no answer, whose seq is returned.
+    fn restart_beyond_window_with(repeat: bool) -> (PathBuf, CommLog, [u64; 3], Option<u64>) {
         let (dir, _setup, log) = collecting_log_on(false);
         let silent = |request: &[u8], after_s: u64| {
             let mut silent = collecting_waited(|evidence| {
@@ -11834,7 +11841,95 @@ pub(crate) mod tests {
             assert!(state.logged_history(later).is_none());
             assert!(state.kept(owner).is_some() && state.kept(later).is_some());
         }
-        (dir, log, [owner, reset, later])
+        let repeated = repeat.then(|| {
+            let mut repeated = collecting_waited(|evidence| {
+                evidence.end = exchange::End::NoResponse;
+                evidence.vci_ended = true;
+            });
+            repeated.times.agent.before_us += 30_000_000;
+            repeated.times.agent.end_us += 30_000_000;
+            log.exchange(repeated).unwrap()
+        });
+        (dir, log, [owner, reset, later], repeated)
+    }
+
+    fn accepted_session_change() -> UnattachedItem {
+        UnattachedItem {
+            data: UnattachedData::Result {
+                rx_flag: vec![0, 0, 0, 0],
+                identifier: Some(0x7E8),
+                bytes: vec![0x50, 0x03, 0x00, 0x32, 0x01, 0xF4],
+            },
+            ..tx_done(0x7E8)
+        }
+    }
+
+    fn same_match_of(log: &CommLog, seq: u64) -> u32 {
+        log.lock().links[0]
+            .1
+            .logged_history(seq)
+            .unwrap()
+            .answered_same_match
+    }
+
+    /// ADR-441, ADR-439: a kept exchange beyond the window that an accepted restart releases has
+    /// its matched answer counted once for a later window exchange with the same key, as an
+    /// owner's settlement counts it; the late response goes through `late_response`.
+    #[test]
+    fn a_late_accepted_restart_counts_the_matched_answer_of_the_exchange_it_releases() {
+        let (dir, log, [_, reset, later], repeated) = restart_beyond_window_with(true);
+        let repeated = repeated.unwrap();
+        assert_eq!(same_match_of(&log, repeated), 0);
+        log.lock()
+            .late_response(
+                0,
+                reset,
+                &accepted_session_change(),
+                placed_after(3_000_000),
+            )
+            .unwrap();
+        assert!(log.lock().links[0].1.kept(later).is_none());
+        assert_eq!(same_match_of(&log, repeated), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// Counted once: an exchange logged after the restart sees the released answer once in the
+    /// link's count, and the window exchange once in its history.
+    #[test]
+    fn a_released_matched_answer_is_not_counted_twice() {
+        let (dir, log, [_, reset, _], repeated) = restart_beyond_window_with(true);
+        let repeated = repeated.unwrap();
+        log.lock().links[0].1.reset_after(reset, reset, true);
+        assert_eq!(same_match_of(&log, repeated), 1);
+        let mut next = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+        });
+        next.times.agent.before_us += 40_000_000;
+        next.times.agent.end_us += 40_000_000;
+        let next = log.exchange(next).unwrap();
+        assert_eq!(same_match_of(&log, next), 1);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-441: a survivor of the restart, between its earliest request and itself, is released
+    /// without counting its matched answer, which is from before the restart.
+    #[test]
+    fn a_released_survivor_does_not_count_its_matched_answer() {
+        let (dir, log, [owner, reset, later], _) = restart_beyond_window_with(false);
+        let mut repeated = collecting_waited(|evidence| {
+            evidence.end = exchange::End::NoResponse;
+            evidence.vci_ended = true;
+        });
+        repeated.times.agent.before_us += 30_000_000;
+        repeated.times.agent.end_us += 30_000_000;
+        let repeated = log.exchange(repeated).unwrap();
+        // `later` is the survivor: the restart is the newest exchange before the repeat.
+        assert!(owner < reset && reset < later && later < repeated);
+        log.lock().links[0].1.reset_after(repeated, later, true);
+        assert!(log.lock().links[0].1.kept(later).is_none());
+        assert_eq!(same_match_of(&log, repeated), 0);
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     /// ADR-439, ADR-369: an ECUReset or session change accepted by a response read late, beyond

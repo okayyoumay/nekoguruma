@@ -43,10 +43,21 @@ in-window path gave the opposite outcome for the same facts.
    worklist, so a chain of kept exchanges, and the window's exchanges after them, lose the
    owner in one pass.
 3. **Classification beyond the window is not re-derived.** ADR-368's window scope stands: the
-   entry's history is not kept, so the visit reads the owners from the live rows (the
-   approximation the late link error already uses for such an exchange) and changes rows and
-   the kept evidence only. Rows that need no owner stay: an identifier a pending is open on
-   (ADR-436) and the whole table of an exchange that ended on rejected results (ADR-437).
+   entry's history is not kept, so the visit reads the owners from the live rows
+   (`LinkState::history_settling`, keeping only the requests sent before the exchange: that
+   method also lists later owed requests, which in the window never mattered and beyond it kept
+   an exchange from being released), and the entry it builds takes the kept classification,
+   floor included, in place of one derived from live counts. What the visit changes is the
+   rows and the kept evidence, the release of an exchange placed alone (its record and
+   `unknown_sends`), `Kept::sent` once an answer confirms the send, and `Kept::matched` when its
+   answer turns into a counted matched answer. A matched answer that cannot count (a late link
+   error may have come after it, or its own exchange saw one after it) is not offered to the
+   later exchanges, since it changes nothing for them and would be offered again at every
+   visit. After an accepted restart the visit changes rows and records only: the restart
+   recounts the matched answers from the window alone, so a matched answer is neither counted
+   nor noted in the record, and the exchange's later final response still counts as one. Rows
+   that need no owner stay: an identifier a pending is open on (ADR-436) and the whole table
+   of an exchange that ended on rejected results (ADR-437).
 
 ## Consequences
 

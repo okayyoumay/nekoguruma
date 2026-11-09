@@ -1,7 +1,7 @@
 # ADR-437: A Rejected Collecting Answer Is No Answer on Its Identifier
 
 **Date:** 2026-11-08
-**Status:** Accepted
+**Status:** Accepted (the Consequences' bullet 3 on a rejected-only window the finished status ended, left unkept, closed by ADR-440)
 **Affects:** `agent` (`comm_log/exchange.rs` `Answer::is_rejected`, `Answer::is_response`,
 `standing_answers`, `standing_answers_covering`, `collecting_end`, `Evidence::final_standing`,
 `Evidence::owed_ids`, `Evidence::as_answer`, `Kept::answered_placed`, `AnswerItem`; `comm_log.rs`

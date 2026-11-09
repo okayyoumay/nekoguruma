@@ -1568,8 +1568,8 @@ impl<C: WorkerApi> WorkerHost<C> {
             let bound_tx = sent.bound_tx.is_some();
             let unbound = unattached_items(&sent.unbound);
             let before_answer = errors_before_answer(&sent);
-            // A collecting window that got answers ends with the primitive's finished status, not
-            // with a receive timeout (ISO 22900-2:2022 8.2.6.2.2).
+            // A collecting window that took a result, usable or rejected, ends with the
+            // primitive's finished status, not with a receive timeout (ISO 22900-2:2022 8.2.6.2.2).
             let vci_ended = sent.vci_ended(collecting);
             let pending = pendings_of(&sent.pendings);
             let pending_ids = pending_ids_of(&sent.pendings, &self.receive_table);
@@ -3172,7 +3172,8 @@ fn primitive_ended_of(
                 vci_ended: vci_ended(
                     progress.rx_timeout.is_some(),
                     progress.collecting,
-                    result.is_ok(),
+                    result,
+                    !progress.rejected.is_empty(),
                     progress.response_times.finished.is_some(),
                 ),
                 reads: progress.take_reads(epoch, Some(result)),
@@ -3320,14 +3321,15 @@ struct Sent {
 
 impl Sent {
     /// Whether the VCI ended the exchange: by its receive timeout, or for a collecting window
-    /// that got answers by the primitive's finished status (ISO 22900-2:2022 8.2.6.2.2). Not the
-    /// agent's own deadline.
+    /// that took a result (usable or rejected) by the primitive's finished status (ISO
+    /// 22900-2:2022 8.2.6.2.2, ADR-440). Not the agent's own deadline.
     fn vci_ended(&self, collecting: bool) -> bool {
         // A response's times count only for an exchange that ended with that response.
         vci_ended(
             self.rx_timeout.is_some(),
             collecting,
-            self.result.is_ok(),
+            &self.result,
+            !self.rejected.is_empty(),
             self.response_times.finished.is_some(),
         )
     }
@@ -4090,11 +4092,26 @@ pub(crate) fn positive_prefix(request: &[u8]) -> Vec<u8> {
     }
 }
 
-/// Whether the VCI ended an exchange: by its receive timeout, or for a collecting window that
-/// got answers (`result_ok`) by the primitive's finished status (ISO 22900-2:2022 8.2.6.2.2).
-/// The one rule the exchange's entry and its `primitive_ended` entry share.
-fn vci_ended(rx_timeout: bool, collecting: bool, result_ok: bool, finished: bool) -> bool {
-    rx_timeout || (collecting && result_ok && finished)
+/// Whether the VCI ended an exchange: by its receive timeout, or for a collecting window the
+/// primitive's finished status ended (ISO 22900-2:2022 8.2.6.2.2) when the window took a result:
+/// a usable answer (`Ok`), or only rejected ones (`Err(NoResponse)` with a rejected result read,
+/// which the VCI took as a response, ADR-437 decision 6). A failed window, a lost VCI, lost
+/// events or a cancel keep false, as a usable answer beside a link error does (`Progress::on_read`
+/// makes that result `Err(PrimitiveFailed)`). The one rule the exchange's entry and its
+/// `primitive_ended` entry share (ADR-440).
+fn vci_ended(
+    rx_timeout: bool,
+    collecting: bool,
+    result: &Result<Vec<u8>, HostError>,
+    rejected_read: bool,
+    finished: bool,
+) -> bool {
+    let took_a_result = match result {
+        Ok(_) => true,
+        Err(HostError::NoResponse) => rejected_read,
+        Err(_) => false,
+    };
+    rx_timeout || (collecting && finished && took_a_result)
 }
 
 /// What the events of one send-receive have shown so far.
@@ -8258,6 +8275,91 @@ mod tests {
         assert_eq!(entry["answers"].as_array().unwrap().len(), 2, "{entry}");
         assert_eq!(entry["timing"]["window"], "timeout_at_limit", "{entry}");
         assert_eq!(entry["outcome"]["result"], "positive", "{entry}");
+    }
+
+    /// ADR-440: at the entry, "a rejected result was read and the result is `NoResponse`" is the
+    /// `end_rejected` that `collecting_end` derives from the answers listed, for the shapes the
+    /// host reads (the entry's gate is `Ok` or `NoResponse` with no agent deadline).
+    #[test]
+    fn a_rejected_read_with_no_response_is_the_end_the_log_calls_rejected() {
+        let finished = || event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+        let shapes: Vec<Vec<EventItem>> = vec![
+            vec![answer_on(Some(0x7E8), 1, &WRONG_ECHO), finished()],
+            vec![
+                answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+                answer_on(Some(0x7E9), 2, &WRONG_ECHO),
+                finished(),
+            ],
+            vec![
+                answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+                answer_on(Some(0x7E9), 2, &[0x7F, 0x3E, 0x78]),
+                finished(),
+            ],
+            vec![
+                answer_on(Some(0x7E8), 1, &WRONG_ECHO),
+                answer_on(Some(0x7E9), 2, &[0x7E, 0x00]),
+                finished(),
+            ],
+            vec![answer_on(Some(0x7E8), 1, &[0x7F, 0x3E, 0x78]), finished()],
+            vec![finished()],
+        ];
+        for events in shapes {
+            let (progress, done) = collect(events);
+            let expected = Expected {
+                positive_prefix: progress.positive_prefix.clone(),
+                negative_pattern: progress.negative.pattern(progress.sid),
+            };
+            let answers = answer_items(
+                &progress.collected,
+                &TABLE,
+                &expected,
+                &progress.negative,
+                progress.sid,
+            );
+            let (_, end_rejected) = crate::comm_log::exchange::collecting_end(&answers, &expected);
+            let done = done.expect("the finished status ends the wait");
+            assert!(
+                matches!(done, Ok(_) | Err(HostError::NoResponse)),
+                "{done:?}"
+            );
+            let host_says =
+                !progress.rejected.is_empty() && matches!(done, Err(HostError::NoResponse));
+            assert_eq!(host_says, end_rejected, "{answers:?} {done:?}");
+        }
+    }
+
+    /// ADR-440: the host's rule for a window the VCI ended. A collecting window the finished
+    /// status ended took a result when it is `Ok`, or `Err(NoResponse)` with a rejected result
+    /// read; a failed window, even with a rejected result read, did not; a receive timeout
+    /// always ends it.
+    #[test]
+    fn vci_ended_counts_a_finished_collecting_window_that_took_a_result() {
+        let ok = || Ok(vec![0x7E, 0x00]);
+        let none = || Err(HostError::NoResponse);
+        let failed = || Err(HostError::PrimitiveFailed(1));
+        let lost = || Err(HostError::EventsLost);
+        // (rx_timeout, collecting, result, rejected_read, finished, expected)
+        let cases = vec![
+            (false, true, ok(), false, true, true),
+            (false, true, ok(), false, false, false),
+            (false, false, ok(), false, true, false),
+            (false, true, none(), true, true, true),
+            (false, true, none(), true, false, false),
+            (false, false, none(), true, true, false),
+            (false, true, none(), false, true, false),
+            (false, true, failed(), true, true, false),
+            (false, true, failed(), false, true, false),
+            (false, true, lost(), true, true, false),
+            (true, false, none(), false, false, true),
+            (true, true, failed(), false, false, true),
+        ];
+        for (rx_timeout, collecting, result, rejected, finished, expected) in cases {
+            assert_eq!(
+                vci_ended(rx_timeout, collecting, &result, rejected, finished),
+                expected,
+                "{rx_timeout} {collecting} {result:?} {rejected} {finished}"
+            );
+        }
     }
 
     /// Case 22: an ordinary primitive that got two bound answers keeps the first as its response

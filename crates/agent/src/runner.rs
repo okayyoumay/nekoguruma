@@ -17251,6 +17251,36 @@ def main():
         );
     }
 
+    /// ADR-440: a functional presence window the host's own wait ends with a wrong echo alone
+    /// (a rejected result) and the finished status, no receive timeout, counts as the VCI ending
+    /// its wait, so the entry is kept and the ECU's usable answer on the same identifier read
+    /// afterwards is the exchange's `late_response`, not `unattached`.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_own_wait_window_with_a_wrong_echo_alone_keeps_the_exchange_for_the_late_answer() {
+        const SCRIPT: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::From(Bound::Own, 203_000, 0x7E8, &[0x67, 0x02, 0xAA, 0xBB]),
+            Step::Finish,
+            Step::Release,
+            Step::From(Bound::Earlier, 9_000_000, 0x7E8, &[0x7E, 0x00]),
+        ];
+        let lines = presence_own_wait_run(SCRIPT).await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 1, "{lines:#?}");
+        assert_eq!(
+            exchanges[0]["outcome"]["result"], "positive_unusable",
+            "{lines:#?}"
+        );
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
     /// Asserts that `lines` hold two presence exchanges, that the ECU's final answer on
     /// `identifier` is `unattached` because both could own it (the first is owed on that
     /// identifier by ADR-432 or ADR-435, and the resend is silent there), and that the unowned

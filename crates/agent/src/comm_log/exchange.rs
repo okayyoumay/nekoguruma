@@ -2745,12 +2745,15 @@ impl LinkState {
         after: u64,
         count_matched: bool,
     ) -> Vec<SettledAnswer> {
-        let beyond: Vec<u64> = self
+        let mut beyond: Vec<u64> = self
             .kept
             .keys()
             .copied()
             .filter(|seq| *seq > after && !self.window.iter().any(|logged| logged.seq == *seq))
             .collect();
+        // In sequence order (ADR-439 decision 1): an exchange's earlier owners are visited, and
+        // released, before it, whatever the map's order.
+        beyond.sort_unstable();
         let mut freed = Vec::new();
         for seq in beyond {
             let Some(kept) = self.kept.get(&seq) else {
@@ -6154,6 +6157,25 @@ mod tests {
         );
         assert_eq!(freed.len(), 1);
         assert!(state.kept(1).is_none());
+    }
+
+    /// ADR-439: the kept exchanges are visited in `seq` order, so a chain of answered exchanges
+    /// beyond the window, each one owed through the ones before it, is released in one pass when
+    /// an accepted restart ends the first one's owner (visited out of order, each would still
+    /// see the rows of those not yet visited).
+    #[test]
+    fn a_chain_of_kept_exchanges_is_released_in_one_pass_after_an_accepted_restart() {
+        let count = 14;
+        let (mut state, _) = owners_and_answered_beyond_window(count, |_, _| {}, false);
+        assert!((2..2 + count as u64).all(|seq| state.kept(seq).is_some()));
+        state.reset_after(1, 2, true);
+        assert!(
+            (2..2 + count as u64).all(|seq| state.kept(seq).is_none()),
+            "{:?}",
+            (2..2 + count as u64)
+                .filter(|seq| state.kept(*seq).is_some())
+                .collect::<Vec<_>>()
+        );
     }
 
     /// Design 8.11 "Settlement": a pending of a later exchange that the earlier owed request

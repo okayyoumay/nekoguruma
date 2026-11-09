@@ -3,7 +3,7 @@
 **Date:** 2026-11-09
 **Status:** Accepted
 **Affects:** `agent` (`comm_log/exchange.rs` `ExchangeEntry::owed_through_owners`; `comm_log.rs`
-the entry's keep in `CommLog::exchange`), design 8.11 "Settlement", `late_response`; ADR-365
+the entry's keep in `CommLog::exchange`), design 8.11 "Settlement", `late_response`, `late_item`; ADR-365
 decision 1, ADR-436 decisions 1 and 3, ADR-439 Consequences, ADR-441 decision 2 and
 Consequences
 
@@ -45,8 +45,8 @@ refreshed only the survivors in the window or kept).
    stays until the second lets go; an owner released with no answer (`release_kept`) leaves
    its rows, so the record's row stays right, and the record is then the only kept candidate
    for a late response on its identifier: an ambiguous late response lists it alone
-   (`Several([record])`) and floors it, where it wrote nothing before; an ambiguous start or
-   pending likewise.
+   (`Several([record])`) and floors it, where it was named in no entry before (the
+   unattached line was written before); an ambiguous start or pending likewise.
 4. **Scope.** An exchange that does not settle is not kept by this rule: one that ended on a
    rejected result (ADR-437), one open on a pending (kept already, ADR-436), one with a silent
    identifier. A collecting exchange with a row an owner holds beside a silent row, whose VCI
@@ -66,12 +66,20 @@ refreshed only the survivors in the window or kept).
   owner is no more inflated by it once the owner has let go.
 - A late indication sees the record too, among the kept exchanges `late_transmit_owners`,
   `late_start_owners` and `late_pending_owners` read (design 8.11 `late_item`). A transmit
-  indication on the request identifier of a record whose send is still `unknown`, with every
-  other owner's send confirmed, now has it as its lone owner and settles it as its late item
+  indication on the request identifier of a record whose send is still `unknown`, when every
+  exchange on the link with an unknown send is kept and the record is the only one on that
+  request identifier (`late_transmit_owners`), now has it as its lone owner and settles it as its late item
   (its send confirmed, the unknown count lowered), where it was `unattached`. An ambiguous
   start, pending or transmit indication read while the owner stands now has the owners
   `[owner, record]` and every owner known, so `late_item_unowned` floors the record too. This
   holds with the record in the window as well.
+- A `late_item` settling entry ends no owed request (an indication is no final response), so
+  it hands the later exchanges an answer that frees no owner: a record that stays owed
+  through it (one kept for its rows, or a collecting record kept with its VCI ended and
+  owners) stays among the owners of the exchanges logged after it, and its entry refers to
+  it alone. Before, the entry passed the exchange's own settling as a final response, which
+  removed it from those owners and reclassified them as if it had answered; this also holds
+  for the collecting records that were kept before this ADR.
 - `place_error` sees the record's evidence (design 8.11 "Link error", ADR-384), as it does for
   any kept exchange: after a restart clears the window it can answer `BeforeWindow` from the
   record's times.

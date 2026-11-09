@@ -4609,8 +4609,12 @@ impl Kept {
         timing.not_judged_reason = None;
         timing.late_pending = None;
         if !self.evidence.collecting {
+            // A final answer delivered late is a usable response, so a rejected end of the entry
+            // is not rejected any more (ADR-443, ADR-435 decision 7).
+            let mut restated = self.evidence.ended_as(end_of, timing);
+            restated.end_rejected = false;
             return (
-                self.evidence.ended_as(end_of, timing),
+                restated,
                 self.answer_order.clone(),
                 self.answer_ends.clone(),
             );
@@ -12623,6 +12627,33 @@ mod tests {
         assert_eq!(answered.open_pending_ids(), [RX]);
         assert!(!answered.end_rejected);
         assert!(!answered.settles_owed());
+    }
+
+    /// ADR-359 item 3, ADR-435 decision 7, ADR-443: a request that is not collecting and whose
+    /// primitive finished on a wrong echo ends as `positive_unusable`, rejected, and is owed on
+    /// its own identifier without settling anything; the final answer delivered late is a usable
+    /// response, so it restates the exchange as `positive`, no longer rejected, with an answer
+    /// head, settling what was owed.
+    #[test]
+    fn a_non_collecting_rejected_end_is_owed_and_a_late_usable_answer_settles_it() {
+        let mut evidence = evidence(&[0x22, 0xF1, 0x86], End::PositiveUnusable(vec![0x62, 0xF1]));
+        evidence.end_rejected = true;
+        evidence.vci_ended = true;
+        assert_eq!(evidence.owed_ids(), [RX]);
+        assert!(!evidence.settles_owed());
+        assert!(evidence.answer_head().is_none());
+        let kept = log_kept(&mut LinkState::default(), 1, evidence).1;
+        assert!(kept.evidence.end_rejected && !kept.evidence.settles_owed());
+        let answered = kept.answered(&[0x62, 0xF1, 0x86, 0x01], &late_on(None));
+        assert!(!answered.end_rejected);
+        assert!(
+            matches!(&answered.end, End::Positive(bytes) if bytes == &[0x62, 0xF1, 0x86, 0x01])
+        );
+        assert!(answered.settles_owed());
+        assert_eq!(
+            answered.answer_head().as_deref(),
+            Some(&[0x62, 0xF1, 0x86, 0x01][..])
+        );
     }
 
     /// ADR-437: `as_answer` derives `end_rejected` from the answer, so a rejected answer is no

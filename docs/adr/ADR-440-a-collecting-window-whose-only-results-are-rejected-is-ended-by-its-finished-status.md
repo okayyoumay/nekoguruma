@@ -1,7 +1,7 @@
 # ADR-440: A Collecting Window Whose Only Results Are Rejected Is Ended by Its Finished Status
 
 **Date:** 2026-11-09
-**Status:** Accepted
+**Status:** Accepted (Consequences bullet 3, a non-collecting primitive finished on a wrong echo unchanged, superseded by ADR-443)
 **Affects:** `agent` (`host.rs` `vci_ended`, `Sent::vci_ended`, `primitive_ended_of`;
 `comm_log/exchange.rs` `Evidence::vci_ended`, the classification row for a collecting window the
 VCI ended), design 8.11 `primitive_ended`, `late_response`, "Classification"; ADR-435 decision 4,

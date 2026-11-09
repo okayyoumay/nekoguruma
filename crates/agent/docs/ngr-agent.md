@@ -580,8 +580,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   one function the exchange's entry uses (`judge_windows`, ADR-400).
   After the entry the log renews an exchange it leaves owed and keeps its record when a pending
   is open on an identifier or the end read the VCI's receive timeout (whatever it read after),
-  or the finished status of a collecting window that took a result, usable or only rejected
-  (the host's `vci_ended`, ADR-440),
+  or the finished status of a collecting window that took a result, usable or only rejected,
+  or of a primitive that is not collecting and finished on a wrong echo (the host's `vci_ended`,
+  ADR-440, ADR-443),
   so the exchange's response is its `late_response`; an end that read none is released
   (ADR-429, ADR-431).
   The `primitive_ended` entry gives the end as an

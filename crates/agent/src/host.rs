@@ -2353,6 +2353,17 @@ impl<C: WorkerApi> WorkerHost<C> {
                 error: progress.error,
                 errors: progress.errors.clone(),
                 rejected_read: !progress.rejected.is_empty(),
+                unanswered_echo: if progress.collecting {
+                    None
+                } else {
+                    unanswered_wrong_echo(
+                        &progress.rejected,
+                        progress.last_rejected,
+                        progress.rx_timeout.is_some(),
+                        false,
+                    )
+                    .cloned()
+                },
                 collecting: progress.collecting,
                 receive_table: self.receive_table.clone(),
                 progress: None,
@@ -2372,6 +2383,7 @@ impl<C: WorkerApi> WorkerHost<C> {
             rejected: std::mem::take(&mut progress.rejected),
             collected: std::mem::take(&mut progress.collected),
             last_rejected: progress.last_rejected,
+            finished: progress.finished,
             bound_start: progress.bound_start,
             bound_tx: progress.bound_tx,
             events_lost: progress.events_lost.take(),
@@ -2642,17 +2654,25 @@ fn deadline_end(end: End, agent_deadline: bool) -> End {
 /// agent cannot use, `positive_unusable` (design 8.11 `outcome`). An exchange the agent's
 /// deadline or the VCI's receive timeout ended keeps its end.
 fn unanswered_end(end: End, sent: &Sent) -> End {
-    match (end, sent.rejected.last()) {
-        (End::NoResponse, Some(last))
-            if sent.last_rejected
-                && sent.rx_timeout.is_none()
-                && !sent.agent_deadline
-                && last.reason == RejectedReason::WrongEcho =>
-        {
-            End::PositiveUnusable(last.bytes.clone())
-        }
+    match (end, sent.unanswered_wrong_echo()) {
+        (End::NoResponse, Some(last)) => End::PositiveUnusable(last.bytes.clone()),
         (end, _) => end,
     }
+}
+
+/// The wrong echo a primitive ended on with nothing after it, if it did: the last result bound to
+/// it was a rejected one of positive form (ADR-359) and neither the VCI's receive timeout nor the
+/// agent's deadline ended the wait. The one condition the end `positive_unusable` and, for a
+/// primitive that is not collecting, the VCI's having ended its wait share (ADR-443).
+fn unanswered_wrong_echo(
+    rejected: &[RejectedRead],
+    last_rejected: bool,
+    rx_timeout: bool,
+    agent_deadline: bool,
+) -> Option<&RejectedRead> {
+    rejected.last().filter(|last| {
+        last_rejected && !rx_timeout && !agent_deadline && last.reason == RejectedReason::WrongEcho
+    })
 }
 
 /// An exchange's `pending_visibility` on a link whose worker said `forwards_pendings`: forwarded
@@ -2857,6 +2877,10 @@ struct Stray {
     /// The wait before the deadline read a rejected result of it (ADR-440): with the finished
     /// status its end reads, the window took a result, which `vci_ended` counts.
     rejected_read: bool,
+    /// The wait before the deadline ended on a wrong echo with nothing after it, for a primitive
+    /// that is not collecting (ADR-443): with the finished status its end reads, the VCI ended its
+    /// wait, and the end is `positive_unusable`.
+    unanswered_echo: Option<RejectedRead>,
     /// Its primitive collects every answer within its window (ADR-396): the waits for its end
     /// go on collecting, so the answers read after the deadline are its exchange's too
     /// (ADR-425).
@@ -2887,6 +2911,11 @@ impl Stray {
         progress.response_times = self.response_times;
         progress.error = self.error;
         progress.errors.clone_from(&self.errors);
+        // The wrong echo the wait before the deadline ended on, which nothing has followed yet.
+        if let Some(echo) = &self.unanswered_echo {
+            progress.rejected.push(echo.clone());
+            progress.last_rejected = true;
+        }
         // Its end is read for its exchange's `primitive_ended` entry (ADR-386). A final response
         // read before the deadline is not in the exchange's entry: it is the first read.
         progress.track_reads = true;
@@ -2931,6 +2960,7 @@ impl Stray {
             error: None,
             errors: Vec::new(),
             rejected_read: false,
+            unanswered_echo: None,
             collecting,
             receive_table,
             progress: None,
@@ -3171,15 +3201,35 @@ fn primitive_ended_of(
                 progress.rx_timeout.as_ref(),
                 &mut detail,
             );
+            // A wrong echo the primitive finished on is the end the exchange's entry gives
+            // it, `positive_unusable`, and the end is rejected (ADR-443).
+            let unanswered = unanswered_wrong_echo(
+                &progress.rejected,
+                progress.last_rejected,
+                progress.rx_timeout.is_some(),
+                false,
+            );
+            let (end, end_rejected) = match (end, unanswered) {
+                (End::NoResponse, Some(last)) if !progress.collecting => {
+                    (End::PositiveUnusable(last.bytes.clone()), result.is_err())
+                }
+                (end, _) => (end, false),
+            };
+            let rejected_read = if progress.collecting {
+                stray.rejected_read || !progress.rejected.is_empty()
+            } else {
+                unanswered.is_some()
+            };
             crate::comm_log::PrimitiveEnded {
                 end: Some(end),
                 detail,
+                end_rejected,
                 vci_ended: vci_ended(
                     progress.rx_timeout.is_some(),
                     progress.collecting,
                     result,
-                    stray.rejected_read || !progress.rejected.is_empty(),
-                    progress.response_times.finished.is_some(),
+                    rejected_read,
+                    progress.finished,
                 ),
                 reads: progress.take_reads(epoch, Some(result)),
             }
@@ -3187,6 +3237,7 @@ fn primitive_ended_of(
         StrayEnd::Cancelled => crate::comm_log::PrimitiveEnded {
             end: None,
             detail: Detail::default(),
+            end_rejected: false,
             vci_ended: false,
             reads: progress.take_reads(epoch, None),
         },
@@ -3304,6 +3355,8 @@ struct Sent {
     collected: Vec<CollectedRead>,
     /// See `Progress::last_rejected`.
     last_rejected: bool,
+    /// See `Progress::finished`.
+    finished: bool,
     /// See `Progress::bound_start`.
     bound_start: bool,
     /// See `Progress::bound_tx`.
@@ -3325,17 +3378,33 @@ struct Sent {
 }
 
 impl Sent {
-    /// Whether the VCI ended the exchange: by its receive timeout, or for a collecting window
-    /// that took a result (usable or rejected) by the primitive's finished status (ISO
-    /// 22900-2:2022 8.2.6.2.2, ADR-440). Not the agent's own deadline.
+    /// The wrong echo the primitive ended on with nothing after it (see
+    /// [`unanswered_wrong_echo`]).
+    fn unanswered_wrong_echo(&self) -> Option<&RejectedRead> {
+        unanswered_wrong_echo(
+            &self.rejected,
+            self.last_rejected,
+            self.rx_timeout.is_some(),
+            self.agent_deadline,
+        )
+    }
+
+    /// Whether the VCI ended the exchange: by its receive timeout, or by the primitive's
+    /// finished status (ISO 22900-2:2022 8.2.6.2.2) for a collecting window that took a result
+    /// (usable or rejected, ADR-440), or for a primitive that is not collecting and finished on a
+    /// wrong echo with no usable answer (ADR-443). Not the agent's own deadline.
     fn vci_ended(&self, collecting: bool) -> bool {
-        // A response's times count only for an exchange that ended with that response.
+        let rejected_read = if collecting {
+            !self.rejected.is_empty()
+        } else {
+            self.unanswered_wrong_echo().is_some()
+        };
         vci_ended(
             self.rx_timeout.is_some(),
             collecting,
             &self.result,
-            !self.rejected.is_empty(),
-            self.response_times.finished.is_some(),
+            rejected_read,
+            self.finished,
         )
     }
 
@@ -3350,7 +3419,7 @@ impl Sent {
         let sent = one_frame || self.bound_tx.is_some() || self.response_times.tx_done.is_some();
         if suppressed
             && sent
-            && self.vci_ended(false)
+            && self.rx_timeout.is_some()
             && self.pendings.is_empty()
             && self.error_events.is_empty()
             && matches!(self.result, Err(HostError::NoResponse))
@@ -3372,6 +3441,7 @@ impl Sent {
             rejected: Vec::new(),
             collected: Vec::new(),
             last_rejected: false,
+            finished: false,
             bound_start: false,
             bound_tx: None,
             events_lost: None,
@@ -3397,7 +3467,7 @@ struct PendingRead {
 /// A result bound to the primitive that does not answer its request (design 8.11 `rejected`,
 /// ADR-359): its response identifier when the worker split one off, its bytes, its VCI time and
 /// clock, why it was not taken, and the agent's clocks when the host read it, if it has a log.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 struct RejectedRead {
     identifier: Option<u32>,
     bytes: Vec<u8>,
@@ -4116,7 +4186,7 @@ fn vci_ended(
         Err(HostError::NoResponse) => rejected_read,
         Err(_) => false,
     };
-    rx_timeout || (collecting && finished && took_a_result)
+    rx_timeout || (finished && took_a_result && (collecting || result.is_err()))
 }
 
 /// What the events of one send-receive have shown so far.
@@ -4158,6 +4228,9 @@ struct Progress {
     receive_cycles: i32,
     /// The last result of the primitive was a rejected one: no pending or answer came after it.
     last_rejected: bool,
+    /// The primitive's finished status was read (not a cancel), for any primitive: the VCI ended
+    /// its wait (ADR-443).
+    finished: bool,
     /// A start-of-message indication bound to the primitive was read: a response may be under
     /// way (design 8.11 `vci_did_not_end`).
     bound_start: bool,
@@ -4278,6 +4351,7 @@ impl Progress {
             receive_table: Vec::new(),
             receive_cycles: 1,
             last_rejected: false,
+            finished: false,
             bound_start: false,
             bound_tx: None,
             events_lost: None,
@@ -4319,6 +4393,7 @@ impl Progress {
             receive_table: Vec::new(),
             receive_cycles: 1,
             last_rejected: false,
+            finished: false,
             bound_start: false,
             bound_tx: None,
             events_lost: None,
@@ -4574,11 +4649,15 @@ impl Progress {
                     || status == PduComPrimitiveStatus::PduCopstCancelled as i32 =>
             {
                 self.ended = true;
-                // Where a collecting window that got answers ended (ISO 22900-2:2022 8.2.6.2.2).
-                if self.collecting && status == PduComPrimitiveStatus::PduCopstFinished as i32 {
-                    self.response_times.finished = Some(at);
-                    if self.track_reads {
-                        self.new_items.push(EndItem::Finished(at));
+                if status == PduComPrimitiveStatus::PduCopstFinished as i32 {
+                    self.finished = true;
+                    // Where a collecting window that got answers ended (ISO 22900-2:2022
+                    // 8.2.6.2.2).
+                    if self.collecting {
+                        self.response_times.finished = Some(at);
+                        if self.track_reads {
+                            self.new_items.push(EndItem::Finished(at));
+                        }
                     }
                 }
                 return Some(match (self.response.take(), self.error) {
@@ -5338,6 +5417,7 @@ mod tests {
             rejected: Vec::new(),
             collected: Vec::new(),
             last_rejected: false,
+            finished: false,
             bound_start: false,
             bound_tx: None,
             events_lost: None,
@@ -5435,6 +5515,7 @@ mod tests {
             rejected: Vec::new(),
             collected: Vec::new(),
             last_rejected: false,
+            finished: false,
             bound_start: false,
             bound_tx: None,
             events_lost: None,
@@ -6407,6 +6488,7 @@ mod tests {
                 error: None,
                 errors: Vec::new(),
                 rejected_read: false,
+                unanswered_echo: None,
                 collecting: false,
                 receive_table: Vec::new(),
                 progress: None,
@@ -6657,6 +6739,7 @@ mod tests {
             rejected: Vec::new(),
             collected: Vec::new(),
             last_rejected: false,
+            finished: false,
             bound_start: false,
             bound_tx: None,
             events_lost: None,
@@ -6717,6 +6800,7 @@ mod tests {
                 rejected: Vec::new(),
                 collected: Vec::new(),
                 last_rejected: false,
+                finished: false,
                 bound_start: false,
                 bound_tx: None,
                 events_lost: None,
@@ -8126,6 +8210,7 @@ mod tests {
                 error: None,
                 errors: Vec::new(),
                 rejected_read: false,
+                unanswered_echo: None,
                 collecting,
                 receive_table: TABLE.to_vec(),
                 progress: None,
@@ -8248,6 +8333,7 @@ mod tests {
                 error: None,
                 errors: Vec::new(),
                 rejected_read: false,
+                unanswered_echo: None,
                 collecting: true,
                 receive_table: TABLE.to_vec(),
                 progress: None,
@@ -8357,13 +8443,21 @@ mod tests {
             (false, false, ok(), false, true, false),
             (false, true, none(), true, true, true),
             (false, true, none(), true, false, false),
-            (false, false, none(), true, true, false),
+            // Changed by ADR-443: a primitive that is not collecting, finished on a wrong echo,
+            // was not the VCI's end before; it is now (see the rows below).
+            (false, false, none(), true, true, true),
             (false, true, none(), false, true, false),
             (false, true, failed(), true, true, false),
             (false, true, failed(), false, true, false),
             (false, true, lost(), true, true, false),
             (true, false, none(), false, false, true),
             (true, true, failed(), false, false, true),
+            // A primitive that is not collecting: finished with a wrong echo and no usable answer
+            // is the VCI's end (ADR-443); a usable answer, no finished status or a failure is not.
+            (false, false, none(), false, true, false),
+            (false, false, ok(), true, true, false),
+            (false, false, none(), true, false, false),
+            (false, false, failed(), true, true, false),
         ];
         for (rx_timeout, collecting, result, rejected, finished, expected) in cases {
             assert_eq!(
@@ -8371,6 +8465,178 @@ mod tests {
                 expected,
                 "{rx_timeout} {collecting} {result:?} {rejected} {finished}"
             );
+        }
+    }
+
+    /// ADR-443: for a primitive that is not collecting, the VCI's end and the end
+    /// `positive_unusable` come from one condition, so they agree on every shape; a receive
+    /// timeout is the one end the VCI gave that `positive_unusable` is not.
+    #[test]
+    fn a_non_collecting_end_is_vci_ended_exactly_when_it_is_positive_unusable() {
+        let rejected = |reason| RejectedRead {
+            identifier: None,
+            bytes: vec![0x62, 0xF1],
+            vci_us: 0,
+            clock: None,
+            reason,
+            read: None,
+        };
+        let shape = |reason, last_rejected, finished, agent_deadline, rx_timeout: bool| Sent {
+            rejected: vec![rejected(reason)],
+            last_rejected,
+            finished,
+            agent_deadline,
+            rx_timeout: rx_timeout.then(|| seen(PduErrorEvent::PduErrEvtRxTimeout as i32)),
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        let wrong = RejectedReason::WrongEcho;
+        let shapes = [
+            // Wrong echo and the finished status: the case.
+            (shape(wrong, true, true, false, false), true),
+            // Another service's refusal: stays `no_response`.
+            (
+                shape(RejectedReason::PatternMismatch, true, true, false, false),
+                false,
+            ),
+            // A pending came after the wrong echo.
+            (shape(wrong, false, true, false, false), false),
+            // The agent's own deadline ended the wait.
+            (shape(wrong, true, false, true, false), false),
+        ];
+        for (sent, positive_unusable) in shapes {
+            let end = unanswered_end(End::NoResponse, &sent);
+            assert_eq!(
+                matches!(end, End::PositiveUnusable(_)),
+                positive_unusable,
+                "{end:?}"
+            );
+            assert_eq!(sent.vci_ended(false), positive_unusable, "{end:?}");
+        }
+        // A primitive cancelled after a wrong echo (no finished status) keeps the end the entry
+        // gives it, but the VCI did not end its wait on a finished status: the second asymmetric
+        // row.
+        let cancelled = shape(wrong, true, false, false, false);
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &cancelled),
+            End::PositiveUnusable(_)
+        ));
+        assert!(!cancelled.vci_ended(false));
+        // The one asymmetric row: a receive timeout ended it, and it keeps `no_response`.
+        let timed_out = shape(wrong, true, true, false, true);
+        assert!(matches!(
+            unanswered_end(End::NoResponse, &timed_out),
+            End::NoResponse
+        ));
+        assert!(timed_out.vci_ended(false));
+        // A usable answer after the wrong echo is not the VCI's end (ADR-442 decision 2).
+        let answered = Sent {
+            result: Ok(vec![0x62, 0xF1, 0x90]),
+            ..shape(wrong, false, true, false, false)
+        };
+        assert!(!answered.vci_ended(false));
+    }
+
+    /// ADR-408 with ADR-443: a suppressed request whose primitive finished on a wrong echo was
+    /// answered by something that is not silence; only the receive timeout makes silence its
+    /// result.
+    #[test]
+    fn a_suppressed_request_whose_primitive_finished_on_a_wrong_echo_is_not_answered_by_silence() {
+        let sent = Sent {
+            rejected: vec![RejectedRead {
+                identifier: None,
+                bytes: vec![0x7E],
+                vci_us: 0,
+                clock: None,
+                reason: RejectedReason::WrongEcho,
+                read: None,
+            }],
+            last_rejected: true,
+            finished: true,
+            ..Sent::not_started(Err(HostError::NoResponse))
+        };
+        assert!(sent.vci_ended(false), "the VCI ended the wait");
+        let mut silent = sent;
+        silent.silence_is_result(true, true);
+        assert!(
+            matches!(silent.result, Err(HostError::NoResponse)),
+            "{:?}",
+            silent.result
+        );
+    }
+
+    /// ADR-443: a stray that is not collecting and read a wrong echo, in the entry's wait
+    /// (carried) or in its own, then the finished status, ends as `positive_unusable`, rejected,
+    /// and ended by the VCI; the finished status alone is not the VCI's end.
+    #[test]
+    fn a_non_collecting_stray_finished_on_a_wrong_echo_is_vci_ended_and_positive_unusable() {
+        let echo = || RejectedRead {
+            identifier: None,
+            bytes: vec![0x62, 0xF1],
+            vci_us: 0,
+            clock: None,
+            reason: RejectedReason::WrongEcho,
+            read: None,
+        };
+        // (carried from the entry's wait, read in the stray's wait, expected)
+        for (carried, in_wait, expected) in [
+            (true, false, true),
+            (false, true, true),
+            (true, true, true),
+            (false, false, false),
+        ] {
+            let progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+            let mut stray = Stray {
+                cop: Some(COP),
+                tag: vec![0; 8],
+                deadline: tokio::time::Instant::now(),
+                cancel_failed: false,
+                request: vec![0x22, 0xF1, 0x90],
+                expectation: crate::send_receive::Expectation {
+                    sid: progress.sid,
+                    positive: progress.positive_prefix.clone(),
+                    negative: progress.negative.clone(),
+                },
+                seq: Some(1),
+                exchange: Some(1),
+                response: None,
+                response_times: VciTimes::default(),
+                error: None,
+                errors: Vec::new(),
+                rejected_read: carried,
+                unanswered_echo: carried.then(echo),
+                collecting: false,
+                receive_table: TABLE.to_vec(),
+                progress: None,
+            };
+            let mut progress = stray.take_progress();
+            if in_wait {
+                assert!(
+                    progress
+                        .on_event(event(Some(COP), result(&[0x62, 0xF1])), COP)
+                        .is_none()
+                );
+            }
+            let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+            let done = progress
+                .on_read(
+                    Some(event_notification::EventData::Item(finished)),
+                    COP,
+                    None,
+                )
+                .expect("the finished status ends the wait");
+            assert!(matches!(done, Err(HostError::NoResponse)), "{done:?}");
+            let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
+            assert_eq!(ended.vci_ended, expected, "{carried} {in_wait}");
+            assert_eq!(ended.end_rejected, expected, "{carried} {in_wait}");
+            assert_eq!(
+                matches!(ended.end, Some(End::PositiveUnusable(ref bytes)) if bytes == &[0x62, 0xF1]),
+                expected,
+                "{:?}",
+                ended.end
+            );
+            if !expected {
+                assert!(matches!(ended.end, Some(End::NoResponse)));
+            }
         }
     }
 
@@ -8401,6 +8667,7 @@ mod tests {
                     error: None,
                     errors: Vec::new(),
                     rejected_read: carried,
+                    unanswered_echo: None,
                     collecting: true,
                     receive_table: TABLE.to_vec(),
                     progress: None,

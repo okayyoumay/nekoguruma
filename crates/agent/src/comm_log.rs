@@ -670,7 +670,11 @@ pub(crate) struct PrimitiveEnded {
     /// it before it ended.
     pub end: Option<exchange::End>,
     pub detail: exchange::Detail,
-    /// The VCI ended it with a receive timeout.
+    /// The end is a rejected one: a primitive that is not collecting finished on a wrong echo
+    /// (ADR-443), whose request stays owed as an exchange entry's `end_rejected` says.
+    pub end_rejected: bool,
+    /// The VCI ended it with a receive timeout, or by the finished status after a rejected result
+    /// (ADR-440, ADR-443).
     pub vci_ended: bool,
     /// Every item read for this end after its exchange's entry, in the order the host read
     /// them: the index is the read ordinal. The log places each on its clock once, in this order
@@ -3365,6 +3369,11 @@ impl CommLog {
         evidence.end = end;
         evidence.detail = ended.detail;
         evidence.vci_ended = ended.vci_ended;
+        // A collecting exchange keeps what its entry said; any other is rejected as its end says
+        // (ADR-443).
+        if !evidence.collecting {
+            evidence.end_rejected = ended.end_rejected;
+        }
         evidence.vci_limits_past_by_us = None;
         // What the host read for the end, by kind, each with where it was placed.
         let mut own_pendings = Vec::new();
@@ -6784,6 +6793,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: self.end,
                 detail: self.detail,
+                end_rejected: false,
                 vci_ended: self.vci_ended,
                 reads,
             }
@@ -9305,6 +9315,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end,
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended,
                 reads: read_after_deadline(items),
             },
@@ -9462,6 +9473,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(end),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -9560,6 +9572,7 @@ pub(crate) mod tests {
                     refused_after_loss: false,
                 }),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: items
                     .into_iter()
@@ -9866,6 +9879,7 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(end),
                     detail: exchange::Detail::default(),
+                    end_rejected: false,
                     vci_ended: true,
                     reads: read_after_deadline(items),
                 },
@@ -10239,6 +10253,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 300_000),
@@ -11043,6 +11058,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended,
                 reads: read_after_deadline(vec![answer_read(0x7E9, 400_000)]),
             },
@@ -11170,6 +11186,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 400_000),
@@ -11220,6 +11237,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 400_000),
@@ -11325,6 +11343,104 @@ pub(crate) mod tests {
         }
     }
 
+    /// A presence exchange that is not collecting, whose primitive ended with a wrong echo
+    /// (`positive_unusable`, rejected), logged as the host hands it, with `vci_ended` as given.
+    fn non_collecting_wrong_echo(vci_ended: bool) -> exchange::Evidence {
+        collecting_waited(|evidence| {
+            evidence.collecting = false;
+            evidence.end = exchange::End::PositiveUnusable(vec![0x7E, 0x01]);
+            evidence.end_rejected = true;
+            evidence.vci_ended = vci_ended;
+        })
+    }
+
+    /// ADR-443: a request that is not collecting and whose primitive the VCI finished on a wrong
+    /// echo is kept at its entry, so the ECU's usable answer delivered later is its
+    /// `late_response`, never `unattached`; the same evidence without the VCI's end is not kept
+    /// (the gap the host's `vci_ended` closes).
+    #[test]
+    fn a_non_collecting_exchange_finished_on_a_wrong_echo_is_kept_and_its_late_usable_answer_is_its_late_response()
+     {
+        for (after_us, class) in [(500_000, "system"), (3_000_000, "undetermined")] {
+            let (dir, setup, log) = collecting_log_on(false);
+            let seq = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+            assert!(kept_of(&log, seq).evidence.end_rejected);
+            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
+            assert_eq!(
+                late_owner_of(&log, &late_final_on(0x7E8)),
+                Some(LateOwner::One(seq))
+            );
+            log.lock()
+                .late_response(0, seq, &late_final_on(0x7E8), placed_after(after_us))
+                .unwrap();
+            // The restated exchange is usable: settled, no longer rejected.
+            assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([seq]), "{late:?}");
+            assert_eq!(late[0]["classification"], class, "{late:?}");
+            assert!(late[0].get("outcome").is_none(), "{late:?}");
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        }
+        // Without the VCI's end the exchange is not kept and its late answer has no owner.
+        let (dir, _setup, log) = collecting_log_on(false);
+        let seq = log.exchange(non_collecting_wrong_echo(false)).unwrap();
+        assert!(!owed_on(&log, 0x7E8, seq).1);
+        assert!(late_owner_of(&log, &late_final_on(0x7E8)).is_none());
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-443 (the stray's end): an exchange the agent's deadline ended is kept by that, and its
+    /// primitive's end as a wrong echo the VCI finished (`positive_unusable`, rejected,
+    /// `vci_ended`) leaves it kept after the host releases it, still unsettled, so the late usable
+    /// answer is its `late_response`; an end that is not the VCI's releases it.
+    #[test]
+    fn a_non_collecting_primitive_end_on_a_wrong_echo_keeps_the_exchange_owed() {
+        for vci_ended in [true, false] {
+            let (dir, setup, log) = collecting_log_on(false);
+            let seq = log
+                .exchange(collecting_waited(|evidence| evidence.collecting = false))
+                .unwrap();
+            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], true));
+            log.primitive_ended(
+                seq,
+                PrimitiveEnded {
+                    end: Some(if vci_ended {
+                        exchange::End::PositiveUnusable(vec![0x7E, 0x01])
+                    } else {
+                        exchange::End::NoResponse
+                    }),
+                    detail: exchange::Detail::default(),
+                    end_rejected: vci_ended,
+                    vci_ended,
+                    reads: read_after_deadline(Vec::new()),
+                },
+            )
+            .unwrap();
+            log.release_kept_ended(seq);
+            assert_eq!(owed_on(&log, 0x7E8, seq), (vec![seq], vci_ended));
+            if vci_ended {
+                assert!(kept_of(&log, seq).evidence.end_rejected);
+                log.lock()
+                    .late_response(0, seq, &late_final_on(0x7E8), placed_after(3_000_000))
+                    .unwrap();
+                // The late usable answer settled it.
+                assert_eq!(owed_on(&log, 0x7E8, seq), (Vec::new(), false));
+            }
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert_eq!(
+                of_event(&lines, "late_response").len(),
+                usize::from(vci_ended),
+                "{lines:#?}"
+            );
+        }
+    }
+
     /// ADR-440: a rejected-only window whose finished status is judged early or late takes the
     /// timeout rows (the VCI ended its wait off its timer): `system`; at the limit it stays
     /// `undetermined`.
@@ -11389,6 +11505,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(answer_on(
@@ -11436,6 +11553,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Unattached(start_of_message(0x7E8)),
@@ -11471,6 +11589,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E9, 1_200_000),
@@ -11505,6 +11624,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(rejected_on(0x7E8, 1_000_000)),
@@ -11566,6 +11686,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(items),
             },
@@ -11623,6 +11744,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(items),
             },
@@ -11677,6 +11799,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 400_000),
@@ -12199,6 +12322,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Positive(accepted.clone())),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(answer_on(0x7E8, exchange::End::Positive(accepted), 400_000)),
@@ -12587,6 +12711,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: read_after_deadline(vec![
                     EndItem::Unattached(tx_done(0x7DF)),
@@ -12951,6 +13076,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
                     // The host reads no receive timeout for a finished status.
+                    end_rejected: false,
                     vci_ended: false,
                     reads: read_after_deadline(items),
                 },
@@ -12992,6 +13118,7 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(exchange::End::Positive(FIRST.to_vec())),
                     detail: exchange::Detail::default(),
+                    end_rejected: false,
                     vci_ended: true,
                     reads: read_after_deadline(vec![
                         answer_read(0x7E8, 400_000),
@@ -13028,6 +13155,7 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
+                    end_rejected: false,
                     vci_ended: true,
                     reads: read_after_deadline(items),
                 },
@@ -13159,6 +13287,7 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(exchange::End::Positive(FIRST.to_vec())),
                     detail: exchange::Detail::default(),
+                    end_rejected: false,
                     vci_ended: true,
                     reads: read_after_deadline(vec![
                         answer_read(0x7E8, 400_000),
@@ -13201,6 +13330,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -13246,6 +13376,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(end),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -13531,6 +13662,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(end),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -13714,6 +13846,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: false,
                 reads: read_after_deadline(vec![EndItem::Finished(device_time(
                     BASE_US + 1_200_000,
@@ -13819,6 +13952,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end,
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: timed_out,
                 reads,
             },
@@ -14023,6 +14157,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: vec![
                     end_read(400_000, EndItem::Pending(pending_on(400_000), None)),
@@ -14138,6 +14273,7 @@ pub(crate) mod tests {
                 PrimitiveEnded {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
+                    end_rejected: false,
                     vci_ended: true,
                     reads: read_after_deadline(items),
                 },
@@ -15208,6 +15344,7 @@ pub(crate) mod tests {
             PrimitiveEnded {
                 end: Some(exchange::End::Negative(vec![0x7F, 0x3E, 0x78])),
                 detail: exchange::Detail::default(),
+                end_rejected: false,
                 vci_ended: true,
                 reads: read_after_deadline(items),
             },
@@ -20884,6 +21021,7 @@ pub(crate) mod tests {
         PrimitiveEnded {
             end,
             detail: exchange::Detail::default(),
+            end_rejected: false,
             vci_ended: false,
             reads,
         }

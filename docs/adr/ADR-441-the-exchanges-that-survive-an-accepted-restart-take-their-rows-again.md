@@ -83,13 +83,10 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
      (`Kept::matched`) and no link error its own entry saw came after the answer (the record's
      note ignores that, since `record` keeps the answer's earlier epoch for it). A late link
      error read later ends a kept record's answer as it ends a window exchange's: `error_after`
-     clears `Kept::matched` of the exchange the error is placed after, whatever its stored
-     answer time (the window leaves that exchange's answer out of the count for the exchanges
-     after it), and of each record after that place whose stored answer time is not shown
-     after the error (ADR-385), whether in the window or beyond it: the same records whose
-     clears the error shifts, since `Kept::matched` says the answer counts in the epoch of
-     those clears. A later answering item of the exchange the error is placed after, shown
-     after the error, is then a new matched answer, counted once.
+     clears `Kept::matched` of a record at or after the error's place, whether in the window or
+     beyond it, whose stored answer time is not shown after the error (ADR-385): the same
+     records whose clears the error shifts, since `Kept::matched` says the answer counts in
+     the epoch of those clears.
      The recount does not test that time again, since it would then also drop the record for
      exchanges before the error, which the error does not end it for; one that did not count
      yet is counted by the settlement that follows (`Place::Beyond`), once, since that sets

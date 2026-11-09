@@ -2735,9 +2735,8 @@ impl LinkState {
             };
         // The freed answer counts as a matched answer only when its stored time is shown after
         // every late link error that may have come after it, as when it was offered before
-        // (ADR-384, ADR-385).
-        // In the window an answer is counted when its time passes; beyond it a link error the
-        // entry saw after its answer ends it too, as `record` applies it.
+        // (ADR-384, ADR-385). In the window an answer is counted when its time passes; beyond
+        // it a link error the entry saw after its answer ends it too, as `record` applies it.
         let since = self.since_late_error(entry.seq, answer_at);
         let counts = since && (place == Place::Window || !entry.error_after_answer());
         if now_matched
@@ -3729,18 +3728,18 @@ impl LinkState {
                 logged.after.errors += 1;
             }
         }
-        // Before the window, an owed exchange beyond it may have answered before the error or
-        // after it: its answer counts for none of the window's exchanges.
-        // Its matched answer ends as a window exchange's does, when its own time does not show
-        // it after the error (ADR-385).
+        // An owed exchange at or after the error's place, in the window or beyond it, may have
+        // answered before the error or after it: its answer counts for none of the window's
+        // exchanges. `Kept::matched` means the answer counts in the epoch of the record's
+        // clears, which the error shifts for each of them below, so the matched answer ends for
+        // each of them whose own time does not show it after the error (ADR-385).
         let oldest = self.window.front().map(|logged| logged.seq);
         let from = seq.or(oldest);
-        let beyond_ends: Vec<u64> = self
+        let kept_ends: Vec<u64> = self
             .kept
             .iter()
             .filter(|(kept_seq, kept)| {
                 from.is_some_and(|from| **kept_seq >= from)
-                    && !self.window.iter().any(|logged| logged.seq == **kept_seq)
                     && !self.since_late_error(**kept_seq, kept.answer_at)
             })
             .map(|(kept_seq, _)| *kept_seq)
@@ -3751,7 +3750,7 @@ impl LinkState {
                 kept.clears.errors += 1;
             }
         }
-        self.end_kept_matched(beyond_ends);
+        self.end_kept_matched(kept_ends);
         // The `Clears::errors` an exchange's answer counted in: an error it saw after its
         // answer, or in no known order with it, ends that answer (`record`).
         let answered_in = |logged: &Logged| {
@@ -4240,6 +4239,7 @@ impl ExchangeEntry {
     fn error_after_answer(&self) -> bool {
         self.effect.link_error.is_some() && !self.effect.answer_after_error
     }
+
     /// Whether its answer is placed with it alone, so it is owed nothing, as
     /// [`LinkState::record`] reads it.
     fn placed_alone(&self) -> bool {
@@ -6433,17 +6433,20 @@ mod tests {
             let (clock, placed) = placed_at(Clock::Device, 0, us);
             AnswerTime::At(clock, placed)
         };
-        /// Where the late error is read: after the owner (before the kept record) and placed at
-        /// 2 000 us, after the window and unplaced, or not at all.
+        /// Where the late error is read: after the owner (before the kept record) or after the
+        /// record itself, placed at 2 000 us, after the window and unplaced, or not at all.
         #[derive(Clone, Copy, Debug)]
         enum Error {
             PlacedBeforeRecord,
+            PlacedAfterRecord,
             UnplacedAfterWindow,
             None,
         }
         let cases = [
             (Error::PlacedBeforeRecord, at(1_000), 0),
             (Error::PlacedBeforeRecord, at(3_000), 1),
+            (Error::PlacedAfterRecord, at(1_000), 0),
+            (Error::PlacedAfterRecord, at(3_000), 1),
             (Error::UnplacedAfterWindow, AnswerTime::Unknown, 1),
             (Error::None, AnswerTime::Unknown, 1),
         ];
@@ -6460,6 +6463,12 @@ mod tests {
                     Error::PlacedBeforeRecord => {
                         let time = Some(placed_at(Clock::Device, 0, 2_000));
                         state.error_after(Some(1), 100, LinkErrorKind::Receive, time);
+                    }
+                    // The error falls after the record itself, which the `>= from` bound of
+                    // the shift and of the ending both take in.
+                    Error::PlacedAfterRecord => {
+                        let time = Some(placed_at(Clock::Device, 0, 2_000));
+                        state.error_after(Some(2), 100, LinkErrorKind::Receive, time);
                     }
                     Error::UnplacedAfterWindow => {
                         state.error_after(Some(window_exchange), 100, LinkErrorKind::Receive, None);
@@ -6492,6 +6501,45 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// ADR-441 decision 7: a late link error placed after an owed exchange that is still in the
+    /// window ends that exchange's matched answer when its time is not shown after the error,
+    /// as it does for a record beyond the window, since the error shifts the record's clears
+    /// either way. Once the exchange leaves the window, a restart does not count it in the
+    /// new epoch.
+    #[test]
+    fn a_restart_does_not_count_the_answer_of_the_exchange_a_late_error_was_placed_after() {
+        let confirmed = |end| {
+            let mut evidence = forwarding(evidence(&READ_F186, end));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let (clock, placed) = placed_at(Clock::Device, 0, 1_000);
+        let mut state = LinkState::default();
+        let (_, first) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        state.keep(1, first);
+        let (_, mut second) = log_kept_owned(
+            &mut state,
+            2,
+            confirmed(End::Positive(vec![0x62, 0xF1, 0x86, 0x41])),
+        );
+        second.answer_at = AnswerTime::At(clock, placed);
+        second.matched = true;
+        state.keep(2, second);
+        // The error is read after exchange 2 and placed after its answer.
+        let time = Some(placed_at(Clock::Device, 0, 2_000));
+        state.error_after(Some(2), 100, LinkErrorKind::Receive, time);
+        assert!(!state.kept(2).unwrap().matched);
+        for seq in 3..3 + WINDOW as u64 {
+            log_kept(&mut state, seq, confirmed(End::NoResponse));
+        }
+        assert!(state.window.iter().all(|logged| logged.seq > 2));
+        assert!(state.kept(2).is_some());
+        let window_exchange = state.window.back().unwrap().seq;
+        state.reset_after(1, 1, true);
+        assert_eq!(same_match(&state, window_exchange), 0);
+        assert_eq!(link_matched(&state), 0);
     }
 
     /// ADR-439: an owed exchange the refresh leaves no row (its answers have no owner left on any

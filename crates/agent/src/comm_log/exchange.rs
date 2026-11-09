@@ -1978,7 +1978,8 @@ struct Logged {
     reason: String,
     /// The link's clears when its history was taken.
     clears: Clears,
-    /// The link's clears just after its entry was taken in.
+    /// The link's clears just after its entry was taken in. A late link error shifts it as it
+    /// shifts the record's `Kept::clears`, the exchange it falls after included (ADR-444).
     after: Clears,
     /// The least classification it keeps whatever its history gives, with the reason: an
     /// ambiguous response read during it may have been its own (design 8.11 `late_response`).
@@ -2814,10 +2815,10 @@ impl LinkState {
     /// The matched answer of the kept exchange `seq` beyond the window, with its key and the
     /// `Clears::matched` epoch it counted in, when it counts as one for the exchanges after it:
     /// the record says so and no link error the record saw came after its answer. A late link
-    /// error read later has ended the record's answer already when it came after it
-    /// ([`LinkState::error_after`] clears `Kept::matched`, as it does for a window exchange), so
-    /// the answer's time is not tested here: an error after the record's place would end the
-    /// answer for the exchanges after it only, which this recount takes from the window.
+    /// error read later has ended the record's answer already when its stored time does not show
+    /// it after the error ([`LinkState::error_after`] clears `Kept::matched`, as it does for a
+    /// window exchange, the exchange the error falls after included, ADR-444), so the answer's
+    /// time is not tested here.
     fn kept_matched_after(&self, seq: u64) -> Option<(MatchKey, u64)> {
         let kept = self.kept.get(&seq).filter(|kept| kept.matched)?;
         (!kept.evidence.error_after_answer())
@@ -3681,7 +3682,8 @@ impl LinkState {
     /// `time` is the error's placed time when it is placed against this link's exchanges (else
     /// it is kept as one that could not be), which [`LinkState::since_late_error`] uses. An
     /// exchange's answer counts again, as a matched answer and as an answer since the error,
-    /// only when its stored time passes that test (ADR-385). Gives
+    /// only when its stored time passes that test (ADR-385), the exchange the error falls after
+    /// included (ADR-444). Gives
     /// each later exchange whose classification or reason this changes, in `seq` order, and the
     /// largest `seq` of a later exchange it does not reclassify.
     pub(crate) fn error_after(
@@ -3704,6 +3706,14 @@ impl LinkState {
             .iter()
             .map(|logged| self.counts_since_error(logged))
             .collect();
+        // The exchange the error falls after, when its answer counts too: its stored time passes
+        // the same test as every other exchange's, and no link error of its own entry came after
+        // the answer, the test its record applies ([`LinkState::kept_matched_after`], ADR-444).
+        let answers_after: Option<u64> = seq.filter(|seq| {
+            self.window.iter().zip(&counts).any(|(logged, counts)| {
+                logged.seq == *seq && *counts && !logged.evidence.error_after_answer()
+            })
+        });
         // An owed exchange whose matched answer stops counting has none counted any more: a
         // later answering item of its own, shown after the error, is a new matched answer.
         let window_ends: Vec<u64> = self
@@ -3718,15 +3728,18 @@ impl LinkState {
             if after(logged.seq) {
                 logged.clears.matched += 1;
                 logged.clears.errors += 1;
-                if let Some(at) = &mut logged.matched_at
-                    && counts
-                {
-                    *at += 1;
-                }
             }
-            // The exchange the error falls after answered before it: its answer, freed later,
-            // counts with the clears from before the error (ADR-384).
-            if seq.is_none_or(|seq| logged.seq > seq) {
+            // An exchange's matched answer moves with the epoch when it counts: a later
+            // exchange's, and the answer of the exchange the error falls after (ADR-444). That
+            // exchange's own `clears` stay, the epoch its history was taken in.
+            if let Some(at) = &mut logged.matched_at
+                && ((after(logged.seq) && counts) || answers_after == Some(logged.seq))
+            {
+                *at += 1;
+            }
+            // `after` follows the record's `Kept::clears`, which the error shifts from the
+            // exchange it falls after on, that exchange included (ADR-444).
+            if seq.is_none_or(|seq| logged.seq >= seq) {
                 logged.after.matched += 1;
                 logged.after.errors += 1;
             }
@@ -3787,7 +3800,10 @@ impl LinkState {
             let since: Vec<&Logged> = self
                 .window
                 .iter()
-                .filter(|earlier| after(earlier.seq) && earlier.seq < later)
+                .filter(|earlier| {
+                    (after(earlier.seq) || answers_after == Some(earlier.seq))
+                        && earlier.seq < later
+                })
                 .collect();
             history.answered_same_match = since
                 .iter()
@@ -3816,7 +3832,7 @@ impl LinkState {
             Some(seq) => self.left_window.filter(|left| *left > seq),
             None => self.left_window,
         };
-        let first = |logged: &&Logged| seq.is_none_or(|seq| logged.seq > seq);
+        let first = |logged: &&Logged| after(logged.seq) || answers_after == Some(logged.seq);
         self.matched.clear();
         for logged in self.window.iter().filter(first) {
             if logged.matched_at == Some(self.clears.matched) {
@@ -6557,19 +6573,20 @@ mod tests {
         log_kept(state, seq, evidence);
     }
 
-    /// ADR-441 decision 7: a late link error placed after an owed exchange whose answer is shown
-    /// before the error ends that exchange's matched answer, in the window and beyond it. Once
-    /// the exchange leaves the window, a restart does not count it in the new epoch. (An answer
-    /// whose stored time is shown after the error is a question the design leaves open.)
+    /// ADR-441 decision 7, ADR-444: a late link error placed after an owed exchange ends that
+    /// exchange's matched answer when its stored time is not shown after the error, and keeps
+    /// it when it is, in the window and beyond it. Once the exchange leaves the window, a
+    /// restart counts it in the new epoch only when it was kept.
     #[test]
-    fn a_restart_does_not_count_the_answer_of_the_exchange_a_late_error_was_placed_after() {
-        for answer_us in [1_000] {
+    fn a_restart_counts_the_answer_of_the_exchange_a_late_error_was_placed_after_by_its_stored_time()
+     {
+        for answer_us in [1_000, 3_000] {
             let mut state = LinkState::default();
             answered_and_kept(&mut state, answer_us);
             // The error is read after exchange 2 and placed at 2 000 us.
             let time = Some(placed_at(Clock::Device, 0, 2_000));
             state.error_after(Some(2), 100, LinkErrorKind::Receive, time);
-            assert!(!state.kept(2).unwrap().matched, "{answer_us}");
+            assert_eq!(state.kept(2).unwrap().matched, answer_us > 2_000);
             for seq in 3..3 + WINDOW as u64 {
                 log_unanswered(&mut state, seq);
             }
@@ -6577,36 +6594,311 @@ mod tests {
             assert!(state.kept(2).is_some());
             let window_exchange = state.window.back().unwrap().seq;
             state.reset_after(1, 1, true);
-            assert_eq!(same_match(&state, window_exchange), 0, "{answer_us}");
-            assert_eq!(link_matched(&state), 0, "{answer_us}");
+            let counted = u32::from(answer_us > 2_000);
+            assert_eq!(same_match(&state, window_exchange), counted, "{answer_us}");
+            assert_eq!(link_matched(&state), counted, "{answer_us}");
         }
     }
 
     /// The same exchange gives the same count in the window and once beyond it: after a late link
-    /// error placed after exchange `2`, whose answer is shown before the error, a restart counts
-    /// `2`'s answer for none of the later exchanges, whether `2` is still in the window or has
-    /// left it.
+    /// error placed after exchange `2`, a restart counts `2`'s answer for the later exchanges
+    /// when its stored time is shown after the error and for none when it is not, whether `2`
+    /// is still in the window or has left it, and for either restart (ADR-444).
     #[test]
     fn the_answer_a_late_error_was_placed_after_counts_alike_in_and_beyond_the_window() {
-        for answer_us in [1_000] {
-            let mut counts = Vec::new();
+        for (answer_us, expected) in [(1_000, (0, 0)), (3_000, (1, 1))] {
+            for (earliest, accepting) in [(1, true), (2, false)] {
+                let mut counts = Vec::new();
+                for extra in [1, WINDOW as u64] {
+                    let mut state = LinkState::default();
+                    answered_and_kept(&mut state, answer_us);
+                    let time = Some(placed_at(Clock::Device, 0, 2_000));
+                    state.error_after(Some(2), 100, LinkErrorKind::Receive, time);
+                    for seq in 3..3 + extra {
+                        log_unanswered(&mut state, seq);
+                    }
+                    assert_eq!(
+                        state.window.iter().any(|logged| logged.seq == 2),
+                        extra == 1
+                    );
+                    let last = state.window.back().unwrap().seq;
+                    state.reset_after(1, earliest, accepting);
+                    counts.push((same_match(&state, last), link_matched(&state)));
+                }
+                assert_eq!(
+                    counts,
+                    [expected, expected],
+                    "{answer_us} {earliest} {accepting}"
+                );
+            }
+        }
+    }
+
+    /// Exchange `1`, kept and owed, which transmits at 1 000 us on the device clock, and a
+    /// silent exchange `2` of its match that transmits at 6 000 us. Gives the state and `1`'s
+    /// evidence.
+    fn owed_and_later_silence() -> (LinkState, Evidence) {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+        state.keep(1, kept);
+        log_kept(&mut state, 2, timed(silent.clone(), Some(6_000), None));
+        (state, silent)
+    }
+
+    /// What exchange `1`'s answer and a late link error leave of the counts: the later exchange
+    /// `2`'s counts and classification, the link's, and the answer's own record and window entry.
+    #[derive(Debug, PartialEq)]
+    struct Settlement {
+        same_match: u32,
+        since_error: u32,
+        vehicle: bool,
+        link_matched: u32,
+        link_since_error: u32,
+        matched_at: Option<u64>,
+        after: Clears,
+        kept_clears: Clears,
+        kept_matched: bool,
+    }
+
+    fn settlement(state: &LinkState) -> Settlement {
+        let first = state.window.iter().find(|logged| logged.seq == 1).unwrap();
+        let later = state.window.iter().find(|logged| logged.seq == 2).unwrap();
+        let kept = state.kept(1).unwrap();
+        Settlement {
+            same_match: later.history.answered_same_match,
+            since_error: later.history.answered_since_error,
+            vehicle: later.classification == Classification::Vehicle,
+            link_matched: link_matched(state),
+            link_since_error: state.answered_since_error,
+            matched_at: first.matched_at,
+            after: first.after,
+            kept_clears: kept.clears,
+            kept_matched: kept.matched,
+        }
+    }
+
+    /// Exchange `1`'s pending is offered at `answer` and a late error at 5 000 us is read, in
+    /// the order given (`error_first` reads the error first). Gives the state and where the
+    /// error was placed.
+    fn answer_and_late_error(
+        silent: &Evidence,
+        mut state: LinkState,
+        answer: AnswerTime,
+        error_first: bool,
+    ) -> (LinkState, ErrorPoint) {
+        let error = placed_at(Clock::Device, 0, 5_000);
+        let point;
+        if error_first {
+            point = read_late_error(&mut state, 3, error);
+            offer_answer(&mut state, 1, silent, true, answer);
+        } else {
+            offer_answer(&mut state, 1, silent, true, answer);
+            point = read_late_error(&mut state, 3, error);
+        }
+        (state, point)
+    }
+
+    /// ADR-444: the exchange a late error falls after counts its answer for the exchanges after
+    /// it by its stored time, the one test every answer gets (ADR-385): when it is shown after
+    /// the error, the later exchange has an answered match and an answer since the error, and
+    /// the link has the matched answer; when it is not (before, at the error's time, another
+    /// clock, another epoch, no time, an error that could not be placed) nothing counts.
+    #[test]
+    fn the_exchange_a_late_error_falls_after_counts_its_answer_by_its_stored_time() {
+        let (state, silent) = owed_and_later_silence();
+        let counted = answer_and_late_error(&silent, state, device_time(0, 5_500), false);
+        assert_eq!(counted.1, ErrorPoint::After(1));
+        let counted = settlement(&counted.0);
+        assert_eq!((counted.same_match, counted.since_error), (1, 1));
+        assert!(counted.vehicle && counted.kept_matched, "{counted:?}");
+        assert_eq!((counted.link_matched, counted.link_since_error), (1, 1));
+        let (clock, placed) = placed_at(Clock::Worker, 0, 5_500);
+        let times = [
+            device_time(0, 4_000),
+            device_time(0, 5_000),
+            AnswerTime::At(clock, placed),
+            device_time(1, 5_500),
+            AnswerTime::Unknown,
+        ];
+        for time in times {
+            let (state, silent) = owed_and_later_silence();
+            let (state, point) = answer_and_late_error(&silent, state, time, false);
+            assert_eq!(point, ErrorPoint::After(1));
+            let not = settlement(&state);
+            assert_eq!((not.same_match, not.since_error), (0, 0), "{time:?}");
+            assert!(!not.vehicle && !not.kept_matched, "{time:?} {not:?}");
+            assert_eq!((not.link_matched, not.link_since_error), (0, 0), "{time:?}");
+        }
+        // An error that could not be placed.
+        let (mut state, silent) = owed_and_later_silence();
+        offer_answer(&mut state, 1, &silent, true, device_time(0, 5_500));
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, None);
+        let not = settlement(&state);
+        assert_eq!(
+            (not.same_match, not.since_error, not.link_matched),
+            (0, 0, 0)
+        );
+        assert!(!not.vehicle && !not.kept_matched, "{not:?}");
+    }
+
+    /// ADR-444: the order the answer and the late error are read in does not change what is
+    /// counted, nor the answer's `matched_at`, `after`, `Kept::clears` and `Kept::matched`.
+    #[test]
+    fn the_order_a_late_answer_and_a_late_error_are_read_in_does_not_change_the_counts() {
+        for time in [device_time(0, 5_500), device_time(0, 4_000)] {
+            let mut results = Vec::new();
+            for error_first in [false, true] {
+                let (state, silent) = owed_and_later_silence();
+                let (state, _) = answer_and_late_error(&silent, state, time, error_first);
+                results.push(settlement(&state));
+            }
+            if time == device_time(0, 5_500) {
+                assert_eq!(results[0], results[1], "{time:?}");
+            } else {
+                // A stale `matched_at` of the answer that does not count is left as it was read:
+                // it matches no live epoch, so only the counts are compared.
+                let counts = |result: &Settlement| {
+                    (
+                        result.same_match,
+                        result.since_error,
+                        result.vehicle,
+                        result.link_matched,
+                        result.link_since_error,
+                        result.kept_matched,
+                    )
+                };
+                assert_eq!(counts(&results[0]), counts(&results[1]), "{time:?}");
+            }
+        }
+    }
+
+    /// ADR-444: a window entry and its record hold one epoch: `Logged::after` is the record's
+    /// `Kept::clears` after a late error placed, unplaced, with the answer before or after it, and
+    /// after a restart.
+    #[test]
+    fn a_late_error_leaves_the_window_entry_and_its_record_on_one_epoch() {
+        let one_epoch = |state: &LinkState, what: &str| {
+            let first = state.window.iter().find(|logged| logged.seq == 1).unwrap();
+            assert_eq!(first.after, state.kept(1).unwrap().clears, "{what}");
+        };
+        for time in [device_time(0, 5_500), device_time(0, 4_000)] {
+            let (state, silent) = owed_and_later_silence();
+            let (mut state, _) = answer_and_late_error(&silent, state, time, false);
+            one_epoch(&state, &format!("placed {time:?}"));
+            state.reset_after(1, 1, true);
+            one_epoch(&state, &format!("restart {time:?}"));
+        }
+        let (mut state, silent) = owed_and_later_silence();
+        offer_answer(&mut state, 1, &silent, true, device_time(0, 5_500));
+        state.error_after(Some(1), 3, LinkErrorKind::Receive, None);
+        one_epoch(&state, "unplaced");
+    }
+
+    /// ADR-444: an answer counted after a late error is counted once: a later final response, a
+    /// re-offer of the answer, a refresh beyond the window and an earlier owner's settlement
+    /// leave the link's matched answers and the later exchange's count as they were.
+    #[test]
+    fn an_answer_counted_after_a_late_error_is_not_counted_again_when_offered_again() {
+        let reoffer = |state: &mut LinkState, newly_answered: bool, final_response: bool| {
+            let kept = state.kept(2).unwrap().clone();
+            let mut answer = SettledAnswer {
+                seq: 2,
+                key: MatchKey::of(&kept.evidence),
+                newly_answered,
+                newly_matched: !kept.matched,
+                final_response,
+                clears: kept.clears,
+                since_error: true,
+                settled_ids: Vec::new(),
+            };
+            state.judge_answer(&mut answer, kept.answer_at);
+            assert!(!answer.newly_matched);
+            state.reclassify_after(&answer);
+        };
+        let counts = |state: &LinkState| (link_matched(state), same_match(state, 3));
+        let mut state = LinkState::default();
+        answered_and_kept(&mut state, 3_000);
+        log_unanswered(&mut state, 3);
+        let time = Some(placed_at(Clock::Device, 0, 2_000));
+        state.error_after(Some(2), 100, LinkErrorKind::Receive, time);
+        assert_eq!(counts(&state), (1, 1));
+        reoffer(&mut state, false, true);
+        assert_eq!(counts(&state), (1, 1));
+        reoffer(&mut state, true, false);
+        assert_eq!(counts(&state), (1, 1));
+        let first = state.kept(1).cloned();
+        if let Some(first) = first {
+            let answer = final_answer(&state, 1, &first, &[0x62, 0xF1, 0x86, 0x41]);
+            state.reclassify_after(&answer);
+            assert_eq!(counts(&state), (1, 1));
+        }
+        // Beyond the window.
+        for seq in 4..4 + WINDOW as u64 {
+            log_unanswered(&mut state, seq);
+        }
+        assert!(state.window.iter().all(|logged| logged.seq > 2));
+        let before = link_matched(&state);
+        assert!(
+            state
+                .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
+                .is_empty()
+        );
+        assert_eq!(link_matched(&state), before);
+        assert!(state.kept(2).unwrap().matched);
+    }
+
+    /// ADR-444: the answer of an exchange whose own entry saw a link error that came after the
+    /// answer, or in no known order with it, is not counted after a late error, whatever its stored
+    /// time: in the window and beyond it. An error placed within it is such an error.
+    #[test]
+    fn an_error_of_its_own_entry_ends_the_answer_before_the_stored_time_is_tested() {
+        for within in [false, true] {
             for extra in [1, WINDOW as u64] {
                 let mut state = LinkState::default();
-                answered_and_kept(&mut state, answer_us);
+                answered_and_kept(&mut state, 3_000);
+                if within {
+                    state.error_in(2, LinkErrorKind::Receive, 1, true, false);
+                } else {
+                    let logged = state.window.iter_mut().find(|logged| logged.seq == 2);
+                    logged.unwrap().evidence.link_errors = vec![LinkErrorKind::Receive];
+                    state.kept.get_mut(&2).unwrap().evidence.link_errors =
+                        vec![LinkErrorKind::Receive];
+                }
                 let time = Some(placed_at(Clock::Device, 0, 2_000));
                 state.error_after(Some(2), 100, LinkErrorKind::Receive, time);
                 for seq in 3..3 + extra {
                     log_unanswered(&mut state, seq);
                 }
-                assert_eq!(
-                    state.window.iter().any(|logged| logged.seq == 2),
-                    extra == 1
-                );
                 let last = state.window.back().unwrap().seq;
                 state.reset_after(1, 1, true);
-                counts.push((same_match(&state, last), link_matched(&state)));
+                assert_eq!(
+                    (same_match(&state, last), link_matched(&state)),
+                    (0, 0),
+                    "{within} {extra}"
+                );
             }
-            assert_eq!(counts, [(0, 0), (0, 0)], "{answer_us}");
+        }
+    }
+
+    /// ADR-444: with two late errors placed after one exchange, its answer counts only when it is
+    /// shown after both; one it is not shown after ends it for good.
+    #[test]
+    fn two_late_errors_after_one_exchange_count_its_answer_only_when_shown_after_both() {
+        for (time, counted) in [(5_500, 1), (5_100, 0)] {
+            let (state, silent) = owed_and_later_silence();
+            let (mut state, point) =
+                answer_and_late_error(&silent, state, device_time(0, time), false);
+            assert_eq!(point, ErrorPoint::After(1));
+            let second = placed_at(Clock::Device, 0, 5_200);
+            assert_eq!(read_late_error(&mut state, 4, second), ErrorPoint::After(1));
+            let result = settlement(&state);
+            assert_eq!(
+                (result.same_match, result.link_matched, result.kept_matched),
+                (counted, counted, counted == 1),
+                "{time}"
+            );
         }
     }
 
@@ -8075,6 +8367,51 @@ mod tests {
         assert_eq!(window_history(&state, 3).answered_same_match, 0);
         let third = state.window.iter().find(|logged| logged.seq == 3).unwrap();
         assert_ne!(third.classification, Classification::Vehicle);
+    }
+
+    /// ADR-444: the answer of an owned exchange, freed after a late error placed after the
+    /// exchange, counts for the later exchange when its stored time is shown after the error, and
+    /// for none when it is not, whether the exchange is still in the window or has left it.
+    #[test]
+    fn an_answer_freed_after_an_error_placed_after_its_exchange_counts_by_its_stored_time() {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let response = vec![0x62, 0xF1, 0x86, 0x41];
+        for (answer_us, counted) in [(5_500, 1), (2_200, 0)] {
+            for extra in [0, WINDOW as u64] {
+                let mut owned = silent.clone();
+                pending_only(&mut owned);
+                let mut state = LinkState::default();
+                let (_, owner) = log_kept(&mut state, 1, timed(silent.clone(), Some(1_000), None));
+                state.keep(1, owner);
+                let (_, kept) = log_kept_owned(&mut state, 2, timed(owned, Some(2_000), None));
+                state.keep(2, kept);
+                log_kept(&mut state, 3, timed(silent.clone(), Some(6_000), None));
+                let at = device_time(0, answer_us);
+                state.kept.get_mut(&2).unwrap().answer_at = at;
+                state
+                    .window
+                    .iter_mut()
+                    .find(|l| l.seq == 2)
+                    .unwrap()
+                    .answer_at = at;
+                let error = placed_at(Clock::Device, 0, 5_000);
+                assert_eq!(state.place_error(error), ErrorPoint::After(2));
+                state.error_after(Some(2), 4, LinkErrorKind::Receive, Some(error));
+                for seq in 4..4 + extra {
+                    log_unanswered(&mut state, seq);
+                }
+                assert_eq!(logged_beyond(&state, 2), extra > 0);
+                let kept = state.kept(1).unwrap().clone();
+                settle_late(&mut state, 1, &kept, &response);
+                let last = state.window.back().unwrap().seq;
+                assert_eq!(
+                    (same_match(&state, last), link_matched(&state)),
+                    (counted, counted),
+                    "{answer_us} {extra}"
+                );
+            }
+        }
     }
 
     /// A settling entry that adds no answer stores no answer time (ADR-384, ADR-385).

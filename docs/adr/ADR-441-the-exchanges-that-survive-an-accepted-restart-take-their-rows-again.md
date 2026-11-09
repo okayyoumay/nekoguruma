@@ -1,10 +1,10 @@
 # ADR-441: The Exchanges That Survive an Accepted Restart Take Their Rows Again
 
 **Date:** 2026-11-09
-**Status:** Accepted
+**Status:** Accepted (Consequences' bullet on the restart's uncounted matched answers closed by decision 7)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState::record`, `LinkState::reset_after`,
 `LinkState::refresh_kept_beyond_window`, `LinkState::refresh_window_survivors`,
-`LinkState::refresh_row_owners`), design 8.11 "Settlement"; ADR-368, ADR-435 decision 6,
+`LinkState::refresh_row_owners`, `LinkState::free_owner_answer`), design 8.11 "Settlement"; ADR-368, ADR-435 decision 6,
 ADR-439 decisions 1 and 3 and Consequences
 
 ## Context
@@ -69,6 +69,36 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
    owner of `r`. If `r` was answered by the survivor's request, `r` was sent after the
    restart and its own answer may still come; refreshing `r` from the live rows would drop a row
    that is right.
+7. **A kept exchange after `r` counts its matched answer in the new epoch.** An owed exchange
+   beyond the window with a `seq` after `r` was sent after the restart, so its answer belongs to
+   the new epoch (`reset_after` shifts its `clears.matched` with the window's later exchanges)
+   and, unlike a survivor's, can count; the recount from the window's `matched_at` alone cannot
+   find it. `reset_after` therefore adds two kinds of answer to what the window's later
+   exchanges (`answered_same_match`) and the link's matched count (`matched`) take from the
+   window:
+   - an exchange the visit releases (`Place::BeyondReleased`: rows and record as `BeyondRows`)
+     counts its matched answer when it is placed alone or loses its last row, also when it
+     counted at its record, since it is no longer kept and no later visit can count it;
+   - an exchange that stays kept counts when its record notes a matched answer
+     (`Kept::matched`) and no link error its own entry saw came after the answer (the record's
+     note ignores that, since `record` keeps the answer's earlier epoch for it). A late link
+     error read later ends a kept record's answer as it ends a window exchange's: `error_after`
+     clears `Kept::matched` of a record at or after the error's place, whether in the window or
+     beyond it, whose stored answer time is not shown after the error (ADR-385): the same
+     records whose clears the error shifts, since `Kept::matched` says the answer counts in
+     the epoch of those clears.
+     The recount does not test that time again, since it would then also drop the record for
+     exchanges before the error, which the error does not end it for; one that did not count
+     yet is counted by the settlement that follows (`Place::Beyond`), once, since that sets
+     `Kept::matched`.
+
+   Both kinds are counted on the unusable path too (a positive response the agent cannot use,
+   `accepting` false): nothing is released then, so only the kept records are read, and a
+   later settlement counts the rest.
+
+   A released record is gone before the kept ones are read, so none is counted twice. The
+   survivors (`seq` before `r`) never count: their epoch is before the restart. This closes the
+   gap ADR-439 decision 3 recorded; it changes no other decision.
 
 ## Consequences
 
@@ -83,5 +113,5 @@ that rows follow owners as they are now (ADR-435 decision 6, ADR-439 decision 1)
 - An owed exchange with no kept record that has left the window keeps a stale row (the case
   ADR-439's last Consequences bullet describes), also when a restart is what let its owner go;
   it stays open as a backlog item.
-- The restart's matched answers of exchanges beyond the window stay uncounted (ADR-439
-  Consequences); this is unchanged.
+- The matched answers of the survivors stay uncounted (decision 3), as they are from before the
+  restart.

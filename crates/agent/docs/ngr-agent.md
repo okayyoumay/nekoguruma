@@ -680,8 +680,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   (ADR-370): the exchange in flight was not yet in flight with the identifier when the item's
   VCI time comes before its own transmit done (`before_starts`). It is written before the
   exchange's own items, and restates that
-  exchange's `sent` and outcome, judges its timing again, and reclassifies it and the later
-  exchanges (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept
+  exchange's `sent` and outcome, judges its timing again, and reclassifies it (not a record whose
+  evidence settles its exchange, below) and the later exchanges
+  (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept
   (`Kept::late_start`), so a late response that completes it, spanning frames, is `system`; a
   start after the limit plus the margin is kept the same way, and any response completing it is
   judged as a late one (`vehicle` when the VCI ended its wait at the limit).
@@ -702,12 +703,17 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   late response; after one whose time is not shown, that limit is not known. A pending or start
   whose one possible owner is a record kept only for its rows that a late final would not settle
   (`Kept::late_pending_or_start_settles`) is not settled this way, and the record stands
-  (ADR-450). Such an item, and the others, are `unattached` events, written in the order read
+  (ADR-450). Such an item, and the
+  others, are `unattached` events, written in the order read
   and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header
   is not a plain 4-byte CAN identifier (extended or mixed addressing), which therefore never
   confirms a send. The confirming indication's read time is the entry's
-  `times.agent.tx_confirmed_us`.
+  `times.agent.tx_confirmed_us`. A transmit indication or loopback echo whose one owner is a record whose evidence
+  settles its exchange (`Kept::late_transmit_reclassifies` false) is still that record's
+  `late_item`, which confirms the send (`sent`, the transmit done kept with the record and its
+  window entry through `LinkState::restate_send`, its `seq` out of the unknown sends) and leaves
+  the classification, the reason and the timing as they were (ADR-452).
   Status and information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
   `break` or `received`; or `error_event`), the `primitive` (`none`, `earlier`, or `in_flight` on the `late_response` of a result bound to the exchange in flight that the host rejected), a result's

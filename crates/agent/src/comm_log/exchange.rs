@@ -1989,6 +1989,17 @@ impl Kept {
         !self.evidence.settles_owed() || self.late_final_settles()
     }
 
+    /// Whether a late transmit indication or loopback echo that only this kept exchange could
+    /// own classifies it again (design 8.11 `late_item`, ADR-452): not a record whose evidence
+    /// settles the exchange, kept only for its rows (ADR-442, ADR-445, ADR-446), whose send it
+    /// confirms and nothing else. The test is the evidence alone, not whether a late final would
+    /// settle the record ([`Kept::late_final_settles`], the gate on a lone pending or start,
+    /// ADR-450): an indication of the send adds no answer, so it gives no ground to judge the
+    /// answers again, whatever the record still owns.
+    pub(crate) fn late_transmit_reclassifies(&self) -> bool {
+        !self.evidence.settles_owed()
+    }
+
     /// The late start that bears on a response with identifier `response_id` (`None` when it
     /// names none): a collecting exchange's start counts for a response on the identifier it was
     /// judged on, or an unnamed one when that is the only identifier open; any other exchange's
@@ -2543,6 +2554,24 @@ impl LinkState {
         }
         if confirmed {
             self.unknown_sends.remove(&seq);
+        }
+    }
+
+    /// The window's evidence of exchange `seq` takes the send of `evidence`, which a `late_item`
+    /// that only confirms that send gave it (ADR-452): its transmit evidence and its transmit
+    /// done, and nothing else. The classification, the reason, the history and the floor stand
+    /// as they are, where [`LinkState::settled_from_evidence`] sets them again. The kept record
+    /// takes the send through [`LinkState::update_kept`].
+    pub(crate) fn restate_send(&mut self, seq: u64, evidence: &Evidence) {
+        if let Some(logged) = self.window.iter_mut().find(|logged| logged.seq == seq) {
+            logged.evidence.transmit_evidence = evidence.transmit_evidence;
+            let tx_done = evidence.times.vci.and_then(|vci| vci.tx_done);
+            logged
+                .evidence
+                .times
+                .vci
+                .get_or_insert_with(VciTimes::default)
+                .tx_done = tx_done;
         }
     }
 

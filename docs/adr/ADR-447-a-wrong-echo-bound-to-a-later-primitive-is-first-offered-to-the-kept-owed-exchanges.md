@@ -60,10 +60,12 @@ exchanges.
    of ADR-437 decision 6). The classification stays `undetermined`, but by a row of its own, read
    from one predicate (`Evidence::end_placed`) above the rows that take the result for the ECU's
    answer to this request (suppressed positive, "does not match the definition", H4) and below
-   the rows that judge the VCI's wait against the limit (a `late` window, an early or late
-   receive timeout, a pending past its limit), so a result the VCI took after the limit plus the
-   margin keeps the exchange `system`: timing is the VCI's, separate from ownership (ADR-437
-   decision 6). The line is written before the entry, so the entry's history already
+   the rows that judge the VCI's wait against the limit (a `late` window, a pending past its
+   limit; a placed end has no receive timeout), so a result the VCI took after the limit plus the
+   margin keeps the exchange `system`, its reason naming the placement and not taking the result
+   for this request's answer: timing is the VCI's, separate from ownership (ADR-437
+   decision 6). Only an end the entry's wait read is placed: a result the wait for the
+   primitive's end read after the entry is not, even with the same bytes. The line is written before the entry, so the entry's history already
    sees the owner settled.
 5. **Scope.** Not offered: a `pattern_mismatch` result, a collecting exchange's rejected answers,
    and a result read in a stray's wait after the deadline. A stray's carried wrong echo was

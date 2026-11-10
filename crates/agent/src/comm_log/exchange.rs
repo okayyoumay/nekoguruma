@@ -1312,6 +1312,9 @@ pub(crate) struct Evidence {
     /// ADR-359 item 3): it is no answer of the request, so the link's history does not count it,
     /// and its bytes are redacted as a rejected result's are.
     pub end_rejected: bool,
+    /// The rejected end is a result the wait for the primitive's end read after the entry (not
+    /// the entry's own), which the log never offered to the earlier exchanges (ADR-447).
+    pub end_read_after_entry: bool,
     pub supply_voltage: Option<SupplyVoltage>,
     pub detail: Detail,
 }
@@ -1370,6 +1373,7 @@ impl Evidence {
             rejected: Vec::new(),
             events_lost: None,
             end_rejected: false,
+            end_read_after_entry: false,
             supply_voltage: None,
             detail: Detail::default(),
         }
@@ -1592,13 +1596,15 @@ impl Evidence {
     /// The `late_response` line that placed the result this exchange ended on, when it ended
     /// on a rejected result (`end_rejected`) the log offered to the exchanges kept owed and
     /// some could own (ADR-447). The rejected end is the last rejected result, and its bytes
-    /// are the end's, so a restated end that is another result is not it.
+    /// are the end's, so a restated end that is another result is not it; nor is a rejected end the
+    /// wait for the primitive's end read after the entry (`end_read_after_entry`), even with
+    /// the same bytes.
     pub(crate) fn end_placed(&self) -> Option<u64> {
         let End::PositiveUnusable(bytes) = &self.end else {
             return None;
         };
         let last = self.rejected.last()?;
-        if self.end_rejected && last.bytes == *bytes {
+        if self.end_rejected && !self.end_read_after_entry && last.bytes == *bytes {
             last.late_response
         } else {
             None
@@ -4499,8 +4505,30 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
     format!("{sent_phrase}; {outcome}.")
 }
 
+/// What the response that ended the wait of an exchange whose end the log placed with earlier
+/// exchanges (`Evidence::end_placed`) was, as a noun phrase the timing rows and the placed row
+/// share (ADR-447): it names the `late_response` line and says the request's own answer is not
+/// decided. Call it only when `end_placed` is `Some`.
+fn placed_phrase(evidence: &Evidence) -> String {
+    let placed = evidence.end_placed().unwrap_or_default();
+    let cut =
+        matches!(&evidence.end, End::PositiveUnusable(bytes) if evidence.own_cut_short(bytes));
+    if cut {
+        format!(
+            "a response that is only the beginning of this request's positive response; the log placed it with the earlier exchange or exchanges that could own it as well (the late response logged as {placed}), so it could be this request's own response cut short or the response of an earlier exchange: whether the ECU answered this request is not decided"
+        )
+    } else {
+        format!(
+            "a response that does not begin as this request's positive response does; the log placed it with the earlier exchange or exchanges that could own it (the late response logged as {placed}), so it is no answer to this request: whether the ECU answered this request is not decided"
+        )
+    }
+}
+
 /// How the exchange ended, as the entry's text and a late pending's reason name it.
 fn outcome_phrase(evidence: &Evidence) -> String {
+    if evidence.end_placed().is_some() {
+        return format!("it took {}", placed_phrase(evidence));
+    }
     match &evidence.end {
         End::Positive(_) => {
             let timing = match evidence.timing.window {
@@ -5637,12 +5665,21 @@ fn rows(
                     "it refused the request: {}",
                     named_code(negative_code(response))
                 ),
+                _ if evidence.end_placed().is_some() => {
+                    format!("it was {}", placed_phrase(evidence))
+                }
                 _ => "its response does not match the definition".to_owned(),
+            };
+            // A placed result is not the answer to this request (ADR-447).
+            let took = if evidence.end_placed().is_some() {
+                "the result"
+            } else {
+                "the answer"
             };
             (
                 System,
                 format!(
-                    "Two faults seen together: the ECU answered after the limit in force, by {} ms, and the VCI did not end its wait at that limit but still took the answer; {outcome}.",
+                    "Two faults seen together: the ECU answered after the limit in force, by {} ms, and the VCI did not end its wait at that limit but still took {took}; {outcome}.",
                     by_ms(&evidence.timing)
                 ),
             )
@@ -5652,22 +5689,13 @@ fn rows(
         // take it as the ECU's answer to this request, do not apply (ADR-447). Below the rows
         // of the VCI's wait against the limit, so a fault of the VCI's timing stays its own
         // (ADR-437 decision 6).
-        _ if evidence.end_placed().is_some() => {
-            let placed = evidence.end_placed().unwrap_or_default();
-            let cut = matches!(&evidence.end, End::PositiveUnusable(bytes) if evidence.own_cut_short(bytes));
-            (
-                Undetermined,
-                if cut {
-                    format!(
-                        "The VCI ended the exchange's wait on a response that is only the beginning of this request's positive response. The log placed it with the earlier exchange or exchanges that could own it as well (the late response logged as {placed}), so it could be this request's own response cut short or the response of an earlier exchange: whether the ECU answered this request is not decided."
-                    )
-                } else {
-                    format!(
-                        "The VCI ended the exchange's wait on a response that does not begin as this request's positive response does. The log placed it with the earlier exchanges that could own it (the late response logged as {placed}), so it is no answer to this request: whether the ECU answered this request is not decided."
-                    )
-                },
-            )
-        }
+        _ if evidence.end_placed().is_some() => (
+            Undetermined,
+            format!(
+                "The VCI ended the exchange's wait on {}.",
+                placed_phrase(evidence)
+            ),
+        ),
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
             if possible_pending && !pending_seen =>
         {

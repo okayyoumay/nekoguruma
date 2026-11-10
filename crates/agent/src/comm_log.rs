@@ -674,6 +674,10 @@ pub(crate) struct PrimitiveEnded {
     /// The end is a rejected one: a primitive that is not collecting finished on a wrong echo
     /// (ADR-443), whose request stays owed as an exchange entry's `end_rejected` says.
     pub end_rejected: bool,
+    /// The rejected end is the wrong echo its exchange's entry carried (the host's wait before
+    /// the deadline ended on it, nothing read after it), not one the wait for the end read: only
+    /// the carried one is a result the entry offered to the earlier exchanges (ADR-447).
+    pub end_is_carried_echo: bool,
     /// The VCI ended it with a receive timeout, or by the finished status after a rejected result
     /// (ADR-440, ADR-443).
     pub vci_ended: bool,
@@ -3451,6 +3455,7 @@ impl CommLog {
         // (ADR-443).
         if !evidence.collecting {
             evidence.end_rejected = ended.end_rejected;
+            evidence.end_read_after_entry = ended.end_rejected && !ended.end_is_carried_echo;
         }
         evidence.vci_limits_past_by_us = None;
         // What the host read for the end, by kind, each with where it was placed.
@@ -7014,6 +7019,7 @@ pub(crate) mod tests {
                 end: self.end,
                 detail: self.detail,
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: self.vci_ended,
                 reads,
             }
@@ -9567,6 +9573,7 @@ pub(crate) mod tests {
                 end,
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended,
                 reads: read_after_deadline(items),
             },
@@ -9725,6 +9732,7 @@ pub(crate) mod tests {
                 end: Some(end),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -9824,6 +9832,7 @@ pub(crate) mod tests {
                 }),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: items
                     .into_iter()
@@ -10131,6 +10140,7 @@ pub(crate) mod tests {
                     end: Some(end),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: read_after_deadline(items),
                 },
@@ -10519,6 +10529,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 300_000),
@@ -11326,6 +11337,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended,
                 reads: read_after_deadline(vec![answer_read(0x7E9, 400_000)]),
             },
@@ -11454,6 +11466,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 400_000),
@@ -11505,6 +11518,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 400_000),
@@ -11965,12 +11979,9 @@ pub(crate) mod tests {
         let (dir, setup, log) = collecting_log_on(false);
         log.exchange(non_collecting_wrong_echo(true)).unwrap();
         let second = log.exchange(late).unwrap();
-        assert!(
-            kept_of(&log, second).evidence.rejected[0]
-                .late_response
-                .is_some(),
-            "the result was still placed with the earlier exchange"
-        );
+        let placed = kept_of(&log, second).evidence.rejected[0]
+            .late_response
+            .expect("the result was still placed with the earlier exchange");
         log.end("ok");
         let lines = lines(&setup);
         std::fs::remove_dir_all(&dir).unwrap();
@@ -11978,6 +11989,15 @@ pub(crate) mod tests {
         assert_eq!(entry["classification"], "system", "{entry}");
         let reason = entry["reason"].as_str().unwrap();
         assert!(reason.contains("Two faults seen together"), "{reason}");
+        // The result was placed, so the text does not take it as this request's answer.
+        assert!(
+            reason.contains(&format!("late response logged as {placed}")),
+            "{reason}"
+        );
+        assert!(
+            !reason.contains("does not match the definition"),
+            "{reason}"
+        );
     }
 
     /// ADR-447 scope: a negative response the host rejected as a pattern mismatch is not
@@ -12215,6 +12235,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::PositiveUnusable(BOUND_ANSWER.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: true,
+                end_is_carried_echo: true,
                 vci_ended: true,
                 reads: read_after_deadline(vec![EndItem::Finished(device_time(
                     BASE_US + 5_100_000,
@@ -12232,6 +12253,45 @@ pub(crate) mod tests {
             reason.contains(&format!("logged as {}", placed.unwrap())),
             "{reason}"
         );
+    }
+
+    /// ADR-447: a stray whose wait for its end read a second result with the bytes of the placed
+    /// one, and finished on it, did not end on the placed result: its end is not placed, and the
+    /// reason is not the placement's.
+    #[test]
+    fn an_identical_result_read_in_the_stray_s_wait_is_not_the_placed_end() {
+        let (dir, setup, log) = collecting_log_on(false);
+        log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let mut stray = rejecting_read(&BOUND_ANSWER);
+        stray.end = exchange::End::VciDidNotEnd;
+        stray.end_rejected = false;
+        stray.vci_ended = false;
+        let second = log.exchange(stray).unwrap();
+        let placed = kept_of(&log, second).evidence.rejected[0].late_response;
+        assert!(placed.is_some());
+        log.primitive_ended(
+            second,
+            PrimitiveEnded {
+                end: Some(exchange::End::PositiveUnusable(BOUND_ANSWER.to_vec())),
+                detail: exchange::Detail::default(),
+                end_rejected: true,
+                end_is_carried_echo: false,
+                vci_ended: true,
+                reads: read_after_deadline(vec![EndItem::Finished(device_time(
+                    BASE_US + 5_100_000,
+                ))]),
+            },
+        )
+        .unwrap();
+        let evidence = kept_of(&log, second).evidence;
+        assert!(evidence.end_rejected && evidence.end_read_after_entry);
+        assert_eq!(evidence.end_placed(), None);
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let ended = &of_event(&lines, "primitive_ended")[0];
+        let reason = ended["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(!reason.contains("logged as"), "{reason}");
     }
 
     /// ADR-447: the later exchange keeps its result in `rejected` and its own late answer still
@@ -12266,6 +12326,7 @@ pub(crate) mod tests {
             }),
             detail: exchange::Detail::default(),
             end_rejected: vci_ended,
+            end_is_carried_echo: vci_ended,
             vci_ended,
             reads: read_after_deadline(Vec::new()),
         }
@@ -12461,6 +12522,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(answer_on(
@@ -12509,6 +12571,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Unattached(start_of_message(0x7E8)),
@@ -12545,6 +12608,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E9, 1_200_000),
@@ -12580,6 +12644,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(rejected_on(0x7E8, 1_000_000)),
@@ -12642,6 +12707,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(items),
             },
@@ -12700,6 +12766,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(items),
             },
@@ -12755,6 +12822,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(FIRST.to_vec())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     answer_read(0x7E8, 400_000),
@@ -13278,6 +13346,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Positive(accepted.clone())),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(answer_on(0x7E8, exchange::End::Positive(accepted), 400_000)),
@@ -13408,6 +13477,7 @@ pub(crate) mod tests {
                 end: Some(end),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: vec![end_read_after(
                     after_s,
@@ -13892,6 +13962,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(vec![
                     EndItem::Answer(answer_on(
@@ -14188,6 +14259,7 @@ pub(crate) mod tests {
                     end: None,
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: false,
                     reads: Vec::new(),
                 },
@@ -14202,6 +14274,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::Positive(FIRST.to_vec())),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: vec![end_read_after(
                         8,
@@ -14219,6 +14292,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::Positive(FIRST.to_vec())),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: vec![
                         end_read_after(8, answer_read(0x7E8, 3_400_000)),
@@ -14270,6 +14344,7 @@ pub(crate) mod tests {
                     end,
                     detail: exchange::Detail::default(),
                     end_rejected: rejected,
+                    end_is_carried_echo: rejected,
                     vci_ended,
                     reads: Vec::new(),
                 },
@@ -14351,6 +14426,7 @@ pub(crate) mod tests {
                 end: Some(f186_response()),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: vec![
                     end_read_after(
@@ -14679,6 +14755,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(vec![
                     EndItem::Unattached(tx_done(0x7DF)),
@@ -15044,6 +15121,7 @@ pub(crate) mod tests {
                     detail: exchange::Detail::default(),
                     // The host reads no receive timeout for a finished status.
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: false,
                     reads: read_after_deadline(items),
                 },
@@ -15086,6 +15164,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::Positive(FIRST.to_vec())),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: read_after_deadline(vec![
                         answer_read(0x7E8, 400_000),
@@ -15123,6 +15202,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: read_after_deadline(items),
                 },
@@ -15255,6 +15335,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::Positive(FIRST.to_vec())),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: read_after_deadline(vec![
                         answer_read(0x7E8, 400_000),
@@ -15298,6 +15379,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -15344,6 +15426,7 @@ pub(crate) mod tests {
                 end: Some(end),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -15630,6 +15713,7 @@ pub(crate) mod tests {
                 end: Some(end),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(items),
             },
@@ -15814,6 +15898,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::LinkError(exchange::LinkErrorKind::Receive)),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: false,
                 reads: read_after_deadline(vec![EndItem::Finished(device_time(
                     BASE_US + 1_200_000,
@@ -15920,6 +16005,7 @@ pub(crate) mod tests {
                 end,
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: timed_out,
                 reads,
             },
@@ -16125,6 +16211,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::NoResponse),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: vec![
                     end_read(400_000, EndItem::Pending(pending_on(400_000), None)),
@@ -16241,6 +16328,7 @@ pub(crate) mod tests {
                     end: Some(exchange::End::NoResponse),
                     detail: exchange::Detail::default(),
                     end_rejected: false,
+                    end_is_carried_echo: false,
                     vci_ended: true,
                     reads: read_after_deadline(items),
                 },
@@ -17312,6 +17400,7 @@ pub(crate) mod tests {
                 end: Some(exchange::End::Negative(vec![0x7F, 0x3E, 0x78])),
                 detail: exchange::Detail::default(),
                 end_rejected: false,
+                end_is_carried_echo: false,
                 vci_ended: true,
                 reads: read_after_deadline(items),
             },
@@ -23250,6 +23339,7 @@ pub(crate) mod tests {
             end,
             detail: exchange::Detail::default(),
             end_rejected: false,
+            end_is_carried_echo: false,
             vci_ended: false,
             reads,
         }

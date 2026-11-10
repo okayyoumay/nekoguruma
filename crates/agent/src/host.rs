@@ -3226,10 +3226,16 @@ fn primitive_ended_of(
             } else {
                 unanswered.is_some()
             };
+            // The end is the echo the wait before the deadline carried only when nothing was
+            // read after it: the carried echo is the first rejected result, and the one the
+            // end took is the last (ADR-447).
+            let end_is_carried_echo =
+                end_rejected && stray.unanswered_echo.is_some() && progress.rejected.len() == 1;
             crate::comm_log::PrimitiveEnded {
                 end: Some(end),
                 detail,
                 end_rejected,
+                end_is_carried_echo,
                 vci_ended: vci_ended(
                     progress.rx_timeout.is_some(),
                     progress.collecting,
@@ -3244,6 +3250,7 @@ fn primitive_ended_of(
             end: None,
             detail: Detail::default(),
             end_rejected: false,
+            end_is_carried_echo: false,
             vci_ended: false,
             reads: progress.take_reads(epoch, None),
         },
@@ -8696,6 +8703,13 @@ mod tests {
             let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
             assert_eq!(ended.vci_ended, expected, "{carried} {in_wait}");
             assert_eq!(ended.end_rejected, expected, "{carried} {in_wait}");
+            // Only an end that is the carried echo, with nothing read after it, is the one the
+            // entry offered (ADR-447).
+            assert_eq!(
+                ended.end_is_carried_echo,
+                expected && carried && !in_wait,
+                "{carried} {in_wait}"
+            );
             assert_eq!(
                 matches!(ended.end, Some(End::PositiveUnusable(ref bytes)) if bytes == &[0x62, 0xF1]),
                 expected,
@@ -8858,6 +8872,7 @@ mod tests {
                 end: ended.end.clone(),
                 detail: Detail::default(),
                 end_rejected: ended.end_rejected,
+                end_is_carried_echo: ended.end_is_carried_echo,
                 vci_ended: ended.vci_ended,
             };
             assert!(log.primitive_ended(seq, ended).is_some());

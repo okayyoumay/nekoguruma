@@ -18871,6 +18871,7 @@ def main():
                         end: None,
                         detail: Default::default(),
                         end_rejected: false,
+                        end_is_carried_echo: false,
                         vci_ended: false,
                         reads: Vec::new(),
                     },

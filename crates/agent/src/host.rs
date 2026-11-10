@@ -2714,6 +2714,7 @@ fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
                 epoch: None,
                 agent_us: rejected.read?.monotonic_us,
                 reason: rejected.reason,
+                late_response: None,
             })
         })
         .collect()
@@ -8646,6 +8647,59 @@ mod tests {
                 assert!(matches!(ended.end, Some(End::NoResponse)));
             }
         }
+    }
+
+    /// ADR-447: the wrong echo a stray carries from the entry's wait was offered at the entry, so
+    /// the stray's end hands the log no read for it: its reads are those of a stray that carried
+    /// none.
+    #[test]
+    fn a_stray_s_carried_wrong_echo_adds_no_read_for_the_log() {
+        let reads_of = |carried: bool| {
+            let progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+            let mut stray = Stray {
+                cop: Some(COP),
+                tag: vec![0; 8],
+                deadline: tokio::time::Instant::now(),
+                cancel_failed: false,
+                request: vec![0x22, 0xF1, 0x90],
+                expectation: crate::send_receive::Expectation {
+                    sid: progress.sid,
+                    positive: progress.positive_prefix.clone(),
+                    negative: progress.negative.clone(),
+                },
+                seq: Some(1),
+                exchange: Some(1),
+                response: None,
+                response_times: VciTimes::default(),
+                error: None,
+                errors: Vec::new(),
+                rejected_read: carried,
+                unanswered_echo: carried.then(|| RejectedRead {
+                    identifier: None,
+                    bytes: vec![0x62, 0xF1],
+                    vci_us: 0,
+                    clock: None,
+                    reason: RejectedReason::WrongEcho,
+                    read: None,
+                }),
+                collecting: false,
+                receive_table: TABLE.to_vec(),
+                progress: None,
+            };
+            let mut progress = stray.take_progress();
+            let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+            let done = progress
+                .on_read(
+                    Some(event_notification::EventData::Item(finished)),
+                    COP,
+                    None,
+                )
+                .expect("the finished status ends the wait");
+            let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
+            assert_eq!(ended.end_rejected, carried);
+            ended.reads.len()
+        };
+        assert_eq!(reads_of(true), reads_of(false));
     }
 
     /// A stray of the read request `22 F1 86` (not collecting) the agent's deadline ended, whose

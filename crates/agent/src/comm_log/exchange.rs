@@ -792,6 +792,10 @@ pub(crate) struct Rejected {
     pub epoch: Option<u32>,
     pub agent_us: u64,
     pub reason: RejectedReason,
+    /// The `seq` of the `late_response` line the log wrote for it, when it offered the result
+    /// to the exchanges kept owed and one or several could own it (design 8.11 `rejected`,
+    /// ADR-447). Set by the log.
+    pub late_response: Option<u64>,
 }
 
 /// Why a result bound to the primitive was not the exchange's answer.
@@ -818,6 +822,10 @@ pub(crate) struct RejectedItem {
     pub epoch: Option<u32>,
     pub agent_us: u64,
     pub reason: RejectedReason,
+    /// The `late_response` line that placed the result with the earlier exchanges that could
+    /// own it (ADR-447).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_response: Option<u64>,
 }
 
 /// The worker's report that the link's events were lost during the exchange (design 8.11
@@ -1564,6 +1572,22 @@ impl Evidence {
                     refused_after_loss: true
                 }
         )
+    }
+
+    /// The `late_response` line that placed the result this exchange ended on, when it ended
+    /// on a rejected result (`end_rejected`) the log offered to the exchanges kept owed and
+    /// some could own (ADR-447). The rejected end is the last rejected result, and its bytes
+    /// are the end's, so a restated end that is another result is not it.
+    pub(crate) fn end_placed(&self) -> Option<u64> {
+        let End::PositiveUnusable(bytes) = &self.end else {
+            return None;
+        };
+        let last = self.rejected.last()?;
+        if self.end_rejected && last.bytes == *bytes {
+            last.late_response
+        } else {
+            None
+        }
     }
 
     /// The exchange has a final response, no identifier is left open on a pending and none is
@@ -4358,6 +4382,7 @@ impl ExchangeEntry {
                     epoch: rejected.epoch,
                     agent_us: rejected.agent_us,
                     reason: rejected.reason,
+                    late_response: rejected.late_response,
                 })
                 .collect(),
             events_lost: evidence.events_lost,
@@ -5573,6 +5598,16 @@ fn rows(
         }
         // A window `timeout_early` or `timeout_late` on a response has no other row.
         _ if timed_out_unjudged => last_row(),
+        // The result that ended the wait was placed with the earlier exchanges that could own
+        // it, so it says nothing about this request's own answer: the rows below, which take it
+        // as the ECU's answer to this request, do not apply (ADR-447).
+        _ if evidence.end_placed().is_some() => (
+            Undetermined,
+            format!(
+                "The VCI ended the exchange's wait on a response that does not begin as this request's positive response does. The log placed it with the earlier exchange or exchanges that could own it (the late response logged as {}), so it is no answer to this request: whether the ECU answered this request is not decided.",
+                evidence.end_placed().unwrap_or_default()
+            ),
+        ),
         End::Positive(_) if suppressed && !pending_seen && !late => {
             if absorbing {
                 (
@@ -8835,6 +8870,7 @@ mod tests {
                 epoch: None,
                 agent_us: 9,
                 reason: RejectedReason::WrongEcho,
+                late_response: None,
             },
             Rejected {
                 rx_id: 0x7E8,
@@ -8844,6 +8880,7 @@ mod tests {
                 epoch: None,
                 agent_us: 10,
                 reason: RejectedReason::WrongEcho,
+                late_response: None,
             },
         ];
         with.events_lost = Some(EventsLost {

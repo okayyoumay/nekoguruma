@@ -489,7 +489,16 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   neither the classification nor `link_history`, except that a primitive that ended with no answer
   after a rejected result of positive form gives that response as the entry's outcome,
   `positive_unusable` (`unanswered_end`, `Evidence::end_rejected`), redacted as a rejected result
-  and counted for no answer in `link_history`; the job still gets no answer. A collecting
+  and counted for no answer in `link_history`; the job still gets no answer. The log offers each
+  `wrong_echo` result of a request that is not collecting to the exchanges kept owed, with the
+  unbound items in the order the host read them and before the entry
+  (`Inner::offer_rejected`, `late_response_owner_with`, ADR-447): one owner is settled by a
+  `late_response` with `primitive` `in_flight`, several by an unowned one that names no
+  `unattached` line, and the item then carries that line's `seq` as `late_response`, which the
+  entry's classification reason reads (`Evidence::end_placed`). The exchange itself counts as an
+  owner in flight only when the result is its own positive prefix cut short, which leaves the
+  answer unowned. A `pattern_mismatch`, a collecting request's rejected answers and a result read
+  in a stray's wait after the deadline are not offered. A collecting
   request lists such results among its `answers` instead (`Answer::is_rejected`): a rejected
   answer is no answer on its identifier, so it folds no pending, covers no identifier or unnamed
   pending (`standing_answers_covering`) and leaves its identifier silent; `collecting_end` gives
@@ -640,7 +649,9 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   exchanges logged later, and a later exchange whose answer no owed request can own any more is
   owed no more. A response two or more exchanges could own stays `unattached`, followed by a
   `late_response` that chooses no owner and raises each owed one that could own it to at least
-  `undetermined`; the exchange in flight that could own it is at least `undetermined` too. Every other
+  `undetermined`; the exchange in flight that could own it is at least `undetermined` too. A
+  rejected `wrong_echo` bound to the exchange in flight is settled or raised the same way but with
+  `primitive` `in_flight` and no `unattached` line (ADR-447). Every other
   item is an `unattached` event, except a link error of no primitive read during the exchange
   (not a receive timeout or a lost VCI) whose VCI time is not before the exchange's earliest one,
   or cannot be set against it: that is a link error of the exchange itself. Any other link error,
@@ -695,7 +706,7 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   `times.agent.tx_confirmed_us`.
   Status and information items are not written. Each gives the `link`, the `item` (from a result item's
   RxFlag, ISO 22900-2:2022 D.2.2: `transmit_indication`, `loopback`, `start_of_message`,
-  `break` or `received`; or `error_event`), the `primitive` (`none` or `earlier`), a result's
+  `break` or `received`; or `error_event`), the `primitive` (`none`, `earlier`, or `in_flight` on the `late_response` of a result bound to the exchange in flight that the host rejected), a result's
   `identifier` when its header carries one, the raw
   `vci_us` with the `clock` the worker gives the item (`device` or `worker`, ADR-353), or none
   when the worker gives none, since the agent does not infer it from the worker (design

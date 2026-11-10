@@ -582,7 +582,8 @@ struct UnattachedEntry<'a> {
     /// `transmit_indication`, `loopback`, `start_of_message`, `break`, `received` (a message
     /// another node sent: a response, a pending, or anything else), or `error_event`.
     item: &'static str,
-    /// `none` or `earlier`.
+    /// `none`, `earlier`, or `in_flight` (a result bound to the primitive of the exchange that
+    /// read it, which the host rejected, ADR-447).
     primitive: &'static str,
     /// The item's VCI time, raw.
     vci_us: u32,
@@ -1076,6 +1077,12 @@ struct ReadAt {
 }
 
 impl<'a> UnattachedEntry<'a> {
+    /// The entry of a result bound to the primitive of the exchange in flight (ADR-447).
+    fn in_flight(mut self) -> Self {
+        self.primitive = "in_flight";
+        self
+    }
+
     fn of(item: &'a UnattachedItem, placed: Option<clocks::Placed>) -> Self {
         use redaction::{Direction, redact};
         let mut entry = Self {
@@ -2355,6 +2362,11 @@ impl CommLog {
         // the lines that use them.
         inner.exchange_began_us = Some(evidence.times.agent.before_us);
         let mut unbound_placed = vec![None; unbound.len()];
+        // Where each unbound item and each rejected result stands in the order the host read
+        // them, which gives the order they are offered to the owed exchanges (ADR-447).
+        let mut unbound_order = vec![usize::MAX; unbound.len()];
+        let mut rejected_placed = vec![None; evidence.rejected.len()];
+        let mut rejected_order = vec![usize::MAX; evidence.rejected.len()];
         let mut pending_placed = vec![None; evidence.pending.len()];
         let mut reads = Vec::new();
         for (index, item) in unbound.iter().enumerate() {
@@ -2470,6 +2482,7 @@ impl CommLog {
                     let item = &unbound[index];
                     unbound_placed[index] =
                         inner.place_read(item.clock, u64::from(item.vci_us), item.read)?;
+                    unbound_order[index] = order;
                 }
                 HostRead::Pending(index) => {
                     let pending = &evidence.pending[index];
@@ -2484,6 +2497,8 @@ impl CommLog {
                     let raw = rejected.vci_us.unwrap_or_default();
                     let placed = inner.place_read(rejected.clock, raw, read_at(read_us))?;
                     evidence.rejected[index].epoch = placed.map(|placed| placed.epoch);
+                    rejected_placed[index] = placed;
+                    rejected_order[index] = order;
                 }
                 HostRead::End => {
                     if let Some(end) = vci.rx_end {
@@ -2569,6 +2584,7 @@ impl CommLog {
             )? {
                 unbound.remove(index);
                 unbound_placed.remove(index);
+                unbound_order.remove(index);
             } else {
                 index += 1;
             }
@@ -2584,6 +2600,7 @@ impl CommLog {
         {
             let indication = unbound.remove(own);
             let placed = unbound_placed.remove(own);
+            unbound_order.remove(own);
             let read = indication.read;
             vci.tx_done = Some(
                 exchange::VciTime::new(u64::from(indication.vci_us), indication.clock).at(placed),
@@ -2664,12 +2681,14 @@ impl CommLog {
                         .reduce(exchange::VciTime::prefer);
                 }
             }
-            let mut keep = unbound
+            let keep = unbound
                 .iter()
                 .map(|item| !item.is_start_indication_for(rx_id))
-                .collect::<Vec<_>>()
-                .into_iter();
-            unbound_placed.retain(|_| keep.next().unwrap_or(true));
+                .collect::<Vec<_>>();
+            let mut kept = keep.iter().copied();
+            unbound_placed.retain(|_| kept.next().unwrap_or(true));
+            let mut kept = keep.iter().copied();
+            unbound_order.retain(|_| kept.next().unwrap_or(true));
             unbound.retain(|item| !item.is_start_indication_for(rx_id));
             evidence.response_started = true;
             // Only a wait the VCI ended is an incomplete response; one the agent's own
@@ -2771,6 +2790,7 @@ impl CommLog {
             }
             unbound.remove(at_item);
             unbound_placed.remove(at_item);
+            unbound_order.remove(at_item);
         }
         // The items bound to the primitive were read too: its pendings, its transmit
         // confirmation, its response, and its end. A refused exchange read none.
@@ -2816,6 +2836,7 @@ impl CommLog {
             )? {
                 unbound.remove(at_item);
                 unbound_placed.remove(at_item);
+                unbound_order.remove(at_item);
             } else {
                 at_item += 1;
             }
@@ -2916,13 +2937,68 @@ impl CommLog {
         // (the maintainer's decision, 2026-10-28).
         let mut may_own_transmit = false;
         let mut may_own_start = false;
-        for (item, placed) in unbound.iter().zip(unbound_placed) {
-            let flags =
-                inner.place_unbound_item(at, item, placed, Some(&evidence), &in_flight, None)?;
-            may_own_unattached |= flags.unattached;
-            may_own_transmit |= flags.transmit;
-            may_own_start |= flags.start;
+        // The result bound to this exchange's primitive that its host rejected as a wrong echo
+        // may be the response of an earlier exchange the log keeps owed: it is offered to them
+        // with the unbound items, in the order the host read them, before the entry (ADR-447).
+        let mut rejected_waiting: Vec<usize> = (0..evidence.rejected.len())
+            .filter(|&index| {
+                let rejected = &evidence.rejected[index];
+                !evidence.collecting
+                    && rejected.reason == exchange::RejectedReason::WrongEcho
+                    && rejected_order[index] != usize::MAX
+                    && rejected.vci_us.is_some_and(|us| u32::try_from(us).is_ok())
+            })
+            .collect();
+        rejected_waiting.sort_by_key(|&index| rejected_order[index]);
+        let mut offers = Vec::new();
+        let mut rejected_waiting = rejected_waiting.into_iter().peekable();
+        for (index, &order) in unbound_order.iter().enumerate() {
+            while order != usize::MAX
+                && rejected_waiting
+                    .peek()
+                    .is_some_and(|&rejected| rejected_order[rejected] < order)
+            {
+                offers.extend(rejected_waiting.next().map(Offer::Rejected));
+            }
+            offers.push(Offer::Unbound(index));
         }
+        offers.extend(rejected_waiting.map(Offer::Rejected));
+        for offer in offers {
+            match offer {
+                Offer::Unbound(index) => {
+                    let flags = inner.place_unbound_item(
+                        at,
+                        &unbound[index],
+                        unbound_placed[index],
+                        Some(&evidence),
+                        &in_flight,
+                        None,
+                    )?;
+                    may_own_unattached |= flags.unattached;
+                    may_own_transmit |= flags.transmit;
+                    may_own_start |= flags.start;
+                }
+                Offer::Rejected(index) => {
+                    let late = inner.offer_rejected(
+                        at,
+                        &evidence,
+                        index,
+                        rejected_placed[index],
+                        agent_epoch,
+                    )?;
+                    evidence.rejected[index].late_response = late;
+                }
+            }
+        }
+        // The rejected end is the last rejected result, which the entry's reason relies on
+        // (ADR-447).
+        debug_assert!(
+            !evidence.end_rejected
+                || !matches!(&evidence.end, exchange::End::PositiveUnusable(bytes)
+                    if evidence.rejected.last().is_some_and(|last| last.late_response.is_some()
+                        && last.bytes != *bytes)),
+            "the end placed with earlier exchanges is the last rejected result"
+        );
         // Each answer's history as an exchange of its own: the owed requests it could belong to
         // are its identifier's. The one derivation the link also reads again at a settlement.
         let history = inner.links[at].1.history_for(&evidence);
@@ -4568,6 +4644,19 @@ fn late_response_owner(
     evidence: Option<&exchange::Evidence>,
     besides: Option<u64>,
 ) -> Option<LateOwner> {
+    let in_flight = evidence.is_some_and(|evidence| awaited_by(item, evidence));
+    late_response_owner_with(state, item, in_flight, besides)
+}
+
+/// [`late_response_owner`] with the caller's say on whether the exchange in flight could own
+/// `item` too (`in_flight`). The owner rule is this one function for an unbound item and for a
+/// result bound to the exchange in flight that the host rejected (ADR-447).
+fn late_response_owner_with(
+    state: &exchange::LinkState,
+    item: &UnattachedItem,
+    in_flight: bool,
+    besides: Option<u64>,
+) -> Option<LateOwner> {
     let UnattachedData::Result {
         rx_flag,
         identifier,
@@ -4580,7 +4669,6 @@ fn late_response_owner(
     if bytes.is_empty() || !is_received(rx_flag) || item.pending_bytes().is_some() {
         return None;
     }
-    let in_flight = evidence.is_some_and(|evidence| awaited_by(item, evidence));
     let mut owners = state.late_response_owners(*identifier, bytes);
     owners.retain(|owner| Some(*owner) != besides);
     // A pending is a late item, not a late response.
@@ -4635,6 +4723,14 @@ fn ended_ordinal(ended: &PrimitiveEnded) -> usize {
             _ => false,
         })
         .unwrap_or(ended.reads.len())
+}
+
+/// What an exchange's entry offers the owed exchanges, in the order the host read it (ADR-447).
+enum Offer {
+    /// The unbound item at this place.
+    Unbound(usize),
+    /// The rejected result at this place.
+    Rejected(usize),
 }
 
 /// Whether an indication of the item may be the exchange in flight's own.
@@ -4745,7 +4841,7 @@ impl Inner {
         if let Some(LateOwner::Several(owners, in_flight)) = owner {
             flags.unattached |= in_flight;
             if !owners.is_empty() {
-                self.late_response_unowned(at, &owners, item, placed, unattached)?;
+                self.late_response_unowned(at, &owners, item, placed, Some(unattached))?;
             }
         }
         if let Some((kind, id)) = item.late_indication() {
@@ -4766,6 +4862,58 @@ impl Inner {
 }
 
 impl Inner {
+    /// Offers the rejected result `index` of `evidence`, the exchange being logged on link `at`,
+    /// to the owed exchanges the log keeps (ADR-447): the one that could own it settles through
+    /// its `late_response`, several are each raised to at least `undetermined` by an unowned one.
+    /// The `seq` of the line written, `None` when the result is offered to no owner; `None`
+    /// outside once the log has failed. `placed` is the time the log gave it already, which is
+    /// not placed again (ADR-361).
+    fn offer_rejected(
+        &mut self,
+        at: usize,
+        evidence: &exchange::Evidence,
+        index: usize,
+        placed: Option<clocks::Placed>,
+        agent_epoch: u32,
+    ) -> Option<Option<u64>> {
+        let rejected = &evidence.rejected[index];
+        let Some(vci_us) = rejected.vci_us.and_then(|us| u32::try_from(us).ok()) else {
+            return Some(None);
+        };
+        let item = UnattachedItem {
+            link: evidence.link,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock: rejected.clock,
+            read: Some(AgentNow {
+                epoch: agent_epoch,
+                monotonic_us: rejected.agent_us,
+                wall_unix_ms: 0,
+            }),
+            data: UnattachedData::Result {
+                rx_flag: vec![0; 4],
+                identifier: (rejected.rx_id != 0).then_some(rejected.rx_id),
+                bytes: rejected.bytes.clone(),
+            },
+        };
+        // The exchange itself counts as in flight only when the result may be its own
+        // response cut short: a non-empty proper beginning of its positive prefix.
+        let prefix = &evidence.expected.positive_prefix;
+        let own = !rejected.bytes.is_empty()
+            && rejected.bytes.len() < prefix.len()
+            && prefix.starts_with(&rejected.bytes);
+        match late_response_owner_with(&self.links[at].1, &item, own, None) {
+            Some(LateOwner::One(owner)) => {
+                self.late_response_written(at, owner, &item, placed, true)
+            }
+            Some(LateOwner::Several(owners, _)) if !owners.is_empty() => {
+                self.late_response_unowned(at, &owners, &item, placed, None)
+            }
+            _ => Some(None),
+        }
+    }
+
     /// Writes the `late_response` settling entry of `item`, a response of the owed exchange
     /// `owner` on link `at`, which it settles (design 8.11 "Settlement", ADR-365).
     fn late_response(
@@ -4775,12 +4923,27 @@ impl Inner {
         item: &UnattachedItem,
         placed: Option<clocks::Placed>,
     ) -> Option<()> {
+        self.late_response_written(at, owner, item, placed, false)
+            .map(|_| ())
+    }
+
+    /// [`Inner::late_response`], giving the `seq` of the line it wrote (`None` inside when it
+    /// wrote none). `bound` says `item` is a result bound to the primitive of the exchange in
+    /// flight that the host rejected (ADR-447), which the line says in its `primitive`.
+    fn late_response_written(
+        &mut self,
+        at: usize,
+        owner: u64,
+        item: &UnattachedItem,
+        placed: Option<clocks::Placed>,
+        bound: bool,
+    ) -> Option<Option<u64>> {
         let UnattachedData::Result { bytes, .. } = &item.data else {
-            return Some(());
+            return Some(None);
         };
         let state = &mut self.links[at].1;
         let Some(kept) = state.kept(owner).cloned() else {
-            return Some(());
+            return Some(None);
         };
         let named = match &item.data {
             UnattachedData::Result { identifier, .. } => *identifier,
@@ -4904,7 +5067,14 @@ impl Inner {
             refers_to: std::iter::once(owner)
                 .chain(later.iter().map(|later| later.seq))
                 .collect(),
-            response: UnattachedEntry::of(item, placed),
+            response: {
+                let response = UnattachedEntry::of(item, placed);
+                if bound {
+                    response.in_flight()
+                } else {
+                    response
+                }
+            },
             unattached: None,
             exchanges: std::iter::once(Settled {
                 seq: owner,
@@ -4922,27 +5092,37 @@ impl Inner {
             .collect(),
             not_reclassified_through: not_reclassified,
             text: format!(
-                "The ECU's response to the exchange logged as {owner} was delivered after that exchange had ended.{}{}",
+                "The ECU's response to the exchange logged as {owner} was delivered {}.{}{}",
+                if bound {
+                    "bound to the primitive of a later exchange, after that exchange had ended"
+                } else {
+                    "after that exchange had ended"
+                },
                 restart_text(restart),
                 not_reclassified_text(not_reclassified)
             ),
             classification: top,
         });
-        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
-        self.refresh_loss(&changed)
+        let line = self
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        self.refresh_loss(&changed)?;
+        Some(Some(line))
     }
 
     /// Writes the `late_response` settling entry of `item`, a response two or more exchanges
     /// could own, logged `unattached` as line `unattached`: each owed exchange of `owners` on
     /// link `at` is at least `undetermined`, and stays owed (design 8.11 `late_response`).
+    /// With no `unattached` line the item is a result bound to the primitive of the exchange
+    /// in flight, which its `rejected` lists (ADR-447). The `seq` of the line it wrote (`None`
+    /// inside when it wrote none).
     fn late_response_unowned(
         &mut self,
         at: usize,
         owners: &[u64],
         item: &UnattachedItem,
         placed: Option<clocks::Placed>,
-        unattached: u64,
-    ) -> Option<()> {
+        unattached: Option<u64>,
+    ) -> Option<Option<u64>> {
         let state = &mut self.links[at].1;
         let mut exchanges = Vec::new();
         for owner in owners {
@@ -4974,25 +5154,35 @@ impl Inner {
         }
         let Some(classification) = exchanges.iter().map(|settled| settled.classification).max()
         else {
-            return Some(());
+            return Some(None);
         };
         let changed: Vec<(u64, exchange::Classification)> = exchanges
             .iter()
             .map(|settled| (settled.seq, settled.classification))
             .collect();
+        let response = UnattachedEntry::of(item, placed);
         let event = Event::LateResponse(LateResponseEntry {
             refers_to: owners.to_vec(),
-            response: UnattachedEntry::of(item, placed),
-            unattached: Some(unattached),
+            response: if unattached.is_none() {
+                response.in_flight()
+            } else {
+                response
+            },
+            unattached,
             exchanges,
             not_reclassified_through: None,
-            text: format!(
-                "A response was delivered that two or more exchanges could own (logged unattached as {unattached}); none is chosen as its owner."
-            ),
+            text: match unattached {
+                Some(unattached) => format!(
+                    "A response was delivered that two or more exchanges could own (logged unattached as {unattached}); none is chosen as its owner."
+                ),
+                None => "A response bound to the primitive of a later exchange, which that exchange's host did not take as its answer, could be the response of two or more earlier exchanges (listed with that exchange as rejected); none is chosen as its owner.".to_owned(),
+            },
             classification,
         });
-        self.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
-        self.refresh_loss(&changed)
+        let line = self
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        self.refresh_loss(&changed)?;
+        Some(Some(line))
     }
 
     /// Writes the `late_item` settling entry of `item`, an indication of the owed exchange
@@ -8465,6 +8655,7 @@ pub(crate) mod tests {
             epoch: None,
             agent_us: agent_of(span + 3_000),
             reason: exchange::RejectedReason::WrongEcho,
+            late_response: None,
         }];
         let start = UnattachedItem {
             vci_us: 10_000,
@@ -10729,8 +10920,9 @@ pub(crate) mod tests {
                 &[seq],
                 &late_final_on(0x7E9),
                 placed_after(3_200_000),
-                999,
+                Some(999),
             )
+            .unwrap()
             .unwrap();
         let rebuilt = log.lock().links[0]
             .1
@@ -11453,6 +11645,441 @@ pub(crate) mod tests {
         assert!(!read_owed_on(&log, 0x7E8, seq).1);
         assert!(late_owner_of(&log, &late_read_on(0x7E8)).is_none());
         std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A request to `0x7E0` that is not collecting, transmitted at `BASE_US`, whose primitive the
+    /// VCI finished on `echo`, a result bound to it that the host rejected for `reason` and
+    /// logged as read 1 s after the transmit (ADR-447).
+    fn rejecting(
+        request: &[u8],
+        echo: &[u8],
+        reason: exchange::RejectedReason,
+    ) -> exchange::Evidence {
+        waited(endpoint(0x7E0), request, false, |evidence| {
+            evidence.end = exchange::End::PositiveUnusable(echo.to_vec());
+            evidence.end_rejected = true;
+            evidence.vci_ended = true;
+            evidence.rejected = vec![rejected_result(echo, reason)];
+        })
+    }
+
+    fn rejected_result(echo: &[u8], reason: exchange::RejectedReason) -> exchange::Rejected {
+        exchange::Rejected {
+            rx_id: 0x7E8,
+            bytes: echo.to_vec(),
+            vci_us: Some(BASE_US + 1_000_000),
+            clock: Some(exchange::Clock::Device),
+            epoch: None,
+            agent_us: BASE_US + 1_000_300,
+            reason,
+            late_response: None,
+        }
+    }
+
+    /// The `22 F1 91` request that ends on the wrong echo `echo`.
+    fn rejecting_read(echo: &[u8]) -> exchange::Evidence {
+        rejecting(
+            &[0x22, 0xF1, 0x91],
+            echo,
+            exchange::RejectedReason::WrongEcho,
+        )
+    }
+
+    /// The usable answer to `22 F1 86` that a worker bound to the next request's primitive.
+    const BOUND_ANSWER: [u8; 4] = [0x62, 0xF1, 0x86, 0x41];
+
+    /// The position of line `seq` among `lines`.
+    fn position_of_seq(lines: &[serde_json::Value], seq: u64) -> usize {
+        lines.iter().position(|line| line["seq"] == seq).unwrap()
+    }
+
+    /// ADR-447: a wrong echo bound to the next request that only one kept exchange could own is
+    /// that exchange's `late_response`, written before the later exchange's entry, which keeps
+    /// the result in `rejected` with the line's `seq`, its outcome and its keep.
+    #[test]
+    fn a_wrong_echo_bound_to_the_next_primitive_settles_the_one_kept_exchange_that_could_own_it() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        assert_eq!(read_owed_on(&log, 0x7E8, first), (vec![first], true));
+        let second = log.exchange(rejecting_read(&BOUND_ANSWER)).unwrap();
+        // The earlier exchange is settled, the later one stays kept and owed.
+        assert_eq!(read_owed_on(&log, 0x7E8, first), (Vec::new(), false));
+        let kept = kept_of(&log, second);
+        assert!(kept.evidence.end_rejected && kept.evidence.vci_ended);
+        let late_seq = kept.evidence.rejected[0].late_response.unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([first]), "{late:?}");
+        assert_eq!(late[0]["primitive"], "in_flight", "{late:?}");
+        assert_eq!(late[0]["seq"], late_seq, "{late:?}");
+        assert!(late[0].get("unattached").is_none(), "{late:?}");
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        assert!(position_of_seq(&lines, first) < position_of_seq(&lines, late_seq));
+        assert!(position_of_seq(&lines, late_seq) < position_of_seq(&lines, second));
+        let entry = lines.iter().find(|line| line["seq"] == second).unwrap();
+        assert_eq!(entry["rejected"][0]["late_response"], late_seq, "{entry}");
+        assert_eq!(entry["outcome"]["result"], "positive_unusable", "{entry}");
+        assert_eq!(entry["classification"], "undetermined", "{entry}");
+        let reason = entry["reason"].as_str().unwrap();
+        assert!(reason.contains(&late_seq.to_string()), "{reason}");
+        assert!(
+            !reason.contains("does not match the definition"),
+            "{reason}"
+        );
+        assert!(!reason.contains("The ECU answered"), "{reason}");
+    }
+
+    /// ADR-447: the same result when two kept exchanges could own it is left unowned: one
+    /// `late_response` names both, each is at least `undetermined` and stays owed, and no
+    /// `unattached` line is written for a result the later entry lists.
+    #[test]
+    fn a_wrong_echo_bound_to_the_next_primitive_is_left_unowned_when_two_kept_exchanges_could_own_it()
+     {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let second = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let third = log.exchange(rejecting_read(&BOUND_ANSWER)).unwrap();
+        assert_eq!(
+            read_owed_on(&log, 0x7E8, first).0,
+            vec![first, second],
+            "both stay owed"
+        );
+        assert!(kept_of(&log, first).evidence.late_final_settles());
+        let late_seq = kept_of(&log, third).evidence.rejected[0]
+            .late_response
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([first, second]));
+        assert_eq!(late[0]["primitive"], "in_flight", "{late:?}");
+        assert_eq!(late[0]["seq"], late_seq, "{late:?}");
+        assert!(late[0].get("unattached").is_none(), "{late:?}");
+        for settled in late[0]["exchanges"].as_array().unwrap() {
+            assert_eq!(settled["classification"], "undetermined", "{late:?}");
+        }
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        assert!(position_of_seq(&lines, late_seq) < position_of_seq(&lines, third));
+    }
+
+    /// ADR-447: nothing the log keeps could own the result, so the later entry is as it was
+    /// without the offer: no `late_response`, no field, the earlier reasons.
+    #[test]
+    fn a_wrong_echo_bound_to_the_next_primitive_stays_only_rejected_when_no_kept_exchange_owns_it()
+    {
+        // (the kept exchange's vci_ended, the echo, whether it is owed to the echo's identifier)
+        for (kept, echo, why) in [
+            (
+                false,
+                BOUND_ANSWER.to_vec(),
+                "the earlier exchange is not kept",
+            ),
+            (
+                true,
+                vec![0x62, 0xF1, 0x87, 0x41],
+                "the echo matches no owed request",
+            ),
+        ] {
+            let (dir, setup, log) = collecting_log_on(false);
+            let first = log.exchange(non_collecting_wrong_echo(kept)).unwrap();
+            let second = log.exchange(rejecting_read(&echo)).unwrap();
+            assert!(
+                kept_of(&log, second).evidence.rejected[0]
+                    .late_response
+                    .is_none(),
+                "{why}"
+            );
+            assert_eq!(read_owed_on(&log, 0x7E8, first).1, kept, "{why}");
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            assert!(of_event(&lines, "late_response").is_empty(), "{why}");
+            let entry = lines.iter().find(|line| line["seq"] == second).unwrap();
+            assert!(
+                entry["rejected"][0].get("late_response").is_none(),
+                "{entry}"
+            );
+            assert_eq!(
+                entry["reason"], "The ECU's response does not match the definition.",
+                "{why}: {entry}"
+            );
+        }
+        // An identifier no owed request is owed on.
+        let (dir, _setup, log) = collecting_log_on(false);
+        log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let mut other = rejecting_read(&BOUND_ANSWER);
+        other.rejected[0].rx_id = 0x7E9;
+        let second = log.exchange(other).unwrap();
+        assert!(
+            kept_of(&log, second).evidence.rejected[0]
+                .late_response
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-447: a result that is the later request's own response cut short is no sure answer of
+    /// the earlier one. An earlier exchange whose prefix the cut result still begins with
+    /// (`22 F1 90 F1 91`, prefix `62`) is not settled; the line names it unowned, as the later
+    /// exchange counts as in flight.
+    #[test]
+    fn a_result_that_could_be_the_request_s_own_response_cut_short_settles_no_earlier_owner() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = log
+            .exchange(waited(
+                endpoint(0x7E0),
+                &[0x22, 0xF1, 0x90, 0xF1, 0x91],
+                false,
+                |evidence| {
+                    evidence.end = exchange::End::PositiveUnusable(vec![0x50, 0x03]);
+                    evidence.end_rejected = true;
+                    evidence.vci_ended = true;
+                },
+            ))
+            .unwrap();
+        assert_eq!(
+            owed_on_for(&log, 0x7E8, first, &[0x62, 0xF1]),
+            (vec![first], true)
+        );
+        let second = log.exchange(rejecting_read(&[0x62, 0xF1])).unwrap();
+        // Still owed, not settled: the lone-owner rule would have restated it positive.
+        assert_eq!(
+            owed_on_for(&log, 0x7E8, first, &[0x62, 0xF1]),
+            (vec![first], true)
+        );
+        let late_seq = kept_of(&log, second).evidence.rejected[0]
+            .late_response
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([first]));
+        assert_eq!(late[0]["seq"], late_seq, "{late:?}");
+        assert_eq!(late[0]["exchanges"][0]["classification"], "undetermined");
+        assert!(late[0].get("unattached").is_none(), "{late:?}");
+        // The cut result alone, with no kept exchange to own it, is offered to nobody.
+        let (dir, _setup, log) = collecting_log_on(false);
+        let alone = log.exchange(rejecting_read(&[0x62, 0xF1])).unwrap();
+        assert!(
+            kept_of(&log, alone).evidence.rejected[0]
+                .late_response
+                .is_none()
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-447 scope: a negative response the host rejected as a pattern mismatch is not
+    /// offered, and neither is a collecting exchange's rejected result.
+    #[test]
+    fn a_pattern_mismatch_and_a_collecting_exchange_s_rejected_result_are_not_offered() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let mismatch = log
+            .exchange(rejecting(
+                &[0x22, 0xF1, 0x91],
+                &BOUND_ANSWER,
+                exchange::RejectedReason::PatternMismatch,
+            ))
+            .unwrap();
+        let collecting = log
+            .exchange(waited(endpoint(0x7E0), &[0x3E, 0x00], true, |evidence| {
+                evidence.vci_ended = true;
+                evidence.rejected = vec![rejected_result(
+                    &BOUND_ANSWER,
+                    exchange::RejectedReason::WrongEcho,
+                )];
+            }))
+            .unwrap();
+        for seq in [mismatch, collecting] {
+            assert!(
+                kept_of(&log, seq).evidence.rejected[0]
+                    .late_response
+                    .is_none()
+            );
+        }
+        assert_eq!(read_owed_on(&log, 0x7E8, first), (vec![first], true));
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert!(of_event(&lines, "late_response").is_empty(), "{lines:#?}");
+    }
+
+    /// The `unbound` result read at `read_us` (agent) / `vci_us` (device) that the earlier
+    /// exchange could own, as an unattached item.
+    fn unbound_answer(vci_us: u32, read_us: u64) -> UnattachedItem {
+        UnattachedItem {
+            vci_us,
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: read_us,
+                wall_unix_ms: 0,
+            }),
+            ..late_read_on(0x7E8)
+        }
+    }
+
+    /// ADR-447: a rejected result and the unbound items are offered in the order the host read
+    /// them; the first settles the one owner and the second finds none.
+    #[test]
+    fn rejected_results_and_unbound_items_are_placed_in_read_order() {
+        // The rejected result is read at agent time BASE_US + 1_000_300.
+        for (rejected_first, vci_us, read_us) in [
+            (true, 3_000_000, BASE_US + 2_000_300),
+            (false, 1_500_000, BASE_US + 500_300),
+        ] {
+            let (dir, setup, log) = collecting_log_on(false);
+            let first = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+            let second = log
+                .exchange_with(
+                    rejecting_read(&BOUND_ANSWER),
+                    vec![unbound_answer(vci_us, read_us)],
+                )
+                .unwrap();
+            let offered = kept_of(&log, second).evidence.rejected[0].late_response;
+            assert_eq!(offered.is_some(), rejected_first);
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let late = of_event(&lines, "late_response");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([first]));
+            assert_eq!(
+                late[0]["primitive"],
+                if rejected_first { "in_flight" } else { "none" },
+                "{late:?}"
+            );
+            assert_eq!(
+                of_event(&lines, "unattached").len(),
+                usize::from(rejected_first)
+            );
+        }
+    }
+
+    /// ADR-361, ADR-447: the rejected result's time is placed once, by the entry's placement of
+    /// its reads, so the entry and the `late_response` line carry the same epoch and the
+    /// log opens no more epochs than without the offer.
+    #[test]
+    fn a_placed_wrong_echo_s_time_is_placed_once() {
+        let epochs = |with_owner: bool| {
+            let (dir, setup, log) = collecting_log_on(false);
+            if with_owner {
+                log.exchange(non_collecting_wrong_echo(true)).unwrap();
+            }
+            let second = log.exchange(rejecting_read(&BOUND_ANSWER)).unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            let entry = lines.iter().find(|line| line["seq"] == second).unwrap();
+            let late = of_event(&lines, "late_response");
+            if with_owner {
+                assert_eq!(
+                    late[0]["epoch"], entry["rejected"][0]["epoch"],
+                    "{late:?} {entry}"
+                );
+            }
+            of_event(&lines, "clock_epoch").len()
+        };
+        // The first exchange of the pair opens its own epoch lines, so compare the growth.
+        let single = epochs(false);
+        let pair = epochs(true);
+        let first_alone = {
+            let (dir, setup, log) = collecting_log_on(false);
+            log.exchange(non_collecting_wrong_echo(true)).unwrap();
+            log.end("ok");
+            let lines = lines(&setup);
+            std::fs::remove_dir_all(&dir).unwrap();
+            of_event(&lines, "clock_epoch").len()
+        };
+        assert!(
+            pair <= single + first_alone,
+            "{pair} {single} {first_alone}"
+        );
+    }
+
+    /// ADR-447: the later exchange's reason does not take the placed result as the ECU's answer
+    /// to it, on a link that absorbs pendings either (no H4 text).
+    #[test]
+    fn a_placed_wrong_echo_is_not_the_later_exchange_s_answer_on_an_absorbing_link() {
+        let (dir, setup, log) = collecting_log_on(false);
+        log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let mut absorbing = rejecting_read(&BOUND_ANSWER);
+        absorbing.pending_visibility = exchange::PendingVisibility::AbsorbedByVci;
+        let second = log.exchange(absorbing).unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let entry = lines.iter().find(|line| line["seq"] == second).unwrap();
+        let reason = entry["reason"].as_str().unwrap();
+        assert!(!reason.contains("H4"), "{reason}");
+        assert!(reason.contains("late response logged as"), "{reason}");
+        assert_eq!(entry["link_history"]["this_exchange"], false, "{entry}");
+    }
+
+    /// ADR-447: a stray whose entry's wait read the wrong echo that the log placed with the
+    /// earlier exchange writes no second `late_response` at its end, and the end keeps the
+    /// placement's reason.
+    #[test]
+    fn the_end_of_a_stray_whose_wrong_echo_was_placed_keeps_the_placement() {
+        let (dir, setup, log) = collecting_log_on(false);
+        log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let mut stray = rejecting_read(&BOUND_ANSWER);
+        stray.end = exchange::End::VciDidNotEnd;
+        stray.end_rejected = false;
+        stray.vci_ended = false;
+        let second = log.exchange(stray).unwrap();
+        let placed = kept_of(&log, second).evidence.rejected[0].late_response;
+        assert!(placed.is_some());
+        log.primitive_ended(
+            second,
+            PrimitiveEnded {
+                end: Some(exchange::End::PositiveUnusable(BOUND_ANSWER.to_vec())),
+                detail: exchange::Detail::default(),
+                end_rejected: true,
+                vci_ended: true,
+                reads: read_after_deadline(vec![EndItem::Finished(device_time(
+                    BASE_US + 5_100_000,
+                ))]),
+            },
+        )
+        .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        assert_eq!(of_event(&lines, "late_response").len(), 1, "{lines:#?}");
+        let ended = &of_event(&lines, "primitive_ended")[0];
+        let reason = ended["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            reason.contains(&format!("logged as {}", placed.unwrap())),
+            "{reason}"
+        );
+    }
+
+    /// ADR-447: the later exchange keeps its result in `rejected` and its own late answer still
+    /// settles it as a `late_response`, as any kept exchange's.
+    #[test]
+    fn the_later_exchange_s_own_late_answer_still_settles_it() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = log.exchange(non_collecting_wrong_echo(true)).unwrap();
+        let second = log.exchange(rejecting_read(&BOUND_ANSWER)).unwrap();
+        let own = late_result_on(0x7E8, vec![0x62, 0xF1, 0x91, 0x01]);
+        assert_eq!(late_owner_of(&log, &own), Some(LateOwner::One(second)));
+        log.lock()
+            .late_response(0, second, &own, placed_after(3_000_000))
+            .unwrap();
+        log.end("ok");
+        let lines = lines(&setup);
+        std::fs::remove_dir_all(&dir).unwrap();
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 2, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([first]));
+        assert_eq!(late[1]["refers_to"], serde_json::json!([second]));
     }
 
     /// The `primitive_ended` input for a read request's primitive the VCI finished on a wrong
@@ -16908,6 +17535,7 @@ pub(crate) mod tests {
             epoch: None,
             agent_us: 500_100,
             reason: exchange::RejectedReason::WrongEcho,
+            late_response: None,
         }];
         let rejected = classified(true, rejected, Vec::new());
         assert_eq!(rejected["classification"], "undetermined", "{rejected}");

@@ -52,8 +52,9 @@ to the standard here.
    change the link state when that item is delivered. A second `CoptStartcomm` on a started link
    is a send-receive and leaves it started.
 5. **The tester-present sends.** While the link is COMM_STARTED and the active handling is on, the
-   delivery thread sends the active message to the attached ECU (`SimEcu::exchange`, physical
-   addressing for address mode 0, functional otherwise): at once when the link starts or a
+   delivery thread (or the start of a ComPrimitive on an idle link, item 6) sends the active
+   message to the attached ECU (`SimEcu::exchange`, physical addressing for address mode 0,
+   functional otherwise): at once when the link starts or a
    `CoptUpdateparam` changes the active values (the note on the tester-present ComParams in B.5.1),
    then a period after each send. Send type 1 is sent as type 0, every period, and a period below
    1 ms is sent every millisecond. With no ECU attached a send is skipped without an error, and
@@ -65,13 +66,18 @@ to the standard here.
 6. **Serialization (8.1.3 Table 1, as ADR-419 for the J2534 worker).** A tester-present goes only
    when no ComPrimitive runs or waits; a ComPrimitive that waits goes first and the
    tester-present stays due. A tester-present already due when a ComPrimitive is started on an
-   idle link was due before anything waited, so the start sends it first and the ComPrimitive
-   waits behind it; the order does not depend on when the delivery thread next runs. This holds every tester-present behind the ComPrimitives, which is
-   stricter than 8.1.3 Table 1 (a functional tester-present with no response may go at once
-   behind a physical request): a simplification of the mock. A send that expects a response (`ReqRsp` 1) puts a marker into the
-   schedule of the running ComPrimitive, due when the ECU's final answer is (response-pending
-   messages included), and the next ComPrimitive begins only after it. A send that expects none
-   holds nothing. The ECU's answer to a tester-present is never delivered as a result item.
+   idle link was due before anything waited, so the start sends it first, with the settings in
+   force before that start (an UPDATEPARAM's copy comes after), and the ComPrimitive waits behind
+   it. The order then does not depend on when the delivery thread next runs, provided the
+   ComPrimitive that made the tester-present due has finished (its last item delivered) before
+   the next start; an UPDATEPARAM started without waiting for its finished status, followed at
+   once by a SENDRECV, can still be ordered by thread timing. This holds every tester-present
+   behind the ComPrimitives, which is stricter than 8.1.3 Table 1 (a functional tester-present
+   with no response may go at once behind a physical request): a simplification of the mock. A
+   send that expects a response (`ReqRsp` 1) puts a marker into the schedule of the running
+   ComPrimitive, due when the ECU's final answer is (response-pending messages included), and the
+   next ComPrimitive begins only after it. A send that expects none holds nothing. The ECU's
+   answer to a tester-present is never delivered as a result item.
 7. **Judging and the error item.** With `ReqRsp` 0 an answer is never an error. With 1 the answer is
    positive when it starts with `ExpPosResp`; with that field empty it is not enabled (B.5.1
    compares only the bytes the field holds), so any answer is positive unless it starts with a

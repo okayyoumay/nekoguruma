@@ -2122,6 +2122,16 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         } else {
             None
         };
+        // A tester-present that fell due while the link was idle goes before a ComPrimitive that
+        // arrives after it, whether or not the delivery thread has got to it yet: otherwise the
+        // order of the two would depend on how soon that thread runs after the item that made
+        // it due (ADR-423 item 6 holds it back only behind a ComPrimitive that runs or waits).
+        // It goes with the buffers in force before this start, so ahead of an UPDATEPARAM's copy.
+        let idle = guard.waiting.is_empty() && guard.scheduled.is_empty();
+        let now = Instant::now();
+        if idle && guard.tp_due.is_some_and(|due| due <= now) {
+            send_tester_present(&mut guard, now);
+        }
         // While an ECU is attached, and while other ComPrimitives still wait or run, the
         // ComPrimitive waits its turn, and the ECU answers a send-and-receive request when it
         // begins (ADR-299). Otherwise the synthetic completion event is queued at once.
@@ -2132,15 +2142,6 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             guard.rc78_active = guard.rc78_working;
             guard.ind_active = guard.ind_working;
             guard.table_active = guard.table_working;
-        }
-        // A tester-present that fell due while the link was idle goes before a ComPrimitive that
-        // arrives after it, whether or not the delivery thread has got to it yet: otherwise the
-        // order of the two would depend on how soon that thread runs after the item that made
-        // it due (ADR-423 item 6 holds it back only behind a ComPrimitive that runs or waits).
-        let idle = guard.waiting.is_empty() && guard.scheduled.is_empty();
-        let now = Instant::now();
-        if idle && guard.tp_due.is_some_and(|due| due <= now) {
-            send_tester_present(&mut guard, now);
         }
         let busy = !guard.waiting.is_empty() || !guard.scheduled.is_empty();
         let immediate = if guard.ecu.is_some() || busy {
@@ -5415,6 +5416,57 @@ mod tester_present_tests {
             assert_eq!(tester_present_indications(true, 0, 0), 0);
             // Functional addressing goes out on another identifier.
             assert_eq!(tester_present_indications(true, 1, 1), 0);
+        }
+
+        /// A tester-present due on an idle link goes out with the indication settings in force
+        /// before an UPDATEPARAM that is started after it, not with that UPDATEPARAM's.
+        #[test]
+        fn a_tester_present_sent_at_the_start_of_an_updateparam_uses_the_settings_before_it() {
+            let rig = Rig::new();
+            // A long period keeps the delivery thread asleep: only the start can send it.
+            rig.keep_alive(2000);
+            rig.ecu(UNBOUND);
+            set(&rig, 0, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            let start = rig.start(E_PDU_COPT::PDU_COPT_STARTCOMM, &[]);
+            rig.finished_or_result(start);
+            rig.wait_for("the first tester-present answered", |state| {
+                state.scheduled.is_empty() && state.waiting.is_empty() && state.tp_due.is_some()
+            });
+            // Working transmit indication on, the active one still off; the next send is due.
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.arm_probe();
+            state().lock().unwrap().pending_events.clear();
+            state().lock().unwrap().tp_due = Some(Instant::now());
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            {
+                let guard = state().lock().unwrap();
+                assert!(Rig::probe_used(&guard), "the tester-present was not sent");
+                let raised = guard
+                    .scheduled
+                    .iter()
+                    .map(|(_, event)| event)
+                    .chain(guard.pending_events.iter())
+                    .filter(|event| {
+                        matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                            && event.h_cop == PDU_HANDLE_UNDEF
+                    })
+                    .count();
+                assert_eq!(raised, 0, "judged with the UPDATEPARAM's settings");
+            }
+            rig.finished_or_result(update);
+            // The UPDATEPARAM's settings apply from then on: the next send raises one.
+            rig.set_number("CP_TesterPresentTime", 20_000);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            state().lock().unwrap().pending_events.clear();
+            rig.wait_for("a transmit indication", |state| {
+                state.pending_events.iter().any(|event| {
+                    matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                        && event.h_cop == PDU_HANDLE_UNDEF
+                })
+            });
         }
 
         /// Sets a ComParam through the FFI, whatever the value.

@@ -6190,9 +6190,12 @@ def main():
     }
 
     fn journal_dir(tag: &str) -> std::path::PathBuf {
+        // The counter keeps apart two directories made on one tick of a coarse clock.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let dir = std::env::temp_dir().join(format!(
-            "ngr-runner-{tag}-{}-{}",
+            "ngr-runner-{tag}-{}-{}-{}",
             std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .unwrap()
@@ -15292,6 +15295,11 @@ def main():
         start_script: Mutex<std::collections::VecDeque<(When, StartEvent)>>,
         /// One permit per primitive whose events the test has released ([`When::Released`]).
         released: Arc<tokio::sync::Semaphore>,
+        /// One permit per start whose events the worker has all sent to the stream (the
+        /// start's event task has ended, after any release it waited for). A test waits for the
+        /// permit instead of sleeping, so a slow runner cannot make it look too early
+        /// (ADR-149).
+        sent: Arc<tokio::sync::Semaphore>,
         /// The sender of the link's event stream, once subscribed.
         events: Arc<Mutex<Option<EventSender>>>,
         /// The items it gives name the device clock (`timestamp_clock`), as a J2534 worker's
@@ -15783,7 +15791,10 @@ def main():
                 let (released, cancelled) =
                     (Arc::clone(&self.released), Arc::clone(&self.cancelled));
                 let device_clock = self.device_clock;
+                let sent = SentOnDrop(Arc::clone(&self.sent));
                 tokio::spawn(async move {
+                    // Gives its permit on every way out of the task, `return`s included.
+                    let _sent = sent;
                     match when {
                         When::After(after) => tokio::time::sleep(after).await,
                         When::Released => released.acquire().await.unwrap().forget(),
@@ -16239,6 +16250,7 @@ def main():
             on_start: None,
             start_script: Mutex::default(),
             released: Arc::new(tokio::sync::Semaphore::new(0)),
+            sent: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
             device_clock: false,
             disconnect_script: Mutex::default(),
@@ -16273,6 +16285,7 @@ def main():
             on_start: None,
             start_script: Mutex::default(),
             released: Arc::new(tokio::sync::Semaphore::new(0)),
+            sent: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
             device_clock: false,
             disconnect_script: Mutex::new(disconnects.into()),
@@ -16309,6 +16322,7 @@ def main():
             on_start: Some((When::After(Duration::ZERO), StartEvent::Respond)),
             start_script: Mutex::default(),
             released: Arc::new(tokio::sync::Semaphore::new(0)),
+            sent: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
             device_clock: false,
             disconnect_script: Mutex::new(disconnects.into()),
@@ -16354,6 +16368,7 @@ def main():
             on_start: None,
             start_script: Mutex::default(),
             released: Arc::new(tokio::sync::Semaphore::new(0)),
+            sent: Arc::new(tokio::sync::Semaphore::new(0)),
             events: Arc::default(),
             device_clock: false,
             disconnect_script: Mutex::default(),
@@ -16365,6 +16380,15 @@ def main():
         serve(service, calls, set).await
     }
 
+    /// Adds a permit to [`FakeWorker`]'s `sent` when dropped: the end of a start's event task.
+    struct SentOnDrop(Arc<tokio::sync::Semaphore>);
+
+    impl Drop for SentOnDrop {
+        fn drop(&mut self) {
+            self.0.add_permits(1);
+        }
+    }
+
     /// What a [`FakeWorker`] whose primitives start recorded: every RPC, the handles it gave
     /// out and the handle of each cancel.
     struct Started {
@@ -16373,6 +16397,8 @@ def main():
         cancelled: Arc<Mutex<Vec<u32>>>,
         /// One permit per primitive whose events the test releases ([`When::Released`]).
         released: Arc<tokio::sync::Semaphore>,
+        /// One permit per start whose events the worker has all sent ([`FakeWorker`]'s `sent`).
+        sent: Arc<tokio::sync::Semaphore>,
         /// The `cop_tag` each start carried, in order.
         start_tags: Arc<Mutex<Vec<Option<Vec<u8>>>>>,
         /// The keep-alive's traffic and how the fake answers it.
@@ -16521,6 +16547,7 @@ def main():
         let recorded_set = Arc::clone(&set);
         let (started, cancelled) = (Arc::default(), Arc::default());
         let released = Arc::new(tokio::sync::Semaphore::new(0));
+        let sent = Arc::new(tokio::sync::Semaphore::new(0));
         let events: Arc<Mutex<Option<EventSender>>> = Arc::default();
         let service = FakeWorker {
             fail_disconnect,
@@ -16536,6 +16563,7 @@ def main():
             on_start,
             start_script: Mutex::new(script.into()),
             released: Arc::clone(&released),
+            sent: Arc::clone(&sent),
             events: Arc::clone(&events),
             device_clock,
             disconnect_script: Mutex::default(),
@@ -16553,6 +16581,7 @@ def main():
                 started,
                 cancelled,
                 released,
+                sent,
                 start_tags,
                 keep,
                 set: recorded_set,
@@ -18549,7 +18578,7 @@ def main():
                 unary: Duration::from_secs(5),
                 send_recv: PAST_DEADLINE,
             };
-            let released = Arc::clone(&fake.released);
+            let (released, sent) = (Arc::clone(&fake.released), Arc::clone(&fake.sent));
             tokio::task::spawn_blocking(move || {
                 use diag_ir::DiagHost;
                 let mut host = WorkerHost::new(handle, client, link, timings);
@@ -18561,8 +18590,12 @@ def main():
                 assert!(matches!(first, Err(HostError::NoResponse)), "{first:?}");
                 // Only the first primitive's events are released; the second's never come.
                 released.add_permits(1);
-                // The first primitive's end, if any, is on the stream before the next request.
-                std::thread::sleep(Duration::from_millis(300));
+                // The first primitive's end, if any, is on the stream before the next request:
+                // its event task ends only after the release, and the second start has not
+                // been made yet, so the one permit is the first's.
+                if on_start.is_some() {
+                    wait_sent(&sent);
+                }
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 if lost {
                     assert!(matches!(second, Err(HostError::EventsLost)), "{second:?}");
@@ -18847,11 +18880,32 @@ def main():
     struct TaggedCtx {
         /// One permit per primitive whose events the body releases ([`When::Released`], [`Step::Release`]).
         released: Arc<tokio::sync::Semaphore>,
+        /// [`FakeWorker`]'s `sent`.
+        sent: Arc<tokio::sync::Semaphore>,
         log: crate::comm_log::CommLog,
         dir: std::path::PathBuf,
     }
 
+    /// Blocks the calling `spawn_blocking` body until one more start's events have all reached
+    /// the stream (a permit of `sent`), which replaces a sleep that a loaded runner could
+    /// outrun (ADR-149). The bound only turns a hang into a failure.
+    fn wait_sent(sent: &Arc<tokio::sync::Semaphore>) {
+        let permit = tokio::runtime::Handle::current()
+            .block_on(tokio::time::timeout(
+                Duration::from_secs(30),
+                sent.acquire(),
+            ))
+            .expect("the fake worker sent the start's events within 30 s")
+            .expect("the semaphore is open");
+        permit.forget();
+    }
+
     impl TaggedCtx {
+        /// Waits until the next start's events are on the stream ([`wait_sent`]).
+        fn wait_sent(&self) {
+            wait_sent(&self.sent);
+        }
+
         /// The `seq` of the first exchange written.
         fn first_exchange(&self) -> u64 {
             comm_log_lines(&self.dir)
@@ -18902,6 +18956,7 @@ def main():
         let timings = Timings { unary, send_recv };
         let ctx = TaggedCtx {
             released: Arc::clone(&fake.released),
+            sent: Arc::clone(&fake.sent),
             log: log.clone(),
             dir: dir.clone(),
         };
@@ -18935,10 +18990,10 @@ def main():
                 StartEvent::Script(TAGGED_TX),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(400),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(
@@ -18949,7 +19004,7 @@ def main():
                     "{first:?}"
                 );
                 // The tagged item is on the stream before the next request.
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
                 host.settle_at_end();
@@ -18998,8 +19053,8 @@ def main():
         let (fake, lines) = tagged_run(
             vec![(When::Released, StartEvent::Script(TAGGED_TX))],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(200),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
             |host, ctx| {
                 use diag_ir::DiagHost;
@@ -19013,7 +19068,7 @@ def main():
                     assert!(matches!(held, Err(HostError::LinkHeld)), "{held:?}");
                 }
                 ctx.released.add_permits(1);
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let third = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(third, Err(HostError::NoResponse)), "{third:?}");
                 host.settle_at_end();
@@ -19050,14 +19105,14 @@ def main():
                 StartEvent::Script(&[Step::Finish]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
             },
@@ -19091,14 +19146,14 @@ def main():
             let (fake, lines) = tagged_run(
                 vec![(When::After(Duration::from_millis(50)), event)],
                 vec![StartAnswer::Late(LATE_START)],
-                Duration::from_millis(300),
-                Duration::from_millis(300),
+                Duration::from_secs(1),
+                Duration::from_secs(1),
                 Duration::from_millis(100),
                 move |host, ctx| {
                     use diag_ir::DiagHost;
                     let first = host.service_request(0x22, &[0xF1, 0x90]);
                     assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                    std::thread::sleep(Duration::from_millis(200));
+                    ctx.wait_sent();
                     let second = host.service_request(0x22, &[0xF1, 0x90]);
                     // The dropped stray's exchange is released: nothing can settle it, and a
                     // later unbound indication is not attributed to it.
@@ -19154,14 +19209,14 @@ def main():
                 StartEvent::Script(&[Step::Error(Bound::Own, 5_000)]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
             },
@@ -19183,14 +19238,14 @@ def main():
                 StartEvent::Script(&[Step::Error(Bound::None, 5_000), Step::Transmit(6_000)]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
             },
@@ -19211,14 +19266,14 @@ def main():
                 StartEvent::Script(&[Step::Error(Bound::None, 5_000), Step::Transmit(6_000)]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::LinkHeld)), "{second:?}");
                 host.settle_at_end();
@@ -19240,14 +19295,14 @@ def main():
                 StartEvent::Script(&[Step::LostEvents, Step::Transmit(6_000)]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
             },
@@ -19276,8 +19331,8 @@ def main():
                 ]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_secs(5),
             |host, ctx| {
                 use diag_ir::DiagHost;
@@ -19300,8 +19355,8 @@ def main():
         let (fake, lines) = tagged_run(
             vec![(When::After(Duration::from_millis(50)), StartEvent::Die)],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_secs(30),
             |host, _| {
                 use diag_ir::DiagHost;
@@ -19326,14 +19381,14 @@ def main():
                 StartEvent::Script(&[Step::Respond(600_000, None)]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
             },
@@ -19362,15 +19417,15 @@ def main():
         let (fake, lines) = tagged_run(
             vec![item, item],
             vec![StartAnswer::Late(LATE_START), StartAnswer::Late(LATE_START)],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 for _ in 0..2 {
                     let timed_out = host.service_request(0x22, &[0xF1, 0x90]);
                     assert!(matches!(timed_out, Err(HostError::WorkerUnresponsive(_))));
-                    std::thread::sleep(Duration::from_millis(200));
+                    ctx.wait_sent();
                 }
                 let third = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(third, Err(HostError::NoResponse)), "{third:?}");
@@ -19395,8 +19450,8 @@ def main():
         let (fake, _lines) = tagged_run(
             vec![(When::Released, StartEvent::Script(TAGGED_TX))],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(150),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
             |host, _| {
                 use diag_ir::DiagHost;
@@ -19433,15 +19488,16 @@ def main():
             .expect("the link opens");
         let handle = tokio::runtime::Handle::current();
         let timings = Timings {
-            unary: Duration::from_millis(300),
-            send_recv: Duration::from_millis(300),
+            unary: Duration::from_secs(1),
+            send_recv: Duration::from_secs(1),
         };
+        let sent = Arc::clone(&fake.sent);
         tokio::task::spawn_blocking(move || {
             use diag_ir::DiagHost;
             let mut host = WorkerHost::new(handle, client, link, timings);
             let first = host.service_request(0x22, &[0xF1, 0x90]);
             assert!(matches!(first, Err(HostError::WorkerUnresponsive(_))));
-            std::thread::sleep(Duration::from_millis(200));
+            wait_sent(&sent);
             let second = host.service_request(0x22, &[0xF1, 0x90]);
             assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
         })
@@ -19459,8 +19515,8 @@ def main():
         let (fake, lines) = tagged_run(
             Vec::new(),
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             wait,
             |host, _| {
                 use diag_ir::DiagHost;
@@ -19486,8 +19542,8 @@ def main():
                 StartEvent::Script(&[Step::Release, Step::Respond(600_000, None), Step::Finish]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_secs(5),
             |host, ctx| {
                 use diag_ir::DiagHost;
@@ -19521,8 +19577,8 @@ def main():
                 StartEvent::Script(&[Step::Release, Step::LostVci(5_000)]),
             )],
             vec![StartAnswer::Late(LATE_START)],
-            Duration::from_millis(100),
-            Duration::from_millis(100),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_secs(30),
             |host, ctx| {
                 use diag_ir::DiagHost;
@@ -19552,14 +19608,14 @@ def main():
                 StartEvent::Script(TAGGED_TX),
             )],
             vec![StartAnswer::NoHandle],
-            Duration::from_millis(300),
-            Duration::from_millis(300),
+            Duration::from_secs(1),
+            Duration::from_secs(1),
             Duration::from_millis(100),
-            |host, _| {
+            |host, ctx| {
                 use diag_ir::DiagHost;
                 let first = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(first, Err(HostError::Setup(_))), "{first:?}");
-                std::thread::sleep(Duration::from_millis(200));
+                ctx.wait_sent();
                 let second = host.service_request(0x22, &[0xF1, 0x90]);
                 assert!(matches!(second, Err(HostError::NoResponse)), "{second:?}");
             },

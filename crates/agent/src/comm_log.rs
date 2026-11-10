@@ -12787,20 +12787,6 @@ pub(crate) mod tests {
         log.lock().links[0].1.late_transmit_owners(tx_id)
     }
 
-    /// [`leave_window_to`] on the functional link (request identifier 0x7DF).
-    fn leave_functional_window(log: &CommLog) {
-        for did in 0..=u8::try_from(exchange::WINDOW).unwrap() {
-            let mut filler = evidence(
-                endpoint(0x7DF),
-                &[0x22, 0xF2, did],
-                exchange::End::Positive(vec![0x62, 0xF2, did, 0x41]),
-            );
-            filler.times.agent.before_us += 20_000_000 + u64::from(did) * 1_000;
-            filler.times.agent.end_us += 20_000_000 + u64::from(did) * 1_000;
-            log.exchange(filler).unwrap();
-        }
-    }
-
     /// ADR-446, case table row 12: the non-collecting exchange a lone late final left owed
     /// through an earlier owner on the functional link is released when the owner's own answer
     /// settles it, and counted once then, as ADR-445 decision 3 counts a collecting one: its send
@@ -12835,7 +12821,7 @@ pub(crate) mod tests {
             assert_eq!(late_owner_of(&log, &late), Some(LateOwner::One(dependent)));
             place_unbound(&log, &late, 10_020_000);
             if beyond {
-                leave_functional_window(&log);
+                leave_window_to(&log, 0x7DF);
             }
             assert_eq!(
                 log.lock().links[0].1.owed_row_ids(dependent),
@@ -12909,7 +12895,7 @@ pub(crate) mod tests {
         let in_flight = functional_dependent(
             f186_response(),
             vec![answer_on(0x7E9, f186_response(), 20_000)],
-            true,
+            false,
             10,
         );
         let item = late_result_on(0x7E8, vec![0x62, 0xF1, 0x86, 0x41]);
@@ -13240,7 +13226,7 @@ pub(crate) mod tests {
                 .exchange(functional_dependent(
                     f186_response(),
                     vec![answer_on(0x7E8, f186_response(), 20_000)],
-                    true,
+                    false,
                     10,
                 ))
                 .unwrap();
@@ -13300,6 +13286,12 @@ pub(crate) mod tests {
                 "{wrong_echo}"
             );
             assert_eq!(late_owner_of(&log, &on_7e9), None, "{wrong_echo}");
+            // A later in-time answered `22 F1 86` is owed through both records (design 8.11
+            // "Owed request").
+            let later = functional_dependent(f186_response(), Vec::new(), false, 12);
+            let history = log.lock().links[0].1.history_for(&later);
+            assert_eq!(history.owners, [owner, dependent], "{wrong_echo}");
+            assert_eq!(history.owed_matching, 2, "{wrong_echo}");
             std::fs::remove_dir_all(&dir).unwrap();
         }
     }

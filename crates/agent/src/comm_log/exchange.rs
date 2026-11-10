@@ -1416,7 +1416,8 @@ impl Evidence {
     /// identifiers a pending is open on, else on its link's `rx_id`. With a table, a request
     /// that is not collecting is owed on its `rx_id` once a final response ended it (and, when
     /// that end is a rejected one or the `rx_id` is 0, on every receive identifier too,
-    /// ADR-443, ADR-446), else on every receive identifier; a collecting request with no answer on every receive identifier.
+    /// ADR-443, ADR-446), else on every receive identifier; a collecting request with no answer
+    /// on every receive identifier.
     /// With answers, it is owed on each of these once, in this order: the identifiers a pending
     /// is open on (an unnamed pending, identifier 0, standing for every
     /// receive identifier with no final answer, and for none when every one has it, ADR-400
@@ -1901,7 +1902,9 @@ impl Kept {
     /// ([`Evidence::late_final_settles`]), or a pending was open when it was kept
     /// ([`Kept::pending_at_end`]) (ADR-436). A record whose evidence settles the exchange is kept
     /// only for its rows (ADR-442, ADR-445): the pending it had open earlier gives it no late
-    /// final answer, as its in-time twin has none (ADR-445 decision 4).
+    /// final answer, as its in-time twin has none (ADR-445 decision 4). A non-collecting record
+    /// whose evidence settles it is the same: it owns no late final (ADR-446), whatever ended
+    /// the VCI's wait.
     pub(crate) fn late_final_settles(&self) -> bool {
         // A non-collecting exchange whose evidence settles it owns no late final, whatever ended
         // the VCI's wait (ADR-446); `vci_ended` stands.

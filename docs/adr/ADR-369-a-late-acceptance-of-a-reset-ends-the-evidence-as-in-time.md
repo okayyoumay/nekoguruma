@@ -1,7 +1,7 @@
 # ADR-369: A Late Acceptance of a Reset Ends the Evidence as in Time
 
 **Date:** 2026-10-27
-**Status:** Accepted
+**Status:** Accepted (decision 3's comparison of the epochs gains the line through which an answer counted after its end's link error counts for no exchange logged before it, ADR-449)
 **Affects:** `agent` communication log (`comm_log.rs` `Inner::late_response`,
 `CommLog::primitive_ended`, `settle_later`; `comm_log/exchange.rs` `LinkState::reset_after`,
 `LinkState::reclassify_one`, `ExchangeEntry::late_restart`, `Logged::matched_at`); design 8.11

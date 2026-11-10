@@ -1918,6 +1918,9 @@ pub(crate) struct Kept {
     pub clears: Clears,
     /// Its entry's answer counted as a matched answer ([`ExchangeEntry::matched_answer`]).
     pub matched: bool,
+    /// The line through which no exchange counts that matched answer, when its primitive's end
+    /// counted it after a link error read with that end ([`MatchedAt`]).
+    pub matched_through: Option<u64>,
     /// The time of the item that answers it: set from its entry's own items, then by each
     /// settling entry that judges an answer ([`LinkState::judge_answer`]). A later offer of the
     /// answer, with no new answering item, is judged by this time (ADR-385).
@@ -2052,10 +2055,27 @@ struct Logged {
     /// counts for a later exchange whose history was taken with the same value. An accepted
     /// ECUReset or session change read late counts the matched answers again from these
     /// ([`LinkState::reset_after`]).
-    matched_at: Option<u64>,
+    matched_at: Option<MatchedAt>,
     /// The time of the item that answers it (as [`Kept::answer_at`]): a recount of the answers
     /// since a late link error tests it ([`LinkState::since_late_error`], ADR-385).
     answer_at: AnswerTime,
+}
+
+/// The epoch a matched answer counts in and the exchanges that can count it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MatchedAt {
+    /// The link's `Clears::matched` it counted in.
+    epoch: u64,
+    /// No exchange logged at or before this line counts it: its own exchange, or, for an answer
+    /// its primitive's end counted after a link error read with that end, the error's line.
+    through: u64,
+}
+
+impl MatchedAt {
+    /// Whether it counts for the exchange logged as `later`, whose history was taken in `epoch`.
+    fn counts_for(self, later: u64, epoch: u64) -> bool {
+        later > self.through && self.epoch == epoch
+    }
 }
 
 /// Where a link error read late falls among a link's exchanges ([`LinkState::place_error`]).
@@ -2117,6 +2137,8 @@ pub(crate) struct SettledAnswer {
     /// it stays owed on others (a settling entry that ends it on some identifiers only, design
     /// 8.11 "Owed request"): the later exchanges' answers on them are freed from it.
     settled_ids: Vec<u32>,
+    /// No exchange logged at or before this line counts the answer ([`MatchedAt`]).
+    through: Option<u64>,
 }
 
 impl SettledAnswer {
@@ -2124,6 +2146,23 @@ impl SettledAnswer {
     pub(crate) fn with_settled_ids(mut self, settled_ids: Vec<u32>) -> Self {
         self.settled_ids = settled_ids;
         self
+    }
+
+    /// The answer came after a link error read with its primitive's end, written as line `line`
+    /// and applied before it: it counts from `clears`, the link's clears after that error, and
+    /// for no exchange logged before the error.
+    pub(crate) fn after_end_error(mut self, clears: Clears, line: u64) -> Self {
+        self.clears = clears;
+        self.through = Some(line);
+        self
+    }
+
+    /// The epoch the answer counts in as a matched answer and the exchanges that can count it.
+    fn matched_at(&self) -> MatchedAt {
+        MatchedAt {
+            epoch: self.clears.matched,
+            through: self.through.unwrap_or(self.seq),
+        }
     }
 
     /// A link error in no known order with the answer ended its matched answer.
@@ -2777,6 +2816,12 @@ impl LinkState {
     ) -> Option<SettledAnswer> {
         let (old_sent, old_matched) = before;
         let seq = entry.seq;
+        // A matched answer its end counted after a link error keeps the line it counts from.
+        let through = self
+            .kept
+            .get(&seq)
+            .filter(|_| old_matched)
+            .and_then(|kept| kept.matched_through);
         // An answer no owed request can own any more is a matched answer for the exchanges
         // after it, a pending too, as `record` would have counted it; a final response is placed
         // with its exchange alone, which is then owed no more and no owner of theirs (design
@@ -2822,6 +2867,7 @@ impl LinkState {
         {
             // Counted once: its final response later is no new matched answer.
             kept.matched = true;
+            kept.matched_through = None;
         }
         if alone {
             self.owed.retain(|owed| owed.seq != seq);
@@ -2858,6 +2904,7 @@ impl LinkState {
             },
             since_error: since,
             settled_ids: dropped_rows,
+            through,
         })
     }
 
@@ -2892,10 +2939,17 @@ impl LinkState {
     /// it after the error ([`LinkState::error_after`] clears `Kept::matched`, as it does for a
     /// window exchange, the exchange the error falls after included, ADR-444), so the answer's
     /// time is not tested here.
-    fn kept_matched_after(&self, seq: u64) -> Option<(MatchKey, u64)> {
+    fn kept_matched_after(&self, seq: u64) -> Option<(MatchKey, MatchedAt)> {
         let kept = self.kept.get(&seq).filter(|kept| kept.matched)?;
-        (!kept.evidence.error_after_answer())
-            .then(|| (MatchKey::of(&kept.evidence), kept.clears.matched))
+        (!kept.evidence.error_after_answer()).then(|| {
+            (
+                MatchKey::of(&kept.evidence),
+                MatchedAt {
+                    epoch: kept.clears.matched,
+                    through: kept.matched_through.unwrap_or(seq),
+                },
+            )
+        })
     }
 
     /// The owed exchanges with a `seq` in `seqs` that have left the window and are kept: their
@@ -3118,12 +3172,13 @@ impl LinkState {
             floor: None,
             settled: false,
             answer_at,
-            matched_at: entry.matched_answer().then(|| {
-                if entry.error_after_answer() {
+            matched_at: entry.matched_answer().then(|| MatchedAt {
+                epoch: if entry.error_after_answer() {
                     clears.matched
                 } else {
                     self.clears.matched
-                }
+                },
+                through: entry.seq,
             }),
         });
     }
@@ -3258,7 +3313,9 @@ impl LinkState {
                     }
                 }
                 if answer.newly_matched
-                    && logged.clears.matched == answer.clears.matched
+                    && answer
+                        .matched_at()
+                        .counts_for(logged.seq, logged.clears.matched)
                     && MatchKey::of(&logged.evidence) == answer.key
                 {
                     history.answered_same_match += 1;
@@ -3327,7 +3384,7 @@ impl LinkState {
             if logged.seq > seq {
                 logged.clears.matched += 1;
                 if let Some(at) = &mut logged.matched_at {
-                    *at += 1;
+                    at.epoch += 1;
                 }
             }
             if logged.seq >= seq {
@@ -3370,10 +3427,10 @@ impl LinkState {
         // `matched_at` does not hold: those the visit released, and the kept ones beyond the
         // window that counted at their record (their epoch shifted above). An exchange the
         // visit released is no longer kept, so none is counted twice (ADR-441).
-        let mut beyond: Vec<(u64, MatchKey, u64)> = released
+        let mut beyond: Vec<(MatchKey, MatchedAt)> = released
             .iter()
             .filter(|answer| answer.newly_matched)
-            .map(|answer| (answer.seq, answer.key.clone(), answer.clears.matched))
+            .map(|answer| (answer.key.clone(), answer.matched_at()))
             .collect();
         beyond.extend(
             self.kept
@@ -3381,10 +3438,7 @@ impl LinkState {
                 .filter(|kept_seq| {
                     **kept_seq > seq && !self.window.iter().any(|logged| logged.seq == **kept_seq)
                 })
-                .filter_map(|kept_seq| {
-                    let (key, epoch) = self.kept_matched_after(*kept_seq)?;
-                    Some((*kept_seq, key, epoch))
-                }),
+                .filter_map(|kept_seq| self.kept_matched_after(*kept_seq)),
         );
         for at in 0..self.window.len() {
             let logged = &self.window[at];
@@ -3408,36 +3462,38 @@ impl LinkState {
                 .iter()
                 .filter(|earlier| {
                     earlier.seq < later
-                        && earlier.matched_at == Some(epoch)
+                        && earlier
+                            .matched_at
+                            .is_some_and(|at| at.counts_for(later, epoch))
                         && MatchKey::of(&earlier.evidence) == key
                 })
                 .count() as u32;
             history.answered_same_match += beyond
                 .iter()
-                .filter(|(earlier, earlier_key, at)| {
-                    *earlier < later && *at == epoch && *earlier_key == key
-                })
+                .filter(|(earlier_key, at)| at.counts_for(later, epoch) && *earlier_key == key)
                 .count() as u32;
             let (freed, reclassified) = self.reclassify_one(at, history);
             if let Some(freed) = freed {
                 if freed.newly_matched {
-                    self.window[at].matched_at = Some(freed.clears.matched);
+                    self.window[at].matched_at = Some(freed.matched_at());
                 }
                 freed_answers.push(freed);
             }
             changed.extend(reclassified);
         }
         self.matched.clear();
+        // The link's next exchange is logged after every line an answer counts from.
+        let live = self.clears.matched;
         for logged in &self.window {
-            if logged.matched_at == Some(self.clears.matched) {
+            if logged.matched_at.is_some_and(|at| at.epoch == live) {
                 *self
                     .matched
                     .entry(MatchKey::of(&logged.evidence))
                     .or_insert(0) += 1;
             }
         }
-        for (_, key, at) in beyond {
-            if at == self.clears.matched {
+        for (key, at) in beyond {
+            if at.epoch == live {
                 *self.matched.entry(key).or_insert(0) += 1;
             }
         }
@@ -3808,7 +3864,7 @@ impl LinkState {
             if let Some(at) = &mut logged.matched_at
                 && ((after(logged.seq) && counts) || answers_after == Some(logged.seq))
             {
-                *at += 1;
+                at.epoch += 1;
             }
             // `after` follows the record's `Kept::clears`, which the error shifts from the
             // exchange it falls after on, that exchange included (ADR-444).
@@ -3883,7 +3939,9 @@ impl LinkState {
             history.answered_same_match = since
                 .iter()
                 .filter(|earlier| {
-                    earlier.matched_at == Some(clears.matched)
+                    earlier
+                        .matched_at
+                        .is_some_and(|at| at.counts_for(later, clears.matched))
                         && MatchKey::of(&earlier.evidence) == key
                 })
                 .count() as u32;
@@ -3896,7 +3954,7 @@ impl LinkState {
             let (freed, reclassified) = self.reclassify_one(at, history);
             if let Some(freed) = freed {
                 if freed.newly_matched {
-                    self.window[at].matched_at = Some(freed.clears.matched);
+                    self.window[at].matched_at = Some(freed.matched_at());
                 }
                 freed_answers.push(freed);
             }
@@ -3909,8 +3967,9 @@ impl LinkState {
         };
         let first = |logged: &&Logged| after(logged.seq) || answers_after == Some(logged.seq);
         self.matched.clear();
+        let live = self.clears.matched;
         for logged in self.window.iter().filter(first) {
-            if logged.matched_at == Some(self.clears.matched) {
+            if logged.matched_at.is_some_and(|at| at.epoch == live) {
                 *self
                     .matched
                     .entry(MatchKey::of(&logged.evidence))
@@ -3936,6 +3995,7 @@ impl LinkState {
         for seq in seqs {
             if let Some(kept) = self.kept.get_mut(&seq) {
                 kept.matched = false;
+                kept.matched_through = None;
             }
         }
     }
@@ -4157,6 +4217,7 @@ impl LinkState {
             && let Some(kept) = self.kept.get_mut(&answer.seq)
         {
             kept.matched = true;
+            kept.matched_through = answer.through;
         }
         if answer.newly_matched
             && let Some(logged) = self
@@ -4164,7 +4225,7 @@ impl LinkState {
                 .iter_mut()
                 .find(|logged| logged.seq == answer.seq)
         {
-            logged.matched_at = Some(answer.clears.matched);
+            logged.matched_at = Some(answer.matched_at());
         }
     }
 
@@ -4295,6 +4356,7 @@ impl ExchangeEntry {
             clears: kept.clears,
             since_error: true,
             settled_ids: Vec::new(),
+            through: None,
         }
     }
 
@@ -5975,6 +6037,7 @@ mod tests {
             pending_at_end: false,
             clears: state.clears(),
             matched: entry.matched_answer(),
+            matched_through: None,
         };
         // The time of its answer, as the log stores it at the entry (ADR-385).
         if entry.link_history.this_exchange {
@@ -6783,7 +6846,7 @@ mod tests {
         vehicle: bool,
         link_matched: u32,
         link_since_error: u32,
-        matched_at: Option<u64>,
+        matched_at: Option<MatchedAt>,
         after: Clears,
         kept_clears: Clears,
         kept_matched: bool,
@@ -7633,6 +7696,7 @@ mod tests {
                 clears: kept.clears,
                 since_error: true,
                 settled_ids: Vec::new(),
+                through: None,
             };
             settled.set_since_error(state.since_late_error(1, answered_at.into()));
             let (changed, _) = state.reclassify_after(&settled);
@@ -7780,6 +7844,7 @@ mod tests {
                 clears: kept.clears,
                 since_error: true,
                 settled_ids: Vec::new(),
+                through: None,
             };
             settled.set_since_error(state.since_late_error(2, answered_at.into()));
             let (changed, _) = state.reclassify_after(&settled);
@@ -7858,6 +7923,7 @@ mod tests {
             clears: kept.clears,
             since_error: true,
             settled_ids: Vec::new(),
+            through: None,
         };
         state.judge_answer(&mut answer, time);
         let since = answer.since_error;
@@ -8162,6 +8228,7 @@ mod tests {
                 clears: kept.clears,
                 since_error: true,
                 settled_ids: Vec::new(),
+                through: None,
             };
             let time = kept.answer_time(
                 None,
@@ -8220,6 +8287,7 @@ mod tests {
                 clears: kept.clears,
                 since_error: true,
                 settled_ids: Vec::new(),
+                through: None,
             };
             state.reclassify_after(&owner);
             assert_eq!(
@@ -8694,6 +8762,7 @@ mod tests {
                     clears: kept.clears,
                     since_error: true,
                     settled_ids: Vec::new(),
+                    through: None,
                 };
                 let time = kept.answer_time(new.0, new.1, new.2);
                 state.judge_answer(&mut answer, time);
@@ -8765,6 +8834,7 @@ mod tests {
             clears: kept.clears,
             since_error: true,
             settled_ids: Vec::new(),
+            through: None,
         };
         let mut state = LinkState::default();
         let (_, kept) = log_kept(&mut state, 1, silent.clone());
@@ -9546,6 +9616,7 @@ mod tests {
             pending_at_end: false,
             clears: Clears::default(),
             matched: false,
+            matched_through: None,
         };
         let settle = |kept: &Kept, response: &[u8], window| {
             let answered = kept.answered(response, &LateAnswer::default());
@@ -9635,6 +9706,7 @@ mod tests {
             pending_at_end: false,
             clears: Clears::default(),
             matched: false,
+            matched_through: None,
         };
         let judged = |id| {
             settle_late_pending(
@@ -9717,6 +9789,7 @@ mod tests {
                 pending_at_end: false,
                 clears: Clears::default(),
                 matched: false,
+                matched_through: None,
             },
         );
         assert!(state.settle_owed(1).is_some());
@@ -13650,5 +13723,295 @@ mod tests {
         let (dropped, emptied) = state.refresh_owed_rows(2, &kept.evidence, &entry.link_history);
         assert!(dropped.is_empty() && !emptied);
         assert_eq!(state.owed_row_ids(2), [RX2]);
+    }
+
+    /// The primitive of the owed exchange `seq` ends: a link error read with the end, written as
+    /// line `line`, then its final response, which the log counts after that error (design 8.11
+    /// "Matched answer"). `stays`: the exchange stays owed and kept, as a collecting exchange with
+    /// a silent identifier does. Mirrors `CommLog::primitive_ended`.
+    fn end_after_link_error(
+        state: &mut LinkState,
+        seq: u64,
+        line: u64,
+        time: AnswerTime,
+        stays: bool,
+    ) {
+        let kept = state.kept(seq).unwrap().clone();
+        let mut answered = kept.answered(&[0x62, 0xF1, 0x86, 0x41], &LateAnswer::default());
+        answered.link_errors.push(LinkErrorKind::Receive);
+        answered.link_errors_before_answer = true;
+        let history = state.history_settling(&answered, seq);
+        let entry = ExchangeEntry::build(seq, answered.clone(), history);
+        if stays {
+            state.update_kept(seq, answered.clone(), entry.sent, None, None);
+        } else {
+            state.settle_owed(seq);
+        }
+        state.settled(seq, entry.classification, &entry.reason, answered, !stays);
+        state.channel_link_error(line, LinkErrorKind::Receive);
+        let mut answer = entry
+            .settled_answer(&kept, !stays)
+            .after_end_error(state.clears(), line);
+        state.judge_answer(&mut answer, time);
+        super::super::settle_later(state, seq, entry.late_restart(), &answer);
+    }
+
+    /// One event of the scenario of `after_end_scenario`.
+    #[derive(Debug, Clone, Copy)]
+    enum AfterEnd {
+        /// The primitive of exchange 2 ends (link error, then final response with this answer
+        /// time); exchange X is logged right after it.
+        End(AnswerTime),
+        /// As `End`, but exchange 2 stays owed and kept.
+        EndKept(AnswerTime),
+        /// A late link error at this device time.
+        Error(i64),
+        /// A late restart of this exchange, accepted or unusable.
+        Restart(u64, bool),
+        Reopen,
+        /// Enough exchanges for exchange 2 to leave the window while exchange 4 stays in it.
+        Fill,
+    }
+
+    /// What `after_end_scenario` reads: the window's count for L and X, and the link's count.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    struct AfterEndCounts {
+        l: u32,
+        x: Option<u32>,
+        link: u32,
+    }
+
+    /// Exchange 1: another match, answered. E = 2: silent read of F186, owed and kept. 3: another
+    /// match, answered. L = 4: a read of F186 of which only the first frame went out, so not owed,
+    /// logged before E's end. X: the same request, logged after the end. Lines and exchanges share
+    /// one numbering, as in the log. `pending`: E's entry holds a forwarded pending, a matched
+    /// answer counted at the entry.
+    fn after_end_scenario(events: &[AfterEnd], pending: bool) -> AfterEndCounts {
+        let mut silent = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        silent.transmit_evidence = Some(TransmitEvidence::TxIndication);
+        let other = |did: u8| {
+            let mut other = judged(forwarding(evidence(
+                &[0x22, 0xF1, did],
+                End::Positive(vec![0x62, 0xF1, did, 0x41]),
+            )));
+            other.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            other
+        };
+        let mut partial = judged(forwarding(evidence(&READ_F186, End::NoResponse)));
+        partial.flow_control = true;
+        let mut state = LinkState::default();
+        log_kept(&mut state, 1, timed(other(0x87), Some(500), Some(600)));
+        let mut silent = timed(silent, Some(1_000), None);
+        if pending {
+            silent.pending = vec![Pending {
+                vci_us: None,
+                clock: None,
+                agent_us: 1_100,
+                epoch: None,
+                since_previous_ms: None,
+            }];
+        }
+        let (_, kept) = log_kept(&mut state, 2, silent);
+        assert_eq!(kept.matched, pending);
+        state.keep(2, kept);
+        log_kept(&mut state, 3, timed(other(0x88), Some(3_000), Some(3_200)));
+        let (entry, _) = log_kept(&mut state, 4, timed(partial.clone(), Some(9_000), None));
+        // L is no possible owner of E's answer.
+        assert_eq!(entry.sent, Sent::Partial);
+        assert!(state.owed_row_ids(4).is_empty());
+        let mut line = 4;
+        let mut x = None;
+        for event in events {
+            line += 1;
+            match *event {
+                AfterEnd::End(time) | AfterEnd::EndKept(time) => {
+                    // An accepted restart read first already ended the owed request.
+                    if state.kept(2).is_some() {
+                        let stays = matches!(event, AfterEnd::EndKept(_));
+                        end_after_link_error(&mut state, 2, line, time, stays);
+                    }
+                    line += 1;
+                    log_kept(&mut state, line, timed(partial.clone(), Some(12_000), None));
+                    x = Some(line);
+                }
+                AfterEnd::Error(us) => {
+                    read_late_error(&mut state, line, placed_at(Clock::Device, 0, us));
+                }
+                AfterEnd::Restart(seq, accepting) => {
+                    state.reset_after(seq, seq, accepting);
+                }
+                AfterEnd::Reopen => state.reopened(),
+                AfterEnd::Fill => {
+                    let first = line + 1;
+                    line += WINDOW as u64 - 2;
+                    for seq in first..=line {
+                        log_kept(&mut state, seq, other(0x89));
+                    }
+                    assert!(state.window.iter().all(|logged| logged.seq > 2));
+                    assert!(state.window.iter().any(|logged| logged.seq == 4));
+                }
+            }
+        }
+        let key = MatchKey::of(&partial);
+        AfterEndCounts {
+            l: same_match(&state, 4),
+            x: x.map(|x| same_match(&state, x)),
+            link: state.matched.get(&key).copied().unwrap_or(0),
+        }
+    }
+
+    fn after_end_orders(events: &[AfterEnd]) -> Vec<Vec<AfterEnd>> {
+        if events.len() <= 1 {
+            return vec![events.to_vec()];
+        }
+        let mut all = Vec::new();
+        for at in 0..events.len() {
+            let mut rest = events.to_vec();
+            let first = rest.remove(at);
+            for mut order in after_end_orders(&rest) {
+                order.insert(0, first);
+                all.push(order);
+            }
+        }
+        all
+    }
+
+    /// The counts of every read order of `events`, which must all be the same, and L's is 0.
+    fn after_end_all_orders(events: &[AfterEnd]) -> AfterEndCounts {
+        let orders = after_end_orders(events);
+        let first = after_end_scenario(&orders[0], false);
+        for order in &orders {
+            let counts = after_end_scenario(order, false);
+            assert_eq!(counts.l, 0, "{order:?}");
+            assert_eq!(counts, first, "{order:?}");
+        }
+        first
+    }
+
+    /// ADR-449: an answer counted after a link error its primitive's end read counts for no
+    /// exchange logged before that error, whichever of the end and the late link error is read
+    /// first (the backlog's first case); an exchange logged after the end counts it as before.
+    #[test]
+    fn matched_answer_after_end_link_error_does_not_count_for_an_exchange_logged_before_it() {
+        let (silent_time, answered_time) = (AnswerTime::Unknown, device_time(0, 20_000));
+        for (time, x, link) in [(silent_time, 0, 0), (answered_time, 1, 1)] {
+            for order in after_end_orders(&[AfterEnd::End(time), AfterEnd::Error(800)]) {
+                let counts = after_end_scenario(&order, false);
+                assert_eq!(
+                    counts,
+                    AfterEndCounts {
+                        l: 0,
+                        x: Some(x),
+                        link
+                    },
+                    "{order:?}"
+                );
+            }
+        }
+        // Without a late link error the exchange logged after the end counts the answer.
+        let counts = after_end_scenario(&[AfterEnd::End(silent_time)], false);
+        assert_eq!(
+            counts,
+            AfterEndCounts {
+                l: 0,
+                x: Some(1),
+                link: 1
+            }
+        );
+    }
+
+    /// ADR-449: a late link error placed after the exchange whose answer was counted, and a late
+    /// accepted or unusable restart, in all six read orders (the backlog's variant): the counts
+    /// do not depend on the order.
+    #[test]
+    fn matched_answer_after_end_link_error_with_a_late_restart_is_read_order_independent() {
+        let early = device_time(0, 1_500);
+        let late = device_time(0, 20_000);
+        for accepting in [true, false] {
+            let counts = after_end_all_orders(&[
+                AfterEnd::End(early),
+                AfterEnd::Error(2_000),
+                AfterEnd::Restart(1, accepting),
+            ]);
+            assert_eq!(counts.x, Some(0));
+            assert_eq!(counts.link, 0);
+        }
+        let counts = after_end_all_orders(&[
+            AfterEnd::End(late),
+            AfterEnd::Error(2_000),
+            AfterEnd::Restart(1, true),
+        ]);
+        assert_eq!((counts.x, counts.link), (Some(1), 1));
+    }
+
+    /// ADR-449: no late link error at all, only a late restart between the exchange and the one
+    /// logged before its end, and a reopen followed by two late errors, give no count either.
+    #[test]
+    fn matched_answer_after_end_link_error_needs_no_late_error_to_be_kept_from_the_earlier_exchange()
+     {
+        let unknown = AnswerTime::Unknown;
+        for accepting in [true, false] {
+            for order in
+                after_end_orders(&[AfterEnd::End(unknown), AfterEnd::Restart(3, accepting)])
+            {
+                assert_eq!(after_end_scenario(&order, false).l, 0, "{order:?}");
+            }
+        }
+        let counts = after_end_scenario(
+            &[
+                AfterEnd::Reopen,
+                AfterEnd::End(unknown),
+                AfterEnd::Error(700),
+                AfterEnd::Error(800),
+            ],
+            false,
+        );
+        assert_eq!(counts.l, 0);
+    }
+
+    /// ADR-449: the record of an exchange that stays owed and kept carries the line too, in the
+    /// window and beyond it, released by an accepted restart or not.
+    #[test]
+    fn kept_matched_answer_after_end_link_error_does_not_count_for_an_earlier_exchange() {
+        let unknown = AnswerTime::Unknown;
+        // In the window the exchange logged after the end counts the answer.
+        let counts = after_end_scenario(
+            &[AfterEnd::EndKept(unknown), AfterEnd::Restart(1, false)],
+            false,
+        );
+        assert_eq!(
+            counts,
+            AfterEndCounts {
+                l: 0,
+                x: Some(1),
+                link: 1
+            }
+        );
+        for accepting in [false, true] {
+            let counts = after_end_scenario(
+                &[
+                    AfterEnd::EndKept(unknown),
+                    AfterEnd::Fill,
+                    AfterEnd::Restart(1, accepting),
+                ],
+                false,
+            );
+            assert_eq!(counts.l, 0, "accepting {accepting}");
+        }
+    }
+
+    /// ADR-449: an answer counted at the exchange's entry (a forwarded pending) still counts for
+    /// an exchange logged after the entry, however the end and a late restart are read.
+    #[test]
+    fn matched_answer_counted_at_the_entry_still_counts_for_the_exchange_logged_after_it() {
+        let unknown = AnswerTime::Unknown;
+        assert_eq!(after_end_scenario(&[], true).l, 1);
+        for events in [
+            vec![AfterEnd::End(unknown)],
+            vec![AfterEnd::End(unknown), AfterEnd::Restart(1, false)],
+            vec![AfterEnd::End(unknown), AfterEnd::Restart(1, true)],
+        ] {
+            assert_eq!(after_end_scenario(&events, true).l, 1, "{events:?}");
+        }
     }
 }

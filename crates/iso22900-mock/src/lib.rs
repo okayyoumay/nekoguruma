@@ -2133,6 +2133,15 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
             guard.ind_active = guard.ind_working;
             guard.table_active = guard.table_working;
         }
+        // A tester-present that fell due while the link was idle goes before a ComPrimitive that
+        // arrives after it, whether or not the delivery thread has got to it yet: otherwise the
+        // order of the two would depend on how soon that thread runs after the item that made
+        // it due (ADR-423 item 6 holds it back only behind a ComPrimitive that runs or waits).
+        let idle = guard.waiting.is_empty() && guard.scheduled.is_empty();
+        let now = Instant::now();
+        if idle && guard.tp_due.is_some_and(|due| due <= now) {
+            send_tester_present(&mut guard, now);
+        }
         let busy = !guard.waiting.is_empty() || !guard.scheduled.is_empty();
         let immediate = if guard.ecu.is_some() || busy {
             // A STARTCOMM with a request is sent as a send-and-receive is (ADR-418 item 3).
@@ -3892,6 +3901,43 @@ mod tester_present_tests {
         let read_events: Vec<_> = events.iter().filter(|(cop, _)| *cop == read).collect();
         assert_eq!(read_events.len(), 3, "{events:?}");
         assert_eq!(read_events[2].1, FINISHED);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
+    }
+
+    /// A tester-present that fell due while the link was idle goes before a ComPrimitive started
+    /// after it, even when the delivery thread has not yet got to it: the thread is asleep here
+    /// (nothing signals it when the due time is set), so only the start can send it.
+    #[test]
+    fn a_tester_present_due_on_an_idle_link_goes_before_a_com_primitive_started_after_it() {
+        let rig = Rig::new();
+        rig.keep_alive(2000);
+        let start = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(start);
+        rig.wait_for("the first tester-present answered", |state| {
+            state.scheduled.is_empty() && state.waiting.is_empty() && state.tp_due.is_some()
+        });
+        rig.arm_probe();
+        // Due now, with the delivery thread asleep until the next period.
+        state().lock().unwrap().tp_due = Some(Instant::now());
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        {
+            let guard = state().lock().unwrap();
+            assert!(
+                Rig::probe_used(&guard),
+                "the read went before the tester-present"
+            );
+            assert!(
+                guard
+                    .tp_due
+                    .is_some_and(|due| due > Instant::now() + Duration::from_secs(1))
+            );
+        }
+        let events = rig.finished(read);
         assert!(
             events
                 .iter()

@@ -64,7 +64,9 @@ to the standard here.
    header, in every binding mode.
 6. **Serialization (8.1.3 Table 1, as ADR-419 for the J2534 worker).** A tester-present goes only
    when no ComPrimitive runs or waits; a ComPrimitive that waits goes first and the
-   tester-present stays due. This holds every tester-present behind the ComPrimitives, which is
+   tester-present stays due. A tester-present already due when a ComPrimitive is started on an
+   idle link was due before anything waited, so the start sends it first and the ComPrimitive
+   waits behind it; the order does not depend on when the delivery thread next runs. This holds every tester-present behind the ComPrimitives, which is
    stricter than 8.1.3 Table 1 (a functional tester-present with no response may go at once
    behind a physical request): a simplification of the mock. A send that expects a response (`ReqRsp` 1) puts a marker into the
    schedule of the running ComPrimitive, due when the ECU's final answer is (response-pending

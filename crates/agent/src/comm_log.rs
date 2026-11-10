@@ -3043,6 +3043,7 @@ impl CommLog {
             pending_at_end: false,
             clears,
             matched: false,
+            matched_through: None,
         };
         let mut entry = exchange::ExchangeEntry::build(inner.next_seq, evidence, history);
         // The time of the item that answers it, kept for the judgement of a late link error read
@@ -3958,20 +3959,23 @@ impl CommLog {
         // since an error from before it, and the answer then counts after it (design 8.11
         // "Link error", as `record` applies it): applied before the answer is counted, which
         // counts from the link's clears then.
-        let mut answer_from = kept.clone();
+        let mut after_error = None;
         if errors_precede_answer && let Some(kind) = new_kinds.first() {
             let next = inner.next_seq;
             for (_, state) in &mut inner.links {
                 state.channel_link_error(next, *kind);
             }
-            answer_from.clears = inner.links[at].1.clears();
+            after_error = Some((inner.links[at].1.clears(), next));
         }
         let state = &mut inner.links[at].1;
         // `final_response` ends the owed request of this exchange (`ends_owed`), as does the end
         // that left it no row.
         let mut answer = entry
-            .settled_answer(&answer_from, final_response || emptied)
+            .settled_answer(&kept, final_response || emptied)
             .with_settled_ids(dropped);
+        if let Some((clears, line)) = after_error {
+            answer = answer.after_end_error(clears, line);
+        }
         if error_with_end.is_some() {
             answer.no_matched_answer();
         }
@@ -25305,5 +25309,227 @@ pub(crate) mod tests {
         assert_eq!(order_of(&lines), ["unattached", "late_item"], "{lines:#?}");
         let late = line_of(&lines, "late_item");
         assert_eq!(late["refers_to"], serde_json::json!([first]), "{late}");
+    }
+
+    fn now_at(monotonic_us: u64) -> AgentNow {
+        AgentNow {
+            epoch: 0,
+            monotonic_us,
+            wall_unix_ms: 0,
+        }
+    }
+
+    /// A request the agent's deadline ended, owed and kept; its transmit-done time on the device
+    /// clock confirms the send and puts no read on the clock.
+    fn stray_at(request: &[u8], at_us: u64) -> (exchange::Evidence, Vec<UnattachedItem>) {
+        let mut waited = evidence(endpoint(0x7E0), request, exchange::End::VciDidNotEnd);
+        waited.pending_visibility = exchange::PendingVisibility::Forwarded;
+        waited.times.agent.before_us = at_us;
+        waited.times.agent.end_us = at_us + 500_000;
+        waited.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(dev(at_us)),
+            ..exchange::VciTimes::default()
+        });
+        (waited, Vec::new())
+    }
+
+    /// A read of `did` answered in time, sent at `at_us`, with `unbound` read during it.
+    fn answered_read_at(
+        did: u8,
+        at_us: u64,
+        unbound: Vec<UnattachedItem>,
+    ) -> (exchange::Evidence, Vec<UnattachedItem>) {
+        let mut evidence = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, did],
+            exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+        );
+        evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+        evidence.times.agent.before_us = at_us;
+        evidence.times.agent.end_us = at_us + 300_000;
+        evidence.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(dev(at_us)),
+            rx_end: Some(dev(at_us + 100_000)),
+            response_read_us: Some(at_us + 200_000),
+            ..exchange::VciTimes::default()
+        });
+        (evidence, unbound)
+    }
+
+    /// A read of F190 of which only the first frame went out: not owed, of the strays' match.
+    fn first_frame_only_at(at_us: u64) -> (exchange::Evidence, Vec<UnattachedItem>) {
+        let mut evidence = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::NoResponse,
+        );
+        evidence.pending_visibility = exchange::PendingVisibility::Forwarded;
+        evidence.flow_control = true;
+        evidence.times.agent.before_us = at_us;
+        evidence.times.agent.end_us = at_us + 300_000;
+        (evidence, Vec::new())
+    }
+
+    fn late_frame_error(vci_us: u32, read_us: u64) -> UnattachedItem {
+        UnattachedItem {
+            link: 1,
+            earlier_primitive: false,
+            owner: None,
+            vci_us,
+            clock: Some(exchange::Clock::Device),
+            read: Some(now_at(read_us)),
+            data: UnattachedData::Error {
+                event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+                link_error: Some(exchange::LinkErrorKind::Frame),
+            },
+        }
+    }
+
+    /// The primitive of `seq` ends: a link error bound to it with no clock time, then its
+    /// response, whose end is `end`.
+    fn end_after_link_error(
+        log: &CommLog,
+        seq: u64,
+        response: Vec<u8>,
+        end: exchange::VciTime,
+        read_us: u64,
+    ) {
+        let error = EndRead {
+            read: now_at(read_us),
+            item: EndItem::Error(EndError {
+                kind: Some(exchange::LinkErrorKind::Receive),
+                time: exchange::VciTime::new(0, None),
+                named: false,
+                event: "PDU_ERR_EVT_RX_ERROR".to_owned(),
+                extra_error_info: None,
+                extra_error_info_name: None,
+            }),
+        };
+        let answer = EndRead {
+            read: now_at(read_us + 100),
+            item: EndItem::Response {
+                end,
+                tx_done: None,
+                rx_start: None,
+            },
+        };
+        log.primitive_ended(
+            seq,
+            ended_with(Some(exchange::End::Positive(response)), vec![error, answer]),
+        )
+        .unwrap();
+    }
+
+    fn answered_same_match(log: &CommLog, seq: u64) -> u32 {
+        log.lock().links[0]
+            .1
+            .logged_history(seq)
+            .unwrap()
+            .answered_same_match
+    }
+
+    /// ADR-449, the first case: an exchange logged between a primitive's entry and its end, which
+    /// reads a link error before its answer, does not count that answer as a matched answer when a
+    /// link error read later falls after an earlier exchange. (The host writes a primitive's end
+    /// before the next request's entry, so this order is reachable through the log's API only.)
+    #[test]
+    fn answer_after_an_end_link_error_is_no_matched_answer_for_an_exchange_logged_before_it() {
+        let (dir, setup, log, seqs) = log_of(vec![
+            answered_read_at(0x91, 1_000_000, Vec::new()),
+            stray_at(&[0x22, 0xF1, 0x90], 3_000_000),
+            first_frame_only_at(4_000_000),
+        ]);
+        let (second, third) = (seqs[1], seqs[2]);
+        // The end's link error, then the response on another clock than the late error's.
+        end_after_link_error(
+            &log,
+            second,
+            vec![0x62, 0xF1, 0x90, 0x41],
+            exchange::VciTime::new(3_400_000, Some(exchange::Clock::Worker)),
+            5_000_000,
+        );
+        // A late link error at 2 s on the device clock, read during a later read: after the first.
+        let (evidence, _) = answered_read_at(0x92, 6_000_000, Vec::new());
+        log.exchange_with(evidence, vec![late_frame_error(2_000_000, 6_000_500)])
+            .unwrap();
+        let count = answered_same_match(&log, third);
+        let lines = finished(&log, &setup, &dir);
+        let late = line_of(&lines, "late_item");
+        assert_eq!(late["epoch"], 0, "{late}");
+        assert_eq!(count, 0, "{lines:#?}");
+    }
+
+    /// ADR-449, the variant: the late link error falls after the exchange whose primitive ended,
+    /// and a late restart is accepted; the count is 0 in either read order.
+    #[test]
+    fn answer_after_an_end_link_error_is_no_matched_answer_in_either_order_of_error_and_restart() {
+        for error_first in [true, false] {
+            let (dir, setup, log, seqs) = log_of(vec![
+                stray_at(&[0x10, 0x03], 1_000_000),
+                stray_at(&[0x22, 0xF1, 0x90], 3_000_000),
+                first_frame_only_at(4_000_000),
+            ]);
+            let (restart, s, later) = (seqs[0], seqs[1], seqs[2]);
+            end_after_link_error(
+                &log,
+                s,
+                vec![0x62, 0xF1, 0x90, 0x41],
+                dev(3_500_000),
+                5_000_000,
+            );
+            let error = |log: &CommLog, at_us: u64| {
+                let (evidence, _) = answered_read_at(0x92, at_us, Vec::new());
+                log.exchange_with(evidence, vec![late_frame_error(3_800_000, at_us + 500)])
+                    .unwrap();
+            };
+            let accept = |log: &CommLog, read_us: u64| {
+                // On another clock, so that it sets no time on the late error's.
+                let answer = EndRead {
+                    read: now_at(read_us),
+                    item: EndItem::Response {
+                        end: exchange::VciTime::new(1_200_000, Some(exchange::Clock::Worker)),
+                        tx_done: None,
+                        rx_start: None,
+                    },
+                };
+                log.primitive_ended(
+                    restart,
+                    ended_with(
+                        Some(exchange::End::Positive(vec![
+                            0x50, 0x03, 0x00, 0x32, 0x01, 0xF4,
+                        ])),
+                        vec![answer],
+                    ),
+                )
+                .unwrap();
+            };
+            if error_first {
+                error(&log, 6_000_000);
+                accept(&log, 7_000_000);
+            } else {
+                accept(&log, 6_000_000);
+                error(&log, 7_000_000);
+            }
+            let count = answered_same_match(&log, later);
+            let lines = finished(&log, &setup, &dir);
+            let accepted = lines
+                .iter()
+                .filter(|line| {
+                    line["event"] == "primitive_ended"
+                        && line["text"].as_str().is_some_and(|text| {
+                            text.contains("accepts that exchange's session change or ECUReset")
+                        })
+                })
+                .count();
+            let placed = lines
+                .iter()
+                .filter(|line| line["event"] == "late_item" && line["epoch"] == 0)
+                .count();
+            assert_eq!(accepted, 1, "error_first {error_first}: {lines:#?}");
+            assert_eq!(placed, 1, "error_first {error_first}: {lines:#?}");
+            assert_eq!(count, 0, "error_first {error_first}: {lines:#?}");
+        }
     }
 }

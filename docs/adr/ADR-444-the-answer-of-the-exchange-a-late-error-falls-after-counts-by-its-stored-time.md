@@ -1,7 +1,7 @@
 # ADR-444: The Answer of the Exchange a Late Error Falls After Counts by Its Stored Time
 
 **Date:** 2026-11-09
-**Status:** Accepted (Consequences' first bullet revised by ADR-445: an exchange kept at its end for its rows counts its matched answer once, at its release, beyond the window too)
+**Status:** Accepted (Consequences' first bullet revised by ADR-445: an exchange kept at its end for its rows counts its matched answer once, at its release, beyond the window too; the read-order case left open in Consequences' first bullet closed by ADR-449)
 **Affects:** `agent` communication log (`comm_log/exchange.rs` `LinkState::error_after`,
 `Logged::after`, `Logged::matched_at`, `LinkState::kept_matched_after`); design 8.11
 "Settlement"; ADR-384 item 1, ADR-385 decision 2 and Consequences, ADR-441 decision 7

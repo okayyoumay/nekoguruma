@@ -1,7 +1,7 @@
 # ADR-441: The Exchanges That Survive an Accepted Restart Take Their Rows Again
 
 **Date:** 2026-11-09
-**Status:** Accepted (Consequences' bullet on the restart's uncounted matched answers closed by decision 7; decision 2's "an unkept exchange beyond the window has no evidence left" revised and the second Consequences bullet closed by ADR-442 for an exchange owed only through its owners; decision 7's record and window entry agree both ways for the exchange a late error falls after, ADR-444)
+**Status:** Accepted (Consequences' bullet on the restart's uncounted matched answers closed by decision 7; decision 2's "an unkept exchange beyond the window has no evidence left" revised and the second Consequences bullet closed by ADR-442 for an exchange owed only through its owners; decision 7's record and window entry agree both ways for the exchange a late error falls after, ADR-444; decision 7's record of a matched answer counted at its end after a link error also carries the line through which no exchange counts it, ADR-449)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState::record`, `LinkState::reset_after`,
 `LinkState::refresh_kept_beyond_window`, `LinkState::refresh_window_survivors`,
 `LinkState::refresh_row_owners`, `LinkState::free_owner_answer`), design 8.11 "Settlement"; ADR-368, ADR-435 decision 6,

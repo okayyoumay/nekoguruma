@@ -85,9 +85,15 @@ fn clock_now() -> UNUM32 {
 
 /// The module clock at `instant`; an instant before the epoch reads 0.
 fn clock_at(instant: Instant) -> UNUM32 {
+    clock_us(instant) as UNUM32
+}
+
+/// The module clock at `instant` in microseconds since the mock's epoch, not truncated to
+/// `UNUM32`.
+fn clock_us(instant: Instant) -> u64 {
     static EPOCH: OnceLock<Instant> = OnceLock::new();
     let epoch = *EPOCH.get_or_init(Instant::now);
-    instant.saturating_duration_since(epoch).as_micros() as UNUM32
+    instant.saturating_duration_since(epoch).as_micros() as u64
 }
 
 /// ComParam id of `CP_CanRespUSDTId` (the table above).
@@ -183,6 +189,32 @@ fn stamp_at(event: &mut PendingEvent, now: UNUM32) {
         Some(tx_done) if (now.wrapping_sub(tx_done) as i32) <= 0 => tx_done.wrapping_add(1),
         _ => now,
     };
+}
+
+/// Extends the `UNUM32` time `timestamp`, which lies within about 35 minutes of the clock
+/// reading `reference_us` (microseconds since the mock's epoch, [`clock_us`]), to microseconds
+/// since the epoch.
+fn unwrap_stamp(timestamp: UNUM32, reference_us: u64) -> u64 {
+    let ahead = i64::from(timestamp.wrapping_sub(reference_us as UNUM32) as i32);
+    reference_us.saturating_add_signed(ahead)
+}
+
+/// Makes the item's time, already set by [`stamp_at`], strictly later than the time of the last
+/// item stamped through here, and records it as the new last one. The link's items (a
+/// ComPrimitive's and the tester-present's) then never share a time, however briefly the delivery
+/// cycle took. The last time is kept in microseconds since the epoch, without the wrap of
+/// `UNUM32`, so a link idle for longer than half the `UNUM32` range is not held behind the clock;
+/// the item's time is truncated to `UNUM32` only here. `reference_us` is the clock reading the
+/// item's time was taken from ([`unwrap_stamp`]).
+fn bump_stamp(state: &mut MockState, event: &mut PendingEvent, reference_us: u64) {
+    let mut stamp = unwrap_stamp(event.timestamp, reference_us);
+    if let Some(last) = state.last_stamp
+        && stamp <= last
+    {
+        stamp = last + 1;
+    }
+    event.timestamp = stamp as UNUM32;
+    state.last_stamp = Some(stamp);
 }
 
 /// What an event item carries.
@@ -570,6 +602,10 @@ struct MockState {
     /// The simulated ECU that answers `PDU_COPT_SENDRECV` ComPrimitives, if one is attached
     /// (`__mock_sim_ecu_control`, or `NGR_SIM_ECU_CONFIG` at `PDUConstruct`; ADR-299).
     ecu: Option<SimEcu>,
+    /// The latest time stamp, in microseconds since the mock's epoch ([`clock_us`], not wrapped),
+    /// that a ComPrimitive began at, a tester-present item took ([`bump_stamp`]) or a delivered
+    /// item carried; the next such item is stamped after it. A reset clears it.
+    last_stamp: Option<u64>,
     /// ComPrimitives started while an ECU is attached (or while others still wait or run),
     /// waiting for the one before them to finish, in start order. The delivery thread
     /// ([`deliver`]) begins each in turn. Discarded with the event queue (`PDUConstruct`,
@@ -979,11 +1015,11 @@ unsafe fn notify_data_available(callback: CALLBACKFNC, event: &PendingEvent, api
 
 unsafe fn queue_event(mut event: PendingEvent) {
     stamp(&mut event);
-    let notified = event.clone();
-    let (callback, api_tag) = {
+    let (notified, callback, api_tag) = {
         let mut guard = state().lock().expect("mock state poisoned");
-        guard.pending_events.push(event);
-        (guard.callback, guard.api_tag)
+        bump_stamp(&mut guard, &mut event, clock_us(Instant::now()));
+        guard.pending_events.push(event.clone());
+        (event, guard.callback, guard.api_tag)
     };
 
     unsafe { notify_data_available(callback, &notified, api_tag) };
@@ -1035,9 +1071,18 @@ fn begin_next(state: &mut MockState, now: Instant) {
     let no_response_times = state.no_response_times;
     let unbound = cop.unbound;
     let header_id = if cop.extra_info { cop.table_id } else { None };
+    // The ComPrimitive's first item is stamped after the link's last stamp ([`bump_stamp`]); all
+    // its items move by the same amount, so the equal times its items share (the transmit
+    // indication and the response's transmit done, a start indication and its response) stay equal.
+    let clock = clock_us(now);
+    let sent_us = match state.last_stamp {
+        Some(last) if clock <= last => last + 1,
+        _ => clock,
+    };
+    let sent = sent_us as UNUM32;
+    let offset = sent.wrapping_sub(clock as UNUM32);
     let mut events = match (state.ecu.as_mut(), cop.request) {
         (Some(ecu), Some((request, cycles))) => {
-            let sent = clock_at(now);
             let mut events = ecu_events(
                 ecu,
                 &request,
@@ -1074,7 +1119,7 @@ fn begin_next(state: &mut MockState, now: Instant) {
     let mut previous: Option<UNUM32> = None;
     for (delay_ms, mut event) in events {
         let due = now + Duration::from_millis(delay_ms.into());
-        stamp_at(&mut event, clock_at(due));
+        stamp_at(&mut event, clock_at(due).wrapping_add(offset));
         if let Some(previous) = previous
             && (event.timestamp.wrapping_sub(previous) as i32) < 0
         {
@@ -1083,6 +1128,26 @@ fn begin_next(state: &mut MockState, now: Instant) {
         previous = Some(event.timestamp);
         state.scheduled.push_back((due, event));
     }
+    // Only the begin stamp counts here; each item raises it as it is delivered ([`note_delivered`]),
+    // so a later item of the link is not stamped after this ComPrimitive's future items.
+    state.last_stamp = Some(sent_us);
+}
+
+/// Records that the item stamped `timestamp` was delivered: the link's last stamp is raised to
+/// it, so an item stamped from now on (a tester-present that its finish made due) comes after
+/// everything delivered. `reference_us` is the clock reading now ([`unwrap_stamp`]).
+/// [`note_delivered`] for a delivered scheduled event. A tester-present answer marker carries no
+/// stamp (`timestamp` 0): it is an internal marker, not an item, so it does not move the last
+/// stamp (unwrapping its 0 would put the last stamp up to a whole clock range ahead).
+fn note_delivered_event(state: &mut MockState, event: &PendingEvent, reference_us: u64) {
+    if !matches!(event.kind, EventKind::TesterPresentAnswer { .. }) {
+        note_delivered(state, event.timestamp, reference_us);
+    }
+}
+
+fn note_delivered(state: &mut MockState, timestamp: UNUM32, reference_us: u64) {
+    let stamp = unwrap_stamp(timestamp, reference_us);
+    state.last_stamp = Some(state.last_stamp.map_or(stamp, |last| last.max(stamp)));
 }
 
 /// Starts the delivery thread unless one runs. Called with the state locked; neither the
@@ -1180,6 +1245,7 @@ fn deliver() {
             Some(_) => {
                 // Stamped with its scheduled time when the ComPrimitive began (`begin_next`).
                 let (_, mut event) = guard.scheduled.pop_front().expect("an event is due");
+                note_delivered_event(&mut guard, &event, clock_us(now));
                 if let Some(hook) = event.on_finish {
                     apply_hook(&mut guard, hook, now);
                 }
@@ -1193,6 +1259,7 @@ fn deliver() {
                                 extra,
                             );
                             stamp(&mut event);
+                            bump_stamp(&mut guard, &mut event, clock_us(Instant::now()));
                         }
                         _ => continue,
                     }
@@ -1290,6 +1357,7 @@ fn send_tester_present(state: &mut MockState, now: Instant) {
             on_finish: None,
         };
         stamp_at(&mut event, clock_at(now));
+        bump_stamp(state, &mut event, clock_us(now));
         state.scheduled.push_back((now, event));
     }
     if tp.req_rsp == 0 {
@@ -2122,6 +2190,16 @@ exported_fn!(PDUStartComPrimitive(_h_mod: UNUM32, _h_cll: UNUM32, cop_type: T_PD
         } else {
             None
         };
+        // A tester-present that fell due while the link was idle goes before a ComPrimitive that
+        // arrives after it, whether or not the delivery thread has got to it yet: otherwise the
+        // order of the two would depend on how soon that thread runs after the item that made
+        // it due (ADR-423 item 6 holds it back only behind a ComPrimitive that runs or waits).
+        // It goes with the buffers in force before this start, so ahead of an UPDATEPARAM's copy.
+        let idle = guard.waiting.is_empty() && guard.scheduled.is_empty();
+        let now = Instant::now();
+        if idle && guard.tp_due.is_some_and(|due| due <= now) {
+            send_tester_present(&mut guard, now);
+        }
         // While an ECU is attached, and while other ComPrimitives still wait or run, the
         // ComPrimitive waits its turn, and the ECU answers a send-and-receive request when it
         // begins (ADR-299). Otherwise the synthetic completion event is queued at once.
@@ -3023,6 +3101,206 @@ mod sim_ecu_tests {
     }
 
     #[test]
+    fn items_stamped_at_the_same_instant_get_strictly_increasing_times() {
+        let item = |kind| PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: PDU_HANDLE_UNDEF,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind,
+            on_finish: None,
+        };
+        let mut state = MockState::default();
+        // A tester-present indication and a ComPrimitive item, scheduled at the same instant.
+        let now = Instant::now();
+        let mut stamps = Vec::new();
+        for kind in [
+            EventKind::Indication(Indication::Transmit),
+            EventKind::Result(vec![0x62]),
+            EventKind::Result(vec![0x62]),
+        ] {
+            let mut event = item(kind);
+            stamp_at(&mut event, clock_at(now));
+            bump_stamp(&mut state, &mut event, clock_us(now));
+            stamps.push(event.timestamp);
+        }
+        assert!(
+            stamps
+                .windows(2)
+                .all(|w| w[1].wrapping_sub(w[0]) as i32 > 0),
+            "{stamps:?}"
+        );
+        // A later clock reading is kept as it is.
+        let reference = clock_us(now) + 100;
+        let mut later = item(EventKind::Result(vec![0x62]));
+        later.timestamp = reference as UNUM32;
+        bump_stamp(&mut state, &mut later, reference);
+        assert_eq!(later.timestamp, reference as UNUM32);
+        assert_eq!(state.last_stamp, Some(reference));
+    }
+
+    #[test]
+    fn a_link_idle_for_longer_than_half_the_clock_range_is_stamped_at_the_clock() {
+        let mut state = MockState::default();
+        // The clock reads more than 2^32 microseconds, so its 32-bit value has wrapped; the link's
+        // last stamp is older than 2^31 microseconds.
+        let reference: u64 = (1 << 32) + 1_000;
+        state.last_stamp = Some(reference - (1 << 31) - 5);
+        let mut event = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: PDU_HANDLE_UNDEF,
+            tag: 0,
+            timestamp: reference as UNUM32,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Result(vec![0x62]),
+            on_finish: None,
+        };
+        bump_stamp(&mut state, &mut event, reference);
+        assert_eq!(event.timestamp, reference as UNUM32);
+        assert_eq!(state.last_stamp, Some(reference));
+        // Across the wrap, a stamp at the last one's value plus one is still ahead of it.
+        state.last_stamp = Some(u64::from(UNUM32::MAX));
+        event.timestamp = UNUM32::MAX;
+        bump_stamp(&mut state, &mut event, u64::from(UNUM32::MAX));
+        assert_eq!(event.timestamp, 0);
+        assert_eq!(state.last_stamp, Some(1 << 32));
+    }
+
+    #[test]
+    fn a_com_primitive_begun_at_the_instant_of_a_tester_present_item_is_stamped_after_it() {
+        let mut state = MockState::default();
+        let now = Instant::now();
+        // The tester-present's item took the clock at `now`.
+        state.last_stamp = Some(clock_us(now));
+        let template = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Result(Vec::new()),
+            on_finish: None,
+        };
+        state.waiting.push_back(WaitingCop {
+            event: template,
+            request: None,
+            rc78: Rc78::default(),
+            indications: Indications::default(),
+            unbound: None,
+            extra_info: false,
+            table_id: None,
+            hook: None,
+        });
+        begin_next(&mut state, now);
+        let (_, event) = &state.scheduled[0];
+        assert!(event.timestamp.wrapping_sub(clock_at(now)) as i32 > 0);
+        assert_eq!(state.last_stamp, Some(u64::from(event.timestamp)));
+    }
+
+    #[test]
+    fn a_delivered_tester_present_answer_marker_does_not_move_the_last_stamp() {
+        let mut state = MockState::default();
+        // 36 minutes in: unwrapping the marker's 0 stamp against this clock would give 2^32.
+        let reference = 2_160_000_000_u64;
+        state.last_stamp = Some(reference - 10);
+        let marker = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::TesterPresentAnswer { error: None },
+            on_finish: None,
+        };
+        note_delivered_event(&mut state, &marker, reference);
+        assert_eq!(state.last_stamp, Some(reference - 10));
+        // A real item still raises it.
+        let item = PendingEvent {
+            timestamp: (reference - 5) as UNUM32,
+            kind: EventKind::Result(Vec::new()),
+            ..marker
+        };
+        note_delivered_event(&mut state, &item, reference);
+        assert_eq!(state.last_stamp, Some(reference - 5));
+    }
+
+    #[test]
+    fn a_tester_present_right_after_a_delivered_item_is_stamped_after_it() {
+        let mut state = MockState::default();
+        apply_sim_ecu_command(
+            &mut state,
+            serde_json::from_str(r#"{"attach":{}}"#).unwrap(),
+        )
+        .unwrap();
+        state.link_state = LinkState::CommStarted;
+        // Physical addressing, so the tester present raises a transmit indication.
+        state.tp_active = TesterPresent {
+            addr_mode: 0,
+            ..TesterPresent::default()
+        };
+        state.ind_active.transmit = true;
+        let template = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::Result(Vec::new()),
+            on_finish: None,
+        };
+        state.waiting.push_back(WaitingCop {
+            event: template,
+            request: Some((vec![0x10, 0x03], Cycles::SendReceive)),
+            rc78: Rc78::default(),
+            indications: Indications {
+                transmit: true,
+                start: false,
+            },
+            unbound: None,
+            extra_info: false,
+            table_id: None,
+            hook: None,
+        });
+        let begun = Instant::now();
+        begin_next(&mut state, begun);
+        // The delivery thread delivers every item (all are due at once), as `deliver` does.
+        let mut delivered = Vec::new();
+        while let Some((_, event)) = state.scheduled.pop_front() {
+            note_delivered(&mut state, event.timestamp, clock_us(begun));
+            delivered.push(event.timestamp);
+        }
+        let finished = delivered.iter().copied().max().unwrap();
+        assert!(
+            finished.wrapping_sub(clock_at(begun)) as i32 >= 1,
+            "the response is stamped after the begin stamp"
+        );
+        // The finished item makes the tester present due; the clock has not passed it.
+        send_tester_present(&mut state, begun);
+        assert_eq!(state.scheduled.len(), 1);
+        let stamp = state.scheduled[0].1.timestamp;
+        assert!(
+            stamp.wrapping_sub(finished) as i32 > 0,
+            "{stamp} after {delivered:?}"
+        );
+    }
+
+    #[test]
     fn a_response_is_stamped_strictly_after_its_transmit_done() {
         let event = |tx_done| PendingEvent {
             h_mod: MOCK_MODULE_HANDLE,
@@ -3892,6 +4170,43 @@ mod tester_present_tests {
         let read_events: Vec<_> = events.iter().filter(|(cop, _)| *cop == read).collect();
         assert_eq!(read_events.len(), 3, "{events:?}");
         assert_eq!(read_events[2].1, FINISHED);
+        assert!(
+            events
+                .iter()
+                .all(|(_, seen)| !matches!(seen, Seen::Error(..))),
+            "{events:?}"
+        );
+    }
+
+    /// A tester-present that fell due while the link was idle goes before a ComPrimitive started
+    /// after it, even when the delivery thread has not yet got to it: the thread is asleep here
+    /// (nothing signals it when the due time is set), so only the start can send it.
+    #[test]
+    fn a_tester_present_due_on_an_idle_link_goes_before_a_com_primitive_started_after_it() {
+        let rig = Rig::new();
+        rig.keep_alive(2000);
+        let start = rig.start(start_comm(), &[0x10, 0x02]);
+        rig.finished(start);
+        rig.wait_for("the first tester-present answered", |state| {
+            state.scheduled.is_empty() && state.waiting.is_empty() && state.tp_due.is_some()
+        });
+        rig.arm_probe();
+        // Due now, with the delivery thread asleep until the next period.
+        state().lock().unwrap().tp_due = Some(Instant::now());
+        let read = rig.start(E_PDU_COPT::PDU_COPT_SENDRECV, &[0x22, 0xF1, 0x90]);
+        {
+            let guard = state().lock().unwrap();
+            assert!(
+                Rig::probe_used(&guard),
+                "the read went before the tester-present"
+            );
+            assert!(
+                guard
+                    .tp_due
+                    .is_some_and(|due| due > Instant::now() + Duration::from_secs(1))
+            );
+        }
+        let events = rig.finished(read);
         assert!(
             events
                 .iter()
@@ -5369,6 +5684,57 @@ mod tester_present_tests {
             assert_eq!(tester_present_indications(true, 0, 0), 0);
             // Functional addressing goes out on another identifier.
             assert_eq!(tester_present_indications(true, 1, 1), 0);
+        }
+
+        /// A tester-present due on an idle link goes out with the indication settings in force
+        /// before an UPDATEPARAM that is started after it, not with that UPDATEPARAM's.
+        #[test]
+        fn a_tester_present_sent_at_the_start_of_an_updateparam_uses_the_settings_before_it() {
+            let rig = Rig::new();
+            // A long period keeps the delivery thread asleep: only the start can send it.
+            rig.keep_alive(2000);
+            rig.ecu(UNBOUND);
+            set(&rig, 0, 0);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            let start = rig.start(E_PDU_COPT::PDU_COPT_STARTCOMM, &[]);
+            rig.finished_or_result(start);
+            rig.wait_for("the first tester-present answered", |state| {
+                state.scheduled.is_empty() && state.waiting.is_empty() && state.tp_due.is_some()
+            });
+            // Working transmit indication on, the active one still off; the next send is due.
+            rig.set_number("CP_TransmitIndEnable", 1);
+            rig.arm_probe();
+            state().lock().unwrap().pending_events.clear();
+            state().lock().unwrap().tp_due = Some(Instant::now());
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            {
+                let guard = state().lock().unwrap();
+                assert!(Rig::probe_used(&guard), "the tester-present was not sent");
+                let raised = guard
+                    .scheduled
+                    .iter()
+                    .map(|(_, event)| event)
+                    .chain(guard.pending_events.iter())
+                    .filter(|event| {
+                        matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                            && event.h_cop == PDU_HANDLE_UNDEF
+                    })
+                    .count();
+                assert_eq!(raised, 0, "judged with the UPDATEPARAM's settings");
+            }
+            rig.finished_or_result(update);
+            // The UPDATEPARAM's settings apply from then on: the next send raises one.
+            rig.set_number("CP_TesterPresentTime", 20_000);
+            let update = rig.start(E_PDU_COPT::PDU_COPT_UPDATEPARAM, &[]);
+            rig.finished_or_result(update);
+            state().lock().unwrap().pending_events.clear();
+            rig.wait_for("a transmit indication", |state| {
+                state.pending_events.iter().any(|event| {
+                    matches!(event.kind, EventKind::Indication(Indication::Transmit))
+                        && event.h_cop == PDU_HANDLE_UNDEF
+                })
+            });
         }
 
         /// Sets a ComParam through the FFI, whatever the value.

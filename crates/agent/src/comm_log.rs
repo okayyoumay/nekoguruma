@@ -4848,8 +4848,11 @@ impl Inner {
         let settles = !answered.collecting || answered.settles_owed();
         // The answer it adds counts for the later exchanges on the link.
         let answered_evidence = answered.clone();
+        let collecting = answered.collecting;
         let entry = exchange::ExchangeEntry::build(owner, answered, history);
-        let ends_owed = settles && !entry.owed_through_owners();
+        // Only a collecting exchange stays owed through an owner that could own another of its
+        // answers (ADR-445 decision 2); any other settles whole.
+        let ends_owed = settles && !(collecting && entry.owed_through_owners());
         if ends_owed {
             state.settle_owed(owner);
         }
@@ -12838,6 +12841,224 @@ pub(crate) mod tests {
             late_owner_of(&log, &late_final_on(0x7E8)),
             Some(LateOwner::Several(vec![owner, dependent], false))
         );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// A collecting read `request` (`22 F1 <did>`) on the functional link's receive table
+    /// (0x7E8, 0x7E9), `after_s` seconds in, that came with `answers` and ended as `end` with the
+    /// VCI's wait ended.
+    fn functional_read_after(
+        did: u8,
+        end: exchange::End,
+        answers: Vec<exchange::Answer>,
+        after_s: u64,
+    ) -> exchange::Evidence {
+        let request = [0x22, 0xF1, did];
+        let mut read = waited(endpoint(0x7DF), &request, true, |evidence| {
+            evidence.end = end;
+            evidence.vci_ended = true;
+            evidence.rx_id = 0;
+            evidence.receive_ids = vec![0x7E8, 0x7E9];
+            evidence.answers = answers;
+        });
+        read.expected = exchange::Expected::uds(&request);
+        read.times.agent.before_us += after_s * 1_000_000;
+        read.times.agent.end_us += after_s * 1_000_000;
+        read
+    }
+
+    /// ADR-445, decision 2: a lone late final that settles a collecting exchange whole is owed
+    /// through an owner only where the owner could own one of the final answers it is owed on.
+    /// `dependent` (`22 F1 86`) holds an unnamed pending that the owner (`22 F1 90`, owed on
+    /// 0x7E8) could own, and a final on 0x7E8, so it is owed on 0x7E9 only and the owner is in its
+    /// owners; the lone late final on 0x7E9 settles it. No row is left, so the log lets go of it
+    /// instead of keeping a record with no rows for good.
+    #[test]
+    fn a_lone_late_final_settles_a_collecting_exchange_whose_pending_only_an_owner_could_own() {
+        let (dir, _setup, log) = collecting_log_on(true);
+        let f190 = |rx_id| {
+            answer_on(
+                rx_id,
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+                20_000,
+            )
+        };
+        let owner = log
+            .exchange(functional_read_after(
+                0x90,
+                exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]),
+                vec![f190(0x7E9)],
+                1,
+            ))
+            .unwrap();
+        let dependent = log
+            .exchange(functional_read_after(
+                0x86,
+                exchange::End::Positive(vec![0x62, 0xF1, 0x86, 0x41]),
+                vec![
+                    answer_on(0, exchange::End::Negative(vec![0x7F, 0x22, 0x78]), 10_000),
+                    answer_on(0x7E8, f186_response(), 20_000),
+                ],
+                10,
+            ))
+            .unwrap();
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert_eq!(state.owed_row_ids(owner), [0x7E8]);
+            assert_eq!(state.owed_row_ids(dependent), [0x7E9]);
+        }
+        let late = late_result_on(0x7E9, vec![0x62, 0xF1, 0x86, 0x41]);
+        assert_eq!(late_owner_of(&log, &late), Some(LateOwner::One(dependent)));
+        place_unbound(&log, &late, 12_000_000);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(state.kept(dependent).is_none());
+            assert!(state.owed_row_ids(dependent).is_empty());
+            assert!(state.kept(owner).is_some());
+        }
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// The functional link's owner `22 F1 90` (silent, owed on the whole receive table, 1 s in) and
+    /// a `22 F1 86` dependent (10 s in) that has a pending open on 0x7E8 at its entry, so it is
+    /// kept with `pending_at_end`: `final_on_7e9` gives it the final answer of 0x7E9 as well.
+    fn owner_and_pending_dependent(log: &CommLog, final_on_7e9: bool) -> [u64; 2] {
+        let owner = log
+            .exchange(functional_read_after(
+                0x90,
+                exchange::End::NoResponse,
+                Vec::new(),
+                1,
+            ))
+            .unwrap();
+        let mut answers = vec![answer_on(
+            0x7E8,
+            exchange::End::Negative(vec![0x7F, 0x22, 0x78]),
+            20_000,
+        )];
+        if final_on_7e9 {
+            answers.push(answer_on(0x7E9, f186_response(), 30_000));
+        }
+        let mut dependent = functional_read_after(0x86, exchange::End::NoResponse, answers, 10);
+        dependent.vci_ended = false;
+        dependent.pending = vec![pending_on(20_000)];
+        dependent.pending_ids = vec![Some(0x7E8)];
+        let dependent = log.exchange(dependent).unwrap();
+        assert!(kept_of(log, dependent).pending_at_end);
+        [owner, dependent]
+    }
+
+    /// ADR-445 decision 4: a record kept for its rows, whose exchange had a pending open when it
+    /// was kept, owns no late final answer once its evidence settles it, as its in-time twin
+    /// (no pending) owns none: a lone late final answer that only it matches is `unattached`, not
+    /// its `late_response`. Here the end reads the final answers (a negative one on 0x7E8 that the
+    /// owner could own, and the read's on 0x7E9) and then a link error, so the VCI's wait is not
+    /// shown ended.
+    #[test]
+    fn a_record_kept_for_its_rows_after_an_end_owns_no_late_final_though_a_pending_was_open() {
+        let (dir, _setup, log) = collecting_log_on(true);
+        let [_owner, dependent] = owner_and_pending_dependent(&log, false);
+        log.primitive_ended(
+            dependent,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                end_rejected: false,
+                vci_ended: false,
+                reads: read_after_deadline(vec![
+                    EndItem::Answer(answer_on(
+                        0x7E8,
+                        exchange::End::Negative(vec![0x7F, 0x22, 0x31]),
+                        30_000,
+                    )),
+                    EndItem::Answer(answer_on(0x7E9, f186_response(), 40_000)),
+                    end_error(Some(exchange::LinkErrorKind::Frame), 50_000),
+                ]),
+            },
+        )
+        .unwrap();
+        log.release_kept_ended(dependent);
+        {
+            let kept = kept_of(&log, dependent);
+            assert!(kept.pending_at_end && kept.evidence.settles_owed());
+            assert!(!kept.late_final_settles());
+            assert_eq!(log.lock().links[0].1.owed_row_ids(dependent), [0x7E8]);
+        }
+        assert_eq!(
+            late_owner_of(&log, &late_result_on(0x7E8, vec![0x62, 0xF1, 0x86, 0x41])),
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-445 decision 4, `late_response` arm: the same record kept by a late final that settles
+    /// its exchange whole where the owner could own another answer of it.
+    #[test]
+    fn a_record_kept_for_its_rows_by_a_late_response_owns_no_late_final_though_a_pending_was_open()
+    {
+        let (dir, _setup, log) = collecting_log_on(true);
+        let [_owner, dependent] = owner_and_pending_dependent(&log, true);
+        let first = late_result_on(0x7E8, vec![0x7F, 0x22, 0x31]);
+        log.lock()
+            .late_response(0, dependent, &first, placed_after(10_020_000))
+            .unwrap();
+        {
+            let kept = kept_of(&log, dependent);
+            assert!(kept.pending_at_end && kept.evidence.settles_owed());
+            assert!(!kept.late_final_settles());
+            assert_eq!(log.lock().links[0].1.owed_row_ids(dependent), [0x7E8]);
+        }
+        assert_eq!(
+            late_owner_of(&log, &late_result_on(0x7E8, vec![0x62, 0xF1, 0x86, 0x41])),
+            None
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-445 decision 2: the late final that settles an exchange whole leaves it owed through
+    /// an owner only for a collecting exchange. A non-collecting one (here a `22 F1 86` with no
+    /// response beside an earlier request of the same kind that could own the same answer)
+    /// settles whole, as before, and its owner stays.
+    #[test]
+    fn a_late_final_settles_a_non_collecting_exchange_whole_whatever_an_owner_could_own() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let silent =
+            |after_s| read_f186_after(exchange::End::NoResponse, Vec::new(), true, after_s);
+        let owner = log.exchange(silent(1)).unwrap();
+        let dependent = log.exchange(silent(10)).unwrap();
+        log.lock()
+            .late_response(0, dependent, &late_f1_reply(0x86), placed_after(10_020_000))
+            .unwrap();
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(dependent).is_none());
+        assert!(state.owed_row_ids(dependent).is_empty());
+        assert!(state.kept(owner).is_some());
+        drop(inner);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    /// ADR-445 decision 3: only an owner sent before an exchange keeps it owed. A later poll of
+    /// the same request is among the owners a late final's history lists, since both could own
+    /// it, yet it is no reason to keep the earlier exchange: the late final that settles `first`
+    /// ends its owed request, and the later poll `second` stays owed.
+    #[test]
+    fn a_later_poll_does_not_keep_an_exchange_owed_when_a_late_final_settles_it() {
+        let (dir, _setup, log) = collecting_log_on(false);
+        let first = log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+        let second = log.exchange(silent_after(&[0x3E, 0x00], 10)).unwrap();
+        log.lock()
+            .late_response(0, first, &late_final_on(0x7E8), placed_after(1_020_000))
+            .unwrap();
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert!(state.kept(first).is_none());
+        assert!(state.owed_row_ids(first).is_empty());
+        assert!(state.kept(second).is_some());
+        assert_eq!(state.owed_row_ids(second), [0x7E8]);
+        drop(inner);
         std::fs::remove_dir_all(&dir).unwrap();
     }
 

@@ -6,7 +6,7 @@
 `comm_log/exchange.rs` `ExchangeEntry::owed_through_owners`, `LinkState::release_kept_ended`,
 `LinkState::reclassify_one`; `host.rs` `settle_cancelled`, comments only), design 8.11
 "Settlement", `primitive_ended`, `late_response`; ADR-366 decision 3, ADR-431 decisions 1 and 2,
-ADR-433 decision 1, ADR-436 decision 1, ADR-442 decision 1, ADR-444 Consequences
+ADR-433 decision 1, ADR-436 decision 1, ADR-442 decisions 1 and 2, ADR-444 Consequences
 
 ## Context
 
@@ -29,12 +29,18 @@ time (primitive end); and the same rule holds for `late_response`.
    exchange could own it.** One predicate, `ExchangeEntry::owed_through_owners` (the entry settles
    and one of its owners was sent before it), serves the entry's keep, `primitive_ended`,
    `late_response` and the release. Owed requests sent after the exchange do not count: the
-   exchange's history lists them too, but they cannot keep it owed.
+   exchange's history lists them too, but they cannot keep it owed. An exchange owed on no
+   identifier (`LinkEffect::owed_ids` empty) has no row to keep, so it is never owed through
+   owners: its owners may include one that could own only a pending of it, which its rows do
+   not count.
 2. **Otherwise the exchange is renewed as any exchange left owed** (ADR-431 decision 1): its rows
    come from `Evidence::owed_ids`, as when it is logged in time, for a collecting exchange the
    identifiers of the final answers an earlier owner could own, the others being freed from the
    later exchanges. If no row is left it is owed no more, as the entry's keep treats one. For
-   `late_response` the rows of a collecting exchange are set again by `settle_on`.
+   `late_response` the rows of a collecting exchange are set again by `settle_on`; the rule
+   holds there for a collecting exchange only (design 8.11 names collecting only): a
+   non-collecting exchange a late final settles is settled whole, as before, though an owner
+   could own the answer, which stays an open question for a functional link.
 3. **Its verdict is final; the owner's letting go only releases it.** The classification of the
    end (`system` within the limit) is not a floor. The existing visits release the record and
    rows when the owner lets go (ADR-442 decision 3; `reclassify_one` frees the answer of a
@@ -44,7 +50,11 @@ time (primitive end); and the same rule holds for `late_response`.
    confirms the send.
 4. **The record owns a late final only as its evidence says.** `late_final_settles` follows the
    evidence: false for a non-collecting usable answer (ADR-443 decision 1), true for a collecting
-   window with a finished status, as in time. The release after the end keeps the record while
+   window with a finished status, as in time. A pending open when the record was kept
+   (`Kept::pending_at_end`) gives it a late final only while its evidence does not settle the
+   exchange: once the end has read the final answers and the record is kept for its rows, it
+   owns none, as its in-time twin owns none, whatever the end after them (a link error, a lost
+   VCI). The release after the end keeps the record while
    `late_final_settles` holds or the record is still owed through an owner (derived from its
    rows, with no stored flag), so a record kept at the entry for its rows survives the end.
 5. **Scope.** An end that does not settle (a wrong echo, a pending only, no response, a cancel, a
@@ -63,6 +73,10 @@ Revises:
 - ADR-442 decision 1: it applies to the entries that settle at the primitive's end and by a late
   response, with the owners sent before the exchange; the release after the end keeps the record
   it keeps.
+- ADR-442 decision 2 ("the record owns no late final answer"): a record kept at a collecting end
+  whose finished window shows the VCI ended owns one, as its evidence says (decision 4).
+- ADR-442 decision 2 ("the record owns no late final answer"): a record kept at a collecting
+  end whose finished window shows the VCI ended owns one, as its evidence says (decision 4).
 - ADR-366 decision 3 ("a final response ends the exchange as an owed request"): not when an
   earlier owed request could own it.
 - ADR-436 decision 1: the release predicate shared with the entry's keep gains the rows reason.
@@ -72,7 +86,10 @@ Revises:
   through owners is kept, so beyond the window its matched answer counts once, when it is
   released.
 
-Cost: more records are kept under ADR-442's cost paragraph, for such exchanges only. In
-production no request sent after the exchange is logged before its end (the host cancels the
-stray before the link's next request), so the bound on the owners matters to the log-level
-tests and to the order of logging, not to the host's flow.
+Cost: more records are kept under ADR-442's cost paragraph, for such exchanges only. The bound
+on the owners matters in production for `late_response`: later polls of the same request are
+routinely among the owners a late final's history lists (`history_settling` leaves out only the
+exchange itself), and without the bound the earliest poll would stay owed through a poll sent
+after it. At the primitive's end no later request is logged yet in the host's flow (it cancels
+the stray before the link's next request), so there the bound matters to the order of logging
+only.

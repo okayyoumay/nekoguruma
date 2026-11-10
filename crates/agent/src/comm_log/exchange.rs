@@ -18,7 +18,7 @@
 //! `text` and `reason` are built from the domain enums only, never from an internal name (a
 //! host error, a gRPC status, an error event); those go to [`Detail`].
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::ops::Range;
 
 use diag_ir::{Idempotency, Interruptible, Section, SourceSpan};
@@ -2177,9 +2177,11 @@ pub(crate) struct LinkState {
     last_link_error: Option<(u64, LinkErrorKind)>,
     /// The `seq` of the last ECUReset or session change accepted.
     last_reset: Option<u64>,
-    /// How many logged exchanges on the link ended with `sent` `unknown`: each could still own a
-    /// transmit indication that comes late (design 8.11 `sent_evidence`).
-    unknown_sends: u32,
+    /// The `seq` of each exchange logged on the current opening of the link whose `sent` is still
+    /// `unknown`, kept or not: each could still own a transmit indication that comes late (design
+    /// 8.11 `sent_evidence`). A reopening empties it, so an exchange from before it is in it no
+    /// more, and its later release or confirmation finds nothing to remove.
+    unknown_sends: BTreeSet<u64>,
     /// What is kept of each owed exchange, by `seq` ([`LinkState::keep`]).
     kept: HashMap<u64, Kept>,
     clears: Clears,
@@ -2307,17 +2309,19 @@ impl LinkState {
         self.matched.clear();
         self.clears.matched += 1;
         // The worker gives an indication only to an open link, so one sent before the link was
-        // opened again cannot arrive on it.
-        self.unknown_sends = 0;
+        // opened again cannot arrive on it. A kept record from before keeps its `sent` (a
+        // reopening is no evidence about the send) but owns no transmit indication read from now
+        // on, and blocks none.
+        self.unknown_sends.clear();
     }
 
     /// Whether an ended exchange on this link could still own a transmit indication: one whose
-    /// `sent` is `unknown`, however long ago it ended, on the same opened link (design 8.11
+    /// `sent` is `unknown`, however long ago it ended, on the current opening of the link (design 8.11
     /// `sent_evidence`). A refusal makes `sent` `not_sent`, so a refused exchange owns none. An
     /// exchange a transmit error or a flow-control failure ended is `unknown` today and counts,
     /// although design 8.11 lets it own none: that only keeps later indications `unattached`.
     pub(crate) fn may_own_tx_indication(&self) -> bool {
-        self.unknown_sends > 0
+        !self.unknown_sends.is_empty()
     }
 
     /// Whether an owed request on this link could still own a start-of-message indication with
@@ -2357,9 +2361,12 @@ impl LinkState {
         self.kept.get(&seq)
     }
 
-    /// [`LinkState::may_own_tx_indication`], leaving out one exchange whose `sent` was `sent`.
-    pub(crate) fn may_own_tx_indication_besides(&self, sent: Sent) -> bool {
-        self.unknown_sends > u32::from(sent == Sent::Unknown)
+    /// Whether exchange `seq`, whose `sent` was `sent`, is the only one on the current opening
+    /// of the link that could own a transmit indication: it is no member of the set when it
+    /// predates a reopening, and then it owns none.
+    pub(crate) fn alone_may_own_tx_indication(&self, seq: u64, sent: Sent) -> bool {
+        (sent != Sent::Unknown || self.unknown_sends.contains(&seq))
+            && self.unknown_sends.iter().all(|unknown| *unknown == seq)
     }
 
     /// [`LinkState::may_own_start_indication`], leaving out the owed exchange `seq`.
@@ -2371,25 +2378,26 @@ impl LinkState {
 
     /// The kept exchanges an unbound transmit indication or loopback echo for request
     /// identifier `tx_id` could belong to (design 8.11 `late_item`): those whose `sent` is still
-    /// `unknown`, by `seq`; and whether they are every exchange on the link that could, which
-    /// they are not when an exchange the log keeps nothing of ended with `sent` `unknown`.
+    /// `unknown`, by `seq`, on the current opening of the link; and whether they are every
+    /// exchange on it that could, which they are not when an exchange the log keeps nothing of
+    /// ended with `sent` `unknown`. A kept exchange from before a reopening is none of them.
     pub(crate) fn late_transmit_owners(&self, tx_id: u32) -> (Vec<u64>, bool) {
-        let mut owners: Vec<u64> = self
-            .kept
+        let unknown_kept = |seq: &u64| self.kept.get(seq).filter(|kept| kept.sent == Sent::Unknown);
+        let owners: Vec<u64> = self
+            .unknown_sends
             .iter()
-            .filter(|(_, kept)| {
-                kept.sent == Sent::Unknown
-                    && matches!(kept.evidence.target, Target::Endpoint { tx_id: id, .. } if id == tx_id)
+            .filter(|seq| {
+                unknown_kept(seq).is_some_and(|kept| {
+                    matches!(kept.evidence.target, Target::Endpoint { tx_id: id, .. } if id == tx_id)
+                })
             })
-            .map(|(seq, _)| *seq)
+            .copied()
             .collect();
-        owners.sort_unstable();
-        let unknown_kept = self
-            .kept
-            .values()
-            .filter(|kept| kept.sent == Sent::Unknown)
-            .count();
-        (owners, self.unknown_sends as usize == unknown_kept)
+        let all = self
+            .unknown_sends
+            .iter()
+            .all(|seq| unknown_kept(seq).is_some());
+        (owners, all)
     }
 
     /// The kept exchanges an unbound start-of-message indication for response identifier
@@ -2467,7 +2475,7 @@ impl LinkState {
             kept.late_start = late_start;
         }
         if confirmed {
-            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            self.unknown_sends.remove(&seq);
         }
     }
 
@@ -2538,7 +2546,7 @@ impl LinkState {
         let kept = self.kept.remove(&seq)?;
         // The answer confirms its send: it can own a late transmit indication no more.
         if kept.sent == Sent::Unknown {
-            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            self.unknown_sends.remove(&seq);
         }
         Some(kept)
     }
@@ -2628,7 +2636,7 @@ impl LinkState {
             self.clears.matched += 1;
         }
         if effect.sent == Sent::Unknown {
-            self.unknown_sends += 1;
+            self.unknown_sends.insert(entry.seq);
         }
         let placed_alone = entry.placed_alone();
         let may_have_arrived = matches!(effect.sent, Sent::Confirmed | Sent::Unknown);
@@ -2723,7 +2731,7 @@ impl LinkState {
                 .remove(&seq)
                 .is_some_and(|kept| kept.sent == Sent::Unknown)
             {
-                self.unknown_sends = self.unknown_sends.saturating_sub(1);
+                self.unknown_sends.remove(&seq);
             }
         } else {
             self.set_owed_rows(seq, sid, &evidence.expected, &ids);
@@ -2778,7 +2786,7 @@ impl LinkState {
         // An answer no owed request can own confirms its send (`sent_of`): it can own a late
         // transmit indication no more.
         if !settled && old_sent == Sent::Unknown && entry.sent == Sent::Confirmed {
-            self.unknown_sends = self.unknown_sends.saturating_sub(1);
+            self.unknown_sends.remove(&seq);
             if let Some(kept) = self.kept.get_mut(&seq) {
                 kept.sent = Sent::Confirmed;
             }
@@ -2822,7 +2830,7 @@ impl LinkState {
                 .remove(&seq)
                 .is_some_and(|kept| kept.sent == Sent::Unknown)
             {
-                self.unknown_sends = self.unknown_sends.saturating_sub(1);
+                self.unknown_sends.remove(&seq);
             }
         }
         // Beyond the window a matched answer that does not count (no time shown after a late
@@ -6349,7 +6357,7 @@ mod tests {
             assert!(!kept.matched);
             if sent_unknown {
                 kept.sent = Sent::Unknown;
-                state.unknown_sends += 1;
+                state.unknown_sends.insert(seq);
             }
             state.keep(seq, kept);
             assert!(state.owed.iter().any(|owed| owed.seq == seq));
@@ -6372,7 +6380,7 @@ mod tests {
     #[test]
     fn an_exchange_beyond_the_window_is_released_when_its_owner_settles() {
         let (mut state, _) = owner_and_answered_beyond_window(|_| {}, true);
-        assert_eq!(state.unknown_sends, 1);
+        assert_eq!(state.unknown_sends.len(), 1);
         state.settle_owed(1);
         assert!(state.kept(2).is_some());
         let freed = state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
@@ -6383,7 +6391,7 @@ mod tests {
         assert!(freed.final_response && freed.newly_matched, "{freed:?}");
         assert!(state.kept(2).is_none());
         assert!(state.owed.iter().all(|owed| owed.seq != 2));
-        assert_eq!(state.unknown_sends, 0);
+        assert_eq!(state.unknown_sends.len(), 0);
         // Counted once: a second pass finds nothing to free.
         assert!(
             state
@@ -6509,7 +6517,7 @@ mod tests {
             },
             false,
         );
-        assert_eq!(state.unknown_sends, 1);
+        assert_eq!(state.unknown_sends.len(), 1);
         assert_eq!(state.kept(2).map(|kept| kept.sent), Some(Sent::Unknown));
         state.settle_owed(1);
         let freed = state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
@@ -6520,7 +6528,7 @@ mod tests {
         let kept = state.kept(2).expect("a pending leaves it owed");
         assert!(kept.matched);
         assert_eq!(kept.sent, Sent::Confirmed);
-        assert_eq!(state.unknown_sends, 0);
+        assert_eq!(state.unknown_sends.len(), 0);
         assert!(
             state
                 .refresh_kept_beyond_window(2..u64::MAX, Place::Beyond)
@@ -7086,11 +7094,11 @@ mod tests {
 
     /// ADR-439: an owed exchange the refresh leaves no row (its answers have no owner left on any
     /// identifier it was owed on) and that is not placed alone, since its exchange-level history
-    /// still names an owner, is released with its send confirmed once: the count of unknown sends
-    /// goes down by one for it, not two. The entry is made so by hand, as no log of events gives
+    /// still names an owner, is released with its send confirmed once: the set of unknown sends
+    /// loses its `seq` once, not twice. The entry is made so by hand, as no log of events gives
     /// the two reads different owners here.
     #[test]
-    fn an_exchange_emptied_of_rows_lowers_the_unknown_sends_once() {
+    fn an_exchange_emptied_of_rows_takes_its_own_unknown_send_out_once() {
         let table = vec![RX, RX2];
         let mut state = LinkState::default();
         let mut owner = collecting(vec![lone(RX2)]);
@@ -7114,9 +7122,9 @@ mod tests {
         assert_eq!(state.owed_row_ids(2).len(), 2);
         // The owner's and the resend's sends are unknown, and a third send elsewhere.
         state.kept.get_mut(&1).unwrap().sent = Sent::Unknown;
-        state.unknown_sends = 3;
+        state.unknown_sends = BTreeSet::from([1, 2, 99]);
         state.settle_owed(1);
-        assert_eq!(state.unknown_sends, 2);
+        assert_eq!(state.unknown_sends, BTreeSet::from([2, 99]));
         let kept = state.kept(2).unwrap().clone();
         let mut entry = state.kept_entry(2, &kept.evidence, kept.classification);
         assert!(entry.placed_alone());
@@ -7134,7 +7142,7 @@ mod tests {
         assert!(freed.is_some_and(|freed| freed.final_response));
         assert!(state.kept(2).is_none());
         assert!(state.owed_row_ids(2).is_empty());
-        assert_eq!(state.unknown_sends, 1);
+        assert_eq!(state.unknown_sends, BTreeSet::from([99]));
     }
 
     /// ADR-442: an entry is owed through its owners only when it settles and an owner stands:
@@ -7463,9 +7471,9 @@ mod tests {
         let unconfirmed = forwarding(read([0xF1, 0x87], End::Negative(vec![0x7F, 0x22, 0x31])));
         let (second, _) = log_kept(&mut state, 2, unconfirmed);
         assert_eq!(second.sent, Sent::Unknown);
-        assert_eq!(state.unknown_sends, 1);
+        assert_eq!(state.unknown_sends, BTreeSet::from([2]));
         state.reclassify_after(&final_answer(&state, 1, &kept, answer));
-        assert_eq!(state.unknown_sends, 0);
+        assert!(state.unknown_sends.is_empty());
 
         // An exchange a final response settled keeps its classification, but its answer is
         // freed once its owner has its response.
@@ -10265,6 +10273,212 @@ mod tests {
         assert!(!state.may_own_tx_indication());
     }
 
+    /// Logs an exchange of unknown send as line `seq` and keeps it, owed.
+    fn log_kept_unknown(state: &mut LinkState, seq: u64) {
+        let (entry, kept) = log_kept(state, seq, read([0xF1, 0x86], End::NoResponse));
+        assert_eq!(entry.sent, Sent::Unknown);
+        state.keep(seq, kept);
+        assert!(state.kept(seq).is_some());
+    }
+
+    /// Design 8.11 `sent_evidence`: a kept exchange from before a reopening keeps its `sent` and
+    /// its owed rows, but owns no transmit indication read afterwards and makes none ambiguous.
+    #[test]
+    fn a_kept_unknown_send_from_before_a_reopening_owns_no_transmit_indication() {
+        for count in 1..=2u64 {
+            let mut state = LinkState::default();
+            for seq in 1..=count {
+                log_kept_unknown(&mut state, seq);
+            }
+            let before: Vec<u64> = (1..=count).collect();
+            assert_eq!(state.late_transmit_owners(0x7E0), (before, true));
+            state.reopened();
+            assert_eq!(state.late_transmit_owners(0x7E0), (Vec::new(), true));
+            assert!(!state.may_own_tx_indication());
+            for seq in 1..=count {
+                assert_eq!(state.kept(seq).map(|kept| kept.sent), Some(Sent::Unknown));
+                assert!(state.owed.iter().any(|owed| owed.seq == seq));
+            }
+            // Only a check that this change leaves the owners of a late start as they were; it
+            // does not say that is the intended rule.
+            assert_eq!(state.late_start_owners(RX), ((1..=count).collect(), true));
+        }
+    }
+
+    /// A kept exchange from before a reopening whose rows are in the window or beyond it, as
+    /// ADR-442 keeps them, is no transmit owner either.
+    #[test]
+    fn a_rows_only_unknown_send_from_before_a_reopening_owns_no_transmit_indication() {
+        let (mut state, _) = owner_and_answered_beyond_window(|_| {}, true);
+        assert_eq!(state.late_transmit_owners(0x7E0), (vec![2], true));
+        state.reopened();
+        assert_eq!(state.late_transmit_owners(0x7E0), (Vec::new(), true));
+        assert_eq!(state.kept(2).map(|kept| kept.sent), Some(Sent::Unknown));
+        assert!(state.unknown_sends.is_empty());
+    }
+
+    /// An unknown send after a reopening is an owner that is kept, or leaves the owners
+    /// incomplete when it is not; the record from before it is neither.
+    #[test]
+    fn late_transmit_owners_after_a_reopening_are_the_sends_of_the_opening() {
+        let mut state = LinkState::default();
+        log_kept_unknown(&mut state, 1);
+        state.reopened();
+        log_kept_unknown(&mut state, 2);
+        assert_eq!(state.late_transmit_owners(0x7E0), (vec![2], true));
+        assert_eq!(state.late_transmit_owners(0x7E1), (Vec::new(), true));
+
+        let mut state = LinkState::default();
+        log_kept_unknown(&mut state, 1);
+        state.reopened();
+        log(&mut state, 2, read([0xF1, 0x86], End::NoResponse));
+        assert_eq!(state.late_transmit_owners(0x7E0), (Vec::new(), false));
+    }
+
+    /// The release or confirmation of a record from before a reopening takes no later send out of
+    /// the set, whichever way it ends. The later send is logged unkept, so none of these paths
+    /// can release it.
+    #[test]
+    fn releasing_a_record_from_before_a_reopening_keeps_the_later_unknown_send() {
+        let later = 1000;
+        let reopen_and_send = |state: &mut LinkState| {
+            state.reopened();
+            log(state, later, read([0xF1, 0x86], End::NoResponse));
+            assert_eq!(state.unknown_sends, BTreeSet::from([later]));
+        };
+
+        // The answer settles the record.
+        let mut state = LinkState::default();
+        log_kept_unknown(&mut state, 1);
+        reopen_and_send(&mut state);
+        assert!(state.settle_owed(1).is_some());
+        assert_eq!(state.unknown_sends, BTreeSet::from([later]));
+
+        // A late pending confirms it.
+        let mut state = LinkState::default();
+        log_kept_unknown(&mut state, 1);
+        reopen_and_send(&mut state);
+        let kept = state.kept(1).unwrap().clone();
+        state.update_kept(
+            1,
+            kept.evidence.clone(),
+            Sent::Confirmed,
+            super::super::timing::At::default(),
+            None,
+        );
+        assert_eq!(state.kept(1).map(|kept| kept.sent), Some(Sent::Confirmed));
+        assert_eq!(state.unknown_sends, BTreeSet::from([later]));
+
+        // Its owner settles, which releases a record beyond the window.
+        let (mut state, _) = owner_and_answered_beyond_window(|_| {}, true);
+        reopen_and_send(&mut state);
+        state.settle_owed(1);
+        let freed = state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
+        assert_eq!(freed.len(), 1, "{freed:?}");
+        assert!(state.kept(2).is_none());
+        assert_eq!(state.unknown_sends, BTreeSet::from([later]));
+
+        // Its owner settles, which confirms a record that stays owed.
+        let (mut state, _) = owners_and_answered_beyond_window(
+            1,
+            |_, evidence| {
+                evidence.pending = vec![pending()];
+                evidence.end = End::NoResponse;
+            },
+            true,
+        );
+        reopen_and_send(&mut state);
+        state.settle_owed(1);
+        state.refresh_kept_beyond_window(2..u64::MAX, Place::Beyond);
+        assert_eq!(state.unknown_sends, BTreeSet::from([later]));
+
+        // The later send itself goes the same way, once.
+        assert!(state.settle_owed(later).is_none());
+        assert_eq!(state.unknown_sends, BTreeSet::from([later]));
+    }
+
+    /// Two reopenings: only the sends after the last are in the set, and the earlier records'
+    /// release in either order leaves them.
+    #[test]
+    fn a_second_reopening_leaves_only_the_sends_after_it() {
+        for reverse in [false, true] {
+            let mut state = LinkState::default();
+            log_kept_unknown(&mut state, 1);
+            state.reopened();
+            log_kept_unknown(&mut state, 2);
+            state.reopened();
+            log(&mut state, 3, read([0xF1, 0x86], End::NoResponse));
+            assert_eq!(state.unknown_sends, BTreeSet::from([3]));
+            assert_eq!(state.late_transmit_owners(0x7E0), (Vec::new(), false));
+            let order = if reverse { [2, 1] } else { [1, 2] };
+            for seq in order {
+                assert!(state.settle_owed(seq).is_some());
+                assert_eq!(state.unknown_sends, BTreeSet::from([3]));
+            }
+        }
+    }
+
+    /// Design 8.11 `sent_evidence`: a record of the current opening released before the one from
+    /// before the reopening takes its own send out of the set, and the later release of the old
+    /// one takes nothing more, so a third send of the opening stays in it either way.
+    #[test]
+    fn a_record_of_the_opening_released_before_the_one_from_before_leaves_the_third_send() {
+        let mut state = LinkState::default();
+        log_kept_unknown(&mut state, 1);
+        state.reopened();
+        log_kept_unknown(&mut state, 2);
+        log(&mut state, 3, read([0xF1, 0x86], End::NoResponse));
+        assert_eq!(state.unknown_sends, BTreeSet::from([2, 3]));
+        assert!(state.settle_owed(2).is_some());
+        assert_eq!(state.unknown_sends, BTreeSet::from([3]));
+        assert!(state.settle_owed(1).is_some());
+        assert_eq!(state.unknown_sends, BTreeSet::from([3]));
+    }
+
+    /// An exchange of the window from before a reopening, with an unknown send and no kept
+    /// record, is confirmed when an answer is freed; that takes a send logged after the
+    /// reopening out of the set no more than it would a record from before it.
+    #[test]
+    fn confirming_an_unkept_window_exchange_from_before_a_reopening_keeps_the_later_send() {
+        let confirmed = |end| {
+            let mut evidence = forwarding(read([0xF1, 0x86], end));
+            evidence.transmit_evidence = Some(TransmitEvidence::TxIndication);
+            evidence
+        };
+        let answer: &[u8] = &[0x62, 0xF1, 0x86, 0x41];
+        let mut state = LinkState::default();
+        let (_, kept) = log_kept(&mut state, 1, confirmed(End::NoResponse));
+        let unconfirmed = forwarding(read([0xF1, 0x87], End::Negative(vec![0x7F, 0x22, 0x31])));
+        let (second, _) = log_kept(&mut state, 2, unconfirmed);
+        assert_eq!(second.sent, Sent::Unknown);
+        assert!(state.kept(2).is_none());
+        state.reopened();
+        log(&mut state, 3, read([0xF1, 0x88], End::NoResponse));
+        assert_eq!(state.unknown_sends, BTreeSet::from([3]));
+        state.reclassify_after(&final_answer(&state, 1, &kept, answer));
+        assert_eq!(state.unknown_sends, BTreeSet::from([3]));
+    }
+
+    #[test]
+    fn alone_may_own_tx_indication_reads_the_set() {
+        let mut state = LinkState::default();
+        // Alone in the set.
+        log(&mut state, 1, read([0xF1, 0x86], End::NoResponse));
+        assert!(state.alone_may_own_tx_indication(1, Sent::Unknown));
+        // Another member.
+        log(&mut state, 2, read([0xF1, 0x86], End::NoResponse));
+        assert!(!state.alone_may_own_tx_indication(1, Sent::Unknown));
+        // Unknown, but not in the set: it predates a reopening.
+        state.reopened();
+        log(&mut state, 3, read([0xF1, 0x86], End::NoResponse));
+        assert!(!state.alone_may_own_tx_indication(1, Sent::Unknown));
+        assert!(state.alone_may_own_tx_indication(3, Sent::Unknown));
+        // Confirmed, with nothing unknown on the opening.
+        state.unknown_sends.clear();
+        assert!(state.alone_may_own_tx_indication(1, Sent::Confirmed));
+        assert!(!state.alone_may_own_tx_indication(1, Sent::Unknown));
+    }
+
     /// Every outcome and cause the classification has, for the checks over all of them.
     fn all_cases() -> Vec<Evidence> {
         let mut cases = Vec::new();
@@ -12323,7 +12537,7 @@ mod tests {
                 state.keep(3, kept);
             }
             let case = (keep, late);
-            assert_eq!(state.unknown_sends, 1, "{case:?}");
+            assert_eq!(state.unknown_sends.len(), 1, "{case:?}");
             assert!(state.may_own_tx_indication());
             if late {
                 log_and_keep(
@@ -12340,7 +12554,7 @@ mod tests {
                 );
             }
             assert!(state.owed_row_ids(3).is_empty(), "{case:?}");
-            assert_eq!(state.unknown_sends, 0, "{case:?}");
+            assert_eq!(state.unknown_sends.len(), 0, "{case:?}");
             assert!(!state.may_own_tx_indication(), "{case:?}");
         }
     }

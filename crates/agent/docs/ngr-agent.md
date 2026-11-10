@@ -699,9 +699,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   when that is not shown; otherwise `undetermined`, and not judged on a link whose VCI absorbs
   pendings). That judgement stands when the exchange is classified again, and the request's own
   timing is judged without it. Only a pending in time carries the limit in force on for a later
-  late response; after one whose time is not shown, that limit is not known. The others are
-  `unattached` events, written in
-  the order read and before the exchange's entry: an item bound to an earlier primitive, a
+  late response; after one whose time is not shown, that limit is not known. A pending or start
+  whose one possible owner is a record kept only for its rows that a late final would not settle
+  (`Kept::late_pending_or_start_settles`) is not settled this way, and the record stands
+  (ADR-450). Such an item, and the others, are `unattached` events, written in the order read
+  and before the exchange's entry: an item bound to an earlier primitive, a
   start-of-message indication no exchange takes as above, and a transmit indication whose header
   is not a plain 4-byte CAN identifier (extended or mixed addressing), which therefore never
   confirms a send. The confirming indication's read time is the entry's

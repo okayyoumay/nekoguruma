@@ -1,7 +1,7 @@
 # ADR-445: A Final Response an Earlier Owner Could Own Leaves Its Exchange Owed, Whichever Entry Delivers It
 
 **Date:** 2026-11-09
-**Status:** Accepted (decision 2's "for `late_response` ... a collecting exchange only" superseded by ADR-446: a non-collecting exchange stays owed through an earlier owner too; decision 4 extended by ADR-446: a non-collecting record whose evidence settles the exchange owns no late final, whatever ended the VCI's wait)
+**Status:** Accepted (decision 2's "for `late_response` ... a collecting exchange only" superseded by ADR-446: a non-collecting exchange stays owed through an earlier owner too; decision 4 extended by ADR-446: a non-collecting record whose evidence settles the exchange owns no late final, whatever ended the VCI's wait; decision 4 extended by ADR-450 from a lone late final to a lone late pending or start)
 **Affects:** `agent` (`comm_log.rs` `CommLog::primitive_ended`, `Inner::late_response`;
 `comm_log/exchange.rs` `ExchangeEntry::owed_through_owners`, `Kept::late_final_settles`, `LinkState::release_kept_ended`,
 `LinkState::reclassify_one`; `host.rs` `settle_cancelled`, comments only), design 8.11

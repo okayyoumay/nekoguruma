@@ -1,7 +1,7 @@
 # ADR-370: A Late Indication Settles Its Ended Exchange
 
 **Date:** 2026-10-28
-**Status:** Accepted (item 4's kept start dropped by an ambiguous later start not shown before it, ADR-384; item 4's one owner of a start is not settled when it is a record kept only for its rows that a late final would not settle, ADR-450)
+**Status:** Accepted (item 4's kept start dropped by an ambiguous later start not shown before it, ADR-384; item 4's one owner of a start is not settled when it is a record kept only for its rows that a late final would not settle, ADR-450; item 4's one owner of a transmit indication or loopback echo has only its send confirmed when it is a record whose evidence settles its exchange, ADR-452)
 **Affects:** `agent` communication log (`comm_log.rs` `exchange_with`, `Inner::late_item`,
 `Inner::late_item_unowned`, `LateItemEntry`, `UnattachedItem::late_indication`,
 `before_starts`, `late_indication_owners`; `comm_log/exchange.rs`

@@ -4505,6 +4505,11 @@ const MAY_OWN_INDICATION: &str = " An indication read during this exchange, logg
 const AMBIGUOUS_INDICATION: &str =
     " An indication read after it ended may be its own or another exchange's: undetermined.";
 
+/// The reason a `late_item` gives a record whose evidence settles its exchange when a transmit
+/// indication or loopback echo only it could own confirms its send (ADR-452): nothing is
+/// classified, so the reason the record stands with is not written again.
+const SEND_CONFIRMED_ONLY: &str = "The indication shows that the request went out. The exchange already had its final answer and is kept only while an earlier request could own that answer, so this changes nothing else: the exchange keeps its classification.";
+
 /// Whether a time on `clock`, placed at `placed`, comes before every start in `starts` on its
 /// clock and epoch: an exchange whose earliest VCI times those are was not yet in flight then.
 /// A time that cannot be set against them does not.
@@ -4808,7 +4813,8 @@ impl Inner {
         // (`late_response_owner_with`, ADR-450): otherwise the item stays `unattached`, floors
         // no one, and the record's classification stands. The gate is here and not in the
         // owners, so an ambiguous item still names and floors the record (ADR-442). A transmit
-        // indication still confirms the send of such a record (ADR-442).
+        // indication still confirms the send of such a record (ADR-442), and only that: its
+        // `late_item` classifies nothing (ADR-452).
         if matches!(kind, LateIndication::Start | LateIndication::Pending)
             && self.links[at]
                 .1
@@ -5241,6 +5247,11 @@ impl Inner {
     /// `owner` on link `at`, read after its entry (design 8.11 `late_item`, ADR-370): the
     /// exchange's `sent` and answers restated with it, and its classification again. It ends
     /// no owed request: an indication is no final response.
+    ///
+    /// A transmit indication or loopback echo of a record whose evidence settles its exchange,
+    /// kept only for its rows, confirms the send and nothing else (ADR-452): the entry restates
+    /// `sent` and the outcome and names the record with the classification it stands with; the
+    /// timing is not judged again and nothing is classified.
     fn late_item(
         &mut self,
         at: usize,
@@ -5253,6 +5264,11 @@ impl Inner {
         let Some(kept) = state.kept(owner).cloned() else {
             return Some(());
         };
+        // The send of a record whose evidence settles its exchange is all a transmit indication
+        // or loopback echo changes: the verdict its entry, its primitive's end or a late final
+        // gave it stands until its owners let go (ADR-445 decision 3, ADR-452).
+        let send_only =
+            matches!(kind, LateIndication::Transmit(_)) && !kept.late_transmit_reclassifies();
         let mut evidence = kept.evidence.clone();
         let mut vci = evidence.times.vci.unwrap_or_default();
         let time = exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed);
@@ -5365,38 +5381,41 @@ impl Inner {
         };
         // The intervals, when every pending the exchange has is placed in order; on a link whose
         // limits the log does not know, its entry's pendings are not kept, and their intervals
-        // stand.
-        if all_pendings.len() == evidence.pending.len() {
-            let pending_placed: Vec<_> = all_pendings
-                .iter()
-                .map(|pending| pending.map(|(_, placed)| placed))
-                .collect();
-            exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
+        // stand. A record whose send alone is confirmed keeps the timing its verdict was given
+        // with (ADR-452).
+        if !send_only {
+            if all_pendings.len() == evidence.pending.len() {
+                let pending_placed: Vec<_> = all_pendings
+                    .iter()
+                    .map(|pending| pending.map(|(_, placed)| placed))
+                    .collect();
+                exchange::pending_intervals(&mut evidence.pending, &pending_placed, transmit);
+            }
+            let response_may_have_begun = evidence.response_started
+                || kept.limits.is_some_and(|limits| !limits.start_indications)
+                || kept.start_unattached;
+            // A late pending is read after the entry's items and takes no place among them.
+            let mut pending_order = kept.pending_order.clone();
+            pending_order.resize(evidence.pending.len(), usize::MAX);
+            let mut answer_order = kept.answer_order.clone();
+            answer_order.resize(evidence.answers.len(), usize::MAX);
+            let mut answer_ends = kept.answer_ends.clone();
+            answer_ends.resize(evidence.answers.len(), None);
+            judge_windows(
+                &mut evidence,
+                &WindowItems {
+                    pendings: &pendings,
+                    pending_order: &pending_order,
+                    answer_order: &answer_order,
+                    answer_ends: &answer_ends,
+                },
+                kept.limits,
+                &vci,
+                transmit,
+                response_may_have_begun,
+                kept.evidence.collecting,
+            );
         }
-        let response_may_have_begun = evidence.response_started
-            || kept.limits.is_some_and(|limits| !limits.start_indications)
-            || kept.start_unattached;
-        // A late pending is read after the entry's items and takes no place among them.
-        let mut pending_order = kept.pending_order.clone();
-        pending_order.resize(evidence.pending.len(), usize::MAX);
-        let mut answer_order = kept.answer_order.clone();
-        answer_order.resize(evidence.answers.len(), usize::MAX);
-        let mut answer_ends = kept.answer_ends.clone();
-        answer_ends.resize(evidence.answers.len(), None);
-        judge_windows(
-            &mut evidence,
-            &WindowItems {
-                pendings: &pendings,
-                pending_order: &pending_order,
-                answer_order: &answer_order,
-                answer_ends: &answer_ends,
-            },
-            kept.limits,
-            &vci,
-            transmit,
-            response_may_have_begun,
-            kept.evidence.collecting,
-        );
         if let Some(limits) = kept.limits {
             // A start is judged like a late response by its time, against the limit in force:
             // before the limit less the margin, or after the limit plus the margin (design 8.11
@@ -5468,9 +5487,14 @@ impl Inner {
             });
         evidence.times.vci = Some(vci);
         let history = state.history_settling(&evidence, owner);
+        // The entry gives `sent`, the outcome and the answer for the later exchanges; a record
+        // whose send alone is confirmed keeps the classification it stands with (ADR-452).
         let entry = exchange::ExchangeEntry::build(owner, evidence.clone(), history);
-        let mut classification = entry.classification;
-        let mut reason = entry.reason.clone();
+        let (mut classification, mut reason) = if send_only {
+            (kept.classification, SEND_CONFIRMED_ONLY.to_owned())
+        } else {
+            (entry.classification, entry.reason.clone())
+        };
         // The pending's judgement, with what the exchange's own rows give, as a late response's
         // (`settle_late_response`): it stands as a floor, since a later item cannot refute a time
         // the VCI observed.
@@ -5502,7 +5526,12 @@ impl Inner {
             LateIndication::Pending => Some(item_rx_id),
             LateIndication::Transmit(_) | LateIndication::Start => None,
         };
-        match late_start.unwrap_or_else(|| kept.late_start_for(item_id)) {
+        let kept_start = if send_only {
+            None
+        } else {
+            late_start.unwrap_or_else(|| kept.late_start_for(item_id))
+        };
+        match kept_start {
             Some(exchange::LateStart::InTime { at_us }) => {
                 classification = classification.max(exchange::Classification::Undetermined);
                 reason.push_str(&format!(
@@ -5522,14 +5551,21 @@ impl Inner {
         // A floor an ambiguous item set stands. A `system` the exchange's own entry gave rested
         // on its timing, which is judged again here: the log keeps no exchange whose `system`
         // the agent observed otherwise (design 8.11 "Settlement"). Its own classification sets
-        // no floor, so a later item can refute what it inferred.
-        if let Some((floor, suffix)) = state.floor_of(owner)
-            && classification < floor
-        {
-            classification = floor;
-            reason.push_str(&suffix);
+        // no floor, so a later item can refute what it inferred. A record whose send alone is
+        // confirmed is not classified here, and its `system` may be its end's or a late final's
+        // (ADR-445, ADR-446): it stands as it is, with the floor it has, and only the send
+        // reaches its evidence (ADR-452).
+        if send_only {
+            state.restate_send(owner, &evidence);
+        } else {
+            if let Some((floor, suffix)) = state.floor_of(owner)
+                && classification < floor
+            {
+                classification = floor;
+                reason.push_str(&suffix);
+            }
+            state.settled_from_evidence(owner, classification, &reason, evidence.clone());
         }
-        state.settled_from_evidence(owner, classification, &reason, evidence.clone());
         let collecting = evidence.collecting;
         state.update_kept(owner, evidence, entry.sent, transmit, late_start);
         if kind == LateIndication::Start && late_start.is_some() {
@@ -14149,6 +14185,421 @@ pub(crate) mod tests {
         }
     }
 
+    /// The ADR-445 case with the owner's send known: the owner (`22 F1 86` to 0x7E0, no answer,
+    /// the VCI ended its wait, its transmit done read) and the `record` (`22 F1 90`, 10 s in, its
+    /// send unknown), which the agent's deadline ended and whose primitive's end then delivers a
+    /// negative response the owner could own too. The record is kept only for its row, with the
+    /// `system` its end gave it and its send still unknown, and it alone could own a transmit
+    /// indication on 0x7E0 (ADR-452).
+    fn confirmed_owner_and_record_kept_at_its_end(log: &CommLog) -> [u64; 2] {
+        let mut owner = read_f186_after(exchange::End::NoResponse, Vec::new(), true, 1);
+        owner.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device_time(BASE_US + 1_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        let owner = log.exchange(owner).unwrap();
+        let mut waiting = read_f186_after(exchange::End::VciDidNotEnd, Vec::new(), false, 10);
+        waiting.request = vec![0x22, 0xF1, 0x90];
+        waiting.expected = exchange::Expected::uds(&[0x22, 0xF1, 0x90]);
+        let record = log.exchange(waiting).unwrap();
+        end_with_response(
+            log,
+            record,
+            exchange::End::Negative(vec![0x7F, 0x22, 0x31]),
+            10,
+        );
+        log.release_kept_ended(record);
+        [owner, record]
+    }
+
+    /// A transmit indication for request identifier `tx_id`, or its loopback echo (`echo`), bound
+    /// to no primitive.
+    fn late_transmit_on(tx_id: u32, echo: bool) -> UnattachedItem {
+        if echo {
+            UnattachedItem {
+                data: UnattachedData::Result {
+                    rx_flag: vec![0, 0, 0, RX_FLAG_TX_MSG_TYPE],
+                    identifier: Some(tx_id),
+                    bytes: vec![0x22, 0xF1, 0x90],
+                },
+                ..tx_done(tx_id)
+            }
+        } else {
+            tx_done(tx_id)
+        }
+    }
+
+    /// A silent `22 F1 91` to 0x7E0, `after_s` seconds in, that the VCI ended, its send unknown.
+    fn silent_f191_after(after_s: u64) -> exchange::Evidence {
+        let mut silent = read_f186_after(exchange::End::NoResponse, Vec::new(), true, after_s);
+        silent.request = vec![0x22, 0xF1, 0x91];
+        silent.expected = exchange::Expected::uds(&[0x22, 0xF1, 0x91]);
+        silent
+    }
+
+    /// ADR-452, Done when: a transmit indication or loopback echo that a record kept only for its
+    /// rows alone could own confirms its send and changes nothing else. The record was kept at
+    /// its primitive's end as `system` with its send unknown (ADR-445). The indication is placed
+    /// 20 ms before the response that end read, so classifying the record again from its entry,
+    /// as `late_item` did before ADR-452, judges the response in time and leaves `undetermined`
+    /// for the owner that could own it. The record keeps `system`, its timing and its row; its
+    /// send is `confirmed` and out of the link's unknown sends; the `late_item` names it with
+    /// the classification it stands with. The owner's own answer then releases it as before and
+    /// takes no other exchange's unknown send with it.
+    #[test]
+    fn a_lone_transmit_indication_confirms_the_send_of_a_record_kept_for_its_rows_and_no_more() {
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        for (echo, beyond) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (dir, setup, log) = collecting_log_on(false);
+            let [owner, record] = confirmed_owner_and_record_kept_at_its_end(&log);
+            if beyond {
+                leave_window_to(&log, 0x7E0);
+            }
+            let before = kept_of(&log, record);
+            assert_eq!(
+                before.classification,
+                exchange::Classification::System,
+                "{echo} {beyond}"
+            );
+            assert_eq!(before.sent, exchange::Sent::Unknown, "{echo} {beyond}");
+            assert!(
+                before.evidence.settles_owed()
+                    && !before.late_final_settles()
+                    && !before.late_transmit_reclassifies(),
+                "{echo} {beyond}"
+            );
+            assert_eq!(
+                late_transmit_owners_of(&log, 0x7E0),
+                (vec![record], true),
+                "{echo} {beyond}"
+            );
+            // The response the end read came 11.2 s after `BASE_US`.
+            let at = placed_after(11_180_000);
+            let item = late_transmit_on(0x7E0, echo);
+            assert_eq!(
+                log.lock().late_item_lone_owner(0, &item, at, none, None),
+                Some(true),
+                "{echo} {beyond}"
+            );
+            let transmit = if echo {
+                exchange::TransmitEvidence::Loopback
+            } else {
+                exchange::TransmitEvidence::TxIndication
+            };
+            let kept = kept_of(&log, record);
+            assert_eq!(
+                kept.classification,
+                exchange::Classification::System,
+                "{echo} {beyond}"
+            );
+            assert_eq!(kept.sent, exchange::Sent::Confirmed, "{echo} {beyond}");
+            assert_eq!(
+                kept.evidence.transmit_evidence,
+                Some(transmit),
+                "{echo} {beyond}"
+            );
+            assert_eq!(
+                kept.transmit,
+                Some(exchange::Clock::Device).zip(at),
+                "{echo} {beyond}"
+            );
+            assert_eq!(
+                kept.evidence.timing, before.evidence.timing,
+                "{echo} {beyond}"
+            );
+            assert!(kept.floor.is_none(), "{echo} {beyond}");
+            {
+                let inner = log.lock();
+                let state = &inner.links[0].1;
+                assert_eq!(
+                    state.standing(record),
+                    Some(exchange::Classification::System),
+                    "{echo} {beyond}"
+                );
+                // The window's entry takes the send and keeps its timing too.
+                let logged = state.logged_evidence(record);
+                assert_eq!(logged.is_none(), beyond, "{echo}");
+                if let Some(logged) = logged {
+                    assert_eq!(logged.transmit_evidence, Some(transmit), "{echo}");
+                    assert_eq!(
+                        logged.times.vci.and_then(|vci| vci.tx_done?.placed()),
+                        kept.transmit,
+                        "{echo}"
+                    );
+                    assert_eq!(logged.timing, before.evidence.timing, "{echo}");
+                }
+                assert_eq!(state.owed_row_ids(record), [0x7E8], "{echo} {beyond}");
+                assert_eq!(
+                    state.late_transmit_owners(0x7E0),
+                    (Vec::new(), true),
+                    "{echo} {beyond}"
+                );
+                assert!(!state.may_own_tx_indication(), "{echo} {beyond}");
+            }
+            // A third exchange with its send unknown, then the owner's own answer, which only
+            // the owner matches: the record goes with the owner, the third's send stays.
+            let third = log.exchange(silent_f191_after(31)).unwrap();
+            assert_eq!(
+                late_transmit_owners_of(&log, 0x7E0),
+                (vec![third], true),
+                "{echo} {beyond}"
+            );
+            place_unbound(&log, &late_f1_reply(0x86), 40_000_000);
+            {
+                let inner = log.lock();
+                let state = &inner.links[0].1;
+                for seq in [owner, record] {
+                    assert!(state.kept(seq).is_none(), "{seq} {echo} {beyond}");
+                    assert!(state.owed_row_ids(seq).is_empty(), "{seq} {echo} {beyond}");
+                }
+                assert_eq!(
+                    state.late_transmit_owners(0x7E0),
+                    (vec![third], true),
+                    "{echo} {beyond}"
+                );
+            }
+            let lines = finished(&log, &setup, &dir);
+            let late = of_event(&lines, "late_item");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([record]));
+            assert!(late[0].get("unattached").is_none(), "{}", late[0]);
+            assert_eq!(late[0]["sent"], "confirmed", "{}", late[0]);
+            assert_eq!(
+                late[0]["sent_evidence"],
+                if echo { "loopback" } else { "tx_indication" },
+                "{}",
+                late[0]
+            );
+            assert_eq!(late[0]["outcome"]["result"], "negative", "{}", late[0]);
+            assert_eq!(late[0]["classification"], "system", "{}", late[0]);
+            assert_eq!(
+                late[0]["exchanges"],
+                serde_json::json!([{
+                    "seq": record,
+                    "link": 1,
+                    "origin": "procedure",
+                    "request": late[0]["exchanges"][0]["request"],
+                    "classification": "system",
+                    "reason": SEND_CONFIRMED_ONLY,
+                }]),
+                "{}",
+                late[0]
+            );
+            assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+            // The owner's `late_response` does not name the record, whose `system` stands.
+            let settled = of_event(&lines, "late_response");
+            assert_eq!(settled.len(), 1, "{lines:#?}");
+            assert!(
+                !settled[0]["exchanges"]
+                    .to_string()
+                    .contains(&format!("\"seq\":{record},")),
+                "{}",
+                settled[0]
+            );
+        }
+    }
+
+    /// ADR-452: the test is the record's evidence alone, not the gate on a lone late final
+    /// (ADR-450). A collecting record kept at an end whose finished window shows the VCI ended
+    /// owns a lone late final, pending or start (ADR-445 decision 4), and a transmit indication
+    /// only it could own still only confirms its send. The window ends 1 s after its one answer,
+    /// which comes 20 ms after the indication's time, so classifying the record again from its
+    /// entry judges both in time and leaves `undetermined` for the owner that could own the
+    /// answer.
+    #[test]
+    fn a_lone_transmit_indication_only_confirms_the_send_of_a_record_that_owns_a_late_final() {
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        for beyond in [false, true] {
+            let (dir, setup, log) = collecting_log_on(false);
+            log.exchange(silent_after(&[0x3E, 0x00], 1)).unwrap();
+            let mut waiting = waited_after(&[0x3E, 0x00], 10);
+            waiting.times.vci = None;
+            let record = log.exchange(waiting).unwrap();
+            log.primitive_ended(
+                record,
+                PrimitiveEnded {
+                    end: Some(exchange::End::Positive(FIRST.to_vec())),
+                    detail: exchange::Detail::default(),
+                    end_rejected: false,
+                    end_is_carried_echo: false,
+                    vci_ended: true,
+                    reads: vec![
+                        end_read_after(14, EndItem::Answer(positive_on(0x7E8, 10_020_000))),
+                        end_read_after(15, EndItem::Finished(device_time(BASE_US + 11_020_000))),
+                    ],
+                },
+            )
+            .unwrap();
+            log.release_kept_ended(record);
+            if beyond {
+                leave_window(&log);
+            }
+            let before = kept_of(&log, record);
+            assert_eq!(
+                before.classification,
+                exchange::Classification::System,
+                "{beyond}"
+            );
+            assert_eq!(before.sent, exchange::Sent::Unknown, "{beyond}");
+            assert!(
+                before.evidence.settles_owed()
+                    && before.late_final_settles()
+                    && before.late_pending_or_start_settles()
+                    && !before.late_transmit_reclassifies(),
+                "{beyond}"
+            );
+            assert_eq!(
+                late_transmit_owners_of(&log, 0x7DF),
+                (vec![record], true),
+                "{beyond}"
+            );
+            assert_eq!(
+                log.lock().late_item_lone_owner(
+                    0,
+                    &tx_done(0x7DF),
+                    placed_after(10_000_000),
+                    none,
+                    None
+                ),
+                Some(true),
+                "{beyond}"
+            );
+            let kept = kept_of(&log, record);
+            assert_eq!(
+                kept.classification,
+                exchange::Classification::System,
+                "{beyond}"
+            );
+            assert_eq!(kept.sent, exchange::Sent::Confirmed, "{beyond}");
+            assert_eq!(kept.evidence.timing, before.evidence.timing, "{beyond}");
+            assert_eq!(
+                kept.evidence.answers[0].timing, before.evidence.answers[0].timing,
+                "{beyond}"
+            );
+            // It still owns a lone late final as its evidence says.
+            assert!(kept.late_final_settles(), "{beyond}");
+            assert_eq!(
+                late_transmit_owners_of(&log, 0x7DF),
+                (Vec::new(), true),
+                "{beyond}"
+            );
+            let lines = finished(&log, &setup, &dir);
+            let late = of_event(&lines, "late_item");
+            assert_eq!(late.len(), 1, "{lines:#?}");
+            assert_eq!(late[0]["refers_to"], serde_json::json!([record]));
+            assert_eq!(late[0]["sent"], "confirmed", "{}", late[0]);
+            assert_eq!(late[0]["classification"], "system", "{}", late[0]);
+            assert_eq!(
+                late[0]["exchanges"][0]["reason"], SEND_CONFIRMED_ONLY,
+                "{}",
+                late[0]
+            );
+        }
+    }
+
+    /// ADR-452 scope: an exchange whose evidence does not settle it is classified again by the
+    /// transmit indication only it could own, as before. A silent read the VCI ended, with its
+    /// send unknown, leaves H1 open; the `late_item` that confirms its send gives it a reason
+    /// of its own, without that reading.
+    #[test]
+    fn a_lone_transmit_indication_still_classifies_an_exchange_its_evidence_does_not_settle() {
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        let (dir, setup, log) = collecting_log_on(false);
+        let silent = log.exchange(silent_f191_after(1)).unwrap();
+        let kept = kept_of(&log, silent);
+        assert!(!kept.evidence.settles_owed() && kept.late_transmit_reclassifies());
+        assert_eq!(kept.sent, exchange::Sent::Unknown);
+        assert_eq!(
+            log.lock()
+                .late_item_lone_owner(0, &tx_done(0x7E0), placed_after(100), none, None),
+            Some(true)
+        );
+        assert_eq!(kept_of(&log, silent).sent, exchange::Sent::Confirmed);
+        let lines = finished(&log, &setup, &dir);
+        let entry = lines
+            .iter()
+            .find(|line| line["seq"] == silent)
+            .unwrap_or_else(|| panic!("no entry {silent} in {lines:#?}"));
+        assert!(
+            entry["reason"].as_str().unwrap().contains("(H1)"),
+            "{entry}"
+        );
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        let reason = late[0]["exchanges"][0]["reason"].as_str().unwrap();
+        assert!(
+            reason != SEND_CONFIRMED_ONLY && !reason.contains("(H1)"),
+            "{}",
+            late[0]
+        );
+    }
+
+    /// ADR-452 scope, ADR-442 decision 2: a transmit indication that the record and another
+    /// ended exchange could own is `unattached`, and its `late_item` names and floors both as
+    /// before; the record's send stays unknown and its `system`, above the floor, stands. Once
+    /// the other exchange is answered the record is the one owner of a second indication, which
+    /// confirms its send and leaves the classification and the floor as they were.
+    #[test]
+    fn an_ambiguous_transmit_indication_still_names_and_floors_a_record_kept_for_its_rows() {
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        let (dir, setup, log) = collecting_log_on(false);
+        let [_owner, record] = confirmed_owner_and_record_kept_at_its_end(&log);
+        let other = log.exchange(silent_f191_after(20)).unwrap();
+        assert_eq!(
+            late_transmit_owners_of(&log, 0x7E0),
+            (vec![record, other], true)
+        );
+        {
+            let mut inner = log.lock();
+            assert_eq!(
+                inner.late_item_lone_owner(0, &tx_done(0x7E0), placed_after(100), none, None),
+                Some(false)
+            );
+            inner
+                .place_unbound_item(0, &tx_done(0x7E0), placed_after(100), None, none, None)
+                .unwrap();
+        }
+        let floored = kept_of(&log, record);
+        assert_eq!(floored.classification, exchange::Classification::System);
+        assert_eq!(floored.sent, exchange::Sent::Unknown);
+        assert_eq!(
+            floored.floor.as_ref().map(|(floor, _)| *floor),
+            Some(exchange::Classification::Undetermined)
+        );
+        assert_eq!(
+            late_transmit_owners_of(&log, 0x7E0),
+            (vec![record, other], true)
+        );
+        // The other exchange's own answer settles it, so the record alone is left.
+        place_unbound(&log, &late_f1_reply(0x91), 21_000_000);
+        assert_eq!(late_transmit_owners_of(&log, 0x7E0), (vec![record], true));
+        assert_eq!(
+            log.lock().late_item_lone_owner(
+                0,
+                &tx_done(0x7E0),
+                placed_after(22_000_000),
+                none,
+                None
+            ),
+            Some(true)
+        );
+        let kept = kept_of(&log, record);
+        assert_eq!(kept.classification, exchange::Classification::System);
+        assert_eq!(kept.sent, exchange::Sent::Confirmed);
+        assert_eq!(kept.floor, floored.floor);
+        let lines = finished(&log, &setup, &dir);
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 2, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([record, other]));
+        assert!(late[0]["unattached"].is_u64(), "{}", late[0]);
+        assert!(late[0].get("sent").is_none(), "{}", late[0]);
+        assert_eq!(late[0]["exchanges"][0]["classification"], "system");
+        assert_eq!(late[1]["refers_to"], serde_json::json!([record]));
+        assert_eq!(late[1]["classification"], "system", "{}", late[1]);
+        assert_eq!(late[1]["exchanges"][0]["reason"], SEND_CONFIRMED_ONLY);
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+    }
+
     /// ADR-446, case table row 16: an exchange in flight on the functional link (non-collecting,
     /// with its final response, own identifier 0) awaits an answer named 0x7E8 after its final,
     /// as one on a physical link does, so an answer a kept owner could own too is the owner's
@@ -15237,6 +15688,7 @@ pub(crate) mod tests {
             log.lock().links[0].1.late_transmit_owners(0x7DF),
             (vec![dependent], true)
         );
+        let standing = serde_json::to_value(kept_of(&log, dependent).classification).unwrap();
         // The indication is read in the owner's wait but stands before the owner's own transmit
         // done, so it is not the owner's own and the dependent alone could own it.
         log.primitive_ended(
@@ -15256,10 +15708,46 @@ pub(crate) mod tests {
         .unwrap();
         // The dependent is still owed, so it still owns the window exchange's answer.
         assert_eq!(owners_of_window(&log), Some(vec![owner, dependent]));
+        let after = kept_of(&log, dependent);
+        assert_eq!(
+            serde_json::to_value(after.classification).unwrap(),
+            standing
+        );
+        assert_eq!(after.sent, exchange::Sent::Confirmed);
         let lines = finished(&log, &setup, &dir);
         let late = of_event(&lines, "late_item");
         assert_eq!(late.len(), 1, "{lines:#?}");
         assert_eq!(late[0]["refers_to"], serde_json::json!([dependent]));
+        // The dependent's evidence settles it, so its send alone is confirmed (ADR-452).
+        assert_eq!(late[0]["sent"], "confirmed", "{}", late[0]);
+        assert_eq!(late[0]["classification"], standing, "{}", late[0]);
+        assert_eq!(late[0]["exchanges"][0]["reason"], SEND_CONFIRMED_ONLY);
+    }
+
+    /// ADR-452 through `CommLog::exchange_with`: a transmit indication read in a later exchange
+    /// and shown before that exchange's transmit done is the lone transmit indication of the
+    /// record kept for its rows, taken by the lone-owner loop. The record keeps the `system` its
+    /// end gave it and its send is confirmed.
+    #[test]
+    fn exchange_with_confirms_the_send_of_a_settled_record_and_keeps_its_classification() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let [_owner, record] = confirmed_owner_and_record_kept_at_its_end(&log);
+        let mut later = silent_f191_after(31);
+        later.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device_time(BASE_US + 31_000_000)),
+            ..exchange::VciTimes::default()
+        });
+        log.exchange_with(later, vec![late_transmit_on(0x7E0, false)])
+            .unwrap();
+        let kept = kept_of(&log, record);
+        assert_eq!(kept.classification, exchange::Classification::System);
+        assert_eq!(kept.sent, exchange::Sent::Confirmed);
+        let lines = finished(&log, &setup, &dir);
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([record]));
+        assert_eq!(late[0]["classification"], "system", "{}", late[0]);
+        assert_eq!(late[0]["exchanges"][0]["reason"], SEND_CONFIRMED_ONLY);
     }
 
     /// ADR-442, ADR-441 (restart in time, `LinkState::record`'s accepting branch): an accepted

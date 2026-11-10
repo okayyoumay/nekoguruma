@@ -2708,6 +2708,8 @@ fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
         .filter_map(|rejected| {
             Some(Rejected {
                 rx_id: rejected.identifier.unwrap_or(rx_id),
+                identifier: rejected.identifier,
+                rx_flag: rejected.rx_flag.clone(),
                 bytes: rejected.bytes.clone(),
                 vci_us: Some(rejected.vci_us),
                 clock: rejected.clock,
@@ -3474,6 +3476,8 @@ struct PendingRead {
 #[derive(Debug, Clone)]
 struct RejectedRead {
     identifier: Option<u32>,
+    /// The RxFlag the worker gave it.
+    rx_flag: Vec<u8>,
     bytes: Vec<u8>,
     vci_us: u64,
     clock: Option<Clock>,
@@ -4502,6 +4506,7 @@ impl Progress {
         {
             self.rejected.push(RejectedRead {
                 identifier: header_identifier(result),
+                rx_flag: result.rx_flag.clone(),
                 bytes: result.data_bytes.clone(),
                 vci_us: u64::from(item.timestamp),
                 clock: clock_of(&item),
@@ -6158,6 +6163,7 @@ mod tests {
     fn a_primitive_ended_on_a_rejected_positive_result_is_positive_unusable() {
         let rejected = |reason| RejectedRead {
             identifier: None,
+            rx_flag: vec![0, 0, 0, 0],
             bytes: vec![0x62, 0xF1],
             vci_us: 0,
             clock: None,
@@ -6246,6 +6252,7 @@ mod tests {
         let short = Sent {
             rejected: vec![RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x50],
                 vci_us: 0,
                 clock: None,
@@ -6455,6 +6462,7 @@ mod tests {
         let logged = rejected_of(
             &[RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x62],
                 vci_us: 5,
                 clock: Some(Clock::Device),
@@ -6469,6 +6477,54 @@ mod tests {
         );
         assert_eq!(logged[0].rx_id, 0x7E8);
         assert_eq!(logged[0].agent_us, 9);
+    }
+
+    /// A rejected result keeps the RxFlag the worker gave it and the identifier its header named,
+    /// none when it named none, while `rx_id` falls back to the link's (ADR-447).
+    #[test]
+    fn a_rejected_result_keeps_its_rx_flag_and_header_identifier() {
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let on = |id: Option<u32>, flags: Vec<u8>| {
+            event(
+                Some(COP),
+                event_item::Data::ResultData(vci_service_interface::ResultData {
+                    rx_flag: flags,
+                    extra_info: id.map(|id| vci_service_interface::ExtraInfo {
+                        header_bytes: id.to_be_bytes().to_vec(),
+                        footer_bytes: Vec::new(),
+                    }),
+                    data_bytes: vec![0x62, 0xF1],
+                    ..Default::default()
+                }),
+            )
+        };
+        assert!(
+            progress
+                .on_event(on(Some(0x7E9), vec![0, 0, 1, 0]), COP)
+                .is_none()
+        );
+        assert!(progress.on_event(on(None, vec![0, 0, 2, 0]), COP).is_none());
+        let read = progress.rejected.clone();
+        assert_eq!(read[0].identifier, Some(0x7E9));
+        assert_eq!(read[0].rx_flag, [0, 0, 1, 0]);
+        assert_eq!(read[1].identifier, None);
+        assert_eq!(read[1].rx_flag, [0, 0, 2, 0]);
+        // The log's form, once the host has read them with a log.
+        let mut with_log = read;
+        for rejected in &mut with_log {
+            rejected.read = Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 1,
+                wall_unix_ms: 0,
+            });
+        }
+        let logged = rejected_of(&with_log, 0x7E8);
+        assert_eq!(logged[0].rx_id, 0x7E9);
+        assert_eq!(logged[0].identifier, Some(0x7E9));
+        assert_eq!(logged[0].rx_flag, [0, 0, 1, 0]);
+        assert_eq!(logged[1].identifier, None);
+        assert_eq!(logged[1].rx_id, 0x7E8);
+        assert_eq!(logged[1].rx_flag, [0, 0, 2, 0]);
     }
 
     /// Design 8.11 "Settlement": a primitive cancelled before the link's next request takes its
@@ -8484,6 +8540,7 @@ mod tests {
     fn a_non_collecting_end_is_vci_ended_exactly_when_it_is_positive_unusable() {
         let rejected = |reason| RejectedRead {
             identifier: None,
+            rx_flag: vec![0, 0, 0, 0],
             bytes: vec![0x62, 0xF1],
             vci_us: 0,
             clock: None,
@@ -8553,6 +8610,7 @@ mod tests {
         let sent = Sent {
             rejected: vec![RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x7E],
                 vci_us: 0,
                 clock: None,
@@ -8580,6 +8638,7 @@ mod tests {
     fn a_non_collecting_stray_finished_on_a_wrong_echo_is_vci_ended_and_positive_unusable() {
         let echo = || RejectedRead {
             identifier: None,
+            rx_flag: vec![0, 0, 0, 0],
             bytes: vec![0x62, 0xF1],
             vci_us: 0,
             clock: None,
@@ -8676,6 +8735,7 @@ mod tests {
                 rejected_read: carried,
                 unanswered_echo: carried.then(|| RejectedRead {
                     identifier: None,
+                    rx_flag: vec![0, 0, 0, 0],
                     bytes: vec![0x62, 0xF1],
                     vci_us: 0,
                     clock: None,
@@ -8726,6 +8786,7 @@ mod tests {
             rejected_read: echo,
             unanswered_echo: echo.then(|| RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x62, 0xF1],
                 vci_us: 0,
                 clock: None,

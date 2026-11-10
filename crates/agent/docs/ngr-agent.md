@@ -495,9 +495,11 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   (`Inner::offer_rejected`, `late_response_owner_with`, ADR-447): one owner is settled by a
   `late_response` with `primitive` `in_flight`, several by an unowned one that names no
   `unattached` line, and the item then carries that line's `seq` as `late_response`, which the
-  entry's classification reason reads (`Evidence::end_placed`). The exchange itself counts as an
-  owner in flight only when the result is its own positive prefix cut short, which leaves the
-  answer unowned. A `pattern_mismatch`, a collecting request's rejected answers and a result read
+  entry's classification reason reads (`Evidence::end_placed`, below the rows of the VCI's wait
+  against the limit, so a timing fault stays `system`). The exchange itself counts as an owner in
+  flight only when the result is its own positive prefix cut short (`Evidence::own_cut_short`),
+  which leaves the answer unowned: each earlier exchange that could own it is raised and none is
+  settled, and the texts say it could be the exchange's own response cut short. A `pattern_mismatch`, a collecting request's rejected answers and a result read
   in a stray's wait after the deadline are not offered. A collecting
   request lists such results among its `answers` instead (`Answer::is_rejected`): a rejected
   answer is no answer on its identifier, so it folds no pending, covers no identifier or unnamed

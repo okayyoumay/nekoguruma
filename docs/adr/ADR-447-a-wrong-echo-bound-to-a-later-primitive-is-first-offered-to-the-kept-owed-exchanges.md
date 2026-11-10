@@ -35,25 +35,35 @@ exchanges.
 1. **The log offers each `wrong_echo` result of a non-collecting exchange to the kept owed
    exchanges**, through the one owner function the unbound items use (`late_response_owner_with`,
    the caller supplying whether the exchange in flight could own the item), in the order the host
-   read it among the unbound items, before the exchange's entry. The time the log placed for the
+   read it among the unbound items (all offered in one pass sorted by the place the host read
+   them at), before the exchange's entry. The time the log placed for the
    result at the entry is reused, never placed twice (ADR-361). A result with no VCI time is not
    offered; one whose identifier is 0 is offered with none.
 2. **One owner settles; several are left unowned.** One owner gets its `late_response`, which
    restates and judges it as any late response (ADR-443 decision 4). Several get one unowned
    `late_response` naming them all, each at least `undetermined` and still owed. Neither writes an
    `unattached` line: the result is already listed in the later entry's `rejected`. The line says
-   `primitive` is `in_flight`.
+   `primitive` is `in_flight`, and its `rx_flag` and `identifier` are the worker's own (the
+   RxFlag it gave, the identifier its header named, none when it named none; the owners are
+   sought on the identifier the entry lists, which falls back to the link's).
 3. **The rejecting exchange counts as an owner in flight only for its own response cut short.**
    That is when the result is a non-empty, proper beginning of its own positive prefix. It then
    always gives the unowned form and never settles an earlier exchange, so the log does not decide
    between possible owners (ADR-375) or take an earlier exchange's answer for a truncated answer
-   to the later request.
+   to the later request. Each earlier exchange that could own it is raised, none is settled. One
+   predicate (`Evidence::own_cut_short`) decides it for the offer and for the texts: the line
+   and the later entry's reason say the result could be the later request's own response cut
+   short or an earlier exchange's, where otherwise they say it is no answer to this request.
 4. **The later entry keeps its facts and takes a new reason.** The result stays in `rejected`
    with `late_response`, the `seq` of the line written for it. The outcome (`positive_unusable`),
    `end_rejected`, `vci_ended`, the keep and the owed rows are unchanged (ADR-443, the timing
    of ADR-437 decision 6). The classification stays `undetermined`, but by a row of its own, read
    from one predicate (`Evidence::end_placed`) above the rows that take the result for the ECU's
-   answer to this request. The line is written before the entry, so the entry's history already
+   answer to this request (suppressed positive, "does not match the definition", H4) and below
+   the rows that judge the VCI's wait against the limit (a `late` window, an early or late
+   receive timeout, a pending past its limit), so a result the VCI took after the limit plus the
+   margin keeps the exchange `system`: timing is the VCI's, separate from ownership (ADR-437
+   decision 6). The line is written before the entry, so the entry's history already
    sees the owner settled.
 5. **Scope.** Not offered: a `pattern_mismatch` result, a collecting exchange's rejected answers,
    and a result read in a stray's wait after the deadline. A stray's carried wrong echo was

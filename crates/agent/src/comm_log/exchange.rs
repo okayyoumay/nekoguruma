@@ -784,7 +784,14 @@ fn negative_code(response: &[u8]) -> Option<u8> {
 /// neither the classification nor `link_history`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rejected {
+    /// The response identifier the entry lists: the header's, or the link's when the worker
+    /// split none off.
     pub rx_id: u32,
+    /// The identifier the worker's header named, none when it named none: what the
+    /// `late_response` line of an offered result may say (ADR-447).
+    pub identifier: Option<u32>,
+    /// The RxFlag the worker gave it.
+    pub rx_flag: Vec<u8>,
     pub bytes: Vec<u8>,
     pub vci_us: Option<u64>,
     pub clock: Option<Clock>,
@@ -1572,6 +1579,14 @@ impl Evidence {
                     refused_after_loss: true
                 }
         )
+    }
+
+    /// Whether `bytes` could be this request's own response cut short: a non-empty proper
+    /// beginning of its positive prefix. The one rule the log offers a rejected result by and
+    /// the classification judges the end placed with earlier exchanges by (ADR-447).
+    pub(crate) fn own_cut_short(&self, bytes: &[u8]) -> bool {
+        let prefix = &self.expected.positive_prefix;
+        !bytes.is_empty() && bytes.len() < prefix.len() && prefix.starts_with(bytes)
     }
 
     /// The `late_response` line that placed the result this exchange ended on, when it ended
@@ -5598,16 +5613,6 @@ fn rows(
         }
         // A window `timeout_early` or `timeout_late` on a response has no other row.
         _ if timed_out_unjudged => last_row(),
-        // The result that ended the wait was placed with the earlier exchanges that could own
-        // it, so it says nothing about this request's own answer: the rows below, which take it
-        // as the ECU's answer to this request, do not apply (ADR-447).
-        _ if evidence.end_placed().is_some() => (
-            Undetermined,
-            format!(
-                "The VCI ended the exchange's wait on a response that does not begin as this request's positive response does. The log placed it with the earlier exchange or exchanges that could own it (the late response logged as {}), so it is no answer to this request: whether the ECU answered this request is not decided.",
-                evidence.end_placed().unwrap_or_default()
-            ),
-        ),
         End::Positive(_) if suppressed && !pending_seen && !late => {
             if absorbing {
                 (
@@ -5640,6 +5645,27 @@ fn rows(
                     "Two faults seen together: the ECU answered after the limit in force, by {} ms, and the VCI did not end its wait at that limit but still took the answer; {outcome}.",
                     by_ms(&evidence.timing)
                 ),
+            )
+        }
+        // The result that ended the wait was placed with the earlier exchanges that could own
+        // it, so it says nothing certain about this request's own answer: the rows below, which
+        // take it as the ECU's answer to this request, do not apply (ADR-447). Below the rows
+        // of the VCI's wait against the limit, so a fault of the VCI's timing stays its own
+        // (ADR-437 decision 6).
+        _ if evidence.end_placed().is_some() => {
+            let placed = evidence.end_placed().unwrap_or_default();
+            let cut = matches!(&evidence.end, End::PositiveUnusable(bytes) if evidence.own_cut_short(bytes));
+            (
+                Undetermined,
+                if cut {
+                    format!(
+                        "The VCI ended the exchange's wait on a response that is only the beginning of this request's positive response. The log placed it with the earlier exchange or exchanges that could own it as well (the late response logged as {placed}), so it could be this request's own response cut short or the response of an earlier exchange: whether the ECU answered this request is not decided."
+                    )
+                } else {
+                    format!(
+                        "The VCI ended the exchange's wait on a response that does not begin as this request's positive response does. The log placed it with the earlier exchanges that could own it (the late response logged as {placed}), so it is no answer to this request: whether the ECU answered this request is not decided."
+                    )
+                },
             )
         }
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
@@ -8864,6 +8890,8 @@ mod tests {
         with.rejected = vec![
             Rejected {
                 rx_id: 0x7E8,
+                identifier: Some(0x7E8),
+                rx_flag: vec![0; 4],
                 bytes: vec![0x62, 0xF1],
                 vci_us: Some(5),
                 clock: Some(Clock::Device),
@@ -8874,6 +8902,8 @@ mod tests {
             },
             Rejected {
                 rx_id: 0x7E8,
+                identifier: Some(0x7E8),
+                rx_flag: vec![0; 4],
                 bytes: vec![0x67, 0x02, 0xAA, 0xBB],
                 vci_us: None,
                 clock: None,

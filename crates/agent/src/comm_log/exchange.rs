@@ -1415,8 +1415,9 @@ impl Evidence {
     /// each once. With no receive table (a physical link) it is owed as before: on the
     /// identifiers a pending is open on, else on its link's `rx_id`. With a table, a request
     /// that is not collecting is owed on its `rx_id` once a final response ended it (and, when
-    /// that end is a rejected one, on every receive identifier too, ADR-443), else on every
-    /// receive identifier; a collecting request with no answer on every receive identifier.
+    /// that end is a rejected one or the `rx_id` is 0, on every receive identifier too,
+    /// ADR-443, ADR-446), else on every receive identifier; a collecting request with no answer
+    /// on every receive identifier.
     /// With answers, it is owed on each of these once, in this order: the identifiers a pending
     /// is open on (an unnamed pending, identifier 0, standing for every
     /// receive identifier with no final answer, and for none when every one has it, ADR-400
@@ -1445,7 +1446,12 @@ impl Evidence {
         }
         if !self.collecting {
             if self.final_response().is_some() {
+                // An unnamed final (0) may have come on any identifier of the table, as for a
+                // collecting exchange below (ADR-446).
                 add(&mut ids, self.rx_id);
+                if self.rx_id == 0 {
+                    table.iter().for_each(|&id| add(&mut ids, id));
+                }
             } else {
                 table.iter().for_each(|&id| add(&mut ids, id));
             }
@@ -1896,8 +1902,15 @@ impl Kept {
     /// ([`Evidence::late_final_settles`]), or a pending was open when it was kept
     /// ([`Kept::pending_at_end`]) (ADR-436). A record whose evidence settles the exchange is kept
     /// only for its rows (ADR-442, ADR-445): the pending it had open earlier gives it no late
-    /// final answer, as its in-time twin has none (ADR-445 decision 4).
+    /// final answer, as its in-time twin has none (ADR-445 decision 4). A non-collecting record
+    /// whose evidence settles it is the same: it owns no late final (ADR-446), whatever ended
+    /// the VCI's wait.
     pub(crate) fn late_final_settles(&self) -> bool {
+        // A non-collecting exchange whose evidence settles it owns no late final, whatever ended
+        // the VCI's wait (ADR-446); `vci_ended` stands.
+        if !self.evidence.collecting && self.evidence.settles_owed() {
+            return false;
+        }
         self.evidence.late_final_settles() || (self.pending_at_end && !self.evidence.settles_owed())
     }
 
@@ -13055,7 +13068,7 @@ mod tests {
         assert_eq!(table.owed_ids(), [0, RX, RX2]);
         table.end_rejected = false;
         table.end = End::Positive(vec![0x62, 0xF1, 0x86, 0x01]);
-        assert_eq!(table.owed_ids(), [0]);
+        assert_eq!(table.owed_ids(), [0, RX, RX2]);
         assert!(!evidence.settles_owed());
         assert!(evidence.answer_head().is_none());
         let kept = log_kept(&mut LinkState::default(), 1, evidence).1;
@@ -13069,6 +13082,56 @@ mod tests {
         assert_eq!(
             answered.answer_head().as_deref(),
             Some(&[0x62, 0xF1, 0x86, 0x01][..])
+        );
+    }
+
+    /// ADR-446: a non-collecting exchange with a usable final response on a link with a receive
+    /// table is owed on its own identifier and, when that is 0, on every receive identifier; a
+    /// record of it whose evidence settles it owns no late final, whatever ended the VCI's wait,
+    /// where a rejected end, a silent one and a collecting exchange keep what they owned.
+    #[test]
+    fn a_settled_non_collecting_record_owns_no_late_final_and_is_owed_on_the_table() {
+        let mut table = evidence(
+            &[0x22, 0xF1, 0x86],
+            End::Positive(vec![0x62, 0xF1, 0x86, 0x01]),
+        );
+        table.rx_id = 0;
+        table.receive_ids = vec![RX, RX2];
+        table.vci_ended = true;
+        assert_eq!(table.owed_ids(), [0, RX, RX2]);
+        // A named own identifier on the table is owed on it alone, as before.
+        let mut named = table.clone();
+        named.rx_id = RX2;
+        assert_eq!(named.owed_ids(), [RX2]);
+        let kept = log_kept(&mut LinkState::default(), 1, table.clone()).1;
+        assert!(kept.evidence.settles_owed() && kept.evidence.vci_ended);
+        assert!(!kept.late_final_settles());
+        // The rejected end, the silent one and a collecting exchange are not changed.
+        let mut rejected_end = table.clone();
+        rejected_end.end = End::PositiveUnusable(vec![0x62, 0xF1]);
+        rejected_end.end_rejected = true;
+        assert_eq!(rejected_end.owed_ids(), [0, RX, RX2]);
+        assert!(
+            log_kept(&mut LinkState::default(), 1, rejected_end)
+                .1
+                .late_final_settles()
+        );
+        let mut silent = table.clone();
+        silent.end = End::NoResponse;
+        assert_eq!(silent.owed_ids(), [RX, RX2]);
+        assert!(
+            log_kept(&mut LinkState::default(), 1, silent)
+                .1
+                .late_final_settles()
+        );
+        let mut settled = collecting(vec![positive(RX, Window::WithinP2)]);
+        settled.rx_id = 0;
+        settled.receive_ids = vec![RX];
+        assert!(settled.settles_owed() && settled.vci_ended);
+        assert!(
+            log_kept(&mut LinkState::default(), 1, settled)
+                .1
+                .late_final_settles()
         );
     }
 

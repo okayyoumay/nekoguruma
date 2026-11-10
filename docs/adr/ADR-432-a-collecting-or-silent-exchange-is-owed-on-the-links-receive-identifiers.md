@@ -1,7 +1,7 @@
 # ADR-432: A Collecting or Silent Exchange Is Owed on the Link's Receive Identifiers
 
 **Date:** 2026-11-07
-**Status:** Accepted (Consequence 1's whole settlement amended by ADR-433: per identifier when several are open; the deferred bullet on settling per identifier closed; Decision item 2's "an identifier with a final answer standing is never owed" and its first-final fallback superseded by ADR-435, which owes the silent identifiers; the deferred bullet on a silent identifier closed)
+**Status:** Accepted (Consequence 1's whole settlement amended by ADR-433: per identifier when several are open; the deferred bullet on settling per identifier closed; Decision item 2's "an identifier with a final answer standing is never owed" and its first-final fallback superseded by ADR-435, which owes the silent identifiers; the deferred bullet on a silent identifier closed; Decision item 2's "a request that is not collecting is owed on its own `rx_id` once a final response ended it" revised by ADR-446: on a link with a receive table, when that identifier is 0, on every receive identifier too)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::receive_ids`, `Evidence::owed_ids`,
 `LinkState::set_owed_rows`, `LinkState::history_for`, `LinkState::record`,
 `LinkState::renew_owed`; `comm_log.rs` `late_response`, `late_response_owner`; `host.rs`

@@ -1,7 +1,7 @@
 # ADR-448: The Unknown Sends of a Link Are Kept by Exchange, per Opening
 
 **Date:** 2026-11-10
-**Status:** Accepted
+**Status:** Accepted (Consequences' last bullet closed by ADR-451)
 **Affects:** `agent` (`comm_log/exchange.rs` `LinkState` `unknown_sends`, `LinkState::reopened`,
 `LinkState::may_own_tx_indication`, `LinkState::alone_may_own_tx_indication`,
 `LinkState::late_transmit_owners`; `comm_log.rs` `Inner::taken_indications`), design 8.11
@@ -73,4 +73,4 @@ reachable only by calling it directly, and this decision changes no production l
   answers from before a second `link_opened` still count and an unknown send from before it
   still blocks later transmit indications, which design 8.11 does not intend. The wiring must
   land after this decision, since calling the earlier `reopened` from `link_opened` would give
-  a `confirmed` to the wrong exchange.
+  a `confirmed` to the wrong exchange. (Closed by ADR-451.)

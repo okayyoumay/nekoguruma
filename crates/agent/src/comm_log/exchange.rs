@@ -51,6 +51,10 @@ pub(crate) enum Origin {
     RestartCheck,
     /// A restart's ECUReset (8.2.5).
     Teardown,
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no producer gives this origin yet")
+    )]
     AccessProgram,
     KeepAlive,
 }
@@ -110,6 +114,10 @@ pub(crate) enum Target {
     /// An exchange sent before roles are bound: the link and the addresses.
     Endpoint { link: u32, tx_id: u32, rx_id: u32 },
     /// The target's role, once bound.
+    #[cfg_attr(
+        not(test),
+        expect(dead_code, reason = "no producer names a target by role yet")
+    )]
     Role(String),
 }
 
@@ -139,6 +147,13 @@ pub(crate) enum SentEvidence {
     Answer,
     FlowControl,
     Refused,
+    #[cfg_attr(
+        not(test),
+        expect(
+            dead_code,
+            reason = "no producer gives a transmit error as send evidence yet"
+        )
+    )]
     TxError,
     None,
 }
@@ -2354,7 +2369,8 @@ impl LinkState {
 
     /// The link was opened again, the worker restarted or the VCI reconnected (design 8.11
     /// "Matched answer"): the matched answers start over, since the link may now be set up
-    /// differently. The owed requests and the counts `answered` and `answered_since_error` stay
+    /// differently. `CommLog::link_opened` calls it on the state of the target it names
+    /// (ADR-451). The owed requests and the counts `answered` and `answered_since_error` stay
     /// ("Owed request": a response already on its way can still arrive).
     pub(crate) fn reopened(&mut self) {
         self.matched.clear();
@@ -4344,6 +4360,7 @@ impl ExchangeEntry {
 
     /// Whether the exchange has a final response and no identifier open on a pending or silent
     /// ([`LinkEffect::settles`], ADR-435).
+    #[cfg(test)]
     pub(crate) fn settles(&self) -> bool {
         self.effect.settles()
     }
@@ -4778,6 +4795,7 @@ impl Kept {
     /// response is restated as an answer of its list, as the log restates a final answer read
     /// after the entry (ADR-425 decision 4, ADR-429): it folds the last pending of the
     /// identifier it came on into it, and the end is the first standing final answer.
+    #[cfg(test)]
     pub(crate) fn answered(&self, response: &[u8], late: &LateAnswer) -> Evidence {
         self.answered_placed(response, late, None).0
     }

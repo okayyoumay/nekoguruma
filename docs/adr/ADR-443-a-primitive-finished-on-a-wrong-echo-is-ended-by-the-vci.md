@@ -1,7 +1,7 @@
 # ADR-443: A Primitive Finished on a Wrong Echo Is Ended by the VCI
 
 **Date:** 2026-11-09
-**Status:** Accepted (Consequences' last sentence, a non-collecting exchange with a usable or negative final response is owed on its own identifier, revised by ADR-446: on a link with a receive table, when that identifier is 0, on every receive identifier too)
+**Status:** Accepted (Consequences' last sentence, a non-collecting exchange with a usable or negative final response is owed on its own identifier, revised by ADR-446: on a link with a receive table, when that identifier is 0, on every receive identifier too; Context's "any usable answer arrives unbound" and decision 3 revised by ADR-447: the answer may come bound to a later primitive, which the log offers to the kept owed exchanges)
 **Affects:** `agent` (`host.rs` `vci_ended`, `unanswered_wrong_echo`, `unanswered_end`, `Progress::finished`,
 `Sent::vci_ended`, `Sent::silence_is_result`, `Stray`, `primitive_ended_of`; `comm_log.rs`
 `PrimitiveEnded`, `CommLog::primitive_ended`; `comm_log/exchange.rs` `Kept::answered_placed`),

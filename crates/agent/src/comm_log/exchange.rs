@@ -784,7 +784,14 @@ fn negative_code(response: &[u8]) -> Option<u8> {
 /// neither the classification nor `link_history`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Rejected {
+    /// The response identifier the entry lists: the header's, or the link's when the worker
+    /// split none off.
     pub rx_id: u32,
+    /// The identifier the worker's header named, none when it named none: what the
+    /// `late_response` line of an offered result may say (ADR-447).
+    pub identifier: Option<u32>,
+    /// The RxFlag the worker gave it.
+    pub rx_flag: Vec<u8>,
     pub bytes: Vec<u8>,
     pub vci_us: Option<u64>,
     pub clock: Option<Clock>,
@@ -792,6 +799,10 @@ pub(crate) struct Rejected {
     pub epoch: Option<u32>,
     pub agent_us: u64,
     pub reason: RejectedReason,
+    /// The `seq` of the `late_response` line the log wrote for it, when it offered the result
+    /// to the exchanges kept owed and one or several could own it (design 8.11 `rejected`,
+    /// ADR-447). Set by the log.
+    pub late_response: Option<u64>,
 }
 
 /// Why a result bound to the primitive was not the exchange's answer.
@@ -818,6 +829,10 @@ pub(crate) struct RejectedItem {
     pub epoch: Option<u32>,
     pub agent_us: u64,
     pub reason: RejectedReason,
+    /// The `late_response` line that placed the result with the earlier exchanges that could
+    /// own it (ADR-447).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub late_response: Option<u64>,
 }
 
 /// The worker's report that the link's events were lost during the exchange (design 8.11
@@ -1297,6 +1312,9 @@ pub(crate) struct Evidence {
     /// ADR-359 item 3): it is no answer of the request, so the link's history does not count it,
     /// and its bytes are redacted as a rejected result's are.
     pub end_rejected: bool,
+    /// The rejected end is a result the wait for the primitive's end read after the entry (not
+    /// the entry's own), which the log never offered to the earlier exchanges (ADR-447).
+    pub end_read_after_entry: bool,
     pub supply_voltage: Option<SupplyVoltage>,
     pub detail: Detail,
 }
@@ -1355,6 +1373,7 @@ impl Evidence {
             rejected: Vec::new(),
             events_lost: None,
             end_rejected: false,
+            end_read_after_entry: false,
             supply_voltage: None,
             detail: Detail::default(),
         }
@@ -1564,6 +1583,32 @@ impl Evidence {
                     refused_after_loss: true
                 }
         )
+    }
+
+    /// Whether `bytes` could be this request's own response cut short: a non-empty proper
+    /// beginning of its positive prefix. The one rule the log offers a rejected result by and
+    /// the classification judges the end placed with earlier exchanges by (ADR-447).
+    pub(crate) fn own_cut_short(&self, bytes: &[u8]) -> bool {
+        let prefix = &self.expected.positive_prefix;
+        !bytes.is_empty() && bytes.len() < prefix.len() && prefix.starts_with(bytes)
+    }
+
+    /// The `late_response` line that placed the result this exchange ended on, when it ended
+    /// on a rejected result (`end_rejected`) the log offered to the exchanges kept owed and
+    /// some could own (ADR-447). The rejected end is the last rejected result, and its bytes
+    /// are the end's, so a restated end that is another result is not it; nor is a rejected end the
+    /// wait for the primitive's end read after the entry (`end_read_after_entry`), even with
+    /// the same bytes.
+    pub(crate) fn end_placed(&self) -> Option<u64> {
+        let End::PositiveUnusable(bytes) = &self.end else {
+            return None;
+        };
+        let last = self.rejected.last()?;
+        if self.end_rejected && !self.end_read_after_entry && last.bytes == *bytes {
+            last.late_response
+        } else {
+            None
+        }
     }
 
     /// The exchange has a final response, no identifier is left open on a pending and none is
@@ -4358,6 +4403,7 @@ impl ExchangeEntry {
                     epoch: rejected.epoch,
                     agent_us: rejected.agent_us,
                     reason: rejected.reason,
+                    late_response: rejected.late_response,
                 })
                 .collect(),
             events_lost: evidence.events_lost,
@@ -4459,8 +4505,30 @@ pub(crate) fn text(evidence: &Evidence, history: &LinkHistory) -> String {
     format!("{sent_phrase}; {outcome}.")
 }
 
+/// What the response that ended the wait of an exchange whose end the log placed with earlier
+/// exchanges (`Evidence::end_placed`) was, as a noun phrase the timing rows and the placed row
+/// share (ADR-447): it names the `late_response` line and says the request's own answer is not
+/// decided. Call it only when `end_placed` is `Some`.
+fn placed_phrase(evidence: &Evidence) -> String {
+    let placed = evidence.end_placed().unwrap_or_default();
+    let cut =
+        matches!(&evidence.end, End::PositiveUnusable(bytes) if evidence.own_cut_short(bytes));
+    if cut {
+        format!(
+            "a response that is only the beginning of this request's positive response; the log placed it with the earlier exchange or exchanges that could own it as well (the late response logged as {placed}), so it could be this request's own response cut short or the response of an earlier exchange: whether the ECU answered this request is not decided"
+        )
+    } else {
+        format!(
+            "a response that does not begin as this request's positive response does; the log placed it with the earlier exchange or exchanges that could own it (the late response logged as {placed}), so it is no answer to this request: whether the ECU answered this request is not decided"
+        )
+    }
+}
+
 /// How the exchange ended, as the entry's text and a late pending's reason name it.
 fn outcome_phrase(evidence: &Evidence) -> String {
+    if evidence.end_placed().is_some() {
+        return format!("it took {}", placed_phrase(evidence));
+    }
     match &evidence.end {
         End::Positive(_) => {
             let timing = match evidence.timing.window {
@@ -5590,6 +5658,17 @@ fn rows(
                 )
             }
         }
+        // A placed result may be an earlier request's answer alone, so its arrival proves no
+        // timing fault of the ECU for this request: only the VCI's wait past the limit is
+        // shown (ADR-437 decision 6, ADR-447 decision 4).
+        End::PositiveUnusable(_) if late && evidence.end_placed().is_some() => (
+            System,
+            format!(
+                "The VCI did not end its wait at the limit in force but took a result {} ms after it; it was {}.",
+                by_ms(&evidence.timing),
+                placed_phrase(evidence)
+            ),
+        ),
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_) if late => {
             let outcome = match &evidence.end {
                 End::Positive(_) => "it responded positively".to_owned(),
@@ -5607,6 +5686,18 @@ fn rows(
                 ),
             )
         }
+        // The result that ended the wait was placed with the earlier exchanges that could own
+        // it, so it says nothing certain about this request's own answer: the rows below, which
+        // take it as the ECU's answer to this request, do not apply (ADR-447). Below the rows
+        // of the VCI's wait against the limit, so a fault of the VCI's timing stays its own
+        // (ADR-437 decision 6).
+        _ if evidence.end_placed().is_some() => (
+            Undetermined,
+            format!(
+                "The VCI ended the exchange's wait on {}.",
+                placed_phrase(evidence)
+            ),
+        ),
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_)
             if possible_pending && !pending_seen =>
         {
@@ -8829,21 +8920,27 @@ mod tests {
         with.rejected = vec![
             Rejected {
                 rx_id: 0x7E8,
+                identifier: Some(0x7E8),
+                rx_flag: vec![0; 4],
                 bytes: vec![0x62, 0xF1],
                 vci_us: Some(5),
                 clock: Some(Clock::Device),
                 epoch: None,
                 agent_us: 9,
                 reason: RejectedReason::WrongEcho,
+                late_response: None,
             },
             Rejected {
                 rx_id: 0x7E8,
+                identifier: Some(0x7E8),
+                rx_flag: vec![0; 4],
                 bytes: vec![0x67, 0x02, 0xAA, 0xBB],
                 vci_us: None,
                 clock: None,
                 epoch: None,
                 agent_us: 10,
                 reason: RejectedReason::WrongEcho,
+                late_response: None,
             },
         ];
         with.events_lost = Some(EventsLost {

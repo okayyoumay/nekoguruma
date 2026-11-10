@@ -1,7 +1,7 @@
 # ADR-359: The Exchange Entry Records Rejected Results and Lost Events
 
 **Date:** 2026-10-26
-**Status:** Accepted (item 3 extended by ADR-437: a collecting request lists its rejected results among its answers, and its end is a rejected result only while no usable answer stands; item 3's "the request stays owed" amended by ADR-443: the primitive the VCI finished on a wrong echo counts as the VCI ending its wait, so its exchange is kept and the ECU's usable answer is its `late_response`)
+**Status:** Accepted (item 3 extended by ADR-437: a collecting request lists its rejected results among its answers, and its end is a rejected result only while no usable answer stands; item 3's "the request stays owed" amended by ADR-443: the primitive the VCI finished on a wrong echo counts as the VCI ending its wait, so its exchange is kept and the ECU's usable answer is its `late_response`; item 1's list item gains `late_response` and item 3's "counts for nothing else" revised by ADR-447: a wrong echo bound to a later primitive is first offered to the kept owed exchanges)
 **Affects:** `agent` host (`host.rs` `Progress::on_event`, `RejectedRead`, `is_indication`) and
 communication log (`comm_log/exchange.rs` `Rejected`, `RejectedItem`, `EventsLost`, the exchange
 entry), `sim-ecu` (`Fault::TruncateResponse`), `crates/agent/docs/ngr-agent.md`,

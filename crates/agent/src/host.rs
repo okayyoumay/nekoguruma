@@ -2708,12 +2708,15 @@ fn rejected_of(rejected: &[RejectedRead], rx_id: u32) -> Vec<Rejected> {
         .filter_map(|rejected| {
             Some(Rejected {
                 rx_id: rejected.identifier.unwrap_or(rx_id),
+                identifier: rejected.identifier,
+                rx_flag: rejected.rx_flag.clone(),
                 bytes: rejected.bytes.clone(),
                 vci_us: Some(rejected.vci_us),
                 clock: rejected.clock,
                 epoch: None,
                 agent_us: rejected.read?.monotonic_us,
                 reason: rejected.reason,
+                late_response: None,
             })
         })
         .collect()
@@ -3223,10 +3226,16 @@ fn primitive_ended_of(
             } else {
                 unanswered.is_some()
             };
+            // The end is the echo the wait before the deadline carried only when nothing was
+            // read after it: the carried echo is the first rejected result, and the one the
+            // end took is the last (ADR-447).
+            let end_is_carried_echo =
+                end_rejected && stray.unanswered_echo.is_some() && progress.rejected.len() == 1;
             crate::comm_log::PrimitiveEnded {
                 end: Some(end),
                 detail,
                 end_rejected,
+                end_is_carried_echo,
                 vci_ended: vci_ended(
                     progress.rx_timeout.is_some(),
                     progress.collecting,
@@ -3241,6 +3250,7 @@ fn primitive_ended_of(
             end: None,
             detail: Detail::default(),
             end_rejected: false,
+            end_is_carried_echo: false,
             vci_ended: false,
             reads: progress.take_reads(epoch, None),
         },
@@ -3473,6 +3483,8 @@ struct PendingRead {
 #[derive(Debug, Clone)]
 struct RejectedRead {
     identifier: Option<u32>,
+    /// The RxFlag the worker gave it.
+    rx_flag: Vec<u8>,
     bytes: Vec<u8>,
     vci_us: u64,
     clock: Option<Clock>,
@@ -4501,6 +4513,7 @@ impl Progress {
         {
             self.rejected.push(RejectedRead {
                 identifier: header_identifier(result),
+                rx_flag: result.rx_flag.clone(),
                 bytes: result.data_bytes.clone(),
                 vci_us: u64::from(item.timestamp),
                 clock: clock_of(&item),
@@ -6157,6 +6170,7 @@ mod tests {
     fn a_primitive_ended_on_a_rejected_positive_result_is_positive_unusable() {
         let rejected = |reason| RejectedRead {
             identifier: None,
+            rx_flag: vec![0, 0, 0, 0],
             bytes: vec![0x62, 0xF1],
             vci_us: 0,
             clock: None,
@@ -6245,6 +6259,7 @@ mod tests {
         let short = Sent {
             rejected: vec![RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x50],
                 vci_us: 0,
                 clock: None,
@@ -6454,6 +6469,7 @@ mod tests {
         let logged = rejected_of(
             &[RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x62],
                 vci_us: 5,
                 clock: Some(Clock::Device),
@@ -6468,6 +6484,54 @@ mod tests {
         );
         assert_eq!(logged[0].rx_id, 0x7E8);
         assert_eq!(logged[0].agent_us, 9);
+    }
+
+    /// A rejected result keeps the RxFlag the worker gave it and the identifier its header named,
+    /// none when it named none, while `rx_id` falls back to the link's (ADR-447).
+    #[test]
+    fn a_rejected_result_keeps_its_rx_flag_and_header_identifier() {
+        let mut progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+        let on = |id: Option<u32>, flags: Vec<u8>| {
+            event(
+                Some(COP),
+                event_item::Data::ResultData(vci_service_interface::ResultData {
+                    rx_flag: flags,
+                    extra_info: id.map(|id| vci_service_interface::ExtraInfo {
+                        header_bytes: id.to_be_bytes().to_vec(),
+                        footer_bytes: Vec::new(),
+                    }),
+                    data_bytes: vec![0x62, 0xF1],
+                    ..Default::default()
+                }),
+            )
+        };
+        assert!(
+            progress
+                .on_event(on(Some(0x7E9), vec![0, 0, 1, 0]), COP)
+                .is_none()
+        );
+        assert!(progress.on_event(on(None, vec![0, 0, 2, 0]), COP).is_none());
+        let read = progress.rejected.clone();
+        assert_eq!(read[0].identifier, Some(0x7E9));
+        assert_eq!(read[0].rx_flag, [0, 0, 1, 0]);
+        assert_eq!(read[1].identifier, None);
+        assert_eq!(read[1].rx_flag, [0, 0, 2, 0]);
+        // The log's form, once the host has read them with a log.
+        let mut with_log = read;
+        for rejected in &mut with_log {
+            rejected.read = Some(AgentNow {
+                epoch: 0,
+                monotonic_us: 1,
+                wall_unix_ms: 0,
+            });
+        }
+        let logged = rejected_of(&with_log, 0x7E8);
+        assert_eq!(logged[0].rx_id, 0x7E9);
+        assert_eq!(logged[0].identifier, Some(0x7E9));
+        assert_eq!(logged[0].rx_flag, [0, 0, 1, 0]);
+        assert_eq!(logged[1].identifier, None);
+        assert_eq!(logged[1].rx_id, 0x7E8);
+        assert_eq!(logged[1].rx_flag, [0, 0, 2, 0]);
     }
 
     /// Design 8.11 "Settlement": a primitive cancelled before the link's next request takes its
@@ -8483,6 +8547,7 @@ mod tests {
     fn a_non_collecting_end_is_vci_ended_exactly_when_it_is_positive_unusable() {
         let rejected = |reason| RejectedRead {
             identifier: None,
+            rx_flag: vec![0, 0, 0, 0],
             bytes: vec![0x62, 0xF1],
             vci_us: 0,
             clock: None,
@@ -8552,6 +8617,7 @@ mod tests {
         let sent = Sent {
             rejected: vec![RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x7E],
                 vci_us: 0,
                 clock: None,
@@ -8579,6 +8645,7 @@ mod tests {
     fn a_non_collecting_stray_finished_on_a_wrong_echo_is_vci_ended_and_positive_unusable() {
         let echo = || RejectedRead {
             identifier: None,
+            rx_flag: vec![0, 0, 0, 0],
             bytes: vec![0x62, 0xF1],
             vci_us: 0,
             clock: None,
@@ -8636,6 +8703,13 @@ mod tests {
             let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
             assert_eq!(ended.vci_ended, expected, "{carried} {in_wait}");
             assert_eq!(ended.end_rejected, expected, "{carried} {in_wait}");
+            // Only an end that is the carried echo, with nothing read after it, is the one the
+            // entry offered (ADR-447).
+            assert_eq!(
+                ended.end_is_carried_echo,
+                expected && carried && !in_wait,
+                "{carried} {in_wait}"
+            );
             assert_eq!(
                 matches!(ended.end, Some(End::PositiveUnusable(ref bytes)) if bytes == &[0x62, 0xF1]),
                 expected,
@@ -8646,6 +8720,60 @@ mod tests {
                 assert!(matches!(ended.end, Some(End::NoResponse)));
             }
         }
+    }
+
+    /// ADR-447: the wrong echo a stray carries from the entry's wait was offered at the entry, so
+    /// the stray's end hands the log no read for it: its reads are those of a stray that carried
+    /// none.
+    #[test]
+    fn a_stray_s_carried_wrong_echo_adds_no_read_for_the_log() {
+        let reads_of = |carried: bool| {
+            let progress = Progress::for_request(&[0x22, 0xF1, 0x90]).unwrap();
+            let mut stray = Stray {
+                cop: Some(COP),
+                tag: vec![0; 8],
+                deadline: tokio::time::Instant::now(),
+                cancel_failed: false,
+                request: vec![0x22, 0xF1, 0x90],
+                expectation: crate::send_receive::Expectation {
+                    sid: progress.sid,
+                    positive: progress.positive_prefix.clone(),
+                    negative: progress.negative.clone(),
+                },
+                seq: Some(1),
+                exchange: Some(1),
+                response: None,
+                response_times: VciTimes::default(),
+                error: None,
+                errors: Vec::new(),
+                rejected_read: carried,
+                unanswered_echo: carried.then(|| RejectedRead {
+                    identifier: None,
+                    rx_flag: vec![0, 0, 0, 0],
+                    bytes: vec![0x62, 0xF1],
+                    vci_us: 0,
+                    clock: None,
+                    reason: RejectedReason::WrongEcho,
+                    read: None,
+                }),
+                collecting: false,
+                receive_table: TABLE.to_vec(),
+                progress: None,
+            };
+            let mut progress = stray.take_progress();
+            let finished = event(Some(COP), status(PduComPrimitiveStatus::PduCopstFinished));
+            let done = progress
+                .on_read(
+                    Some(event_notification::EventData::Item(finished)),
+                    COP,
+                    None,
+                )
+                .expect("the finished status ends the wait");
+            let ended = primitive_ended_of(&stray, &mut progress, StrayEnd::Ended(&done), 0);
+            assert_eq!(ended.end_rejected, carried);
+            ended.reads.len()
+        };
+        assert_eq!(reads_of(true), reads_of(false));
     }
 
     /// A stray of the read request `22 F1 86` (not collecting) the agent's deadline ended, whose
@@ -8672,6 +8800,7 @@ mod tests {
             rejected_read: echo,
             unanswered_echo: echo.then(|| RejectedRead {
                 identifier: None,
+                rx_flag: vec![0, 0, 0, 0],
                 bytes: vec![0x62, 0xF1],
                 vci_us: 0,
                 clock: None,
@@ -8743,6 +8872,7 @@ mod tests {
                 end: ended.end.clone(),
                 detail: Detail::default(),
                 end_rejected: ended.end_rejected,
+                end_is_carried_echo: ended.end_is_carried_echo,
                 vci_ended: ended.vci_ended,
             };
             assert!(log.primitive_ended(seq, ended).is_some());

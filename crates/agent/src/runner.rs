@@ -17345,6 +17345,133 @@ def main():
         lines
     }
 
+    /// Runs one read of the data identifier `22 F1 <last>` per entry of `reads`, each a primitive
+    /// of its own with its script (the fake worker gives them in order) and none collecting; each
+    /// read ends with no response within the host's wait. Returns the log's lines.
+    async fn consecutive_reads_run(reads: Vec<(u8, &'static [Step])>) -> Vec<serde_json::Value> {
+        let dir = journal_dir("consecutive-reads");
+        let (identifiers, scripts): (Vec<u8>, Vec<_>) = reads.into_iter().unzip();
+        let script = scripts
+            .into_iter()
+            .map(|script| (When::After(Duration::ZERO), StartEvent::Script(script)))
+            .collect();
+        let (mut client, _fake) =
+            fake_worker_scripted(CancelAnswer::Done, None, true, false, script).await;
+        let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir)).expect("the log opens");
+        let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+        let link = link::open(&mut client, &config, Duration::from_secs(5))
+            .await
+            .expect("the link opens");
+        let handle = tokio::runtime::Handle::current();
+        let timings = Timings {
+            unary: Duration::from_secs(5),
+            send_recv: Duration::from_secs(5),
+        };
+        tokio::task::spawn_blocking(move || {
+            use diag_ir::DiagHost;
+            let mut host = WorkerHost::new(handle, client, link, timings);
+            host.set_comm_log(Some(log));
+            host.set_link_ids(0x7E0, 0x7E8);
+            host.own_reads(Some(OwnRead::Identification));
+            host.set_job_end_wait(JOB_END_WAIT);
+            for last in identifiers {
+                let result = host.service_request(0x22, &[0xF1, last]);
+                assert!(matches!(result, Err(HostError::NoResponse)), "{result:?}");
+            }
+            host.settle_at_end();
+        })
+        .await
+        .unwrap();
+        let lines = comm_log_lines(&dir);
+        std::fs::remove_dir_all(&dir).unwrap();
+        lines
+    }
+
+    /// ADR-447, the Done-when: the ECU's usable answer to the first read, bound by the worker to
+    /// the next request's primitive and rejected by the host as a wrong echo there, is the first
+    /// exchange's `late_response` (written before the second exchange's entry, `refers_to` the
+    /// first, not `unattached`), and the second's entry lists it as rejected with that line.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_usable_answer_bound_to_the_next_request_is_the_kept_exchange_s_late_response() {
+        const FIRST: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::From(Bound::Own, 203_000, 0x7E8, &[0x62, 0xF1]),
+            Step::Finish,
+        ];
+        const SECOND: &[Step] = &[
+            Step::Transmit(1_003_000),
+            Step::From(Bound::Own, 1_203_000, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+            Step::Finish,
+        ];
+        let lines = consecutive_reads_run(vec![(0x90, FIRST), (0x91, SECOND)]).await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 2, "{lines:#?}");
+        for exchange in &exchanges {
+            assert_eq!(
+                exchange["outcome"]["result"], "positive_unusable",
+                "{lines:#?}"
+            );
+        }
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"]]),
+            "{lines:#?}"
+        );
+        assert_eq!(late[0]["primitive"], "in_flight", "{lines:#?}");
+        assert_eq!(
+            exchanges[1]["rejected"][0]["late_response"], late[0]["seq"],
+            "{lines:#?}"
+        );
+        let seq_at = |seq: &serde_json::Value| lines.iter().position(|l| l["seq"] == *seq);
+        assert!(seq_at(&exchanges[0]["seq"]) < seq_at(&late[0]["seq"]));
+        assert!(seq_at(&late[0]["seq"]) < seq_at(&exchanges[1]["seq"]));
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
+    /// ADR-447: with two kept exchanges that could own the answer bound to the third request's
+    /// primitive, the `late_response` is unowned: it names both, each is left `undetermined`, and
+    /// no `unattached` line is written.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_late_usable_answer_bound_to_the_next_request_is_left_unowned_with_two_kept_exchanges()
+     {
+        const FIRST: &[Step] = &[
+            Step::Transmit(3_000),
+            Step::From(Bound::Own, 203_000, 0x7E8, &[0x62, 0xF1]),
+            Step::Finish,
+        ];
+        const SECOND: &[Step] = &[
+            Step::Transmit(1_003_000),
+            Step::From(Bound::Own, 1_203_000, 0x7E8, &[0x62, 0xF1]),
+            Step::Finish,
+        ];
+        const THIRD: &[Step] = &[
+            Step::Transmit(2_003_000),
+            Step::From(Bound::Own, 2_203_000, 0x7E8, &[0x62, 0xF1, 0x90, 0x41]),
+            Step::Finish,
+        ];
+        let lines = consecutive_reads_run(vec![(0x90, FIRST), (0x90, SECOND), (0x91, THIRD)]).await;
+        let exchanges = of_event(&lines, "exchange");
+        assert_eq!(exchanges.len(), 3, "{lines:#?}");
+        let late = of_event(&lines, "late_response");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(
+            late[0]["refers_to"],
+            serde_json::json!([exchanges[0]["seq"], exchanges[1]["seq"]]),
+            "{lines:#?}"
+        );
+        assert!(late[0].get("unattached").is_none(), "{lines:#?}");
+        for settled in late[0]["exchanges"].as_array().unwrap() {
+            assert_eq!(settled["classification"], "undetermined", "{lines:#?}");
+        }
+        assert_eq!(
+            exchanges[2]["rejected"][0]["late_response"], late[0]["seq"],
+            "{lines:#?}"
+        );
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+    }
+
     /// ADR-443: a read that is not collecting, whose primitive the VCI finished on a wrong echo
     /// within the host's own wait, ends as `positive_unusable` with that echo listed as
     /// rejected; the exchange is kept, so the ECU's usable answer read afterwards is its
@@ -18744,6 +18871,7 @@ def main():
                         end: None,
                         detail: Default::default(),
                         end_rejected: false,
+                        end_is_carried_echo: false,
                         vci_ended: false,
                         reads: Vec::new(),
                     },

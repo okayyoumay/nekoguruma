@@ -12873,6 +12873,11 @@ pub(crate) mod tests {
     /// 0x7E8) could own, and a final on 0x7E8, so it is owed on 0x7E9 only and the owner is in its
     /// owners; the lone late final on 0x7E9 settles it. No row is left, so the log lets go of it
     /// instead of keeping a record with no rows for good.
+    ///
+    /// A regression test of the folded path, which passes without the guard on an exchange owed
+    /// on no identifier (a defensive invariant, ADR-445 decision 1): the covered unnamed pending
+    /// is folded, so the owner owns a final answer whose identifier the rows count. The unit
+    /// test in `exchange.rs` builds the unfolded state the guard is for.
     #[test]
     fn a_lone_late_final_settles_a_collecting_exchange_whose_pending_only_an_owner_could_own() {
         let (dir, _setup, log) = collecting_log_on(true);

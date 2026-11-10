@@ -1859,7 +1859,8 @@ pub(crate) struct Kept {
     /// A pending was open on the exchange when it was kept, at its entry or in the evidence its
     /// `primitive_ended` renewed ([`LinkState::note_pending_at_end`]; it only rises): its late
     /// final answers settle it on every identifier it stays owed on, though the first of them
-    /// folds the pending out of the evidence (ADR-436).
+    /// folds the pending out of the evidence (ADR-436). It gives none once the record's evidence
+    /// settles the exchange and the record is kept only for its rows (ADR-445 decision 4).
     pub pending_at_end: bool,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
@@ -2436,7 +2437,9 @@ impl LinkState {
     /// usable answer (ADR-443), whatever else it read after (as an entry's is), so an end that
     /// read none (a cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
     /// released unless a pending is open on it or the kept record notes one open at its keep or
-    /// after the end's renewal ([`Kept::pending_at_end`]).
+    /// after the end's renewal ([`Kept::pending_at_end`]). A record is kept as well while the
+    /// exchange is still owed through an owner that could own its final answer, for its rows
+    /// (ADR-445), derived from the rows and the evidence with no stored flag.
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
             && self.kept.get(&seq).is_some_and(|kept| {

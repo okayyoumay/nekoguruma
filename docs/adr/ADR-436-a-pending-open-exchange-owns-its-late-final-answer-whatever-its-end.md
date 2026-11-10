@@ -1,7 +1,7 @@
 # ADR-436: An Exchange With a Pending Open Owns Its Late Final Answer, Whatever Its End
 
 **Date:** 2026-11-08
-**Status:** Accepted (the Consequences' finished-time gap closed by ADR-438; decisions 1 and 3's reasons to keep a record are joined by ADR-442: an exchange owed only through its owners keeps a record for its rows, which owns no late final answer; decision 1's release predicate gains the rows reason, ADR-445)
+**Status:** Accepted (the Consequences' finished-time gap closed by ADR-438; decisions 1 and 3's reasons to keep a record are joined by ADR-442: an exchange owed only through its owners keeps a record for its rows, which owns no late final answer; decision 1's release predicate gains the rows reason, ADR-445; decision 4's "the flag does not lapse" superseded by ADR-445 decision 4: the flag gives a late final to no record whose evidence settles the exchange)
 **Affects:** `agent` (`comm_log/exchange.rs` `Evidence::late_final_settles`,
 `Kept::late_final_settles`, `Kept::pending_at_end`, `LinkState::note_pending_at_end`,
 `LinkState::release_kept_ended`; `comm_log.rs` `late_response_owner`, the entry's keep in

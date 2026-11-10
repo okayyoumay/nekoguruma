@@ -44,13 +44,6 @@ pub(crate) mod clocks;
 
 /// The exchange entry, its evidence, the per-link history and the classification (design 8.11,
 /// ADR-346 items 2, 3 and 6).
-#[cfg_attr(
-    not(test),
-    expect(
-        dead_code,
-        reason = "evidence and origins the host does not give yet (transmit indications, VCI times, the runner's own reads)"
-    )
-)]
 pub(crate) mod exchange;
 
 /// The judgement of an exchange's times against the limit in force (design 8.11).
@@ -1972,7 +1965,10 @@ struct Inner {
     _lock: Option<WriterLock>,
     /// The link state of each target the run's exchanges went to, in the order of their first
     /// exchange. It lives as long as the log, so it outlives a link, a worker or a VCI connection
-    /// within the run; a later run of the job starts it over, since the log is not read back.
+    /// within the run; a later run of the job starts it over, since the log is not read back. A
+    /// target's `link_opened` starts its matched answers and unknown sends over (ADR-451; the owed
+    /// requests, the kept records and the window stay), after the caller has written what the old
+    /// link left.
     links: Vec<(exchange::Target, exchange::LinkState)>,
     /// The run's VCI, from its facts, for `vci_connected`.
     vci: Option<VciFacts>,
@@ -4085,6 +4081,11 @@ impl CommLog {
     /// "Header"); `valued_by_document` names the link's own ComParams whose value the document
     /// gave (`link::valued_by_document`), and `indications` those of its indications the library
     /// accepted. The event's `seq`; `None` once the log has failed.
+    ///
+    /// Once the line is written, the matched answers and unknown sends of the target the event
+    /// names start over (`LinkState::reopened`, ADR-451); its owed requests, kept records and
+    /// window stay. The caller writes what the old link left before this
+    /// call, since the order decides which opening owns an item.
     pub(crate) fn link_opened(
         &self,
         link: u32,
@@ -4165,13 +4166,14 @@ impl CommLog {
                 });
             }
         }
+        let target = exchange::Target::Endpoint {
+            link,
+            tx_id: config.tx_id,
+            rx_id: config.rx_id,
+        };
         let event = Event::LinkOpened(LinkOpened {
             link,
-            target: exchange::Target::Endpoint {
-                link,
-                tx_id: config.tx_id,
-                rx_id: config.rx_id,
-            },
+            target: target.clone(),
             channel: 1,
             protocol: &config.protocol_short_name,
             baud_rate: config.baud_rate,
@@ -4213,7 +4215,18 @@ impl CommLog {
         };
         inner.limits.retain(|(of, _)| *of != link);
         inner.limits.push((link, limits));
-        inner.append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))
+        let written = inner
+            .append_with(|seq, line| serde_json::to_writer(line, &Line { seq, event: &event }))?;
+        // The target's link is open anew from this line on (design 8.11 "Matched answer",
+        // `sent_evidence`; ADR-451): the matched answers start over and no exchange from before
+        // it owns a transmit indication read from now on. The owed requests and the kept
+        // records stay. A target's first opening finds no state yet, since a state begins with
+        // the target's first exchange. The host has written what the old link left before it
+        // calls this (`WorkerHost::reopen`, `close_job_link`).
+        if let Some((_, state)) = inner.links.iter_mut().find(|(of, _)| *of == target) {
+            state.reopened();
+        }
+        Some(written)
     }
 
     /// Writes the `vci_connected` event of the job's VCI (design 8.11 "Header"): the VCI as the
@@ -24253,6 +24266,223 @@ pub(crate) mod tests {
             ..tx_done(0x7E0)
         };
         (evidence, vec![transmit])
+    }
+
+    /// The run's link is opened again as the host logs it (ADR-393): `vci_connected`, then
+    /// `link_opened` on the link of [`log_of`].
+    fn opened_again(log: &CommLog) {
+        log.vci_connected(None, None).unwrap();
+        log.link_opened(
+            1,
+            &crate::link::LinkConfig::iso15765(0x7E0, 0x7E8),
+            &[],
+            crate::link::Indications {
+                transmit: true,
+                start_of_message: true,
+                ..Default::default()
+            },
+            Some(true),
+        )
+        .unwrap();
+    }
+
+    /// A read of `did` answered positively, sent at `at_us`, whose transmit indication is
+    /// unbound, read during it.
+    fn answered_unbound_read(did: u8, at_us: u64) -> (exchange::Evidence, Vec<UnattachedItem>) {
+        let mut answered = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, did],
+            exchange::End::Positive(vec![0x62, 0xF1, did, 0x41]),
+        );
+        answered.pending_visibility = exchange::PendingVisibility::Forwarded;
+        answered.times.agent.before_us = at_us;
+        answered.times.agent.end_us = at_us + 100_000;
+        let transmit = UnattachedItem {
+            vci_us: u32::try_from(at_us).unwrap(),
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: at_us + 100,
+                wall_unix_ms: 0,
+            }),
+            ..tx_done(0x7E0)
+        };
+        (answered, vec![transmit])
+    }
+
+    /// The exchange entry logged as `seq`.
+    fn exchange_line(lines: &[serde_json::Value], seq: u64) -> &serde_json::Value {
+        lines
+            .iter()
+            .find(|line| line["event"] == "exchange" && line["seq"] == seq)
+            .unwrap_or_else(|| panic!("no exchange {seq} in {lines:#?}"))
+    }
+
+    /// Design 8.11 "Matched answer", ADR-451: a run that opens its link again starts the
+    /// target's matched answers over. A silent read whose only matched answer came before the
+    /// link was opened again is `undetermined` with H2 open, not the vehicle's; an answer on the
+    /// link opened now counts again, once, and the count of answered exchanges goes on.
+    #[test]
+    fn a_link_opened_again_starts_the_matched_answers_over() {
+        let (dir, setup, log, _) = log_of(vec![
+            answered_unbound_read(0x90, 300_000),
+            answered_unbound_read(0x92, 600_000),
+        ]);
+        opened_again(&log);
+        let (evidence, unbound) = silent_read(0x90, 2_000_000);
+        let silent = log.exchange_with(evidence, unbound).unwrap();
+        let (evidence, unbound) = answered_unbound_read(0x92, 4_000_000);
+        log.exchange_with(evidence, unbound).unwrap();
+        let (evidence, unbound) = silent_read(0x92, 6_000_000);
+        let after = log.exchange_with(evidence, unbound).unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(of_event(&lines, "link_opened").len(), 2, "{lines:#?}");
+        let silent = exchange_line(&lines, silent);
+        assert_eq!(silent["link_history"]["answered_same_match"], 0, "{silent}");
+        assert_eq!(silent["link_history"]["answered"], 2, "{silent}");
+        assert_eq!(silent["classification"], "undetermined", "{silent}");
+        assert!(
+            silent["reason"].as_str().unwrap().contains("(H2)"),
+            "{silent}"
+        );
+        // Only the answer since the link was opened again counts, not the one before it too.
+        let after = exchange_line(&lines, after);
+        assert_eq!(after["link_history"]["answered_same_match"], 1, "{after}");
+        assert_eq!(after["classification"], "vehicle", "{after}");
+    }
+
+    /// Design 8.11 `sent_evidence`, ADR-448, ADR-451: an exchange the lost VCI ended with its
+    /// send unknown owns no transmit indication of the link opened again, so the indications of
+    /// the exchanges after it attach to them. It stays owed, with its `sent` as written.
+    #[test]
+    fn a_link_opened_again_lets_a_transmit_indication_attach_again() {
+        let mut lost = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::VciLost {
+                refused_after_loss: false,
+            },
+        );
+        lost.pending_visibility = exchange::PendingVisibility::Forwarded;
+        lost.times.agent.before_us = 2_000_000;
+        lost.times.agent.end_us = 2_100_000;
+        let (dir, setup, log, seqs) = log_of(vec![
+            answered_unbound_read(0x91, 300_000),
+            (lost, Vec::new()),
+        ]);
+        let lost = seqs[1];
+        assert!(log.lock().links[0].1.may_own_tx_indication());
+        opened_again(&log);
+        {
+            let inner = log.lock();
+            let state = &inner.links[0].1;
+            assert!(!state.may_own_tx_indication());
+            assert_eq!(state.owed_row_ids(lost), [0x7E8]);
+        }
+        let (evidence, unbound) = answered_unbound_read(0x91, 4_000_000);
+        let answered = log.exchange_with(evidence, unbound).unwrap();
+        let (evidence, unbound) = silent_read(0x91, 6_000_000);
+        let silent = log.exchange_with(evidence, unbound).unwrap();
+        let lines = finished(&log, &setup, &dir);
+        assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+        assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
+        assert_eq!(exchange_line(&lines, lost)["sent"], "unknown");
+        for seq in [answered, silent] {
+            let entry = exchange_line(&lines, seq);
+            assert_eq!(entry["sent"], "confirmed", "{entry}");
+            assert_eq!(entry["sent_evidence"], "tx_indication", "{entry}");
+        }
+        let silent = exchange_line(&lines, silent);
+        assert_eq!(silent["link_history"]["answered_same_match"], 1, "{silent}");
+        assert_eq!(silent["classification"], "vehicle", "{silent}");
+    }
+
+    /// Design 8.11 "Matched answer", "Owed request", ADR-451: a restart sent with its positive
+    /// response suppressed and silent, after the link was opened again, has no matched answer on
+    /// the link opened now, so its silence is `undetermined`, not `none`. It is an unsure
+    /// restart: it ends the matched answers but leaves the owed request from before the
+    /// reopening standing.
+    #[test]
+    fn a_silent_suppressed_restart_after_a_link_opened_again_leaves_the_owed_requests() {
+        let mut lost = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::VciLost {
+                refused_after_loss: false,
+            },
+        );
+        lost.pending_visibility = exchange::PendingVisibility::Forwarded;
+        lost.times.agent.before_us = 2_000_000;
+        lost.times.agent.end_us = 2_100_000;
+        // A session change the ECU refuses: a matched answer of this request's match that
+        // accepts nothing.
+        let (mut session, unbound) = answered_unbound_read(0x91, 300_000);
+        session.request = vec![0x10, 0x03];
+        session.expected = exchange::Expected::uds(&session.request);
+        session.end = exchange::End::Negative(vec![0x7F, 0x10, 0x22]);
+        let (dir, setup, log, seqs) = log_of(vec![(session, unbound), (lost, Vec::new())]);
+        let lost = seqs[1];
+        opened_again(&log);
+        let (mut restart, unbound) = silent_read(0x91, 4_000_000);
+        restart.request = vec![0x10, 0x83];
+        restart.expected = exchange::Expected::uds(&restart.request);
+        restart.suppressed = true;
+        let restart = log.exchange_with(restart, unbound).unwrap();
+        assert_eq!(log.lock().links[0].1.owed_row_ids(lost), [0x7E8]);
+        let lines = finished(&log, &setup, &dir);
+        let restart = exchange_line(&lines, restart);
+        assert_eq!(
+            restart["link_history"]["answered_same_match"], 0,
+            "{restart}"
+        );
+        assert_eq!(restart["classification"], "undetermined", "{restart}");
+    }
+
+    /// ADR-451: the host writes what the old link left before `link_opened`
+    /// (`WorkerHost::reopen`), because the order decides the owner. A transmit indication of
+    /// the old link placed before it is the late item of the kept exchange whose send is
+    /// unknown; placed after it, it is no one's.
+    #[test]
+    fn an_item_of_the_old_link_is_owned_only_when_it_is_placed_before_the_link_opens_again() {
+        for before in [true, false] {
+            let (mut waited, unbound) = stray_at(&[0x22, 0xF1, 0x90], 500_000);
+            waited.times.vci = None;
+            let (dir, setup, log, seqs) = log_of(vec![(waited, unbound)]);
+            let owner = seqs[0];
+            assert_eq!(kept_of(&log, owner).sent, exchange::Sent::Unknown);
+            let none: &InFlight<'_> = &|_, _, _, _| false;
+            let place = |log: &CommLog| {
+                let mut inner = log.lock();
+                let settled = inner
+                    .late_item_lone_owner(0, &tx_done(0x7E0), placed_after(100), none, None)
+                    .unwrap();
+                if !settled {
+                    inner
+                        .place_unbound_item(0, &tx_done(0x7E0), placed_after(100), None, none, None)
+                        .unwrap();
+                }
+                settled
+            };
+            if before {
+                assert!(place(&log));
+                opened_again(&log);
+            } else {
+                opened_again(&log);
+                assert!(!place(&log));
+            }
+            let sent = kept_of(&log, owner).sent;
+            let lines = finished(&log, &setup, &dir);
+            let late = of_event(&lines, "late_item");
+            if before {
+                assert_eq!(sent, exchange::Sent::Confirmed);
+                assert_eq!(late.len(), 1, "{lines:#?}");
+                assert_eq!(late[0]["refers_to"], serde_json::json!([owner]));
+                assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
+            } else {
+                assert_eq!(sent, exchange::Sent::Unknown);
+                assert!(late.is_empty(), "{lines:#?}");
+                assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+            }
+        }
     }
 
     /// The classification of `seq`, and of it in the last `vci_loss` record.

@@ -777,7 +777,9 @@ impl<C: WorkerApi> WorkerHost<C> {
     /// ids). The log gets the new connection: `vci_connected`, which settles the run's own
     /// loss, then `link_opened`, on the link number the log used before.
     pub(crate) fn reopen(&mut self, mut client: C, link: Link, config: &LinkConfig) {
-        // What the old link left unwritten is written before its record is dropped.
+        // What the old link left unwritten is written before its record is dropped, and before
+        // the log's `link_opened` starts the target's link state over (ADR-451), so each item is
+        // placed against the opening it belongs to.
         self.flush_pending(&[]);
         if let Some(log) = &self.comm_log {
             log_connected(

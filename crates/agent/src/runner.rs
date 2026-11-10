@@ -22793,6 +22793,83 @@ def main():
         std::fs::remove_dir_all(&dir).unwrap();
     }
 
+    /// Design 8.11 "Matched answer", ADR-451: an answer from before the run opened its link
+    /// again (ADR-393) is no matched answer for the exchanges after it. A read is answered, the
+    /// VCI is lost in the next, the link opens again, and the resend gets no response: it is
+    /// sent, but no answer on the link opened now shows the address, the filter and the
+    /// response patterns right. The fake's timing is not judged, so the classification is
+    /// `undetermined` with or without the change; the assertion that tests it is
+    /// `answered_same_match` being 0 on the resend.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn an_answer_from_before_the_link_opened_again_is_no_matched_answer_after_it() {
+        const LOSE: &[Step] = &[Step::Transmit(1_000), Step::LostVci(2_000)];
+        let dir = journal_dir("reopen-matched");
+        let (client, _fake) = fake_worker_scripted(
+            CancelAnswer::Done,
+            None,
+            true,
+            false,
+            vec![
+                (When::After(Duration::ZERO), StartEvent::Respond),
+                (When::After(Duration::ZERO), StartEvent::Script(LOSE)),
+                (When::After(Duration::ZERO), StartEvent::TransmitThenTimeOut),
+                (When::After(Duration::ZERO), StartEvent::TransmitThenTimeOut),
+                (When::After(Duration::ZERO), StartEvent::TransmitThenTimeOut),
+            ],
+        )
+        .await;
+        let setup = comm_log_setup_in(&dir);
+        let run = run_program(
+            client,
+            &LinkConfig::iso15765(0x7E0, 0x7E8),
+            Job::from(plain_steps(&[(0x22, Safe), (0x22, Safe)])).with_comm_log(setup.clone()),
+            JobLimits {
+                reopen_poll: Duration::from_millis(1),
+                ..JobLimits::default()
+            },
+            vci_only_guards("reopen-matched"),
+        )
+        .await;
+        // The resends found no usable answer, which ends the run; the log is what is tested.
+        assert!(
+            matches!(
+                &run.result,
+                Err(JobError::Host {
+                    source: HostError::NoResponse,
+                    ..
+                })
+            ),
+            "{:?}",
+            run.result
+        );
+        let lines = comm_log_lines(&dir);
+        let opened: Vec<usize> = lines
+            .iter()
+            .enumerate()
+            .filter(|(_, line)| line["event"] == "link_opened")
+            .map(|(at, _)| at)
+            .collect();
+        assert_eq!(opened.len(), 2, "{lines:#?}");
+        let same_match =
+            |line: &serde_json::Value| line["link_history"]["answered_same_match"].clone();
+        // The exchange the loss ended counted the answer before it, on the link's first opening.
+        let lost = lines[..opened[1]]
+            .iter()
+            .rfind(|line| line["event"] == "exchange")
+            .expect("the exchange the loss ended");
+        assert_eq!(same_match(lost), 1, "{lost}");
+        // The resend on the link opened again is sent and silent, with no matched answer.
+        let resend = lines[opened[1]..]
+            .iter()
+            .find(|line| line["event"] == "exchange")
+            .expect("the resend");
+        assert_eq!(resend["origin"], "repeat", "{resend}");
+        assert_eq!(resend["sent_evidence"], "tx_indication", "{resend}");
+        assert_eq!(same_match(resend), 0, "{resend}");
+        assert_eq!(resend["classification"], "undetermined", "{resend}");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
     /// ADR-393: a lost link whose own disconnect the worker answers with a failure (the J2534
     /// worker's does on a lost device) is confirmed closed by the module's disconnect, so the
     /// run opens a new link and goes on. The new link is healthy, so the final close of it, whose
@@ -25495,6 +25572,71 @@ def main():
                 .unwrap();
                 assert!(matches!(lost, HostError::SessionLost));
                 assert!(after.is_ok(), "{after:?}");
+            }
+
+            /// ADR-393, ADR-451: what the old link left unwritten is written before the log's
+            /// record of the link opened again, so it is placed against the old opening: an
+            /// answer of no primitive the drain read comes before the `vci_connected` and the
+            /// `link_opened` that `reopen` writes.
+            #[tokio::test(flavor = "multi_thread")]
+            async fn what_the_old_link_left_is_written_before_the_link_opens_again() {
+                let script = vec![(
+                    When::After(Duration::ZERO),
+                    StartEvent::Script(READ_ANSWERED),
+                )];
+                let (mut client, fake) = fake_worker_answering(
+                    CancelAnswer::Done,
+                    None,
+                    false,
+                    false,
+                    script,
+                    Vec::new(),
+                )
+                .await;
+                let dir = journal_dir("reopen-flush");
+                let log = crate::comm_log::CommLog::open(&comm_log_setup_in(&dir))
+                    .expect("the log opens");
+                let config = LinkConfig::iso15765(0x7E0, 0x7E8);
+                let mut first = link::open(&mut client, &config, Duration::from_secs(5))
+                    .await
+                    .expect("the link opens");
+                first.permission = Permission::Simulator;
+                let handle = tokio::runtime::Handle::current();
+                let timings = Timings {
+                    unary: Duration::from_secs(5),
+                    send_recv: Duration::from_secs(5),
+                };
+                let reopened = client.clone();
+                let handle2 = handle.clone();
+                let events = Arc::clone(&fake.events);
+                tokio::task::spawn_blocking(move || {
+                    let mut host = WorkerHost::new(handle, client, first, timings);
+                    host.set_comm_log(Some(log));
+                    host.set_link_ids(0x7E0, 0x7E8);
+                    host.own_reads(Some(OwnRead::Identification));
+                    host.service_request(0x22, &[0xF1, 0x90]).unwrap();
+                    inject_result(&events, 900_000);
+                    poll_waits(&mut host).unwrap();
+                    let mut reopened = reopened;
+                    let mut second = handle2
+                        .block_on(link::open(&mut reopened, &config, Duration::from_secs(5)))
+                        .expect("the link opens again");
+                    second.permission = Permission::Simulator;
+                    host.reopen(reopened, second, &config);
+                })
+                .await
+                .unwrap();
+                let lines = comm_log_lines(&dir);
+                let at = |event: &str| {
+                    lines
+                        .iter()
+                        .position(|line| line["event"] == event)
+                        .unwrap_or_else(|| panic!("no {event} in {lines:#?}"))
+                };
+                let (left, connected, opened) =
+                    (at("unattached"), at("vci_connected"), at("link_opened"));
+                assert!(left < connected && connected < opened, "{lines:#?}");
+                std::fs::remove_dir_all(&dir).unwrap();
             }
 
             /// A drain batch of a tester-present error then a lost VCI reports the loss, as the

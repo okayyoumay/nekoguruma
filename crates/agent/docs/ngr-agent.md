@@ -802,9 +802,13 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   requests. It also empties the set of unknown sends (kept by exchange, ADR-448), so a kept record
   from before it keeps its `sent` and rows, owns no transmit indication read afterwards, and
   its later release takes no later send out of the set; what an owed request owns otherwise is
-  unchanged by it. The other rows stand as comments where the table puts them, and evidence only they
-  could classify falls to the last row, `undetermined`, at the place in the table where that row
-  stands.
+  unchanged by it. `CommLog::link_opened` makes that call, on the state of the target its event
+  names, after the line is written (ADR-451). It does so for every `link_opened` of a target:
+  the host's own reopening after a lost VCI or a worker's end (`WorkerHost::reopen`, which first
+  writes what the old link left) and each link an identification run opens for a target it used
+  before. A target's first `link_opened` finds no state. The other rows stand as comments where
+  the table puts them, and evidence only they could classify falls to the last row,
+  `undetermined`, at the place in the table where that row stands.
 - **Exchange entries.** The worker host writes one entry for each request a VM step, the runner
   or the restart sends through it (`send_recv`, the generic send-receive) and for each it refuses
   before sending (`not_sent`: the request policy, an undeclared service, TransferData outside

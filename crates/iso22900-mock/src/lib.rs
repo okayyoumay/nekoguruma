@@ -1136,6 +1136,15 @@ fn begin_next(state: &mut MockState, now: Instant) {
 /// Records that the item stamped `timestamp` was delivered: the link's last stamp is raised to
 /// it, so an item stamped from now on (a tester-present that its finish made due) comes after
 /// everything delivered. `reference_us` is the clock reading now ([`unwrap_stamp`]).
+/// [`note_delivered`] for a delivered scheduled event. A tester-present answer marker carries no
+/// stamp (`timestamp` 0): it is an internal marker, not an item, so it does not move the last
+/// stamp (unwrapping its 0 would put the last stamp up to a whole clock range ahead).
+fn note_delivered_event(state: &mut MockState, event: &PendingEvent, reference_us: u64) {
+    if !matches!(event.kind, EventKind::TesterPresentAnswer { .. }) {
+        note_delivered(state, event.timestamp, reference_us);
+    }
+}
+
 fn note_delivered(state: &mut MockState, timestamp: UNUM32, reference_us: u64) {
     let stamp = unwrap_stamp(timestamp, reference_us);
     state.last_stamp = Some(state.last_stamp.map_or(stamp, |last| last.max(stamp)));
@@ -1236,7 +1245,7 @@ fn deliver() {
             Some(_) => {
                 // Stamped with its scheduled time when the ComPrimitive began (`begin_next`).
                 let (_, mut event) = guard.scheduled.pop_front().expect("an event is due");
-                note_delivered(&mut guard, event.timestamp, clock_us(now));
+                note_delivered_event(&mut guard, &event, clock_us(now));
                 if let Some(hook) = event.on_finish {
                     apply_hook(&mut guard, hook, now);
                 }
@@ -3196,6 +3205,36 @@ mod sim_ecu_tests {
         let (_, event) = &state.scheduled[0];
         assert!(event.timestamp.wrapping_sub(clock_at(now)) as i32 > 0);
         assert_eq!(state.last_stamp, Some(u64::from(event.timestamp)));
+    }
+
+    #[test]
+    fn a_delivered_tester_present_answer_marker_does_not_move_the_last_stamp() {
+        let mut state = MockState::default();
+        // 36 minutes in: unwrapping the marker's 0 stamp against this clock would give 2^32.
+        let reference = 2_160_000_000_u64;
+        state.last_stamp = Some(reference - 10);
+        let marker = PendingEvent {
+            h_mod: MOCK_MODULE_HANDLE,
+            h_cll: MOCK_LOGICAL_LINK_HANDLE,
+            h_cop: MOCK_COM_PRIMITIVE_HANDLE,
+            tag: 0,
+            timestamp: 0,
+            tx_done: None,
+            times_valid: false,
+            identifier: None,
+            kind: EventKind::TesterPresentAnswer { error: None },
+            on_finish: None,
+        };
+        note_delivered_event(&mut state, &marker, reference);
+        assert_eq!(state.last_stamp, Some(reference - 10));
+        // A real item still raises it.
+        let item = PendingEvent {
+            timestamp: (reference - 5) as UNUM32,
+            kind: EventKind::Result(Vec::new()),
+            ..marker
+        };
+        note_delivered_event(&mut state, &item, reference);
+        assert_eq!(state.last_stamp, Some(reference - 5));
     }
 
     #[test]

@@ -797,7 +797,10 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   since the error (VCI times are not compared); an error after it, or from another link of the
   channel, ends it. A late link error read afterwards tests that answer's time as above. A reopened link, a worker
   restart or a VCI reconnect (`LinkState::reopened`) ends the matched answers and keeps the owed
-  requests. The other rows stand as comments where the table puts them, and evidence only they
+  requests. It also empties the set of unknown sends (kept by exchange, ADR-448), so a kept record
+  from before it keeps its `sent` and rows, owns no transmit indication read afterwards, and
+  its later release takes no later send out of the set; what an owed request owns otherwise is
+  unchanged by it. The other rows stand as comments where the table puts them, and evidence only they
   could classify falls to the last row, `undetermined`, at the place in the table where that row
   stands.
 - **Exchange entries.** The worker host writes one entry for each request a VM step, the runner

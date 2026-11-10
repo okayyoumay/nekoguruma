@@ -4816,7 +4816,7 @@ impl Inner {
             exchange::Target::Endpoint { tx_id, .. }
                 if evidence.transmit_evidence.is_none()
                     && !transmit_read
-                    && !state.may_own_tx_indication_besides(kept.sent) =>
+                    && state.alone_may_own_tx_indication(seq, kept.sent) =>
             {
                 reads.iter().position(|read| {
                     matches!(&read.item, EndItem::Unattached(item) if item.is_tx_indication_for(tx_id))
@@ -14631,7 +14631,7 @@ pub(crate) mod tests {
     /// ADR-442, design 8.11 `late_item`: an unbound transmit indication on the request
     /// identifier, with the owner's send confirmed and the dependent's unknown, has the
     /// dependent as its one possible owner (the log keeps it), so it settles as the
-    /// dependent's late item: its send confirmed, the unknown count lowered, no `unattached`.
+    /// dependent's late item: its send confirmed, its `seq` out of the unknown sends, no `unattached`.
     #[test]
     fn a_transmit_indication_only_the_exchange_owed_through_an_owner_could_own_is_its_late_item() {
         for beyond in [false, true] {
@@ -14677,6 +14677,94 @@ pub(crate) mod tests {
             assert_eq!(late[0]["exchanges"].as_array().map(Vec::len), Some(1));
             assert!(of_event(&lines, "unattached").is_empty(), "{lines:#?}");
         }
+    }
+
+    /// Design 8.11 `sent_evidence`: a transmit indication read after the link was opened again
+    /// belongs to none of the kept exchanges from before it, so it is `unattached` and no late
+    /// item names or floors the dependent, whose send stays unknown.
+    #[test]
+    fn a_transmit_indication_after_a_reopening_is_not_a_late_item_of_an_earlier_exchange() {
+        for beyond in [false, true] {
+            let (dir, setup, log, [_, dependent]) = owner_and_dependent(beyond);
+            let floor = floor_of(&log, dependent);
+            log.lock().links[0].1.reopened();
+            assert_eq!(late_transmit_owners_of(&log, 0x7DF), (Vec::new(), true));
+            let none: &InFlight<'_> = &|_, _, _, _| false;
+            {
+                let mut inner = log.lock();
+                assert_eq!(
+                    inner.late_item_lone_owner(0, &tx_done(0x7DF), placed_after(100), none, None),
+                    Some(false),
+                    "beyond {beyond}"
+                );
+                inner
+                    .place_unbound_item(0, &tx_done(0x7DF), placed_after(100), None, none, None)
+                    .unwrap();
+            }
+            let kept = kept_of(&log, dependent);
+            assert_eq!(kept.sent, exchange::Sent::Unknown, "beyond {beyond}");
+            assert_eq!(kept.floor, floor, "beyond {beyond}");
+            let lines = finished(&log, &setup, &dir);
+            assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
+            assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+        }
+    }
+
+    /// Design 8.11 `late_item`: an exchange logged after the reopening with its send unknown is
+    /// the one owner of a transmit indication read then; the dependent from before is not.
+    #[test]
+    fn a_transmit_indication_after_a_reopening_is_the_late_item_of_an_exchange_after_it() {
+        let (dir, setup, log, [owner, _]) = owner_and_dependent(false);
+        log.lock().links[0].1.reopened();
+        let mut third = answered_after(30);
+        third.times.vci = None;
+        let third = log.exchange(third).unwrap();
+        assert_eq!(late_transmit_owners_of(&log, 0x7DF), (vec![third], true));
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        let settled = log.lock().late_item_lone_owner(
+            0,
+            &tx_done(0x7DF),
+            placed_after(100_000_000),
+            none,
+            None,
+        );
+        assert_eq!(settled, Some(true), "owner {owner}");
+        let lines = finished(&log, &setup, &dir);
+        let late = of_event(&lines, "late_item");
+        assert_eq!(late.len(), 1, "{lines:#?}");
+        assert_eq!(late[0]["refers_to"], serde_json::json!([third]));
+    }
+
+    /// Design 8.11 `late_item`: the end of the exchange `owner`, written after a reopening, gives
+    /// it no unbound transmit indication of an earlier opening to own: its send stays unknown
+    /// and the item is written `unattached`.
+    #[test]
+    fn an_exchange_ended_after_a_reopening_takes_no_unbound_transmit_indication() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let mut waited = waited_after(&[0x3E, 0x00], 1);
+        waited.times.vci = None;
+        let owner = log.exchange(waited).unwrap();
+        assert_eq!(kept_of(&log, owner).sent, exchange::Sent::Unknown);
+        log.lock().links[0].1.reopened();
+        log.primitive_ended(
+            owner,
+            PrimitiveEnded {
+                end: Some(exchange::End::NoResponse),
+                detail: exchange::Detail::default(),
+                end_rejected: false,
+                end_is_carried_echo: false,
+                vci_ended: false,
+                reads: read_after_deadline(vec![
+                    EndItem::Finished(device_time(BASE_US + 1_400_000)),
+                    EndItem::Unattached(tx_done(0x7DF)),
+                ]),
+            },
+        )
+        .unwrap();
+        assert_eq!(kept_of(&log, owner).sent, exchange::Sent::Unknown);
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+        assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
     }
 
     /// ADR-442, design 8.11 `late_item`: an unbound start of the response on 0x7E8 read while

@@ -62,9 +62,9 @@ exchanges.
    answer to this request (suppressed positive, "does not match the definition", H4) and below
    the rows that judge the VCI's wait against the limit (a `late` window, a pending past its
    limit; a placed end has no receive timeout), so a result the VCI took after the limit plus the
-   margin keeps the exchange `system`, its reason naming the placement and not taking the result
-   for this request's answer: timing is the VCI's, separate from ownership (ADR-437
-   decision 6). Only an end the entry's wait read is placed: a result the wait for the
+   margin keeps the exchange `system`, its reason naming the placement and only the VCI's fault:
+   the result may be an earlier request's answer alone, so its arrival proves no late answer of
+   the ECU to this request (timing is the VCI's, separate from ownership, ADR-437 decision 6). Only an end the entry's wait read is placed: a result the wait for the
    primitive's end read after the entry is not, even with the same bytes. The line is written before the entry, so the entry's history already
    sees the owner settled.
 5. **Scope.** Not offered: a `pattern_mismatch` result, a collecting exchange's rejected answers,

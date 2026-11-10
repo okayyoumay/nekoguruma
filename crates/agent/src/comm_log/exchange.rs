@@ -5658,6 +5658,17 @@ fn rows(
                 )
             }
         }
+        // A placed result may be an earlier request's answer alone, so its arrival proves no
+        // timing fault of the ECU for this request: only the VCI's wait past the limit is
+        // shown (ADR-437 decision 6, ADR-447 decision 4).
+        End::PositiveUnusable(_) if late && evidence.end_placed().is_some() => (
+            System,
+            format!(
+                "The VCI did not end its wait at the limit in force but took a result {} ms after it; it was {}.",
+                by_ms(&evidence.timing),
+                placed_phrase(evidence)
+            ),
+        ),
         End::Positive(_) | End::PositiveUnusable(_) | End::Negative(_) if late => {
             let outcome = match &evidence.end {
                 End::Positive(_) => "it responded positively".to_owned(),
@@ -5665,21 +5676,12 @@ fn rows(
                     "it refused the request: {}",
                     named_code(negative_code(response))
                 ),
-                _ if evidence.end_placed().is_some() => {
-                    format!("it was {}", placed_phrase(evidence))
-                }
                 _ => "its response does not match the definition".to_owned(),
-            };
-            // A placed result is not the answer to this request (ADR-447).
-            let took = if evidence.end_placed().is_some() {
-                "the result"
-            } else {
-                "the answer"
             };
             (
                 System,
                 format!(
-                    "Two faults seen together: the ECU answered after the limit in force, by {} ms, and the VCI did not end its wait at that limit but still took {took}; {outcome}.",
+                    "Two faults seen together: the ECU answered after the limit in force, by {} ms, and the VCI did not end its wait at that limit but still took the answer; {outcome}.",
                     by_ms(&evidence.timing)
                 ),
             )

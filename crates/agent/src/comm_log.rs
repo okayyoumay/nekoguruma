@@ -11988,7 +11988,11 @@ pub(crate) mod tests {
         let entry = lines.iter().find(|line| line["seq"] == second).unwrap();
         assert_eq!(entry["classification"], "system", "{entry}");
         let reason = entry["reason"].as_str().unwrap();
-        assert!(reason.contains("Two faults seen together"), "{reason}");
+        // Only the VCI's fault is shown: the placed result may be the earlier request's
+        // answer alone, so it proves no late answer of the ECU to this request.
+        assert!(!reason.contains("Two faults seen together"), "{reason}");
+        assert!(!reason.contains("the ECU answered after"), "{reason}");
+        assert!(reason.contains("The VCI did not end its wait"), "{reason}");
         // The result was placed, so the text does not take it as this request's answer.
         assert!(
             reason.contains(&format!("late response logged as {placed}")),

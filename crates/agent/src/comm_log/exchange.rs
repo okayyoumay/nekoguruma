@@ -1859,7 +1859,8 @@ pub(crate) struct Kept {
     /// A pending was open on the exchange when it was kept, at its entry or in the evidence its
     /// `primitive_ended` renewed ([`LinkState::note_pending_at_end`]; it only rises): its late
     /// final answers settle it on every identifier it stays owed on, though the first of them
-    /// folds the pending out of the evidence (ADR-436).
+    /// folds the pending out of the evidence (ADR-436). It gives none once the record's evidence
+    /// settles the exchange and the record is kept only for its rows (ADR-445 decision 4).
     pub pending_at_end: bool,
     /// The link's clears just after its entry was taken in, which tell whether an answer it gets
     /// later counts for a later exchange ([`LinkState::reclassify_after`]).
@@ -1893,9 +1894,11 @@ impl From<Option<(Clock, super::clocks::Placed)>> for AnswerTime {
 impl Kept {
     /// Whether a late final response can settle this kept exchange: its evidence allows it
     /// ([`Evidence::late_final_settles`]), or a pending was open when it was kept
-    /// ([`Kept::pending_at_end`]) (ADR-436).
+    /// ([`Kept::pending_at_end`]) (ADR-436). A record whose evidence settles the exchange is kept
+    /// only for its rows (ADR-442, ADR-445): the pending it had open earlier gives it no late
+    /// final answer, as its in-time twin has none (ADR-445 decision 4).
     pub(crate) fn late_final_settles(&self) -> bool {
-        self.evidence.late_final_settles() || self.pending_at_end
+        self.evidence.late_final_settles() || (self.pending_at_end && !self.evidence.settles_owed())
     }
 
     /// The late start that bears on a response with identifier `response_id` (`None` when it
@@ -2434,13 +2437,17 @@ impl LinkState {
     /// usable answer (ADR-443), whatever else it read after (as an entry's is), so an end that
     /// read none (a cancel, or a link error, a lost VCI or an unknown end with no receive timeout) is
     /// released unless a pending is open on it or the kept record notes one open at its keep or
-    /// after the end's renewal ([`Kept::pending_at_end`]).
+    /// after the end's renewal ([`Kept::pending_at_end`]). A record is kept as well while the
+    /// exchange is still owed through an owner that could own its final answer, for its rows
+    /// (ADR-445), derived from the rows and the evidence with no stored flag.
     pub(crate) fn release_kept_ended(&mut self, seq: u64) {
         let open = self.owed.iter().any(|owed| owed.seq == seq)
-            && self
-                .kept
-                .get(&seq)
-                .is_some_and(|kept| kept.late_final_settles());
+            && self.kept.get(&seq).is_some_and(|kept| {
+                kept.late_final_settles()
+                    || self
+                        .kept_entry(seq, &kept.evidence, kept.classification)
+                        .owed_through_owners()
+            });
         if !open {
             self.kept.remove(&seq);
         }
@@ -4030,10 +4037,11 @@ impl LinkState {
         let answer_at = self.window[at].answer_at;
         let clears = (self.window[at].clears, self.window[at].after);
         let fallback = self.window[at].evidence.clone();
+        let ended = settled && !self.owed.iter().any(|owed| owed.seq == seq);
         let freed = self.free_owner_answer(
             (old.sent, old.matched_answer()),
             &entry,
-            settled,
+            ended,
             &fallback,
             answer_at,
             clears,
@@ -4272,9 +4280,12 @@ impl ExchangeEntry {
 
     /// Whether it is owed only because an owner could own its final answer: it settles, and an
     /// earlier owed request still stands that could own that answer (design 8.11, ADR-442). The
-    /// log keeps its record for its rows until the owners let go.
+    /// log keeps its record for its rows until the owners let go. An exchange owed on no
+    /// identifier has no row to keep, whoever could own an answer of it (ADR-445 decision 2).
     pub(crate) fn owed_through_owners(&self) -> bool {
-        self.effect.settles() && !self.effect.owners.is_empty()
+        self.effect.settles()
+            && !self.effect.owed_ids.is_empty()
+            && self.effect.owners.iter().any(|owner| *owner < self.seq)
     }
 
     /// The entry for `evidence` as line `seq`, with `history` from
@@ -7044,6 +7055,14 @@ mod tests {
             collecting(vec![positive(RX, Window::WithinP2)]),
         );
         assert!(settling.owed_through_owners() && !settling.placed_alone());
+        // Only owners sent after it could own its answer (ADR-445): it ends the owed request.
+        let mut later_only = settling.clone();
+        later_only.effect.owners = vec![3];
+        assert!(!later_only.owed_through_owners());
+        // An owner sent before it and one after it: the earlier one keeps it owed.
+        let mut both = settling.clone();
+        both.effect.owners = vec![1, 3];
+        assert!(both.owed_through_owners());
         // No final response.
         let silent = log(&mut state, 3, collecting(Vec::new()));
         assert!(!silent.owed_through_owners());
@@ -7066,6 +7085,39 @@ mod tests {
         let beside = log(&mut state, 2, beside);
         assert!(!beside.effect.owners.is_empty());
         assert!(!beside.settles() && !beside.owed_through_owners());
+    }
+
+    /// ADR-445 decision 2: an entry that settles is owed through its owners only when an
+    /// identifier is left for them to own. Here an unnamed pending that stands in the answers
+    /// (the evidence is not folded) is the only thing the owner could own, and the final answers
+    /// on both identifiers are not: the owners are not empty and the entry is owed on no
+    /// identifier, so it ends its owed request instead of holding a record with no rows.
+    #[test]
+    fn an_entry_owed_on_no_identifier_is_not_owed_through_owners() {
+        let table = vec![RX, RX2];
+        let mut state = LinkState::default();
+        let mut owner = collecting(Vec::new());
+        owner.rx_id = 0;
+        owner.receive_ids = table.clone();
+        // It could own a pending or a negative response of the presence request, no positive one.
+        owner.expected.positive_prefix = vec![0x62];
+        log(&mut state, 1, owner);
+        let mut dependent = collecting(vec![
+            lone(0),
+            positive(RX, Window::WithinP2),
+            positive(RX2, Window::WithinP2),
+        ]);
+        dependent.end = End::Positive(POSITIVE.to_vec());
+        dependent.rx_id = 0;
+        dependent.receive_ids = table;
+        let mut histories = state.history_for(&dependent);
+        dependent.set_answer_histories(state.answer_histories(&dependent, &histories, 2));
+        histories = state.history_for(&dependent);
+        let dependent = ExchangeEntry::build(2, dependent, histories);
+        assert!(dependent.settles());
+        assert_eq!(dependent.effect.owners, [1]);
+        assert!(dependent.effect.owed_ids.is_empty());
+        assert!(!dependent.owed_through_owners());
     }
 
     /// ADR-439: the refresh after an accepted restart changes rows and records only; it does not

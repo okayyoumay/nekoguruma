@@ -1,7 +1,7 @@
 # ADR-446: A Non-Collecting Exchange a Late Final Settles Stays Owed Through an Earlier Owner
 
 **Date:** 2026-11-10
-**Status:** Accepted
+**Status:** Accepted (decision 3 extended by ADR-450: the record owns no lone late pending or start either)
 **Affects:** `agent` (`comm_log.rs` `Inner::late_response`; `comm_log/exchange.rs`
 `Evidence::owed_ids`, `Kept::late_final_settles`), design 8.11 "Owed request", `late_response`;
 ADR-432 decision 2, ADR-443 Consequences, ADR-445 decisions 2 and 4

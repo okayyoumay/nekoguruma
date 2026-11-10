@@ -1962,6 +1962,18 @@ impl Kept {
         self.evidence.late_final_settles() || (self.pending_at_end && !self.evidence.settles_owed())
     }
 
+    /// Whether a late pending or start-of-message indication that only this kept exchange could
+    /// own settles it (design 8.11 `late_item`, ADR-450), as a lone late final would
+    /// ([`Kept::late_final_settles`]): not for a record whose evidence settles the exchange, kept
+    /// only for its rows (ADR-442, ADR-445 decision 4, ADR-446 decision 3), unless it owns a late
+    /// final as its evidence says (a collecting window the VCI ended). An exchange whose evidence
+    /// does not settle it takes one as before, whether or not a late final settles it (one the
+    /// agent's deadline ended, whose primitive still runs). Among several owners every kept
+    /// exchange is named and floored, whatever this says.
+    pub(crate) fn late_pending_or_start_settles(&self) -> bool {
+        !self.evidence.settles_owed() || self.late_final_settles()
+    }
+
     /// The late start that bears on a response with identifier `response_id` (`None` when it
     /// names none): a collecting exchange's start counts for a response on the identifier it was
     /// judged on, or an unnamed one when that is the only identifier open; any other exchange's
@@ -13517,6 +13529,65 @@ mod tests {
                 .1
                 .late_final_settles()
         );
+    }
+
+    /// ADR-450: a lone late pending or start settles no record
+    /// (`Kept::late_pending_or_start_settles`) whose evidence settles the exchange and that no
+    /// late final can settle: a settled non-collecting one, whatever ended the VCI's wait
+    /// (ADR-446), and a settled collecting one whose window is not shown ended by the VCI, though
+    /// a pending was open when it was kept (ADR-445 decision 4). It settles an exchange that is
+    /// not settled, whether a late final can settle it (a silent end, a rejected end, a pending
+    /// open) or not (the agent's deadline ended it), and a settled collecting one whose finished
+    /// window shows the VCI ended, which owns a late final as its evidence says.
+    #[test]
+    fn a_lone_late_pending_or_start_settles_no_record_that_is_settled_and_owns_no_late_final() {
+        let kept_of = |evidence: Evidence| log_kept(&mut LinkState::default(), 1, evidence).1;
+        let mut table = evidence(
+            &[0x22, 0xF1, 0x86],
+            End::Positive(vec![0x62, 0xF1, 0x86, 0x01]),
+        );
+        table.rx_id = 0;
+        table.receive_ids = vec![RX, RX2];
+        for vci_ended in [true, false] {
+            let mut settled = table.clone();
+            settled.vci_ended = vci_ended;
+            assert!(
+                !kept_of(settled).late_pending_or_start_settles(),
+                "{vci_ended}"
+            );
+        }
+        let mut silent = table.clone();
+        silent.end = End::NoResponse;
+        silent.vci_ended = true;
+        assert!(kept_of(silent).late_pending_or_start_settles());
+        let mut rejected_end = table.clone();
+        rejected_end.end = End::PositiveUnusable(vec![0x62, 0xF1]);
+        rejected_end.end_rejected = true;
+        rejected_end.vci_ended = true;
+        assert!(kept_of(rejected_end).late_pending_or_start_settles());
+        let mut waiting = table.clone();
+        waiting.end = End::VciDidNotEnd;
+        let waiting = kept_of(waiting);
+        assert!(!waiting.late_final_settles() && waiting.late_pending_or_start_settles());
+        // Collecting: the finished window decides.
+        let mut window = collecting(vec![positive(RX, Window::WithinP2)]);
+        window.rx_id = 0;
+        window.receive_ids = vec![RX];
+        assert!(window.settles_owed() && window.vci_ended);
+        assert!(kept_of(window.clone()).late_pending_or_start_settles());
+        window.vci_ended = false;
+        let mut unended = kept_of(window.clone());
+        assert!(!unended.late_pending_or_start_settles());
+        // The pending open when it was kept gives it no late final once its evidence settles it.
+        unended.pending_at_end = true;
+        assert!(!unended.late_pending_or_start_settles());
+        // A pending still open: not settled, and a late final settles it.
+        let mut open = collecting(vec![lone(RX)]);
+        open.pending = vec![pending()];
+        open.pending_ids = vec![Some(RX)];
+        open.vci_ended = false;
+        let open = kept_of(open);
+        assert!(open.late_final_settles() && open.late_pending_or_start_settles());
     }
 
     /// ADR-437: `as_answer` derives `end_rejected` from the answer, so a rejected answer is no

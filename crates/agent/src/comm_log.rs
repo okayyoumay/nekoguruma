@@ -4770,7 +4770,9 @@ struct UnboundFlags {
 impl Inner {
     /// Settles `item` as a late item of the one ended exchange that could own it, when it is an
     /// indication (or a pending) that exchange alone could own and the exchange in flight
-    /// (`in_flight`) does not use (design 8.11 `late_item`, ADR-370). `besides` is the owed
+    /// (`in_flight`) does not use (design 8.11 `late_item`, ADR-370), unless it is a pending or
+    /// a start and that exchange is a record a lone one does not settle
+    /// ([`exchange::Kept::late_pending_or_start_settles`], ADR-450). `besides` is the owed
     /// exchange that is the one in flight when the log keeps it. Whether it was settled; `None`
     /// once the log has failed.
     fn late_item_lone_owner(
@@ -4786,6 +4788,20 @@ impl Inner {
         };
         let (owners, all) = late_indication_owners(&self.links[at].1, item, kind, id, besides);
         if in_flight(item, placed, kind, id) || !all || owners.len() != 1 {
+            return Some(false);
+        }
+        // A record kept only for its rows, whose evidence settles its exchange, owns a pending
+        // or a start alone only when it would own a final answer alone
+        // (`late_response_owner_with`, ADR-450): otherwise the item stays `unattached`, floors
+        // no one, and the record's classification stands. The gate is here and not in the
+        // owners, so an ambiguous item still names and floors the record (ADR-442). A transmit
+        // indication still confirms the send of such a record (ADR-442).
+        if matches!(kind, LateIndication::Start | LateIndication::Pending)
+            && self.links[at]
+                .1
+                .kept(owners[0])
+                .is_some_and(|kept| !kept.late_pending_or_start_settles())
+        {
             return Some(false);
         }
         self.late_item(at, owners[0], kind, item, placed)?;
@@ -13752,6 +13768,371 @@ pub(crate) mod tests {
                 "{}",
                 late[1]
             );
+        }
+    }
+
+    /// The ADR-446 case on the functional link: the collecting owner `22 F1 90`, whose final
+    /// answer is on 0x7E9, so it is owed on 0x7E8 only, and the non-collecting `22 F1 86` `record`
+    /// (own identifier 0, silent, the VCI ended its wait), which a lone late `7F 22 31` named
+    /// 0x7E9 settles and leaves owed through the owner on the whole table. The late final comes
+    /// 20 ms after the transmit, within the limit in force, so its verdict is `system`, and the
+    /// record is kept only for its rows (ADR-450).
+    fn owner_and_record_kept_for_its_rows(log: &CommLog) -> [u64; 2] {
+        let f190 = || exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]);
+        let owner = log
+            .exchange(functional_read_after(
+                0x90,
+                f190(),
+                vec![answer_on(0x7E9, f190(), 20_000)],
+                1,
+            ))
+            .unwrap();
+        let record = log
+            .exchange(functional_dependent(
+                exchange::End::NoResponse,
+                Vec::new(),
+                true,
+                10,
+            ))
+            .unwrap();
+        let late = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
+        assert_eq!(late_owner_of(log, &late), Some(LateOwner::One(record)));
+        place_unbound(log, &late, 20_000);
+        let inner = log.lock();
+        let state = &inner.links[0].1;
+        assert_eq!(state.owed_row_ids(owner), [0x7E8]);
+        assert_eq!(state.owed_row_ids(record), [0, 0x7E8, 0x7E9]);
+        let kept = state.kept(record).expect("kept for its rows");
+        assert!(kept.evidence.settles_owed() && !kept.late_pending_or_start_settles());
+        assert_eq!(kept.classification, exchange::Classification::System);
+        [owner, record]
+    }
+
+    /// A forwarded pending of a `22` request named `rx_id`, or the start of a response on it,
+    /// bound to no primitive.
+    fn late_pending_or_start_on(rx_id: u32, start: bool) -> UnattachedItem {
+        if start {
+            start_of_message(rx_id)
+        } else {
+            late_result_on(rx_id, vec![0x7F, 0x22, 0x78])
+        }
+    }
+
+    /// ADR-450, Done when: a record kept only for its rows, whose evidence settles it, owns no
+    /// late pending or start alone, as it owns no late final alone. After the ADR-446 setup (a
+    /// lone late `7F 22 31` named 0x7E9), a `7F 22 78` named 0x7E9, or a start on 0x7E9, has the
+    /// record as its only possible owner (the owner is owed on 0x7E8 only): it is plain
+    /// `unattached`, no `late_item` names or floors anyone, and the record keeps the `system`
+    /// its late final gave it, with its evidence as it was. Before ADR-450 the record owned the
+    /// item, and `late_item` classified it again from its entry (`undetermined`).
+    #[test]
+    fn a_record_kept_for_its_rows_owns_no_lone_late_pending_or_start() {
+        for (start, beyond) in [(false, false), (false, true), (true, false), (true, true)] {
+            let (dir, setup, log) = collecting_log_on(true);
+            let [owner, record] = owner_and_record_kept_for_its_rows(&log);
+            if beyond {
+                leave_window_to(&log, 0x7DF);
+            }
+            let item = late_pending_or_start_on(0x7E9, start);
+            let (kind, id) = item.late_indication().unwrap();
+            let none: &InFlight<'_> = &|_, _, _, _| false;
+            {
+                let mut inner = log.lock();
+                // The record is the only owed request the item could belong to, and it is kept.
+                assert_eq!(
+                    late_indication_owners(&inner.links[0].1, &item, kind, id, None),
+                    (vec![record], true),
+                    "{start} {beyond}"
+                );
+                assert_eq!(
+                    inner.late_item_lone_owner(0, &item, placed_after(3_000_000), none, None),
+                    Some(false),
+                    "{start} {beyond}"
+                );
+                let flags = inner
+                    .place_unbound_item(0, &item, placed_after(3_000_000), None, none, None)
+                    .unwrap();
+                assert!(
+                    !flags.unattached && !flags.transmit && !flags.start,
+                    "{start} {beyond}"
+                );
+            }
+            let kept = kept_of(&log, record);
+            assert_eq!(
+                kept.classification,
+                exchange::Classification::System,
+                "{start} {beyond}"
+            );
+            assert!(kept.floor.is_none(), "{start} {beyond}");
+            assert!(
+                kept.evidence.pending.is_empty() && !kept.evidence.response_started,
+                "{start} {beyond}"
+            );
+            assert!(
+                kept.late_pendings.is_empty() && kept.late_start.is_none(),
+                "{start} {beyond}"
+            );
+            assert!(floor_of(&log, owner).is_none(), "{start} {beyond}");
+            assert_eq!(
+                log.lock().links[0].1.owed_row_ids(record),
+                [0, 0x7E8, 0x7E9],
+                "{start} {beyond}"
+            );
+            let lines = finished(&log, &setup, &dir);
+            assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
+            assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+            assert_eq!(of_event(&lines, "late_response").len(), 1, "{lines:#?}");
+        }
+    }
+
+    /// ADR-450 through `exchange_with`: the pending is read while a later exchange is in flight
+    /// that does not use its identifier (a `22 F1 91` answered on 0x7E8), so the record on 0x7E9
+    /// is its only possible owner. The log writes it `unattached` before that exchange's entry,
+    /// writes no `late_item`, and neither exchange is raised.
+    #[test]
+    fn a_lone_late_pending_read_during_a_later_exchange_leaves_the_record_kept_for_its_rows() {
+        let (dir, setup, log) = collecting_log_on(true);
+        let [_owner, record] = owner_and_record_kept_for_its_rows(&log);
+        let mut later = evidence(
+            endpoint(0x7DF),
+            &[0x22, 0xF1, 0x91],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x91, 0x41]),
+        );
+        later.times.agent.before_us += 30_000_000;
+        later.times.agent.end_us += 30_000_000;
+        let later = log
+            .exchange_with(later, vec![late_pending_or_start_on(0x7E9, false)])
+            .unwrap();
+        let kept = kept_of(&log, record);
+        assert_eq!(kept.classification, exchange::Classification::System);
+        assert!(kept.floor.is_none() && kept.evidence.pending.is_empty());
+        let lines = finished(&log, &setup, &dir);
+        assert!(of_event(&lines, "late_item").is_empty(), "{lines:#?}");
+        let unattached = of_event(&lines, "unattached");
+        assert_eq!(unattached.len(), 1, "{lines:#?}");
+        assert!(unattached[0]["seq"].as_u64() < Some(later), "{lines:#?}");
+        let entry = lines
+            .iter()
+            .find(|line| line["seq"] == later)
+            .unwrap_or_else(|| panic!("no entry {later} in {lines:#?}"));
+        let reason = entry["reason"].as_str().unwrap();
+        assert!(
+            !reason.contains(MAY_OWN_INDICATION) && !reason.contains(MAY_OWN_UNATTACHED),
+            "{entry}"
+        );
+    }
+
+    /// ADR-450, ADR-442: the record is still one of the owners of an ambiguous pending or start,
+    /// named and floored like any kept exchange: on 0x7E8, which the owner awaits too (`owner`);
+    /// on 0x7E9 while an exchange in flight uses the identifier (`in_flight`); and on 0x7E8 once
+    /// the owner's record is released with its row left, so the log does not keep every possible
+    /// owner (`unkept`).
+    #[test]
+    fn a_record_kept_for_its_rows_is_still_named_and_floored_by_an_ambiguous_pending_or_start() {
+        for start in [false, true] {
+            for case in ["owner", "in_flight", "unkept"] {
+                let (dir, setup, log) = collecting_log_on(true);
+                let [owner, record] = owner_and_record_kept_for_its_rows(&log);
+                if case == "unkept" {
+                    log.lock().links[0].1.release_kept(owner);
+                }
+                let rx_id = if case == "in_flight" { 0x7E9 } else { 0x7E8 };
+                let item = late_pending_or_start_on(rx_id, start);
+                let (kind, id) = item.late_indication().unwrap();
+                let owners = match case {
+                    "owner" => (vec![owner, record], true),
+                    "in_flight" => (vec![record], true),
+                    _ => (vec![record], false),
+                };
+                let used = case == "in_flight";
+                let in_flight: &InFlight<'_> = &move |_, _, _, _| used;
+                {
+                    let mut inner = log.lock();
+                    assert_eq!(
+                        late_indication_owners(&inner.links[0].1, &item, kind, id, None),
+                        owners,
+                        "{start} {case}"
+                    );
+                    assert_eq!(
+                        inner.late_item_lone_owner(
+                            0,
+                            &item,
+                            placed_after(3_000_000),
+                            in_flight,
+                            None
+                        ),
+                        Some(false),
+                        "{start} {case}"
+                    );
+                    let flags = inner
+                        .place_unbound_item(
+                            0,
+                            &item,
+                            placed_after(3_000_000),
+                            None,
+                            in_flight,
+                            None,
+                        )
+                        .unwrap();
+                    assert_eq!(flags.start, used, "{start} {case}");
+                }
+                // Floored at `undetermined`; the `system` it has is above that and stands.
+                let kept = kept_of(&log, record);
+                assert_eq!(
+                    kept.classification,
+                    exchange::Classification::System,
+                    "{start} {case}"
+                );
+                assert_eq!(
+                    kept.floor.map(|(floor, _)| floor),
+                    Some(exchange::Classification::Undetermined),
+                    "{start} {case}"
+                );
+                // It is named, not settled: its evidence is as it was.
+                assert!(
+                    kept.evidence.pending.is_empty() && !kept.evidence.response_started,
+                    "{start} {case}"
+                );
+                if case == "owner" {
+                    assert_eq!(
+                        floor_of(&log, owner).map(|(floor, _)| floor),
+                        Some(exchange::Classification::Undetermined),
+                        "{start}"
+                    );
+                }
+                let lines = finished(&log, &setup, &dir);
+                let late = of_event(&lines, "late_item");
+                assert_eq!(late.len(), 1, "{start} {case} {lines:#?}");
+                assert_eq!(
+                    late[0]["refers_to"],
+                    serde_json::json!(owners.0),
+                    "{start} {case}"
+                );
+                assert!(late[0]["unattached"].is_u64(), "{start} {case}");
+                assert_eq!(of_event(&lines, "unattached").len(), 1, "{lines:#?}");
+            }
+        }
+    }
+
+    /// ADR-450 scope: the gate is the one on a lone late final (`Kept::late_final_settles`), for
+    /// a record whose evidence settles its exchange, and no wider. An exchange the agent's
+    /// deadline ended, whose evidence does not settle it, still owns a lone late pending or start,
+    /// though a late final does not settle it either; and a collecting record kept for its rows
+    /// whose finished window shows the VCI ended owns one as it owns a lone late final (ADR-445
+    /// decision 4), where the same record with the VCI's wait not shown ended owns neither.
+    #[test]
+    fn the_gate_on_a_lone_late_pending_or_start_is_the_one_on_a_lone_late_final() {
+        let none: &InFlight<'_> = &|_, _, _, _| false;
+        let f190 = || exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]);
+        for start in [false, true] {
+            // Not settled: the agent stopped waiting, the VCI did not end the exchange.
+            let (dir, setup, log) = collecting_log_on(true);
+            log.exchange(functional_read_after(
+                0x90,
+                f190(),
+                vec![answer_on(0x7E9, f190(), 20_000)],
+                1,
+            ))
+            .unwrap();
+            let waiting = log
+                .exchange(functional_dependent(
+                    exchange::End::VciDidNotEnd,
+                    Vec::new(),
+                    false,
+                    10,
+                ))
+                .unwrap();
+            let kept = kept_of(&log, waiting);
+            assert!(
+                !kept.late_final_settles() && kept.late_pending_or_start_settles(),
+                "{start}"
+            );
+            let item = late_pending_or_start_on(0x7E9, start);
+            assert_eq!(
+                log.lock()
+                    .late_item_lone_owner(0, &item, placed_after(3_000_000), none, None),
+                Some(true),
+                "{start}"
+            );
+            let lines = finished(&log, &setup, &dir);
+            let late = of_event(&lines, "late_item");
+            assert_eq!(late.len(), 1, "{start} {lines:#?}");
+            assert_eq!(
+                late[0]["refers_to"],
+                serde_json::json!([waiting]),
+                "{start}"
+            );
+            // Settled, collecting: named finals on the whole table and an unnamed one the owner
+            // could own, so the record is owed on the whole table and the owner on 0x7E8 only.
+            for vci_ended in [true, false] {
+                let on_table = |answers: Vec<exchange::Answer>, after_s: u64, vci_ended: bool| {
+                    let mut evidence = collecting_waited(|evidence| {
+                        evidence.end = exchange::End::Positive(FIRST.to_vec());
+                        evidence.vci_ended = vci_ended;
+                        evidence.rx_id = 0;
+                        evidence.receive_ids = vec![0x7E8, 0x7E9];
+                        evidence.answers = answers;
+                    });
+                    evidence.times.agent.before_us += after_s * 1_000_000;
+                    evidence.times.agent.end_us += after_s * 1_000_000;
+                    evidence
+                };
+                let (dir, setup, log) = collecting_log_on(true);
+                log.exchange(on_table(vec![positive_on(0x7E9, 20_000)], 1, true))
+                    .unwrap();
+                let record = log
+                    .exchange(on_table(
+                        vec![
+                            positive_on(0x7E8, 20_000),
+                            positive_on(0x7E9, 30_000),
+                            positive_on(0, 40_000),
+                        ],
+                        10,
+                        vci_ended,
+                    ))
+                    .unwrap();
+                let kept = kept_of(&log, record);
+                assert!(kept.evidence.settles_owed(), "{start} {vci_ended}");
+                assert_eq!(kept.late_final_settles(), vci_ended, "{start} {vci_ended}");
+                assert_eq!(
+                    kept.late_pending_or_start_settles(),
+                    vci_ended,
+                    "{start} {vci_ended}"
+                );
+                assert_eq!(
+                    late_owner_of(&log, &late_final_on(0x7E9)),
+                    vci_ended.then_some(LateOwner::One(record)),
+                    "{start} {vci_ended}"
+                );
+                let item = if start {
+                    start_of_message(0x7E9)
+                } else {
+                    late_result_on(0x7E9, vec![0x7F, 0x3E, 0x78])
+                };
+                {
+                    let mut inner = log.lock();
+                    let lone = inner
+                        .late_item_lone_owner(0, &item, placed_after(3_000_000), none, None)
+                        .unwrap();
+                    assert_eq!(lone, vci_ended, "{start} {vci_ended}");
+                    if !lone {
+                        inner
+                            .place_unbound_item(0, &item, placed_after(3_000_000), None, none, None)
+                            .unwrap();
+                    }
+                }
+                let lines = finished(&log, &setup, &dir);
+                assert_eq!(
+                    of_event(&lines, "late_item").len(),
+                    usize::from(vci_ended),
+                    "{start} {vci_ended} {lines:#?}"
+                );
+                assert_eq!(
+                    of_event(&lines, "unattached").len(),
+                    usize::from(!vci_ended),
+                    "{start} {vci_ended} {lines:#?}"
+                );
+            }
         }
     }
 

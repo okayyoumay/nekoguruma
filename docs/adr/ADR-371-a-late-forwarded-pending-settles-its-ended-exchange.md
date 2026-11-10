@@ -1,7 +1,7 @@
 # ADR-371: A Late Forwarded Pending Settles Its Ended Exchange
 
 **Date:** 2026-10-28
-**Status:** Accepted (Decision item 3's judgement of a collecting exchange's late pending from the transmit superseded by ADR-426)
+**Status:** Accepted (Decision item 3's judgement of a collecting exchange's late pending from the transmit superseded by ADR-426; item 3's one owner is not settled when it is such a record, ADR-450)
 **Affects:** `agent` communication log (`comm_log.rs` `UnattachedItem::pending_bytes`,
 `LateIndication::Pending`, `late_indication_owners`, `late_response_owner`, `Inner::late_item`;
 `comm_log/exchange.rs` `Expected::pending`, `LinkState::late_pending_owners`,

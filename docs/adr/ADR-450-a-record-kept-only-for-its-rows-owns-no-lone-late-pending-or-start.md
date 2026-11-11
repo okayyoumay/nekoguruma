@@ -1,7 +1,7 @@
 # ADR-450: A Record Kept Only for Its Rows Owns No Lone Late Pending or Start
 
 **Date:** 2026-11-10
-**Status:** Accepted (decision 4's unchanged transmit indication and the Consequences' bullet on a lone transmit indication superseded by ADR-452: it confirms the send only)
+**Status:** Accepted (decision 4's unchanged transmit indication and the Consequences' bullet on a lone transmit indication superseded by ADR-452: it confirms the send only; the Consequences' bullet on the order of the offers closed by ADR-453)
 **Affects:** `agent` (`comm_log.rs` `Inner::late_item_lone_owner`; `comm_log/exchange.rs`
 `Kept::late_pending_or_start_settles`), design 8.11 `late_item`; ADR-370 item 4, ADR-371
 item 3, ADR-442 decision 2 and Consequences, ADR-445 decision 4, ADR-446 decision 3

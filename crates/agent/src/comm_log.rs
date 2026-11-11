@@ -2567,131 +2567,198 @@ impl CommLog {
             }
         }
         inner.exchange_began_us = None;
-        // An unbound indication the one ended exchange that could own it, and not this one,
-        // owns is that exchange's, read late (design 8.11 `late_item`, ADR-370). This exchange
-        // was in flight with the identifier unless the indication's VCI time comes before its
-        // own transmit done (bound to it or carried by its response), on one clock and epoch:
-        // nothing it sent or received comes before its transmit (the maintainer's decisions,
-        // 2026-10-28). Settled first, so this exchange then takes its own indications as it
-        // would have.
+        // One pass over the unbound items and the results bound to this exchange's primitive
+        // that its host rejected as a wrong echo, in the order the host read them (ADR-447,
+        // ADR-453). Each is judged against what the items read before it left:
+        //
+        // 1. An indication or a forwarded pending that the one ended exchange which could own
+        //    it, and not this one, owns is that exchange's, read late (design 8.11 `late_item`,
+        //    ADR-370). This exchange was in flight with the identifier unless the indication's
+        //    VCI time comes before its own transmit done (bound to it or carried by its
+        //    response), on one clock and epoch: nothing it sent or received comes before its
+        //    transmit (the maintainer's decisions, 2026-10-28). It is offered there first, so
+        //    this exchange then takes its own indications as it would have.
+        // 2. Else a transmit indication with this exchange's request identifier is its send
+        //    evidence, and a start-of-message indication with its response identifier the first
+        //    frame of its response, when no ended exchange on the link could own it by then.
+        // 3. Else it is placed: a response only one owed exchange could own settles it
+        //    (`late_response`), and anything else is `unattached`, with the line that raises the
+        //    exchanges that could share it.
+        //
+        // A late final therefore stands before a pending, a start or a transmit indication read
+        // after it, whose one owner is judged on the evidence the final left (ADR-450, ADR-452).
+        // A link error takes no owner and is set against this exchange's span, which this pass
+        // completes, so the link errors follow it.
         let in_flight = in_flight_of(&evidence, transmit_starts([vci.tx_done]));
-        let mut index = 0;
-        while index < unbound.len() {
-            if inner.late_item_lone_owner(
-                at,
-                &unbound[index],
-                unbound_placed[index],
-                &in_flight,
-                None,
-            )? {
-                unbound.remove(index);
-                unbound_placed.remove(index);
-                unbound_order.remove(index);
-            } else {
-                index += 1;
-            }
-        }
         // The response's own transmit done, which the host read from its item.
         let response_tx_done = vci.tx_done.is_some();
-        if let exchange::Target::Endpoint { tx_id, .. } = evidence.target
-            && evidence.transmit_evidence.is_none()
-            && !inner.links[at].1.may_own_tx_indication()
-            && let Some(own) = unbound
-                .iter()
-                .position(|item| item.is_tx_indication_for(tx_id))
-        {
-            let indication = unbound.remove(own);
-            let placed = unbound_placed.remove(own);
-            unbound_order.remove(own);
-            let read = indication.read;
-            vci.tx_done = Some(
-                exchange::VciTime::new(u64::from(indication.vci_us), indication.clock).at(placed),
+        // A response read during the exchange that it or an earlier exchange could own leaves
+        // its own classification at least `undetermined` (design 8.11 `late_response`).
+        let mut may_own_unattached = false;
+        // An indication read during it that it or an earlier exchange could own does the same
+        // (design 8.11 `late_item`, ADR-370), when the indication would change it: a transmit
+        // indication while its own send stays unknown, a start while it has no answer of its own
+        // (the maintainer's decision, 2026-10-28).
+        let mut may_own_transmit = false;
+        let mut may_own_start = false;
+        // The result bound to this exchange's primitive that its host rejected as a wrong echo
+        // may be the response of an earlier exchange the log keeps owed: it is offered to them
+        // with the unbound items, before the entry (ADR-447).
+        let rejected_waiting: Vec<usize> = (0..evidence.rejected.len())
+            .filter(|&index| {
+                let rejected = &evidence.rejected[index];
+                !evidence.collecting
+                    && rejected.reason == exchange::RejectedReason::WrongEcho
+                    && rejected_order[index] != usize::MAX
+                    && rejected.vci_us.is_some_and(|us| u32::try_from(us).is_ok())
+            })
+            .collect();
+        // By the place the host read them at, an item of no known place last (the sort is
+        // stable): the unbound items are not taken to be in read order.
+        let mut offers: Vec<(usize, Offer)> = unbound_order
+            .iter()
+            .enumerate()
+            .map(|(index, &order)| (order, Offer::Unbound(index)))
+            .chain(
+                rejected_waiting
+                    .into_iter()
+                    .map(|index| (rejected_order[index], Offer::Rejected(index))),
             )
-            .into_iter()
-            .chain(vci.tx_done)
-            .reduce(exchange::VciTime::prefer);
-            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
-            // The agent's time of the transmit confirmation is when the host read it, on the
-            // entry's agent epoch.
-            evidence.times.agent.tx_confirmed_us = read
-                .filter(|read| read.epoch == evidence.times.agent.epoch)
-                .map(|read| read.monotonic_us);
-        }
-        // A transmit done the response's own item carries confirms the send (design 8.11
-        // `sent_evidence` `tx_done_time`) when no indication did.
-        if response_tx_done && evidence.transmit_evidence.is_none() {
-            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxDoneTime);
-        }
-        // A start-of-message indication carrying the exchange's response identifier is the
-        // first frame of its response, which counts as an answer of the ECU (design 8.11 "Link
-        // settings for the log", "Answer of the ECU"), unless an owed request on the link could
-        // own it. Nothing a refusal ended can have an answer. The latest start can be the final
-        // response's start only when it came after the last pending and the response spans
-        // frames: a start comes only with a multi-frame response's first frame, so one before a
-        // single-frame answer was a transfer the ECU aborted (design 8.11 "Link settings for the
-        // log"). The entry has no agent-side field for it.
-        if !matches!(
+            .collect();
+        offers.sort_by_key(|&(order, _)| order);
+        let own_tx_id = match evidence.target {
+            exchange::Target::Endpoint { tx_id, .. } => Some(tx_id),
+            _ => None,
+        };
+        // Nothing a refusal ended can have an answer.
+        let may_start = !matches!(
             evidence.end,
             exchange::End::NotSent(_)
                 | exchange::End::VciLost {
                     refused_after_loss: true
                 }
-        ) && !inner.links[at].1.may_own_start_indication(evidence.rx_id)
-            && unbound
-                .iter()
-                .any(|item| item.is_start_indication_for(evidence.rx_id))
-        {
-            // Every start with the identifier is the same response's: with no other owner,
-            // the ECU aborted and began again.
-            let rx_id = evidence.rx_id;
+        );
+        let rx_id = evidence.rx_id;
+        // The items the pass gave away: the late item of its one owner, or this exchange's own.
+        let mut gone = vec![false; unbound.len()];
+        // The starts of this exchange's response among them, in the order read.
+        let mut own_starts: Vec<usize> = Vec::new();
+        for (_, offer) in offers {
+            let index = match offer {
+                Offer::Rejected(index) => {
+                    let late = inner.offer_rejected(
+                        at,
+                        &evidence,
+                        index,
+                        rejected_placed[index],
+                        agent_epoch,
+                    )?;
+                    evidence.rejected[index].late_response = late;
+                    continue;
+                }
+                Offer::Unbound(index) => index,
+            };
+            let item = &unbound[index];
+            if item.link_error().is_some() {
+                continue;
+            }
+            let placed = unbound_placed[index];
+            if inner.late_item_lone_owner(at, item, placed, &in_flight, None)? {
+                gone[index] = true;
+                continue;
+            }
+            // The first transmit indication no ended exchange could own (one whose `sent` is
+            // still `unknown`) is this exchange's send evidence (design 8.11 `sent_evidence`).
+            if own_tx_id.is_some_and(|tx_id| item.is_tx_indication_for(tx_id))
+                && evidence.transmit_evidence.is_none()
+                && !inner.links[at].1.may_own_tx_indication()
+            {
+                vci.tx_done =
+                    Some(exchange::VciTime::new(u64::from(item.vci_us), item.clock).at(placed))
+                        .into_iter()
+                        .chain(vci.tx_done)
+                        .reduce(exchange::VciTime::prefer);
+                evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxIndication);
+                // The agent's time of the transmit confirmation is when the host read it, on the
+                // entry's agent epoch.
+                evidence.times.agent.tx_confirmed_us = item
+                    .read
+                    .filter(|read| read.epoch == evidence.times.agent.epoch)
+                    .map(|read| read.monotonic_us);
+                gone[index] = true;
+                continue;
+            }
+            // A start-of-message indication carrying the exchange's response identifier is the
+            // first frame of its response, which counts as an answer of the ECU (design 8.11
+            // "Link settings for the log", "Answer of the ECU"), unless an owed request on the
+            // link could own it.
+            if may_start
+                && item.is_start_indication_for(rx_id)
+                && !inner.links[at].1.may_own_start_indication(rx_id)
+            {
+                own_starts.push(index);
+                gone[index] = true;
+                continue;
+            }
+            let flags =
+                inner.place_unbound_item(at, item, placed, Some(&evidence), &in_flight, None)?;
+            may_own_unattached |= flags.unattached;
+            may_own_transmit |= flags.transmit;
+            may_own_start |= flags.start;
+        }
+        // The rejected end is the last rejected result, which the entry's reason relies on
+        // (ADR-447).
+        debug_assert!(
+            !evidence.end_rejected
+                || !matches!(&evidence.end, exchange::End::PositiveUnusable(bytes)
+                    if evidence.rejected.last().is_some_and(|last| last.late_response.is_some()
+                        && last.bytes != *bytes)),
+            "the end placed with earlier exchanges is the last rejected result"
+        );
+        // A transmit done the response's own item carries confirms the send (design 8.11
+        // `sent_evidence` `tx_done_time`) when no indication did.
+        if response_tx_done && evidence.transmit_evidence.is_none() {
+            evidence.transmit_evidence = Some(exchange::TransmitEvidence::TxDoneTime);
+        }
+        // Every start the exchange took is the same response's: with no other owner, the ECU
+        // aborted and began again. The latest can be the final response's start only when it
+        // came after the last pending and the response spans frames: a start comes only with a
+        // multi-frame response's first frame, so one before a single-frame answer was a transfer
+        // the ECU aborted (design 8.11 "Link settings for the log"). The entry has no agent-side
+        // field for it.
+        if let Some(&latest) = own_starts.last() {
             let response_len = match &evidence.end {
                 exchange::End::Positive(bytes)
                 | exchange::End::PositiveUnusable(bytes)
                 | exchange::End::Negative(bytes) => Some(bytes.len()),
                 _ => None,
             };
-            if let Some(at) = unbound
-                .iter()
-                .rposition(|item| item.is_start_indication_for(rx_id))
-            {
-                let start = &unbound[at];
-                let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock)
-                    .at(unbound_placed[at]);
-                // After the last pending, on one clock and epoch, unwrapped: with a pending
-                // whose time, clock or place is unknown, or a start with none, the order is
-                // unknown and no start is taken.
-                let last_pending = evidence
-                    .pending
-                    .last()
-                    .map(|pending| pending.clock.zip(pending_placed.last().copied().flatten()));
-                let after_pending = match last_pending {
-                    None => true,
-                    Some(pending) => match (pending, time.placed()) {
-                        (Some((clock, at)), Some((own, start))) => {
-                            clock == own
-                                && at.epoch == start.epoch
-                                && start.unwrapped >= at.unwrapped
-                        }
-                        _ => false,
-                    },
-                };
-                let spans_frames = response_len.is_none_or(|len| len > SINGLE_FRAME_MAX);
-                if after_pending && spans_frames {
-                    vci.rx_start = Some(time)
-                        .into_iter()
-                        .chain(vci.rx_start)
-                        .reduce(exchange::VciTime::prefer);
-                }
+            let start = &unbound[latest];
+            let time = exchange::VciTime::new(u64::from(start.vci_us), start.clock)
+                .at(unbound_placed[latest]);
+            // After the last pending, on one clock and epoch, unwrapped: with a pending whose
+            // time, clock or place is unknown, or a start with none, the order is unknown and no
+            // start is taken.
+            let last_pending = evidence
+                .pending
+                .last()
+                .map(|pending| pending.clock.zip(pending_placed.last().copied().flatten()));
+            let after_pending = match last_pending {
+                None => true,
+                Some(pending) => match (pending, time.placed()) {
+                    (Some((clock, at)), Some((own, start))) => {
+                        clock == own && at.epoch == start.epoch && start.unwrapped >= at.unwrapped
+                    }
+                    _ => false,
+                },
+            };
+            let spans_frames = response_len.is_none_or(|len| len > SINGLE_FRAME_MAX);
+            if after_pending && spans_frames {
+                vci.rx_start = Some(time)
+                    .into_iter()
+                    .chain(vci.rx_start)
+                    .reduce(exchange::VciTime::prefer);
             }
-            let keep = unbound
-                .iter()
-                .map(|item| !item.is_start_indication_for(rx_id))
-                .collect::<Vec<_>>();
-            let mut kept = keep.iter().copied();
-            unbound_placed.retain(|_| kept.next().unwrap_or(true));
-            let mut kept = keep.iter().copied();
-            unbound_order.retain(|_| kept.next().unwrap_or(true));
-            unbound.retain(|item| !item.is_start_indication_for(rx_id));
             evidence.response_started = true;
             // Only a wait the VCI ended is an incomplete response; one the agent's own
             // deadline ended may still be arriving (design 8.11 `vci_did_not_end`).
@@ -2699,6 +2766,12 @@ impl CommLog {
                 evidence.end = exchange::End::ResponseIncomplete;
             }
         }
+        let mut left = gone.iter().map(|gone| !gone);
+        unbound_placed.retain(|_| left.next().unwrap_or(true));
+        let mut left = gone.iter().map(|gone| !gone);
+        unbound_order.retain(|_| left.next().unwrap_or(true));
+        let mut left = gone.iter().map(|gone| !gone);
+        unbound.retain(|_| left.next().unwrap_or(true));
         // A link error of no primitive read during the exchange is a fault seen in it (design
         // 8.11 "Link error"): the worker gives link-level errors no primitive handle. One whose
         // time comes before the exchange's earliest placed VCI time is an earlier exchange's, read late,
@@ -2847,6 +2920,21 @@ impl CommLog {
             let since = inner.read_since(&item, &batch_reads);
             inner.late_link_error(&item, None, kind, since, false)?;
         }
+        // A link error that wrote no line is an `unattached` event, in the order read.
+        let mut unwritten: Vec<usize> = (0..unbound.len())
+            .filter(|&index| unbound[index].link_error().is_some())
+            .collect();
+        unwritten.sort_by_key(|&index| unbound_order[index]);
+        for index in unwritten {
+            inner.place_unbound_item(
+                at,
+                &unbound[index],
+                unbound_placed[index],
+                Some(&evidence),
+                &in_flight,
+                None,
+            )?;
+        }
         inner.note_reads(&batch_reads);
         // The transmit done starts the first pending's interval.
         let transmit = vci.tx_done.and_then(|time| time.placed());
@@ -2930,76 +3018,6 @@ impl CommLog {
         // Copied before the evidence takes it: the answer's time is read from it below.
         let entry_times = (!vci.is_empty()).then_some(vci);
         evidence.times.vci = entry_times;
-        // A response read during the exchange that it or an earlier exchange could own leaves
-        // its own classification at least `undetermined` (design 8.11 `late_response`).
-        let mut may_own_unattached = false;
-        // An indication read during it that it or an earlier exchange could own does the same
-        // (design 8.11 `late_item`, ADR-370), when the indication would change it: a transmit
-        // indication while its own send stays unknown, a start while it has no answer of its own
-        // (the maintainer's decision, 2026-10-28).
-        let mut may_own_transmit = false;
-        let mut may_own_start = false;
-        // The result bound to this exchange's primitive that its host rejected as a wrong echo
-        // may be the response of an earlier exchange the log keeps owed: it is offered to them
-        // with the unbound items, in the order the host read them, before the entry (ADR-447).
-        let rejected_waiting: Vec<usize> = (0..evidence.rejected.len())
-            .filter(|&index| {
-                let rejected = &evidence.rejected[index];
-                !evidence.collecting
-                    && rejected.reason == exchange::RejectedReason::WrongEcho
-                    && rejected_order[index] != usize::MAX
-                    && rejected.vci_us.is_some_and(|us| u32::try_from(us).is_ok())
-            })
-            .collect();
-        // One pass over all of them by the place the host read them at, an item of no known
-        // place last (the sort is stable): the unbound items are not taken to be in read order.
-        let mut offers: Vec<(usize, Offer)> = unbound_order
-            .iter()
-            .enumerate()
-            .map(|(index, &order)| (order, Offer::Unbound(index)))
-            .chain(
-                rejected_waiting
-                    .into_iter()
-                    .map(|index| (rejected_order[index], Offer::Rejected(index))),
-            )
-            .collect();
-        offers.sort_by_key(|&(order, _)| order);
-        for (_, offer) in offers {
-            match offer {
-                Offer::Unbound(index) => {
-                    let flags = inner.place_unbound_item(
-                        at,
-                        &unbound[index],
-                        unbound_placed[index],
-                        Some(&evidence),
-                        &in_flight,
-                        None,
-                    )?;
-                    may_own_unattached |= flags.unattached;
-                    may_own_transmit |= flags.transmit;
-                    may_own_start |= flags.start;
-                }
-                Offer::Rejected(index) => {
-                    let late = inner.offer_rejected(
-                        at,
-                        &evidence,
-                        index,
-                        rejected_placed[index],
-                        agent_epoch,
-                    )?;
-                    evidence.rejected[index].late_response = late;
-                }
-            }
-        }
-        // The rejected end is the last rejected result, which the entry's reason relies on
-        // (ADR-447).
-        debug_assert!(
-            !evidence.end_rejected
-                || !matches!(&evidence.end, exchange::End::PositiveUnusable(bytes)
-                    if evidence.rejected.last().is_some_and(|last| last.late_response.is_some()
-                        && last.bytes != *bytes)),
-            "the end placed with earlier exchanges is the last rejected result"
-        );
         // Each answer's history as an exchange of its own: the owed requests it could belong to
         // are its identifier's. The one derivation the link also reads again at a settlement.
         let history = inner.links[at].1.history_for(&evidence);
@@ -3363,15 +3381,14 @@ impl CommLog {
                 in_wait.push((item, placed.time));
             }
         }
-        // A late indication one other exchange alone could own is settled first.
-        let mut waiting = Vec::new();
-        for (item, placed) in in_wait {
-            if !inner.late_item_lone_owner(at, item, placed, &in_flight, Some(seq))? {
-                waiting.push((item, placed));
-            }
-        }
+        // In the order the host read them, each is first offered to the one other exchange that
+        // alone could own it and placed when none takes it, so an item read after a late final
+        // is judged on the evidence that final left (ADR-453).
         let mut flags = UnboundFlags::default();
-        for (item, placed) in waiting {
+        for (item, placed) in in_wait {
+            if inner.late_item_lone_owner(at, item, placed, &in_flight, Some(seq))? {
+                continue;
+            }
             let placed_flags = inner.place_unbound_item(
                 at,
                 item,
@@ -13820,13 +13837,12 @@ pub(crate) mod tests {
         }
     }
 
-    /// The ADR-446 case on the functional link: the collecting owner `22 F1 90`, whose final
-    /// answer is on 0x7E9, so it is owed on 0x7E8 only, and the non-collecting `22 F1 86` `record`
-    /// (own identifier 0, silent, the VCI ended its wait), which a lone late `7F 22 31` named
-    /// 0x7E9 settles and leaves owed through the owner on the whole table. The late final comes
-    /// 20 ms after the transmit, within the limit in force, so its verdict is `system`, and the
-    /// record is kept only for its rows (ADR-450).
-    fn owner_and_record_kept_for_its_rows(log: &CommLog) -> [u64; 2] {
+    /// The ADR-446 case before its late final is read: the collecting owner `22 F1 90`, whose
+    /// final answer is on 0x7E9, so it is owed on 0x7E8 only, and the non-collecting `22 F1 86`
+    /// `record` (own identifier 0, silent, the VCI ended its wait), the one owed request a
+    /// `7F 22 31`, a `7F 22 78` or a start named 0x7E9 could belong to. With `send_unknown` the
+    /// record's send is not shown, so it alone could own a transmit indication too.
+    fn owner_and_silent_record(log: &CommLog, send_unknown: bool) -> [u64; 2] {
         let f190 = || exchange::End::Positive(vec![0x62, 0xF1, 0x90, 0x41]);
         let owner = log
             .exchange(functional_read_after(
@@ -13836,14 +13852,21 @@ pub(crate) mod tests {
                 1,
             ))
             .unwrap();
-        let record = log
-            .exchange(functional_dependent(
-                exchange::End::NoResponse,
-                Vec::new(),
-                true,
-                10,
-            ))
-            .unwrap();
+        let mut silent = functional_dependent(exchange::End::NoResponse, Vec::new(), true, 10);
+        if send_unknown {
+            silent.times.vci = None;
+        }
+        [owner, log.exchange(silent).unwrap()]
+    }
+
+    /// The ADR-446 case on the functional link: the collecting owner `22 F1 90`, whose final
+    /// answer is on 0x7E9, so it is owed on 0x7E8 only, and the non-collecting `22 F1 86` `record`
+    /// (own identifier 0, silent, the VCI ended its wait), which a lone late `7F 22 31` named
+    /// 0x7E9 settles and leaves owed through the owner on the whole table. The late final comes
+    /// 20 ms after the transmit, within the limit in force, so its verdict is `system`, and the
+    /// record is kept only for its rows (ADR-450).
+    fn owner_and_record_kept_for_its_rows(log: &CommLog) -> [u64; 2] {
+        let [owner, record] = owner_and_silent_record(log, false);
         let late = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
         assert_eq!(late_owner_of(log, &late), Some(LateOwner::One(record)));
         place_unbound(log, &late, 20_000);
@@ -14182,6 +14205,539 @@ pub(crate) mod tests {
                     "{start} {vci_ended} {lines:#?}"
                 );
             }
+        }
+    }
+
+    /// `item` as the host read it at agent time `read_us`, its VCI time `after_us` after the
+    /// transmit on the device clock.
+    fn read_late(item: UnattachedItem, after_us: u32, read_us: u64) -> UnattachedItem {
+        UnattachedItem {
+            vci_us: BASE_US as u32 + after_us,
+            read: Some(AgentNow {
+                epoch: 0,
+                monotonic_us: read_us,
+                wall_unix_ms: 0,
+            }),
+            ..item
+        }
+    }
+
+    /// A `22 F1 91` to the functional link's target answered on 0x7E8, `after_s` seconds in: the
+    /// exchange in flight that reads late items named 0x7E9, which it does not await. With
+    /// `own_tx` its transmit done is read, `after_s` seconds after the earlier exchanges', so an
+    /// indication from before it is not its own (ADR-370 item 2).
+    fn later_read_on_7e8(after_s: u64, own_tx: bool) -> exchange::Evidence {
+        let mut later = evidence(
+            endpoint(0x7DF),
+            &[0x22, 0xF1, 0x91],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x91, 0x41]),
+        );
+        later.times.agent.before_us += after_s * 1_000_000;
+        later.times.agent.end_us += after_s * 1_000_000 + 500_000;
+        if own_tx {
+            later.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device_time(BASE_US + after_s * 1_000_000)),
+                ..exchange::VciTimes::default()
+            });
+        }
+        later
+    }
+
+    /// Logs one exchange of `later` per batch, 30 s in and a second apart, each reading its
+    /// batch's items in the order given, a millisecond apart on the agent's clock. The items'
+    /// VCI times follow the order read across the batches, 5 ms apart from 20 ms after the
+    /// transmit. The exchanges' `seq`s.
+    fn read_in_batches(
+        log: &CommLog,
+        batches: Vec<Vec<UnattachedItem>>,
+        later: impl Fn(u64) -> exchange::Evidence,
+    ) -> Vec<u64> {
+        let mut read = 0;
+        let mut seqs = Vec::new();
+        for (after_s, batch) in (30..).zip(batches) {
+            let later = later(after_s);
+            let before_us = later.times.agent.before_us;
+            let items = batch
+                .into_iter()
+                .zip(1..)
+                .map(|(item, nth)| {
+                    read += 1;
+                    read_late(item, 15_000 + 5_000 * read, before_us + 1_000 * nth)
+                })
+                .collect();
+            seqs.push(log.exchange_with(later, items).unwrap());
+        }
+        seqs
+    }
+
+    /// What late reads left of the kept exchange `seq`: its classification, its floor, its
+    /// `sent`, how many pendings a `late_item` gave it, and whether one started its response.
+    type LeftOf = (
+        exchange::Classification,
+        Option<exchange::Classification>,
+        exchange::Sent,
+        usize,
+        bool,
+    );
+
+    fn left_of(log: &CommLog, seq: u64) -> LeftOf {
+        let kept = kept_of(log, seq);
+        (
+            kept.classification,
+            kept.floor.map(|(floor, _)| floor),
+            kept.sent,
+            kept.evidence.pending.len(),
+            kept.evidence.response_started || kept.late_start.is_some(),
+        )
+    }
+
+    /// The settling lines and `unattached` events of `lines` that a late item or response
+    /// wrote, in order, each with the exchanges it refers to (none for `unattached`).
+    fn late_lines(lines: &[serde_json::Value]) -> Vec<(String, serde_json::Value)> {
+        lines
+            .iter()
+            .filter_map(|line| {
+                let event = line["event"].as_str()?;
+                matches!(event, "late_item" | "late_response" | "unattached")
+                    .then(|| (event.to_owned(), line["refers_to"].clone()))
+            })
+            .collect()
+    }
+
+    fn late_line(event: &str, refers_to: &[u64]) -> (String, serde_json::Value) {
+        (event.to_owned(), serde_json::json!(refers_to))
+    }
+
+    fn unattached_line() -> (String, serde_json::Value) {
+        ("unattached".to_owned(), serde_json::Value::Null)
+    }
+
+    /// ADR-453, Done when: a late final and a pending or start read after it give the same
+    /// outcome read in one batch and in two. In the ADR-446 setup the record is the one owner
+    /// of all three on 0x7E9. The final settles it and leaves it kept only for its rows, so the
+    /// pending or start read after it is gated on that evidence (ADR-450): it is plain
+    /// `unattached`, no `late_item` names anyone, and the record keeps the `system` the final
+    /// gave it, with no floor and its evidence as the final left it. Before ADR-453 the items of
+    /// one batch were offered to their one owner before its final was placed, so the record took
+    /// the pending or start there and not when they came in two batches.
+    #[test]
+    fn a_pending_or_start_read_after_a_late_final_is_gated_the_same_in_one_batch_and_in_two() {
+        for start in [false, true] {
+            let mut outcomes = Vec::new();
+            for two in [false, true] {
+                let (dir, setup, log) = collecting_log_on(true);
+                let [owner, record] = owner_and_silent_record(&log, false);
+                let last = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
+                let after = late_pending_or_start_on(0x7E9, start);
+                let batches = if two {
+                    vec![vec![last], vec![after]]
+                } else {
+                    vec![vec![last, after]]
+                };
+                read_in_batches(&log, batches, |after_s| later_read_on_7e8(after_s, false));
+                assert!(floor_of(&log, owner).is_none(), "{start} {two}");
+                assert_eq!(
+                    log.lock().links[0].1.owed_row_ids(record),
+                    [0, 0x7E8, 0x7E9],
+                    "{start} {two}"
+                );
+                let left = left_of(&log, record);
+                let lines = finished(&log, &setup, &dir);
+                assert_eq!(
+                    late_lines(&lines),
+                    [late_line("late_response", &[record]), unattached_line()],
+                    "{start} {two} {lines:#?}"
+                );
+                outcomes.push(left);
+            }
+            assert_eq!(outcomes[0], outcomes[1], "{start}");
+            assert_eq!(
+                outcomes[0],
+                (
+                    exchange::Classification::System,
+                    None,
+                    exchange::Sent::Confirmed,
+                    0,
+                    false
+                ),
+                "{start}"
+            );
+        }
+    }
+
+    /// ADR-453: the order is the one the host read the items in, not the one they are listed
+    /// in. The pending is listed first and read after the final, so it is gated as above.
+    #[test]
+    fn the_order_read_decides_not_the_order_the_unbound_items_are_listed_in() {
+        let (dir, setup, log) = collecting_log_on(true);
+        let [_owner, record] = owner_and_silent_record(&log, false);
+        let later = later_read_on_7e8(30, false);
+        let before_us = later.times.agent.before_us;
+        let last = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
+        let pending = late_pending_or_start_on(0x7E9, false);
+        log.exchange_with(
+            later,
+            vec![
+                read_late(pending, 25_000, before_us + 2_000),
+                read_late(last, 20_000, before_us + 1_000),
+            ],
+        )
+        .unwrap();
+        assert_eq!(
+            left_of(&log, record),
+            (
+                exchange::Classification::System,
+                None,
+                exchange::Sent::Confirmed,
+                0,
+                false
+            )
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            late_lines(&lines),
+            [late_line("late_response", &[record]), unattached_line()],
+            "{lines:#?}"
+        );
+    }
+
+    /// ADR-453: a pending or start read before the final is the record's as before, in one batch
+    /// and in two: the record's evidence does not settle it yet, so its `late_item` settles it,
+    /// and the final read after it then settles the exchange.
+    #[test]
+    fn a_pending_or_start_read_before_a_late_final_settles_its_owner_in_one_batch_and_in_two() {
+        for start in [false, true] {
+            let mut outcomes = Vec::new();
+            for two in [false, true] {
+                let (dir, setup, log) = collecting_log_on(true);
+                let [_owner, record] = owner_and_silent_record(&log, false);
+                let before = late_pending_or_start_on(0x7E9, start);
+                let last = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
+                let batches = if two {
+                    vec![vec![before], vec![last]]
+                } else {
+                    vec![vec![before, last]]
+                };
+                read_in_batches(&log, batches, |after_s| later_read_on_7e8(after_s, false));
+                let left = left_of(&log, record);
+                let lines = finished(&log, &setup, &dir);
+                assert_eq!(
+                    late_lines(&lines),
+                    [
+                        late_line("late_item", &[record]),
+                        late_line("late_response", &[record])
+                    ],
+                    "{start} {two} {lines:#?}"
+                );
+                outcomes.push(left);
+            }
+            assert_eq!(outcomes[0], outcomes[1], "{start}");
+            let (_, _, _, pendings, started) = outcomes[0];
+            assert_eq!((pendings, started), (usize::from(!start), start), "{start}");
+        }
+    }
+
+    /// ADR-453, ADR-452: a transmit indication read after the final that settles its one owner
+    /// meets the record that final left, so it confirms the send and classifies nothing, in one
+    /// batch as in two. The record's send is unknown, and the exchange in flight's own transmit
+    /// done comes after the indication, so the record alone could own it. Before ADR-453 the
+    /// indication of the same batch was the record's `late_item` before its final was placed,
+    /// and classified it again.
+    #[test]
+    fn a_transmit_indication_read_after_a_late_final_only_confirms_the_send_in_one_batch_and_in_two()
+     {
+        let mut outcomes = Vec::new();
+        for two in [false, true] {
+            let (dir, setup, log) = collecting_log_on(true);
+            let [_owner, record] = owner_and_silent_record(&log, true);
+            assert!(kept_of(&log, record).sent == exchange::Sent::Unknown);
+            let last = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
+            let batches = if two {
+                vec![vec![last], vec![tx_done(0x7DF)]]
+            } else {
+                vec![vec![last, tx_done(0x7DF)]]
+            };
+            read_in_batches(&log, batches, |after_s| later_read_on_7e8(after_s, true));
+            let left = left_of(&log, record);
+            let lines = finished(&log, &setup, &dir);
+            assert_eq!(
+                late_lines(&lines),
+                [
+                    late_line("late_response", &[record]),
+                    late_line("late_item", &[record])
+                ],
+                "{two} {lines:#?}"
+            );
+            let late = line_of(&lines, "late_item");
+            assert_eq!(
+                late["exchanges"][0]["reason"], SEND_CONFIRMED_ONLY,
+                "{two} {late}"
+            );
+            assert_eq!(
+                late["exchanges"][0]["classification"],
+                line_of(&lines, "late_response")["exchanges"][0]["classification"],
+                "{two} {late}"
+            );
+            outcomes.push(left);
+        }
+        assert_eq!(outcomes[0], outcomes[1]);
+        assert!(outcomes[0].2 == exchange::Sent::Confirmed);
+    }
+
+    /// ADR-453: the items a primitive's end read while the primitive was in flight follow the
+    /// same order. The stray `22 F1 91` reads the record's final and then a pending or start on
+    /// 0x7E9 before its own receive timeout: the final settles the record, and the item read
+    /// after it is gated on the evidence it left, as in `exchange_with`.
+    #[test]
+    fn the_items_read_in_a_primitive_s_wait_are_offered_in_the_order_read() {
+        for start in [false, true] {
+            let (dir, setup, log) = collecting_log_on(true);
+            let [_owner, record] = owner_and_silent_record(&log, false);
+            let mut stray = later_read_on_7e8(30, false);
+            stray.end = exchange::End::VciDidNotEnd;
+            let stray = log.exchange(stray).unwrap();
+            let last = read_late(
+                late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]),
+                20_000,
+                31_000_000,
+            );
+            let after = read_late(late_pending_or_start_on(0x7E9, start), 25_000, 31_000_001);
+            let reads = vec![
+                EndRead {
+                    read: last.read.unwrap(),
+                    item: EndItem::Unattached(last),
+                },
+                EndRead {
+                    read: after.read.unwrap(),
+                    item: EndItem::Unattached(after),
+                },
+                EndRead {
+                    read: AgentNow {
+                        epoch: 0,
+                        monotonic_us: 31_000_002,
+                        wall_unix_ms: 0,
+                    },
+                    item: EndItem::RxTimeout(device_time(BASE_US + 31_000_000)),
+                },
+            ];
+            log.primitive_ended(
+                stray,
+                PrimitiveEnded {
+                    vci_ended: true,
+                    ..ended_with(Some(exchange::End::NoResponse), reads)
+                },
+            )
+            .unwrap();
+            assert_eq!(
+                left_of(&log, record),
+                (
+                    exchange::Classification::System,
+                    None,
+                    exchange::Sent::Confirmed,
+                    0,
+                    false
+                ),
+                "{start}"
+            );
+            let lines = finished(&log, &setup, &dir);
+            assert_eq!(
+                late_lines(&lines),
+                [late_line("late_response", &[record]), unattached_line()],
+                "{start} {lines:#?}"
+            );
+        }
+    }
+
+    /// Logs a `22 F1 86` to 0x7E0 that got no answer, the VCI ended its wait: it is kept and
+    /// owed on 0x7E8. With `send_unknown` its send is not shown.
+    fn silent_read_on_a_physical_link(log: &CommLog, send_unknown: bool) -> u64 {
+        let mut first = read_f186_after(exchange::End::NoResponse, Vec::new(), true, 1);
+        if !send_unknown {
+            first.times.vci = Some(exchange::VciTimes {
+                tx_done: Some(device_time(BASE_US)),
+                ..exchange::VciTimes::default()
+            });
+        }
+        log.exchange(first).unwrap()
+    }
+
+    /// A `22 F1 90` to 0x7E0, `after_s` seconds in, answered with a response that spans frames.
+    fn long_read_after(after_s: u64) -> exchange::Evidence {
+        let mut later = evidence(
+            endpoint(0x7E0),
+            &[0x22, 0xF1, 0x90],
+            exchange::End::Positive(vec![0x62, 0xF1, 0x90, 1, 2, 3, 4, 5, 6, 7, 8, 9]),
+        );
+        later.pending_visibility = exchange::PendingVisibility::Forwarded;
+        later.vci_ended = true;
+        later.times.agent.before_us = BASE_US + after_s * 1_000_000;
+        later.times.agent.end_us = later.times.agent.before_us + 500_000;
+        later
+    }
+
+    /// ADR-453: the exchange in flight takes its own start or transmit indication by what the
+    /// items read before it left. The late final of the earlier `22 F1 86` settles it, so no
+    /// ended exchange could own the start or the transmit indication read after it, and the
+    /// exchange that reads it takes it as its own, in one batch as in two. Before ADR-453 the
+    /// exchange decided on its own indications before the finals of its batch were placed, and
+    /// left such an indication `unattached` when it came in the final's batch.
+    #[test]
+    fn the_exchange_in_flight_takes_its_own_indication_read_after_the_final_that_frees_it() {
+        for start in [false, true] {
+            for two in [false, true] {
+                let (dir, setup, log) = collecting_log_on(false);
+                let first = silent_read_on_a_physical_link(&log, !start);
+                let last = late_result_on(0x7E8, vec![0x62, 0xF1, 0x86, 0x01]);
+                let own = if start {
+                    start_of_message(0x7E8)
+                } else {
+                    tx_done(0x7E0)
+                };
+                let batches = if two {
+                    vec![vec![last], vec![own]]
+                } else {
+                    vec![vec![last, own]]
+                };
+                let seqs = read_in_batches(&log, batches, long_read_after);
+                let lines = finished(&log, &setup, &dir);
+                assert_eq!(
+                    late_lines(&lines),
+                    [late_line("late_response", &[first])],
+                    "{start} {two} {lines:#?}"
+                );
+                let reader = seqs.last().unwrap();
+                let entry = lines.iter().find(|line| line["seq"] == *reader).unwrap();
+                if start {
+                    assert!(
+                        entry["times"]["vci"]["rx_start"].is_object(),
+                        "{two} {entry}"
+                    );
+                } else {
+                    assert_eq!(entry["sent_evidence"], "tx_indication", "{two} {entry}");
+                }
+            }
+        }
+    }
+
+    /// ADR-453: an indication read before the final is judged by the owed requests as they stood
+    /// then. The start on 0x7E8 could be the earlier exchange's or the one in flight's when it
+    /// was read, so it stays `unattached` and names the earlier exchange, though the final read
+    /// after it settles that exchange: the exchange in flight does not take it.
+    #[test]
+    fn an_indication_read_before_the_final_that_frees_it_stays_ambiguous() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = silent_read_on_a_physical_link(&log, false);
+        let seqs = read_in_batches(
+            &log,
+            vec![vec![
+                start_of_message(0x7E8),
+                late_result_on(0x7E8, vec![0x62, 0xF1, 0x86, 0x01]),
+            ]],
+            long_read_after,
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            late_lines(&lines),
+            [
+                unattached_line(),
+                late_line("late_item", &[first]),
+                late_line("late_response", &[first])
+            ],
+            "{lines:#?}"
+        );
+        let entry = lines.iter().find(|line| line["seq"] == seqs[0]).unwrap();
+        assert!(entry["times"]["vci"]["rx_start"].is_null(), "{entry}");
+    }
+
+    /// ADR-453: an item two ended exchanges could own when it was read names both, though a
+    /// final read after it settles one of them: each item is placed where it was read, not after
+    /// the batch's finals. Two silent reads to the same ECU are owed on 0x7E8, and the exchange
+    /// in flight, whose own transmit done comes after the start, is not in flight for it.
+    #[test]
+    fn an_item_two_exchanges_could_own_when_read_names_both_though_a_later_final_settles_one() {
+        let (dir, setup, log) = collecting_log_on(false);
+        let first = silent_read_on_a_physical_link(&log, false);
+        let mut second = read_f186_after(exchange::End::NoResponse, Vec::new(), true, 2);
+        second.request = vec![0x22, 0xF1, 0x87];
+        second.expected = exchange::Expected::uds(&[0x22, 0xF1, 0x87]);
+        second.times.vci = Some(exchange::VciTimes {
+            tx_done: Some(device_time(BASE_US + 1_000)),
+            ..exchange::VciTimes::default()
+        });
+        let second = log.exchange(second).unwrap();
+        read_in_batches(
+            &log,
+            vec![vec![
+                start_of_message(0x7E8),
+                late_result_on(0x7E8, vec![0x62, 0xF1, 0x87, 0x01]),
+            ]],
+            |after_s| {
+                let mut later = long_read_after(after_s);
+                later.times.vci = Some(exchange::VciTimes {
+                    tx_done: Some(device_time(BASE_US + after_s * 1_000_000)),
+                    ..exchange::VciTimes::default()
+                });
+                later
+            },
+        );
+        let lines = finished(&log, &setup, &dir);
+        assert_eq!(
+            late_lines(&lines),
+            [
+                unattached_line(),
+                late_line("late_item", &[first, second]),
+                late_line("late_response", &[second])
+            ],
+            "{lines:#?}"
+        );
+    }
+
+    /// ADR-453: a link error takes no owner and follows the pass, whichever was read first. The
+    /// late final settles the record before the error's `late_item` is written, and the record
+    /// stands as the final left it in both orders.
+    #[test]
+    fn a_late_link_error_of_the_batch_follows_its_late_final_whichever_was_read_first() {
+        for error_first in [false, true] {
+            let (dir, setup, log) = collecting_log_on(true);
+            let [_owner, record] = owner_and_silent_record(&log, false);
+            let last = late_result_on(0x7E9, vec![0x7F, 0x22, 0x31]);
+            let error = UnattachedItem {
+                data: UnattachedData::Error {
+                    event: "PDU_ERR_EVT_FRAME_STRUCT".to_owned(),
+                    extra_error_info: None,
+                    extra_error_info_name: None,
+                    link_error: Some(exchange::LinkErrorKind::Frame),
+                },
+                ..tx_done(0x7DF)
+            };
+            let batch = if error_first {
+                vec![error, last]
+            } else {
+                vec![last, error]
+            };
+            read_in_batches(&log, vec![batch], |after_s| {
+                later_read_on_7e8(after_s, true)
+            });
+            assert_eq!(
+                left_of(&log, record),
+                (
+                    exchange::Classification::System,
+                    None,
+                    exchange::Sent::Confirmed,
+                    0,
+                    false
+                ),
+                "{error_first}"
+            );
+            let lines = finished(&log, &setup, &dir);
+            assert_eq!(
+                late_lines(&lines),
+                [
+                    late_line("late_response", &[record]),
+                    late_line("late_item", &[])
+                ],
+                "{error_first} {lines:#?}"
+            );
         }
     }
 

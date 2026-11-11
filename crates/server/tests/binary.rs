@@ -178,8 +178,11 @@ fn a_second_signal_during_the_grace_period_stops_it_at_once() {
     let mut held = TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
     held.write_all(b"GET /api/v1/health HTTP/1.1\r\n").unwrap();
     let pid = child.id().to_string();
-    for _ in 0..2 {
-        let sent = Command::new("kill").args(["-TERM", &pid]).status().unwrap();
+    // Two different signals: a second SIGTERM sent before the first is taken would be merged
+    // with it by the kernel, which delivers one pending signal of a kind, and the stop would
+    // then wait out the grace period.
+    for signal in ["-TERM", "-INT"] {
+        let sent = Command::new("kill").args([signal, &pid]).status().unwrap();
         assert!(sent.success());
     }
     let started = Instant::now();

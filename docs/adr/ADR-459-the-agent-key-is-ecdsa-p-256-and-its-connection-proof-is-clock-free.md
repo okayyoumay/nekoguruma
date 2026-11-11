@@ -25,7 +25,7 @@ binds more than the agent's connection.
    that replacing the primitive touches one crate. P-256 is what TPMs and HSMs support
    generally; Ed25519 is not, and the agent key is meant to move into a TPM (item 7). The
    `p256` crates have not had an independent audit. That is accepted, mitigated by
-   known-answer tests in `shared-crypto` (the P-256 vectors of RFC 6979) and by the one-crate
+   known-answer tests in `shared-crypto` (the P-256 vectors of RFC 6979, appendix A.2.5) and by the one-crate
    wrapper; `ring` is the fallback if the risk is judged too high. The same primitive will sign
    job instructions (design 11.1).
 2. **Encodings.** The public key is an SPKI DER document, which names its algorithm, stored as

@@ -156,6 +156,12 @@ scripts/check-adr-index.sh
 scripts/check-backlog.sh
 ```
 
+The workspace tests need PostgreSQL's server binaries (`initdb`, `pg_ctl`): the server's database
+tests start a throwaway cluster per test, and a missing PostgreSQL fails them. The helper looks
+in `NGR_TEST_PG_BIN`, then on `PATH`, then in the highest `/usr/lib/postgresql/<version>/bin`,
+then in `PGBIN` (ADR-458); CI sets `NGR_TEST_PG_BIN` from the runner image. As root the helper
+runs PostgreSQL as the `postgres` account, so `TMPDIR` must be a directory that account can enter.
+
 CI runs the tests with [cargo-nextest](https://nexte.st/) instead. The `core-linux` job runs
 `cargo nextest run --workspace --locked --profile ci`, then
 the doc tests with `cargo test ... --doc`, which leaves out `sim-vci`: it is built only as a

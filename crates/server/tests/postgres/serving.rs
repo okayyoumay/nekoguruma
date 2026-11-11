@@ -1,11 +1,18 @@
 //! The guard and the health route over real TCP against a running server on an ephemeral port.
 //! The requests are written by hand so that the test controls every header.
+//!
+//! Most tests serve over a pool that points at no database (health then answers 503); the ones
+//! that need the database up start a throwaway PostgreSQL.
 
 use std::time::Duration;
 
-use server::{Config, Server};
+use server::config::{Config, Database, Http, Profile};
+use server::{Server, db};
+use sqlx::postgres::{PgConnectOptions, PgSslMode};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 use tokio::net::TcpStream;
+
+use crate::support::{TestPostgres, free_port};
 
 struct Reply {
     status: u16,
@@ -64,15 +71,48 @@ struct Running {
 }
 
 impl Running {
+    /// Serves over a pool that points at a port nothing listens on.
     async fn start() -> Running {
         Running::start_with_grace(2).await
     }
 
     async fn start_with_grace(grace_secs: u64) -> Running {
-        let mut config = Config::default();
-        config.http.port = 0;
-        config.http.shutdown_grace_secs = grace_secs;
+        let options = PgConnectOptions::new_without_pgpass()
+            .host("127.0.0.1")
+            .port(free_port())
+            .ssl_mode(PgSslMode::Disable);
+        let pool = db::pool_lazy(options, Duration::from_secs(1));
+        Running::serve(
+            Http {
+                port: 0,
+                shutdown_grace_secs: grace_secs,
+            },
+            pool,
+        )
+        .await
+    }
+
+    /// Starts as a deployment does: connect, migrate, bind.
+    async fn start_with_database(pg: &TestPostgres, grace_secs: u64) -> Running {
+        let mut database = Database::new(pg.url());
+        database.connect_timeout_secs = 5;
+        let config = Config {
+            profile: Profile::Local,
+            http: Http {
+                port: 0,
+                shutdown_grace_secs: grace_secs,
+            },
+            database,
+        };
         let server = Server::start(&config).await.unwrap();
+        Running::spawn(server)
+    }
+
+    async fn serve(http: Http, pool: sqlx::PgPool) -> Running {
+        Running::spawn(Server::bind(&http, pool).await.unwrap())
+    }
+
+    fn spawn(server: Server) -> Running {
         let addr = server.local_addr();
         let (stop, stop_rx) = tokio::sync::oneshot::channel::<()>();
         let (force, force_rx) = tokio::sync::oneshot::channel::<()>();
@@ -128,13 +168,51 @@ impl Running {
 
 #[tokio::test]
 async fn the_listener_is_on_loopback_and_health_is_200() {
-    let s = Running::start().await;
+    let pg = TestPostgres::start();
+    let s = Running::start_with_database(&pg, 2).await;
     assert_eq!(s.addr.ip().to_string(), "127.0.0.1");
     let r = exchange(s.addr, &request("GET", "/api/v1/health", &[s.host()])).await;
     assert_eq!(r.status, 200, "{}", r.head);
     assert_eq!(r.header("content-type"), Some("application/json"));
     assert_eq!(r.header("cache-control"), Some("no-store"));
     assert_eq!(r.body.trim(), r#"{"status":"ok"}"#);
+    s.finish().await;
+}
+
+#[tokio::test]
+async fn health_is_503_when_the_database_is_down_and_200_when_it_is_up() {
+    let mut pg = TestPostgres::start();
+    let s = Running::start_with_database(&pg, 2).await;
+    let ask = || request("GET", "/api/v1/health", &[s.host()]);
+    assert_eq!(exchange(s.addr, &ask()).await.status, 200);
+
+    pg.stop();
+    let started = std::time::Instant::now();
+    let r = exchange(s.addr, &ask()).await;
+    assert_eq!(r.status, 503, "{}", r.head);
+    assert!(
+        started.elapsed() < Duration::from_secs(4),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(r.header("content-type"), Some("application/problem+json"));
+    assert_eq!(r.header("cache-control"), Some("no-store"));
+    assert!(r.body.contains("\"status\":503"), "{}", r.body);
+    assert!(
+        !r.body.contains("127.0.0.1"),
+        "the body names the database: {}",
+        r.body
+    );
+    s.finish().await;
+}
+
+#[tokio::test]
+async fn health_is_503_within_its_timeout_for_a_database_that_never_was_there() {
+    let s = Running::start().await;
+    let started = std::time::Instant::now();
+    let r = exchange(s.addr, &request("GET", "/api/v1/health", &[s.host()])).await;
+    assert_eq!(r.status, 503, "{}", r.head);
+    assert!(started.elapsed() < server::health::DATABASE_TIMEOUT + Duration::from_secs(2));
     s.finish().await;
 }
 
@@ -207,7 +285,8 @@ async fn the_alias_is_redirected_with_307_for_every_method() {
 
 #[tokio::test]
 async fn a_foreign_origin_is_403_and_the_pinned_origin_passes() {
-    let s = Running::start().await;
+    let pg = TestPostgres::start();
+    let s = Running::start_with_database(&pg, 2).await;
     let port = s.addr.port();
     for origin in [
         "null".to_owned(),
@@ -345,7 +424,8 @@ async fn a_slow_request_head_is_dropped_after_the_header_read_timeout() {
 
 #[tokio::test]
 async fn a_request_in_flight_finishes_during_the_grace_period() {
-    let mut s = Running::start_with_grace(30).await;
+    let pg = TestPostgres::start();
+    let mut s = Running::start_with_database(&pg, 30).await;
     let mut partial = TcpStream::connect(s.addr).await.unwrap();
     partial
         .write_all(format!("GET /api/v1/health HTTP/1.1\r\n{}\r\n", s.host()).as_bytes())
@@ -408,8 +488,15 @@ async fn a_second_stop_signal_ends_the_wait_at_once() {
 #[tokio::test]
 async fn start_fails_when_the_port_is_taken() {
     let s = Running::start().await;
-    let mut config = Config::default();
-    config.http.port = s.addr.port();
-    assert!(Server::start(&config).await.is_err());
+    let options = PgConnectOptions::new_without_pgpass()
+        .host("127.0.0.1")
+        .port(free_port())
+        .ssl_mode(PgSslMode::Disable);
+    let http = Http {
+        port: s.addr.port(),
+        shutdown_grace_secs: 2,
+    };
+    let pool = db::pool_lazy(options, Duration::from_secs(1));
+    assert!(Server::bind(&http, pool).await.is_err());
     s.finish().await;
 }

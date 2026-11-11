@@ -13,7 +13,7 @@ Cargo workspace corresponding to the design document `docs/system-architecture.m
 | Crate | Role | Design document |
 |---|---|---|
 | `shared-proto` | Commands, events, capabilities, job types | 5.1 / 5.3 / 9.5 |
-| `shared-crypto` | Signature verification for all 3 trust layers | 11.1 |
+| `shared-crypto` | Agent key (ECDSA P-256) and connection proof; signature verification for all 3 trust layers | 6.4, 11.1 |
 | `diag-ir` | IR schema, bytecode, VM | 8.2 |
 | `diag-frontend` | ODX/OTX parser, CSV + Starlark->IR conversion (server only) | 8.3 / 8.4 |
 | `vendor-manifest` | Manifest parser for ECU distribution packages | 11.2 |

@@ -447,7 +447,7 @@ The agent key proves only that "this is this execution environment on this devic
 | Startup | At login or explicit start | At OS startup (service) |
 | Registration unit | Device x OS user | Device |
 | Keys and journal | User area | Device area |
-| Execution account | Logged-in user | Dedicated low-privilege account |
+| Execution account | Logged-in user | Dedicated low-privilege account (on Windows a virtual service account, `NT SERVICE\<name>`) |
 
 Unattended devices use device mode. Each device is fixed to one mode, eliminating contention for the same VCI at configuration time.
 
@@ -467,7 +467,13 @@ Policies are set per "job type x agent" and cannot be looser than the organizati
 ### 6.4 Credentials
 
 - Registration via one-time code or device authorization flow (RFC 8628)
-- The key pair is stored in the OS credential store (Windows: DPAPI, Linux: libsecret). A TPM is used where possible
+- The agent key is an ECDSA P-256 key pair (signature with SHA-256), held behind a signer over a named-secret store, one store per platform and mode (ADR-459):
+  - Windows, both modes: a DPAPI-protected blob file in the account's own scope. Machine-scope DPAPI is not used, because any local user could decrypt it or plant a key
+  - Linux user mode: the Secret Service. A locked collection counts as unavailable, never as absent
+  - Linux device mode: a systemd encrypted credential that the administrator provisions (systemd 250 or later; older hosts need a method of their own, to be designed)
+  - There is no plain-file fallback in release builds. A store that is unavailable is retried; a key that cannot be decrypted is never overwritten and asks for re-registration
+  - A TPM-held, non-exportable key follows in M6 (16.3); moving to it means registering again
+- The agent proves it holds its key by signing a challenge transcript, not a timestamp, since the device clock is untrusted (14.4, 16.3). The public key is registered as an SPKI document and identified by the SHA-256 of that document
 - On shared accounts, the browser's edit cache is separated per operator ID, with automatic logout on inactivity and re-authentication before writes
 
 ### 6.5 Startup Method
@@ -522,7 +528,7 @@ The installer decides and configures the following. They are fixed per device; c
 | Deployment profile (standard / local) | Same as above | At installation |
 | Server URL and distribution key root | Bundled with installer | At installation |
 | Per-device settings (drivers, udev rules, shared lock area, auto-start) | Run with administrator privileges | At installation |
-| Per-user registration (key pair generation, agent registration) | The user (administrator in device mode) | At first startup |
+| Per-user registration (key pair generation, agent registration) | The user (administrator in device mode) | At first startup. The key is created by the first command that needs it (identity, registration or connect), not by a plain run (ADR-459) |
 | Connection restriction preset (6.6) | Default is "Personal only" | At registration |
 
 On organization-managed devices, these can be distributed as a configuration file.
@@ -1475,7 +1481,7 @@ Everything is unified on Rust, organized as a single Cargo workspace.
 
 ```
 shared-proto     commands, events, capabilities, frame formats
-shared-crypto    provider signature verification, ingestion signing and verification with the distribution key, root key verification, job instruction signing, hash computation
+shared-crypto    the agent key (ECDSA P-256) and its connection proof, provider signature verification, ingestion signing and verification with the distribution key, root key verification, job instruction signing, hash computation
 vendor-manifest  per-vendor manifest parsers
 diag-ir          IR schema, bytecode definition, VM (shared by server and agent)
 diag-frontend    ODX/OTX parser, CSV + Starlark→IR transpiler (server only)
@@ -1487,7 +1493,7 @@ vci-service-*    gRPC interface, service launcher (stdio control, bearer tokens)
 server / agent
 ```
 
-Signature verification is needed on both server and agent, and is consolidated in a shared crate to avoid inconsistencies from duplicate implementations. Verification logic for all three trust layers (11.1) lives here.
+Signature verification is needed on both server and agent, and is consolidated in a shared crate to avoid inconsistencies from duplicate implementations. Verification logic for all three trust layers (11.1) lives here. The signature library is used only through this crate's types, so replacing it touches one crate (ADR-459).
 
 | Area | Choice |
 |---|---|
@@ -1680,7 +1686,7 @@ The agent uses only outbound 443, so no inbound firewall rule is needed on the d
 - Do not restrict by source IP; protect with authentication
 - Registration one-time codes have a short expiry and limited attempts. Connection rate is also limited
 - To handle lost or stolen devices, allow immediate revocation per agent
-- mTLS (using the agent key as a client certificate) is an additional option. Revocation management and the TLS termination setup need to be checked
+- The agent's identity does not depend on TLS: the agent signs a server challenge with its key (6.4, ADR-459), which also works on the local profile, where there is no TLS. mTLS (using the agent key as a client certificate) stays an additional option. Revocation management and the TLS termination setup need to be checked
 - Certificate pinning makes connection impossible behind TLS-decrypting proxies, so decide based on the environment
 - In case the agent cannot connect, provide a feature for it to self-diagnose and display the connection path
 

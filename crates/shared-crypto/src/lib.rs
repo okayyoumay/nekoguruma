@@ -9,9 +9,11 @@
 //! - the connection proof ([`proof`]): the agent signs a transcript that names the server, the
 //!   agent and a fresh server challenge, and the server verifies it (design 6.4, 14.4).
 //!
-//! The same primitive will sign job instructions (design 11.1). Every message signed for a
-//! purpose starts with that purpose's own tag, so a signature made for one purpose never
-//! verifies for another; see [`proof`] for the rule.
+//! The same primitive will sign job instructions (design 11.1). Signing and verifying for a
+//! purpose go through [`sign_tagged`] and [`verify_tagged`], which put the purpose's own tag
+//! in front of the message, so a signature made for one purpose never verifies for another.
+//! The connection proof is the first caller and the job instruction signer will be the second,
+//! with a tag of its own. The untagged primitive is not exported.
 //!
 //! # Encodings
 //!
@@ -27,6 +29,6 @@ mod key;
 pub mod proof;
 
 pub use key::{
-    KeyError, PublicKey, RandomError, SIGNATURE_LEN, SignError, Signature, SignatureError, Signer,
-    SigningKey, VerifyError, random_32, verify,
+    KeyError, PublicKey, RandomError, SIGNATURE_LEN, SignError, SignErrorKind, Signature,
+    SignatureError, Signer, SigningKey, VerifyError, random_32, sign_tagged, verify_tagged,
 };

@@ -34,7 +34,7 @@ binds more than the agent's connection.
    fingerprint is the SHA-256 of the canonical SPKI DER; a non-canonical SPKI is refused so the
    stored bytes and the fingerprint cannot disagree.
 3. **Connection proof.** "The agent signs its connection" means a clock-free challenge proof.
-   The agent signs a transcript of a domain-separation tag, a protocol version, the audience
+   The agent signs a transcript of a domain-separation tag (one tag per signed purpose, applied by `shared-crypto`'s tagged sign and verify), a protocol version, the audience
    (the server's origin string), the agent ID, a 32-byte server challenge and a 32-byte agent
    nonce, with length-prefixed variable fields and no timestamp. The server issues each
    challenge once. `shared-crypto` provides building the transcript, signing and verifying. The
@@ -64,9 +64,13 @@ binds more than the agent's connection.
    file store and an in-memory store exist for tests.
 5. **Mode name.** The name is `device`, as in the design and the command line. The database and
    the Web API description still say `machine`; the registration work renames them.
-6. **Dependabot.** `p256`, `ecdsa` and the crates beside them (`elliptic-curve`, `primeorder`,
-   `primefield`, `rfc6979`), and later `zbus`, are kept out of the `cargo-minor-patch` group
+6. **Dependabot.** `p256`, and later `zbus`, are kept out of the `cargo-minor-patch` group
    that ADR-248 merges by itself. Their updates get their own pull requests for the maintainer.
+   Only direct dependencies can be named: Dependabot's Cargo version updates change the
+   manifest's own entries. The signing path's transitive crates (`ecdsa`, `elliptic-curve`,
+   `digest`, `crypto-bigint`, `sec1`, `der`, `spki` and others) can therefore still move as
+   side effects of the lock inside the auto-merged group. That is accepted, because
+   `shared-crypto`'s known-answer tests run on every such pull request.
 7. **TPM.** A non-exportable key in a TPM is M6 work (design 16.3). Moving to it replaces the
    key, so the agent registers again.
 
@@ -79,4 +83,4 @@ binds more than the agent's connection.
   process that takes the port receives the agent's events, but it cannot issue jobs, since
   those are signed (design 11.1).
 - A new signed purpose in `shared-crypto` must pick its own tag and never reuse the proof's.
-- Three more crypto crates enter the lock with a different update path from the rest.
+- The signature crate `p256` has a different update path from the rest; the crates under it do not (item 6).

@@ -1,7 +1,7 @@
 # ADR-248: Dependabot's Cargo Minor/Patch Group Merges Itself
 
 **Date:** 2026-10-08
-**Status:** Accepted (the group leaves out the agent key's signature crates, ADR-459 Decision item 6)
+**Status:** Accepted (the group leaves out the agent key's signature crate `p256`, ADR-459 Decision item 6)
 **Affects:** `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml`,
 `.github/instructions/ci.instructions.md`
 

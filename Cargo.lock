@@ -2307,10 +2307,18 @@ version = "0.1.0"
 dependencies = [
  "axum",
  "diag-ir",
+ "hyper",
+ "hyper-util",
  "serde",
+ "serde_json",
  "shared-proto",
+ "tempfile",
+ "thiserror",
  "tokio",
+ "toml",
+ "tower",
  "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

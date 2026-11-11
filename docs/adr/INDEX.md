@@ -445,6 +445,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-453](ADR-453-the-items-an-exchange-reads-are-offered-in-the-order-read-the-late-finals-among-them.md) | The Items an Exchange Reads Are Offered in the Order Read, the Late Finals Among Them | Accepted | `agent` communication log (`comm_log.rs` `CommLog::exchange_with`, `CommLog::primitive_ended`); design 8.11 `late_item`; ADR-370 item 4 and Consequences, ADR-447 decision 1, ADR-450 Consequences |
 | [ADR-454](ADR-454-a-jobs-ir-documents-are-named-by-hash-in-its-signed-instruction.md) | A Job's IR Documents Are Named by Content Hash in Its Signed Instruction | Accepted | design 8.2.6 / 11.1, `agent` `check_job`; ADR-318, ADR-325 |
 | [ADR-455](ADR-455-the-communication-log-goes-to-the-server-only-by-explicit-user-action.md) | The Agent's Communication Log Goes to the Server Only by Explicit User Action | Accepted | design 8.11 / 16.2, `agent` communication log; ADR-237, ADR-346 |
+| [ADR-456](ADR-456-the-local-profile-server-serves-one-pinned-origin-behind-a-request-guard.md) | The Local-Profile Server Serves One Pinned Origin Behind a Request Guard | Accepted | design 13.3, `crates/server`, `api/openapi.yaml` health path |
 
 ## Status Legend
 
@@ -756,6 +757,7 @@ the predecessor repository these ADRs came from.
 - ADR-282
 - ADR-284
 - ADR-415
+- ADR-456
 
 ### vci-service-manager Process Startup
 - ADR-073

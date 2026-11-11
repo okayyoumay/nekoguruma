@@ -1568,7 +1568,7 @@ Such operations are hidden in the UI from the outset and are also stated explici
 
 - Listen on `127.0.0.1` only. Perform Host header validation, WebSocket Origin validation and CSRF protection
 - Other OS users on the same PC can also connect, so login is mandatory
-- `localhost` and `127.0.0.1` are treated as different origins, so pin one and redirect to it
+- `localhost` and `127.0.0.1` are treated as different origins, so pin one and redirect to it. The pinned origin is `http://127.0.0.1:<port>`: a request whose Host is `localhost:<port>` gets a 307 to the same path and query there, any other Host but `127.0.0.1:<port>` gets 421 (a malformed or missing Host, 400), and a request carrying an Origin other than the pinned one gets 403 (a missing Origin passes, since the agent and same-origin GETs send none, and Origin never authorizes, 5.7.1). The check runs before routing, so unknown paths are guarded too, and only HTTP/1 is served so that Host is the only carrier of the authority. The rules and their order, and the bounds on a slow client and on shutdown, are in ADR-456
 - In the personal deployment, backup is the user's responsibility, so provide an export function
 
 ### 13.4 Testing Use

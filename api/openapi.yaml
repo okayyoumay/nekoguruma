@@ -27,8 +27,29 @@ tags:
   - name: extensions
   - name: data
   - name: sovd
+  - name: system
 
 paths:
+  # ------------------------------------------------------------ System
+  /v1/health:
+    get:
+      tags: [system]
+      summary: Liveness and readiness probe
+      description: |
+        Needs no login: the installer, the service manager and tests probe it before any user
+        exists. In the first build of the local deployment it answers 200 whenever the server
+        serves; once the server has a database it answers 503 while the database does not
+        respond. The body holds nothing else, since other OS users can reach it (13.3). Like every
+        route of the local deployment it is subject to the Host and Origin rules of 13.3.
+      security: []
+      responses:
+        '200':
+          description: The server is serving
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Health' }
+        '503': { $ref: '#/components/responses/Problem' }
+
   # ------------------------------------------------------------ Jobs
   /v1/jobs:
     post:
@@ -432,6 +453,12 @@ components:
           schema: { $ref: '#/components/schemas/Problem' }
 
   schemas:
+    Health:
+      type: object
+      required: [status]
+      properties:
+        status: { type: string, enum: [ok] }
+
     Problem:
       type: object
       description: RFC 9457. `code` holds a machine-readable value

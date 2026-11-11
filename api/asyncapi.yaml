@@ -42,6 +42,7 @@ channels:
       agentEvent: { $ref: '#/components/messages/AgentEvent' }
       heartbeat: { $ref: '#/components/messages/Heartbeat' }
       reconcile: { $ref: '#/components/messages/Reconcile' }
+      commandRejected: { $ref: '#/components/messages/CommandRejected' }
 
   browserStream:
     address: /ws/v1
@@ -57,10 +58,22 @@ operations:
     channel: { $ref: '#/channels/agentControl' }
     summary: Server → agent. Job delivery
     description: |
-      Idempotent. The agent ACKs receipt, records the job ID in its journal, and
-      ignores duplicates (5.3). Jobs past their start deadline are not run; Expired is reported instead.
+      Idempotent. The agent verifies the signed instruction first (11.1), then ACKs receipt,
+      records the job ID in its journal, and ignores duplicates (5.3). A command whose
+      instruction fails verification is answered with commandRejected (ADR-461) and creates no job. Jobs past their start deadline are not run; Expired is reported instead.
     messages:
       - { $ref: '#/channels/agentControl/messages/jobCommand' }
+
+  rejectCommand:
+    action: send
+    channel: { $ref: '#/channels/agentControl' }
+    summary: Agent → server. A job command the agent refused
+    description: |
+      Sent for a job command whose instruction does not verify or is not for this agent (5.3,
+      ADR-461). It is keyed by the command, not by a job: no job state exists for the command.
+      The agent also writes an operational-log entry.
+    messages:
+      - { $ref: '#/channels/agentControl/messages/commandRejected' }
 
   sendEvent:
     action: send
@@ -102,10 +115,28 @@ components:
           signedJob:
             type: string
             description: |
-              base64. Signed with the server's instruction key (11.1).
-              The agent verifies it with the key received at registration.
-          irDigests: { type: array, items: { type: string } }
-          artifactDigest: { type: string }
+              base64 of one envelope (11.1, ADR-461): a format byte (1), the SHA-256
+              fingerprint of the signing key's SPKI (32 bytes), the signature (64 bytes, r then
+              s, low-S) and the payload, a postcard `JobInstruction` of at most 64 KiB. The
+              signature covers the payload bytes under the tag "nekoguruma job instruction".
+              The agent verifies it with the key pinned at registration before it parses the
+              payload. The job's documents, artifact and plan are named by hash inside the
+              payload; nothing the agent acts on is carried beside it.
+
+    CommandRejected:
+      name: commandRejected
+      payload:
+        type: object
+        required: [commandId, reason]
+        properties:
+          commandId: { type: string, description: The commandId of the refused job command }
+          reason:
+            type: string
+            description: |
+              Coarse on purpose. unknownKey: the envelope names a key other than the agent's
+              pinned one (the server asks the agent to register again after it rotated its
+              key). notForThisAgent: the instruction verified but names another agent.
+            enum: [malformed, unknownKey, badSignature, unsupportedVersion, notForThisAgent]
 
     CancelCommand:
       name: cancelCommand

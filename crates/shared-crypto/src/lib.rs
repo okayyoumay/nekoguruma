@@ -9,11 +9,15 @@
 //! - the connection proof ([`proof`]): the agent signs a transcript that names the server, the
 //!   agent and a fresh server challenge, and the server verifies it (design 6.4, 14.4).
 //!
-//! The same primitive will sign job instructions (design 11.1). Signing and verifying for a
-//! purpose go through [`sign_tagged`] and [`verify_tagged`], which put the purpose's own tag
-//! in front of the message, so a signature made for one purpose never verifies for another.
-//! The connection proof is the first caller and the job instruction signer will be the second,
-//! with a tag of its own. The untagged primitive is not exported.
+//! - the job instruction ([`instruction`]): the server signs an instruction's payload bytes
+//!   and the agent verifies them before it parses them; the module also joins and splits the
+//!   envelope that carries the key fingerprint, the signature and the payload (ADR-461,
+//!   design 11.1).
+//!
+//! Signing and verifying for a purpose go through [`sign_tagged`] and [`verify_tagged`], which
+//! put the purpose's own tag in front of the message, so a signature made for one purpose
+//! never verifies for another. The connection proof and the job instruction each have a tag of
+//! their own. The untagged primitive is not exported.
 //!
 //! # Encodings
 //!
@@ -25,6 +29,7 @@
 //! - A signature is 64 bytes, the fixed-size r then s. The signer produces the low-S form and
 //!   the verifier accepts only that form, so a signature has one valid encoding.
 
+pub mod instruction;
 mod key;
 pub mod proof;
 

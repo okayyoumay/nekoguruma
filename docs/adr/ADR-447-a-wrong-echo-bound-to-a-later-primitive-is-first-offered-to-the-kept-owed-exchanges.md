@@ -1,7 +1,7 @@
 # ADR-447: A Wrong Echo Bound to a Later Primitive Is First Offered to the Kept Owed Exchanges
 
 **Date:** 2026-11-10
-**Status:** Accepted
+**Status:** Accepted (decision 1's one pass extended by ADR-453: it also offers each indication and pending to its one owner and gives the exchange in flight its own, in the order read)
 **Affects:** `agent` (`comm_log.rs` `CommLog::exchange_with`, `Inner::offer_rejected`,
 `late_response_owner_with`, `Inner::late_response_written`, `Inner::late_response_unowned`;
 `comm_log/exchange.rs` `Rejected`, `RejectedItem`, `Evidence::end_placed`, `classify`), design 8.11

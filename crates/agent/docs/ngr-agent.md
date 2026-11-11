@@ -678,8 +678,18 @@ tell a vehicle fault from a fault of the diagnostic system. `agent::comm_log` wr
   could own it (one whose `sent` is still `unknown`, or an owed request awaiting a response on
   that identifier) owns, and not the exchange in flight, is a `late_item` settling entry
   (ADR-370): the exchange in flight was not yet in flight with the identifier when the item's
-  VCI time comes before its own transmit done (`before_starts`). It is written before the
-  exchange's own items, and restates that
+  VCI time comes before its own transmit done (`before_starts`). `exchange_with` goes through
+  the unbound items and the rejected wrong echoes once, in the order the host read them
+  (`Offer`, ADR-447, ADR-453), and judges each against what the items read before it left: the
+  one ended owner's `late_item` first, else the exchange's own transmit indication or start when
+  no ended exchange could own it by then (`may_own_tx_indication`,
+  `may_own_start_indication`), else `late_response` or `unattached` with the possible owners
+  named (`place_unbound_item`). A pending, start or transmit indication read after a late final
+  therefore meets the record that final left, in one read as across two. The link errors follow
+  the pass, since they are set against the exchange's span, which the pass completes;
+  `primitive_ended` goes through the items read in its primitive's wait in the same order, after
+  choosing the indications its own entry takes, which it still does first. The
+  `late_item` restates that
   exchange's `sent` and outcome, judges its timing again, and reclassifies it (not a record whose
   evidence settles its exchange, below) and the later exchanges
   (`exchange::LinkState::update_kept`); a start before the limit less the margin is kept

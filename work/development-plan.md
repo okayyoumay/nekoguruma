@@ -35,6 +35,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 - `diag-ir`: declaration part in FlatBuffers with pre-expanded decode plans and COMPU-METHOD conversions (8.2.2); the full procedure-part instruction set (8.2.4); resume model (8.2.5); interruptibility attributes (8.10.1).
 - `diag-frontend`: the proprietary format first, CSV tables + Starlark subset -> IR (8.4), because it needs no purchased standard. Dry-run validation with vehicle access mocked (12.1).
 - COMPARAM mapping on the J2534 side for the base protocols (8.5).
+- The agent's communication log (8.11) as the runtime writes it: one entry per exchange and per event, secrets and bulk bytes left out, the job's outcome never changed by it, and each exchange classified from what was known when it was written (decided by the maintainer, 2026-11-11). It is implemented and serves the milestone's runs; it adds no exit criterion. The attribution of late items across exchanges is refined in M8.
 
 **Exit criteria.**
 
@@ -60,6 +61,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 - Control channel WSS and data channel HTTPS with resumable chunks (5.2); idempotent commands, start deadlines, sequence-numbered outbox and reconnection reconciliation (5.3).
 - Agent identity, installation and initial registration (6.1, 6.4, 6.7); job instruction signing and verification in `shared-crypto` (11.1).
 - `api/openapi.yaml` and `api/asyncapi.yaml` kept in sync with the implementation.
+- The agent's communication log (8.11) stored with the job's result: its upload over the data channel and its retention on the server (decided by the maintainer, 2026-11-11; the upload and retention policy is under "Decisions needed").
 
 **Exit criteria.**
 
@@ -80,7 +82,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Goal.** Operators use the system from an ordinary browser (R4): run jobs, view and edit acquired data, and start pre-fetched jobs offline.
 
-**Scope.** UI framework and reference implementation (9.6); acquired data, record templates and annotations (4.3, 4.3.1, R21); concurrent editing and merge (R7); local-first sync (4.4, R6); PWA caching and the offline local connection (5.7, 5.7.1); confirmation levels for the job types (5.1, 6.3).
+**Scope.** Viewing a job's communication log (8.11) in the browser (decided by the maintainer, 2026-11-11). UI framework and reference implementation (9.6); acquired data, record templates and annotations (4.3, 4.3.1, R21); concurrent editing and merge (R7); local-first sync (4.4, R6); PWA caching and the offline local connection (5.7, 5.7.1); confirmation levels for the job types (5.1, 6.3).
 
 **Exit criteria.**
 
@@ -148,6 +150,8 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 
 **Goal.** The standard deployment (design 14) with OIDC, S3-compatible storage and containers; the size-S measures that apply regardless of scale (15.2); validation with real VCIs against the per-vendor checklist (design 17, "Items to Confirm Early").
 
+**Scope.** Besides the deployment and the validation above: the communication log's attribution of late items across exchanges (8.11 `late_item`, `late_response`, Settlement) is refined against what real VCIs deliver (decided by the maintainer, 2026-11-11). Its invariants are written down and checked by generated-sequence tests, its placement paths are unified under those tests, and the coarse cases are refined only where the real-VCI runs show they leave exchanges `undetermined` often enough to matter.
+
 **Exit criteria.**
 
 1. The server runs as a container with OIDC and S3-compatible storage, and an agent over the internet completes a job (14.4).
@@ -162,6 +166,8 @@ This is the one milestone whose exit criteria require real hardware. It runs the
 ## Decisions needed
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
+
+- The communication log's upload and retention before M3 stores it: not a design-17 item, but design 8.11 leaves them open.
 
 - Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start; SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145 before M7's generic OBD package. The M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Design 17 P5 (non-functional targets) before M8.

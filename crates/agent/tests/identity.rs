@@ -163,19 +163,75 @@ fn a_release_build_has_no_file_store() {
     assert!(is_empty_dir(state.path()));
 }
 
-/// E1: `run` does not touch the key store or the state directory, with both variables set.
+/// A variant's document whose procedure is `SecurityAccess`, which every build refuses (ADR-259),
+/// so `run` gets past reading the document and checking the job, as far as it goes before a
+/// worker starts.
+fn refused_document(dir: &Path) -> std::path::PathBuf {
+    use diag_ir::declaration::{EcuDocumentT, EcuVariantT, ProtocolT, encode_ecu_document};
+    use diag_ir::{IR_SCHEMA_VERSION, Op, Program};
+    let program = Program {
+        schema_version: IR_SCHEMA_VERSION,
+        code: vec![Op::PushBytes(0), Op::SecurityAccess { level: 1 }],
+        constants: vec![vec![0xF1, 0x90]],
+        sections: Vec::new(),
+        source_map: Vec::new(),
+        identity: Default::default(),
+        preconditions: Default::default(),
+        flash: Vec::new(),
+        targets: Vec::new(),
+    };
+    let mut protocol = ProtocolT::default();
+    protocol.short_name = Some("ISO15765".into());
+    protocol.application_layer = Some("UDS".into());
+    protocol.baud_rate = 500_000;
+    protocol.tx_id = 0x7E0;
+    protocol.rx_id = 0x7E8;
+    let mut variant = EcuVariantT::default();
+    variant.id = 1;
+    variant.short_name = Some("v".into());
+    variant.protocols = Some(vec![protocol]);
+    let mut document = EcuDocumentT::default();
+    document.schema_version = IR_SCHEMA_VERSION;
+    document.source_format = Some("csv-starlark".into());
+    document.source_digest = Some("00".into());
+    document.variant = Some(Box::new(variant));
+    document.procedure = Some(postcard::to_allocvec(&program).unwrap());
+    let path = dir.join("variant.dir");
+    std::fs::write(&path, encode_ecu_document(&document)).unwrap();
+    path
+}
+
+/// E1: `run` and `identify` do not touch the key store or the state directory, with both
+/// variables set. Neither is driven to a worker here (that needs a VCI, which the end-to-end
+/// tests of the worker packages have): each goes as far as the agent's own checks refuse the job,
+/// after argument parsing and reading its inputs, which is where a store access added to the
+/// command would sit.
 #[test]
-fn run_leaves_the_state_directory_alone() {
+fn run_and_identify_leave_the_state_directory_alone() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
-    let output = ngr_agent(home.path())
-        .args(["run", "--vci", "x", "--mode", "user", "--document"])
-        .arg(home.path().join("missing.dir"))
+    let inputs = tempfile::tempdir().unwrap();
+    let document = refused_document(inputs.path());
+    let garbage_plan = inputs.path().join("plan.bin");
+    std::fs::write(&garbage_plan, b"not a plan").unwrap();
+    let run = ngr_agent(home.path())
+        .args(["run", "--vci", "none", "--mode", "user", "--document"])
+        .arg(&document)
         .env(KEY_STORE_VAR, "file")
         .env(STATE_DIR_VAR, state.path())
         .output()
         .unwrap();
-    assert_eq!(output.status.code(), Some(1));
+    assert_exit(&run, 1);
+    assert!(String::from_utf8_lossy(&run.stderr).contains("refused"));
+    let identify = ngr_agent(home.path())
+        .args(["identify", "--vci", "none", "--mode", "user", "--plan"])
+        .arg(&garbage_plan)
+        .env(KEY_STORE_VAR, "file")
+        .env(STATE_DIR_VAR, state.path())
+        .output()
+        .unwrap();
+    assert_exit(&identify, 1);
+    assert!(String::from_utf8_lossy(&identify.stderr).contains("plan refused"));
     assert!(is_empty_dir(state.path()));
 }
 
@@ -279,11 +335,54 @@ fn an_unusable_key_exits_with_4_and_is_not_replaced() {
     assert_eq!(std::fs::read(&file).unwrap(), b"not a key");
 }
 
-/// L7, exit 3: with the key absent and the state directory unusable (a regular file stands where
-/// the `identity` directory belongs; this fails for root as well), the exit is 3 and no key exists.
+/// L7, exit 3: with the key absent and the lock unopenable (a directory stands at the lock's
+/// name, which fails for root as well), the exit is 3 and no key is created.
 #[cfg(debug_assertions)]
 #[test]
-fn an_unusable_state_directory_exits_with_3() {
+fn a_lock_that_cannot_be_opened_exits_with_3() {
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let lock = state
+        .path()
+        .join("identity")
+        .join("nekoguruma-agent-key.user.v1.lock");
+    std::fs::create_dir_all(&lock).unwrap();
+    let output = identity(home.path(), state.path(), "user")
+        .output()
+        .unwrap();
+    assert_exit(&output, 3);
+    assert!(
+        !state
+            .path()
+            .join("identity")
+            .join("nekoguruma-agent-key.user.v1.pk8")
+            .exists()
+    );
+}
+
+/// L9, exit 3: an `identity` directory that others may write is refused (mode bits, which hold
+/// for root too), and no key is created in it.
+#[cfg(all(debug_assertions, unix))]
+#[test]
+fn a_world_writable_identity_directory_exits_with_3() {
+    use std::os::unix::fs::PermissionsExt;
+    let home = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+    let dir = state.path().join("identity");
+    std::fs::create_dir(&dir).unwrap();
+    std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+    let output = identity(home.path(), state.path(), "user")
+        .output()
+        .unwrap();
+    assert_exit(&output, 3);
+    assert!(std::fs::read_dir(&dir).unwrap().next().is_none());
+}
+
+/// A regular file where the `identity` directory belongs: the store cannot even be read, so the
+/// exit is 3 (S3) and the file is as it was.
+#[cfg(debug_assertions)]
+#[test]
+fn an_identity_path_that_is_a_file_exits_with_3() {
     let home = tempfile::tempdir().unwrap();
     let state = tempfile::tempdir().unwrap();
     std::fs::write(state.path().join("identity"), b"a file").unwrap();

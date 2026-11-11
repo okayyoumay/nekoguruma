@@ -129,11 +129,13 @@ type GetHook = Arc<dyn Fn() + Send + Sync>;
 
 #[derive(Default)]
 struct MemoryInner {
-    secrets: HashMap<String, Vec<u8>>,
+    secrets: HashMap<String, Zeroizing<Vec<u8>>>,
     /// Outcomes `get` returns before it answers from `secrets`, in order: bytes, or an error
     /// kind (`Absent` answers that the name holds nothing).
-    scripted_gets: VecDeque<Result<Vec<u8>, StoreErrorKind>>,
+    scripted_gets: VecDeque<Result<Zeroizing<Vec<u8>>, StoreErrorKind>>,
     put_fault: Option<StoreErrorKind>,
+    /// Whether a faulting `put_new` has stored the secret before it fails.
+    put_fault_after_write: bool,
     read_only: bool,
     absent_hook: Option<GetHook>,
 }
@@ -163,11 +165,13 @@ impl MemoryStore {
 
     /// Puts `bytes` under `name` as they are, whatever they hold, bypassing every fault.
     pub fn insert_raw(&self, name: &SecretName, bytes: &[u8]) {
-        self.inner().secrets.insert(name.0.clone(), bytes.to_vec());
+        self.inner()
+            .secrets
+            .insert(name.0.clone(), Zeroizing::new(bytes.to_vec()));
     }
 
     /// The bytes under `name`, bypassing every fault.
-    pub fn peek(&self, name: &SecretName) -> Option<Vec<u8>> {
+    pub fn peek(&self, name: &SecretName) -> Option<Zeroizing<Vec<u8>>> {
         self.inner().secrets.get(&name.0).cloned()
     }
 
@@ -182,12 +186,24 @@ impl MemoryStore {
 
     /// Queues the outcome of one `get`, used before any answer from the stored secrets.
     pub fn queue_get(&self, outcome: Result<Vec<u8>, StoreErrorKind>) {
-        self.inner().scripted_gets.push_back(outcome);
+        self.inner()
+            .scripted_gets
+            .push_back(outcome.map(Zeroizing::new));
     }
 
     /// Makes every `put_new` fail with `kind` (nothing is stored), or stop failing.
     pub fn set_put_fault(&self, kind: Option<StoreErrorKind>) {
-        self.inner().put_fault = kind;
+        let mut inner = self.inner();
+        inner.put_fault = kind;
+        inner.put_fault_after_write = false;
+    }
+
+    /// Makes every `put_new` store the secret and then fail with `kind`, like a file store whose
+    /// last sync fails after the file is in place.
+    pub fn set_put_fault_after_write(&self, kind: StoreErrorKind) {
+        let mut inner = self.inner();
+        inner.put_fault = Some(kind);
+        inner.put_fault_after_write = true;
     }
 
     /// Calls `hook` after every `get` that answers `Absent`, before it returns, so a test can
@@ -212,7 +228,7 @@ impl SecretStore for MemoryStore {
             (outcome, inner.absent_hook.clone())
         };
         match outcome {
-            Ok(bytes) => Ok(Zeroizing::new(bytes)),
+            Ok(bytes) => Ok(bytes),
             Err(kind) => {
                 if let (StoreErrorKind::Absent, Some(hook)) = (kind, hook) {
                     hook();
@@ -227,14 +243,19 @@ impl SecretStore for MemoryStore {
         if inner.read_only {
             return Err(StoreError::new(StoreErrorKind::NotCreatable));
         }
-        if let Some(kind) = inner.put_fault {
+        if let (Some(kind), false) = (inner.put_fault, inner.put_fault_after_write) {
             return Err(StoreError::new(kind));
         }
         if inner.secrets.contains_key(&name.0) {
             return Err(StoreError::new(StoreErrorKind::AlreadyExists));
         }
-        inner.secrets.insert(name.0.clone(), secret.to_vec());
-        Ok(())
+        inner
+            .secrets
+            .insert(name.0.clone(), Zeroizing::new(secret.to_vec()));
+        match inner.put_fault {
+            Some(kind) => Err(StoreError::new(kind)),
+            None => Ok(()),
+        }
     }
 }
 

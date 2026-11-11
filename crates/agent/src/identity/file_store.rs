@@ -3,17 +3,16 @@
 //! store that writes a key unprotected.
 
 use std::fs::{self, OpenOptions};
-use std::io::{self, Write};
-use std::path::{Path, PathBuf};
+use std::io;
+use std::path::PathBuf;
 
 use shared_crypto::Zeroizing;
 
 use super::store::{SecretName, SecretStore, StoreError, StoreErrorKind};
-use crate::journal::sync_dir;
+use crate::journal::{CreateLinkedError, create_linked};
 
-/// Secrets as files `<name>.pk8` in one directory. A file appears complete or not at all: the
-/// bytes are written and synced under a temporary name, then hard-linked to the final name, which
-/// fails when the name exists (the way `Journal::create` makes the journal).
+/// Secrets as files `<name>.pk8` in one directory. A file appears complete or not at all, made by the
+/// same routine as the journal (`create_linked`).
 pub struct DebugFileStore {
     dir: PathBuf,
 }
@@ -47,44 +46,25 @@ impl SecretStore for DebugFileStore {
     fn put_new(&self, name: &SecretName, secret: &[u8]) -> Result<(), StoreError> {
         let path = self.path(name);
         let tmp = path.with_extension("pk8.tmp");
-        // A temporary file left by an attempt that crashed holds no key anyone adopted.
-        match fs::remove_file(&tmp) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => {
-                return Err(unavailable(error));
+        match create_linked(&self.dir, &path, &tmp, secret, private_options()) {
+            Ok(_) => Ok(()),
+            Err(CreateLinkedError::AlreadyExists) => {
+                Err(StoreError::new(StoreErrorKind::AlreadyExists))
             }
-            _ => {}
+            Err(CreateLinkedError::Io(error)) => Err(unavailable(error)),
         }
-        let written = (|| {
-            let mut file = create_private(&tmp)?;
-            file.write_all(secret)?;
-            file.sync_all()
-        })();
-        if let Err(error) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(unavailable(error));
-        }
-        let linked = fs::hard_link(&tmp, &path);
-        let _ = fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(StoreError::new(StoreErrorKind::AlreadyExists));
-            }
-            Err(error) => return Err(unavailable(error)),
-        }
-        sync_dir(&self.dir).map_err(unavailable)
     }
 }
 
-fn create_private(path: &Path) -> io::Result<fs::File> {
+/// Options that give the new file to its owner only on Unix.
+fn private_options() -> OpenOptions {
     let mut options = OpenOptions::new();
-    options.write(true).create_new(true);
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600);
     }
-    options.open(path)
+    options
 }
 
 #[cfg(test)]

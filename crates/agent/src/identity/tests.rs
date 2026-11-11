@@ -25,6 +25,15 @@ fn no_lock_dir() -> Result<PathBuf, StateDirError> {
     panic!("the lock directory is not needed");
 }
 
+/// A transcript with a challenge and a nonce drawn at run time.
+fn transcript() -> ProofTranscript {
+    let (challenge, nonce) = (
+        shared_crypto::random_32().unwrap(),
+        shared_crypto::random_32().unwrap(),
+    );
+    ProofTranscript::new("https://ngr.example", "agent-1", challenge, nonce).unwrap()
+}
+
 fn key_bytes() -> (SigningKey, Vec<u8>) {
     let key = SigningKey::generate().unwrap();
     let der = key.to_pkcs8_der().to_vec();
@@ -82,8 +91,7 @@ fn a_first_run_creates_and_a_rerun_finds_the_same_key() {
 fn a_proof_made_with_the_loaded_key_verifies_against_its_public_key() {
     let temp = tempfile::tempdir().unwrap();
     let key = load(&MemoryStore::new(), temp.path()).unwrap();
-    let transcript =
-        ProofTranscript::new("https://ngr.example", "agent-1", [1; 32], [2; 32]).unwrap();
+    let transcript = transcript();
     let signature = sign_proof(&*key.signer(), &transcript).unwrap();
     verify_proof(&key.public_key(), &transcript, &signature).unwrap();
     let other = SigningKey::generate().unwrap();
@@ -112,7 +120,7 @@ fn an_undecryptable_key_is_unusable_and_not_replaced() {
     let error = load_or_create(&store, &name(), &no_lock_dir, WAIT).unwrap_err();
     assert_eq!(kind(&error), "KeyUnusable");
     assert!(!error.retryable());
-    assert_eq!(store.peek(&name()).unwrap(), b"sealed");
+    assert_eq!(store.peek(&name()).unwrap().as_slice(), b"sealed");
 }
 
 /// S5: a present value that is not a P-256 PKCS#8 key is unusable and byte-identical afterwards.
@@ -135,7 +143,7 @@ fn a_present_value_that_is_not_a_p256_key_is_unusable_and_not_replaced() {
         store.insert_raw(&name(), &bytes);
         let error = load_or_create(&store, &name(), &no_lock_dir, WAIT).unwrap_err();
         assert_eq!(kind(&error), "KeyUnusable", "{label}");
-        assert_eq!(store.peek(&name()).unwrap(), bytes, "{label}");
+        assert_eq!(store.peek(&name()).unwrap().as_slice(), bytes, "{label}");
     }
 }
 
@@ -163,7 +171,7 @@ fn a_key_that_appears_while_waiting_is_adopted() {
     let loaded = load(&store, temp.path()).unwrap();
     assert!(!loaded.created());
     assert_eq!(loaded.public_key(), key.public_key());
-    assert_eq!(store.peek(&name()).unwrap(), der);
+    assert_eq!(store.peek(&name()).unwrap().as_slice(), der);
 }
 
 /// S11: the re-check finds the store unavailable or the key unusable: no create.
@@ -197,6 +205,69 @@ fn a_failed_create_is_unavailable_and_stores_nothing() {
     // The next try, with the fault gone, creates.
     store.set_put_fault(None);
     assert!(load(&store, temp.path()).unwrap().created());
+}
+
+/// A create that failed after the key was in place (a sync failed) leaves a key: it is adopted,
+/// and this call does not claim to have created it.
+#[test]
+fn a_create_that_fails_after_the_key_is_in_place_adopts_it() {
+    let temp = tempfile::tempdir().unwrap();
+    let store = MemoryStore::new();
+    store.set_put_fault_after_write(StoreErrorKind::Unavailable);
+    let loaded = load(&store, temp.path()).unwrap();
+    assert!(!loaded.created());
+    assert_eq!(store.len(), 1);
+    assert_eq!(
+        store.peek(&name()).unwrap().as_slice(),
+        &*SigningKey::from_pkcs8_der(&store.peek(&name()).unwrap())
+            .unwrap()
+            .to_pkcs8_der()
+    );
+}
+
+/// A wait too long to add to the clock does not panic.
+#[test]
+fn a_wait_beyond_the_clock_is_no_deadline() {
+    let temp = tempfile::tempdir().unwrap();
+    let key = load_or_create(
+        &MemoryStore::new(),
+        &name(),
+        &dir_of(temp.path()),
+        Duration::MAX,
+    )
+    .unwrap();
+    assert!(key.created());
+}
+
+/// E4 across processes: a second store instance on the same directory (as a later process has)
+/// loads the key the first created, and its proof verifies against the PEM the first printed.
+#[cfg(debug_assertions)]
+#[test]
+fn a_proof_from_a_later_load_verifies_against_the_first_loads_pem() {
+    use file_store::DebugFileStore;
+    let temp = tempfile::tempdir().unwrap();
+    let keys = temp.path().to_owned();
+    let first = load_or_create(
+        &DebugFileStore::new(keys.clone()),
+        &name(),
+        &dir_of(&keys),
+        WAIT,
+    )
+    .unwrap();
+    let pem = first.public_key().to_spki_pem();
+    drop(first);
+    let later = load_or_create(
+        &DebugFileStore::new(keys.clone()),
+        &name(),
+        &no_lock_dir,
+        WAIT,
+    )
+    .unwrap();
+    assert!(!later.created());
+    let transcript = transcript();
+    let signature = sign_proof(&*later.signer(), &transcript).unwrap();
+    let printed = shared_crypto::PublicKey::from_spki_pem(&pem).unwrap();
+    verify_proof(&printed, &transcript, &signature).unwrap();
 }
 
 /// S13: a writer outside the lock created the key first: adopt it.

@@ -128,7 +128,11 @@ pub(crate) fn prepare_subdir(
     name: &str,
 ) -> Result<PathBuf, StateDirError> {
     if create_root {
+        let existed = root.exists();
         make_dir_all(root).map_err(|error| io_error("create the state directory", &error))?;
+        if !existed {
+            sync_parent(root)?;
+        }
     } else if !root.is_dir() {
         return Err(StateDirError::new(
             "the state directory is missing (the installation creates it)",
@@ -136,12 +140,21 @@ pub(crate) fn prepare_subdir(
     }
     let dir = root.join(name);
     match make_dir(&dir) {
-        Ok(()) => {}
+        Ok(()) => sync_parent(&dir)?,
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
         Err(error) => return Err(io_error("create a state sub-directory", &error)),
     }
     check_private(&dir)?;
     Ok(dir)
+}
+
+/// Makes the entry of a directory just created durable, by syncing the directory it is in.
+fn sync_parent(dir: &Path) -> Result<(), StateDirError> {
+    match dir.parent() {
+        Some(parent) => crate::journal::sync_dir(parent)
+            .map_err(|error| io_error("sync the state directory", &error)),
+        None => Ok(()),
+    }
 }
 
 fn io_error(what: &str, error: &std::io::Error) -> StateDirError {

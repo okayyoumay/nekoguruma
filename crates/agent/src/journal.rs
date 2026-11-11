@@ -765,33 +765,11 @@ impl Journal<FileStore> {
             push_frame(&mut bytes, &encode(&entry)?)?;
             records += 1;
         }
-        // A temporary file left by an earlier attempt that crashed holds no commits.
-        match fs::remove_file(&tmp) {
-            Err(error) if error.kind() != io::ErrorKind::NotFound => return Err(error.into()),
-            _ => {}
-        }
-        let written = (|| {
-            let mut file = OpenOptions::new().write(true).create_new(true).open(&tmp)?;
-            file.write_all(&bytes)?;
-            file.sync_all()
-        })();
-        if let Err(error) = written {
-            let _ = fs::remove_file(&tmp);
-            return Err(error.into());
-        }
-        let linked = fs::hard_link(&tmp, &path);
-        let _ = fs::remove_file(&tmp);
-        match linked {
-            Ok(()) => {}
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                return Err(JournalError::AlreadyExists);
-            }
-            Err(error) => return Err(error.into()),
-        }
-        sync_dir(dir)?;
-        let file = OpenOptions::new().read(true).write(true).open(&path)?;
-        // Where the directory cannot be synced, the file's own sync covers its entry.
-        file.sync_all()?;
+        let file = match create_linked(dir, &path, &tmp, &bytes, OpenOptions::new()) {
+            Ok(file) => file,
+            Err(CreateLinkedError::AlreadyExists) => return Err(JournalError::AlreadyExists),
+            Err(CreateLinkedError::Io(error)) => return Err(error.into()),
+        };
         Ok(Self {
             store: FileStore {
                 file,
@@ -1177,6 +1155,62 @@ pub(crate) fn job_file_stem(key: &JobKey) -> Result<String, JournalError> {
 /// `{job_id}.g{generation}.journal` in `dir`.
 fn journal_path(dir: &Path, key: &JobKey) -> Result<PathBuf, JournalError> {
     Ok(dir.join(format!("{}.journal", job_file_stem(key)?)))
+}
+
+/// Why [`create_linked`] did not create the file.
+pub(crate) enum CreateLinkedError {
+    /// The final name exists.
+    AlreadyExists,
+    Io(io::Error),
+}
+
+/// Creates the file `path` in `dir` holding `bytes` so that it appears complete or not at all:
+/// the bytes are written and synced under the temporary name `tmp` (opened with `tmp_options`,
+/// to which the new-file and write flags are added), which is then hard-linked to `path`, a
+/// link that fails when `path` exists, and removed. A temporary file left by an earlier attempt
+/// that crashed is removed first. The directory entry is synced, and the file reopened for
+/// reading and writing is synced too, since syncing a directory does nothing on Windows. The
+/// journal and the debug key store both create their files this way.
+pub(crate) fn create_linked(
+    dir: &Path,
+    path: &Path,
+    tmp: &Path,
+    bytes: &[u8],
+    mut tmp_options: OpenOptions,
+) -> Result<File, CreateLinkedError> {
+    match fs::remove_file(tmp) {
+        Err(error) if error.kind() != io::ErrorKind::NotFound => {
+            return Err(CreateLinkedError::Io(error));
+        }
+        _ => {}
+    }
+    let written = (|| {
+        let mut file = tmp_options.write(true).create_new(true).open(tmp)?;
+        file.write_all(bytes)?;
+        file.sync_all()
+    })();
+    if let Err(error) = written {
+        let _ = fs::remove_file(tmp);
+        return Err(CreateLinkedError::Io(error));
+    }
+    let linked = fs::hard_link(tmp, path);
+    let _ = fs::remove_file(tmp);
+    match linked {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
+            return Err(CreateLinkedError::AlreadyExists);
+        }
+        Err(error) => return Err(CreateLinkedError::Io(error)),
+    }
+    sync_dir(dir).map_err(CreateLinkedError::Io)?;
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .map_err(CreateLinkedError::Io)?;
+    // Where the directory cannot be synced, the file's own sync covers its entry.
+    file.sync_all().map_err(CreateLinkedError::Io)?;
+    Ok(file)
 }
 
 /// Makes a new directory entry durable. NTFS logs the entry with the file's metadata, which

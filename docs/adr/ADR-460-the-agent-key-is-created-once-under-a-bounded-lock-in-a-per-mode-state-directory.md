@@ -73,4 +73,6 @@ does), but it is covered by the same rule.
   seconds, instead of hanging.
 - On Windows a temporary profile or an unmounted home reads as Absent and would create a new
   key; the Windows store work must account for it.
+- A create that fails after the key is in place (a file store whose last sync fails) is
+  adopted by reading back, and reported as not created by this call.
 - Registration and connect call the create-once routine and never `put_new`.

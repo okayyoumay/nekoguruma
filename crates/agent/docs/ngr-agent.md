@@ -1,8 +1,8 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has three commands: `run` runs the procedure of a variant's document on a VCI, and
-`identify` runs an identification plan's functional presence requests, VIN reads and ECU reads, for local
-end-to-end runs and tests (below), and `identity` creates the agent's key and prints its public key
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has three commands. `run` runs the procedure of a variant's document on a VCI, and `identify` runs
+an identification plan's functional presence requests, VIN reads and ECU reads; both are for local
+end-to-end runs and tests (below). `identity` creates the agent's key and prints its public key
 ("`ngr-agent identity`" below). It does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
@@ -231,7 +231,7 @@ Loads the agent key (design 6.4, ADR-459) from the key store of the build and mo
 
 1. Take the exclusive lock on `<state directory>/identity/<name>.lock`, polling every 20 ms for up to 10 seconds. A process that races another waits, then adopts the winner's key; a holder stuck longer makes the waiter report the store unavailable (exit 3).
 2. Read again, and adopt a key that appeared.
-3. Generate a key, create it in the store (which never replaces), read it back and use what the store returns.
+3. Generate a key, create it in the store (which never replaces), read it back and use what the store returns. A create that reports a failure after the key is in place is read back the same way and the key adopted, with `created` false.
 
 So two processes that race create one key, a key that is present needs no lock and no writable state directory, a store that cannot be read is never taken for an empty one, and an undecryptable or malformed key is reported and never overwritten. The lock file is never deleted. The loaded key stays in memory (the `Signer` of `AgentKey`), so a store that locks later does not stop a reconnection. Later code that needs the key calls `load_or_create` (or `agent::identity::agent_key`) and never the store's `put_new`; a key reset must take the same lock.
 

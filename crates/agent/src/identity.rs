@@ -200,16 +200,24 @@ pub fn load_or_create(
     let generated = SigningKey::generate()?;
     match store.put_new(name, &generated.to_pkcs8_der()) {
         Ok(()) => {}
+        Err(error) if error.kind() == StoreErrorKind::NotCreatable => {
+            return Err(IdentityError::NotProvisioned);
+        }
         // A writer outside the lock got there first: take its key.
         Err(error) if error.kind() == StoreErrorKind::AlreadyExists => {
             return read(store, name)?
                 .map(|key| adopt(key, false))
                 .ok_or_else(|| unavailable("the key store", &error));
         }
-        Err(error) if error.kind() == StoreErrorKind::NotCreatable => {
-            return Err(IdentityError::NotProvisioned);
+        // A create that failed after the key was in place (a sync that failed) still left a key:
+        // use it, as another creator's, since this call cannot say it made it. Without a
+        // readable key the failure stands and nothing is handed out.
+        Err(error) => {
+            return match read(store, name) {
+                Ok(Some(key)) => Ok(adopt(key, false)),
+                _ => Err(unavailable("the key store", &error)),
+            };
         }
-        Err(error) => return Err(unavailable("the key store", &error)),
     }
     // Hand out what the store holds, not what was generated.
     let stored = read(store, name)?
@@ -225,11 +233,12 @@ pub fn load_or_create(
 
 /// Takes the exclusive lock on the file `path`, waiting up to `wait`.
 fn take_lock(path: &std::path::Path, wait: Duration) -> Result<WriterLock, IdentityError> {
-    let deadline = Instant::now() + wait;
+    // A wait too long to add to the clock never ends.
+    let deadline = Instant::now().checked_add(wait);
     loop {
         match WriterLock::at(path) {
             Ok(lock) => return Ok(lock),
-            Err(JournalError::InUse) if Instant::now() < deadline => {
+            Err(JournalError::InUse) if deadline.is_none_or(|end| Instant::now() < end) => {
                 std::thread::sleep(LOCK_POLL);
             }
             Err(JournalError::InUse) => {

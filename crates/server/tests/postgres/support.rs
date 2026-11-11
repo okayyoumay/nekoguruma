@@ -23,6 +23,8 @@ pub struct TestPostgres {
     bin: PathBuf,
     port: u16,
     password: String,
+    /// The `postgres` account's ids when the tests run as root (Unix only).
+    #[cfg(unix)]
     run_as: Option<(u32, u32)>,
     running: bool,
 }
@@ -32,6 +34,7 @@ impl TestPostgres {
     /// missing or does not start.
     pub fn start() -> TestPostgres {
         let bin = find_bin();
+        #[cfg(unix)]
         let run_as = root_identity();
         let dir = tempfile::Builder::new()
             .prefix("ngr-test-pg-")
@@ -47,6 +50,7 @@ impl TestPostgres {
             bin,
             port: 0,
             password: random_password(),
+            #[cfg(unix)]
             run_as,
             running: false,
         };
@@ -320,10 +324,8 @@ fn highest_installed() -> Option<PathBuf> {
 /// `Some((uid, gid))` of the `postgres` account when the tests run as root, since PostgreSQL
 /// refuses to run as root; `None` otherwise. The ids come from the `id` command, which keeps the
 /// helper free of `unsafe` and of a libc binding.
+#[cfg(unix)]
 fn root_identity() -> Option<(u32, u32)> {
-    if !cfg!(unix) {
-        return None;
-    }
     let id = |args: &[&str]| -> Option<u32> {
         let out = Command::new("id").args(args).output().ok()?;
         String::from_utf8(out.stdout).ok()?.trim().parse().ok()

@@ -10,6 +10,9 @@
 //!   before the procedure starts
 //! - [`host`]: [`diag_ir::DiagHost`] on top of the worker gRPC client
 //! - [`identification`]: the identification job's plan, its checks and the endpoints it derives (ADR-395)
+//! - [`identity`]: the agent's key in a named-secret store, created once under a lock (design 6.4,
+//!   ADR-459, ADR-460)
+//! - [`state`]: where the agent keeps its state for each operating mode (design 6.2, ADR-460)
 //! - [`inputs`]: the runtime inputs and service fields a restart reads (ADR-229, ADR-245)
 //! - [`journal`]: the write-job journal a restart resumes from (ADR-244)
 //! - [`restart`]: how a job whose journal exists goes on (ADR-253, ADR-255)
@@ -30,6 +33,7 @@ pub mod document;
 pub mod guards;
 pub mod host;
 pub mod identification;
+pub mod identity;
 pub mod inputs;
 pub mod journal;
 mod journaling;
@@ -42,6 +46,7 @@ pub mod policy;
 pub mod restart;
 pub mod runner;
 pub mod send_receive;
+pub mod state;
 
 pub use artifact::Artifact;
 pub use client::{ExitHow, WorkerApi, WorkerExit, WorkerSource, WorkerStatus};

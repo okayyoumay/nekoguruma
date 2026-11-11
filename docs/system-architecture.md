@@ -449,6 +449,8 @@ The agent key proves only that "this is this execution environment on this devic
 | Keys and journal | User area | Device area |
 | Execution account | Logged-in user | Dedicated low-privilege account (on Windows a virtual service account, `NT SERVICE\<name>`) |
 
+The two areas are the state directory of the mode (ADR-460), resolved by the agent's `agent::state`: in user mode the user's own, `$XDG_STATE_HOME/nekoguruma` (else `~/.local/state/nekoguruma`) on Linux and `%LOCALAPPDATA%\nekoguruma` on Windows; in device mode `/var/lib/nekoguruma` on Linux, which the installation creates for the service account (the agent creates only the sub-directories in it), and on Windows the service account's own `%LOCALAPPDATA%\nekoguruma`, beside the DPAPI master key its key blob depends on. Sub-directories are created readable by the account only.
+
 Unattended devices use device mode. Each device is fixed to one mode, eliminating contention for the same VCI at configuration time.
 
 **Expected use cases for unattended devices**: permanently installed devices on inspection lines, test benches, setups that stay connected to a vehicle for long-duration measurements, and so on. Used when remote operation is needed even with no user logged in. Typical workshop work devices are expected to use user mode.
@@ -471,6 +473,8 @@ Policies are set per "job type x agent" and cannot be looser than the organizati
   - Windows, both modes: a DPAPI-protected blob file in the account's own scope. Machine-scope DPAPI is not used, because any local user could decrypt it or plant a key
   - Linux user mode: the Secret Service. A locked collection counts as unavailable, never as absent
   - Linux device mode: a systemd encrypted credential that the administrator provisions (systemd 250 or later; older hosts need a method of their own, to be designed)
+  - The store holds the secret under the name `nekoguruma-agent-key.<mode>.v1` (mode and format version, no host or account name; a later version reads the earlier names before it creates one) and can only create it, never replace or delete it (ADR-460)
+  - The key is created once: the agent reads first and only when the store positively holds nothing takes an exclusive lock file in the `identity` sub-directory of the state directory (6.2), waits for it up to 10 seconds, reads again, creates, reads back and uses what it read. A present key needs neither the lock nor a writable state directory. Registration and connect call the same create-once routine; a key reset takes the same lock
   - There is no plain-file fallback in release builds. A store that is unavailable is retried; a key that cannot be decrypted is never overwritten and asks for re-registration
   - A TPM-held, non-exportable key follows in M6 (16.3); moving to it means registering again
 - The agent proves it holds its key by signing a challenge transcript, not a timestamp, since the device clock is untrusted (14.4, 16.3). The public key is registered as an SPKI document and identified by the SHA-256 of that document

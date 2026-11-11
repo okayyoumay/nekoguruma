@@ -448,7 +448,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-456](ADR-456-the-local-profile-server-serves-one-pinned-origin-behind-a-request-guard.md) | The Local-Profile Server Serves One Pinned Origin Behind a Request Guard | Accepted (items 7 and 8 extended by ADR-458: the database, the migrations and the health check) | design 13.3, `crates/server`, `api/openapi.yaml` health path |
 | [ADR-457](ADR-457-the-workspace-s-minimum-rust-version-is-1-94.md) | The Workspace's Minimum Rust Version Is 1.94 | Accepted | `Cargo.toml` (`rust-version`), ADR-255 (item 7's MSRV bullet); `.cargo/config.toml`, `msrv` job |
 | [ADR-458](ADR-458-the-server-migrates-before-it-binds-and-its-tests-start-a-throwaway-postgresql.md) | The Server Applies Embedded Migrations Before It Binds, and Its Tests Start a Throwaway PostgreSQL | Accepted | design 12, 13.3, `crates/server`, `db/migrations`, `db/README.md`, `.github/workflows/ci.yml`; extends ADR-456 items 7 and 8 |
-| [ADR-459](ADR-459-the-agent-key-is-ecdsa-p-256-and-its-connection-proof-is-clock-free.md) | The Agent Key Is ECDSA P-256 and Its Connection Proof Is Clock-Free | Accepted | design 6.2, 6.4, 6.7, 12, 14.4, 16.3, `crates/shared-crypto`, `.github/dependabot.yml`; annotates ADR-248 |
+| [ADR-459](ADR-459-the-agent-key-is-ecdsa-p-256-and-its-connection-proof-is-clock-free.md) | The Agent Key Is ECDSA P-256 and Its Connection Proof Is Clock-Free | Accepted (Decision item 4's create-once rule and state directory given their form by ADR-460) | design 6.2, 6.4, 6.7, 12, 14.4, 16.3, `crates/shared-crypto`, `.github/dependabot.yml`; annotates ADR-248 |
+| [ADR-460](ADR-460-the-agent-key-is-created-once-under-a-bounded-lock-in-a-per-mode-state-directory.md) | The Agent Key Is Created Once Under a Bounded Lock in a Per-Mode State Directory | Accepted | design 6.2, 6.4, `crates/agent` (`state`, `identity`, `ngr-agent identity`); annotates ADR-459 |
 
 ## Status Legend
 
@@ -1025,4 +1026,5 @@ the predecessor repository these ADRs came from.
 - ADR-455
 
 ### Agent Identity
-- ADR-459
+- ADR-459 (item 4's create-once rule and state directory given their form by ADR-460)
+- ADR-460

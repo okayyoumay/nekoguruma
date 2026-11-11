@@ -1,9 +1,9 @@
 # `ngr-agent`
 
-`ngr-agent` is the binary of the `agent` crate (design 3.3). It has two commands, for local
-end-to-end runs and tests: `run` runs the procedure of a variant's document on a VCI, and
-`identify` runs an identification plan's functional presence requests, VIN reads and ECU reads (below). It
-does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
+`ngr-agent` is the binary of the `agent` crate (design 3.3). It has three commands: `run` runs the procedure of a variant's document on a VCI, and
+`identify` runs an identification plan's functional presence requests, VIN reads and ECU reads, for local
+end-to-end runs and tests (below), and `identity` creates the agent's key and prints its public key
+("`ngr-agent identity`" below). It does not connect to the server or take jobs from it. A procedure job is always a document: a bare program has no
 declarations to decode with and no declared link, so `run` takes none.
 
 ## `ngr-agent run`
@@ -208,6 +208,47 @@ API and the width as a procedure's does.
 | 0 | The job ended: the report, including a run whose presence section is interrupted (`presence_interrupted`), whose VIN phase is interrupted (`vin_interrupted`), whose ECU phase is interrupted (`ecu_reads_interrupted`) or whose tables the VCI refused | The `IdentificationReport` as one line of JSON on stdout (it holds the VIN when one was established, the ECU reads and entry states, ADR-401, and the rule fields and component values, ADR-403) |
 | 1 | The plan or a document cannot be read (`cannot read <path>`) or the plan is refused (`plan refused: ...`), both before the VCI; the job failed (`job failed: ...`, nothing on stdout; among them guards still marked after the VIN phase's last close when an ECU read remains, `LinkUnconfirmed`); or the worker may still hold the VCI after a failed link close | The reason on stderr |
 | 2 | Invalid command line | The error and the usage on stderr |
+
+## `ngr-agent identity`
+
+```sh
+ngr-agent identity --mode <device|user>
+```
+
+Loads the agent key (design 6.4, ADR-459) from the key store of the build and mode, creating it once when the store holds none, and prints one line of JSON on stdout: `public_key_pem` (the SPKI document as PEM), `fingerprint` (the SHA-256 of the SPKI DER as 64 lowercase hexadecimal digits) and `created` (true only for the process that created the key). `--mode` is required and the only option: the key's name, the store and the state directory depend on the mode. The command needs no worker and no VCI, and `run` and `identify` never touch the store.
+
+| Exit status | Meaning | Output |
+|---|---|---|
+| 0 | The key was found or created | The JSON line |
+| 1 | This build or mode has no key store (every release build until the platform stores land), the store holds no key and cannot create one (an administrator provisions it), randomness is unavailable, or the debug variables are wrong | The reason on stderr |
+| 2 | Invalid command line | The error and the usage on stderr |
+| 3 | The store, the creation lock or the state directory is unavailable; nothing changed and a retry may work | The reason on stderr |
+| 4 | A key is present and cannot be used (the store cannot decrypt it, or it is not a P-256 private key); the store is untouched, and registering again needs an explicit reset | The reason on stderr |
+
+### Agent key
+
+`agent::identity::load_or_create` reads the key from the store by its name, `nekoguruma-agent-key.<mode>.v1`, whose value is the PKCS#8 DER of the key. Only when the store positively answers that it holds nothing does it create one (ADR-460):
+
+1. Take the exclusive lock on `<state directory>/identity/<name>.lock`, polling every 20 ms for up to 10 seconds. A process that races another waits, then adopts the winner's key; a holder stuck longer makes the waiter report the store unavailable (exit 3).
+2. Read again, and adopt a key that appeared.
+3. Generate a key, create it in the store (which never replaces), read it back and use what the store returns.
+
+So two processes that race create one key, a key that is present needs no lock and no writable state directory, a store that cannot be read is never taken for an empty one, and an undecryptable or malformed key is reported and never overwritten. The lock file is never deleted. The loaded key stays in memory (the `Signer` of `AgentKey`), so a store that locks later does not stop a reconnection. Later code that needs the key calls `load_or_create` (or `agent::identity::agent_key`) and never the store's `put_new`; a key reset must take the same lock.
+
+The release build selects no store yet: the platform stores (a DPAPI blob on Windows, the Secret Service in Linux user mode, a systemd credential in Linux device mode) come with their own changes. A debug build has a plain-file store for tests, selected only when both `NGR_AGENT_KEY_STORE=file` and an absolute `NGR_AGENT_STATE_DIR` are set; neither variable is read in a release build, and the plain-file store is not compiled there.
+
+### State directory
+
+`agent::state` resolves where the agent keeps its state, per mode (design 6.2, ADR-460):
+
+| Mode | OS | Root | Created by |
+|---|---|---|---|
+| user | Unix | `$XDG_STATE_HOME/nekoguruma` (absolute), else `~/.local/state/nekoguruma` | the agent, 0700 |
+| user | Windows | `%LOCALAPPDATA%\nekoguruma` | the agent |
+| device | Unix | `/var/lib/nekoguruma` | the installation (for example systemd's `StateDirectory=`, 0700, the service account); the agent creates only sub-directories, and a missing root is an error |
+| device | Windows | the service account's own `%LOCALAPPDATA%\nekoguruma` | the agent |
+
+Each kind of state has a sub-directory of its own: `identity` holds the key's lock file and the debug store, and `journal` is for the write-job journal. A sub-directory is created readable by its account only, and on Unix one that is writable by its group or others is refused. The operational log's directory (below) keeps its own rules.
 
 ## Operational log
 

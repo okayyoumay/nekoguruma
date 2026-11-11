@@ -17,6 +17,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.1",
+ "shared-crypto",
  "shared-proto",
  "sim-ecu",
  "tempfile",

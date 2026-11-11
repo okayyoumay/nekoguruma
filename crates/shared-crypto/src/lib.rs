@@ -32,3 +32,6 @@ pub use key::{
     KeyError, PublicKey, RandomError, SIGNATURE_LEN, SignError, SignErrorKind, Signature,
     SignatureError, Signer, SigningKey, VerifyError, random_32, sign_tagged, verify_tagged,
 };
+/// The buffer type that wipes its contents when dropped, which the key stores hand secrets over
+/// in, re-exported so a user of this crate needs no direct dependency on the wiping crate.
+pub use p256::elliptic_curve::zeroize::Zeroizing;

@@ -1,9 +1,9 @@
 # `ngr-server`
 
 The server (design 3.2, 12, 13). `crates/server` is a library plus the binary `ngr-server`. This
-build serves the local deployment profile (design 13) only: it listens on loopback, has no
-database yet and has one route, the health probe. The rules of the listener and the request guard
-are in ADR-456.
+build serves the local deployment profile (design 13) only: it listens on loopback, uses
+PostgreSQL through sqlx and has one route, the health probe. The rules of the listener and the
+request guard are in ADR-456; the database, the migrations and the test database are in ADR-458.
 
 ## Running
 
@@ -13,7 +13,7 @@ ngr-server --config <file>
 
 `--config` is required. There is no default path, no search and no environment variable.
 Exit codes: 0 after a graceful stop, 1 when the configuration is refused or the server cannot
-start or run, 2 for a usage error.
+start or run (including a database that cannot be reached or migrated), 2 for a usage error.
 
 ## Configuration
 
@@ -26,8 +26,20 @@ profile = "local"            # the only value this build accepts; the default
 [http]
 port = 8080                  # 1-65535, default 8080
 shutdown_grace_secs = 30     # default 30, at most 300
+
+[database]                   # required
+url = "postgres://ngr:<password>@127.0.0.1:5432/nekoguruma"
+connect_timeout_secs = 10    # default 10, 1-300
 ```
 
+- The `[database]` table is required, and the file holds the database password: make it readable
+  by the service account only. The URL must be `postgres://user:password@host[:port]/database`
+  (`postgresql://` also works) with a password and no query string or fragment; it is checked
+  when the file is loaded. A parameter is refused because sqlx logs the value of one it does not
+  know, and the required parts keep sqlx from filling them from `PGHOST`, `PGUSER`,
+  `PGPASSWORD`, `PGDATABASE`, `PGPORT` or `~/.pgpass`. One exception: sqlx reads `PGOPTIONS` and
+  cannot be told not to, so that variable still applies if it is set for the service. It is never logged, and its `Debug` output is empty. An invalid
+  one is reported with fixed text. The server has no TLS to the database yet (ADR-458).
 - There is no bind-address key. The listener is `127.0.0.1:<port>` in code, so no configuration
   can make the local profile listen elsewhere, and `[::1]` is not bound (design 13.3).
 - There is no pinned-host key. The pinned origin is `http://127.0.0.1:<port>`. Changing the port
@@ -44,15 +56,28 @@ shutdown_grace_secs = 30     # default 30, at most 300
 1. Arguments, then the configuration file.
 2. Logging: `tracing` text on stderr, at `info` unless `RUST_LOG` says otherwise. The operational
    log of design 12.2 replaces it later. A rejected Host or Origin value is not logged.
-3. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
-   signal sent once the log line appears is never lost.
-4. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
+3. Connect to the database, waiting at most `connect_timeout_secs` (sqlx retries a refused
+   connection within it). Then apply the migrations embedded from `db/migrations`, at most 60
+   seconds. Any failure ends the process with exit 1, with no retry: the advisory lock sqlx
+   takes is per session and counts how often it was taken, so a retry on a session that still
+   holds it could leave it held. The run has a connection of its own with `lock_timeout` and
+   `statement_timeout` set to that limit, so PostgreSQL itself stops a wait or a statement that
+   takes too long (the client waits 5 seconds longer as a backstop), and a failed run closes
+   its connection, which releases the lock. A database with a migration the binary does not carry, a changed one or
+   one left half applied refuses the start. Two servers starting together are safe: one
+   applies the migrations, the other finds nothing to do. Restarting after the database is
+   back is the service manager's job.
+4. Bind `127.0.0.1:<port>`, install the signal handlers, then log the pinned origin: a stop
+   signal sent once the log line appears is never lost. A listening port means a migrated
+   schema.
+5. Serve until SIGTERM or SIGINT (Unix) or Ctrl-C or Ctrl-Break (Windows). Then stop accepting,
    let requests in flight finish for at most `shutdown_grace_secs`, and exit 0. A second signal
    during the grace period ends the wait at once (still exit 0). A connection that is still
    open then is dropped. A connection that has not delivered a complete request head is held
    for no longer than the header-read timeout below. A Windows service stop control arrives
    with packaging. A long-lived connection such as a WebSocket never finishes by itself, so the
-   routes that hold one must close it when the shutdown begins.
+   routes that hold one must close it when the shutdown begins. The database pool is closed
+   last.
 
 ## The request guard
 
@@ -95,21 +120,46 @@ value. The 307 carries `Cache-Control: no-store` and an absolute `Location`.
 
 ## Routes
 
-- `GET /api/v1/health` (`api/openapi.yaml`): 200 `{"status":"ok"}`, `Cache-Control: no-store`,
-  no login. In this build it is a liveness answer only and checks no dependency, because the
-  server has no database yet; once it has one, the route answers 503 while the database does not
-  respond.
+- `GET /api/v1/health` (`api/openapi.yaml`): runs `SELECT 1` on the pool. 200
+  `{"status":"ok"}` when it succeeds within 2 seconds, otherwise 503 `application/problem+json`
+  with no detail (the cause goes to the log, in a field named `external`). Both carry
+  `Cache-Control: no-store`; no login.
 
 Any other path answers 404 with a problem body, after the guard.
 
+## Database access
+
+sqlx 0.9 with default features off and `runtime-tokio`, `postgres`, `migrate` and `macros`. There
+is no `query!` macro (it needs `DATABASE_URL` or a committed cache in every job that compiles the
+server): queries are `sqlx::query` with static SQL, and the database tests are their check. There
+is no TLS feature; the standard profile adds it. `build.rs` makes cargo watch `db/migrations`, so
+a new migration file rebuilds the crate. How migrations are written and applied is in
+`db/README.md`.
+
 ## Tests
 
-- `cargo test -p server` needs nothing outside the workspace. The unit tests cover the guard's
-  decision table and the configuration. `tests/serving.rs` runs the server in the test process on
-  an ephemeral port and drives it over TCP with hand-written HTTP/1.1 requests, which gives the
-  test every header, and covers the stop: a request in flight finishes during the grace period, a
-  stalled one is dropped at its end, a second signal ends the wait. `tests/binary.rs` starts
-  `ngr-server` as a process (on a port that was free a moment before, trying again when another
-  process takes it): usage and start failures, health, and the SIGTERM stops on Unix.
+- `cargo test -p server` needs the machine's PostgreSQL server binaries (`initdb`, `pg_ctl`):
+  the database tests start a throwaway cluster per test through the helper in
+  `tests/postgres/support.rs`, with password authentication on 127.0.0.1 and no Unix socket,
+  stopped when the test ends. The binaries are looked up in the directory `NGR_TEST_PG_BIN`,
+  then on `PATH`, then in the highest `/usr/lib/postgresql/<version>/bin`, then in `PGBIN`; a
+  missing PostgreSQL fails the test and never skips it. When the tests run as root, the helper
+  runs PostgreSQL as the `postgres` account, which then needs access to the temporary directory
+  (`TMPDIR` and its parents). A test killed by a timeout can leave its postmaster behind.
+- The tests are one test binary, `postgres` (`tests/postgres/`). `migrations.rs` covers the
+  migrations: applying them, a second start as a no-op, a changed, unknown or half-applied
+  migration refusing the start, two starts at once, and the connect and migration timeouts.
+  `serving.rs` runs the server in the test process on an ephemeral port and drives it over TCP
+  with hand-written HTTP/1.1 requests, which gives the test every header; most of its tests
+  serve over a pool that points at no database, the ones that need health 200 or 503 with the
+  database up or down start a cluster. It also covers the stop: a request in flight finishes
+  during the grace period, a stalled one is dropped at its end, a second signal ends the wait.
+  `binary.rs` starts `ngr-server` as a process (on a port that was free a moment before, trying
+  again when another process takes it): usage and start failures, a refused database and a
+  changed migration (exit 1, nothing listens, no password in the log), health over TCP, and the
+  SIGTERM stops on Unix.
+- The unit tests need no database: the guard's decision table, the configuration (including that
+  no error shows the URL), and that the embedded migrations are the files of `db/migrations`
+  and contain no carriage return.
 - The HTTP/1-only test must also pass in a workspace build, where hyper's HTTP/2 is enabled:
-  build with `cargo test --workspace --no-run` and run the `serving` binary.
+  build with `cargo test --workspace --no-run` and run the `postgres` test binary.

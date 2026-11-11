@@ -2,9 +2,11 @@
 //! (`crates/server/docs/ngr-server.md`).
 //!
 //! This build serves the local deployment profile: it listens on 127.0.0.1 only, behind the
-//! request guard of design 13.3 (ADR-456).
+//! request guard of design 13.3 (ADR-456). It connects to PostgreSQL and applies the embedded
+//! migrations before it binds, so a listening port means a migrated schema (ADR-458).
 
 pub mod config;
+pub mod db;
 pub mod health;
 pub mod local_guard;
 pub mod problem;
@@ -21,6 +23,7 @@ use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::server::graceful::GracefulShutdown;
 use hyper_util::service::TowerToHyperService;
+use sqlx::PgPool;
 use tokio::net::TcpListener;
 use tokio::task::JoinSet;
 use tower::Layer;
@@ -33,10 +36,12 @@ pub use config::{Config, ConfigError, Profile};
 pub const HEADER_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// State the routes and the guard share.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct AppState {
     /// The port the listener is bound to; it decides the pinned origin.
     pub port: u16,
+    /// The database pool.
+    pub pool: PgPool,
 }
 
 /// The server's routes behind the local profile's request guard (design 13, 13.3).
@@ -47,7 +52,8 @@ pub struct AppState {
 pub fn router(state: AppState) -> Router {
     let routes = Router::new()
         .route("/api/v1/health", get(health::health))
-        .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") });
+        .fallback(|| async { problem::Problem::new(StatusCode::NOT_FOUND, "Not found") })
+        .with_state(state.pool);
     // The standard profile supplies its own ingress layer here (design 13).
     let guarded = middleware::from_fn_with_state(state.port, local_guard::guard).layer(routes);
     Router::new().fallback_service(guarded)
@@ -56,6 +62,8 @@ pub fn router(state: AppState) -> Router {
 /// Why `Server::start` failed.
 #[derive(Debug, thiserror::Error)]
 pub enum StartError {
+    #[error(transparent)]
+    Database(#[from] db::DbError),
     #[error("cannot listen on 127.0.0.1:{port}: {source}")]
     Bind { port: u16, source: std::io::Error },
 }
@@ -71,25 +79,50 @@ pub enum RunError {
 pub struct Server {
     listener: TcpListener,
     router: Router,
+    pool: PgPool,
     grace: Duration,
 }
 
 impl Server {
-    /// Binds `127.0.0.1:<port>` (the address is fixed in code) and derives the pinned origin from
-    /// the listener's real port, so a configured port 0 works in tests.
+    /// Connects to the database (within the connect timeout), applies the migrations (within
+    /// [`db::MIGRATION_TIMEOUT`]), then binds `127.0.0.1:<port>`: nothing listens before the
+    /// schema is current (ADR-458). Any failure ends the start; a failed migration run is never
+    /// retried on its pool (the advisory lock is per session and counts how often it was taken, so
+    /// a retry could leave it held).
     pub async fn start(config: &Config) -> Result<Server, StartError> {
-        let port = config.http.port;
-        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, port))
-            .await
-            .map_err(|source| StartError::Bind { port, source })?;
+        let pool = db::connect(&config.database).await?;
+        if let Err(error) = db::migrate(&pool).await {
+            db::close(&pool).await;
+            return Err(error.into());
+        }
+        Server::bind(&config.http, pool).await
+    }
+
+    /// Binds `127.0.0.1:<port>` (the address is fixed in code) and derives the pinned origin from
+    /// the listener's real port, so a configured port 0 works in tests. The pool is taken as it
+    /// is, without migrating it. Tests only: a deployment starts with [`Server::start`].
+    #[doc(hidden)]
+    pub async fn bind(http: &config::Http, pool: PgPool) -> Result<Server, StartError> {
+        let port = http.port;
+        let listener = match TcpListener::bind((Ipv4Addr::LOCALHOST, port)).await {
+            Ok(listener) => listener,
+            Err(source) => {
+                db::close(&pool).await;
+                return Err(StartError::Bind { port, source });
+            }
+        };
         let bound = listener
             .local_addr()
             .map_err(|source| StartError::Bind { port, source })?
             .port();
         Ok(Server {
             listener,
-            router: router(AppState { port: bound }),
-            grace: Duration::from_secs(config.http.shutdown_grace_secs),
+            router: router(AppState {
+                port: bound,
+                pool: pool.clone(),
+            }),
+            pool,
+            grace: Duration::from_secs(http.shutdown_grace_secs),
         })
     }
 
@@ -118,6 +151,7 @@ impl Server {
         let Server {
             listener,
             router,
+            pool,
             grace,
         } = self;
         let service = TowerToHyperService::new(router);
@@ -167,6 +201,10 @@ impl Server {
                 tracing::warn!("second stop signal; stopping at once");
             }
         }
+        // Connections still open at the end of the grace period (or of a second signal) are
+        // aborted first, so that none holds a pooled connection that `close` would wait for.
+        connections.shutdown().await;
+        db::close(&pool).await;
         Ok(())
     }
 }

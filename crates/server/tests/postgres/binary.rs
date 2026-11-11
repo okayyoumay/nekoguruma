@@ -7,7 +7,7 @@ use std::path::Path;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use crate::support::{TestPostgres, refused_url};
+use crate::support::{TestPostgres, random_password, refused_url};
 
 fn server(args: &[&str]) -> Command {
     let mut c = Command::new(env!("CARGO_BIN_EXE_ngr-server"));
@@ -217,7 +217,9 @@ fn a_second_signal_during_the_grace_period_stops_it_at_once() {
 fn a_refused_database_exits_1_within_the_connect_timeout_and_never_listens() {
     let dir = tempfile::tempdir().unwrap();
     let port = free_port();
-    let path = write_config(dir.path(), port, &refused_url("s3cret-value"));
+    // A value made at run time, so the test holds no fixed secret.
+    let secret = random_password();
+    let path = write_config(dir.path(), port, &refused_url(&secret));
     let mut command = server(&["--config", path.to_str().unwrap()]);
     command.stderr(Stdio::piped());
     let child = command.spawn().unwrap();
@@ -234,10 +236,7 @@ fn a_refused_database_exits_1_within_the_connect_timeout_and_never_listens() {
     // The server never got as far as listening (the port itself may belong to anyone by now).
     assert!(!log.contains("listening"), "{log}");
     assert!(log.contains("cannot connect to the database"), "{log}");
-    assert!(
-        !log.contains("s3cret-value"),
-        "the log shows the password: {log}"
-    );
+    assert!(!log.contains(&secret), "the log shows the password: {log}");
 }
 
 #[test]
@@ -266,21 +265,17 @@ fn a_changed_migration_exits_1_and_never_listens() {
 #[test]
 fn a_url_with_a_parameter_is_refused_without_showing_it() {
     let dir = tempfile::tempdir().unwrap();
-    for url in [
-        "postgres://ngr:pw@127.0.0.1:5432/db?sslpassword=s3cret-value",
-        "postgres://ngr:pw@127.0.0.1:5432/db?pasword=s3cret-value",
-    ] {
-        let path = write_config(dir.path(), free_port(), url);
+    let secret = random_password();
+    for parameter in ["sslpassword", "pasword"] {
+        let url = format!("postgres://ngr:pw@127.0.0.1:5432/db?{parameter}={secret}");
+        let path = write_config(dir.path(), free_port(), &url);
         let mut command = server(&["--config", path.to_str().unwrap()]);
         command.stderr(Stdio::piped());
         let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
         assert_eq!(output.status.code(), Some(1));
         let log = String::from_utf8_lossy(&output.stderr);
         assert!(log.contains("database.url is not a"), "{log}");
-        assert!(
-            !log.contains("s3cret-value"),
-            "the log shows the value: {log}"
-        );
+        assert!(!log.contains(&secret), "the log shows the value: {log}");
     }
 }
 

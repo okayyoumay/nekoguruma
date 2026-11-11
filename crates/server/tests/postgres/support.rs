@@ -263,7 +263,8 @@ pub fn free_port() -> u16 {
         .port()
 }
 
-fn random_password() -> String {
+/// 32 random hex digits.
+pub fn random_password() -> String {
     let mut bytes = [0u8; 16];
     getrandom::fill(&mut bytes).expect("random bytes");
     bytes.iter().map(|b| format!("{b:02x}")).collect()

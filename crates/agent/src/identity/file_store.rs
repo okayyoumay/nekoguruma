@@ -58,13 +58,17 @@ impl SecretStore for DebugFileStore {
 
 /// Options that give the new file to its owner only on Unix.
 fn private_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
+        let mut options = OpenOptions::new();
         options.mode(0o600);
+        options
     }
-    options
+    #[cfg(not(unix))]
+    {
+        OpenOptions::new()
+    }
 }
 
 #[cfg(test)]

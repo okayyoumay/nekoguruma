@@ -33,4 +33,6 @@ Flag as P1:
   write token, so any step that checks out or runs code from the pull request is P1, as is
   widening it beyond Dependabot's `cargo-minor-patch` group, or dropping the step that turns
   auto-merge off after a push by anyone other than Dependabot (other Dependabot updates and all
-  human pull requests are merged by the maintainer).
+  human pull requests are merged by the maintainer). Removing a crate from the group's
+  `exclude-patterns` in `dependabot.yml` (`p256` today) is a trust-boundary change too, P1
+  unless the pull request records the decision (ADR-459, ADR-248).

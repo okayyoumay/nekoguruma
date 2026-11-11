@@ -224,8 +224,9 @@ use a recently stabilized language or library feature.
 
 `dependabot-auto-merge.yml` turns on GitHub auto-merge (squash) for Dependabot's grouped Cargo
 minor/patch pull request only, so it merges once the required checks pass (ADR-248). Dependabot's
-other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, and GitHub
-Actions) wait for the maintainer like any other.
+other pull requests (Cargo updates Cargo treats as breaking, such as 0.22 to 0.23, updates of
+`p256`, which the group leaves out (ADR-459), and GitHub Actions) wait for the maintainer like
+any other.
 
 Compiler warnings fail CI: `core-linux`, `core-windows` and `worker-check` build with
 `RUSTFLAGS=-D warnings`, and `core-linux` runs `cargo fmt --check`. Clippy is not run in CI

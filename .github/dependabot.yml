@@ -5,6 +5,9 @@
 # (cooldown), so a compromised or yanked release has time to surface.
 # The cargo-minor-patch group's pull request is auto-merged once the required checks pass
 # (.github/workflows/dependabot-auto-merge.yml); every other update waits for the maintainer.
+# The agent key's signature crate (p256) is kept out of that group, so its updates get pull requests
+# of their own that the maintainer merges (ADR-459). Only direct dependencies are listed: Dependabot
+# updates the manifest's own entries, so naming transitive crates would do nothing.
 # Security updates are separate: they follow the repository's Dependabot alert settings and
 # ignore the schedule, grouping and cooldown below.
 version: 2
@@ -24,6 +27,8 @@ updates:
     groups:
       cargo-minor-patch:
         update-types: [minor, patch]
+        exclude-patterns:
+          - p256
 
   - package-ecosystem: github-actions
     directory: /

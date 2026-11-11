@@ -237,7 +237,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-245](ADR-245-ir-restart-declaration-in-the-procedure-part.md) | The IR's Restart Declaration Lives in the Procedure Part | Accepted (items 4 and 6 amended by ADR-250; the restart declaration's sources and plans name their target and `Program::validate` refuses cross-target flash steps since ADR-325 item 4; its sources and plans get their CSV and Starlark syntax, with the boundaries derived by the lowering, by ADR-336; the agent builds its source table from the job's document for a job with one, by ADR-345; the target index on its sources and plans and the rules over it given their IR form by ADR-410) | `diag-ir` `Program` restart declaration, `ir.fbs` `FlashSession` |
 | [ADR-246](ADR-246-codeql-hand-off-carries-private-alert-details.md) | The CodeQL Hand-Off Carries High and Critical Alert Details Privately | Accepted | `.github/workflows/codeql-alert-handoff.yml`, `.claude/skills/codeql-alerts` |
 | [ADR-247](ADR-247-debug-builds-may-write-to-sim-vci.md) | Debug Builds May Send Write Requests to `sim-vci` | Accepted (Decision item 4's refusal of `FlashTransfer` superseded by ADR-250; its reason for refusing `SecurityAccess` replaced by ADR-259; item 1's read-only ceiling widened inside access programs by ADR-325 item 10; items 1 and 2 extended to `iso22900-mock` by ADR-331) | `agent` policy, link, host, runner |
-| [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
+| [ADR-248](ADR-248-dependabot-auto-merge-trust-boundary.md) | Dependabot's Cargo Minor/Patch Group Merges Itself | Accepted (the group leaves out the agent key's signature crate `p256`, ADR-459 Decision item 6) | `.github/workflows/dependabot-auto-merge.yml`, `.github/dependabot.yml` |
 | [ADR-249](ADR-249-backlog-loop-iterations-start-from-a-fresh-branch.md) | Backlog Loop Iterations Start from a Fresh Branch at `origin/main` | Accepted | `.claude/skills/backlog-loop` (step 1), `codeql-alerts` |
 | [ADR-250](ADR-250-agent-host-flash-transfer.md) | The Agent Host Implements FlashTransfer with Its Own Block Count | Accepted (items 1 to 3 amended by ADR-336: the transfer's block bytes come from `FlashBlock`, and the host checks the ECU's maxNumberOfBlockLength) | `agent` host, policy; `diag-ir` plan validation |
 | [ADR-251](ADR-251-copilot-re-review-only-after-fixes-that-need-it.md) | Copilot Re-Review Only After Fixes That Need It | Accepted (applies to Codex and Copilot alike, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating; a re-request it allows can be withheld for the maintainer's choice, on a specification pull request by ADR-349 and on any pull request by ADR-381) | `.claude/skills/pr-review-loop` (Steps 0, 4-5), `.github/copilot-instructions.md`, `CLAUDE.md` |
@@ -448,6 +448,7 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-456](ADR-456-the-local-profile-server-serves-one-pinned-origin-behind-a-request-guard.md) | The Local-Profile Server Serves One Pinned Origin Behind a Request Guard | Accepted (items 7 and 8 extended by ADR-458: the database, the migrations and the health check) | design 13.3, `crates/server`, `api/openapi.yaml` health path |
 | [ADR-457](ADR-457-the-workspace-s-minimum-rust-version-is-1-94.md) | The Workspace's Minimum Rust Version Is 1.94 | Accepted | `Cargo.toml` (`rust-version`), ADR-255 (item 7's MSRV bullet); `.cargo/config.toml`, `msrv` job |
 | [ADR-458](ADR-458-the-server-migrates-before-it-binds-and-its-tests-start-a-throwaway-postgresql.md) | The Server Applies Embedded Migrations Before It Binds, and Its Tests Start a Throwaway PostgreSQL | Accepted | design 12, 13.3, `crates/server`, `db/migrations`, `db/README.md`, `.github/workflows/ci.yml`; extends ADR-456 items 7 and 8 |
+| [ADR-459](ADR-459-the-agent-key-is-ecdsa-p-256-and-its-connection-proof-is-clock-free.md) | The Agent Key Is ECDSA P-256 and Its Connection Proof Is Clock-Free | Accepted | design 6.2, 6.4, 6.7, 12, 14.4, 16.3, `crates/shared-crypto`, `.github/dependabot.yml`; annotates ADR-248 |
 
 ## Status Legend
 
@@ -796,7 +797,7 @@ the predecessor repository these ADRs came from.
 - ADR-241
 - ADR-243 (Decision item 3's skipping of high and critical alerts and item 4's number-only hand-off of them superseded by ADR-246; item 4's trigger follows the CodeQL workflow instead of default setup, ADR-283)
 - ADR-246
-- ADR-248
+- ADR-248 (the auto-merged group leaves out the agent key's signature crate `p256`, ADR-459)
 - ADR-249
 - ADR-251 (applies to Codex and Copilot alike, ADR-312; Decision item 1 amended: a sweep fix of a kind no finding of the round named also re-requests, while a sibling of a fixed finding keeps its rating; a re-request it allows can be withheld for the maintainer's choice, on a specification pull request by ADR-349 and on any pull request by ADR-381)
 - ADR-260
@@ -1022,3 +1023,6 @@ the predecessor repository these ADRs came from.
 ### Regulatory Scope
 - ADR-237
 - ADR-455
+
+### Agent Identity
+- ADR-459

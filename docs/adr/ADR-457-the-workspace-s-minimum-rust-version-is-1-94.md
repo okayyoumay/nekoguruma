@@ -2,7 +2,7 @@
 
 **Date:** 2026-11-11
 **Status:** Accepted
-**Affects:** `Cargo.toml` (`rust-version`), ADR-255 (its MSRV paragraph); `.cargo/config.toml`'s resolver preference and the `msrv` job in `.github/workflows/ci.yml` follow the manifest
+**Affects:** `Cargo.toml` (`rust-version`), ADR-255 (item 7's MSRV bullet); `.cargo/config.toml`'s resolver preference and the `msrv` job in `.github/workflows/ci.yml` follow the manifest
 
 ## Context
 
@@ -15,7 +15,7 @@ the minimum instead of staying on 0.8.
 
 ## Decision
 
-1. The workspace's `rust-version` is 1.94.
+1. The workspace's `rust-version` is 1.94. This supersedes ADR-255 item 7's MSRV bullet.
 2. Nothing else changes with it. `.cargo/config.toml` keeps preferring dependency versions
    that support the workspace's `rust-version`, which now means 1.94, and the `msrv` job keeps
    reading the version from `Cargo.toml`.
@@ -25,7 +25,7 @@ the minimum instead of staying on 0.8.
 ## Consequences
 
 - Code may use what Rust 1.94 stabilized. The `msrv` job checks the workspace with 1.94 on
-  pull requests that touch a manifest, the lock or `.cargo/`, and on every push to `main`.
+  pull requests that touch a manifest, the lock or `.cargo/`, and on every push to `main` that is not documentation-only.
 - A contributor or a build machine with an older toolchain than 1.94 cannot build the
   workspace. The CI jobs use stable, apart from `msrv` and `fuzz`.
 - `cargo update`, and Dependabot through it, may now pick versions that need up to 1.94.

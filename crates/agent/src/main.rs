@@ -1,7 +1,9 @@
 //! `ngr-agent`: the device-side agent (design 3.3). The job runner lives in the `agent` library.
 //! The binary's commands: `ngr-agent run` runs the procedure of a variant's document on a VCI and
-//! prints the final VM state as JSON, and `ngr-agent identify` runs an identification plan's
-//! functional presence requests, VIN reads and ECU reads and prints the report as JSON (`crates/agent/docs/ngr-agent.md`).
+//! prints the final VM state as JSON, `ngr-agent identify` runs an identification plan's
+//! functional presence requests, VIN reads and ECU reads and prints the report as JSON, and
+//! `ngr-agent identity` creates the agent's key if needed and prints its public key as JSON
+//! (`crates/agent/docs/ngr-agent.md`).
 
 use std::ffi::OsString;
 use std::future::Future;
@@ -31,6 +33,7 @@ const USAGE: &str = "\
 usage: ngr-agent run --vci <name> --mode <device|user> --document <file> [options]
        ngr-agent identify --vci <name> --mode <device|user> --plan <file> [--document <file>]...
                           [options]
+       ngr-agent identity --mode <device|user>
 
 run: runs the procedure of a variant's document on a J2534 v04.04 or D-PDU API VCI and prints the
 final VM state as JSON on stdout. The job takes its link from the protocol the variant
@@ -43,6 +46,13 @@ candidates, why the others were dropped and the component values the rules gave,
 document the plan does not name is ignored with a warning). It sends only the presence request
 and read-only requests, and takes the VCI lock, then the lock of the vehicle whose VIN it
 established.
+
+identity: loads the agent's key from its key store, creating it once when the store has none,
+and prints public_key_pem, fingerprint and created as JSON on stdout. It takes no option
+but --mode. Exit status: 0 the key is there; 1 this build or mode has no key store, the store
+cannot create the key, or the debug variables are wrong; 2 a usage error; 3 the store, its lock
+or the state directory is unavailable (nothing changed, try again); 4 the stored key cannot be
+used (nothing changed; register again after an explicit reset).
 
 options:
   --vci <name>         library name the worker service resolves: a J2534 library, or the
@@ -111,6 +121,8 @@ struct IdentifyArgs {
 enum Command {
     Run(RunArgs),
     Identify(IdentifyArgs),
+    /// `ngr-agent identity --mode <mode>`.
+    Identity(OperatingMode),
 }
 
 impl Command {
@@ -118,6 +130,7 @@ impl Command {
         match self {
             Command::Run(args) => args.mode,
             Command::Identify(args) => args.mode,
+            Command::Identity(mode) => *mode,
         }
     }
 }
@@ -134,6 +147,10 @@ fn main() -> ExitCode {
     // rotated file, with the settings of the configuration file checked for the device's mode
     // (`crates/agent/docs/ngr-agent.md`).
     let _logging = agent::logging::install(command.mode());
+    // The identity command needs no runtime and no worker.
+    if let Command::Identity(mode) = command {
+        return identity(mode);
+    }
     // The job's VM runs on a blocking thread that blocks on the runtime for every primitive,
     // so the runtime must be multi-threaded (ADR-235).
     let runtime = match tokio::runtime::Builder::new_multi_thread()
@@ -149,6 +166,7 @@ fn main() -> ExitCode {
     let outcome = match command {
         Command::Run(args) => runtime.block_on(run(args)),
         Command::Identify(args) => runtime.block_on(identify(args)),
+        Command::Identity(_) => unreachable!("handled before the runtime starts"),
     };
     match outcome {
         Ok(state) => {
@@ -162,11 +180,43 @@ fn main() -> ExitCode {
     }
 }
 
+/// `ngr-agent identity`: prints the key as one JSON line. The exit status says why there is none
+/// (the usage text lists them): 3 asks for a retry, 4 for registering again.
+fn identity(mode: OperatingMode) -> ExitCode {
+    use agent::identity::{IdentityError, agent_key};
+    match agent_key(mode) {
+        Ok(key) => {
+            let public_key = key.public_key();
+            println!(
+                "{}",
+                serde_json::json!({
+                    "public_key_pem": public_key.to_spki_pem(),
+                    "fingerprint": public_key.fingerprint_hex(),
+                    "created": key.created(),
+                })
+            );
+            ExitCode::SUCCESS
+        }
+        Err(error) => {
+            eprintln!("ngr-agent: identity: {error}");
+            ExitCode::from(match error {
+                IdentityError::Unavailable(_) => 3,
+                IdentityError::KeyUnusable(_) => 4,
+                IdentityError::NoStore(_)
+                | IdentityError::NotProvisioned
+                | IdentityError::Random(_) => 1,
+            })
+        }
+    }
+}
+
 fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, String> {
     let mut args = args.into_iter();
     let identify = match args.next() {
         Some(command) if command == "run" => false,
         Some(command) if command == "identify" => true,
+        Some(command) if command == "identity" => return parse_identity(args),
+
         Some(command) => return Err(format!("unknown command {command:?}")),
         None => return Err("missing command".to_owned()),
     };
@@ -279,6 +329,28 @@ fn parse_args(args: impl IntoIterator<Item = OsString>) -> Result<Command, Strin
         locks,
         comm_log,
     }))
+}
+
+/// The options of `ngr-agent identity`: `--mode` and nothing else.
+fn parse_identity(mut args: impl Iterator<Item = OsString>) -> Result<Command, String> {
+    let mut mode = None;
+    while let Some(flag) = args.next() {
+        if flag != "--mode" {
+            return Err(format!("unknown option {flag:?}"));
+        }
+        let value = args.next().ok_or("--mode needs a value")?;
+        if mode.is_some() {
+            return Err("give --mode once".to_owned());
+        }
+        mode = Some(
+            value
+                .to_str()
+                .ok_or_else(|| format!("--mode {value:?} is not valid UTF-8"))?
+                .parse::<OperatingMode>()
+                .map_err(|error| format!("--mode: {error}"))?,
+        );
+    }
+    Ok(Command::Identity(mode.ok_or("--mode is required")?))
 }
 
 /// The `workers` directory next to the running executable.
@@ -627,14 +699,38 @@ mod tests {
     fn parse(args: &[&str]) -> Result<RunArgs, String> {
         match parse_command(args)? {
             Command::Run(args) => Ok(args),
-            Command::Identify(_) => Err("not a run".to_owned()),
+            Command::Identify(_) | Command::Identity(_) => Err("not a run".to_owned()),
         }
     }
 
     fn identify_args(args: &[&str]) -> Result<IdentifyArgs, String> {
         match parse_command(args)? {
             Command::Identify(args) => Ok(args),
-            Command::Run(_) => Err("not an identify".to_owned()),
+            Command::Run(_) | Command::Identity(_) => Err("not an identify".to_owned()),
+        }
+    }
+
+    #[test]
+    fn parses_an_identity_with_its_mode_only() {
+        for (mode, expected) in [
+            ("device", OperatingMode::Device),
+            ("user", OperatingMode::User),
+        ] {
+            assert_eq!(
+                parse_command(&["identity", "--mode", mode]),
+                Ok(Command::Identity(expected))
+            );
+        }
+        for bad in [
+            &["identity"][..],
+            &["identity", "--mode"],
+            &["identity", "--mode", "machine"],
+            &["identity", "--mode", "user", "--mode", "user"],
+            &["identity", "--mode", "user", "--vci", "x"],
+            &["identity", "--vci", "x"],
+            &["identity", "extra"],
+        ] {
+            assert!(parse_command(bad).is_err(), "{bad:?}");
         }
     }
 

@@ -19,6 +19,7 @@ j2534-0404-registry.workspace = true
 ngr-library-resolver.workspace = true
 vci-service-config.workspace = true
 ngr-oplog.workspace = true
+shared-crypto.workspace = true
 tracing-subscriber.workspace = true
 vci-service-interface.workspace = true
 tokio.workspace = true

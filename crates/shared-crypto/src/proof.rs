@@ -127,43 +127,67 @@ mod tests {
     const AUDIENCE: &str = "https://ngr.example.com";
     const AGENT: &str = "3f1c2a52-6a0e-4c0d-9d3e-0a1b2c3d4e5f";
 
-    fn base() -> ProofTranscript {
-        ProofTranscript::new(AUDIENCE, AGENT, [1; 32], [2; 32]).unwrap()
+    /// A fresh 32-byte value for a challenge or nonce. The tests make their values at run time
+    /// rather than writing fixed ones.
+    fn fresh() -> [u8; 32] {
+        crate::random_32().unwrap()
+    }
+
+    /// A challenge and a nonce that differ from each other.
+    fn pair() -> ([u8; 32], [u8; 32]) {
+        let challenge = fresh();
+        loop {
+            let nonce = fresh();
+            if nonce != challenge {
+                return (challenge, nonce);
+            }
+        }
+    }
+
+    fn transcript(challenge: [u8; 32], nonce: [u8; 32]) -> ProofTranscript {
+        ProofTranscript::new(AUDIENCE, AGENT, challenge, nonce).unwrap()
     }
 
     #[test]
     fn a_proof_verifies() {
+        let (c, n) = pair();
         let key = SigningKey::generate().unwrap();
-        let sig = sign_proof(&key, &base()).unwrap();
-        verify_proof(&key.public_key(), &base(), &sig).unwrap();
+        let sig = sign_proof(&key, &transcript(c, n)).unwrap();
+        verify_proof(&key.public_key(), &transcript(c, n), &sig).unwrap();
     }
 
     #[test]
     fn encoding_is_the_documented_layout() {
-        let t = ProofTranscript::new("ab", "c", [1; 32], [2; 32]).unwrap();
+        let (c, n) = pair();
+        let t = ProofTranscript::new("ab", "c", c, n).unwrap();
         let mut want = Vec::new();
         want.extend(PROTOCOL_VERSION.to_be_bytes());
         want.extend(2u32.to_be_bytes());
         want.extend(b"ab");
         want.extend(1u32.to_be_bytes());
         want.extend(b"c");
-        want.extend([1u8; 32]);
-        want.extend([2u8; 32]);
+        want.extend(c);
+        want.extend(n);
         assert_eq!(t.encode(), want);
     }
 
     #[test]
     fn every_changed_field_fails() {
+        let (c, n) = pair();
         let key = SigningKey::generate().unwrap();
-        let sig = sign_proof(&key, &base()).unwrap();
+        let sig = sign_proof(&key, &transcript(c, n)).unwrap();
         let pk = key.public_key();
+        let mut other_c = c;
+        other_c[0] ^= 1;
+        let mut other_n = n;
+        other_n[31] ^= 1;
         let cases = [
-            ProofTranscript::new("https://ngr.example.org", AGENT, [1; 32], [2; 32]).unwrap(),
-            ProofTranscript::new(AUDIENCE, "other", [1; 32], [2; 32]).unwrap(),
-            ProofTranscript::new(AUDIENCE, AGENT, [3; 32], [2; 32]).unwrap(),
-            ProofTranscript::new(AUDIENCE, AGENT, [1; 32], [3; 32]).unwrap(),
+            ProofTranscript::new("https://ngr.example.org", AGENT, c, n).unwrap(),
+            ProofTranscript::new(AUDIENCE, "other", c, n).unwrap(),
+            transcript(other_c, n),
+            transcript(c, other_n),
             // Challenge and nonce swapped.
-            ProofTranscript::new(AUDIENCE, AGENT, [2; 32], [1; 32]).unwrap(),
+            transcript(n, c),
         ];
         for t in cases {
             assert_eq!(
@@ -176,29 +200,32 @@ mod tests {
 
     #[test]
     fn a_changed_version_fails() {
+        let (c, n) = pair();
         // The version is internal, so build the bytes of another version by hand.
         let key = SigningKey::generate().unwrap();
-        let mut body = base().encode();
+        let mut body = transcript(c, n).encode();
         body[..4].copy_from_slice(&(PROTOCOL_VERSION + 1).to_be_bytes());
         let sig = sign_tagged(&key, DOMAIN_TAG, &body).unwrap();
-        assert!(verify_proof(&key.public_key(), &base(), &sig).is_err());
+        assert!(verify_proof(&key.public_key(), &transcript(c, n), &sig).is_err());
     }
 
     #[test]
     fn field_boundaries_are_unambiguous() {
         // Moving a byte between audience and agent ID must change the encoding.
-        let a = ProofTranscript::new("ab", "c", [0; 32], [0; 32]).unwrap();
-        let b = ProofTranscript::new("a", "bc", [0; 32], [0; 32]).unwrap();
+        let (c, n) = pair();
+        let a = ProofTranscript::new("ab", "c", c, n).unwrap();
+        let b = ProofTranscript::new("a", "bc", c, n).unwrap();
         assert_ne!(a.encode(), b.encode());
     }
 
     #[test]
     fn another_key_or_signature_form_fails() {
+        let (c, n) = pair();
         let key = SigningKey::generate().unwrap();
-        let sig = sign_proof(&key, &base()).unwrap();
+        let sig = sign_proof(&key, &transcript(c, n)).unwrap();
         let other = SigningKey::generate().unwrap().public_key();
         assert_eq!(
-            verify_proof(&other, &base(), &sig),
+            verify_proof(&other, &transcript(c, n), &sig),
             Err(VerifyError::Mismatch)
         );
         let bytes = sig.to_bytes();
@@ -210,18 +237,20 @@ mod tests {
 
     #[test]
     fn a_signature_without_the_tag_is_not_a_proof() {
+        let (c, n) = pair();
         // The same body signed untagged (the raw primitive) does not verify as a proof.
         let key = SigningKey::generate().unwrap();
-        let t = base();
+        let t = transcript(c, n);
         let raw = key.sign(&t.encode()).unwrap();
         assert!(verify_proof(&key.public_key(), &t, &raw).is_err());
     }
 
     #[test]
     fn a_signature_under_another_tag_is_not_a_proof() {
+        let (c, n) = pair();
         // What a job instruction signer would do: the same body under its own tag.
         let key = SigningKey::generate().unwrap();
-        let t = base();
+        let t = transcript(c, n);
         let other = sign_tagged(&key, b"nekoguruma job instruction", &t.encode()).unwrap();
         assert!(verify_proof(&key.public_key(), &t, &other).is_err());
         verify_tagged(
@@ -246,7 +275,8 @@ mod tests {
 
     #[test]
     fn empty_or_oversized_fields_are_refused() {
-        let bad = |a: &str, g: &str| ProofTranscript::new(a, g, [0; 32], [0; 32]);
+        let (c, n) = pair();
+        let bad = |a: &str, g: &str| ProofTranscript::new(a, g, c, n);
         assert_eq!(
             bad("", AGENT),
             Err(TranscriptError::BadField { field: "audience" })
@@ -275,7 +305,11 @@ mod tests {
                 ))
             }
         }
-        let err = sign_proof(&Broken(SigningKey::generate().unwrap()), &base()).unwrap_err();
+        let err = sign_proof(
+            &Broken(SigningKey::generate().unwrap()),
+            &transcript(fresh(), fresh()),
+        )
+        .unwrap_err();
         assert_eq!(err.kind(), SignErrorKind::Unavailable);
         assert!(!err.to_string().contains("collection"));
         assert!(

@@ -443,6 +443,8 @@ Architecture decision records for Nekoguruma. ADR-001 to ADR-226 cover the worke
 | [ADR-451](ADR-451-the-log-starts-a-targets-matched-answers-and-unknown-sends-over-at-its-link-opened.md) | The Log Starts a Target's Matched Answers and Unknown Sends Over at Its `link_opened` | Accepted | `agent` communication log (`comm_log.rs` `CommLog::link_opened`; `comm_log/exchange.rs` `LinkState::reopened`; `host.rs` `WorkerHost::reopen`; `runner.rs` `close_job_link`); design 8.11 "Matched answer", `sent_evidence`; ADR-393, ADR-448 |
 | [ADR-452](ADR-452-a-transmit-indication-only-confirms-the-send-of-a-record-kept-only-for-its-rows.md) | A Transmit Indication Only Confirms the Send of a Record Kept Only for Its Rows | Accepted | `agent` communication log (`comm_log.rs` `Inner::late_item`; `comm_log/exchange.rs` `Kept::late_transmit_reclassifies`, `LinkState::restate_send`); design 8.11 `late_item`; ADR-370 item 4, ADR-442 Consequences, ADR-445 decision 3, ADR-446 decision 4, ADR-448 decision 1, ADR-450 decision 4 and Consequences |
 | [ADR-453](ADR-453-the-items-an-exchange-reads-are-offered-in-the-order-read-the-late-finals-among-them.md) | The Items an Exchange Reads Are Offered in the Order Read, the Late Finals Among Them | Accepted | `agent` communication log (`comm_log.rs` `CommLog::exchange_with`, `CommLog::primitive_ended`); design 8.11 `late_item`; ADR-370 item 4 and Consequences, ADR-447 decision 1, ADR-450 Consequences |
+| [ADR-454](ADR-454-a-jobs-ir-documents-are-named-by-hash-in-its-signed-instruction.md) | A Job's IR Documents Are Named by Content Hash in Its Signed Instruction | Accepted | design 8.2.6 / 11.1, `agent` `check_job`; ADR-318, ADR-325 |
+| [ADR-455](ADR-455-the-communication-log-goes-to-the-server-only-by-explicit-user-action.md) | The Agent's Communication Log Goes to the Server Only by Explicit User Action | Accepted | design 8.11 / 16.2, `agent` communication log; ADR-237, ADR-346 |
 
 ## Status Legend
 
@@ -1005,9 +1007,11 @@ the predecessor repository these ADRs came from.
 - ADR-431 (the Consequences' deferred bullet on a response read in the stray primitive's job-end wait closed; Decision items 2 and 3's gate on `vci_ended` superseded by ADR-436 for an exchange a pending is open on or noted open on its kept record; Decision item 3's `vci_ended` of a renewed record extended by ADR-440: the finished status of a collecting window that took a rejected result counts too; amended by ADR-443: the finished status of a non-collecting primitive that ended on a wrong echo counts too; Decision item 1's "no final response" and item 2's reasons to keep a record revised by ADR-445: an exchange whose final response an earlier owed request could own is renewed and kept for its rows too)
 - ADR-432 (Consequence 1's whole settlement amended by ADR-433; the deferred bullet on settling per identifier closed; Decision item 2's "an identifier with a final answer standing is never owed" and its first-final fallback superseded by ADR-435; the deferred bullet on a silent identifier closed; Decision item 2's "a request that is not collecting is owed on its own `rx_id` once a final response ended it" revised by ADR-446: on a link with a receive table, when that identifier is 0, on every receive identifier too)
 - ADR-433 (decision C built: the covering fold of an unnamed pending; Decision item 6's "open" and the Consequences' bullet that a silent identifier is not owed superseded by ADR-435 (read as "unanswered": silent, or with a pending open); decision 1's "settled whole" revised by ADR-445 while an owed request sent before could own one of the exchange's answers)
+- ADR-454
 
 ### Acquired Data & Monitoring
 - ADR-236
 
 ### Regulatory Scope
 - ADR-237
+- ADR-455

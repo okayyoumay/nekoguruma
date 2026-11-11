@@ -33,7 +33,7 @@ M5 and M6 do not depend on each other; M6 comes first (maintainer's decision, 20
 - Control channel WSS and data channel HTTPS with resumable chunks (5.2); idempotent commands, start deadlines, sequence-numbered outbox and reconnection reconciliation (5.3).
 - Agent identity, installation and initial registration (6.1, 6.4, 6.7); job instruction signing and verification in `shared-crypto` (11.1).
 - `api/openapi.yaml` and `api/asyncapi.yaml` kept in sync with the implementation.
-- The agent's communication log (8.11) stored with the job's result: its upload over the data channel and its retention on the server (decided by the maintainer, 2026-11-11; the upload and retention policy is under "Decisions needed").
+- The agent's communication log (8.11) uploaded only by explicit operator action, with the scope shown, over the data channel, and kept on the server with the job's result under its retention (8.11, 16.2, ADR-455; the agent deletes nothing locally before the server acknowledges the upload).
 
 **Exit criteria.**
 
@@ -139,7 +139,6 @@ This is the one milestone whose exit criteria require real hardware. It runs the
 
 These change the plan's scope or order; each is a design-17 item or a purchase.
 
-- The communication log's upload and retention before M3 stores it: not a design-17 item, but design 8.11 leaves them open.
 
 - Standards purchase: SAE J3138 before M6; ISO 13209 (OTX) and ISO 20077/20078 (ExVe) before M7's OTX and ExVe parts start; SAE J1979, J1979-2, ISO 15031-5, ISO 15765-4 and ISO 27145 before M7's generic OBD package. The M2 standards, ISO 22901-1 (ODX) and ISO 17978 (SOVD) are held.
 - Design 17 P5 (non-functional targets) before M8.

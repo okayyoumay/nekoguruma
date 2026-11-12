@@ -167,8 +167,8 @@ fn split_host_port(authority: &str) -> Result<(&str, Option<&str>), AudienceErro
 
 /// Lowers the case of `host` and checks it. An IPv6 literal is rewritten through `Ipv6Addr`'s
 /// text form (brackets kept). A host whose last label is all digits must be an IPv4 address that
-/// `Ipv4Addr` parses, which refuses leading zeros and short forms; it is refused otherwise
-/// rather than rewritten, since a number-like name could mean different addresses to different
+/// `Ipv4Addr` parses, which refuses leading zeros and short forms, and one whose last label is
+/// `0x` with hexadecimal digits is refused; such hosts are refused rather than rewritten, since a number-like name could mean different addresses to different
 /// parsers.
 fn canonical_host(host: &str) -> Result<String, AudienceError> {
     let host = host.to_ascii_lowercase();
@@ -201,6 +201,14 @@ fn canonical_host(host: &str) -> Result<String, AudienceError> {
     if last.bytes().all(|b| b.is_ascii_digit()) {
         let addr: std::net::Ipv4Addr = host.parse().map_err(|_| AudienceError::BadHost)?;
         return Ok(addr.to_string());
+    }
+    // A last label of `0x` and hexadecimal digits makes the whole host an IPv4 address to a URL
+    // parser (`0x7f000001`, `127.0.0.0x1`), so it is refused like any other non-dotted form.
+    if last
+        .strip_prefix("0x")
+        .is_some_and(|hex| hex.bytes().all(|b| b.is_ascii_hexdigit()))
+    {
+        return Err(AudienceError::BadHost);
     }
     Ok(host)
 }
@@ -561,6 +569,10 @@ mod tests {
             ("http://a_b.example", BadHost),
             ("http://127.000.0.1", BadHost),
             ("http://0x7f.0.0.1", BadHost),
+            ("http://0x7f000001", BadHost),
+            ("http://127.0.0.0x1", BadHost),
+            ("http://127.0.0.0x", BadHost),
+            ("http://0X7F000001", BadHost),
             ("http://127.1", BadHost),
             ("http://1.2.3.256", BadHost),
             ("http://1.2.3.4.5", BadHost),

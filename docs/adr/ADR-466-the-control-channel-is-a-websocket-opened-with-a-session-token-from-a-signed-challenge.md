@@ -55,7 +55,7 @@ fixed points constrain it:
    lowered, the scheme's default port left out, no path, no trailing slash, query, fragment or
    user information. An IPv6 host is written through the standard address text form (brackets
    kept); a host whose last label is numeric must parse as a dotted IPv4 address and is written
-   in that form, and anything else of that shape (leading zeros, short or hexadecimal forms) is
+   in that form, a host whose last label is `0x` with hexadecimal digits is refused, and anything else of that shape (leading zeros, short or hexadecimal forms) is
    refused, not rewritten, since such a name could mean different addresses to different
    parsers. It is
    canonicalised once, when the registration record is written (one trailing slash and an

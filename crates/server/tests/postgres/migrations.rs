@@ -4,7 +4,7 @@
 
 use std::time::Duration;
 
-use server::config::{Config, Database, Http, Profile};
+use server::config::{Config, Database, Http, InstructionKeyConfig, Profile};
 use server::db::{self, DbError};
 use server::{Server, StartError};
 use sqlx::migrate::{Migration, MigrationType, Migrator};
@@ -24,6 +24,9 @@ fn config(pg: &TestPostgres) -> Config {
             shutdown_grace_secs: 2,
         },
         database,
+        instruction_key: InstructionKeyConfig {
+            path: pg.key_path(),
+        },
     }
 }
 
@@ -152,6 +155,9 @@ async fn a_start_against_a_database_that_is_down_fails_within_the_connect_timeou
             shutdown_grace_secs: 2,
         },
         database,
+        instruction_key: InstructionKeyConfig {
+            path: std::env::temp_dir().join("never-created.key"),
+        },
     };
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(LIMIT, Server::start(&config))

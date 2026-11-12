@@ -2662,6 +2662,7 @@ dependencies = [
  "hyper-util",
  "serde",
  "serde_json",
+ "shared-crypto",
  "shared-proto",
  "sqlx",
  "tempfile",

@@ -53,13 +53,26 @@ fn get_health(port: u16) -> Option<String> {
     Some(text)
 }
 
+/// A configuration whose key file is `instruction.key` in `dir`.
 fn write_config(dir: &Path, port: u16, database_url: &str) -> std::path::PathBuf {
+    write_config_with_key(dir, port, database_url, &dir.join("instruction.key"))
+}
+
+fn write_config_with_key(
+    dir: &Path,
+    port: u16,
+    database_url: &str,
+    key: &Path,
+) -> std::path::PathBuf {
     let path = dir.join("ngr-server.toml");
+    // A literal string: a Windows path holds backslashes.
     std::fs::write(
         &path,
         format!(
             "[http]\nport = {port}\nshutdown_grace_secs = 2\n\
-             [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n"
+             [instruction_key]\npath = '{}'\n\
+             [database]\nurl = \"{database_url}\"\nconnect_timeout_secs = 2\n",
+            key.display()
         ),
     )
     .unwrap();
@@ -277,6 +290,33 @@ fn a_url_with_a_parameter_is_refused_without_showing_it() {
         assert!(log.contains("database.url is not a"), "{log}");
         assert!(!log.contains(&secret), "the log shows the value: {log}");
     }
+}
+
+#[test]
+fn a_refused_instruction_key_exits_1_and_never_listens() {
+    let pg = TestPostgres::start();
+    let dir = tempfile::tempdir().unwrap();
+    // Two ways a key path is refused on every platform: a directory, and a file that is no key.
+    let as_dir = dir.path().join("a-directory");
+    std::fs::create_dir(&as_dir).unwrap();
+    let as_file = dir.path().join("not-a-key");
+    std::fs::write(&as_file, b"not a key").unwrap();
+    for key in [as_dir, as_file.clone()] {
+        let port = free_port();
+        let path = write_config_with_key(dir.path(), port, &pg.url(), &key);
+        let mut command = server(&["--config", path.to_str().unwrap()]);
+        command.stderr(Stdio::piped());
+        let output = wait_output(command.spawn().unwrap(), Duration::from_secs(30));
+        assert_eq!(output.status.code(), Some(1));
+        let log = String::from_utf8_lossy(&output.stderr);
+        assert!(!log.contains("listening"), "{log}");
+        assert!(log.contains("instruction key"), "{log}");
+        assert!(
+            get_health(port).is_none(),
+            "something listens on the port after a refused key"
+        );
+    }
+    assert_eq!(std::fs::read(&as_file).unwrap(), b"not a key");
 }
 
 fn wait_output(child: Child, limit: Duration) -> std::process::Output {

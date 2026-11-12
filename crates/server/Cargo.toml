@@ -13,6 +13,7 @@ path = "src/main.rs"
 
 [dependencies]
 shared-proto.workspace = true
+shared-crypto.workspace = true
 diag-ir.workspace = true
 tokio.workspace = true
 axum.workspace = true

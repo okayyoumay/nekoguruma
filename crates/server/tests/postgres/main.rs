@@ -2,6 +2,7 @@
 //! test binary, so the PostgreSQL helper in `support` links once and nextest names one binary.
 
 mod binary;
+mod instruction_key;
 mod migrations;
 mod serving;
 mod support;

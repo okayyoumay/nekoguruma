@@ -551,8 +551,12 @@ async fn a_valid_registration_writes_one_transaction_and_signs_what_it_assigned(
 
     let text = logs.text();
     assert!(text.contains("agent registered"), "{text}");
-    for secret in [plain(&code), "Bench PC", owner.as_str(), "alice"] {
-        assert!(!text.contains(secret), "the log holds {secret:?}: {text}");
+    for (i, secret) in [plain(&code), "Bench PC", owner.as_str(), "alice"]
+        .into_iter()
+        .enumerate()
+    {
+        // The message names the value by its position only, so a failure prints no secret.
+        assert!(!text.contains(secret), "the log holds forbidden value #{i}");
     }
     w.finish().await;
 }
@@ -755,11 +759,14 @@ async fn every_refusal_is_the_same_403_and_its_reason_is_logged() {
         assert_eq!(bytes_of(r), bytes_of(&replies[0]), "{i}");
     }
     let text = logs.text();
-    for code in &codes {
-        assert!(!text.contains(plain(code)), "the log holds a code: {text}");
+    for (i, code) in codes.iter().enumerate() {
+        assert!(!text.contains(plain(code)), "the log holds code #{i}");
     }
-    for secret in ["Bench PC", "alice", "bob", "carol"] {
-        assert!(!text.contains(secret), "the log holds {secret:?}: {text}");
+    for (i, secret) in ["Bench PC", "alice", "bob", "carol"]
+        .into_iter()
+        .enumerate()
+    {
+        assert!(!text.contains(secret), "the log holds forbidden value #{i}");
     }
     w.finish().await;
 }

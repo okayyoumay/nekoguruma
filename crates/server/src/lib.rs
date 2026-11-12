@@ -27,7 +27,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::http::StatusCode;
 use axum::middleware;
-use axum::routing::{get, post};
+use axum::routing::{any, get, post};
 use hyper::server::conn::http1;
 use hyper_util::rt::{TokioIo, TokioTimer};
 use hyper_util::service::TowerToHyperService;
@@ -89,8 +89,9 @@ pub fn router(state: AppState) -> Router {
             state.sessions.clone(),
         ));
     // The control channel judges the token the exchange issues, and hands its sockets to the hub.
+    // It takes every method, so that its 405 is a problem document like its other refusals.
     let control = Router::new()
-        .route(control::PATH, get(control::upgrade))
+        .route(control::PATH, any(control::upgrade))
         .with_state(control::Control::new(state.sessions, state.hub));
     let routes = health
         .merge(register)

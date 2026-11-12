@@ -22,8 +22,8 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
 ## Decision
 
 1. **The route is judged in this order, and the first step that applies answers:** the request
-   guard (unchanged, before routing), the method (405 with `Allow`; a HEAD request is 405 too,
-   checked in the handler because axum hands it to a GET handler), the token (401 with
+   guard (unchanged, before routing), the method (405 with `Allow: GET`; the route takes every method and the handler
+   refuses all but GET itself, HEAD included, because the router's own 405 has no body), the token (401 with
    `WWW-Authenticate: Bearer`), the WebSocket request (400), the subprotocol (400), then the
    upgrade (101, naming the subprotocol, no extension). Every refusal is the server's problem
    document. A caller with no token learns nothing else about the route, and the token costs
@@ -60,9 +60,11 @@ public sending interface: `last_seen_at`, the revocation pass, and the sending o
    stop (every session closes with 1001), wait for both sets within `shutdown_grace_secs` (or
    until the second signal), abort the HTTP connections (a pending upgrade then fails), abort the
    sessions, close the pool. An upgrade that completes after the stop began is dropped without a
-   frame, and so is a session that is still starting: no 503 exists in the asyncapi file for it.
-   A peer that answers the Close ends its task at once; one that never answers is waited for
-   5 seconds, or aborted at the end of the grace period if that is shorter. *Rejected:* running
+   frame (no 503 exists in the asyncapi file for it); a session that was adopted before the stop
+   and registers after it closes with 1001 like the others. A peer that answers the Close ends
+   its task at once; one that never answers is waited for 5 seconds after its Close is written
+   (the write itself may take up to the 10-second write limit), or aborted at the end of the
+   grace period if that is shorter. *Rejected:* running
    the session inside axum's callback and tracking a completion guard (aborting would then need
    a second mechanism); splitting the socket into reader and writer tasks (two tasks to stop and
    a lock between them, with one writer anyway).

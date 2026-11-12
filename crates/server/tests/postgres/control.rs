@@ -288,10 +288,15 @@ async fn the_guard_and_the_method_answer_before_the_token_is_looked_at() {
         );
         let r = exchange(s.addr, &text).await;
         assert_eq!(r.status, 405, "{method}: {}", r.head);
-        assert_eq!(r.header("allow"), Some("GET,HEAD"), "{method}");
+        assert_eq!(r.header("allow"), Some("GET"), "{method}");
+        assert_eq!(
+            r.header("content-type"),
+            Some("application/problem+json"),
+            "{method}"
+        );
         assert_eq!(r.header("www-authenticate"), None, "{method}");
     }
-    // axum hands a HEAD request to the GET handler, which refuses it before the token.
+    // HEAD is refused by the same handler, before the token.
     let text = format!(
         "HEAD {PATH} HTTP/1.1\r\n{}\r\nConnection: close\r\n\r\n",
         s.host()
@@ -299,6 +304,7 @@ async fn the_guard_and_the_method_answer_before_the_token_is_looked_at() {
     let r = exchange(s.addr, &text).await;
     assert_eq!(r.status, 405, "{}", r.head);
     assert_eq!(r.header("allow"), Some("GET"));
+    assert_eq!(r.header("content-type"), Some("application/problem+json"));
     assert_eq!(r.header("www-authenticate"), None);
     s.finish().await;
 }
@@ -477,6 +483,32 @@ async fn read_exactly(stream: &mut TcpStream, buf: &mut [u8]) {
 }
 
 #[tokio::test]
+async fn a_connection_outlives_the_token_that_opened_it() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    // Seven heartbeats 50 s apart take the clock past the token's 300 s; the token is judged
+    // at the upgrade only, so the connection stays open and is still echoed.
+    for _ in 0..7 {
+        jump(50).await;
+        heartbeat(&mut client).await;
+    }
+    // The token itself has expired: a new upgrade with it is refused.
+    let r = exchange(
+        u.s.addr,
+        &raw(
+            &u.s.host(),
+            "HTTP/1.1",
+            &[upgrade_headers(), vec![bearer(&t)]].concat(),
+        ),
+    )
+    .await;
+    assert_eq!(r.status, 401, "{}", r.head);
+    heartbeat(&mut client).await;
+    u.finish().await;
+}
+
+#[tokio::test]
 async fn the_heartbeat_is_echoed_and_three_intervals_of_silence_close_with_4003() {
     let u = Up::new().await;
     let t = token(&u).await;
@@ -563,6 +595,49 @@ async fn each_malformed_text_closes_with_1002() {
         assert_eq!(close_code(&mut client).await, 1002, "{name}");
     }
     u.finish().await;
+}
+
+/// Writes one masked text frame whose payload is not UTF-8, which the stack refuses on read.
+async fn send_invalid_utf8(client: &mut Client) {
+    use tokio::io::AsyncWriteExt;
+    // FIN and text, masked with a zero key so the payload goes as written.
+    let frame = [0x81, 0x82, 0, 0, 0, 0, 0xff, 0xfe];
+    client.get_mut().write_all(&frame).await.unwrap();
+}
+
+#[tokio::test]
+async fn a_text_frame_that_is_not_utf8_closes_with_1002() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    send_invalid_utf8(&mut client).await;
+    assert_eq!(close_code(&mut client).await, 1002);
+    u.finish().await;
+}
+
+#[tokio::test]
+async fn a_stop_ends_the_wait_after_a_read_error() {
+    let u = Up::new().await;
+    let t = token(&u).await;
+    let mut client = open(u.s.addr, &t).await;
+    send_invalid_utf8(&mut client).await;
+    // The Close has been written, so the session now waits without reading.
+    match frame(&mut client).await {
+        Some(Ok(Message::Close(Some(close)))) => assert_eq!(u16::from(close.code), 1002),
+        other => panic!("not a Close frame: {other:?}"),
+    }
+    let Up { w, mut s, .. } = u;
+    let started = Instant::now();
+    s.signal_stop();
+    s.joined().await;
+    // The wait is 5 seconds and the grace period 2: the stop ends the wait well before either.
+    assert!(
+        started.elapsed() < Duration::from_secs(1),
+        "{:?}",
+        started.elapsed()
+    );
+    drop(client);
+    w.finish().await;
 }
 
 #[tokio::test]
@@ -659,7 +734,7 @@ async fn a_second_stop_signal_drops_a_connection_at_once() {
     let t = token(&u).await;
     let client = open(u.s.addr, &t).await;
     let Up { w, mut s, .. } = u;
-    s.begin_stop().await;
+    s.signal_stop();
     let started = Instant::now();
     let _ = s.force.take().unwrap().send(());
     s.joined().await;

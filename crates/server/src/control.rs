@@ -103,7 +103,7 @@ fn unauthorized() -> Response {
 /// extractor, whose own rejection (400) would otherwise answer a caller without a token.
 pub async fn upgrade(State(control): State<Control>, request: Request) -> Response {
     let (mut parts, _body) = request.into_parts();
-    // axum hands a HEAD request to a GET handler.
+    // The route takes every method, so that this 405 is the problem document; HEAD is refused too.
     if parts.method != Method::GET {
         let mut response =
             Problem::new(StatusCode::METHOD_NOT_ALLOWED, "Method not allowed").into_response();
@@ -246,7 +246,12 @@ async fn session(hub: Hub, agent: AgentId, mut socket: WebSocket) {
     // own drop leaves again, which removes nothing.
     leave.hub.leave(&leave.agent, id);
     finish(&mut socket, &end, &mut stopping).await;
-    tracing::info!(connection = %id, end = end.word(), "control channel ended");
+    tracing::info!(
+        agent_id = %leave.agent.0,
+        connection = %id,
+        end = end.word(),
+        "control channel ended"
+    );
 }
 
 /// The connection's loop: `hello`, then messages until something ends it.

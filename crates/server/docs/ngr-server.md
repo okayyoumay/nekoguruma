@@ -340,8 +340,8 @@ the tasks that run them (design 5.2, 13.3, 14.1; ADR-466, ADR-468). The accept l
 connection with hyper's `with_upgrades()`.
 
 - **The route, in this order, the first step that applies answers.** The guard (before routing);
-  the method (405 with `Allow: GET,HEAD` from the router, and 405 with `Allow: GET` for a HEAD
-  request, which the handler refuses itself); the token (401 with `WWW-Authenticate: Bearer`);
+  the method (405 with `Allow: GET` for every other method, HEAD included: the route takes every
+  method and the handler refuses them itself, so that this 405 is a problem document too); the token (401 with `WWW-Authenticate: Bearer`);
   the WebSocket request (400); the subprotocol (400); then the 101 with
   `Sec-WebSocket-Protocol: ngr-control.v1` and no extension. Every refusal is a problem
   document, and a caller with no token learns nothing else about the route: a request with
@@ -385,8 +385,9 @@ connection with hyper's `with_upgrades()`.
   the entry it finds is its successor's.
 - **The stop.** After the accept loop ends: signal the HTTP connections (each task calls
   hyper's `graceful_shutdown`, because hyper-util's graceful watch does not cover a connection
-  that allows upgrades), begin the hub's stop (every session closes with 1001; a connection that
-  upgrades after it, or that is still starting, is dropped without a frame), wait for both sets
+  that allows upgrades), begin the hub's stop (every session closes with 1001, also one that registers
+  after the stop began; a connection whose upgrade completes after it is dropped without a
+  frame), wait for both sets
   within `shutdown_grace_secs` or until the second signal, abort the HTTP connections (a pending
   upgrade then fails), abort the sessions, close the pool.
 - **Logging.** One info line at the connect and one at the end, with the agent ID, a connection
@@ -461,16 +462,20 @@ a new migration file rebuilds the crate. How migrations are written and applied 
   TCP with `tokio-tungstenite` as the client. Refusals: every way of having no valid token is
   the same 401 (no header, another scheme, a bare scheme, two headers, 43 characters, an unknown
   token, a lower-case scheme, nothing else valid in the request), the guard and the method answer
-  before the token (307, 403, 405 for POST, PUT, DELETE and HEAD), an expired token (a jump of
+  before the token (307, 403, a 405 problem document with `Allow: GET` for POST, PUT, DELETE and
+  HEAD), an expired token (a jump of
   301 seconds) and a token sent twice are 401, and a valid token on a plain GET, with no
   subprotocol, another case, quotes, another version, version 12, no key or over HTTP/1.0 is 400
   and still usable. Connection: the subprotocol from a list and from two headers with `hello`
   first and no extension, the heartbeat echo and the idle close under moved clocks (jumps of 50,
   50, 50 and 61 seconds with a ping in between, so that the ping is shown to count), binary
   giving 1003, 131073 bytes giving 1009 and 131072 bytes read, each malformed text giving 1002,
-  valid outcomes and events read and the connection kept, a Close from the agent answered,
+  a text frame that is not UTF-8 giving 1002 (a read error),
+  valid outcomes and events read and the connection kept, a Close from the agent answered, a connection outliving its token
+  (seven heartbeats 50 seconds apart, after which the token itself is refused),
   replacement (the old connection reads 4001, the new one is echoed). Stop: 1001 within the grace
-  period, a peer that never answers aborted at the end of the grace period, and a second signal
+  period, a peer that never answers aborted at the end of the grace period, a stop ending the wait
+  after a read error, and a second signal
   dropping the connection at once. The unit tests cover the `Authorization` table, the close for
   each decode error, the classes of read errors, and the hub's registration, replacement and
   stop. The plain-HTTP stop tests in `serving.rs` are the check that the loop's own watch did
